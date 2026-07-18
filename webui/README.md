@@ -7,10 +7,10 @@ AI Agent 平台的 React + TypeScript 前端，对接 [peco-server](../crates/pe
 ```bash
 cd webui
 npm install
-npm run dev        # 开发模式，默认 http://localhost:5173
+npm run dev        # 开发模式，默认 http://localhost:9233
 ```
 
-Vite 自动将 `/api` 请求代理到 `http://localhost:3000`（peco-server 默认端口）。
+Vite 自动将 `/api` 请求代理到 `http://localhost:9227`（peco-server 默认端口）。
 确保后端已启动且 `DEEPSEEK_API_KEY` 已设置。
 
 ## 技术栈
@@ -165,7 +165,7 @@ ChatBubble 组件渲染
 ## 命令行
 
 ```bash
-npm run dev         # 启动开发服务器 (http://localhost:5173)
+npm run dev         # 启动开发服务器 (http://localhost:9233)
 npm run build       # TypeScript 编译 + Vite 生产构建
 npm run preview     # 预览生产构建
 npx vitest run      # 运行单元测试
@@ -176,7 +176,7 @@ npx tsc --noEmit    # TypeScript 类型检查
 
 - Node.js 22+
 - npm 10+
-- peco-server 后端运行在 `localhost:3000`
+- peco-server 后端运行在 `localhost:9227`
 
 ## 生产部署
 
@@ -203,7 +203,7 @@ server {
 
     # API 代理
     location /api/ {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://localhost:9227;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

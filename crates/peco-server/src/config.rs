@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 pub struct ServerConfig {
     /// 绑定地址，默认 `0.0.0.0`。
     pub host: String,
-    /// 监听端口，默认 `3000`。
+    /// 监听端口，默认 `9227`。
     pub port: u16,
     /// SQLite 数据库连接串，默认 `sqlite:~/.peco/server.db?mode=rwc`。
     pub database_url: String,
@@ -55,7 +55,7 @@ impl ServerConfig {
     /// | 变量 | 默认值 |
     /// |------|--------|
     /// | `PECO_SERVER_HOST` | `0.0.0.0` |
-    /// | `PECO_SERVER_PORT` | `3000` |
+    /// | `PECO_SERVER_PORT` | `9227` |
     /// | `PECO_DATABASE_URL` | `sqlite:~/.peco/server.db?mode=rwc` |
     /// | `PECO_JWT_SECRET` | 环境变量 → DB → 随机 UUID（重启后不失效） |
     /// | `PECO_DATA_DIR` | `~/.peco/` |
@@ -88,7 +88,7 @@ fn parse_common_env() -> (String, u16, String, PathBuf) {
     let port = std::env::var("PECO_SERVER_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(3000u16);
+        .unwrap_or(9227u16);
 
     let database_url = std::env::var("PECO_DATABASE_URL").unwrap_or_else(|_| {
         let home = home_dir();

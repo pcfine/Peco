@@ -62,8 +62,8 @@ trap cleanup EXIT INT TERM
 if $BACKEND; then
     printf "\n${BOLD}${BLUE}=== Starting peco-server (backend) ===${NC}\n"
     log_info "Building & running peco-server..."
-    log_info "API  : http://localhost:3000"
-    log_info "Docs : http://localhost:3000/docs"
+    log_info "API  : http://localhost:9227"
+    log_info "Docs : http://localhost:9227/docs"
 
     cargo run -p peco-server &
     BACKEND_PID=$!
@@ -85,7 +85,7 @@ if $FRONTEND; then
     npm install --silent 2>/dev/null || npm install
 
     log_info "Starting Vite dev server..."
-    log_info "Web UI: http://localhost:5173"
+    log_info "Web UI: http://localhost:9233"
 
     npx vite --host 0.0.0.0 &
     FRONTEND_PID=$!
@@ -94,9 +94,9 @@ if $FRONTEND; then
     printf "${GREEN}========================================${NC}\n"
     printf "${GREEN}  peco dev environment ready!${NC}\n"
     printf "${GREEN}========================================${NC}\n"
-    $BACKEND && printf "  Backend API : ${BOLD}http://localhost:3000${NC}\n"
-    $BACKEND && printf "  API Docs    : ${BOLD}http://localhost:3000/docs${NC}\n"
-    printf "  Web UI      : ${BOLD}http://localhost:5173${NC}\n"
+    $BACKEND && printf "  Backend API : ${BOLD}http://localhost:9227${NC}\n"
+    $BACKEND && printf "  API Docs    : ${BOLD}http://localhost:9227/docs${NC}\n"
+    printf "  Web UI      : ${BOLD}http://localhost:9233${NC}\n"
     printf "\n${YELLOW}  Press Ctrl+C to stop all services${NC}\n"
     printf "\n"
 

@@ -84,7 +84,7 @@ echo "DEEPSEEK_API_KEY=sk-your-key-here" > .env
 bash scripts/dev.sh
 ```
 
-后端启动于 `http://localhost:3000`，前端启动于 `http://localhost:5173`。
+后端启动于 `http://localhost:9227`，前端启动于 `http://localhost:9233`。
 
 ### 3. 生产部署
 
@@ -177,14 +177,14 @@ max_turns: 30
 |------|------|------|
 | `DEEPSEEK_API_KEY` | ✓ | DeepSeek API 密钥 |
 | `PECO_SERVER_HOST` | - | 服务监听地址（默认 `127.0.0.1`） |
-| `PECO_SERVER_PORT` | - | 服务端口（默认 `3000`） |
+| `PECO_SERVER_PORT` | - | 服务端口（默认 `9227`） |
 | `PECO_JWT_SECRET` | - | JWT 签名密钥（自动生成） |
 | `PECO_DATA_DIR` | - | 数据目录（默认 `/var/lib/peco`） |
 | `PECO_DATABASE_URL` | - | SQLite 数据库路径 |
 
 ### API 文档
 
-启动后端后访问 `http://localhost:3000/docs` 查看 Swagger UI。
+启动后端后访问 `http://localhost:9227/docs` 查看 Swagger UI。
 
 ## 技术栈
 
@@ -285,8 +285,8 @@ echo "DEEPSEEK_API_KEY=sk-your-key-here" > .env
 
 # Development (both backend + frontend)
 bash scripts/dev.sh
-# Backend: http://localhost:3000  |  Frontend: http://localhost:5173
-# API Docs: http://localhost:3000/docs
+# Backend: http://localhost:9227  |  Frontend: http://localhost:9233
+# API Docs: http://localhost:9227/docs
 
 # Production deployment
 sudo -E bash scripts/deploy.sh

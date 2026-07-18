@@ -146,35 +146,35 @@ export PECO_JWT_SECRET=your-production-secret   # 可选，未设置时自动生
 cd crates/peco-server
 cargo run --release
 
-# 服务默认监听 http://0.0.0.0:3000
-# Swagger UI: http://localhost:3000/docs
-# OpenAPI JSON: http://localhost:3000/api-docs/openapi.json
+# 服务默认监听 http://0.0.0.0:9227
+# Swagger UI: http://localhost:9227/docs
+# OpenAPI JSON: http://localhost:9227/api-docs/openapi.json
 ```
 
 ### 快速验证
 
 ```bash
 # 注册用户
-curl -X POST http://localhost:3000/api/auth/register \
+curl -X POST http://localhost:9227/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{"username":"alice","email":"alice@example.com","password":"secret123"}'
 
 # 登录获取 token
-TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
+TOKEN=$(curl -s -X POST http://localhost:9227/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"secret123"}' | jq -r '.token')
 
 # 查看当前用户
-curl http://localhost:3000/api/auth/me -H "Authorization: Bearer $TOKEN"
+curl http://localhost:9227/api/auth/me -H "Authorization: Bearer $TOKEN"
 
 # 创建对话
-curl -X POST http://localhost:3000/api/conversations \
+curl -X POST http://localhost:9227/api/conversations \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"title":"测试对话"}'
 
 # SSE 流式对话（在终端中实时输出）
-curl -N "http://localhost:3000/api/conversations/{conv_id}/stream?message=你好" \
+curl -N "http://localhost:9227/api/conversations/{conv_id}/stream?message=你好" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -320,7 +320,7 @@ PDF、DOCX、HTML、Markdown、纯文本、Python/Rust/Go/JS/TS 源码。
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PECO_SERVER_HOST` | `0.0.0.0` | 绑定地址 |
-| `PECO_SERVER_PORT` | `3000` | 监听端口 |
+| `PECO_SERVER_PORT` | `9227` | 监听端口 |
 | `PECO_DATABASE_URL` | `sqlite:~/.peco/server.db?mode=rwc` | SQLite 连接串 |
 | `PECO_JWT_SECRET` | 自动生成+持久化 | JWT 签名密钥（三层降级） |
 | `PECO_DATA_DIR` | `~/.peco/` | 数据存储根目录 |
@@ -483,7 +483,7 @@ docker build -t peco-server .
 # 运行
 docker run -d \
   --name peco-server \
-  -p 3000:3000 \
+  -p 9227:9227 \
   -e DEEPSEEK_API_KEY=sk-your-key \
   -e PECO_JWT_SECRET=your-secret \
   -v peco_data:/root/.peco \

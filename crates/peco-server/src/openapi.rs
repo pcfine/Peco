@@ -28,7 +28,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
             `agent_call_start`, `agent_call_end`, `turn_complete`, `done`, `error`",
         contact(name = "peco", url = "https://github.com/pcfine/peco"),
     ),
-    servers((url = "http://localhost:3000", description = "本地开发服务器")),
+    servers((url = "http://localhost:9227", description = "本地开发服务器")),
     modifiers(&SecurityAddon),
     tags(
         (name = "Auth", description = "用户认证 — 注册、登录、获取当前用户"),
