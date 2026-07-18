@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use model_provider::{ChatResponse, Message, ToolCall, Usage};
 
 use super::agent_looper::{OuterState, ReActState, TurnFailureReason};
+use crate::session::Session;
 
 // ============================================================================
 // Hook 返回值类型
@@ -123,11 +124,13 @@ pub trait LooperHook: Send + Sync {
     ///
     /// `failure: None` 表示正常完成（`ReActState::Done`）；
     /// `failure: Some(...)` 携带具体的 [`TurnFailureReason`]。
+    /// `session` 提供对当前对话消息的只读访问。
     async fn on_turn_complete(
         &self,
         _turn_index: usize,
         _failure: Option<&TurnFailureReason>,
         _usage: &Usage,
+        _session: &Session,
     ) {
     }
 
@@ -215,6 +218,7 @@ impl LooperHook for TokenBudgetHook {
         _turn_index: usize,
         failure: Option<&TurnFailureReason>,
         usage: &Usage,
+        _session: &Session,
     ) {
         if failure.is_none() {
             let mut acc = self.accumulated.lock().await;
@@ -325,7 +329,7 @@ mod tests {
             input_tokens: 200,
             output_tokens: 300,
         };
-        hook.on_turn_complete(0, None, &usage).await;
+        hook.on_turn_complete(0, None, &usage, &Session::new("test".into(), "test".into())).await;
         assert_eq!(hook.accumulated().await, 500);
     }
 }

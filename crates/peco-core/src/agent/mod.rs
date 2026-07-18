@@ -14,8 +14,8 @@ pub use agent_config::{
     split_frontmatter,
 };
 pub use agent_looper::{
-    AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState, TurnOutcome,
-    UserMsg,
+    AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState, TurnFailureReason,
+    TurnOutcome, UserMsg,
 };
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;

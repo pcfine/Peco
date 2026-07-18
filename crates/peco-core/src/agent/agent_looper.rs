@@ -951,9 +951,10 @@ impl AgentLooper {
         turn: usize,
         failure: Option<&TurnFailureReason>,
         usage: &Usage,
+        session: &Session,
     ) {
         for hook in hooks {
-            hook.on_turn_complete(turn, failure, usage).await;
+            hook.on_turn_complete(turn, failure, usage, session).await;
         }
     }
 
@@ -1265,6 +1266,7 @@ impl AgentLooper {
                 .await;
                 Self::invoke_on_turn_complete(
                     &self.config.hooks, turn, outcome.failure_reason(), &usage,
+                    &self.session,
                 )
                 .await;
 
@@ -1331,6 +1333,7 @@ impl AgentLooper {
                 .await;
                 Self::invoke_on_turn_complete(
                     &self.config.hooks, turn, outcome.failure_reason(), &usage,
+                    &self.session,
                 )
                 .await;
 

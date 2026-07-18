@@ -19,6 +19,7 @@ pub mod error;
 pub mod knowledge;
 pub mod middleware;
 pub mod openapi;
+pub mod personal_assistant;
 pub mod session_store;
 pub mod state;
 pub mod task;

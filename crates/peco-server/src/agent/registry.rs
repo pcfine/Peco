@@ -25,6 +25,8 @@ use crate::knowledge::tools::{
     WebAddToKnowledgeBase, WebGetKnowledgeBaseDocs, WebListKnowledgeBases, WebSearchKnowledge,
     WebSyncKnowledgeBase,
 };
+use crate::personal_assistant::tools::{ForgetTool, RecallTool, RememberTool};
+use crate::personal_assistant::PersonalMemoryStore;
 
 use super::orchestration::{WebDelegateSubAgentTool, WebRunParallelSubAgentsTool};
 
@@ -278,6 +280,19 @@ impl AgentRegistry {
         replace_tool_if_configured(&config, &executor, "add_to_knowledge_base", WebAddToKnowledgeBase::new(web_km.clone(), uid.clone()));
         replace_tool_if_configured(&config, &executor, "sync_knowledge_base", WebSyncKnowledgeBase::new(web_km.clone(), uid.clone()));
         replace_tool_if_configured(&config, &executor, "get_knowledge_base_docs", WebGetKnowledgeBaseDocs::new(web_km.clone(), uid.clone()));
+
+        // ★ PPA 工具：remember / recall / forget（用户隔离）
+        let user_km = self.web_km.get_manager(&uid).await.map_err(|e| {
+            ApiError::Internal(format!("failed to get user knowledge manager: {e}"))
+        })?;
+        let ppa_store = Arc::new(PersonalMemoryStore::new(
+            user_km,
+            format!("personal_memory_{}", uid),
+            Default::default(),
+        ));
+        replace_tool_if_configured(&config, &executor, "remember", RememberTool::new(ppa_store.clone()));
+        replace_tool_if_configured(&config, &executor, "recall", RecallTool::new(ppa_store.clone()));
+        replace_tool_if_configured(&config, &executor, "forget", ForgetTool::new(ppa_store.clone()));
 
         let tool_executor: Arc<dyn ToolExecutor> = Arc::new(executor);
 

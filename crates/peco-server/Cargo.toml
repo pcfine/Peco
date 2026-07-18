@@ -30,6 +30,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 # Scheduling
 tokio-cron-scheduler = { workspace = true }

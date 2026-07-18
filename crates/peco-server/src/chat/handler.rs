@@ -22,6 +22,10 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::db::{agents, conversations, messages};
 use crate::error::ApiError;
+use crate::personal_assistant::analyzer::MemoryAnalyzer;
+use crate::personal_assistant::classifier::QueryClassifier;
+use crate::personal_assistant::config::PpaConfig;
+use crate::personal_assistant::{PersonalMemoryStore, PpaDynamicContext, PpaMemoryHook};
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
@@ -436,6 +440,9 @@ pub async fn stream_chat(
     // ── 4. 创建 SSE channel ──────────────────────────────────────────────
     let (sse_tx, sse_rx) = mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(256);
 
+    // ── 4.5. 构建 PPA 组件 ───────────────────────────────────────────────
+    let ppa_ctx = build_ppa_components(&state, &user_id).await;
+
     let db_for_bg = state.db.clone();
     let conv_id_for_bg = conv_id.clone();
     let _conv_title = conv.title.clone();
@@ -451,6 +458,8 @@ pub async fn stream_chat(
             per_turn_timeout: Some(Duration::from_secs(300)),
             total_timeout: Some(Duration::from_secs(1800)),
             persist_on_failure: true,
+            dynamic_context: ppa_ctx.dynamic_context,
+            hooks: ppa_ctx.hooks,
             ..LooperConfig::default()
         };
 
@@ -880,4 +889,82 @@ pub async fn get_session_snapshot(
         turns,
         total_usage: usage,
     }))
+}
+
+// ============================================================================
+// PPA 组件构建
+// ============================================================================
+
+/// PPA 组件集合，注入到 LooperConfig 中。
+struct PpaComponents {
+    dynamic_context: Option<Arc<dyn peco_core::agent::DynamicContext>>,
+    hooks: Vec<Arc<dyn peco_core::agent::hooks::LooperHook>>,
+}
+
+/// 构建 PPA 组件（PersonalMemoryStore、PpaDynamicContext、PpaMemoryHook）。
+async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaComponents {
+    let ppa_config = PpaConfig::default();
+
+    if !ppa_config.enabled {
+        tracing::info!("PPA disabled");
+        return PpaComponents {
+            dynamic_context: None,
+            hooks: Vec::new(),
+        };
+    }
+
+    // 获取 per-user KnowledgeManager
+    let user_km = match state.web_knowledge_manager.get_manager(user_id).await {
+        Ok(km) => km,
+        Err(e) => {
+            tracing::warn!(error = %e, user_id = %user_id, "Failed to get user knowledge manager, PPA disabled");
+            return PpaComponents {
+                dynamic_context: None,
+                hooks: Vec::new(),
+            };
+        }
+    };
+
+    let kb_name = format!("personal_memory_{}", user_id);
+    let store = Arc::new(PersonalMemoryStore::new(
+        user_km,
+        kb_name,
+        ppa_config.storage.clone(),
+    ));
+
+    // 创建 DynamicContext（读路径）
+    let dynamic_context: Option<Arc<dyn peco_core::agent::DynamicContext>> = Some(Arc::new(
+        PpaDynamicContext::new(
+            store.clone(),
+            QueryClassifier::new(),
+            ppa_config.clone(),
+        ),
+    ));
+
+    // 创建 MemoryAnalyzer（写路径）
+    // 使用独立模型分析对话，失败不影响主流程
+    let analyzer_model = match model_provider::DeepSeek::from_env() {
+        Ok(provider) => Arc::new(provider),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create PPA analyzer model provider, PPA write path disabled");
+            return PpaComponents {
+                dynamic_context,
+                hooks: Vec::new(),
+            };
+        }
+    };
+
+    let analyzer = MemoryAnalyzer::new(
+        analyzer_model as Arc<dyn model_provider::ModelProvider>,
+        ppa_config.analyzer.clone(),
+    );
+
+    let hook = Arc::new(PpaMemoryHook::new(store, analyzer, ppa_config));
+
+    tracing::info!(user_id = %user_id, "PPA components built");
+
+    PpaComponents {
+        dynamic_context,
+        hooks: vec![hook],
+    }
 }
