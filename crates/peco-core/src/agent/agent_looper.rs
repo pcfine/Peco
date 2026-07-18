@@ -21,6 +21,7 @@ use model_provider::{ChatResponse, ChatStream, Message, StreamEvent, ToolCall, U
 use serde::{Deserialize, Serialize};
 
 use super::agent::{Agent, MessageFilter, ModelResponse};
+use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
 use crate::session::{AnnotatedMessage, MessageSource, Session, SessionState};
@@ -137,6 +138,8 @@ pub struct LooperConfig {
     pub total_timeout: Option<Duration>,
     /// Hook 链（按注册顺序调用）。
     pub hooks: Vec<Arc<dyn LooperHook>>,
+    /// 动态上下文提供者。
+    pub dynamic_context: Option<Arc<dyn DynamicContext>>,
     /// 上下文构建策略。
     pub context_strategy: super::context::ContextStrategy,
     /// 失败时是否持久化（Phase 3 使用）。
@@ -159,6 +162,7 @@ impl Default for LooperConfig {
             per_turn_timeout: None,
             total_timeout: None,
             hooks: Vec::new(),
+            dynamic_context: None,
             context_strategy: super::context::ContextStrategy::FullHistory,
             persist_on_failure: false,
             message_filter: None,
@@ -681,6 +685,11 @@ pub struct AgentLooper {
     /// 缓存 `agent.system_prompt()`，避免每次 turn 重新计算。
     system_prompt: String,
 
+    /// 当前 turn 缓存的动态上下文字符串。
+    /// 在 [`prepare_and_send_request`] 检测到新 query 时更新，
+    /// 同一 turn 内多次 ReAct 迭代复用该值。
+    dynamic_context: Option<String>,
+
     // ── 会话 ──
     /// Session 持有全部对话状态（committed + staging + pending + turn_index + usage）。
     session: Box<Session>,
@@ -762,6 +771,7 @@ impl AgentLooper {
             max_turns,
             config,
             system_prompt,
+            dynamic_context: None,
             session,
             outer_state: OuterState::Idle,
             react_state: ReActState::PreparingRequest,
@@ -1391,11 +1401,39 @@ impl AgentLooper {
 
         // 3. 构建消息列表（Agent 层上下文策略，零拷贝 Arc 共享）
         let refs: Vec<&AnnotatedMessage> = self.session.all_message_refs().collect();
-        let system_prompt = &self.system_prompt;
+
+        // ── 动态上下文解析 ─────────────────────────────────────────────
+        // 若末条消息为 User query，表示新一轮对话开始，解析动态上下文；
+        // 否则（tool 结果返回后的 ReAct 迭代）复用已缓存的上下文。
+        let last_is_user = refs
+            .last()
+            .map(|am| matches!(am.message.as_ref(), Message::User { .. }))
+            .unwrap_or(false);
+
+        if last_is_user {
+            if let Some(dc) = &self.config.dynamic_context {
+                let query_text = refs
+                    .last()
+                    .and_then(|am| match am.message.as_ref() {
+                        Message::User { content } => Some(content.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                self.dynamic_context = dc.query(query_text).await;
+            }
+        }
+
+        // ── 合并 system prompt ─────────────────────────────────────────
+        let effective_prompt = match &self.dynamic_context {
+            Some(dyn_ctx) => {
+                format!("{}\n\n[Dynamic Context]\n{}", self.system_prompt, dyn_ctx)
+            }
+            None => self.system_prompt.clone(),
+        };
 
         let ctx = super::context::build_context(
             &refs,
-            Some(system_prompt.as_str()),
+            Some(effective_prompt.as_str()),
             &self.config.context_strategy,
         );
         let mut session_messages = ctx.messages;
