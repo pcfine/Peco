@@ -38,6 +38,23 @@ pub struct ModelResponse {
 
 // ── Agent ───────────────────────────────────────────────────────────────────────
 
+// ── MessageFilter ─────────────────────────────────────────────────────────────
+
+/// Agent 层消息过滤器。
+///
+/// 在上下文构建完成、system prompt 注入后，对最终发送给 LLM 的消息列表
+/// 进行转换。典型用途包括：脱敏、注入提醒、重排消息顺序等。
+///
+/// 与 [`ContextFilter`](super::context::ContextFilter) 的区别：
+/// - `ContextFilter` 从 Session 历史中选择*哪些*消息进入上下文
+/// - `MessageFilter` 对已选定的消息列表做*最后一公里*转换
+///
+/// 默认为 `None`（不过滤），可通过外部注入 `dyn` trait 对象覆盖。
+pub trait MessageFilter: Send + Sync {
+    /// 转换消息列表，返回处理后的结果。
+    fn filter(&self, messages: Vec<Arc<Message>>) -> Vec<Arc<Message>>;
+}
+
 /// 一个从 `agent.md` 配置文件加载的完整 Agent 实例。
 ///
 /// 包含 LLM provider（已注册工具和 MCP 工具）、Skill 引用等全部组件。
@@ -242,21 +259,10 @@ impl Agent {
 
     // ── 请求发送方法 ───────────────────────────────────────────────────────────
 
-    /// 从 session 消息构建完整请求消息列表（System prompt 动态注入）。
-    ///
-    /// System 消息不写入 Session — 每次请求时动态生成，确保修改 agent.md 后立即生效。
-    ///
-    /// 接收所有权以避免 clone 整个消息列表：多轮对话中 history 随轮次线性增长，
-    /// 每次都 clone 导致 O(n²) 的 clone 开销。改为 `insert(0, ...)` 仅移动指针。
-    fn build_request_messages(&self, mut session_messages: Vec<Message>) -> Vec<Message> {
-        session_messages.insert(0, Message::system(self.system_prompt()));
-        session_messages
-    }
-
     /// 构造 [`ChatRequest`]。
     fn build_chat_request(
         &self,
-        messages: Vec<Message>,
+        messages: Vec<Arc<Message>>,
         tools: Vec<ToolDefinition>,
     ) -> ChatRequest {
         // 构建 additional_params：
@@ -290,15 +296,12 @@ impl Agent {
 
     /// 发送非流式 chat 请求。
     ///
-    /// 内部完成：构建消息列表 → 收集 tool 定义 → 构造 ChatRequest → 调用 provider.chat()。
-    ///
-    /// 接收 [`Vec<Message>`] 所有权以避免 clone 整个消息列表。
-    /// 多轮对话中 history 随轮次线性增长，每次 clone 导致 O(n²) 的 clone 开销。
+    /// 调用方需自行构建完整的消息列表（含 system prompt）。
+    /// Agent 负责收集 tool 定义、构造 ChatRequest、调用 provider。
     pub(crate) async fn chat(
         &self,
-        session_messages: Vec<Message>,
+        messages: Vec<Arc<Message>>,
     ) -> Result<ChatResponse, AgentError> {
-        let messages = self.build_request_messages(session_messages);
         let tools = self.tool_executor.definitions();
         let request = self.build_chat_request(messages, tools);
         Ok(self.model.chat(&request).await?)
@@ -306,15 +309,12 @@ impl Agent {
 
     /// 发送流式 chat 请求。
     ///
-    /// 内部完成：构建消息列表 → 收集 tool 定义 → 构造 ChatRequest → 调用 provider.stream_chat()。
-    ///
-    /// 接收 [`Vec<Message>`] 所有权以避免 clone 整个消息列表。
-    /// 多轮对话中 history 随轮次线性增长，每次 clone 导致 O(n²) 的 clone 开销。
+    /// 调用方需自行构建完整的消息列表（含 system prompt）。
+    /// Agent 负责收集 tool 定义、构造 ChatRequest、调用 provider。
     pub(crate) async fn stream_chat(
         &self,
-        session_messages: Vec<Message>,
+        messages: Vec<Arc<Message>>,
     ) -> Result<ChatStream, AgentError> {
-        let messages = self.build_request_messages(session_messages);
         let tools = self.tool_executor.definitions();
         let request = self.build_chat_request(messages, tools);
         Ok(self.model.stream_chat(&request).await?)

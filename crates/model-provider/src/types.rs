@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// 聊天对话中的一条消息，遵循 OpenAI/DeepSeek 的传输格式。
@@ -180,7 +182,7 @@ pub struct ChatRequest {
     /// 要使用的模型标识符。
     pub model: String,
     /// 对话消息列表。
-    pub messages: Vec<Message>,
+    pub messages: Vec<Arc<Message>>,
     /// 可选的工具定义，用于函数调用。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDefinition>,

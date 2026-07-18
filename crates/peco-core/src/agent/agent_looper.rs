@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use model_provider::{ChatResponse, ChatStream, Message, StreamEvent, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
 
-use super::agent::{Agent, ModelResponse};
+use super::agent::{Agent, MessageFilter, ModelResponse};
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
 use crate::session::{AnnotatedMessage, MessageSource, Session, SessionState};
@@ -141,6 +141,15 @@ pub struct LooperConfig {
     pub context_strategy: super::context::ContextStrategy,
     /// 失败时是否持久化（Phase 3 使用）。
     pub persist_on_failure: bool,
+    /// 可选的消息过滤器：在上下文构建完成、system prompt 注入后，
+    /// 对最终发送给 LLM 的消息列表进行转换。
+    ///
+    /// 与 [`ContextFilter`](super::context::ContextFilter) 的区别：
+    /// - `ContextFilter` 从 Session 历史中选择*哪些*消息进入上下文
+    /// - `MessageFilter` 对已选定的消息列表做*最后一公里*转换
+    ///
+    /// 默认为 `None`（不过滤）。每个 `AgentLooper` 实例可独立配置。
+    pub message_filter: Option<Arc<dyn MessageFilter>>,
 }
 
 impl Default for LooperConfig {
@@ -152,6 +161,7 @@ impl Default for LooperConfig {
             hooks: Vec::new(),
             context_strategy: super::context::ContextStrategy::FullHistory,
             persist_on_failure: false,
+            message_filter: None,
         }
     }
 }
@@ -856,7 +866,7 @@ impl AgentLooper {
     async fn invoke_on_before_request(
         hooks: &[Arc<dyn LooperHook>],
         turn: usize,
-        messages: &mut Vec<Message>,
+        messages: &mut Vec<Arc<Message>>,
     ) -> HookAction {
         for hook in hooks {
             match hook.on_before_request(turn, messages).await {
@@ -1383,12 +1393,7 @@ impl AgentLooper {
             Some(system_prompt.as_str()),
             &self.config.context_strategy,
         );
-        // 在 provider 边界将 Arc<Message> 转换为 Message（单次克隆）
-        let mut session_messages: Vec<Message> = ctx
-            .messages
-            .iter()
-            .map(|arc_msg| (**arc_msg).clone())
-            .collect();
+        let mut session_messages = ctx.messages;
 
         // ★ Hook: on_before_request — 可修改消息或中止
         if let HookAction::Abort(reason) =
@@ -1397,6 +1402,11 @@ impl AgentLooper {
             self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
             self.react_state = ReActState::Failed;
             return;
+        }
+
+        // ★ MessageFilter: 最后一公里消息转换（每个 AgentLooper 实例可独立配置）
+        if let Some(filter) = &self.config.message_filter {
+            session_messages = filter.filter(session_messages);
         }
 
         // 4. 分支：根据 ModelConfig.stream 决定路径

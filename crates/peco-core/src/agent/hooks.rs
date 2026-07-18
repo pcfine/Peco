@@ -6,6 +6,7 @@
 // 第一个返回非 Continue 的 hook 会短路后续 hook 的执行。
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use model_provider::{ChatResponse, Message, ToolCall, Usage};
@@ -71,7 +72,7 @@ pub trait LooperHook: Send + Sync {
     async fn on_before_request(
         &self,
         _turn_index: usize,
-        _messages: &mut Vec<Message>,
+        _messages: &mut Vec<Arc<Message>>,
     ) -> HookAction {
         HookAction::Continue
     }
@@ -224,7 +225,7 @@ impl LooperHook for TokenBudgetHook {
     async fn on_before_request(
         &self,
         _turn_index: usize,
-        _messages: &mut Vec<Message>,
+        _messages: &mut Vec<Arc<Message>>,
     ) -> HookAction {
         let acc = *self.accumulated.lock().await;
         if acc >= self.max_total_tokens {

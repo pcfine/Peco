@@ -20,6 +20,8 @@ pub use multi_turn::MultiTurnExecutor;
 pub use single_turn::SingleTurnExecutor;
 pub use tool::AgentExecutorTool;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use model_provider::{Message, Usage};
 
@@ -56,7 +58,7 @@ pub struct ExecutorInput {
     /// 用户 prompt 文本
     pub prompt: String,
     /// 注入到临时 Session 的上下文消息（不含 system prompt）
-    pub context: Vec<Message>,
+    pub context: Vec<Arc<Message>>,
     /// 结构化输出 schema（StructuredOutputExecutor 使用，Phase 2）
     pub output_schema: Option<serde_json::Value>,
 }
@@ -72,7 +74,7 @@ impl ExecutorInput {
     }
 
     /// 创建带上下文消息的输入。
-    pub fn with_context(prompt: impl Into<String>, context: Vec<Message>) -> Self {
+    pub fn with_context(prompt: impl Into<String>, context: Vec<Arc<Message>>) -> Self {
         Self {
             prompt: prompt.into(),
             context,

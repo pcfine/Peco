@@ -15,6 +15,8 @@
 //! 4. 流式 `stream_chat()` 调用，逐条输出增量内容
 //! 5. 将提供商作为 `Box<dyn ModelProvider>` 传递
 
+use std::sync::Arc;
+
 use model_provider::providers::deepseek::DEEPSEEK_V4_PRO;
 use model_provider::{
     ChatRequest, ChatStream, DeepSeek, Message, ModelProvider, ProviderError, StreamEvent,
@@ -40,8 +42,8 @@ async fn run_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
     let request = ChatRequest {
         model: DEEPSEEK_V4_PRO.to_string(),
         messages: vec![
-            Message::system("You are a helpful assistant. Keep answers concise."),
-            Message::user("What are the top 3 programming languages in 2026?"),
+            Arc::new(Message::system("You are a helpful assistant. Keep answers concise.")),
+            Arc::new(Message::user("What are the top 3 programming languages in 2026?")),
         ],
         tools: vec![],
         temperature: Some(0.7),
@@ -62,8 +64,8 @@ async fn run_stream_chat(provider: &dyn ModelProvider) -> Result<(), ProviderErr
     let request = ChatRequest {
         model: DEEPSEEK_V4_PRO.to_string(),
         messages: vec![
-            Message::system("You are a helpful assistant. Keep answers concise."),
-            Message::user("Write a haiku about Rust programming."),
+            Arc::new(Message::system("You are a helpful assistant. Keep answers concise.")),
+            Arc::new(Message::user("Write a haiku about Rust programming.")),
         ],
         tools: vec![],
         temperature: Some(0.9),
@@ -134,7 +136,7 @@ async fn run_tool_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError
 
     let request = ChatRequest {
         model: DEEPSEEK_V4_PRO.to_string(),
-        messages: vec![Message::user("What's the weather like in San Francisco?")],
+        messages: vec![Arc::new(Message::user("What's the weather like in San Francisco?"))],
         tools: vec![weather_tool],
         temperature: Some(0.0),
         max_tokens: Some(256),

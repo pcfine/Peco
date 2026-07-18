@@ -7,7 +7,7 @@ pub mod hooks;
 pub(crate) mod simple_looper;
 mod stream;
 
-pub use agent::{Agent, build_model_config, build_provider};
+pub use agent::{Agent, MessageFilter, build_model_config, build_provider};
 pub use agent_config::{
     AgentIdentity, AgentProfile, LlmConfig, ModelConfig, ModelConfigBuilder, resolve_api_key,
     split_frontmatter,

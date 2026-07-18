@@ -3,6 +3,8 @@
 //! 提供 [`DeepSeek`]，为 [DeepSeek API](https://api.deepseek.com) 实现
 //! [`ModelProvider`]，使用与 OpenAI 兼容的聊天补全协议。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,7 +98,7 @@ struct ApiToolDef<'a> {
 #[derive(Serialize)]
 struct DeepSeekRequest<'a> {
     model: &'a str,
-    messages: &'a [Message],
+    messages: &'a [Arc<Message>],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiToolDef<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,7 +501,7 @@ mod tests {
     fn test_chat_request_serialization() {
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![Message::system("You are helpful."), Message::user("Hi")],
+            messages: vec![Arc::new(Message::system("You are helpful.")), Arc::new(Message::user("Hi"))],
             tools: vec![],
             temperature: Some(0.7),
             max_tokens: Some(1024),
@@ -623,7 +625,7 @@ mod tests {
         // 非流式请求
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![Message::system("You are helpful."), Message::user("Hello")],
+            messages: vec![Arc::new(Message::system("You are helpful.")), Arc::new(Message::user("Hello"))],
             tools: vec![],
             temperature: Some(0.7),
             max_tokens: None,
@@ -651,7 +653,7 @@ mod tests {
         };
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![Message::user("天气怎么样？")],
+            messages: vec![Arc::new(Message::user("天气怎么样？"))],
             tools: vec![tool],
             temperature: None,
             max_tokens: None,

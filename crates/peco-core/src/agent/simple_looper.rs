@@ -39,7 +39,7 @@ pub struct SimpleAgentLooper {
     ///
     /// System prompt is NOT stored here — [`Agent::chat`] injects it on each
     /// call. This vec contains User, Assistant, and Tool messages only.
-    messages: Vec<Message>,
+    messages: Vec<Arc<Message>>,
 
     /// Model calls made so far in this run. Checked against `max_turns`.
     react_loop_iteration: usize,
@@ -88,7 +88,7 @@ impl SimpleAgentLooper {
     /// Execute the ReAct loop and return the final assistant text.
     async fn run(&mut self, prompt: String) -> Result<String, AgentError> {
         // Build initial message list: [User(prompt)]
-        self.messages.push(Message::user(&prompt));
+        self.messages.push(Arc::new(Message::user(&prompt)));
 
         loop {
             // ── Check cancel ──────────────────────────────────────────────
@@ -105,9 +105,12 @@ impl SimpleAgentLooper {
             self.react_loop_iteration += 1;
 
             // ── Model call (batch, non-streaming) ─────────────────────────
-            // Agent::chat handles system prompt injection + tool definition
-            // collection internally.
-            let response = self.agent.chat(self.messages.clone()).await?;
+            // Build messages with system prompt prepended (system prompt is
+            // not stored in history — injected dynamically each call).
+            let mut chat_messages = Vec::with_capacity(self.messages.len() + 1);
+            chat_messages.push(Arc::new(Message::system(self.agent.system_prompt())));
+            chat_messages.extend(self.messages.iter().cloned());
+            let response = self.agent.chat(chat_messages).await?;
 
             // Extract content from response
             let (text, tool_calls) = match &response.message {
@@ -120,7 +123,7 @@ impl SimpleAgentLooper {
             };
 
             // Store assistant message in history
-            self.messages.push(response.message);
+            self.messages.push(Arc::new(response.message));
 
             // No tool calls → done, return final text
             let tool_calls = match tool_calls {
@@ -144,7 +147,7 @@ impl SimpleAgentLooper {
     async fn execute_tools(
         &self,
         tool_calls: &[ToolCall],
-    ) -> Result<Vec<Message>, AgentError> {
+    ) -> Result<Vec<Arc<Message>>, AgentError> {
         let executor = self.agent.mcp_manager().tools_executor().clone();
 
         // Spawn all tools concurrently (with index for order preservation)
@@ -165,7 +168,7 @@ impl SimpleAgentLooper {
                 .collect();
 
         // Await in order, checking cancel between each handle
-        let mut results: Vec<(usize, Message)> = Vec::with_capacity(handles.len());
+        let mut results: Vec<(usize, Arc<Message>)> = Vec::with_capacity(handles.len());
         let mut expected_idx = 0usize;
         for handle in handles {
             if self.cancel_flag.load(Ordering::Acquire) {
@@ -179,14 +182,14 @@ impl SimpleAgentLooper {
                         Ok(r) => r,
                         Err(e) => e,
                     };
-                    results.push((idx, Message::tool(&tc.id, &content)));
+                    results.push((idx, Arc::new(Message::tool(&tc.id, &content))));
                 }
                 Err(join_err) => {
                     tracing::error!(error = %join_err, "Tool execution task panicked");
                     // Insert an error placeholder with estimated index
                     results.push((
                         expected_idx,
-                        Message::tool("unknown", format!("tool panicked: {join_err}")),
+                        Arc::new(Message::tool("unknown", format!("tool panicked: {join_err}"))),
                     ));
                 }
             }
