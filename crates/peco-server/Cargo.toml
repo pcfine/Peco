@@ -1,0 +1,68 @@
+[package]
+name = "peco-server"
+version.workspace = true
+edition.workspace = true
+description = "Axum web backend for peco — RESTful API + SSE streaming"
+
+[dependencies]
+# Internal
+peco-core = { path = "../peco-core" }
+model-provider = { path = "../model-provider" }
+knowledge-base = { path = "../knowledge-base" }
+
+# Web framework
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+futures = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Auth
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Scheduling
+tokio-cron-scheduler = { workspace = true }
+croner = "2.2"
+
+# File upload
+axum-extra = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# OpenAPI docs
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# Cache
+lru = "0.14"
+
+# Rate limiting
+governor = "0.8"
+
+# Utils
+chrono = { workspace = true }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true, features = ["macros"] }
+serial_test = "3"
+tempfile = "3"
+
+[lib]
+name = "peco_server"
+path = "src/lib.rs"
