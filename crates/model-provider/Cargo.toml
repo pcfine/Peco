@@ -1,0 +1,27 @@
+[package]
+name = "model-provider"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+description = "支持动态分发的 ModelProvider trait，包含 DeepSeek 实现"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+async-stream = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+futures-timer = { workspace = true }
+http = { workspace = true }
+mime_guess = { workspace = true }
+pin-project-lite = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
