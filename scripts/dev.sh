@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# ============================================================================
+# peco 开发调试一键启动脚本
+# ============================================================================
+# 用法:
+#   bash scripts/dev.sh
+#   bash scripts/dev.sh --backend-only     # 只启动后端
+#   bash scripts/dev.sh --frontend-only    # 只启动前端
+# ============================================================================
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ── 颜色 ──────────────────────────────────────────────────────────────────
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+log_info() { printf "  ${GREEN}[INFO]${NC} %s\n" "$*"; }
+
+# ── 解析参数 ──────────────────────────────────────────────────────────────
+BACKEND=true
+FRONTEND=true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --backend-only) FRONTEND=false; shift ;;
+        --frontend-only) BACKEND=false; shift ;;
+        -h|--help)
+            echo "Usage: bash scripts/dev.sh [--backend-only|--frontend-only]"
+            echo ""
+            echo "Starts both backend (peco-server) and frontend (webui) for development."
+            echo "Ctrl+C to stop all services."
+            exit 0
+            ;;
+        *) echo "Unknown option: $1 (use --help)"; exit 1 ;;
+    esac
+done
+
+# ── 加载 .env ──────────────────────────────────────────────────────────────
+cd "$REPO_DIR"
+if [[ -f .env ]]; then
+    set -a; source .env; set +a
+    log_info "Loaded .env"
+elif [[ -f crates/peco-core/.env ]]; then
+    set -a; source crates/peco-core/.env; set +a
+    log_info "Loaded crates/peco-core/.env"
+fi
+
+if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+    echo "  [WARN] DEEPSEEK_API_KEY not set. Set it in .env or export it."
+fi
+
+# ── 清理函数 ──────────────────────────────────────────────────────────────
+cleanup() {
+    printf "\n"
+    log_info "Shutting down..."
+    [[ -n "${BACKEND_PID:-}" ]] && kill "$BACKEND_PID" 2>/dev/null && log_info "Backend stopped."
+    wait 2>/dev/null || true
+    log_info "All services stopped."
+}
+trap cleanup EXIT INT TERM
+
+# ── 启动后端 ──────────────────────────────────────────────────────────────
+if $BACKEND; then
+    printf "\n${BOLD}${BLUE}=== Starting peco-server (backend) ===${NC}\n"
+    log_info "Building & running peco-server..."
+    log_info "API  : http://localhost:3000"
+    log_info "Docs : http://localhost:3000/docs"
+
+    cargo run -p peco-server &
+    BACKEND_PID=$!
+    sleep 2
+
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+        echo "  [ERROR] Backend failed to start. Check output above."
+        exit 1
+    fi
+    log_info "Backend running (PID: $BACKEND_PID)"
+fi
+
+# ── 启动前端 ──────────────────────────────────────────────────────────────
+if $FRONTEND; then
+    printf "\n${BOLD}${BLUE}=== Starting webui (frontend) ===${NC}\n"
+    cd "$REPO_DIR/webui"
+
+    log_info "Installing dependencies (if needed)..."
+    npm install --silent 2>/dev/null || npm install
+
+    log_info "Starting Vite dev server..."
+    log_info "Web UI: http://localhost:5173"
+
+    npx vite --host 0.0.0.0 &
+    FRONTEND_PID=$!
+
+    printf "\n"
+    printf "${GREEN}========================================${NC}\n"
+    printf "${GREEN}  peco dev environment ready!${NC}\n"
+    printf "${GREEN}========================================${NC}\n"
+    $BACKEND && printf "  Backend API : ${BOLD}http://localhost:3000${NC}\n"
+    $BACKEND && printf "  API Docs    : ${BOLD}http://localhost:3000/docs${NC}\n"
+    printf "  Web UI      : ${BOLD}http://localhost:5173${NC}\n"
+    printf "\n${YELLOW}  Press Ctrl+C to stop all services${NC}\n"
+    printf "\n"
+
+    wait
+fi
+
+# 如果只启动后端，前端没启动的话，在这里等待
+if $BACKEND && ! $FRONTEND; then
+    printf "\n${YELLOW}Press Ctrl+C to stop${NC}\n"
+    wait "$BACKEND_PID"
+fi
