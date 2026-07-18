@@ -1,0 +1,57 @@
+[package]
+name = "knowledge-base"
+version = "0.1.0"
+edition = "2024"
+description = "Knowledge base abstractions — traits, engine, and in-memory backend"
+
+[lib]
+name = "knowledge_base"
+path = "src/lib.rs"
+
+[features]
+default = ["fastembed-embedding", "pdf", "lancedb"]
+fastembed-embedding = ["dep:fastembed"]
+pdf = ["dep:pdf-extract"]
+lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
+helixdb = ["dep:reqwest"]
+# docx = ["dep:docx-rs"]   # Phase 2
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+thiserror = "2"
+reqwest = { workspace = true, optional = true }
+
+# 嵌入引擎（可选）
+fastembed = { workspace = true, optional = true }
+
+# 向量存储（可选）
+lancedb = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+# 文档解析（可选）
+pdf-extract = { version = "0.9", optional = true }
+
+[[example]]
+name = "helixdb_demo"
+required-features = ["helixdb"]
+
+[[example]]
+name = "kb_demo"
+
+[dev-dependencies]
+fastembed = { workspace = true }
+pdf-extract = "0.9"
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+tracing-subscriber = { workspace = true }
