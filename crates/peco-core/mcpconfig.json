@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "local-tools": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["./servers/local-tools/index.js"],
+      "env": {
+        "NODE_ENV": "production"
+      },
+      "enabled": true
+    },
+    "remote-github": {
+      "transport": "sse",
+      "url": "http://localhost:18080/sse",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "enabled": true
+    },
+    "remote-database": {
+      "transport": "streamable_http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "X-API-Key": "${DB_API_KEY}"
+      },
+      "timeoutSecs": 30,
+      "maxRetries": 3,
+      "enabled": true
+    }
+  }
+}

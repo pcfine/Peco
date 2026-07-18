@@ -1,0 +1,385 @@
+// ============================================================================
+// SimpleAgentLooper — batch-only ReAct executor for single-shot sub-agent tasks
+// ============================================================================
+//
+// Unlike [`AgentLooper`], this is intentionally minimal:
+// - No user input channel (single prompt → single result)
+// - No streaming (batch mode only)
+// - No hooks
+// - No event broadcasting
+// - No session persistence
+// - No pause/resume
+//
+// The only shared state is a cancel flag (Arc<AtomicBool>), checked at each
+// loop iteration boundary.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use model_provider::{Message, ToolCall};
+
+use super::agent::Agent;
+use super::error::AgentError;
+
+// ============================================================================
+// SimpleAgentLooper — internal
+// ============================================================================
+
+/// Minimal, batch-only ReAct executor for single-shot sub-agent tasks.
+///
+/// Created via [`SimpleAgentLooper::spawn`], which returns a
+/// [`SimpleLooperHandle`] for cancel + wait.
+pub struct SimpleAgentLooper {
+    /// The assembled Agent (model + tools + MCP).
+    agent: Arc<Agent>,
+    /// Maximum model-call iterations before forcing failure.
+    max_turns: usize,
+
+    /// Accumulated message history.
+    ///
+    /// System prompt is NOT stored here — [`Agent::chat`] injects it on each
+    /// call. This vec contains User, Assistant, and Tool messages only.
+    messages: Vec<Message>,
+
+    /// Model calls made so far in this run. Checked against `max_turns`.
+    react_loop_iteration: usize,
+
+    /// External cancel signal shared with [`SimpleLooperHandle`].
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl SimpleAgentLooper {
+    /// Spawn a single-shot agent execution as a background tokio task.
+    ///
+    /// Returns a [`SimpleLooperHandle`] that can cancel or wait for the result.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent` — The assembled Agent instance.
+    /// * `prompt` — The task description / user query.
+    /// * `max_turns` — Override for `agent.max_turns()`. Pass `None` to use
+    ///   the agent's configured value.
+    pub fn spawn(
+        agent: Arc<Agent>,
+        prompt: String,
+        max_turns: Option<usize>,
+    ) -> SimpleLooperHandle {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let max_turns = max_turns.unwrap_or_else(|| agent.max_turns());
+
+        let mut looper = SimpleAgentLooper {
+            agent,
+            max_turns,
+            messages: Vec::new(),
+            react_loop_iteration: 0,
+            cancel_flag: cancel_flag.clone(),
+        };
+
+        let join_handle = tokio::spawn(async move { looper.run(prompt).await });
+
+        SimpleLooperHandle {
+            cancel_flag,
+            join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+        }
+    }
+
+    // ── Core loop ──────────────────────────────────────────────────────────
+
+    /// Execute the ReAct loop and return the final assistant text.
+    async fn run(&mut self, prompt: String) -> Result<String, AgentError> {
+        // Build initial message list: [User(prompt)]
+        self.messages.push(Message::user(&prompt));
+
+        loop {
+            // ── Check cancel ──────────────────────────────────────────────
+            if self.cancel_flag.load(Ordering::Acquire) {
+                return Err(AgentError::AgentProtocol("cancelled".into()));
+            }
+
+            // ── Check max_turns ───────────────────────────────────────────
+            if self.react_loop_iteration >= self.max_turns {
+                return Err(AgentError::MaxTurns {
+                    max_turns: self.max_turns,
+                });
+            }
+            self.react_loop_iteration += 1;
+
+            // ── Model call (batch, non-streaming) ─────────────────────────
+            // Agent::chat handles system prompt injection + tool definition
+            // collection internally.
+            let response = self.agent.chat(self.messages.clone()).await?;
+
+            // Extract content from response
+            let (text, tool_calls) = match &response.message {
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => (content.clone().unwrap_or_default(), tool_calls.clone()),
+                _ => (String::new(), None),
+            };
+
+            // Store assistant message in history
+            self.messages.push(response.message);
+
+            // No tool calls → done, return final text
+            let tool_calls = match tool_calls {
+                Some(tcs) if !tcs.is_empty() => tcs,
+                _ => return Ok(text),
+            };
+
+            // ── Execute tools ─────────────────────────────────────────────
+            let tool_messages = self.execute_tools(&tool_calls).await?;
+            self.messages.extend(tool_messages);
+        }
+    }
+
+    // ── Tool execution ─────────────────────────────────────────────────────
+
+    /// Execute a batch of tool calls concurrently with cancel awareness.
+    ///
+    /// Spawns one tokio task per tool call. Awaits them in order (preserving
+    /// the model's `tool_calls` sequence) while checking cancel between each.
+    /// Returns `Vec<Message>` to be appended to the message history.
+    async fn execute_tools(
+        &self,
+        tool_calls: &[ToolCall],
+    ) -> Result<Vec<Message>, AgentError> {
+        let executor = self.agent.mcp_manager().tools_executor().clone();
+
+        // Spawn all tools concurrently (with index for order preservation)
+        let handles: Vec<tokio::task::JoinHandle<(usize, ToolCall, Result<String, String>)>> =
+            tool_calls
+                .iter()
+                .enumerate()
+                .map(|(idx, tc)| {
+                    let executor = executor.clone();
+                    let tc = tc.clone();
+                    tokio::spawn(async move {
+                        let result = executor
+                            .execute(&tc.function.name, &tc.function.arguments)
+                            .await;
+                        (idx, tc, result)
+                    })
+                })
+                .collect();
+
+        // Await in order, checking cancel between each handle
+        let mut results: Vec<(usize, Message)> = Vec::with_capacity(handles.len());
+        let mut expected_idx = 0usize;
+        for handle in handles {
+            if self.cancel_flag.load(Ordering::Acquire) {
+                // Remaining handles will be dropped (tokio tasks continue but
+                // their results are discarded)
+                return Err(AgentError::AgentProtocol("cancelled".into()));
+            }
+            match handle.await {
+                Ok((idx, tc, output)) => {
+                    let content = match output {
+                        Ok(r) => r,
+                        Err(e) => e,
+                    };
+                    results.push((idx, Message::tool(&tc.id, &content)));
+                }
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "Tool execution task panicked");
+                    // Insert an error placeholder with estimated index
+                    results.push((
+                        expected_idx,
+                        Message::tool("unknown", format!("tool panicked: {join_err}")),
+                    ));
+                }
+            }
+            expected_idx += 1;
+        }
+
+        // Sort by original index to preserve model's tool_calls order
+        results.sort_by_key(|(idx, _)| *idx);
+        Ok(results.into_iter().map(|(_, msg)| msg).collect())
+    }
+}
+
+// ============================================================================
+// SimpleLooperHandle — public control handle
+// ============================================================================
+
+/// Control handle for a running [`SimpleAgentLooper`] background task.
+///
+/// Created by [`SimpleAgentLooper::spawn`].
+///
+/// # Lifecycle
+///
+/// ```text
+/// let handle = SimpleAgentLooper::spawn(agent, "do X".into(), None);
+///
+/// // Option A: wait for result (consumes the handle)
+/// let output = handle.wait().await?;
+///
+/// // Option B: cancel early and discard
+/// handle.cancel();
+/// drop(handle); // cancel flag was already set
+///
+/// // Option C: just drop — auto-cancels if last reference
+/// drop(handle); // sets cancel flag, task exits gracefully
+/// ```
+///
+/// # Clone
+///
+/// `SimpleLooperHandle` is `Clone` — all fields are `Arc`-backed. Multiple
+/// holders can share control. Only the last clone being dropped triggers
+/// auto-cancel.
+pub struct SimpleLooperHandle {
+    cancel_flag: Arc<AtomicBool>,
+    join_handle:
+        Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<String, AgentError>>>>>,
+}
+
+impl SimpleLooperHandle {
+    /// Request cancellation.
+    ///
+    /// The looper checks this flag at each iteration boundary (before model
+    /// calls and between tool executions). In-flight model calls are not
+    /// interrupted mid-request.
+    pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::Release);
+    }
+
+    /// Block until the looper completes, returning the final assistant text.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AgentError::AgentProtocol("task already consumed")` if
+    /// `wait()` has already been called on this handle.
+    ///
+    /// # Panics
+    ///
+    /// Propagates if the background task panicked.
+    pub async fn wait(&self) -> Result<String, AgentError> {
+        let handle = self.join_handle.lock().await.take().ok_or_else(|| {
+            AgentError::AgentProtocol("task already consumed".into())
+        })?;
+        match handle.await {
+            Ok(result) => result,
+            Err(join_err) => Err(AgentError::AgentProtocol(format!(
+                "looper task panicked: {join_err}"
+            ))),
+        }
+    }
+
+    /// Returns `true` if the background task is still executing.
+    pub fn is_running(&self) -> bool {
+        match self.join_handle.try_lock() {
+            Ok(guard) => guard.as_ref().is_some_and(|h| !h.is_finished()),
+            Err(_) => false,
+        }
+    }
+
+    /// Returns `true` if the cancel flag has been set.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::Acquire)
+    }
+}
+
+impl Clone for SimpleLooperHandle {
+    fn clone(&self) -> Self {
+        Self {
+            cancel_flag: Arc::clone(&self.cancel_flag),
+            join_handle: Arc::clone(&self.join_handle),
+        }
+    }
+}
+
+impl Drop for SimpleLooperHandle {
+    fn drop(&mut self) {
+        // strong_count == 1 → this is the last reference
+        if Arc::strong_count(&self.join_handle) == 1 {
+            self.cancel_flag.store(true, Ordering::Release);
+            tracing::warn!(
+                "SimpleLooperHandle dropped without calling wait(). \
+                 Cancel flag set; looper will exit gracefully on next loop iteration."
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_clone() {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let join_handle = Arc::new(tokio::sync::Mutex::new(None::<
+            tokio::task::JoinHandle<Result<String, AgentError>>,
+        >));
+        let h1 = SimpleLooperHandle {
+            cancel_flag: cancel_flag.clone(),
+            join_handle: join_handle.clone(),
+        };
+        let h2 = h1.clone();
+        assert!(!h1.is_cancelled());
+        assert!(!h2.is_cancelled());
+        h2.cancel();
+        assert!(h1.is_cancelled());
+        assert!(h2.is_cancelled());
+    }
+
+    #[test]
+    fn test_handle_is_running_no_task() {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let join_handle = Arc::new(tokio::sync::Mutex::new(None::<
+            tokio::task::JoinHandle<Result<String, AgentError>>,
+        >));
+        let h = SimpleLooperHandle {
+            cancel_flag,
+            join_handle,
+        };
+        assert!(!h.is_running());
+    }
+
+    #[test]
+    fn test_handle_wait_already_consumed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let join_handle = Arc::new(tokio::sync::Mutex::new(None::<
+            tokio::task::JoinHandle<Result<String, AgentError>>,
+        >));
+        let h = SimpleLooperHandle {
+            cancel_flag,
+            join_handle,
+        };
+        let result = rt.block_on(h.wait());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already consumed"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_wait_returns_result() {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let join_handle = tokio::spawn(async { Ok("hello".to_string()) });
+        let handle = SimpleLooperHandle {
+            cancel_flag,
+            join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+        };
+        let result = handle.wait().await.unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_handle_wait_returns_error() {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let join_handle = tokio::spawn(async {
+            Err::<String, AgentError>(AgentError::MaxTurns { max_turns: 1 })
+        });
+        let handle = SimpleLooperHandle {
+            cancel_flag,
+            join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+        };
+        let result = handle.wait().await;
+        assert!(result.is_err());
+    }
+}
