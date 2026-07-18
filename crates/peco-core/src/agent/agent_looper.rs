@@ -678,6 +678,8 @@ pub struct AgentLooper {
     agent: Arc<Agent>,
     max_turns: usize,
     config: LooperConfig,
+    /// 缓存 `agent.system_prompt()`，避免每次 turn 重新计算。
+    system_prompt: String,
 
     // ── 会话 ──
     /// Session 持有全部对话状态（committed + staging + pending + turn_index + usage）。
@@ -753,11 +755,13 @@ impl AgentLooper {
         persister: Arc<dyn crate::persistence::SessionPersister>,
     ) -> Self {
         let max_turns = agent.max_turns();
+        let system_prompt = agent.system_prompt();
 
         AgentLooper {
             agent,
             max_turns,
             config,
+            system_prompt,
             session,
             outer_state: OuterState::Idle,
             react_state: ReActState::PreparingRequest,
@@ -1387,7 +1391,8 @@ impl AgentLooper {
 
         // 3. 构建消息列表（Agent 层上下文策略，零拷贝 Arc 共享）
         let refs: Vec<&AnnotatedMessage> = self.session.all_message_refs().collect();
-        let system_prompt = self.agent.system_prompt();
+        let system_prompt = &self.system_prompt;
+
         let ctx = super::context::build_context(
             &refs,
             Some(system_prompt.as_str()),
