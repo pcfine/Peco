@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/model-provider",
+  "crates/knowledge-base",
+  "crates/peco-derive",
+  "crates/peco-core",
+  "crates/peco-cli",
+  "crates/peco-server",
+]
+exclude = ["example"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+unused_crate_dependencies = "warn"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+arrow-array = "58"
+arrow-schema = "58"
+async-stream = "0.3"
+async-trait = "0.1.89"
+bytes = "1"
+dotenvy = "0.15.7"
+eventsource-stream = "0.2"
+fastembed = "4.9.1"
+futures = "0.3"
+hex = "0.4"
+futures-timer = "3"
+http = "1"
+lancedb = "0.30"
+mime_guess = "2"
+pin-project-lite = "0.2"
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "stream",
+] }
+rmcp = { version = "1", features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9"
+schemars = "1.0.4"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1.49.0", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "net",
+  "io-std",
+] }
+tokio-stream = "0.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
+jsonwebtoken = "9"
+bcrypt = "0.16"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+axum-extra = { version = "0.10", features = ["multipart"] }
+tokio-cron-scheduler = "0.13"
+chrono = { version = "0.4", features = ["serde"] }

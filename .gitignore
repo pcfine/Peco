@@ -1,0 +1,6 @@
+target/
+.fastembed_cache/
+node_modules/
+node_modules.bak/
+dist/
+.env
