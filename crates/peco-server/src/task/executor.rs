@@ -68,8 +68,8 @@ pub async fn execute_task(
     }
 
     // ── 2. 查找 Agent 名称并获取 Agent（通过 WorkspaceManager）───────────
-    let agent_row = match crate::db::agents::find_by_id(&pool, &agent_id).await {
-        Ok(Some(row)) => row,
+    let agent_name = match crate::db::agents::find_name_by_id(&pool, &agent_id).await {
+        Ok(Some(name)) => name,
         Ok(None) => {
             tracing::error!(task_id = %task_id, agent_id = %agent_id, "Agent not found");
             return;
@@ -86,7 +86,7 @@ pub async fn execute_task(
 
     let agent = match state
         .workspace_manager
-        .get_agent(&user_id, &agent_row.name)
+        .get_agent(&user_id, &agent_name)
     {
         Ok(a) => a,
         Err(e) => {

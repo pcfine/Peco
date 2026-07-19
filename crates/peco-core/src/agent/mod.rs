@@ -1,5 +1,5 @@
 pub(crate) mod agent;
-pub(crate) mod agent_config;
+pub mod agent_config;
 pub(crate) mod agent_looper;
 pub(crate) mod context;
 pub(crate) mod dynamic_context;
@@ -10,8 +10,8 @@ mod stream;
 
 pub use agent::{Agent, MessageFilter};
 pub use agent_config::{
-    AgentIdentity, AgentProfile, LlmConfig, ModelConfig, ModelConfigBuilder, resolve_api_key,
-    split_frontmatter,
+    AgentIdentity, AgentProfile, AssembleAgentMdParams, LlmConfig, ModelConfig, ModelConfigBuilder,
+    assemble_agent_md, parse_agent_md, resolve_api_key, split_frontmatter,
 };
 pub use agent_looper::{
     AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState, TurnFailureReason,

@@ -105,11 +105,10 @@ async fn row_to_response(
     pool: &sqlx::SqlitePool,
     row: &tasks::TaskRow,
 ) -> TaskResponse {
-    let agent_name = crate::db::agents::find_by_id(pool, &row.agent_id)
+    let agent_name = crate::db::agents::find_name_by_id(pool, &row.agent_id)
         .await
         .ok()
-        .flatten()
-        .map(|a| a.name);
+        .flatten();
 
     TaskResponse {
         id: row.id.clone(),
@@ -152,7 +151,7 @@ pub async fn create_task(
     Json(body): Json<CreateTaskRequest>,
 ) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
     // 校验 agent 存在且属于当前用户
-    let agent = crate::db::agents::find_by_id_and_user(&state.db, &body.agent_id, &user_id)
+    let agent = crate::db::agents::find_index_by_id_and_user(&state.db, &body.agent_id, &user_id)
         .await
         .map_err(|e| ApiError::Internal(format!("db error: {e}")))?
         .ok_or_else(|| ApiError::NotFound(format!("agent '{}' not found", body.agent_id)))?;
@@ -239,7 +238,7 @@ pub async fn update_task(
 
     // 校验新的 agent_id（如果提供）
     if let Some(ref agent_id) = body.agent_id {
-        crate::db::agents::find_by_id_and_user(&state.db, agent_id, &user_id)
+        crate::db::agents::find_index_by_id_and_user(&state.db, agent_id, &user_id)
             .await
             .map_err(|e| ApiError::Internal(format!("db error: {e}")))?
             .ok_or_else(|| ApiError::NotFound(format!("agent '{agent_id}' not found")))?;

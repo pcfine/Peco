@@ -41,7 +41,43 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         sqlx::raw_sql(trimmed).execute(pool).await?;
     }
 
+    // 运行版本化迁移
+    run_versioned_migrations(pool).await?;
+
     tracing::info!("Database migrations completed successfully");
+    Ok(())
+}
+
+/// 执行版本化 SQL 迁移（`migrations/` 目录下的 SQL 文件）。
+///
+/// 每个迁移在执行前检查前置条件，若已满足则跳过。
+async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // Migration 002: Slim agents table
+    // 检查旧列是否存在（有 config_json 列说明需要迁移）
+    let has_old_schema = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'config_json'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if has_old_schema {
+        tracing::info!("Running migration 002: slim agents table");
+        let migration_sql = include_str!("migrations/002_slim_agents.sql");
+        for statement in migration_sql.split(';') {
+            let trimmed = statement.trim();
+            if trimmed.is_empty()
+                || trimmed.lines().all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+            {
+                continue;
+            }
+            sqlx::raw_sql(trimmed).execute(pool).await?;
+        }
+        tracing::info!("Migration 002 completed");
+    } else {
+        tracing::debug!("Migration 002 skipped: agents table already slim");
+    }
+
     Ok(())
 }
 

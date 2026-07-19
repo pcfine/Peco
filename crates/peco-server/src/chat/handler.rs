@@ -145,43 +145,56 @@ fn extract_sub_agent_result(tool_result: &str, info: &SubAgentInfo, tool_name: &
 ///
 /// 若不存在则自动创建，返回 agent_id。
 async fn ensure_omni_agent(
-    pool: &sqlx::SqlitePool,
+    state: &Arc<AppState>,
     user_id: &str,
 ) -> Result<String, ApiError> {
     // 查找名为 "全能助手" 的 agent
-    let existing = agents::find_by_name_and_user(pool, "全能助手", user_id).await?;
-    if let Some(agent) = existing {
-        return Ok(agent.id);
+    let existing = agents::find_id_by_name_and_user(&state.db, "全能助手", user_id).await?;
+    if let Some(agent_id) = existing {
+        return Ok(agent_id);
     }
 
     // 创建默认全能助手
     let agent_id = Uuid::new_v4().to_string();
-    let config_json = serde_json::json!({
-        "tools": ["shell_exec", "fetch"],
-        "mcp_servers": [],
-        "skills": [],
-        "temperature": null,
-        "max_tokens": null,
-    })
-    .to_string();
-
-    let params = agents::CreateAgentParams {
-        id: agent_id.clone(),
-        user_id: user_id.to_string(),
+    let assemble_params = peco_core::agent::agent_config::AssembleAgentMdParams {
         name: "全能助手".to_string(),
         description: "默认全能 AI 助手，可处理各类问题并与专业 Agent 协作".to_string(),
+        provider: "deepseek".to_string(),
+        model: "deepseek-v4-flash".to_string(),
+        temperature: None,
+        max_tokens: None,
+        stream: None,
+        reasoning_effort: None,
+        tools: vec!["shell_exec".to_string(), "fetch".to_string()],
+        mcp_servers: vec![],
+        skills: vec![],
+        max_turns: 20,
         system_prompt: "你是一个智能 AI 助手（Omni-Assistant），能够回答各种问题、使用工具完成任务。\
             当遇到专业领域问题时，你可以调用子 Agent 来获取更专业的帮助。\
             请始终使用中文回复用户。"
             .to_string(),
-        model: "deepseek-v4-flash".to_string(),
-        provider: "deepseek".to_string(),
+    };
+    let content = peco_core::agent::agent_config::assemble_agent_md(&assemble_params);
+
+    let ws = state.workspace_manager.get(user_id)?;
+
+    // ── 先写 DB 索引（UNIQUE 约束防止并发重复创建）───────────────────────
+    let db_params = agents::CreateAgentParams {
+        id: agent_id.clone(),
+        user_id: user_id.to_string(),
+        name: "全能助手".to_string(),
+        description: assemble_params.description.clone(),
         icon: "🌟".to_string(),
         color: "#6366f1".to_string(),
-        config_json,
     };
+    agents::insert(&state.db, &db_params).await?;
 
-    agents::insert(pool, &params).await?;
+    // ── 后写 agent.md 文件 ─────────────────────────────────────────────────
+    if let Err(e) = ws.save_agent("全能助手", &content) {
+        // 回滚：删除已写入的 DB 索引
+        let _ = agents::delete(&state.db, &agent_id).await;
+        return Err(ApiError::Internal(format!("failed to write omni agent.md: {e}")));
+    }
 
     tracing::info!(
         user_id = %user_id,
@@ -198,9 +211,7 @@ async fn row_to_response(
     row: &conversations::ConversationRow,
 ) -> Result<ConversationResponse, ApiError> {
     let agent_name = match &row.agent_id {
-        Some(aid) => agents::find_by_id(pool, aid)
-            .await?
-            .map(|a| a.name),
+        Some(aid) => agents::find_name_by_id(pool, aid).await?,
         None => None,
     };
 
@@ -256,12 +267,12 @@ pub async fn create_conversation(
 
     // 若指定 agent_id，验证归属；否则使用全能助手
     let agent_id = if let Some(ref aid) = req.agent_id {
-        agents::find_by_id_and_user(&state.db, aid, &user_id)
+        agents::find_index_by_id_and_user(&state.db, aid, &user_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("agent '{aid}' not found")))?;
         Some(aid.clone())
     } else {
-        let omni_id = ensure_omni_agent(&state.db, &user_id).await?;
+        let omni_id = ensure_omni_agent(&state, &user_id).await?;
         Some(omni_id)
     };
 
@@ -394,7 +405,7 @@ pub async fn stream_chat(
     };
 
     // agent 必须属于当前用户
-    let agent_row = agents::find_by_id_and_user(&state.db, &agent_id, &user_id)
+    let agent_row = agents::find_index_by_id_and_user(&state.db, &agent_id, &user_id)
         .await?
         .ok_or_else(|| ApiError::Forbidden("you do not have access to this agent".into()))?;
 
@@ -522,13 +533,12 @@ pub async fn stream_chat(
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
                         let agent_name = args["agent_name"].as_str().unwrap_or("unknown");
                         let task = args["prompt"].as_str().unwrap_or("");
-                        let agent_id = agents::find_by_name_and_user(
+                        let agent_id = agents::find_id_by_name_and_user(
                             &db_for_bg, agent_name, &user_id_for_bg,
                         )
                         .await
                         .ok()
                         .flatten()
-                        .map(|a| a.id)
                         .unwrap_or_else(|| "unknown".to_string());
 
                         // call_id 直接使用 LLM 生成的 tool_call_id，前端可据此配对
@@ -580,13 +590,12 @@ pub async fn stream_chat(
                                 for (index, task) in task_list.iter().enumerate() {
                                     let agent_name = task["agent_name"].as_str().unwrap_or("unknown");
                                     let prompt = task["prompt"].as_str().unwrap_or("");
-                                    let agent_id = agents::find_by_name_and_user(
+                                    let agent_id = agents::find_id_by_name_and_user(
                                         &db_for_bg, agent_name, &user_id_for_bg,
                                     )
                                     .await
                                     .ok()
                                     .flatten()
-                                    .map(|a| a.id)
                                     .unwrap_or_else(|| "unknown".to_string());
 
                                     // 并行任务的 call_id = tool_call_id + 序号后缀，

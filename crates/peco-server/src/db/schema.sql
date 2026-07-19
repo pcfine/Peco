@@ -16,21 +16,18 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Agent 配置表
+-- Agent 配置表（轻量索引：完整配置存储在 agents/{name}/agent.md）
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    system_prompt TEXT NOT NULL,
-    model TEXT NOT NULL DEFAULT 'deepseek-v4-flash',
-    provider TEXT NOT NULL DEFAULT 'deepseek',
     icon TEXT NOT NULL DEFAULT '🤖',
     color TEXT NOT NULL DEFAULT '#6366f1',
     status TEXT NOT NULL DEFAULT 'idle',
-    config_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, name)
 );
 
 -- 对话表
