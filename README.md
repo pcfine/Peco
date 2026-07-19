@@ -13,7 +13,7 @@
 │      REST API · SSE 流 · JWT 认证 · 限流 · OpenAPI/Swagger   │
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent 引擎)                       │
-│    Agent · Session · ReAct Loop · MCP · Skills · Tools · KB  │
+│  Agent · Session · ReAct Loop · Workspace · PPA · MCP · Skills · Tools · KB │
 ├────────────────────────┬────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │   (LLM 统一抽象层)       │   (RAG: 向量+BM25+知识图谱)          │
@@ -31,9 +31,15 @@
 - **Session 管理**：状态机驱动（Idle → Active → Commit/Rollback/Cancel），支持 turn 回滚、中断队列、自动持久化
 
 ### 工具系统
-- **10 个内置工具**：`shell`、`fetch`、`read_skill`、子 Agent 委派/并行、知识库 CRUD 与搜索
+- **13 个内置工具**：`shell`、`fetch`、`read_skill`、子 Agent 委派/并行、知识库 CRUD 与搜索、PPA 记忆（`remember` / `recall` / `forget`）
 - **MCP 协议**：完整实现 Model Context Protocol，支持 stdio 和 HTTP Streamable 传输，工具自动发现与同步
 - **可扩展**：`#[peco_tool]` 宏自动生成工具定义，`Tool`/`ToolDyn` 双 trait 设计
+
+### Personal Memory（PPA）
+- **自动记忆提取**：对话完成后独立 Flash 模型分析，自动识别并存储用户偏好、决策、事实
+- **三层记忆模型**：Profile（用户身份/偏好）→ Semantic（离散事实/知识）→ Episodic（对话摘要/上下文）
+- **智能检索**：写路径（阈值过滤 + LLM 分析）和读路径（Profile + 向量检索）分离
+- **记忆工具**：Agent 可通过 `remember` / `recall` / `forget` 主动管理记忆
 
 ### 知识库（RAG）
 - **多格式解析**：PDF、DOCX、HTML、Markdown、代码、纯文本
@@ -109,7 +115,7 @@ cargo run -p peco-cli -- --agent <agent-name>
 ```
 peco/
 ├── crates/
-│   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、MCP、Skills、Tools
+│   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、Workspace、PPA、MCP、Skills、Tools
 │   ├── peco-server/            # Web 服务：Axum REST API、SSE、JWT、Cron 调度
 │   ├── peco-cli/               # 命令行 AI 助手
 │   ├── model-provider/         # LLM 统一抽象层（当前仅实现 DeepSeek）
@@ -256,7 +262,7 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 │      REST API · SSE · JWT Auth · Rate Limit · OpenAPI        │
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent Engine)                     │
-│    Agent · Session · ReAct Loop · MCP · Skills · Tools · KB  │
+│  Agent · Session · ReAct Loop · Workspace · PPA · MCP · Skills · Tools · KB │
 ├────────────────────────┬────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │     (LLM Abstraction)   │   (RAG: Vector+BM25+Graph)         │
@@ -268,7 +274,8 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 ### Key Features
 
 - **Agent Engine**: Declarative `agent.md` definitions, ReAct execution loop, sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue
-- **Tool System**: 10 built-in tools, full MCP protocol support (stdio + HTTP Streamable), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design
+- **Tool System**: 13 built-in tools, full MCP protocol support (stdio + HTTP Streamable), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design
+- **Personal Memory (PPA)**: Auto memory extraction via Flash model, three-tier memory (Profile → Semantic → Episodic), `remember`/`recall`/`forget` tools
 - **RAG Knowledge Base**: Multi-format parsing (PDF/DOCX/HTML/MD/Code/TXT), intelligent chunking, hybrid search (vector + BM25 + knowledge graph), adaptive RRF fusion, local ONNX embeddings with Chinese-optimized `bge-small-zh-v1.5`
 - **Skill System**: 3-tier progressive loading, `SKILL.md` format, automatic directory discovery
 - **Web UI**: SSE streaming chat with 9 event types, Agent CRUD, knowledge base management, cron task scheduling, JWT authentication

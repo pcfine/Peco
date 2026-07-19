@@ -5,11 +5,13 @@ AI Agent 核心框架 — 提供 Agent 组装、会话管理、知识库、MCP �
 ## 架构总览
 
 ```
-GlobalHandler（全局单例）
-├── GlobalConfig          ← 配置加载（providers.toml + mcpconfig.json + knowledge config）
-├── ToolFactory           ← 内置工具注册表（10 个工具）
+Workspace（用户隔离核心）
+├── SystemConfig          ← 系统级配置（providers.toml + mcpconfig.json）
+├── UserConfig            ← 用户级配置（Merge 深递归合并）
+├── ToolFactory           ← 内置工具注册表（13 个工具）
 ├── GlobalSkillList       ← Skill 发现与生命周期管理
 ├── KnowledgeManager      ← 知识库管理（增量同步 + 混合检索）
+├── PersonalMemoryStore   ← PPA 个人记忆存储（三层记忆模型）
 └── [create_agent()]      ← 从 agent.md 组装完整 Agent 实例
 ```
 
@@ -26,21 +28,23 @@ GlobalHandler（全局单例）
 - **AgentLooper / SimpleAgentLooper 是仅有的两个引擎** — AgentExecutor 不直接调用 `Agent.chat()`
 - **Agent 内部接口不对外** — `Agent.chat()` / `Agent.stream_chat()` 为 `pub(crate)`
 - **Executor 可注册为 Tool** — `AgentExecutorTool` 让一个 agent 把另一个 agent 当工具调用
+- **Workspace 是用户隔离边界** — 所有用户级资源（工具、知识库、记忆）通过 Workspace 管理
 
 ## 模块地图
 
 | 模块 | 职责 |
 |------|------|
-| [`agent`](src/agent/mod.rs) | Agent 组装（从 agent.md 配置 → LLM provider + 工具 + MCP + Skill） |
+| [`agent`](src/agent/mod.rs) | Agent 组装（从 agent.md 配置 → LLM provider + 工具 + MCP + Skill），含 DynamicContext trait |
 | [`executor`](src/executor/mod.rs) | AgentExecutor 外观层：SingleTurn / MultiTurn / agent-as-tool |
-| [`config`](src/config/mod.rs) | 全局配置：providers.toml、MCP 服务器注册表、知识库配置 |
-| [`global_handler`](src/global_handler.rs) | `LazyLock` 全局单例，集中管理所有管理器 |
-| [`knowledge`](src/knowledge/mod.rs) | 知识库管理：文件哈希追踪、增量同步、Agent 工具暴露 |
+| [`config`](src/config/mod.rs) | 配置系统：SystemConfig + UserConfig + Merge 深递归合并，providers.toml + MCP 注册表 |
+| [`workspace`](src/workspace/mod.rs) | 用户隔离核心：Workspace、ToolRegister、ToolDependencies 窄 trait 依赖注入 |
+| [`personal_memory`](src/personal_memory/mod.rs) | PPA 个人记忆：PersonalMemoryStore、MemoryFact/UserProfile/TurnContext 类型与配置 |
+| [`knowledge`](src/knowledge/mod.rs) | 知识库管理：文件哈希追踪、增量同步（工具移至 `tools/knowledge.rs`） |
 | [`mcp`](src/mcp/mod.rs) | MCP 客户端：连接管理、工具自动同步、热重载 |
 | [`persistence`](src/persistence/mod.rs) | 会话持久化：`SessionPersister` trait + 文件持久化实现 |
 | [`session`](src/session/mod.rs) | 多轮对话状态管理：Session、消息缓冲、Snapshot |
 | [`skills`](src/skills/mod.rs) | Skill 系统：三层渐进式加载、YAML frontmatter 解析 |
-| [`tools`](src/tools/mod.rs) | 工具抽象层：`Tool`/`ToolDyn` trait、`ToolFactory`、内置工具实现 |
+| [`tools`](src/tools/mod.rs) | 工具抽象层：`Tool`/`ToolDyn` trait、`ToolFactory`、13 个内置工具（含 PPA 记忆工具） |
 
 ## 快速开始
 
@@ -74,17 +78,12 @@ max_turns: 20
 
 ```rust
 use std::sync::Arc;
-use peco_core::GlobalHandler;
 use peco_core::agent::Agent;
 use peco_core::executor::{SingleTurnExecutor, ExecutorInput, AgentExecutor};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 初始化全局 Handler（自动加载配置 + 工具 + Skill）
-    let handler = GlobalHandler::global();
-    handler.init_skills()?;
-
-    // 从 agent.md 创建 Agent
+    // 从 agent.md 创建 Agent（内部自动加载配置、工具、Skill、MCP）
     let agent = Arc::new(Agent::from_file("agent.md").await?);
 
     // SingleTurnExecutor：单轮问答，自动 ReAct tool calling
@@ -117,9 +116,8 @@ agent.md
 
 配置优先级：**agent.md 显式设置 > providers.toml provider 默认值**
 
-> **注意**：`Agent::from_file` 内部通过 `GlobalHandler::global()` 获取 MCP 配置和 Skill 列表。
-> 这意味着首次调用会触发 `GlobalHandler` 的 `LazyLock` 初始化。如需在测试中注入 mock 依赖，
-> 请使用 `AgentBuilder`（Phase 2 计划）。
+> **注意**：`Agent::from_file` 内部通过 `Workspace` 获取 MCP 配置、Skill 列表和工具依赖。
+> 在测试中可通过 `AgentBuilder` 注入 mock 依赖。
 
 ### Agent 运行循环
 
@@ -157,13 +155,50 @@ agent.md
 | `RouterExecutor` | — | 路由分发 | 🔜 Phase 2 |
 | `ParallelExecutor` | — | 并行执行 | 🔜 Phase 2 |
 
-### 全局 Handler
+### Workspace 用户隔离
 
-[`GlobalHandler`](src/global_handler.rs) 是 `LazyLock` 全局单例，首次访问时自动初始化：
+[`Workspace`](src/workspace/workspace.rs) 是用户隔离的核心抽象，替代了旧的 `GlobalHandler` 全局单例：
 
-- **同步初始化**（首次访问 `GlobalHandler::global()` 时）：加载 Provider 配置、MCP 配置、`ToolFactory`（10 个工具）、空 `GlobalSkillList`、`KnowledgeManager`（延迟加载底层）
-- **异步初始化**（首次使用时）：知识库底层管理器通过 `ensure_loaded().await` 延迟加载
-- **Skill 加载**（需显式调用）：`handler.init_skills()?` 扫描 `./skills/` 目录
+- **Workspace** 持有用户级资源：`ToolRegister`、`PersonalMemoryStore`、知识库访问、Agent 加载
+- **ToolDependencies** 定义窄 trait 接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），实现依赖注入
+- **ToolRegister** 基于依赖一次构建到位，避免重复创建工具实例
+- **SystemConfig + UserConfig** 分层配置，`merge.rs` 提供深递归合并策略
+
+```rust
+use peco_core::workspace::{Workspace, ToolDependencies};
+
+// 构建用户 Workspace
+let workspace = Workspace::builder()
+    .system_config(system_config)
+    .user_config(user_config)
+    .tool_deps(tool_deps)  // 注入 AgentLoader, KnowledgeAccess, MemoryStore 等
+    .build()?;
+
+// 从 agent.md 创建 Agent
+let agent = workspace.create_agent("my-agent").await?;
+```
+
+### Personal Memory（PPA）
+
+[`personal_memory`](src/personal_memory/mod.rs) 提供个人记忆存储与检索能力：
+
+- **PersonalMemoryStore**：三层记忆 CRUD（`MemoryFact` → `UserProfile` → `TurnContext`）
+- **MemoryFact**：原子事实，含 `category`（Profile/Semantic/Episodic 三层记忆）、`importance`（Low/Medium/High）、`content``
+- **UserProfile**：聚合的用户偏好（语言、工具偏好、工作风格）
+- **PpaConfig**：可配置的阈值、最大事实数、模型选择
+
+```rust
+use peco_core::personal_memory::{PersonalMemoryStore, MemoryFact, MemoryCategory, Importance};
+
+let store = PersonalMemoryStore::new(knowledge_manager, "personal_memory".into(), config);
+store.remember(MemoryFact::new(
+    MemoryCategory::Semantic,
+    Importance::High,
+    "用户偏好 Rust 异步代码风格".into(),
+)).await?;
+
+let facts = store.recall("Rust 异步编程", 5).await?;
+```
 
 ### 工具系统
 
@@ -188,11 +223,14 @@ DefaultToolsExecutor               ← 按名称分发执行
 | `shell` | [tools/shell.rs](src/tools/shell.rs) | 执行 shell 命令 |
 | `fetch` | [tools/fetch.rs](src/tools/fetch.rs) | HTTP 请求 |
 | `read_skill` | [tools/skill.rs](src/tools/skill.rs) | 读取 Skill 内容 |
-| `search_knowledge` | [knowledge/tools.rs](src/knowledge/tools.rs) | 混合检索知识库 |
-| `list_knowledge_bases` | [knowledge/tools.rs](src/knowledge/tools.rs) | 列出所有知识库 |
-| `sync_knowledge_base` | [knowledge/tools.rs](src/knowledge/tools.rs) | 增量同步知识库 |
-| `add_to_knowledge_base` | [knowledge/tools.rs](src/knowledge/tools.rs) | 手动添加文本到知识库 |
-| `get_knowledge_base_docs` | [knowledge/tools.rs](src/knowledge/tools.rs) | 查看知识库文档列表 |
+| `search_knowledge` | [tools/knowledge.rs](src/tools/knowledge.rs) | 混合检索知识库 |
+| `list_knowledge_bases` | [tools/knowledge.rs](src/tools/knowledge.rs) | 列出所有知识库 |
+| `sync_knowledge_base` | [tools/knowledge.rs](src/tools/knowledge.rs) | 增量同步知识库 |
+| `add_to_knowledge_base` | [tools/knowledge.rs](src/tools/knowledge.rs) | 手动添加文本到知识库 |
+| `get_knowledge_base_docs` | [tools/knowledge.rs](src/tools/knowledge.rs) | 查看知识库文档列表 |
+| `remember` | [tools/memory.rs](src/tools/memory.rs) | 主动记录记忆事实 |
+| `recall` | [tools/memory.rs](src/tools/memory.rs) | 检索个人记忆 |
+| `forget` | [tools/memory.rs](src/tools/memory.rs) | 删除指定记忆 |
 | `delegate_sub_agent` | [tools/sub_agent.rs](src/tools/sub_agent.rs) | 委托子 Agent 执行任务 |
 | `run_parallel_sub_agents` | [tools/sub_agent.rs](src/tools/sub_agent.rs) | 并行运行多个子 Agent |
 
@@ -201,6 +239,7 @@ DefaultToolsExecutor               ← 按名称分发执行
 1. 创建工具函数并用 `#[peco_tool]` 注解
 2. 在 `tools/mod.rs` 中声明模块并 `pub use`
 3. 在 [`ToolFactory::init()`](src/tools/tool_factory.rs) 中注册
+4. 如需外部依赖（知识库、记忆、Agent 加载），通过 `ToolDependencies` trait 注入
 
 ### Skill 系统
 
@@ -256,6 +295,7 @@ Session 不包含内部锁，由 `AgentLooper` 以 `Box<Session>` 独占所有�
 
 | 组件 | 并发原语 | 保证 |
 |------|---------|------|
+| `Workspace` | `Arc` 共享 | 用户级资源隔离，Clone 语义 |
 | `GlobalSkillList` | `RwLock` | 读多写少，Tier 1 加载后极少写入 |
 | `KnowledgeManager` 底层 | `Mutex<Option<...>>` | 延迟初始化，初始化后不可变借用 |
 | `LooperHandle` | `Arc` + `AtomicBool`（cancel/pause flag） | Clone 语义，多持有者共享控制 |
@@ -285,15 +325,13 @@ ToolError                       SessionError                     AgentError
                                                                     ├─ AgentProtocol (协议错误)
 KnowledgeModuleError            SkillError                       └─ Tool (来自工具层)
   ├─ Sync (同步失败)               ├─ Io
-  ├─ Backend (后端错误)            ├─ Parse (YAML 解析失败)
-  └─ Config                       └─ SkillNotFound
-                                                               ExecutorError
-McpError / McpClientError                                        ├─ Agent (来自 AgentError)
-  ├─ Connection                                                   ├─ Schema (结构化输出解析失败)
-  ├─ ToolList                                                     ├─ Timeout / Cancelled
-  └─ ToolCall                                                     ├─ SessionRequired
-                                                                  ├─ LooperExited
-                                                                  └─ ChainStep (Phase 2)
+  ├─ Backend (后端错误)            ├─ Parse (YAML 解析失败)      ExecutorError
+  └─ Config                       └─ SkillNotFound                 ├─ Agent (来自 AgentError)
+                                                                    ├─ Schema (结构化输出解析失败)
+McpError / McpClientError        WorkspaceError                    ├─ Timeout / Cancelled
+  ├─ Connection                    ├─ Config (配置加载失败)         ├─ SessionRequired
+  ├─ ToolList                      ├─ AgentNotFound                 ├─ LooperExited
+  └─ ToolCall                      └─ ToolBuild (工具构建失败)      └─ ChainStep (Phase 2)
 ```
 
 **错误传播规则**：
@@ -321,15 +359,16 @@ search_kb() 混合检索（语义 + 关键词 + 图谱 + RRF 融合）
 - **文件哈希追踪**：[`FileHashManifest`](src/knowledge/hash_manifest.rs) 记录 SHA-256，对比检测新增/更新/删除
 - **增量同步**：只处理变更文件，错误累积不中断
 - **多知识库并发搜索**：`search_all()` 使用 `futures::join_all` 并行检索
-- **延迟加载**：`Mutex<Option<KnowledgeBaseManager>>` 确保与 `LazyLock` 同步初始化兼容
+- **延迟加载**：`Mutex<Option<KnowledgeBaseManager>>` 确保与 Workspace 初始化兼容
 - **多后端支持**：LanceDB（默认，本地）和 HelixDB（feature-gated：`helixdb` feature，需额外配置 URL 连接）
+- **Agent 工具**：5 个知识库工具位于 [`tools/knowledge.rs`](src/tools/knowledge.rs)，通过 `ToolDependencies` 注入用户隔离
 
 ## 测试策略
 
 | 层级 | 范围 | 工具 | 状态 |
 |------|------|------|------|
 | 单元测试 | 纯数据结构、StreamAssembler、Session 状态机 | `cargo test -p peco-core --lib` | ✅ 已有覆盖 |
-| 工具注册测试 | ToolFactory 注册完整性、tool 名称正确性 | `cargo test -p peco-core --lib` | ✅ 10 个工具全覆盖 |
+| 工具注册测试 | ToolFactory 注册完整性、tool 名称正确性 | `cargo test -p peco-core --lib` | ✅ 13 个工具全覆盖 |
 | 集成测试 | 知识库同步/检索（需 fastembed 模型下载 ~100MB） | `cargo test -p peco-core --lib -- --include-ignored` | ✅ 已实现 |
 | E2E 测试 | AgentLooper 完整 ReAct 循环（需 mock LLM） | — | 🔜 Phase 2 |
 | 压力测试 | 并发 MCP 工具调用、大 Session 恢复 | — | 🔜 Phase 2 |
@@ -349,9 +388,9 @@ search_kb() 混合检索（语义 + 关键词 + 图谱 + RRF 融合）
 
 | 稳定性等级 | 范围 | 说明 |
 |-----------|------|------|
-| **相对稳定** | `Session`、`SessionPersister`、`Tool`/`ToolDyn` trait | 核心抽象已稳定，预计不会有大的接口变更 |
-| **可能变更** | `AgentExecutor` trait、`LooperHandle`、`LooperEvent` | 正在根据实际使用反馈迭代 |
-| **实验性** | `ExecutorType` 中标记 Phase 2 的 variant、HelixDB 后端 | 接口仅为占位，实现和 API 均可能大幅调整 |
+| **相对稳定** | `Session`、`SessionPersister`、`Tool`/`ToolDyn` trait、`Workspace` | 核心抽象已稳定，预计不会有大的接口变更 |
+| **可能变更** | `AgentExecutor` trait、`LooperHandle`、`LooperEvent`、`DynamicContext` | 正在根据实际使用反馈迭代 |
+| **实验性** | `ExecutorType` 中标记 Phase 2 的 variant、HelixDB 后端、`PersonalMemoryStore` | 接口仅为占位，实现和 API 均可能大幅调整 |
 
 ## 配置
 
@@ -410,12 +449,12 @@ max_tokens = 4096
 ```text
 src/
 ├── lib.rs                  # crate 根，公共 API 重导出
-├── global_handler.rs       # 全局单例
 ├── agent/
 │   ├── agent.rs            # Agent 组装（from_file → ModelProvider + ToolExecutor + McpManager）
-│   ├── agent_config.rs     # AgentProfile、ModelConfig、agent.md 解析
+│   ├── agent_config.rs     # AgentProfile、ModelConfig、agent.md YAML + Markdown 解析/序列化
 │   ├── agent_looper.rs     # 双层状态机 ReAct 循环（AgentLooper + LooperHandle + LooperEvent）
 │   ├── context.rs          # 上下文构建策略（FullHistory / SlidingWindow）
+│   ├── dynamic_context.rs  # DynamicContext trait — 根据 query 动态注入上下文
 │   ├── hooks.rs            # LooperHook trait + 内置 hook（TokenBudgetHook、ToolAllowlistHook）
 │   ├── simple_looper.rs    # SimpleAgentLooper（轻量 batch-only ReAct，用于子 Agent）
 │   ├── stream.rs           # ModelStream / ModelStreamEvent
@@ -426,24 +465,39 @@ src/
 │   ├── multi_turn.rs       # MultiTurnExecutor（多轮对话，复用 Session，内部使用 AgentLooper）
 │   └── tool.rs             # AgentExecutorTool（impl ToolDyn，agent-as-tool）
 ├── config/
-│   ├── global_config.rs    # GlobalConfig（providers + MCP + knowledge）
+│   ├── mod.rs              # 配置模块入口
+│   ├── system_config.rs    # SystemConfig（providers + MCP 注册表，系统级）
+│   ├── user_config.rs      # UserConfig（用户级覆盖）
+│   ├── merge.rs            # 深递归合并策略（system ← user）
 │   ├── types.rs            # ProvidersConfig、ProviderEntry
 │   ├── loader.rs           # providers.toml I/O
 │   ├── mcp_config.rs       # McpConfig、McpServerConfig、TransportType
 │   └── error.rs            # ConfigError
+├── workspace/
+│   ├── mod.rs              # Workspace 模块入口
+│   ├── workspace.rs        # Workspace（用户隔离边界，持有 ToolRegister + 用户资源）
+│   ├── tool_register.rs    # ToolRegister（基于 ToolDependencies 一次构建）
+│   ├── deps.rs             # ToolDependencies 窄 trait（AgentLoader/SkillProvider/MemoryStore/KnowledgeAccess）
+│   └── error.rs            # WorkspaceError
+├── personal_memory/
+│   ├── mod.rs              # PPA 记忆模块入口
+│   ├── store.rs            # PersonalMemoryStore（三层记忆 CRUD）
+│   ├── types.rs            # MemoryFact / UserProfile / TurnContext 数据模型
+│   └── config.rs           # PpaConfig 及子配置
 ├── tools/
 │   ├── mod.rs              # Tool/ToolDyn trait、ToolExecutor、ToolError
 │   ├── tool_factory.rs     # ToolFactory 全局注册表 + DefaultToolsExecutor
 │   ├── shell.rs            # shell 工具
 │   ├── fetch.rs            # fetch 工具
 │   ├── skill.rs            # read_skill 工具
+│   ├── knowledge.rs        # 5 个知识库工具（search/list/add/sync/getDocs）
+│   ├── memory.rs           # 3 个 PPA 记忆工具（remember/recall/forget）
 │   └── sub_agent.rs        # delegate_sub_agent + run_parallel_sub_agents 工具
 ├── knowledge/
 │   ├── manager.rs          # KnowledgeManager 核心
 │   ├── config.rs           # KnowledgeConfig
 │   ├── hash_manifest.rs    # 文件哈希清单（SHA-256 追踪）
 │   ├── sync.rs             # SyncReport + 增量同步逻辑
-│   ├── tools.rs            # 5 个 Agent 知识库工具
 │   └── error.rs            # KnowledgeModuleError
 ├── skills/
 │   ├── global_skill_list.rs # GlobalSkillList（三层渐进式加载）
@@ -497,6 +551,7 @@ peco-core
 ├── knowledge-base      ← 底层知识库引擎（LanceDB + HelixDB(feature-gated) + 混合检索）
 ├── rmcp                ← MCP 协议 Rust 实现
 ├── fastembed            ← 本地 ONNX 嵌入推理
+├── serde + serde_yaml   ← agent.md / SKILL.md YAML frontmatter 解析
 ├── tokio               ← 异步运行时
 └── tracing             ← 结构化日志
 ```

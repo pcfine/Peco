@@ -35,8 +35,8 @@
 │                   Axum HTTP Server                    │
 │  ┌──────────┬──────────┬──────────┬──────────────┐  │
 │  │  Auth    │  Agent   │  Chat    │  Knowledge   │  │
-│  │  JWT     │  Registry│  SSE     │  Manager     │  │
-│  │  BCrypt  │  LRU     │  Stream  │  User-Isolate│  │
+│  │  JWT     │  Handler │  SSE     │  Handler     │  │
+│  │  BCrypt  │  agent.md│  Stream  │  User-Isolate│  │
 │  ├──────────┴──────────┴──────────┴──────────────┤  │
 │  │         Middleware: Rate Limit (GCRA)           │  │
 │  ├────────────────────────────────────────────────┤  │
@@ -77,26 +77,36 @@ src/
 │
 ├── agent/
 │   ├── mod.rs               # Agent 路由组 (/api/agents/*)
-│   ├── handler.rs           # CRUD + agent.md 文件生成
-│   ├── registry.rs          # AgentRegistry — LRU 缓存 + Agent 构建
-│   └── orchestration.rs     # Web 版子 Agent 工具（DB 查找替代文件查找）
+│   └── handler.rs           # CRUD + agent.md 文件生成与解析
 │
 ├── chat/
 │   ├── mod.rs               # 对话路由组 (/api/conversations/*)
-│   ├── handler.rs           # 对话 CRUD + SSE 流式聊天
+│   ├── handler.rs           # 对话 CRUD + SSE 流式聊天 + PPA 组件构建
 │   └── sse.rs               # ChatSseEvent 类型 + LooperEvent → SSE 映射
 │
 ├── knowledge/
 │   ├── mod.rs               # 知识库路由组 (/api/knowledge/*)
-│   ├── handler.rs           # CRUD + 文件上传 + 手动同步
-│   ├── manager.rs           # WebKnowledgeManager — 用户级知识库隔离
-│   └── tools.rs             # Web 版知识工具（search/list/add/sync/getDocs）
+│   └── handler.rs           # CRUD + 文件上传 + 手动同步（调用 peco-core 工具）
+│
+├── personal_assistant/
+│   ├── mod.rs               # PPA 个人记忆系统模块
+│   ├── types.rs             # MemoryFact / UserProfile / TurnContext 数据模型
+│   ├── config.rs            # PpaConfig 及子配置
+│   ├── store.rs             # PersonalMemoryStore — 三层记忆 CRUD
+│   ├── classifier.rs        # QueryClassifier — 关键词规则引擎
+│   ├── analyzer.rs          # MemoryAnalyzer — Flash 模型驱动记忆提取
+│   ├── dynamic_context.rs   # PpaDynamicContext — 读路径（Profile + 向量检索）
+│   └── hook.rs              # PpaMemoryHook — 写路径（对话完成 → 记忆提取 → 写入）
 │
 ├── task/
 │   ├── mod.rs               # 任务路由组 (/api/tasks/*)
 │   ├── handler.rs           # CRUD + toggle + 执行日志
 │   ├── scheduler.rs         # CronScheduler — tokio-cron-scheduler 封装
 │   └── executor.rs          # 任务执行逻辑
+│
+├── workspace/
+│   ├── mod.rs               # Workspace 模块入口
+│   └── manager.rs           # WorkspaceManager — LRU 缓存 Workspace 生命周期
 │
 ├── db/
 │   ├── mod.rs               # 连接池 + 迁移 + server_config 存取
@@ -208,26 +218,28 @@ curl -N "http://localhost:9227/api/conversations/{conv_id}/stream?message=你好
 | `PATCH` | `/api/agents/:id` | 更新 Agent 部分字段 |
 | `DELETE` | `/api/agents/:id` | 删除 Agent 及关联文件 |
 
-**Agent 配置字段：**
+**Agent 配置字段（agent.md YAML frontmatter）：**
 
-```json
-{
-  "name": "代码审查员",
-  "description": "负责代码质量审查",
-  "system_prompt": "你是一位资深代码审查专家...",
-  "model": "deepseek-v4-flash",
-  "provider": "deepseek",
-  "icon": "🔍",
-  "color": "#6366f1",
-  "tools": ["shell_exec", "fetch"],
-  "mcp_servers": ["filesystem"],
-  "skills": ["code-review"],
-  "temperature": 0.7,
-  "max_tokens": 4096
-}
+```yaml
+agent:
+  name: "代码审查员"
+  description: "负责代码质量审查"
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  temperature: 0.7
+  max_tokens: 4096
+tools:
+  - shell_exec
+  - fetch
+mcp:
+  - filesystem
+skills:
+  - code-review
+max_turns: 30
 ```
 
-创建的 Agent 会在 `{data_dir}/agents/{user_id}/{agent_id}/agent.md` 生成对应的 Markdown 配置文件。
+创建的 Agent 在 `{data_dir}/agents/{user_id}/{agent_name}/agent.md` 生成对应的配置文件。DB 仅保存 name/description/icon/color 等索引字段。
 
 ### 对话与流式聊天
 
@@ -282,14 +294,14 @@ PDF、DOCX、HTML、Markdown、纯文本、Python/Rust/Go/JS/TS 源码。
 - 支持混合检索（BM25 + 向量相似度，RRF 融合）
 - 支持三种分块策略：重叠窗口、固定大小、基于句子
 
-**知识工具（Agent 可用）：**
+**知识工具（Agent 可用，由 peco-core 提供）：**
 - `search_knowledge` — 搜索知识库
 - `list_knowledge_bases` — 列出可用知识库
 - `add_to_knowledge_base` — 添加文本内容
 - `sync_knowledge_base` — 增量同步
 - `get_knowledge_base_docs` — 查看文档列表
 
-所有知识工具均为 **用户隔离** 的 Web 版本，确保用户间数据不交叉。
+Server 层通过 `ToolDependencies` trait 注入 `user_id`，确保用户间数据隔离。所有工具实现位于 `peco-core::tools`。
 
 ### 定时任务
 
@@ -355,12 +367,12 @@ PDF、DOCX、HTML、Markdown、纯文本、Python/Rust/Go/JS/TS 源码。
 
 ## 数据库设计
 
-SQLite 数据库，10 张表，完整外键约束 + CASCADE 删除：
+SQLite 数据库，10 张表，完整外键约束 + CASCADE 删除。Agent 完整配置（model、provider、system_prompt、tools、MCP、skills）存储为 `agents/{name}/agent.md` 文件，DB 仅保留轻量索引和 UI 元数据：
 
 | 表 | 说明 | 关键字段 |
 |-----|------|---------|
 | `users` | 用户 | id, username (UNIQUE), email (UNIQUE), password_hash |
-| `agents` | Agent 配置 | user_id FK, name, system_prompt, model, provider, config_json |
+| `agents` | Agent 轻量索引 | user_id FK, name (UNIQUE per user), description, icon, color — 完整配置存于 `agent.md` |
 | `conversations` | 对话 | user_id FK, agent_id FK, title |
 | `messages` | 消息概要 | conversation_id FK, role, content |
 | `knowledge_bases` | 知识库 | user_id FK, name, description |
@@ -376,20 +388,38 @@ SQLite 数据库，10 张表，完整外键约束 + CASCADE 删除：
 
 ## 核心设计
 
-### Agent 实例缓存
+### Agent 配置模型
 
-`AgentRegistry` 使用 LRU 缓存（默认容量 128），避免每次请求重新创建 MCP 连接和工具实例：
+Agent 以 `agent.md`（YAML frontmatter + Markdown body）为唯一真相源：
 
-- `get_or_build()` → 缓存命中直接返回 → 未命中从 DB 构建 → 写入缓存
-- `invalidate()` → 配置更新后立即使缓存失效
-- `get_by_name()` → 按名称查找后委托给 `get_or_build`
+- **agent.md** 包含完整配置：`llm`（provider/model/temperature/max_tokens）、`tools`、`mcp`、`skills`、`max_turns`，以及 Markdown 格式的 system prompt
+- **DB agents 表**仅保存轻量索引（name, description, icon, color）和 UI 元数据，不含 system_prompt/model/provider
+- `assemble_agent_md()` / `parse_agent_md()` 负责序列化与反序列化
+- 迁移 `002_slim_agents.sql` 安全地将旧宽表迁移到新轻量表
+
+### Workspace 隔离
+
+`WorkspaceManager` 封装 LRU 缓存（默认容量 128），管理用户级 Workspace 生命周期：
+
+- 每个 Workspace 持有该用户的 `ToolRegister`、`PersonalMemoryStore`、知识库访问等资源
+- `Workspace` 下移到 `peco-core`，提供 `ToolDependencies` 窄 trait 接口实现依赖注入
+- Server 层通过 `WorkspaceManager` 管理缓存、构建和销毁
+
+### Personal Memory（PPA）
+
+PPA（Personal PA）在对话中自动学习用户偏好和事实，采用三层记忆模型（Profile → Semantic → Episodic）：
+
+- **写路径**：`PpaMemoryHook`（`on_turn_complete`）→ 阈值过滤 → `MemoryAnalyzer`（独立 Flash 模型）→ 写入 `PersonalMemoryStore`
+- **读路径**：`PpaDynamicContext` 在每次请求时检索 UserProfile + 向量相似记忆，注入 system prompt
+- **记忆工具**：Agent 可通过 `remember` / `recall` / `forget` 主动管理记忆
+- **查询分类**：`QueryClassifier` 关键词规则引擎，4 类查询分类（记忆操作 / 偏好查询 / 事实查询 / 通用）
 
 ### 用户隔离
 
 Web 层所有资源均按 `user_id` 隔离：
 
-- **Agent 工具**：`WebDelegateSubAgentTool` 和 `WebRunParallelSubAgentsTool` 按 `user_id` 从 DB 查找子 Agent（而非文件系统路径）
-- **知识工具**：5 个知识工具 (`WebSearchKnowledge` 等) 注入 `user_id`，通过 `WebKnowledgeManager` 路由到用户专属目录 `{data_dir}/knowledge/{user_id}/`
+- **Agent 工具**：子 Agent 按 `user_id` 从 DB 查找（而非文件系统路径），通过 `peco-core::workspace::AgentLoader` trait 注入
+- **知识工具**：5 个知识工具注入 `user_id`，路由到用户专属目录 `{data_dir}/knowledge/{user_id}/`
 - **API 层**：所有 handler 通过 `AuthUser` extractor 提取 `user_id`，查询 DB 时附加 `user_id` 过滤
 
 ### SSE 流式对话架构
@@ -415,7 +445,7 @@ Client                     Axum Handler                  Background Task
 每个 job 的 closure 在触发时 clone 所有捕获状态（task_id、agent_id、prompt、pool、state），然后委托给 `executor::execute_task`，后者：
 
 1. 写入 running 日志
-2. 从 `AgentRegistry` 获取 Agent
+2. 通过 `WorkspaceManager` 获取 Agent
 3. `AgentLooper` 执行 ReAct 循环
 4. 收集结果，更新日志状态
 5. 更新任务 `last_run_at`
@@ -526,7 +556,7 @@ cargo test -p peco-server --test task_test
 
 ```
 peco-server
-├── peco-core          # Agent/Session/Tools/MCP/Skills 核心抽象
+├── peco-core          # Agent/Session/Workspace/PPA/Tools/MCP/Skills 核心抽象
 ├── model-provider       # LLM Provider 抽象层 (DeepSeek / OpenAI)
 ├── knowledge-base       # 本地文档向量化、混合检索、PDF 解析
 ├── knowledge-helixdb    # HelixDB 知识图谱后端（可选扩展）
