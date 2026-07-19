@@ -136,7 +136,7 @@ impl McpConfig {
     /// Returns [`ConfigError`] on parse or validation failure.
     ///
     /// This is the primary entry point for loading MCP configuration.
-    /// It is called by [`GlobalConfig::load`](super::GlobalConfig::load).
+    /// It is called by [`SystemConfig::load`](super::SystemConfig::load).
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::default_config_path();
         match Self::from_file(&path) {

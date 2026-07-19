@@ -284,8 +284,9 @@ pub async fn create(
 
     agents::insert(&state.db, &params).await?;
 
-    // ── 写入 agent.md 文件 ────────────────────────────────────────────────
-    write_agent_md(&state.data_dir, &user_id, &agent_id, &params)?;
+    // ── 写入 agent.md 文件（通过 Workspace）───────────────────────────────
+    let ws = state.workspace_manager.get(&user_id)?;
+    write_agent_md_to_workspace(&ws, &params)?;
 
     // ── 读取完整行返回 ────────────────────────────────────────────────────
     let row = agents::find_by_id(&state.db, &agent_id)
@@ -375,7 +376,7 @@ pub async fn update(
     }
 
     // ── 使缓存失效 ────────────────────────────────────────────────────────
-    state.agent_registry.invalidate(&agent_id).await;
+    state.workspace_manager.invalidate_agent(&user_id, &existing.name)?;
 
     // ── 重新读取返回 ──────────────────────────────────────────────────────
     let row = agents::find_by_id(&state.db, &agent_id)
@@ -383,6 +384,7 @@ pub async fn update(
         .ok_or_else(|| ApiError::Internal("agent updated but not found".into()))?;
 
     // 更新 agent.md 文件
+    let ws = state.workspace_manager.get(&user_id)?;
     let create_params = CreateAgentParams {
         id: row.id.clone(),
         user_id: row.user_id.clone(),
@@ -395,7 +397,7 @@ pub async fn update(
         color: row.color.clone(),
         config_json: row.config_json.clone(),
     };
-    write_agent_md(&state.data_dir, &row.user_id, &row.id, &create_params)?;
+    write_agent_md_to_workspace(&ws, &create_params)?;
 
     tracing::info!(
         user_id = %user_id,
@@ -423,18 +425,12 @@ pub async fn delete(
     agents::delete(&state.db, &agent_id).await?;
 
     // ── 使缓存失效 ────────────────────────────────────────────────────────
-    state.agent_registry.invalidate(&agent_id).await;
+    state.workspace_manager.invalidate_agent(&user_id, &existing.name)?;
 
-    // ── 删除 agent.md 文件 ────────────────────────────────────────────────
-    let agent_dir = state.data_dir.join("agents").join(&existing.user_id).join(&agent_id);
-    if agent_dir.exists() {
-        if let Err(e) = tokio::fs::remove_dir_all(&agent_dir).await {
-            tracing::warn!(
-                error = %e,
-                dir = %agent_dir.display(),
-                "Failed to delete agent directory"
-            );
-        }
+    // ── 删除 agent.md 文件（通过 Workspace）───────────────────────────────
+    let ws = state.workspace_manager.get(&user_id)?;
+    if let Err(e) = ws.delete_agent(&existing.name) {
+        tracing::warn!(error = %e, agent = %existing.name, "Failed to delete agent files");
     }
 
     tracing::info!(
@@ -449,30 +445,20 @@ pub async fn delete(
 
 // ── agent.md 文件生成 ──────────────────────────────────────────────────────
 
-/// 将 Agent 配置写入 agent.md 文件（YAML frontmatter + Markdown body）。
-///
-/// 文件路径：`{data_dir}/agents/{user_id}/{agent_id}/agent.md`
-fn write_agent_md(
-    data_dir: &std::path::Path,
-    user_id: &str,
-    agent_id: &str,
+/// 将 Agent 配置写入 Workspace 的 agent.md 文件。
+fn write_agent_md_to_workspace(
+    ws: &peco_core::workspace::Workspace,
     params: &CreateAgentParams,
 ) -> Result<(), ApiError> {
-    let agent_dir = data_dir.join("agents").join(user_id).join(agent_id);
-    std::fs::create_dir_all(&agent_dir).map_err(|e| {
-        ApiError::Internal(format!("failed to create agent directory: {e}"))
-    })?;
-
-    // 解析 config_json 以获取 tools/mcp_servers/skills
     let (tools, mcp_servers, skills, temperature, max_tokens) =
         parse_config_json(&params.config_json);
 
     // 构建 YAML frontmatter
     let mut yaml = String::from("---\n");
-    yaml.push_str(&format!("agent:\n"));
+    yaml.push_str("agent:\n");
     yaml.push_str(&format!("  name: \"{}\"\n", params.name));
     yaml.push_str(&format!("  description: \"{}\"\n", params.description));
-    yaml.push_str(&format!("llm:\n"));
+    yaml.push_str("llm:\n");
     yaml.push_str(&format!("  provider: \"{}\"\n", params.provider));
     yaml.push_str(&format!("  model: \"{}\"\n", params.model));
     if let Some(t) = temperature {
@@ -507,10 +493,8 @@ fn write_agent_md(
     yaml.push_str(&params.system_prompt);
     yaml.push('\n');
 
-    let md_path = agent_dir.join("agent.md");
-    std::fs::write(&md_path, yaml).map_err(|e| {
-        ApiError::Internal(format!("failed to write agent.md: {e}"))
-    })?;
+    ws.save_agent(&params.name, &yaml)
+        .map_err(|e| ApiError::Internal(format!("failed to write agent.md: {e}")))?;
 
     Ok(())
 }

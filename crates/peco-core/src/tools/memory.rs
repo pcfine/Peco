@@ -1,30 +1,22 @@
 // ============================================================================
-// PPA Tools — remember / recall / forget 工具
+// PPA Memory Tools — remember / recall / forget
 // ============================================================================
 //
-// 这三个工具让 Agent 可以显式操作用户的个人记忆：
-//   - remember: 保存一条记忆
-//   - recall:   搜索个人记忆
-//   - forget:   删除一条记忆
-//
-// 直接实现 ToolDyn trait（与 WebSearchKnowledge 等 Web 工具模式一致），
-// 在 AgentRegistry::build_agent() 中通过 replace_tool_if_configured 注入。
+// 基于 `MemoryStore` trait 的依赖注入实现。
+// CLI 和 Web 使用同一个工具实现 — 差异仅在 Workspace 传入的 MemoryStore 实现。
 
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Future;
 use model_provider::ToolDefinition;
-use peco_core::tools::{StringError, ToolDyn, ToolError};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::store::PersonalMemoryStore;
-use super::types::{Importance, MemoryCategory, MemoryFact};
+use crate::personal_memory::{Importance, MemoryCategory, MemoryFact};
+use crate::workspace::MemoryStore;
 
-// ============================================================================
-// 辅助函数
-// ============================================================================
+use super::{StringError, ToolDyn, ToolError};
 
 fn string_err(msg: impl ToString) -> ToolError {
     ToolError::ToolCallError(Box::new(StringError(msg.to_string())))
@@ -34,26 +26,19 @@ fn string_err(msg: impl ToString) -> ToolError {
 // RememberTool
 // ============================================================================
 
-/// `remember` 工具 — 显式保存一条个人记忆。
-///
-/// # 示例
-///
-/// ```json
-/// {
-///   "category": "semantic",
-///   "content": "用户偏好 Axum 框架",
-///   "importance": "high"
-/// }
-/// ```ignore
 pub struct RememberTool {
-    store: Arc<PersonalMemoryStore>,
+    store: Arc<dyn MemoryStore>,
 }
 
 impl RememberTool {
-    pub fn new(store: Arc<PersonalMemoryStore>) -> Self {
+    pub fn new(store: Arc<dyn MemoryStore>) -> Self {
         Self { store }
     }
 }
+
+// ============================================================================
+// RememberTool
+// ============================================================================
 
 impl ToolDyn for RememberTool {
     fn name(&self) -> String {
@@ -125,7 +110,7 @@ impl ToolDyn for RememberTool {
                 .await
                 .map_err(|e| string_err(format!("保存记忆失败: {e}")))?;
 
-            Ok(format!("✅ 已保存记忆 [{}]: {}", fact.id, parsed.content))
+            Ok(format!("已保存记忆 [{}]: {}", fact.id, parsed.content))
         })
     }
 }
@@ -134,13 +119,12 @@ impl ToolDyn for RememberTool {
 // RecallTool
 // ============================================================================
 
-/// `recall` 工具 — 搜索个人记忆。
 pub struct RecallTool {
-    store: Arc<PersonalMemoryStore>,
+    store: Arc<dyn MemoryStore>,
 }
 
 impl RecallTool {
-    pub fn new(store: Arc<PersonalMemoryStore>) -> Self {
+    pub fn new(store: Arc<dyn MemoryStore>) -> Self {
         Self { store }
     }
 }
@@ -195,13 +179,13 @@ impl ToolDyn for RecallTool {
                 .store
                 .search_semantic(&parsed.query, parsed.top_k, 0.5)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| string_err(format!("语义记忆搜索失败: {e}")))?;
 
             let episodic = self
                 .store
                 .search_episodic(&parsed.query, parsed.top_k, 0.5)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| string_err(format!("历史记忆搜索失败: {e}")))?;
 
             if semantic.is_empty() && episodic.is_empty() {
                 return Ok("未找到相关记忆。".to_string());
@@ -232,13 +216,12 @@ impl ToolDyn for RecallTool {
 // ForgetTool
 // ============================================================================
 
-/// `forget` 工具 — 删除一条个人记忆。
 pub struct ForgetTool {
-    store: Arc<PersonalMemoryStore>,
+    store: Arc<dyn MemoryStore>,
 }
 
 impl ForgetTool {
-    pub fn new(store: Arc<PersonalMemoryStore>) -> Self {
+    pub fn new(store: Arc<dyn MemoryStore>) -> Self {
         Self { store }
     }
 }
@@ -279,7 +262,6 @@ impl ToolDyn for ForgetTool {
             let parsed: ForgetArgs = serde_json::from_str(&args)
                 .map_err(|e| string_err(format!("参数解析失败: {e}")))?;
 
-            // 创建一个临时 fact 用于失效标记
             let fact = MemoryFact::with_id(
                 parsed.memory_id.clone(),
                 MemoryCategory::Semantic,
@@ -291,7 +273,7 @@ impl ToolDyn for ForgetTool {
                 .await
                 .map_err(|e| string_err(format!("删除记忆失败: {e}")))?;
 
-            Ok(format!("✅ 已删除记忆: {}", parsed.memory_id))
+            Ok(format!("已删除记忆: {}", parsed.memory_id))
         })
     }
 }

@@ -8,7 +8,7 @@
 //! # Architecture
 //!
 //! ```text
-//! GlobalConfig::mcp_config() → McpConfig
+//! SystemConfig::load() → McpConfig
 //!   → McpManager::from_config(config, executor)
 //!     → for each enabled server:
 //!         create transport (stdio / HTTP)
@@ -20,8 +20,8 @@
 //!
 //! # Configuration
 //!
-//! Configuration is loaded by [`GlobalConfig`](crate::config::GlobalConfig) at startup.
-//! Use [`GlobalConfig::mcp_config()`](crate::config::GlobalConfig::mcp_config) to
+//! Configuration is loaded by [`SystemConfig`](crate::config::SystemConfig) at startup.
+//! Use [`SystemConfig`](crate::config::SystemConfig) to
 //! access the parsed [`McpConfig`](crate::config::McpConfig), then pass it to
 //! [`McpManager::from_config`].
 //!
@@ -114,7 +114,7 @@ impl McpManager {
     /// shared executor via [`McpClientHandler::connect`].
     ///
     /// Configuration should be obtained from
-    /// [`GlobalConfig::mcp_config()`](crate::config::GlobalConfig::mcp_config)
+    /// [`SystemConfig`](crate::config::SystemConfig)
     /// or loaded explicitly via [`McpConfig::load()`].
     pub async fn from_config(
         config: McpConfig,

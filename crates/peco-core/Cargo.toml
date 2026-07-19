@@ -32,6 +32,7 @@ chrono = "0.4.45"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 fastembed = "4.9.1"
 pdf-extract = "0.9"
 tokio = { workspace = true, features = ["rt-multi-thread"] }

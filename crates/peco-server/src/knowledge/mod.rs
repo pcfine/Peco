@@ -16,8 +16,6 @@
 //   DELETE /api/knowledge/:id/documents/:doc_id  — 删除文档
 
 pub mod handler;
-pub mod manager;
-pub mod tools;
 
 use std::sync::Arc;
 

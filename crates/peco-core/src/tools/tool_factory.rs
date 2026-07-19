@@ -1,11 +1,10 @@
 // ============================================================================
-// ToolFactory — global registry of built-in tool constructors
+// DefaultToolsExecutor — owns tool instances and dispatches execution by name.
 // ============================================================================
 //
-// This module provides:
-// - [`ToolFactory`] — singleton registry that creates tool instances by name
-// - [`CreateToolFn`] — type alias for the factory function signature
-// - [`make_tool_fn!`] — helper macro to generate a [`CreateToolFn`] for a tool struct
+// Also provides:
+// - [`StringError`] — minimal error wrapper for string-based tool errors
+// - [`FnToolAdapter`] — adapts closure-based tools to the ToolDyn trait
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -15,137 +14,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use model_provider::ToolDefinition;
 
-use super::{
-    DelegateSubAgent, Fetch, ReadSkill, RunParallelSubAgents, ShellExec, ToolDyn, ToolError,
-    ToolExecutor,
-};
-use crate::knowledge::tools::{
-    AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases, SearchKnowledge,
-    SyncKnowledgeBase,
-};
-
-// ── CreateToolFn ─────────────────────────────────────────────────────────────
-
-/// A factory function that constructs a fresh [`ToolDyn`] instance.
-type CreateToolFn = fn() -> Box<dyn ToolDyn>;
-
-/// Generate a [`CreateToolFn`] function pointer for a tool struct.
-macro_rules! make_tool_fn {
-    ($type:ident) => {{
-        fn f() -> Box<dyn ToolDyn> {
-            Box::new($type)
-        }
-        f as fn() -> Box<dyn ToolDyn>
-    }};
-}
-
-// ── ToolFactory ──────────────────────────────────────────────────────────────
-
-/// Registry of all built-in tools.
-///
-/// Each tool is stored as a factory closure keyed by name.
-/// Use [`ToolFactory::global()`] to access the singleton, then
-/// [`get_tool`](ToolFactory::get_tool) to construct a tool instance.
-///
-/// # Adding a new tool
-///
-/// 1. Create `tools/<name>.rs` with a `#[peco_tool]`-annotated `pub async fn`.
-/// 2. Add `mod <name>;` and `pub use <name>::<StructName>;` in the parent `mod.rs`.
-/// 3. Insert the factory closure in [`ToolFactory::init`].
-pub struct ToolFactory {
-    tools: HashMap<String, CreateToolFn>,
-}
-
-impl ToolFactory {
-    /// Initialize the registry with all built-in tools.
-    ///
-    /// This is called by [`GlobalHandler`](crate::GlobalHandler) and should not be
-    /// called directly. Use [`ToolFactory::global()`] to access the global singleton.
-    pub(crate) fn init() -> Self {
-        let mut tools: HashMap<String, CreateToolFn> = HashMap::new();
-        tools.insert("shell".into(), make_tool_fn!(ShellExec));
-        tools.insert("fetch".into(), make_tool_fn!(Fetch));
-        tools.insert("read_skill".into(), make_tool_fn!(ReadSkill));
-        // 知识库工具
-        tools.insert("search_knowledge".into(), make_tool_fn!(SearchKnowledge));
-        tools.insert(
-            "list_knowledge_bases".into(),
-            make_tool_fn!(ListKnowledgeBases),
-        );
-        tools.insert(
-            "sync_knowledge_base".into(),
-            make_tool_fn!(SyncKnowledgeBase),
-        );
-        tools.insert(
-            "add_to_knowledge_base".into(),
-            make_tool_fn!(AddToKnowledgeBase),
-        );
-        tools.insert(
-            "get_knowledge_base_docs".into(),
-            make_tool_fn!(GetKnowledgeBaseDocs),
-        );
-        // 子 Agent 工具
-        tools.insert("delegate_sub_agent".into(), make_tool_fn!(DelegateSubAgent));
-        tools.insert(
-            "run_parallel_sub_agents".into(),
-            make_tool_fn!(RunParallelSubAgents),
-        );
-        Self { tools }
-    }
-
-    /// Returns a reference to the global [`ToolFactory`] singleton.
-    ///
-    /// Delegates to [`GlobalHandler`](crate::GlobalHandler). Initialization
-    /// happens on the first call.
-    pub fn global() -> &'static ToolFactory {
-        crate::GlobalHandler::global().tool_factory()
-    }
-
-    /// Construct a new tool instance by name.
-    ///
-    /// Returns `None` if no tool with the given name is registered.
-    /// The returned [`ToolDyn`] can be registered with an agent via
-    /// `handle.add_tool(boxed_tool)` or passed to any API that accepts
-    /// `impl ToolDyn`.
-    pub fn get_tool(&self, name: &str) -> Option<Box<dyn ToolDyn>> {
-        self.tools.get(name).map(|f| f())
-    }
-
-    /// Returns all registered tool names.
-    pub fn tool_names(&self) -> Vec<&str> {
-        self.tools.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Returns the number of registered tools.
-    pub fn tool_count(&self) -> usize {
-        self.tools.len()
-    }
-
-    /// Returns `true` if a tool with the given name is registered.
-    pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
-    }
-
-    pub fn get_tools(&self, tools: &[impl AsRef<str>]) -> Vec<Box<dyn ToolDyn>> {
-        let mut result = Vec::new();
-        for tool_name in tools {
-            if let Some(tool) = self.get_tool(tool_name.as_ref()) {
-                result.push(tool);
-            } else {
-                tracing::warn!(
-                    tool = %tool_name.as_ref(),
-                    "Tool not registered in ToolFactory, skipping"
-                );
-            }
-        }
-        result
-    }
-
-    pub fn make_tools_executor(&self, tools: &[impl AsRef<str>]) -> DefaultToolsExecutor {
-        let tool_instances = self.get_tools(tools);
-        DefaultToolsExecutor::new(tool_instances)
-    }
-}
+use super::{ToolDyn, ToolError, ToolExecutor};
 
 // ── FnToolAdapter ──────────────────────────────────────────────────────────────
 
@@ -198,22 +67,15 @@ impl std::error::Error for StringError {}
 /// A [`ToolExecutor`] that owns a set of [`ToolDyn`] instances and dispatches
 /// execution by tool name.
 ///
-/// Unlike [`ToolFactory`] which stores factory functions and creates fresh
-/// instances on each lookup, `DefaultToolsExecutor` holds fully-constructed
-/// tools and calls them directly.
+/// Tools can be added via [`add_tool`](DefaultToolsExecutor::add_tool) or
+/// passed directly to [`new`](DefaultToolsExecutor::new).
 ///
 /// # Examples
 ///
 /// ```ignore
 /// use peco_core::tools::{DefaultToolsExecutor, ToolExecutor};
 ///
-/// // Build from ToolFactory
-/// let executor = DefaultToolsExecutor::from_factory(ToolFactory::global());
-///
-/// // Execute a tool by name
-/// let result = executor.execute("shell", r#"{"command": "echo hello"}"#).await?;
-///
-/// // Get tool definitions for the model
+/// let executor = DefaultToolsExecutor::new(vec![]);
 /// let defs = executor.definitions();
 /// ```
 pub struct DefaultToolsExecutor {

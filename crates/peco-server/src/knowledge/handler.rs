@@ -166,6 +166,15 @@ fn is_allowed_mime(mime: &str) -> bool {
     || mime.starts_with("text/")
 }
 
+/// 获取用户 KnowledgeManager (via Workspace).
+fn get_user_km(
+    state: &AppState,
+    user_id: &str,
+) -> Result<std::sync::Arc<peco_core::knowledge::KnowledgeManager>, ApiError> {
+    let ws = state.workspace_manager.get(user_id)?;
+    Ok(ws.knowledge_manager().clone())
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 /// `GET /api/knowledge`
@@ -181,7 +190,7 @@ pub async fn list_knowledge_bases(
     for row in &rows {
         // 尝试获取知识库统计信息
         let (doc_count, chunk_count) =
-            match state.web_knowledge_manager.get_manager(&user_id).await {
+            match get_user_km(&state, &user_id) {
                 Ok(km) => match km.list_kbs().await {
                     Ok(infos) => {
                         let info = infos.iter().find(|i| i.name == row.name);
@@ -252,7 +261,7 @@ pub async fn create_knowledge_base(
     .await?;
 
     // 在 KnowledgeBaseManager 中创建知识库
-    let km = state.web_knowledge_manager.get_manager(&user_id).await?;
+    let km = get_user_km(&state, &user_id)?;
     let kb_config = KbConfig {
         name: name.clone(),
         description: req.description.clone(),
@@ -301,7 +310,7 @@ pub async fn get_knowledge_base(
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
     let (doc_count, chunk_count) =
-        match state.web_knowledge_manager.get_manager(&user_id).await {
+        match get_user_km(&state, &user_id) {
             Ok(km) => match km.list_kbs().await {
                 Ok(infos) => {
                     let info = infos.iter().find(|i| i.name == row.name);
@@ -351,7 +360,7 @@ pub async fn delete_knowledge_base(
     knowledge_bases::delete(&state.db, &kb_id).await?;
 
     // 3. 通过 KnowledgeBaseManager 删除知识库（含磁盘 + LanceDB 数据）
-    if let Ok(km) = state.web_knowledge_manager.get_manager(&user_id).await {
+    if let Ok(km) = get_user_km(&state, &user_id) {
         if let Err(e) = km.delete_kb(&kb_name).await {
             tracing::warn!(
                 kb_name = %kb_name,
@@ -429,7 +438,7 @@ pub async fn upload_document(
     let kb_name_for_bg = kb_name.clone();
     let user_id_for_bg = user_id.clone();
     let db_for_bg = state.db.clone();
-    let wkm_for_bg = state.web_knowledge_manager.clone();
+    let wsm_for_bg = state.workspace_manager.clone();
 
     // 解析 multipart 中的文件字段
     let mut filename: Option<String> = None;
@@ -464,9 +473,13 @@ pub async fn upload_document(
     let file_size = data.len() as i64;
 
     // 保存文件到磁盘
+    let sanitized = knowledge_base::sanitize_kb_name(&kb_name);
     let docs_dir = state
-        .web_knowledge_manager
-        .user_kb_docs_dir(&user_id, &kb_name);
+        .workspace_manager
+        .workspace_dir(&user_id)
+        .join("knowledge")
+        .join(sanitized)
+        .join("docs");
     tokio::fs::create_dir_all(&docs_dir).await.map_err(|e| {
         ApiError::Internal(format!("failed to create docs directory: {e}"))
     })?;
@@ -497,8 +510,8 @@ pub async fn upload_document(
         // 更新状态为 processing
         let _ = documents::update_status(&db_for_bg, &doc_id_for_bg, "processing", None).await;
 
-        match wkm_for_bg.get_manager(&user_id_for_bg).await {
-            Ok(km) => match km.sync_kb(&kb_name_for_bg).await {
+        match wsm_for_bg.get(&user_id_for_bg) {
+            Ok(ws) => match ws.knowledge_manager().sync_kb(&kb_name_for_bg).await {
                 Ok(_report) => {
                     let _ = documents::update_status(
                         &db_for_bg,
@@ -534,7 +547,7 @@ pub async fn upload_document(
                     &db_for_bg,
                     &doc_id_for_bg,
                     "error",
-                    Some(&e.to_string()),
+                    Some(&format!("workspace error: {e}")),
                 )
                 .await;
             }
@@ -567,7 +580,7 @@ pub async fn sync_knowledge_base(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
-    let km = state.web_knowledge_manager.get_manager(&user_id).await?;
+    let km = get_user_km(&state, &user_id)?;
     let report = km
         .sync_kb(&row.name)
         .await

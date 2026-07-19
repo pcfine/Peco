@@ -2,7 +2,7 @@
 //!
 //! Demonstrates the full Agent lifecycle with the DeepSeek provider:
 //! 1. Creating a minimal `providers.toml` and `agent.md` at runtime
-//! 2. Building an Agent via [`Agent::from_file`]
+//! 2. Building an Agent via [`Agent::from_file`] with dependency injection
 //! 3. Running the agent through [`AgentLooper`] — a complete ReAct loop
 //!
 //! ## Running
@@ -21,8 +21,52 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use peco_core::agent::{Agent, AgentLooper, LooperConfig, LooperEvent, UserMsg};
+use peco_core::agent::{Agent, AgentError, AgentLooper, LooperConfig, LooperEvent, UserMsg};
+use peco_core::config::{SystemConfig, UserConfig};
+use peco_core::knowledge::KnowledgeManager;
+use peco_core::personal_memory::MemoryFact;
+use peco_core::skills::GlobalSkillList;
 use peco_core::utils::intercom::make_async_intercom_pair;
+use peco_core::workspace::{
+    AgentLoader, KnowledgeAccess, MemoryStore, SkillProvider, ToolDependencies,
+};
+
+// ── Noop trait implementations for the example (agent has tools: []) ─────
+
+struct NoopAgentLoader;
+impl AgentLoader for NoopAgentLoader {
+    fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
+        Err(AgentError::Config("noop agent loader".into()))
+    }
+    fn list_agent_names(&self) -> Vec<String> { vec![] }
+}
+
+struct NoopSkillProvider {
+    registry: Arc<std::sync::RwLock<GlobalSkillList>>,
+}
+impl SkillProvider for NoopSkillProvider {
+    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> { &self.registry }
+}
+
+struct NoopMemoryStore;
+#[async_trait::async_trait]
+impl MemoryStore for NoopMemoryStore {
+    async fn save_or_update_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
+    async fn search_semantic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
+    async fn search_episodic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
+    async fn invalidate_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
+}
+
+struct NoopKnowledgeAccess;
+impl KnowledgeAccess for NoopKnowledgeAccess {
+    fn user_id(&self) -> &str { "example-user" }
+    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+        // Leaked for simplicity in example — ok for a short-lived example process
+        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> =
+            std::sync::LazyLock::new(|| Arc::new(KnowledgeManager::new(std::env::temp_dir().join("peco-example-kb"))));
+        &KM
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +108,7 @@ max_tokens = 4096
     std::fs::write(&providers_toml, providers_content)?;
     println!("Wrote: {}", providers_toml.display());
 
-    // CRITICAL: set env var BEFORE GlobalHandler is first accessed
+    // CRITICAL: set env var BEFORE SystemConfig is first accessed
     unsafe {
         std::env::set_var("PECO_PROVIDERS_CONFIG", &providers_toml);
     }
@@ -99,9 +143,29 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     std::fs::write(&agent_md, agent_content)?;
     println!("Wrote: {}", agent_md.display());
 
-    // ── 4. Build the Agent ────────────────────────────────────────────────
+    // ── 4. Build the Agent (new API: dependency injection) ──────────────────
     println!("\n=== Building Agent ===");
-    let agent = Arc::new(Agent::from_file(&agent_md).await?);
+
+    let system_config = SystemConfig::load();
+    let user_config = UserConfig::load(&system_config, &dir)?;
+
+    let skill_registry = Arc::new(std::sync::RwLock::new(
+        GlobalSkillList::new(dir.join("skills")),
+    ));
+
+    let tool_deps = ToolDependencies {
+        agent_loader: Arc::new(NoopAgentLoader),
+        skill_provider: Arc::new(NoopSkillProvider { registry: skill_registry.clone() }),
+        memory_store: Arc::new(NoopMemoryStore),
+        knowledge_access: Arc::new(NoopKnowledgeAccess),
+    };
+
+    let agent = Arc::new(Agent::from_file(
+        &agent_md,
+        &user_config,
+        &skill_registry,
+        &tool_deps,
+    )?);
     println!(
         "Agent built successfully: name={}, provider={}",
         agent.config().agent.name,

@@ -1,258 +1,230 @@
 // ============================================================================
-// sub_agent — Sub-Agent delegation tools
+// sub_agent — Sub-Agent delegation tools (dependency-injected)
 // ============================================================================
 //
-// Provides two tools for sub-agent orchestration:
-//
-// - `delegate_sub_agent`       Delegate a single task, block until complete
-// - `run_parallel_sub_agents`  Run multiple tasks in parallel, return all results
-//
-// Both are driven by [`SimpleAgentLooper`], a minimal batch-only ReAct executor.
-// No global task registry, no polling, no task_id management — the LLM calls
-// the tool and gets the result(s) directly.
+// Both CLI and Web use the same tool implementations.
+// Difference is only in how the AgentLoader is constructed:
+// - CLI: Workspace reads agents/ from local filesystem
+// - Web: Workspace reads agents/ from user workspace directory
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Future;
+use model_provider::ToolDefinition;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::agent::simple_looper::SimpleAgentLooper;
-use crate::global_handler::GlobalHandler;
-use crate::tools::ToolError;
+use crate::workspace::AgentLoader;
+
+use super::{StringError, ToolDyn, ToolError};
 
 // ============================================================================
-// Shared types for run_parallel_sub_agents
+// DelegateSubAgent
 // ============================================================================
 
-/// Input: a single parallel task definition.
-#[derive(Debug, Deserialize)]
-struct ParallelTaskDef {
-    agent_file: String,
-    prompt: String,
+pub struct DelegateSubAgent {
+    agent_loader: Arc<dyn AgentLoader>,
 }
 
-/// Output: the result of a single parallel task.
-#[derive(Debug, Serialize)]
-struct ParallelTaskResult {
-    agent_file: String,
-    prompt: String,
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+impl DelegateSubAgent {
+    pub fn new(agent_loader: Arc<dyn AgentLoader>) -> Self {
+        Self { agent_loader }
+    }
 }
 
-// ============================================================================
-// Tool implementations (via #[peco_tool])
-// ============================================================================
-
-use peco_derive::peco_tool;
-
-// ── delegate_sub_agent ─────────────────────────────────────────────────────
-
-/// Delegate a task to a sub-agent and wait for the result (blocking).
-///
-/// The sub-agent runs a full ReAct loop (model → tools → … → final answer) and
-/// the result is returned inline as the tool output. Use this for single
-/// subtasks where you need the result before continuing.
-///
-/// For multiple parallel tasks, use `run_parallel_sub_agents` instead.
-#[peco_tool(
-    name = "delegate_sub_agent",
-    description = "Delegate a task to a sub-agent and wait for the result. The sub-agent runs a full ReAct loop (model → tools → ... → final answer) and returns its output. Use this for single subtasks where you need the result before continuing. For parallel work, use run_parallel_sub_agents instead.",
-    params(
-        agent_file = "Path to the agent.md configuration file that defines the sub-agent (model, tools, system prompt). Example: 'agents/code-reviewer.md'.",
-        prompt = "The task description / user query to send to the sub-agent. Be specific about what you want the sub-agent to do."
-    )
-)]
-pub async fn delegate_sub_agent(
-    agent_file: String,
-    prompt: String,
-) -> Result<String, ToolError> {
-    let agent = GlobalHandler::global()
-        .create_agent(&agent_file)
-        .await
-        .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
-
-    let agent = Arc::new(agent);
-    let handle = SimpleAgentLooper::spawn(agent, prompt, None);
-
-    let output = handle
-        .wait()
-        .await
-        .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
-
-    Ok(output)
-}
-
-// ── run_parallel_sub_agents ────────────────────────────────────────────────
-
-/// Run multiple sub-agent tasks in parallel and return all results.
-///
-/// Each task runs in its own tokio task using [`SimpleAgentLooper`]. All tasks
-/// are spawned concurrently, then awaited in order. Results are returned as a
-/// JSON array with status, output, and (on failure) error for each task.
-///
-/// # Example input
-///
-/// ```json
-/// [
-///   {"agent_file": "agents/reviewer.md", "prompt": "Review auth.rs"},
-///   {"agent_file": "agents/reviewer.md", "prompt": "Review api.rs"}
-/// ]
-/// ```
-#[peco_tool(
-    name = "run_parallel_sub_agents",
-    description = "Run multiple sub-agent tasks in parallel and return all results. Each task is defined by an agent_file (path to agent.md) and a prompt. All tasks run concurrently. Results are returned as a JSON array with status, output, and optional error for each task. Use this when you need to perform multiple independent subtasks at the same time.",
-    params(
-        tasks = "JSON array of task objects, each with 'agent_file' and 'prompt' fields. Example: [{\"agent_file\": \"agents/reviewer.md\", \"prompt\": \"Review auth.rs for security issues\"}, {\"agent_file\": \"agents/researcher.md\", \"prompt\": \"Research Rust async patterns\"}]"
-    )
-)]
-pub async fn run_parallel_sub_agents(tasks: String) -> Result<String, ToolError> {
-    // ── Parse tasks ──────────────────────────────────────────────────────────
-    let task_defs: Vec<ParallelTaskDef> = serde_json::from_str(&tasks)
-        .map_err(|e| ToolError::ToolCallError(
-            format!("Failed to parse tasks JSON: {e}. Expected format: [{{\"agent_file\": \"...\", \"prompt\": \"...\"}}]").into()
-        ))?;
-
-    if task_defs.is_empty() {
-        return Err(ToolError::ToolCallError(
-            "tasks array is empty — provide at least one task".into(),
-        ));
+impl ToolDyn for DelegateSubAgent {
+    fn name(&self) -> String {
+        "delegate_sub_agent".to_string()
     }
 
-    // ── Load all agents ──────────────────────────────────────────────────────
-    let mut agents = Vec::with_capacity(task_defs.len());
-    for td in &task_defs {
-        let agent = GlobalHandler::global()
-            .create_agent(&td.agent_file)
-            .await
-            .map_err(|e| ToolError::ToolCallError(
-                format!("Failed to load agent '{}': {e}", td.agent_file).into()
-            ))?;
-        agents.push(Arc::new(agent));
-    }
-
-    // ── Spawn all tasks concurrently ─────────────────────────────────────────
-    struct IndexedHandle {
-        agent_file: String,
-        prompt: String,
-        handle: crate::agent::SimpleLooperHandle,
-    }
-
-    let mut handles = Vec::with_capacity(task_defs.len());
-    for (td, agent) in task_defs.iter().zip(agents.into_iter()) {
-        let handle = SimpleAgentLooper::spawn(agent, td.prompt.clone(), None);
-        handles.push(IndexedHandle {
-            agent_file: td.agent_file.clone(),
-            prompt: td.prompt.clone(),
-            handle,
-        });
-    }
-
-    // ── Collect results in order ─────────────────────────────────────────────
-    let mut results: Vec<ParallelTaskResult> = Vec::with_capacity(handles.len());
-
-    for h in handles {
-        match h.handle.wait().await {
-            Ok(output) => {
-                results.push(ParallelTaskResult {
-                    agent_file: h.agent_file,
-                    prompt: h.prompt,
-                    status: "completed",
-                    output: Some(output),
-                    error: None,
-                });
-            }
-            Err(e) => {
-                results.push(ParallelTaskResult {
-                    agent_file: h.agent_file,
-                    prompt: h.prompt,
-                    status: "failed",
-                    output: None,
-                    error: Some(e.to_string()),
-                });
-            }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "delegate_sub_agent".to_string(),
+            description: "Delegate a task to a sub-agent by name and wait for the result. \
+                The sub-agent runs a full ReAct loop (model → tools → ... → final answer) \
+                and returns its output. Use this for single subtasks."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Name of the sub-agent to delegate to. Must match an existing agent name exactly."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task description to send to the sub-agent."
+                    }
+                },
+                "required": ["agent_name", "prompt"]
+            }),
         }
     }
 
-    // Sort by original definition order. Build a position map for O(n log n) sort.
-    let positions: std::collections::HashMap<(&str, &str), usize> = task_defs
-        .iter()
-        .enumerate()
-        .map(|(i, td)| ((td.agent_file.as_str(), td.prompt.as_str()), i))
-        .collect();
-    results.sort_by_key(|r| {
-        positions
-            .get(&(r.agent_file.as_str(), r.prompt.as_str()))
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct SubAgentArgs {
+                agent_name: String,
+                prompt: String,
+            }
 
-    Ok(serde_json::to_string_pretty(&results).map_err(ToolError::JsonError)?)
+            let parsed: SubAgentArgs =
+                serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+
+            let agent_name = parsed.agent_name.trim();
+            if agent_name.is_empty() {
+                return Err(ToolError::ToolCallError(Box::new(StringError(
+                    "agent_name is required".into(),
+                ))));
+            }
+
+            let agent = self.agent_loader.load_agent(agent_name).map_err(|e| {
+                ToolError::ToolCallError(Box::new(StringError(format!(
+                    "failed to load agent '{agent_name}': {e}"
+                ))))
+            })?;
+
+            let handle = SimpleAgentLooper::spawn(agent, parsed.prompt, None);
+            let output = handle.wait().await.map_err(|e| {
+                ToolError::ToolCallError(Box::new(StringError(format!(
+                    "sub-agent '{agent_name}' execution failed: {e}"
+                ))))
+            })?;
+
+            Ok(output)
+        })
+    }
 }
 
 // ============================================================================
-// Tests
+// RunParallelSubAgents
 // ============================================================================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub struct RunParallelSubAgents {
+    agent_loader: Arc<dyn AgentLoader>,
+}
 
-    #[test]
-    fn test_parse_empty_tasks() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(run_parallel_sub_agents("[]".to_string()));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
+impl RunParallelSubAgents {
+    pub fn new(agent_loader: Arc<dyn AgentLoader>) -> Self {
+        Self { agent_loader }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ParallelTaskDef {
+    agent_name: String,
+    prompt: String,
+}
+
+impl ToolDyn for RunParallelSubAgents {
+    fn name(&self) -> String {
+        "run_parallel_sub_agents".to_string()
     }
 
-    #[test]
-    fn test_parse_invalid_json() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(run_parallel_sub_agents("not json".to_string()));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Failed to parse"));
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "run_parallel_sub_agents".to_string(),
+            description: "Run multiple sub-agent tasks in parallel and return all results. \
+                Each task is defined by an agent_name and a prompt. All tasks run concurrently."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "string",
+                        "description": "JSON array of task objects, each with 'agent_name' and 'prompt'. \
+                            Example: [{\"agent_name\": \"reviewer\", \"prompt\": \"Review auth.rs\"}]"
+                    }
+                },
+                "required": ["tasks"]
+            }),
+        }
     }
 
-    #[test]
-    fn test_parse_missing_fields() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result =
-            rt.block_on(run_parallel_sub_agents(r#"[{"agent_file": "a.md"}]"#.to_string()));
-        // Missing 'prompt' field
-        assert!(result.is_err());
-    }
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct TasksWrapper {
+                tasks: String,
+            }
 
-    #[test]
-    fn test_result_serialization() {
-        let result = ParallelTaskResult {
-            agent_file: "agents/test.md".to_string(),
-            prompt: "hello".to_string(),
-            status: "completed",
-            output: Some("world".to_string()),
-            error: None,
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("completed"));
-        assert!(json.contains("world"));
-        assert!(!json.contains("error"));
-    }
+            let wrapper: TasksWrapper =
+                serde_json::from_str(&args).map_err(ToolError::JsonError)?;
 
-    #[test]
-    fn test_result_serialization_error() {
-        let result = ParallelTaskResult {
-            agent_file: "agents/test.md".to_string(),
-            prompt: "hello".to_string(),
-            status: "failed",
-            output: None,
-            error: Some("something broke".to_string()),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("failed"));
-        assert!(json.contains("something broke"));
-        // output is None, so it should be skipped
-        assert!(!json.contains("output"));
+            let task_defs: Vec<ParallelTaskDef> =
+                serde_json::from_str(&wrapper.tasks).map_err(|e| {
+                    ToolError::ToolCallError(Box::new(StringError(format!(
+                        "Failed to parse tasks JSON: {e}"
+                    ))))
+                })?;
+
+            if task_defs.is_empty() {
+                return Err(ToolError::ToolCallError(Box::new(StringError(
+                    "tasks array is empty".into(),
+                ))));
+            }
+
+            // Load all agents
+            let mut agent_pairs = Vec::with_capacity(task_defs.len());
+            for td in &task_defs {
+                let agent = self.agent_loader.load_agent(&td.agent_name).map_err(|e| {
+                    ToolError::ToolCallError(Box::new(StringError(format!(
+                        "failed to load agent '{}': {e}", td.agent_name
+                    ))))
+                })?;
+                agent_pairs.push((td.agent_name.clone(), td.prompt.clone(), agent));
+            }
+
+            // Spawn all concurrently
+            struct IndexedHandle {
+                agent_name: String,
+                prompt: String,
+                handle: crate::agent::SimpleLooperHandle,
+            }
+
+            let mut handles = Vec::with_capacity(agent_pairs.len());
+            for (name, prompt, agent) in agent_pairs {
+                let handle = SimpleAgentLooper::spawn(agent, prompt.clone(), None);
+                handles.push(IndexedHandle {
+                    agent_name: name,
+                    prompt,
+                    handle,
+                });
+            }
+
+            // Collect results
+            let mut results: Vec<serde_json::Value> = Vec::with_capacity(handles.len());
+            for h in handles {
+                match h.handle.wait().await {
+                    Ok(output) => {
+                        results.push(json!({
+                            "agent_name": h.agent_name,
+                            "prompt": h.prompt,
+                            "status": "completed",
+                            "output": output,
+                        }));
+                    }
+                    Err(e) => {
+                        results.push(json!({
+                            "agent_name": h.agent_name,
+                            "prompt": h.prompt,
+                            "status": "failed",
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+
+            serde_json::to_string_pretty(&results).map_err(ToolError::JsonError)
+        })
     }
 }

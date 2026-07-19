@@ -69,3 +69,6 @@ pub use config::{Skill, SkillFrontmatter, SkillMeta, validate_name};
 pub use error::SkillError;
 pub use global_skill_list::{GlobalSkillList, GlobalSkillListStats};
 pub use loader::SkillLoader;
+
+/// Alias for [`GlobalSkillList`] — the new design name.
+pub type SkillRegistry = GlobalSkillList;

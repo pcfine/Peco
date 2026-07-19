@@ -22,7 +22,7 @@ use crate::state::AppState;
 /// # 流程
 ///
 /// 1. 写入 task_log (status = "running")
-/// 2. 从 AgentRegistry 构建 Agent（带 LRU 缓存）
+/// 2. 从 WorkspaceManager 构建 Agent（带两级缓存）
 /// 3. 创建临时 Session + AgentLooper
 /// 4. 发送 prompt，通过 LooperEvent 收集结果文本
 /// 5. 更新 task_log (status = "success" / "error")
@@ -67,18 +67,26 @@ pub async fn execute_task(
         return;
     }
 
-    // ── 2. 构建 Agent ─────────────────────────────────────────────────────
-    // ★ 注意：get_or_build 需要 self_arc 参数
+    // ── 2. 查找 Agent 名称并获取 Agent（通过 WorkspaceManager）───────────
+    let agent_row = match crate::db::agents::find_by_id(&pool, &agent_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::error!(task_id = %task_id, agent_id = %agent_id, "Agent not found");
+            return;
+        }
+        Err(e) => {
+            let _ = task_logs::update_status(
+                &pool, &log_id, "error", "",
+                &format!("Failed to query agent: {e}"),
+                &Utc::now().to_rfc3339(),
+            ).await;
+            return;
+        }
+    };
+
     let agent = match state
-        .agent_registry
-        .get_or_build(
-            Arc::clone(&state.agent_registry),
-            &pool,
-            &user_id,
-            &agent_id,
-            &state.data_dir,
-        )
-        .await
+        .workspace_manager
+        .get_agent(&user_id, &agent_row.name)
     {
         Ok(a) => a,
         Err(e) => {
@@ -86,14 +94,8 @@ pub async fn execute_task(
             let error_msg = format!("Failed to build agent: {e}");
             tracing::error!(task_id = %task_id, error = %error_msg);
             let _ = task_logs::update_status(
-                &pool,
-                &log_id,
-                "error",
-                "",
-                &error_msg,
-                &finished_at,
-            )
-            .await;
+                &pool, &log_id, "error", "", &error_msg, &finished_at,
+            ).await;
             return;
         }
     };

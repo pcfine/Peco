@@ -1030,6 +1030,9 @@ impl AgentLooper {
         &mut self,
         mut user_listener: Listener<UserMsg>,
     ) -> Result<ModelResponse, AgentError> {
+        // Ensure deferred MCP connections are established before first tool use.
+        self.agent.mcp_manager().ensure_connected().await;
+
         // 用户输入 channel 是否已关闭（所有 sender 被 drop）。
         // 关闭后不再尝试接收新输入，专注驱动 react_step 直至 Idle。
         let mut input_closed = false;

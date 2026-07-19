@@ -26,6 +26,9 @@ tracing-subscriber = { workspace = true }
 # 错误处理
 anyhow = { workspace = true }
 
+# async trait
+async-trait = { workspace = true }
+
 # 配置
 dotenvy = { workspace = true }
 serde = { workspace = true }

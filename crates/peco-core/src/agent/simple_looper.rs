@@ -87,6 +87,9 @@ impl SimpleAgentLooper {
 
     /// Execute the ReAct loop and return the final assistant text.
     async fn run(&mut self, prompt: String) -> Result<String, AgentError> {
+        // Ensure deferred MCP connections are established before first tool use.
+        self.agent.mcp_manager().ensure_connected().await;
+
         // Build initial message list: [User(prompt)]
         self.messages.push(Arc::new(Message::user(&prompt)));
 

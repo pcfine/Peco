@@ -41,7 +41,7 @@
 //! # }
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::future::join_all;
 use tracing::{info, warn};
@@ -89,7 +89,10 @@ pub struct McpManager {
     /// Shared tool executor — tools are registered here by handlers.
     tools_executor: Arc<dyn crate::tools::ToolExecutor>,
     /// Active MCP services, kept alive to maintain connections.
-    services: Vec<McpServerHandler>,
+    services: Mutex<Vec<McpServerHandler>>,
+    /// Server configs awaiting lazy connection.
+    /// Drained by [`ensure_connected`](McpManager::ensure_connected).
+    pending: Mutex<Vec<(String, McpServerConfig)>>,
 }
 
 impl McpManager {
@@ -161,7 +164,35 @@ impl McpManager {
 
         Self {
             tools_executor,
-            services,
+            services: Mutex::new(services),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create an MCP manager that lazily connects to servers.
+    ///
+    /// Unlike [`new`](McpManager::new), this only stores server configurations
+    /// without establishing connections. Connections are deferred until
+    /// [`ensure_connected`](McpManager::ensure_connected) is called.
+    /// This keeps `Agent::from_file` synchronous.
+    pub fn new_lazy(
+        servers: &[(String, McpServerConfig)],
+        tools_executor: Arc<dyn crate::tools::ToolExecutor>,
+    ) -> Self {
+        info!(
+            server_count = servers.len(),
+            "MCP manager created (lazy — connections deferred)"
+        );
+
+        Self {
+            tools_executor,
+            services: Mutex::new(Vec::new()),
+            pending: Mutex::new(
+                servers
+                    .iter()
+                    .map(|(n, c)| (n.clone(), c.clone()))
+                    .collect(),
+            ),
         }
     }
 
@@ -171,7 +202,49 @@ impl McpManager {
     pub fn empty(tools_executor: Arc<dyn crate::tools::ToolExecutor>) -> Self {
         Self {
             tools_executor,
-            services: Vec::new(),
+            services: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Ensure all deferred lazy connections are established.
+    ///
+    /// Idempotent — once all pending configs have been consumed, subsequent
+    /// calls are no-ops. Call this once before the first tool execution.
+    pub async fn ensure_connected(&self) {
+        let pending = {
+            let mut guard = self.pending.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+
+        if pending.is_empty() {
+            return;
+        }
+
+        info!(count = pending.len(), "Establishing deferred MCP connections");
+
+        for (name, config) in &pending {
+            match connect_one(&name, config, self.tools_executor.clone()).await {
+                Ok(service) => {
+                    let mut guard = self.services.lock().unwrap();
+                    guard.push(McpServerHandler {
+                        name: name.clone(),
+                        service,
+                    });
+                    info!(
+                        server = %name,
+                        total = guard.len(),
+                        "MCP server connected (lazy)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        server = %name,
+                        error = %e,
+                        "Failed to connect to MCP server (lazy), skipping"
+                    );
+                }
+            }
         }
     }
 
@@ -184,19 +257,20 @@ impl McpManager {
     ///
     /// Returns [`McpClientError`] if the connection fails.
     pub async fn add_server(
-        &mut self,
+        &self,
         name: &str,
         server_config: &McpServerConfig,
     ) -> Result<(), McpClientError> {
         let service = connect_one(name, server_config, self.tools_executor.clone()).await?;
-        self.services.push(McpServerHandler {
+        let mut guard = self.services.lock().unwrap();
+        guard.push(McpServerHandler {
             name: name.to_string(),
             service,
         });
 
         info!(
             server = %name,
-            total = self.services.len(),
+            total = guard.len(),
             "Added MCP server to manager"
         );
         Ok(())
@@ -204,14 +278,17 @@ impl McpManager {
 
     // ── Query methods ────────────────────────────────────────────────────────
 
-    /// Return the number of successfully connected servers.
+    /// Return the number of successfully connected servers plus pending connections.
     pub fn server_count(&self) -> usize {
-        self.services.len()
+        let services = self.services.lock().unwrap();
+        let pending = self.pending.lock().unwrap();
+        services.len() + pending.len()
     }
 
     /// Return the names of all connected servers.
-    pub fn server_names(&self) -> Vec<&str> {
-        self.services.iter().map(|s| s.name.as_str()).collect()
+    pub fn server_names(&self) -> Vec<String> {
+        let guard = self.services.lock().unwrap();
+        guard.iter().map(|s| s.name.clone()).collect()
     }
 
     /// Return the total number of tools across all connected MCP servers.

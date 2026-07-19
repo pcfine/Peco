@@ -26,15 +26,7 @@ async fn main() -> anyhow::Result<()> {
     // ── 2. 加载 .env ───────────────────────────────────────────────────────
     dotenvy::dotenv().ok();
 
-    // ── 3. 初始化 GlobalHandler（加载 providers / MCP / skills 配置）──────
-    let handler = peco_core::GlobalHandler::global();
-    match handler.init_skills() {
-        Ok(n) => tracing::info!(count = n, "Skills initialized"),
-        Err(e) => tracing::warn!(error = %e, "Failed to initialize skills (server will start without skills)"),
-    }
-    tracing::info!("GlobalHandler initialized");
-
-    // ── 4. 加载初步配置（获取 database_url 和 data_dir）─────────────────
+    // ── 3. 加载初步配置（获取 database_url 和 data_dir）─────────────────
     //    此时还不依赖 DB，JWT 先用环境变量或随机值
     let config_prelim = ServerConfig::from_env()?;
     tracing::info!(
@@ -44,15 +36,15 @@ async fn main() -> anyhow::Result<()> {
         "Preliminary configuration loaded"
     );
 
-    // ── 5. 确保数据目录存在 ──────────────────────────────────────────────
+    // ── 4. 确保数据目录存在 ──────────────────────────────────────────────
     tokio::fs::create_dir_all(&config_prelim.data_dir).await?;
     tokio::fs::create_dir_all(config_prelim.data_dir.join("sessions")).await?;
 
-    // ── 6. 创建 SQLite 连接池 + 运行迁移 ──────────────────────────────────
+    // ── 5. 创建 SQLite 连接池 + 运行迁移 ──────────────────────────────────
     let pool = db::connect(&config_prelim.database_url).await?;
     db::run_migrations(&pool).await?;
 
-    // ── 7. 重新加载完整配置（含 DB 持久化的 JWT 密钥）───────────────────
+    // ── 6. 重新加载完整配置（含 DB 持久化的 JWT 密钥）───────────────────
     //    DB 已就绪，JWT 密钥支持三层降级：环境变量 → DB → 随机生成+持久化
     let config = ServerConfig::from_env_with_db(&pool).await?;
     tracing::info!(

@@ -394,14 +394,13 @@ pub async fn stream_chat(
     };
 
     // agent 必须属于当前用户
-    let _agent_row = agents::find_by_id_and_user(&state.db, &agent_id, &user_id)
+    let agent_row = agents::find_by_id_and_user(&state.db, &agent_id, &user_id)
         .await?
         .ok_or_else(|| ApiError::Forbidden("you do not have access to this agent".into()))?;
 
     let agent = state
-        .agent_registry
-        .get_or_build(Arc::clone(&state.agent_registry), &state.db, &user_id, &agent_id, &state.data_dir)
-        .await?;
+        .workspace_manager
+        .get_agent(&user_id, &agent_row.name)?;
 
     // ── 3. 加载或创建 Session ────────────────────────────────────────────
     let persister = SqliteSessionPersister::new(state.db.clone());
@@ -913,11 +912,11 @@ async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaComponents 
         };
     }
 
-    // 获取 per-user KnowledgeManager
-    let user_km = match state.web_knowledge_manager.get_manager(user_id).await {
-        Ok(km) => km,
+    // 获取 per-user KnowledgeManager (via Workspace)
+    let ws = match state.workspace_manager.get(user_id) {
+        Ok(ws) => ws,
         Err(e) => {
-            tracing::warn!(error = %e, user_id = %user_id, "Failed to get user knowledge manager, PPA disabled");
+            tracing::warn!(error = %e, user_id = %user_id, "Failed to get workspace, PPA disabled");
             return PpaComponents {
                 dynamic_context: None,
                 hooks: Vec::new(),
@@ -925,6 +924,7 @@ async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaComponents 
         }
     };
 
+    let user_km = ws.knowledge_manager().clone();
     let kb_name = format!("personal_memory_{}", user_id);
     let store = Arc::new(PersonalMemoryStore::new(
         user_km,

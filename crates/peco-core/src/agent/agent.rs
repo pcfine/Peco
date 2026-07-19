@@ -4,10 +4,11 @@
 
 use std::sync::Arc;
 
+use std::sync::RwLock;
+
 use model_provider::{
     ChatRequest, ChatResponse, ChatStream, DeepSeek, Message, ModelProvider, ToolDefinition, Usage,
 };
-use crate::GlobalHandler;
 use crate::agent::agent_config::{
     AgentProfile, ModelConfig, ModelConfigBuilder, resolve_api_key, split_frontmatter,
 };
@@ -15,9 +16,11 @@ use crate::agent::error::AgentError;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::McpServerConfig;
+use crate::config::{McpServerConfig, UserConfig};
 use crate::mcp::McpManager;
-use crate::tools::{ToolExecutor, ToolFactory};
+use crate::skills::SkillRegistry;
+use crate::tools::ToolExecutor;
+use crate::workspace::ToolDependencies;
 
 /// The response from a completed agent run.
 ///
@@ -83,6 +86,9 @@ pub struct Agent {
 
     /// 根据profile.mcp构建的MCP管理器，用于管理MCP连接
     mcp_manager: Arc<McpManager>,
+
+    /// Skill 注册表（从 Workspace 注入）。
+    skill_registry: Arc<RwLock<SkillRegistry>>,
 }
 
 impl Agent {
@@ -98,6 +104,7 @@ impl Agent {
         model_config: ModelConfig,
         tool_executor: Arc<dyn ToolExecutor>,
         mcp_manager: Arc<McpManager>,
+        skill_registry: Arc<RwLock<SkillRegistry>>,
     ) -> Self {
         Agent {
             md_path,
@@ -107,12 +114,24 @@ impl Agent {
             model_config,
             tool_executor,
             mcp_manager,
+            skill_registry,
         }
     }
 
-    /// 从 `agent.md` 文件创建 Agent。
-    /// 若文件读取、YAML 解析、provider 构建等任一环节失败，返回 [`AgentError`]。
-    pub async fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, AgentError> {
+    /// 从 `agent.md` 文件创建 Agent（新签名：显式依赖注入，同步）。
+    ///
+    /// 接收显式依赖作为参数，内部完成：
+    /// 1. 解析 agent.md → profile + preamble
+    /// 2. 通过 ToolRegister 构建 tool_executor
+    /// 3. 通过 user_config 构建 ModelProvider
+    /// 4. 注入 skill_registry
+    /// 5. 构建 McpManager（MCP 连接延迟到首次使用时建立）
+    pub fn from_file(
+        path: impl AsRef<std::path::Path>,
+        user_config: &UserConfig,
+        skill_registry: &Arc<RwLock<SkillRegistry>>,
+        tool_deps: &ToolDependencies,
+    ) -> Result<Self, AgentError> {
         let path = path.as_ref();
         // ── 解析 agent.md ──────────────────────────────────────────────
         let raw = std::fs::read_to_string(path)?;
@@ -122,17 +141,18 @@ impl Agent {
         let profile: AgentProfile = serde_yaml::from_str(frontmatter_str)?;
         let preamble = body.to_string();
 
-        // 构建最终生效的模型配置：agent.md 覆盖 → 合并 providers.toml 默认值
-        let model_config = build_model_config(&profile);
+        // 构建最终生效的模型配置：agent.md 覆盖 → 合并 UserConfig
+        let model_config = build_model_config_with_user(&profile, user_config);
 
         tracing::debug!(
             provider = ?model_config.provider_name,
             model = ?model_config.model_name,
             temperature = ?model_config.temperature,
-            "Model config resolved (agent.md merged with provider defaults)"
+            "Model config resolved"
         );
+
         // ── 1. 构建 ModelProvider ──────────────────────────────────────────
-        let model = build_provider(&model_config)?;
+        let model = build_provider_with_user(&model_config, user_config)?;
 
         tracing::info!(
             provider = %model.name(),
@@ -140,10 +160,8 @@ impl Agent {
             "Agent assembled successfully"
         );
 
-        // ── 2. 构建 ToolExecutor ──────────────────────────────────────────
-        let tool_factory = ToolFactory::global();
-        let tool_executor: Arc<dyn ToolExecutor> =
-            Arc::new(tool_factory.make_tools_executor(&profile.tools));
+        // ── 2. 构建 ToolExecutor（通过 ToolRegister，依赖注入）────────────
+        let tool_executor = crate::workspace::ToolRegister::build(&profile.tools, tool_deps);
 
         tracing::info!(
             tool_count = tool_executor.definitions().len(),
@@ -151,22 +169,20 @@ impl Agent {
             "Built-in tools registered for agent"
         );
 
-        // ── 3. 构建 McpManager ────────────────────────────────────────────
-        let mcp_config = GlobalHandler::global().config().mcp_config();
+        // ── 3. 构建 McpManager（lazy connect）─────────────────────────────
         let mcp_servers: Vec<(String, McpServerConfig)> = profile
             .mcp
             .iter()
             .filter_map(|name| {
-                mcp_config
+                user_config.mcp
                     .get_server(name)
                     .filter(|c| c.enabled)
                     .map(|c| (name.clone(), c.clone()))
             })
             .collect();
 
-        // 对 profile 中声明了但未在 McpConfig 中找到的 server 发出警告
         for name in &profile.mcp {
-            if mcp_config.get_server(name).is_none() {
+            if user_config.mcp.get_server(name).is_none() {
                 tracing::warn!(
                     server = %name,
                     "MCP server declared in agent.md but not found in mcpconfig.json"
@@ -174,12 +190,12 @@ impl Agent {
             }
         }
 
-        let mcp_manager = Arc::new(McpManager::new(&mcp_servers, tool_executor.clone()).await);
+        let mcp_manager = Arc::new(McpManager::new_lazy(&mcp_servers, tool_executor.clone()));
 
         tracing::info!(
             mcp_count = mcp_manager.server_count(),
             mcp_names = ?mcp_manager.server_names(),
-            "MCP connections established for agent"
+            "MCP manager created (connections lazy)"
         );
 
         Ok(Agent {
@@ -190,6 +206,7 @@ impl Agent {
             model_config,
             tool_executor,
             mcp_manager,
+            skill_registry: skill_registry.clone(),
         })
     }
 
@@ -232,8 +249,7 @@ impl Agent {
     pub fn system_prompt(&self) -> String {
         let mut prompt = self.preamble.clone();
         if !self.profile.skills.is_empty() {
-            let skill_list = GlobalHandler::global()
-                .skill_list()
+            let skill_list = self.skill_registry
                 .read()
                 .expect("RwLock poisoned");
             let all_meta = skill_list.all_meta();
@@ -247,7 +263,7 @@ impl Agent {
                     None => {
                         tracing::warn!(
                             skill = %skill_name,
-                            "Skill declared in agent.md but not found in GlobalSkillList"
+                            "Skill declared in agent.md but not found in SkillRegistry"
                         );
                     }
                 }
@@ -323,17 +339,13 @@ impl Agent {
 
 // ── 辅助函数 ────────────────────────────────────────────────────────────────────
 
-/// 从 [`AgentProfile`](crate::agent::AgentProfile) 的 LLM 配置构建最终生效的 [`ModelConfig`]。
-///
-/// 合并策略（高优先级覆盖低优先级）：
-/// 1. agent.md 中的 `llm` 显式配置（最高优先级）
-/// 2. providers.toml 中 provider 的 `[providers.<name>.default]` 默认参数
-///
-/// 若 agent.md 未指定 `provider`，则使用 `providers.toml` 中的 `default_provider`。
-pub fn build_model_config(profile: &crate::agent::agent_config::AgentProfile) -> ModelConfig {
+/// 从 AgentProfile 构建 ModelConfig（使用 UserConfig 替代 GlobalHandler）。
+pub fn build_model_config_with_user(
+    profile: &AgentProfile,
+    user_config: &UserConfig,
+) -> ModelConfig {
     let mut builder = ModelConfigBuilder::new();
 
-    // Step 1: 从 agent.md 的 llm 段读取显式覆盖值
     if let Some(ref llm) = profile.llm {
         if let Some(ref provider) = llm.provider {
             builder = builder.provider_name(provider.clone());
@@ -357,62 +369,40 @@ pub fn build_model_config(profile: &crate::agent::agent_config::AgentProfile) ->
 
     let model_config = builder.build();
 
-    // Step 2: 确定 provider 名称（agent.md 未指定则用全局默认值）
-    let handler = GlobalHandler::global();
-    let config = handler.config();
-
     let provider_name = model_config
         .provider_name
         .as_deref()
-        .unwrap_or_else(|| config.default_provider_name())
+        .unwrap_or_else(|| user_config.default_provider_name())
         .to_string();
 
-    // 确保 provider_name 已设置
     let model_config = ModelConfig {
         provider_name: Some(provider_name.clone()),
         ..model_config
     };
 
-    // Step 3: 合并 providers.toml 中的 provider 默认参数
-    let defaults = config
+    let defaults = user_config
         .provider_entry(Some(&provider_name))
         .and_then(|e| e.default.as_ref());
 
     model_config.merge_defaults(defaults)
 }
 
-/// 从合并后的 [`ModelConfig`] 构建 [`ModelProvider`] 实例。
-///
-/// 使用 `model_config.provider_name` 在 `providers.toml` 中查找对应的 provider
-/// 条目，解析 API key 和 base URL，并根据 `provider_type` 构造具体实例。
-///
-/// # 解析流程
-///
-/// 1. 从 `model_config.provider_name` 获取 provider 名称
-/// 2. 从 [`GlobalHandler`] 的 Provider 配置中查找 API key 和 base URL
-/// 3. 根据 `provider_type` 构造对应的 provider 实例（当前支持 `deepseek`）
-///
-/// # Errors
-///
-/// 若 provider 未在 `providers.toml` 中配置、缺少 API key、或 provider 类型不
-/// 支持，返回 [`AgentError`]。
-pub fn build_provider(model_config: &ModelConfig) -> Result<Arc<dyn ModelProvider>, AgentError> {
-    let handler = GlobalHandler::global();
-    let config = handler.config();
-
+/// 从 ModelConfig 构建 ModelProvider（使用 UserConfig 替代 GlobalHandler）。
+pub fn build_provider_with_user(
+    model_config: &ModelConfig,
+    user_config: &UserConfig,
+) -> Result<Arc<dyn ModelProvider>, AgentError> {
     let provider_name = model_config
         .provider_name
         .as_deref()
-        .unwrap_or_else(|| config.default_provider_name());
+        .unwrap_or_else(|| user_config.default_provider_name());
 
-    // 从全局配置中查找 provider 条目
-    let entry = config.provider_entry(Some(provider_name)).ok_or_else(|| {
+    let entry = user_config.provider_entry(Some(provider_name)).ok_or_else(|| {
         AgentError::Config(format!(
             "provider '{provider_name}' not found in providers.toml"
         ))
     })?;
 
-    // 解析 API Key
     let api_key = match &entry.api_key {
         Some(key) => resolve_api_key(key)?,
         None => {
@@ -422,7 +412,6 @@ pub fn build_provider(model_config: &ModelConfig) -> Result<Arc<dyn ModelProvide
         }
     };
 
-    // 根据 provider 类型构建实例
     match entry.provider_type.as_str() {
         "deepseek" => {
             let mut provider = DeepSeek::new(api_key)?;

@@ -11,7 +11,6 @@ pub mod error;
 pub mod hash_manifest;
 pub mod manager;
 pub mod sync;
-pub mod tools;
 
 pub use config::KnowledgeConfig;
 pub use error::KnowledgeModuleError;

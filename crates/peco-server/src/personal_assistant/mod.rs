@@ -18,7 +18,6 @@ pub mod config;
 pub mod dynamic_context;
 pub mod hook;
 pub mod store;
-pub mod tools;
 pub mod types;
 
 // Re-exports
@@ -26,4 +25,3 @@ pub use config::PpaConfig;
 pub use dynamic_context::PpaDynamicContext;
 pub use hook::PpaMemoryHook;
 pub use store::PersonalMemoryStore;
-pub use tools::{ForgetTool, RecallTool, RememberTool};

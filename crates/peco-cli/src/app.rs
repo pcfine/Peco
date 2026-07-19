@@ -6,15 +6,63 @@
 
 use std::sync::Arc;
 
-use peco_core::agent::{Agent, AgentLooper, LooperEvent, LooperHandle};
+use peco_core::agent::{Agent, AgentError, AgentLooper, LooperEvent, LooperHandle};
+use peco_core::config::{SystemConfig, UserConfig};
+use peco_core::knowledge::KnowledgeManager;
 use peco_core::persistence::{FileSessionPersister, NullSessionPersister, SessionPersister};
+use peco_core::personal_memory::MemoryFact;
 use peco_core::session::Session;
-use peco_core::GlobalHandler;
+use peco_core::skills::GlobalSkillList;
+use peco_core::workspace::{
+    AgentLoader, KnowledgeAccess, MemoryStore, SkillProvider, ToolDependencies,
+};
 
 use crate::commands::{self, CommandRegistry, CommandResult};
 use crate::config::CliConfig;
 use crate::display::{ConsoleRenderer, Renderer};
 use crate::input::InputReader;
+
+// ── Noop trait implementations for CLI tools ─────────────────────────────
+
+struct NoopAgentLoader;
+impl AgentLoader for NoopAgentLoader {
+    fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
+        Err(AgentError::Config("noop agent loader".into()))
+    }
+    fn list_agent_names(&self) -> Vec<String> { vec![] }
+}
+
+struct NoopSkillProvider {
+    registry: Arc<std::sync::RwLock<GlobalSkillList>>,
+}
+impl SkillProvider for NoopSkillProvider {
+    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> { &self.registry }
+}
+
+struct NoopMemoryStore;
+#[async_trait::async_trait]
+impl MemoryStore for NoopMemoryStore {
+    async fn save_or_update_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
+    async fn search_semantic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
+    async fn search_episodic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
+    async fn invalidate_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
+}
+
+struct NoopKnowledgeAccess;
+impl KnowledgeAccess for NoopKnowledgeAccess {
+    fn user_id(&self) -> &str { "cli-user" }
+    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> =
+            std::sync::LazyLock::new(|| Arc::new(KnowledgeManager::new(
+                dirs_next().unwrap_or_else(|| std::env::temp_dir()).join("peco-cli-kb")
+            )));
+        &KM
+    }
+}
+
+fn dirs_next() -> Option<std::path::PathBuf> {
+    std::env::var("PECO_KNOWLEDGE_DIR").ok().map(std::path::PathBuf::from)
+}
 
 // ============================================================================
 // CliApp
@@ -50,9 +98,15 @@ pub struct CliApp {
 impl CliApp {
     /// 创建 CliApp 实例。
     pub async fn new(config: CliConfig) -> anyhow::Result<Self> {
-        // ── 1. 初始化 GlobalHandler + Skills ────────────────────────────
-        let handler = GlobalHandler::global();
-        match handler.init_skills() {
+        // ── 1. 加载系统配置 + Skills ───────────────────────────────────
+        let system_config = SystemConfig::load();
+
+        let skills_root = config
+            .skills_root
+            .clone()
+            .unwrap_or_else(|| system_config.skills_root.clone());
+        let mut skill_registry = GlobalSkillList::new(skills_root.clone());
+        match skill_registry.init() {
             Ok(n) => {
                 eprintln!("[init] 已加载 {n} 个 Skill");
             }
@@ -60,8 +114,17 @@ impl CliApp {
                 eprintln!("[warn] Skill 加载失败: {e}");
             }
         }
+        let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
 
-        // ── 2. 创建持久化器 ────────────────────────────────────────────
+        // ── 2. 确定 workspace 根目录并加载用户配置 ─────────────────────
+        let workspace_root = config
+            .agent_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let user_config = UserConfig::load(&system_config, &workspace_root)?;
+
+        // ── 3. 创建持久化器 ────────────────────────────────────────────
         let persister: Arc<dyn SessionPersister> = if config.no_persist {
             Arc::new(NullSessionPersister)
         } else {
@@ -71,7 +134,7 @@ impl CliApp {
             }
         };
 
-        // ── 3. 创建或恢复 Session ──────────────────────────────────────
+        // ── 4. 创建或恢复 Session ──────────────────────────────────────
         let (session, session_id, session_description) =
             if let Some(ref id) = config.session_id {
                 match persister.load(id).await? {
@@ -104,8 +167,21 @@ impl CliApp {
                 (s, id, desc)
             };
 
-        // ── 4. 创建 Agent ──────────────────────────────────────────────
-        let agent = Arc::new(Agent::from_file(&config.agent_path).await?);
+        // ── 5. 构建 ToolDependencies ────────────────────────────────────
+        let tool_deps = ToolDependencies {
+            agent_loader: Arc::new(NoopAgentLoader),
+            skill_provider: Arc::new(NoopSkillProvider { registry: skill_registry.clone() }),
+            memory_store: Arc::new(NoopMemoryStore),
+            knowledge_access: Arc::new(NoopKnowledgeAccess),
+        };
+
+        // ── 6. 创建 Agent ──────────────────────────────────────────────
+        let agent = Arc::new(Agent::from_file(
+            &config.agent_path,
+            &user_config,
+            &skill_registry,
+            &tool_deps,
+        )?);
 
         // ── 5. 构建渲染器和输入 ────────────────────────────────────────
         let renderer: Box<dyn Renderer> =

@@ -15,7 +15,7 @@
 //! # Architecture
 //!
 //! ```text
-//! GlobalConfig::load() → McpConfig (global registry of all servers)
+//! SystemConfig::load() → McpConfig (registry of all servers)
 //!
 //! Caller resolves server names → McpServerConfig from McpConfig:
 //!   let servers: Vec<(String, McpServerConfig)> = names

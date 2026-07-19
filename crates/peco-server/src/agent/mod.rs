@@ -3,11 +3,6 @@
 // ============================================================================
 
 mod handler;
-mod orchestration;
-mod registry;
-
-pub use orchestration::{WebDelegateSubAgentTool, WebRunParallelSubAgentsTool};
-pub use registry::AgentRegistry;
 
 use std::sync::Arc;
 

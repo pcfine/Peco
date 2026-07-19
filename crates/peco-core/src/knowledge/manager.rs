@@ -26,7 +26,7 @@ use super::sync::SyncReport;
 ///
 /// # 延迟初始化
 ///
-/// 构造是同步的（适配 `GlobalHandler` 的 `LazyLock` 初始化），
+/// 构造是同步的，
 /// 实际的知识库管理器加载通过 `ensure_loaded()` 延迟完成。
 /// 所有公共方法在内部首先调用 `ensure_loaded()`。
 pub struct KnowledgeManager {

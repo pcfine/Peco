@@ -23,6 +23,7 @@ pub mod personal_assistant;
 pub mod session_store;
 pub mod state;
 pub mod task;
+pub mod workspace;
 
 /// 构建完整的 Axum Router（不含限流层，供集成测试使用）。
 ///
