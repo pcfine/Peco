@@ -22,10 +22,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::db::{agents, conversations, messages};
 use crate::error::ApiError;
-use crate::personal_assistant::analyzer::MemoryAnalyzer;
-use crate::personal_assistant::classifier::QueryClassifier;
-use crate::personal_assistant::config::PpaConfig;
-use crate::personal_assistant::{PersonalMemoryStore, PpaDynamicContext, PpaMemoryHook};
+use crate::personal_assistant::build_ppa_components;
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
@@ -902,78 +899,3 @@ pub async fn get_session_snapshot(
 // ============================================================================
 // PPA 组件构建
 // ============================================================================
-
-/// PPA 组件集合，注入到 LooperConfig 中。
-struct PpaComponents {
-    dynamic_context: Option<Arc<dyn peco_core::agent::DynamicContext>>,
-    hooks: Vec<Arc<dyn peco_core::agent::hooks::LooperHook>>,
-}
-
-/// 构建 PPA 组件（PersonalMemoryStore、PpaDynamicContext、PpaMemoryHook）。
-async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaComponents {
-    let ppa_config = PpaConfig::default();
-
-    if !ppa_config.enabled {
-        tracing::info!("PPA disabled");
-        return PpaComponents {
-            dynamic_context: None,
-            hooks: Vec::new(),
-        };
-    }
-
-    // 获取 per-user KnowledgeManager (via Workspace)
-    let ws = match state.workspace_manager.get(user_id) {
-        Ok(ws) => ws,
-        Err(e) => {
-            tracing::warn!(error = %e, user_id = %user_id, "Failed to get workspace, PPA disabled");
-            return PpaComponents {
-                dynamic_context: None,
-                hooks: Vec::new(),
-            };
-        }
-    };
-
-    let user_km = ws.knowledge_manager().clone();
-    let kb_name = format!("personal_memory_{}", user_id);
-    let store = Arc::new(PersonalMemoryStore::new(
-        user_km,
-        kb_name,
-        ppa_config.storage.clone(),
-    ));
-
-    // 创建 DynamicContext（读路径）
-    let dynamic_context: Option<Arc<dyn peco_core::agent::DynamicContext>> = Some(Arc::new(
-        PpaDynamicContext::new(
-            store.clone(),
-            QueryClassifier::new(),
-            ppa_config.clone(),
-        ),
-    ));
-
-    // 创建 MemoryAnalyzer（写路径）
-    // 使用独立模型分析对话，失败不影响主流程
-    let analyzer_model = match model_provider::DeepSeek::from_env() {
-        Ok(provider) => Arc::new(provider),
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create PPA analyzer model provider, PPA write path disabled");
-            return PpaComponents {
-                dynamic_context,
-                hooks: Vec::new(),
-            };
-        }
-    };
-
-    let analyzer = MemoryAnalyzer::new(
-        analyzer_model as Arc<dyn model_provider::ModelProvider>,
-        ppa_config.analyzer.clone(),
-    );
-
-    let hook = Arc::new(PpaMemoryHook::new(store, analyzer, ppa_config));
-
-    tracing::info!(user_id = %user_id, "PPA components built");
-
-    PpaComponents {
-        dynamic_context,
-        hooks: vec![hook],
-    }
-}

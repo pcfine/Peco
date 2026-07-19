@@ -11,6 +11,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod agent;
+pub mod assistant;
 pub mod auth;
 pub mod chat;
 pub mod config;
