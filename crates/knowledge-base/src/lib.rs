@@ -49,6 +49,7 @@ pub use graph::KnowledgeGraphBuilder;
 
 // 后端
 pub use backends::memory::InMemoryBackend;
+pub use backends::memory_graph::MemoryGraphStore;
 
 #[cfg(feature = "lancedb")]
 pub use backends::lancedb::LanceDbBackend;

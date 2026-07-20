@@ -267,6 +267,7 @@ pub async fn create_knowledge_base(
         chunking,
         backend: BackendType::LanceDb,
         storage_path: None,
+        default_storage_mode: Default::default(),
     };
 
     km.create_kb(kb_config)

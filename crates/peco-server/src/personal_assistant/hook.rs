@@ -23,7 +23,7 @@ use tracing::warn;
 use super::analyzer::MemoryAnalyzer;
 use super::config::PpaConfig;
 use super::store::PersonalMemoryStore;
-use super::types::{MemoryCategory, MemoryOperation, TurnContext};
+use super::types::{Importance, MemoryCategory, MemoryOperation, TurnContext};
 
 /// PPA 的 LooperHook 实现。
 ///
@@ -153,6 +153,31 @@ impl LooperHook for PpaMemoryHook {
         // 检查是否需要更新 Profile
         if facts.iter().any(|f| f.category == MemoryCategory::Profile) {
             let _ = self.store.sync_profile().await;
+        }
+
+        // 同时以图三元组形式保存语义/情景记忆（双写路径）
+        let graph_facts: Vec<knowledge_base::Fact> = facts
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.category,
+                    MemoryCategory::Semantic | MemoryCategory::Episodic
+                )
+            })
+            .map(|mf| {
+                let confidence = match mf.importance {
+                    Importance::High => 0.95,
+                    Importance::Medium => 0.8,
+                    Importance::Low => 0.5,
+                };
+                knowledge_base::Fact::new("用户", mf.category_name(), &mf.content, confidence)
+            })
+            .collect();
+
+        if !graph_facts.is_empty()
+            && let Err(e) = self.store.save_facts_as_graph(&graph_facts).await
+        {
+            warn!(error = %e, "Failed to save facts to graph");
         }
     }
 

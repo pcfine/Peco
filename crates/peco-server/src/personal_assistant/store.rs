@@ -81,6 +81,7 @@ impl PersonalMemoryStore {
             chunking: knowledge_base::ChunkingStrategySerde::FixedSize { size: 512 },
             backend: knowledge_base::BackendType::InMemory,
             storage_path: None,
+            default_storage_mode: Default::default(),
         };
 
         self.km
@@ -275,6 +276,49 @@ impl PersonalMemoryStore {
     }
 
     // =========================================================================
+    // 图谱存储
+    // =========================================================================
+
+    /// 以结构化图三元组形式保存事实，跳过文档分块和嵌入。
+    ///
+    /// 与 `save_or_update_fact`（文档路径）并行使用，
+    /// 将 MemoryFact 转换为 knowledge_base::Fact 写入图谱。
+    pub async fn save_facts_as_graph(
+        &self,
+        facts: &[knowledge_base::Fact],
+    ) -> Result<(), String> {
+        if facts.is_empty() {
+            return Ok(());
+        }
+        self.ensure_kb().await?;
+        self.km
+            .add_facts_to_kb(&self.kb_name, facts, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        info!(count = facts.len(), "Memory facts saved to graph");
+        Ok(())
+    }
+
+    /// 将 PPA MemoryFact 列表转换为 knowledge_base::Fact 列表。
+    ///
+    /// 以「用户」为主体，事实类别为谓词，内容为客体。
+    pub fn memory_facts_to_kb_facts(memories: &[MemoryFact]) -> Vec<knowledge_base::Fact> {
+        use crate::personal_assistant::types::Importance;
+
+        memories
+            .iter()
+            .map(|mf| {
+                let confidence = match mf.importance {
+                    Importance::High => 0.95,
+                    Importance::Medium => 0.8,
+                    Importance::Low => 0.5,
+                };
+                knowledge_base::Fact::new("用户", mf.category_name(), &mf.content, confidence)
+            })
+            .collect()
+    }
+
+    // =========================================================================
     // 统计
     // =========================================================================
 
@@ -295,7 +339,7 @@ impl PersonalMemoryStore {
 // ============================================================================
 
 impl MemoryFact {
-    fn category_name(&self) -> &str {
+    pub fn category_name(&self) -> &str {
         match self.category {
             MemoryCategory::Profile => "profile",
             MemoryCategory::Semantic => "semantic",

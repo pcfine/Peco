@@ -112,6 +112,81 @@ pub struct Entity {
 }
 
 // ---------------------------------------------------------------------------
+// 知识事实（结构化三元组）
+// ---------------------------------------------------------------------------
+
+/// 知识事实 — 结构化三元组，用于存储离散知识。
+///
+/// 适合表示对话中提取的用户偏好、事件、关系等。
+/// 每条 Fact 映射为图谱中的 Entity→Entity 边。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fact {
+    /// 确定性 ID：`fact:{sha256(subject+predicate+object)[:8]}`
+    pub id: String,
+    /// 主体实体名称（如 "用户"、"张三"、"技术部"）
+    pub subject: String,
+    /// 谓词 / 关系类型（如 "prefers"、"works_for"、"has_skill"）
+    pub predicate: String,
+    /// 客体实体名称或字面量值
+    pub object: String,
+    /// 置信度 0.0–1.0
+    pub confidence: f32,
+    /// 来源标识（对话轮次 ID、文档 ID 等）
+    #[serde(default)]
+    pub source: String,
+    /// 时间戳 ISO 8601
+    #[serde(default)]
+    pub created_at: String,
+    /// 扩展属性
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+impl Fact {
+    /// 计算确定性 Fact ID。
+    pub fn compute_id(subject: &str, predicate: &str, object: &str) -> String {
+        use sha2::Digest;
+        let input = format!("{subject}|{predicate}|{object}");
+        let hash = sha2::Sha256::digest(input.as_bytes());
+        format!("fact:{}", hex::encode(&hash[..8]))
+    }
+
+    /// 创建新的 Fact，自动生成 ID。
+    pub fn new(
+        subject: impl Into<String>,
+        predicate: impl Into<String>,
+        object: impl Into<String>,
+        confidence: f32,
+    ) -> Self {
+        let subject = subject.into();
+        let predicate = predicate.into();
+        let object = object.into();
+        let id = Self::compute_id(&subject, &predicate, &object);
+        Self {
+            id,
+            subject,
+            predicate,
+            object,
+            confidence,
+            source: String::new(),
+            created_at: String::new(),
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+/// 计算确定性实体节点 ID。
+///
+/// 格式：`entity:{entity_type}:{sha256(normalized_name)[:8]}`
+pub fn compute_entity_id(entity_name: &str, entity_type: &str) -> String {
+    use sha2::Digest;
+    let normalized = entity_name.trim().to_lowercase();
+    let input = format!("{entity_type}:{normalized}");
+    let hash = sha2::Sha256::digest(input.as_bytes());
+    format!("entity:{}:{}", entity_type, hex::encode(&hash[..8]))
+}
+
+// ---------------------------------------------------------------------------
 // 搜索类型
 // ---------------------------------------------------------------------------
 
@@ -211,6 +286,76 @@ pub struct SearchFilters {
 }
 
 // ---------------------------------------------------------------------------
+// 存储模式
+// ---------------------------------------------------------------------------
+
+/// 控制文档摄入时使用哪些存储后端的模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    /// 全量存储：向量 + 全文 + 图（默认，兼容现有行为）
+    #[default]
+    Full,
+    /// 仅向量语义搜索
+    VectorOnly,
+    /// 仅全文关键词索引
+    TextOnly,
+    /// 仅图谱结构边（CONTAINS + NEXT_CHUNK），不嵌入
+    GraphOnly,
+    /// 向量 + 全文（无图）
+    VectorAndText,
+    /// 向量 + 图
+    VectorAndGraph,
+    /// 全文 + 图
+    TextAndGraph,
+}
+
+/// 返回该模式是否需要分块。
+pub fn mode_requires_chunks(mode: &StorageMode) -> bool {
+    matches!(
+        mode,
+        StorageMode::Full
+            | StorageMode::VectorOnly
+            | StorageMode::TextOnly
+            | StorageMode::VectorAndText
+            | StorageMode::VectorAndGraph
+            | StorageMode::TextAndGraph
+    )
+}
+
+/// 返回该模式是否需要嵌入。
+pub fn mode_requires_embed(mode: &StorageMode) -> bool {
+    matches!(
+        mode,
+        StorageMode::Full | StorageMode::VectorOnly | StorageMode::VectorAndText | StorageMode::VectorAndGraph
+    )
+}
+
+/// 返回该模式是否需要向量索引更新。
+pub fn mode_requires_vector(mode: &StorageMode) -> bool {
+    matches!(
+        mode,
+        StorageMode::Full | StorageMode::VectorOnly | StorageMode::VectorAndText | StorageMode::VectorAndGraph
+    )
+}
+
+/// 返回该模式是否需要全文索引。
+pub fn mode_requires_text(mode: &StorageMode) -> bool {
+    matches!(
+        mode,
+        StorageMode::Full | StorageMode::TextOnly | StorageMode::VectorAndText | StorageMode::TextAndGraph
+    )
+}
+
+/// 返回该模式是否需要图谱结构边。
+pub fn mode_requires_graph(mode: &StorageMode) -> bool {
+    matches!(
+        mode,
+        StorageMode::Full | StorageMode::GraphOnly | StorageMode::VectorAndGraph | StorageMode::TextAndGraph
+    )
+}
+
+// ---------------------------------------------------------------------------
 // 存储统计
 // ---------------------------------------------------------------------------
 
@@ -269,5 +414,80 @@ mod tests {
         assert!(f.kb_id.is_none());
         assert!(f.document_ids.is_none());
         assert!(f.file_types.is_none());
+    }
+
+    #[test]
+    fn storage_mode_full_requires_all() {
+        let m = StorageMode::Full;
+        assert!(mode_requires_chunks(&m));
+        assert!(mode_requires_embed(&m));
+        assert!(mode_requires_vector(&m));
+        assert!(mode_requires_text(&m));
+        assert!(mode_requires_graph(&m));
+    }
+
+    #[test]
+    fn storage_mode_graph_only_requires_no_embed() {
+        let m = StorageMode::GraphOnly;
+        assert!(!mode_requires_chunks(&m));
+        assert!(!mode_requires_embed(&m));
+        assert!(!mode_requires_vector(&m));
+        assert!(!mode_requires_text(&m));
+        assert!(mode_requires_graph(&m));
+    }
+
+    #[test]
+    fn storage_mode_vector_only() {
+        let m = StorageMode::VectorOnly;
+        assert!(mode_requires_chunks(&m));
+        assert!(mode_requires_embed(&m));
+        assert!(mode_requires_vector(&m));
+        assert!(!mode_requires_text(&m));
+        assert!(!mode_requires_graph(&m));
+    }
+
+    #[test]
+    fn storage_mode_default_is_full() {
+        assert_eq!(StorageMode::default(), StorageMode::Full);
+    }
+
+    #[test]
+    fn fact_compute_id_deterministic() {
+        let id1 = Fact::compute_id("用户", "prefers", "Rust");
+        let id2 = Fact::compute_id("用户", "prefers", "Rust");
+        assert_eq!(id1, id2);
+        assert!(id1.starts_with("fact:"));
+    }
+
+    #[test]
+    fn fact_compute_id_different_for_different_input() {
+        let id1 = Fact::compute_id("用户", "prefers", "Rust");
+        let id2 = Fact::compute_id("用户", "prefers", "Go");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn compute_entity_id_deterministic() {
+        let id1 = compute_entity_id("张三", "Person");
+        let id2 = compute_entity_id("张三", "Person");
+        assert_eq!(id1, id2);
+        assert!(id1.starts_with("entity:Person:"));
+    }
+
+    #[test]
+    fn compute_entity_id_case_insensitive() {
+        let id1 = compute_entity_id("Alice", "Person");
+        let id2 = compute_entity_id("alice", "Person");
+        assert_eq!(id1, id2, "entity ID should be case-insensitive");
+    }
+
+    #[test]
+    fn fact_new_auto_generates_id() {
+        let fact = Fact::new("用户", "has_skill", "Rust", 0.9);
+        assert!(fact.id.starts_with("fact:"));
+        assert_eq!(fact.subject, "用户");
+        assert_eq!(fact.predicate, "has_skill");
+        assert_eq!(fact.object, "Rust");
+        assert_eq!(fact.confidence, 0.9);
     }
 }

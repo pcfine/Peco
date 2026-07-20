@@ -598,15 +598,25 @@ impl GraphStore for HelixDbBackend {
         direction: TraversalDirection,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        if edge_types.is_empty() {
-            return Ok(vec![]);
-        }
+        // 空 edge_types 表示匹配所有已知固定边类型，与 MemoryGraphStore /
+        // InMemoryBackend 保持一致。
+        let edge_types: Vec<EdgeType> = if edge_types.is_empty() {
+            vec![
+                EdgeType::RelatedTo,
+                EdgeType::Contains,
+                EdgeType::BelongsTo,
+                EdgeType::NextChunk,
+                EdgeType::Mentions,
+            ]
+        } else {
+            edge_types.to_vec()
+        };
 
         let dir_str = Self::direction_str(direction);
         let mut all_steps: Vec<TraversalStep> = Vec::new();
 
         // 对每个边类型分别遍历
-        for et in edge_types {
+        for et in &edge_types {
             let label = self.edge_label(et);
             let query =
                 queries::traverse_graph(&self.schema, start_node, &label, dir_str, max_depth);

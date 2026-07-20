@@ -119,4 +119,23 @@ pub trait GraphStore: Send + Sync {
         edge_types: &[EdgeType],
         max_depth: u32,
     ) -> Result<Vec<GraphNode>, KnowledgeError>;
+
+    /// 插入或更新一个节点。
+    ///
+    /// 默认实现为空操作，适用于不显式存储节点元数据的后端。
+    async fn upsert_node(&self, _node: GraphNode) -> Result<(), KnowledgeError> {
+        Ok(())
+    }
+
+    /// 按 ID 获取节点。
+    ///
+    /// 返回 `None` 表示节点不存在或此后端不支持节点存储。
+    async fn get_node(&self, _node_id: &str) -> Result<Option<GraphNode>, KnowledgeError> {
+        Ok(None)
+    }
+
+    /// 检查节点是否存在。
+    async fn node_exists(&self, node_id: &str) -> Result<bool, KnowledgeError> {
+        Ok(self.get_node(node_id).await?.is_some())
+    }
 }

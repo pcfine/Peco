@@ -42,46 +42,73 @@ impl IngestionPipeline {
         }
     }
 
-    /// 摄入单个文档。
+    /// 摄入单个文档（默认 Full 模式）。
     ///
-    /// 步骤：
-    /// 1. 对文档文本进行分块。
-    /// 2. 批量嵌入所有分块。
-    /// 3. 存储文档 + 分块。
-    /// 4. 更新插入向量。
-    /// 5. 索引文本。
-    /// 6. 构建结构化图边（CONTAINS + NEXT_CHUNK）。
+    /// 委托给 [`ingest_with_mode`] 以 `StorageMode::Full` 执行。
     pub async fn ingest(&self, doc: Document) -> Result<(), KnowledgeError> {
+        self.ingest_with_mode(doc, StorageMode::Full).await
+    }
+
+    /// 按指定存储模式摄入文档。
+    ///
+    /// 不同 mode 跳过不需要的步骤，避免不必要的分块、嵌入或索引操作。
+    pub async fn ingest_with_mode(
+        &self,
+        doc: Document,
+        mode: StorageMode,
+    ) -> Result<(), KnowledgeError> {
         let doc_id = doc.id.clone();
         let chunker_name = self.chunker.strategy_name();
         info!(
             doc_id = %doc_id,
             title = %doc.title,
             chunker = chunker_name,
+            mode = ?mode,
             "正在摄入文档"
         );
 
-        // 1. 分块
-        let mut chunks = self.chunker.chunk(&doc);
-        if chunks.is_empty() {
-            // 即使分块没有产生任何结果，仍然存储文档。
-            self.doc_store
-                .store(doc, vec![])
+        let need_chunks = mode_requires_chunks(&mode);
+        let need_embed = mode_requires_embed(&mode);
+        let need_vector = mode_requires_vector(&mode);
+        let need_text = mode_requires_text(&mode);
+        let need_graph = mode_requires_graph(&mode);
+
+        // 1. 分块（仅在需要时）
+        let mut chunks = if need_chunks {
+            let c = self.chunker.chunk(&doc);
+            if c.is_empty() {
+                self.doc_store
+                    .store(doc, vec![])
+                    .await
+                    .map_err(|e| KnowledgeError::StoreError(e.to_string()))?;
+                return Ok(());
+            }
+            c
+        } else {
+            // 不需要分块时，创建一个代表全文的合成「分块」，使文档存储和图结构边仍能构建
+            vec![Chunk {
+                id: format!("{doc_id}__full"),
+                document_id: doc_id.clone(),
+                text: doc.content.clone(),
+                sequence_index: 0,
+                page_number: None,
+                embedding: vec![],
+                metadata: ChunkMetadata::default(),
+            }]
+        };
+
+        // 2. 嵌入（仅在需要时）
+        if need_embed && need_chunks {
+            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+            let embeddings = self
+                .embedding
+                .embed_batch(&texts)
                 .await
-                .map_err(|e| KnowledgeError::StoreError(e.to_string()))?;
-            return Ok(());
-        }
+                .map_err(|e| KnowledgeError::EmbeddingError(e.to_string()))?;
 
-        // 2. 嵌入
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let embeddings = self
-            .embedding
-            .embed_batch(&texts)
-            .await
-            .map_err(|e| KnowledgeError::EmbeddingError(e.to_string()))?;
-
-        for (chunk, embedding) in chunks.iter_mut().zip(embeddings.into_iter()) {
-            chunk.embedding = embedding;
+            for (chunk, embedding) in chunks.iter_mut().zip(embeddings.into_iter()) {
+                chunk.embedding = embedding;
+            }
         }
 
         // 3. 存储文档 + 分块
@@ -91,7 +118,9 @@ impl IngestionPipeline {
             .map_err(|e| KnowledgeError::StoreError(e.to_string()))?;
 
         // 4. 更新插入向量
-        if let Some(ref vi) = self.vector_index {
+        if need_vector
+            && let Some(ref vi) = self.vector_index
+        {
             let entries: Vec<VectorEntry> = chunks
                 .iter()
                 .map(|c| VectorEntry {
@@ -106,8 +135,10 @@ impl IngestionPipeline {
                 .map_err(|e| KnowledgeError::VectorError(e.to_string()))?;
         }
 
-        // 5. 索引文本（包括文档标题以支持标题关键词搜索）
-        if let Some(ref ft) = self.fulltext_index {
+        // 5. 索引文本
+        if need_text
+            && let Some(ref ft) = self.fulltext_index
+        {
             let mut entries: Vec<FullTextEntry> = chunks
                 .iter()
                 .map(|c| FullTextEntry {
@@ -116,8 +147,6 @@ impl IngestionPipeline {
                     text: c.text.clone(),
                 })
                 .collect();
-            // 将文档标题作为额外可搜索条目添加，使标题中的
-            // 关键词（例如「简历」）即使不出现在分块内容中也能被匹配。
             entries.push(FullTextEntry {
                 id: format!("{doc_id}__title"),
                 document_id: doc_id.clone(),
@@ -128,8 +157,10 @@ impl IngestionPipeline {
                 .map_err(|e| KnowledgeError::TextSearchError(e.to_string()))?;
         }
 
-        // 6. 构建结构化图（第一阶段）
-        if let Some(ref gs) = self.graph_store {
+        // 6. 构建结构化图边（CONTAINS + NEXT_CHUNK）
+        if need_graph
+            && let Some(ref gs) = self.graph_store
+        {
             let builder = KnowledgeGraphBuilder::new();
             let edges = builder.build_structural_edges(&doc, &chunks);
             if !edges.is_empty() {
@@ -142,6 +173,7 @@ impl IngestionPipeline {
         info!(
             doc_id = %doc_id,
             chunk_count = chunks.len(),
+            mode = ?mode,
             "文档摄入完成"
         );
 

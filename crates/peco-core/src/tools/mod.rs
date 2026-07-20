@@ -11,8 +11,8 @@ mod tool_factory;
 
 pub use fetch::Fetch;
 pub use knowledge::{
-    AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases, SearchKnowledge,
-    SyncKnowledgeBase,
+    AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
+    SearchKnowledge, SyncKnowledgeBase,
 };
 pub use shell::ShellExec;
 pub use skill::ReadSkill;

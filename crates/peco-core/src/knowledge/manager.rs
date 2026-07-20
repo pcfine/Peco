@@ -294,6 +294,89 @@ impl KnowledgeManager {
         Ok(kb.add_text(title, content, source).await?)
     }
 
+    /// 按指定存储模式添加文本到知识库。
+    pub async fn add_text_to_kb_with_mode(
+        &self,
+        kb_name: &str,
+        title: &str,
+        content: &str,
+        source: &str,
+        mode: knowledge_base::StorageMode,
+    ) -> Result<knowledge_base::Document, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.add_text_with_mode(title, content, source, mode).await?)
+    }
+
+    // ── 图谱操作 ────────────────────────────────────────────────────────────
+
+    /// 添加结构化事实到知识图谱。
+    pub async fn add_facts_to_kb(
+        &self,
+        kb_name: &str,
+        facts: &[knowledge_base::Fact],
+        index_text: bool,
+    ) -> Result<Vec<knowledge_base::Fact>, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.add_facts(facts, index_text).await?)
+    }
+
+    /// 添加实体到知识图谱。
+    pub async fn add_entities_to_kb(
+        &self,
+        kb_name: &str,
+        entities: &[knowledge_base::Entity],
+    ) -> Result<(), KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.add_entities(entities).await?)
+    }
+
+    /// 查询实体相关事实。
+    pub async fn query_entity_facts(
+        &self,
+        kb_name: &str,
+        entity_name: &str,
+        max_depth: u32,
+    ) -> Result<Vec<knowledge_base::TraversalStep>, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.query_entity_facts(entity_name, max_depth).await?)
+    }
+
     // ── 同步 ────────────────────────────────────────────────────────────────
 
     /// 同步指定知识库：扫描 docs/ 目录，对比文件哈希，执行增量更新。
@@ -521,6 +604,7 @@ mod tests {
             chunking: ChunkingStrategySerde::FixedSize { size: 100 },
             backend: knowledge_base::BackendType::InMemory,
             storage_path: None,
+            default_storage_mode: Default::default(),
         }
     }
 

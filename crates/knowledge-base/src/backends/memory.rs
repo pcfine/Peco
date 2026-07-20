@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -21,6 +21,8 @@ pub struct InMemoryBackend {
     /// `chunk_id → (document_id, vector)`
     vectors: RwLock<HashMap<String, (String, Vec<f32>)>>,
     edges: RwLock<Vec<KnowledgeEdge>>,
+    /// 图节点存储：`node_id → GraphNode`
+    nodes: RwLock<HashMap<String, GraphNode>>,
     /// 简单倒排索引：`lowercase_word → [(chunk_id, document_id)]`
     text_index: RwLock<HashMap<String, Vec<(String, String)>>>,
 }
@@ -32,6 +34,7 @@ impl InMemoryBackend {
             chunks: RwLock::new(HashMap::new()),
             vectors: RwLock::new(HashMap::new()),
             edges: RwLock::new(Vec::new()),
+            nodes: RwLock::new(HashMap::new()),
             text_index: RwLock::new(HashMap::new()),
         }
     }
@@ -348,9 +351,10 @@ impl GraphStore for InMemoryBackend {
         });
 
         // BFS
-        let mut frontier: Vec<(String, u32)> = vec![(start_node.to_string(), 0)];
+        let mut frontier: VecDeque<(String, u32)> =
+            VecDeque::from([(start_node.to_string(), 0)]);
 
-        while let Some((current, depth)) = frontier.pop() {
+        while let Some((current, depth)) = frontier.pop_front() {
             if depth >= max_depth {
                 continue;
             }
@@ -384,7 +388,7 @@ impl GraphStore for InMemoryBackend {
                     },
                     via_edge: Some(edge.edge_type.clone()),
                 });
-                frontier.push((neighbor.clone(), next_depth));
+                frontier.push_back((neighbor.clone(), next_depth));
             }
         }
 
@@ -402,12 +406,12 @@ impl GraphStore for InMemoryBackend {
         let mut visited: HashMap<String, (u32, Option<String>, Option<EdgeType>)> = HashMap::new();
         // (node, depth, parent, via_edge)
 
-        let mut frontier: Vec<(String, u32)> = vec![(from.to_string(), 0)];
+        let mut frontier: VecDeque<(String, u32)> = VecDeque::from([(from.to_string(), 0)]);
         visited.insert(from.to_string(), (0, None, None));
 
         let mut found = false;
 
-        while let Some((current, depth)) = frontier.pop() {
+        while let Some((current, depth)) = frontier.pop_front() {
             if current == to {
                 found = true;
                 break;
@@ -443,7 +447,7 @@ impl GraphStore for InMemoryBackend {
                         Some(edge.edge_type.clone()),
                     ),
                 );
-                frontier.push((neighbor.clone(), next_depth));
+                frontier.push_back((neighbor.clone(), next_depth));
             }
         }
 
@@ -455,7 +459,10 @@ impl GraphStore for InMemoryBackend {
         let mut path: Vec<TraversalStep> = Vec::new();
         let mut cur = to.to_string();
         loop {
-            let (dist, parent, via) = visited.remove(&cur).unwrap();
+            let (dist, parent, via) = visited
+                .get(&cur)
+                .cloned()
+                .expect("target node must be in visited");
             path.push(TraversalStep {
                 node: GraphNode {
                     id: cur.clone(),
@@ -491,6 +498,15 @@ impl GraphStore for InMemoryBackend {
         let mut seen = HashMap::new();
         all_nodes.retain(|n| seen.insert(n.id.clone(), ()).is_none());
         Ok(all_nodes)
+    }
+
+    async fn upsert_node(&self, node: GraphNode) -> Result<(), KnowledgeError> {
+        self.nodes.write().await.insert(node.id.clone(), node);
+        Ok(())
+    }
+
+    async fn get_node(&self, node_id: &str) -> Result<Option<GraphNode>, KnowledgeError> {
+        Ok(self.nodes.read().await.get(node_id).cloned())
     }
 }
 

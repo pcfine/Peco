@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::embedding::FastembedModelType;
 use crate::traits::ChunkingStrategy;
+use crate::types::StorageMode;
 
 // ---------------------------------------------------------------------------
 // KbConfig
@@ -28,6 +29,9 @@ pub struct KbConfig {
     /// 存储路径（LanceDB 需要，其他后端可选）。
     #[serde(default)]
     pub storage_path: Option<PathBuf>,
+    /// 默认存储模式（默认为 Full）。
+    #[serde(default)]
+    pub default_storage_mode: StorageMode,
 }
 
 /// 后端类型（可序列化版本）。
