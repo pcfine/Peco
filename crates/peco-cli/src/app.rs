@@ -183,6 +183,14 @@ impl CliApp {
             &tool_deps,
         )?);
 
+        eprintln!(
+            "[init] Agent 已加载: name={}, path={}, provider={}, model={}",
+            agent.config().agent.name,
+            agent.path().display(),
+            agent.provider().name(),
+            agent.model_config().model_name.as_deref().unwrap_or("default"),
+        );
+
         // ── 5. 构建渲染器和输入 ────────────────────────────────────────
         let renderer: Box<dyn Renderer> =
             Box::new(ConsoleRenderer::new(&config));
