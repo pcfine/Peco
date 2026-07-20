@@ -1414,7 +1414,17 @@ impl AgentLooper {
         self.react_loop_iteration += 1;
 
         // 3. 构建消息列表（Agent 层上下文策略，零拷贝 Arc 共享）
-        let refs: Vec<&AnnotatedMessage> = self.session.all_message_refs().collect();
+        let all_refs: Vec<&AnnotatedMessage> = self.session.all_message_refs().collect();
+
+        // ★ MessageFilter: 在 build_context 之前过滤，system prompt + 动态上下文
+        //    由 build_context 单独注入，不受过滤器影响。
+        let owned_filtered: Vec<AnnotatedMessage>;
+        let refs: Vec<&AnnotatedMessage> = if let Some(filter) = &self.config.message_filter {
+            owned_filtered = filter.filter(&all_refs);
+            owned_filtered.iter().collect()
+        } else {
+            all_refs
+        };
 
         // ── 动态上下文解析 ─────────────────────────────────────────────
         // 若末条消息为 User query，表示新一轮对话开始，解析动态上下文；
@@ -1450,18 +1460,13 @@ impl AgentLooper {
         );
         let mut session_messages = ctx.messages;
 
-        // ★ Hook: on_before_request — 可修改消息或中止
+        // ★ Hook: on_before_request — 可修改消息或中止（在 filter 之后，看到最终消息列表）
         if let HookAction::Abort(reason) =
             Self::invoke_on_before_request(&self.config.hooks, turn, &mut session_messages).await
         {
             self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
             self.react_state = ReActState::Failed;
             return;
-        }
-
-        // ★ MessageFilter: 最后一公里消息转换（每个 AgentLooper 实例可独立配置）
-        if let Some(filter) = &self.config.message_filter {
-            session_messages = filter.filter(session_messages);
         }
 
         // 4. 分支：根据 ModelConfig.stream 决定路径

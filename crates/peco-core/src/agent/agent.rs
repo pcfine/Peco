@@ -45,17 +45,23 @@ pub struct ModelResponse {
 
 /// Agent 层消息过滤器。
 ///
-/// 在上下文构建完成、system prompt 注入后，对最终发送给 LLM 的消息列表
-/// 进行转换。典型用途包括：脱敏、注入提醒、重排消息顺序等。
+/// 在上下文构建**之前**对 Session 中的 [`AnnotatedMessage`] 引用列表进行过滤。
+/// System prompt 和动态上下文由 [`build_context`](super::context::build_context)
+/// 单独注入，不经过此过滤器，因此不会被误修改或误删除。
+///
+/// 典型用途包括：按 turn 过滤历史消息、脱敏、注入提醒等。
 ///
 /// 与 [`ContextFilter`](super::context::ContextFilter) 的区别：
-/// - `ContextFilter` 从 Session 历史中选择*哪些*消息进入上下文
-/// - `MessageFilter` 对已选定的消息列表做*最后一公里*转换
+/// - `ContextFilter` 从 Session 历史中选择*哪些*消息进入上下文（替代 build_context 内部策略）
+/// - `MessageFilter` 在 build_context **之前**对消息做预处理（system prompt 不可见）
 ///
 /// 默认为 `None`（不过滤），可通过外部注入 `dyn` trait 对象覆盖。
 pub trait MessageFilter: Send + Sync {
-    /// 转换消息列表，返回处理后的结果。
-    fn filter(&self, messages: Vec<Arc<Message>>) -> Vec<Arc<Message>>;
+    /// 对 AnnotatedMessage 引用列表进行过滤/转换，返回处理后的结果。
+    fn filter(
+        &self,
+        messages: &[&crate::session::AnnotatedMessage],
+    ) -> Vec<crate::session::AnnotatedMessage>;
 }
 
 /// 一个从 `agent.md` 配置文件加载的完整 Agent 实例。

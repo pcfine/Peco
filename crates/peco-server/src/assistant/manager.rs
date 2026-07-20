@@ -21,7 +21,9 @@ use futures::stream::Stream;
 use model_provider::Message;
 use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent, MessageFilter};
 use peco_core::persistence::SessionPersister;
-use peco_core::session::Session;
+use peco_core::session::{AnnotatedMessage, Session};
+#[cfg(test)]
+use peco_core::session::{MessageId, MessageSource};
 use tokio::sync::mpsc;
 
 use crate::chat::sse::{ChatSseEvent, UsageData, map_looper_event};
@@ -284,11 +286,13 @@ impl PersonalAssistantManager {
 
 /// 个人助理专用消息过滤器。
 ///
-/// 区分当前轮与历史轮，减少历史 tool_call/tool_result 的 token 消耗：
-/// - 当前轮（最后一个 User 消息起）：保留全部消息（含 tool_call / tool_result）
+/// 在 build_context 之前对 AnnotatedMessage 引用列表进行过滤。
+/// System prompt 和动态上下文由 build_context 单独注入，不经过此过滤器。
+///
+/// 过滤策略：
+/// - 当前轮（最后 turn_index 的所有消息）：保留全部（含 tool_call / tool_result）
 /// - 历史轮：只保留 User + 有内容的 Assistant 消息
 /// - 历史轮施加滑动窗口（最近 N 条）
-/// - System 消息始终保留
 pub struct PersonalAssistantMessageFilter {
     /// 历史轮保留的最大消息条数（默认 20，约 10 轮对话）
     max_history_messages: usize,
@@ -303,50 +307,33 @@ impl PersonalAssistantMessageFilter {
 }
 
 impl MessageFilter for PersonalAssistantMessageFilter {
-    fn filter(&self, messages: Vec<Arc<Message>>) -> Vec<Arc<Message>> {
+    fn filter(&self, messages: &[&AnnotatedMessage]) -> Vec<AnnotatedMessage> {
         if messages.is_empty() {
-            return messages;
+            return vec![];
         }
 
-        // ── 1. 定位当前轮起点：最后一个 User 消息的索引 ──────────────
-        let last_user_idx = messages
+        // ── 1. 定位当前轮：最后一条消息的 turn_index ──────────────
+        let current_turn = messages.last().unwrap().turn_index;
+
+        // ── 2. 切分：当前轮 vs 历史轮 ────────────────────────────
+        let (history, current): (Vec<_>, Vec<_>) = messages
             .iter()
-            .rposition(|m| matches!(m.as_ref(), Message::User { .. }));
+            .map(|m| (*m).clone())
+            .partition(|m| m.turn_index < current_turn);
 
-        // 无 User 消息 → 全部视为当前轮，原样返回
-        let split_idx = match last_user_idx {
-            Some(i) => i,
-            None => return messages,
-        };
-
-        // 检查首条是否为 System 消息
-        let system_msg: Option<&Arc<Message>> = messages
-            .first()
-            .filter(|m| matches!(m.as_ref(), Message::System { .. }));
-
-        let system_offset = if system_msg.is_some() { 1 } else { 0 };
-
-        // ── 2. 切分：当前轮 [split_idx..] vs 历史轮 [system_offset..split_idx)
-        let current_turn: Vec<Arc<Message>> = messages[split_idx..].to_vec();
-
-        // ── 3. 过滤历史轮 ────────────────────────────────────────────
-        let filtered_history: Vec<Arc<Message>> = messages[system_offset..split_idx]
-            .iter()
-            .filter(|m| {
-                match m.as_ref() {
-                    Message::User { .. } => true,
-                    // 保留有文本内容的 Assistant 消息
-                    // 注意：同时含 content + tool_calls 的消息也被保留，
-                    // 因为 content 中通常包含对用户 query 的直接回复
-                    Message::Assistant { content, .. } => content.is_some(),
-                    // Tool / 其他 → 丢弃（历史的 tool 过程已被最终回复总结）
-                    _ => false,
-                }
+        // ── 3. 过滤历史轮 ────────────────────────────────────────
+        let filtered_history: Vec<_> = history
+            .into_iter()
+            .filter(|m| match m.message.as_ref() {
+                Message::User { .. } => true,
+                // 保留有文本内容的 Assistant 消息
+                Message::Assistant { content, .. } => content.is_some(),
+                // Tool / 其他 → 丢弃（历史的 tool 过程已被最终回复总结）
+                _ => false,
             })
-            .cloned()
             .collect();
 
-        // ── 4. 滑动窗口：历史轮只保留最近 N 条 ───────────────────────
+        // ── 4. 滑动窗口：历史轮只保留最近 N 条 ───────────────────
         let recent_history = if filtered_history.len() > self.max_history_messages {
             let start = filtered_history.len() - self.max_history_messages;
             filtered_history[start..].to_vec()
@@ -354,15 +341,10 @@ impl MessageFilter for PersonalAssistantMessageFilter {
             filtered_history
         };
 
-        // ── 5. 组装：System + 截断后的历史 + 完整当前轮 ──────────────
-        let mut result: Vec<Arc<Message>> =
-            Vec::with_capacity(1 + recent_history.len() + current_turn.len());
-
-        if let Some(sys) = system_msg {
-            result.push(Arc::clone(sys));
-        }
+        // ── 5. 组装：截断后的历史 + 完整当前轮 ──────────────────
+        let mut result = Vec::with_capacity(recent_history.len() + current.len());
         result.extend(recent_history);
-        result.extend(current_turn);
+        result.extend(current);
 
         result
     }
@@ -377,22 +359,26 @@ mod tests {
     use super::*;
     use model_provider::{Message, ToolCall, ToolCallFunction};
 
-    fn make_user(content: &str) -> Arc<Message> {
-        Arc::new(Message::User {
-            content: content.to_string(),
-        })
+    fn make_annotated(turn: usize, msg: Message) -> AnnotatedMessage {
+        AnnotatedMessage::new(MessageId(0), turn, msg, MessageSource::UserInput)
     }
 
-    fn make_assistant_text(content: &str) -> Arc<Message> {
-        Arc::new(Message::Assistant {
+    fn make_user(content: &str) -> Message {
+        Message::User {
+            content: content.to_string(),
+        }
+    }
+
+    fn make_assistant_text(content: &str) -> Message {
+        Message::Assistant {
             content: Some(content.to_string()),
             tool_calls: None,
             reasoning_content: None,
-        })
+        }
     }
 
-    fn make_assistant_tool_call(id: &str, name: &str, args: &str) -> Arc<Message> {
-        Arc::new(Message::Assistant {
+    fn make_assistant_tool_call(id: &str, name: &str, args: &str) -> Message {
+        Message::Assistant {
             content: Some("Let me run a command.".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: id.to_string(),
@@ -403,173 +389,107 @@ mod tests {
                 },
             }]),
             reasoning_content: None,
-        })
+        }
     }
 
-    fn make_tool(tool_call_id: &str, content: &str) -> Arc<Message> {
-        Arc::new(Message::Tool {
+    fn make_tool(tool_call_id: &str, content: &str) -> Message {
+        Message::Tool {
             tool_call_id: tool_call_id.to_string(),
             content: content.to_string(),
-        })
-    }
-
-    fn make_system(content: &str) -> Arc<Message> {
-        Arc::new(Message::System {
-            content: content.to_string(),
-        })
-    }
-
-    #[test]
-    fn test_current_turn_preserved_with_tool_calls() {
-        let filter = PersonalAssistantMessageFilter::new(20);
-        let messages = vec![
-            make_system("System prompt"),
-            make_user("帮我修复编译错误"),
-            make_assistant_tool_call("1", "shell_exec", "cargo build"),
-            make_tool("1", "error[E0425]..."),
-            make_assistant_text("编译报错是因为缺少 use 语句"),
-        ];
-
-        let result = filter.filter(messages);
-
-        // System + 当前轮全部保留（含 tool_call/tool_result）
-        assert_eq!(result.len(), 5);
-        assert!(matches!(result[0].as_ref(), Message::System { .. }));
-        assert!(matches!(result[1].as_ref(), Message::User { .. }));
-        assert!(matches!(result[2].as_ref(), Message::Assistant { .. }));
-        assert!(matches!(result[3].as_ref(), Message::Tool { .. }));
-        assert!(matches!(result[4].as_ref(), Message::Assistant { .. }));
-    }
-
-    #[test]
-    fn test_history_tool_calls_filtered() {
-        let filter = PersonalAssistantMessageFilter::new(20);
-        let messages = vec![
-            make_system("System prompt"),                               // 0: System
-            make_user("历史问题1"),                                     // 1: User → 保留
-            make_assistant_tool_call("1", "shell_exec", "ls"), // 2: 含 tool_calls + content → 保留
-            make_tool("1", "..."),                             // 3: Tool → 丢弃
-            make_assistant_text("历史回答1"),                  // 4: 纯文本 → 保留
-            make_user("当前问题"),                             // 5: ★ 当前轮起点
-            make_assistant_tool_call("2", "shell_exec", "cargo build"), // 6: 当前轮 → 保留
-            make_tool("2", "..."),                             // 7: 当前轮 → 保留
-        ];
-
-        let result = filter.filter(messages);
-
-        // 期望: [System] [历史User] [历史Assistant(含content)] [历史纯文本Assistant] [当前User] [当前Assistant(tool)] [当前Tool]
-        assert_eq!(result.len(), 7);
-        assert!(matches!(result[0].as_ref(), Message::System { .. }));
-        assert!(matches!(result[1].as_ref(), Message::User { .. }));
-        assert!(matches!(result[2].as_ref(), Message::Assistant { .. }));
-        assert!(matches!(result[3].as_ref(), Message::Assistant { .. }));
-        assert!(matches!(result[4].as_ref(), Message::User { .. })); // 当前 User
-        assert!(matches!(result[5].as_ref(), Message::Assistant { .. })); // 当前 tool_call
-        assert!(matches!(result[6].as_ref(), Message::Tool { .. })); // 当前 tool_result
+        }
     }
 
     #[test]
     fn test_sliding_window() {
         let filter = PersonalAssistantMessageFilter::new(4); // 只保留最近 4 条历史
-        let mut messages = vec![make_system("System prompt")];
+        let mut msgs: Vec<AnnotatedMessage> = Vec::new();
 
-        // 添加 5 轮历史对话
+        // 添加 5 轮历史对话（turn 0..4）
         for i in 0..5 {
-            messages.push(make_user(&format!("问题{i}")));
-            messages.push(make_assistant_text(&format!("回答{i}")));
+            msgs.push(make_annotated(i, make_user(&format!("问题{i}"))));
+            msgs.push(make_annotated(i, make_assistant_text(&format!("回答{i}"))));
         }
-        // 添加当前轮
-        messages.push(make_user("当前问题"));
+        // 添加当前轮（turn 5）
+        msgs.push(make_annotated(5, make_user("当前问题")));
 
-        let result = filter.filter(messages);
+        let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
+        let result = filter.filter(&refs);
 
         // 历史 10 条 → 滑动窗口保留最近 4 条（问题3,回答3,问题4,回答4）
-        // + System(1) + 当前轮 User(1) = 6
-        assert_eq!(result.len(), 6);
-        assert!(matches!(result[0].as_ref(), Message::System { .. }));
-        // 前4条历史
-        assert!(matches!(result[1].as_ref(), Message::User { .. }));
-        assert!(matches!(result[2].as_ref(), Message::Assistant { .. }));
-        assert!(matches!(result[3].as_ref(), Message::User { .. }));
-        assert!(matches!(result[4].as_ref(), Message::Assistant { .. }));
+        // + 当前轮 User(1) = 5。无 System 消息。
+        assert_eq!(result.len(), 5);
+        assert!(matches!(result[0].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[1].message.as_ref(),
+            Message::Assistant { .. }
+        ));
+        assert!(matches!(result[2].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[3].message.as_ref(),
+            Message::Assistant { .. }
+        ));
         // 当前轮
-        assert!(matches!(result[5].as_ref(), Message::User { .. }));
+        assert!(matches!(result[4].message.as_ref(), Message::User { .. }));
     }
 
     #[test]
     fn test_empty_messages() {
         let filter = PersonalAssistantMessageFilter::new(20);
-        let result = filter.filter(vec![]);
+        let refs: Vec<&AnnotatedMessage> = vec![];
+        let result = filter.filter(&refs);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_no_user_messages() {
         let filter = PersonalAssistantMessageFilter::new(20);
-        let messages = vec![
-            make_system("System prompt"),
-            make_assistant_text("No user message"),
-        ];
-        // 无 User 消息 → 全部原样返回
-        let result = filter.filter(messages);
-        assert_eq!(result.len(), 2);
+        let msgs = vec![make_annotated(0, make_assistant_text("No user message"))];
+        let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
+        // 只有 Assistant 消息（无 User 消息）→ 全部视为当前轮，原样保留
+        let result = filter.filter(&refs);
+        assert_eq!(result.len(), 1);
     }
 
     #[test]
     fn test_assistant_no_content_tool_calls_filtered_in_history() {
         // Assistant { content: None, tool_calls: Some } in history → dropped
         let filter = PersonalAssistantMessageFilter::new(20);
-        let messages = vec![
-            make_system("System prompt"),
-            make_user("历史问题"),
-            Arc::new(Message::Assistant {
-                content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "t1".to_string(),
-                    call_type: "function".to_string(),
-                    function: ToolCallFunction {
-                        name: "shell_exec".to_string(),
-                        arguments: "ls".to_string(),
-                    },
-                }]),
-                reasoning_content: None,
-            }),
-            make_tool("t1", "output"),
-            make_assistant_text("历史回答"),
-            make_user("当前问题"),
+        let msgs = vec![
+            // turn 0: history
+            make_annotated(0, make_user("历史问题")),
+            make_annotated(
+                0,
+                Message::Assistant {
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "t1".to_string(),
+                        call_type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: "shell_exec".to_string(),
+                            arguments: "ls".to_string(),
+                        },
+                    }]),
+                    reasoning_content: None,
+                },
+            ),
+            make_annotated(0, make_tool("t1", "output")),
+            make_annotated(0, make_assistant_text("历史回答")),
+            // turn 1: current
+            make_annotated(1, make_user("当前问题")),
         ];
+        let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
 
-        let result = filter.filter(messages);
+        let result = filter.filter(&refs);
 
-        // Expected: System + 历史User + 历史纯文本Assistant + 当前User
+        // Expected: 历史User + 历史纯文本Assistant + 当前User
         // Assistant(content=None, tool_calls=Some) and its Tool are dropped
-        assert_eq!(result.len(), 4);
-        assert!(matches!(result[0].as_ref(), Message::System { .. }));
-        assert!(matches!(result[1].as_ref(), Message::User { .. }));
-        assert!(matches!(result[2].as_ref(), Message::Assistant { .. }));
-        assert!(matches!(result[3].as_ref(), Message::User { .. }));
-    }
-
-    #[test]
-    fn test_no_system_message() {
-        // No System message → system_offset=0, filter starts from index 0
-        let filter = PersonalAssistantMessageFilter::new(20);
-        let messages = vec![
-            make_user("历史问题1"),
-            make_assistant_text("历史回答1"),
-            make_user("历史问题2"),
-            make_assistant_text("历史回答2"),
-            make_user("当前问题"),
-        ];
-
-        let result = filter.filter(messages);
-
-        assert_eq!(result.len(), 5);
-        assert!(matches!(result[0].as_ref(), Message::User { .. }));
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0].message.as_ref(), Message::User { .. }));
         assert!(matches!(
-            result[result.len() - 1].as_ref(),
-            Message::User { .. }
+            result[1].message.as_ref(),
+            Message::Assistant { .. }
         ));
+        assert!(matches!(result[2].message.as_ref(), Message::User { .. }));
     }
 
     #[test]
@@ -577,35 +497,52 @@ mod tests {
         // History Tool messages dropped, Assistant with content+tool_calls kept,
         // current turn Tools preserved.
         let filter = PersonalAssistantMessageFilter::new(20);
-        let messages = vec![
-            make_system("System prompt"),
-            // Turn 1 (history): User + tool-call Assistant(content+tool_calls) + Tool + text Assistant
-            make_user("问题1"),
-            make_assistant_tool_call("c1", "shell_exec", "cargo build"),
-            make_tool("c1", "compilation error..."),
-            make_assistant_text("修复完成"),
-            // Turn 2 (history): User + text-only Assistant
-            make_user("问题2"),
-            make_assistant_text("回答2"),
-            // Turn 3 (current): User + tool-call Assistant + Tool
-            make_user("当前问题"),
-            make_assistant_tool_call("c2", "shell_exec", "cargo test"),
-            make_tool("c2", "tests passed"),
+        let msgs = vec![
+            // Turn 0 (history): User + tool-call Assistant(content+tool_calls) + Tool + text Assistant
+            make_annotated(0, make_user("问题1")),
+            make_annotated(
+                0,
+                make_assistant_tool_call("c1", "shell_exec", "cargo build"),
+            ),
+            make_annotated(0, make_tool("c1", "compilation error...")),
+            make_annotated(0, make_assistant_text("修复完成")),
+            // Turn 1 (history): User + text-only Assistant
+            make_annotated(1, make_user("问题2")),
+            make_annotated(1, make_assistant_text("回答2")),
+            // Turn 2 (current): User + tool-call Assistant + Tool
+            make_annotated(2, make_user("当前问题")),
+            make_annotated(
+                2,
+                make_assistant_tool_call("c2", "shell_exec", "cargo test"),
+            ),
+            make_annotated(2, make_tool("c2", "tests passed")),
         ];
+        let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
 
-        let result = filter.filter(messages);
+        let result = filter.filter(&refs);
 
         // 10 input messages, 1 history Tool dropped → 9 output messages
-        // [System][User"问题1"][Asst(tool)][Asst"修复完成"][User"问题2"][Asst"回答2"][User"当前"][Asst(tool)][Tool]
-        assert_eq!(result.len(), 9);
-        assert!(matches!(result[0].as_ref(), Message::System { .. }));
-        assert!(matches!(result[1].as_ref(), Message::User { .. })); // "问题1"
-        assert!(matches!(result[2].as_ref(), Message::Assistant { .. })); // tool_call with content
-        assert!(matches!(result[3].as_ref(), Message::Assistant { .. })); // "修复完成"
-        assert!(matches!(result[4].as_ref(), Message::User { .. })); // "问题2"
-        assert!(matches!(result[5].as_ref(), Message::Assistant { .. })); // "回答2"
-        assert!(matches!(result[6].as_ref(), Message::User { .. })); // "当前问题" (current)
-        assert!(matches!(result[7].as_ref(), Message::Assistant { .. })); // current tool_call
-        assert!(matches!(result[8].as_ref(), Message::Tool { .. })); // current tool_result
+        // [User"问题1"][Asst(tool)][Asst"修复完成"][User"问题2"][Asst"回答2"][User"当前"][Asst(tool)][Tool]
+        assert_eq!(result.len(), 8);
+        assert!(matches!(result[0].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[1].message.as_ref(),
+            Message::Assistant { .. }
+        )); // tool_call with content
+        assert!(matches!(
+            result[2].message.as_ref(),
+            Message::Assistant { .. }
+        ));
+        assert!(matches!(result[3].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[4].message.as_ref(),
+            Message::Assistant { .. }
+        )); // "回答2"
+        assert!(matches!(result[5].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[6].message.as_ref(),
+            Message::Assistant { .. }
+        )); // current tool_call
+        assert!(matches!(result[7].message.as_ref(), Message::Tool { .. }));
     }
 }
