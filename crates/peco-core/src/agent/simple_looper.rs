@@ -20,6 +20,7 @@ use model_provider::{Message, ToolCall};
 
 use super::agent::Agent;
 use super::error::AgentError;
+use crate::tools::ToolExecutor;
 
 /// Concurrent tool execution result: (index, tool_call, output).
 type ToolExecResult = (usize, ToolCall, Result<String, String>);
@@ -52,6 +53,11 @@ pub struct SimpleAgentLooper {
 
     /// External cancel signal shared with [`SimpleLooperHandle`].
     cancel_flag: Arc<AtomicBool>,
+
+    /// 可选的自定义 ToolExecutor，覆盖 agent 内置的执行器。
+    /// 设置后，工具定义获取和执行均使用此执行器。
+    /// 由 [`StructuredOutputExecutor`](crate::executor::StructuredOutputExecutor) 使用。
+    tool_executor_override: Option<Arc<dyn ToolExecutor>>,
 }
 
 impl SimpleAgentLooper {
@@ -79,6 +85,37 @@ impl SimpleAgentLooper {
             messages: Vec::new(),
             react_loop_iteration: 0,
             cancel_flag: cancel_flag.clone(),
+            tool_executor_override: None,
+        };
+
+        let join_handle = tokio::spawn(async move { looper.run(prompt).await });
+
+        SimpleLooperHandle {
+            cancel_flag,
+            join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+        }
+    }
+
+    /// 使用自定义 [`ToolExecutor`] 启动（覆盖 agent 内置的）。
+    ///
+    /// 供 [`StructuredOutputExecutor`](crate::executor::StructuredOutputExecutor)
+    /// 注入 `__submit_output__` 工具使用，其他行为与 [`spawn`](SimpleAgentLooper::spawn) 一致。
+    pub fn spawn_with_executor(
+        agent: Arc<Agent>,
+        prompt: String,
+        tool_executor: Arc<dyn ToolExecutor>,
+        max_turns: Option<usize>,
+    ) -> SimpleLooperHandle {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let max_turns = max_turns.unwrap_or_else(|| agent.max_turns());
+
+        let mut looper = SimpleAgentLooper {
+            agent,
+            max_turns,
+            messages: Vec::new(),
+            react_loop_iteration: 0,
+            cancel_flag: cancel_flag.clone(),
+            tool_executor_override: Some(tool_executor),
         };
 
         let join_handle = tokio::spawn(async move { looper.run(prompt).await });
@@ -119,7 +156,14 @@ impl SimpleAgentLooper {
             let mut chat_messages = Vec::with_capacity(self.messages.len() + 1);
             chat_messages.push(Arc::new(Message::system(self.agent.system_prompt())));
             chat_messages.extend(self.messages.iter().cloned());
-            let response = self.agent.chat(chat_messages).await?;
+
+            // 如果有自定义执行器则使用它获取工具定义，否则用 agent 默认的
+            let response = if let Some(ref executor) = self.tool_executor_override {
+                let tools = executor.definitions();
+                self.agent.chat_with_tools(chat_messages, tools).await?
+            } else {
+                self.agent.chat(chat_messages).await?
+            };
 
             // Extract content from response
             let (text, tool_calls) = match &response.message {
@@ -157,7 +201,12 @@ impl SimpleAgentLooper {
         &self,
         tool_calls: &[ToolCall],
     ) -> Result<Vec<Arc<Message>>, AgentError> {
-        let executor = self.agent.mcp_manager().tools_executor().clone();
+        // 有自定义执行器则用它，否则用 MCP 托管的执行器
+        let executor = if let Some(ref ov) = self.tool_executor_override {
+            ov.clone()
+        } else {
+            self.agent.mcp_manager().tools_executor().clone()
+        };
 
         // Spawn all tools concurrently (with index for order preservation)
         let handles: Vec<ToolExecHandle> = tool_calls

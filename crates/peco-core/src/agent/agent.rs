@@ -326,6 +326,19 @@ impl Agent {
         let request = self.build_chat_request(messages, tools);
         Ok(self.model.stream_chat(&request).await?)
     }
+
+    /// 发送非流式 chat 请求，使用指定的 tool 定义。
+    ///
+    /// 由 `SimpleAgentLooper` 在 tool_executor_override 场景下使用，
+    /// 允许调用方提供自定义 tool 列表（如包含 `__submit_output__`）。
+    pub(crate) async fn chat_with_tools(
+        &self,
+        messages: Vec<Arc<Message>>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<ChatResponse, AgentError> {
+        let request = self.build_chat_request(messages, tools);
+        Ok(self.model.chat(&request).await?)
+    }
 }
 
 // ── 辅助函数 ────────────────────────────────────────────────────────────────────

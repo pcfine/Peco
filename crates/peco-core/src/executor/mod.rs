@@ -14,10 +14,12 @@
 
 mod multi_turn;
 mod single_turn;
+mod structured_output;
 mod tool;
 
 pub use multi_turn::MultiTurnExecutor;
 pub use single_turn::SingleTurnExecutor;
+pub use structured_output::StructuredOutputExecutor;
 pub use tool::AgentExecutorTool;
 
 use std::sync::Arc;
@@ -79,6 +81,15 @@ impl ExecutorInput {
             prompt: prompt.into(),
             context,
             output_schema: None,
+        }
+    }
+
+    /// 创建带输出 schema 的输入，供 [`StructuredOutputExecutor`] 使用。
+    pub fn with_schema(prompt: impl Into<String>, output_schema: serde_json::Value) -> Self {
+        Self {
+            prompt: prompt.into(),
+            context: Vec::new(),
+            output_schema: Some(output_schema),
         }
     }
 }
