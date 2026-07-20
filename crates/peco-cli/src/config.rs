@@ -13,14 +13,18 @@ use peco_core::agent::LooperConfig;
 #[derive(Parser, Debug)]
 #[command(name = "peco", version, about, long_about = None)]
 pub struct CliArgs {
-    /// agent.md 配置文件路径
+    /// Agent 名称（从 workspace 的 agents/ 目录加载）或 agent.md 文件路径
     #[arg(
         short = 'a',
         long,
-        default_value = "./agent.md",
+        default_value = "personal-assistant",
         env = "PECO_AGENT_PATH"
     )]
     pub agent: PathBuf,
+
+    /// Workspace 根目录（包含 agents/、skills/、knowledge/ 子目录）
+    #[arg(short = 'w', long, default_value = "./", env = "PECO_WORKSPACE")]
+    pub workspace: PathBuf,
 
     /// 恢复指定 ID 的会话
     #[arg(short = 's', long)]
@@ -37,18 +41,6 @@ pub struct CliArgs {
     /// 会话存储目录
     #[arg(long, env = "PC_AGENT_SESSIONS_DIR")]
     pub sessions_dir: Option<PathBuf>,
-
-    /// Skills 根目录
-    #[arg(long, env = "PECO_SKILLS_ROOT")]
-    pub skills_root: Option<PathBuf>,
-
-    /// 知识库目录
-    #[arg(long, env = "PC_AGENT_KNOWLEDGE_DIR")]
-    pub knowledge_dir: Option<PathBuf>,
-
-    /// 详细日志（debug 级别）
-    #[arg(short = 'v', long)]
-    pub verbose: bool,
 
     /// 禁用彩色输出
     #[arg(long, env = "NO_COLOR")]
@@ -67,15 +59,11 @@ pub struct CliArgs {
 #[derive(Debug, Clone)]
 pub struct CliConfig {
     pub agent_path: PathBuf,
+    pub workspace_root: PathBuf,
     pub session_id: Option<String>,
     pub no_persist: bool,
     pub list_sessions: bool,
     pub sessions_dir: Option<PathBuf>,
-    pub skills_root: Option<PathBuf>,
-    #[allow(dead_code)]
-    pub knowledge_dir: Option<PathBuf>,
-    #[allow(dead_code)]
-    pub verbose: bool,
     pub no_color: bool,
     pub show_reasoning: bool,
     pub show_tools: bool,
@@ -88,13 +76,11 @@ impl CliConfig {
 
         Ok(Self {
             agent_path: args.agent,
+            workspace_root: args.workspace,
             session_id: args.session,
             no_persist: args.no_persist,
             list_sessions: args.list_sessions,
             sessions_dir: args.sessions_dir,
-            skills_root: args.skills_root,
-            knowledge_dir: args.knowledge_dir,
-            verbose: args.verbose,
             no_color: args.no_color,
             show_reasoning: args.show_reasoning,
             show_tools: args.show_tools,

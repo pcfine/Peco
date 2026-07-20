@@ -6,62 +6,16 @@
 
 use std::sync::Arc;
 
-use peco_core::agent::{Agent, AgentError, AgentLooper, LooperEvent, LooperHandle};
-use peco_core::config::{SystemConfig, UserConfig};
-use peco_core::knowledge::KnowledgeManager;
+use peco_core::agent::{Agent, AgentLooper, LooperEvent, LooperHandle};
+use peco_core::config::SystemConfig;
 use peco_core::persistence::{FileSessionPersister, NullSessionPersister, SessionPersister};
 use peco_core::session::Session;
-use peco_core::skills::GlobalSkillList;
-use peco_core::workspace::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+use peco_core::workspace::Workspace;
 
 use crate::commands::{self, CommandRegistry, CommandResult};
 use crate::config::CliConfig;
 use crate::display::{ConsoleRenderer, Renderer};
 use crate::input::InputReader;
-
-// ── Noop trait implementations for CLI tools ─────────────────────────────
-
-struct NoopAgentLoader;
-impl AgentLoader for NoopAgentLoader {
-    fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
-        Err(AgentError::Config("noop agent loader".into()))
-    }
-    fn list_agent_names(&self) -> Vec<String> {
-        vec![]
-    }
-}
-
-struct NoopSkillProvider {
-    registry: Arc<std::sync::RwLock<GlobalSkillList>>,
-}
-impl SkillProvider for NoopSkillProvider {
-    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> {
-        &self.registry
-    }
-}
-
-struct NoopKnowledgeAccess;
-impl KnowledgeAccess for NoopKnowledgeAccess {
-    fn user_id(&self) -> &str {
-        "cli-user"
-    }
-    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
-        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> = std::sync::LazyLock::new(|| {
-            Arc::new(KnowledgeManager::new(
-                dirs_next()
-                    .unwrap_or_else(std::env::temp_dir)
-                    .join("peco-cli-kb"),
-            ))
-        });
-        &KM
-    }
-}
-
-fn dirs_next() -> Option<std::path::PathBuf> {
-    std::env::var("PECO_KNOWLEDGE_DIR")
-        .ok()
-        .map(std::path::PathBuf::from)
-}
 
 // ============================================================================
 // CliApp
@@ -70,8 +24,10 @@ fn dirs_next() -> Option<std::path::PathBuf> {
 /// CLI 应用主结构。
 pub struct CliApp {
     /// CLI 配置
-    #[allow(dead_code)]
     config: CliConfig,
+    /// Workspace 实例（管理 agents/skills/knowledge，保持生命周期）
+    #[allow(dead_code)]
+    workspace: Arc<Workspace>,
     /// Agent 实例
     agent: Arc<Agent>,
     /// AgentLooper 控制句柄（spawn 后持有）
@@ -97,33 +53,41 @@ pub struct CliApp {
 impl CliApp {
     /// 创建 CliApp 实例。
     pub async fn new(config: CliConfig) -> anyhow::Result<Self> {
-        // ── 1. 加载系统配置 + Skills ───────────────────────────────────
+        // ── 1. 加载系统配置 ────────────────────────────────────────────
         let system_config = SystemConfig::load();
 
-        let skills_root = config
-            .skills_root
-            .clone()
-            .unwrap_or_else(|| system_config.skills_root.clone());
-        let mut skill_registry = GlobalSkillList::new(skills_root.clone());
-        match skill_registry.init() {
-            Ok(n) => {
-                eprintln!("[init] 已加载 {n} 个 Skill");
-            }
-            Err(e) => {
-                eprintln!("[warn] Skill 加载失败: {e}");
-            }
-        }
-        let skill_registry = Arc::new(std::sync::RwLock::new(skill_registry));
+        // ── 2. 创建 Workspace ──────────────────────────────────────────
+        let user_id = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "cli-user".to_string());
 
-        // ── 2. 确定 workspace 根目录并加载用户配置 ─────────────────────
-        let workspace_root = config
-            .agent_path
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-        let user_config = UserConfig::load(&system_config, &workspace_root)?;
+        let workspace = Arc::new(
+            Workspace::open(config.workspace_root.clone(), user_id, &system_config)
+                .map_err(|e| anyhow::anyhow!("Workspace 创建失败: {e}"))?,
+        );
 
-        // ── 3. 创建持久化器 ────────────────────────────────────────────
+        eprintln!(
+            "[init] Workspace 已打开: root={}, skills={}",
+            workspace.root().display(),
+            workspace.skill_registry().read().map(|r| r.stats().registered).unwrap_or(0),
+        );
+
+        // ── 3. 加载 Agent ─────────────────────────────────────────────
+        let agent = load_agent_from_config(&workspace, &config)?;
+
+        eprintln!(
+            "[init] Agent 已加载: name={}, path={}, provider={}, model={}",
+            agent.config().agent.name,
+            agent.path().display(),
+            agent.provider().name(),
+            agent
+                .model_config()
+                .model_name
+                .as_deref()
+                .unwrap_or("default"),
+        );
+
+        // ── 4. 创建持久化器 ────────────────────────────────────────────
         let persister: Arc<dyn SessionPersister> = if config.no_persist {
             Arc::new(NullSessionPersister)
         } else {
@@ -133,7 +97,7 @@ impl CliApp {
             }
         };
 
-        // ── 4. 创建或恢复 Session ──────────────────────────────────────
+        // ── 5. 创建或恢复 Session ──────────────────────────────────────
         let (session, session_id, session_description) = if let Some(ref id) = config.session_id {
             match persister.load(id).await? {
                 Some((snapshot, meta)) => {
@@ -152,53 +116,20 @@ impl CliApp {
             }
         } else {
             let id = uuid::Uuid::new_v4().to_string();
-            let desc = config
-                .agent_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("new session")
-                .to_string();
+            let desc = agent.config().agent.name.clone();
             eprintln!("[init] 新建会话: {id}");
             let s = Session::new(id.clone(), desc.clone());
             (s, id, desc)
         };
 
-        // ── 5. 构建 ToolDependencies ────────────────────────────────────
-        let tool_deps = ToolDependencies {
-            agent_loader: Arc::new(NoopAgentLoader),
-            skill_provider: Arc::new(NoopSkillProvider {
-                registry: skill_registry.clone(),
-            }),
-            knowledge_access: Arc::new(NoopKnowledgeAccess),
-        };
-
-        // ── 6. 创建 Agent ──────────────────────────────────────────────
-        let agent = Arc::new(Agent::from_file(
-            &config.agent_path,
-            &user_config,
-            &skill_registry,
-            &tool_deps,
-        )?);
-
-        eprintln!(
-            "[init] Agent 已加载: name={}, path={}, provider={}, model={}",
-            agent.config().agent.name,
-            agent.path().display(),
-            agent.provider().name(),
-            agent
-                .model_config()
-                .model_name
-                .as_deref()
-                .unwrap_or("default"),
-        );
-
-        // ── 5. 构建渲染器和输入 ────────────────────────────────────────
+        // ── 6. 构建渲染器和输入 ────────────────────────────────────────
         let renderer: Box<dyn Renderer> = Box::new(ConsoleRenderer::new(&config));
 
         let input = InputReader::new()?;
 
         Ok(Self {
             config,
+            workspace,
             agent,
             handle: None,
             session_id,
@@ -392,6 +323,43 @@ impl CliApp {
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+/// 根据 CliConfig 解析并加载 Agent。
+///
+/// - 如果 `agent_path` 指向一个已存在的文件 → 直接从文件加载（向后兼容），
+///   使用 workspace 提供的 ToolDependencies。
+/// - 否则 → 视为 workspace 内的 Agent 名称，通过 workspace 加载。
+fn load_agent_from_config(
+    workspace: &Arc<Workspace>,
+    config: &CliConfig,
+) -> anyhow::Result<Arc<Agent>> {
+    if config.agent_path.is_file() {
+        // 直接路径模式（向后兼容）
+        eprintln!(
+            "[init] 从文件加载 Agent: {}",
+            config.agent_path.display()
+        );
+        let deps = workspace.tool_dependencies();
+        let agent = Agent::from_file(
+            &config.agent_path,
+            workspace.config(),
+            workspace.skill_registry(),
+            &deps,
+        )?;
+        Ok(Arc::new(agent))
+    } else {
+        // Workspace 内 Agent 名称模式
+        let name = config
+            .agent_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("personal-assistant");
+        eprintln!("[init] 从 workspace 加载 Agent: {name}");
+        workspace
+            .load_agent_cached(name)
+            .map_err(|e| anyhow::anyhow!("加载 Agent '{}' 失败: {e}", name))
+    }
+}
 
 /// 列出已保存的会话并退出。
 pub async fn list_sessions_and_exit(config: &CliConfig) -> anyhow::Result<()> {
