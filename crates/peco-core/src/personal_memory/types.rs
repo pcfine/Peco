@@ -2,6 +2,8 @@
 // PPA 数据类型 — MemoryFact, UserProfile, QueryType, MemoryOperation
 // ============================================================================
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

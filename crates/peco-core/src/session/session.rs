@@ -15,8 +15,8 @@ use super::buffer::{CommittedBuffer, StagingBuffer};
 use super::error::SessionError;
 use super::snapshot::{SessionSnapshot, TurnBoundaryToken};
 use super::types::{
-    unix_timestamp_ms, unix_timestamp_secs, AnnotatedMessage, InputPriority, MessageId,
-    MessageSource, PendingInput, SessionState,
+    AnnotatedMessage, InputPriority, MessageId, MessageSource, PendingInput, SessionState,
+    unix_timestamp_ms, unix_timestamp_secs,
 };
 
 /// 会话实体。
@@ -202,9 +202,7 @@ impl Session {
 
     /// 展示用消息的引用迭代器（UI 渲染 — 仅 User query + Assistant 最终回复）。
     pub fn display_message_refs(&self) -> impl Iterator<Item = &AnnotatedMessage> {
-        self.committed
-            .iter_all()
-            .filter(|am| am.is_displayable())
+        self.committed.iter_all().filter(|am| am.is_displayable())
     }
 
     // ── Turn 生命周期（&mut self，状态机守卫）─────────────────────────
@@ -292,16 +290,13 @@ impl Session {
     ///
     /// 返回 `TurnBoundaryToken`，用于后续调用 `snapshot()`。
     pub fn rollback_turn(&mut self, requeue: bool) -> Result<TurnBoundaryToken, SessionError> {
-        if requeue {
-            if let Some(ui) = self.staging.take_user_input() {
-                let text = match ui.message.as_ref() {
-                    Message::User { content } => content.clone(),
-                    _ => String::new(),
-                };
-                if !text.is_empty() {
-                    self.pending
-                        .push_front(PendingInput::new(text));
-                }
+        if requeue && let Some(ui) = self.staging.take_user_input() {
+            let text = match ui.message.as_ref() {
+                Message::User { content } => content.clone(),
+                _ => String::new(),
+            };
+            if !text.is_empty() {
+                self.pending.push_front(PendingInput::new(text));
             }
         }
 
@@ -342,7 +337,8 @@ impl Session {
 
     /// 将指定优先级的用户输入加入 pending 队列。
     pub fn enqueue_pending_with_priority(&mut self, text: String, priority: InputPriority) {
-        self.pending.push_back(PendingInput::with_priority(text, priority));
+        self.pending
+            .push_back(PendingInput::with_priority(text, priority));
     }
 
     /// 从 pending 队列取出下一个输入并启动新 turn。
@@ -505,8 +501,11 @@ mod tests {
     fn test_stage_and_commit_turn() {
         let mut s = make_session();
         s.start_turn("hello".to_string()).unwrap();
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("hi there"))
-            .unwrap();
+        s.stage_message(
+            MessageSource::ModelGeneration,
+            Message::assistant("hi there"),
+        )
+        .unwrap();
 
         let token = s.commit_turn().unwrap();
         assert_eq!(s.state(), SessionState::Idle);
@@ -526,7 +525,10 @@ mod tests {
         let result = s.commit_turn();
         assert!(result.is_err());
         match result {
-            Err(SessionError::InvalidStateTransition { current_state, action }) => {
+            Err(SessionError::InvalidStateTransition {
+                current_state,
+                action,
+            }) => {
                 assert_eq!(current_state, SessionState::Idle);
                 assert_eq!(action, "commit_turn");
             }
@@ -557,8 +559,11 @@ mod tests {
     fn test_rollback_turn() {
         let mut s = make_session();
         s.start_turn("hello".to_string()).unwrap();
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("partial"))
-            .unwrap();
+        s.stage_message(
+            MessageSource::ModelGeneration,
+            Message::assistant("partial"),
+        )
+        .unwrap();
 
         let _token = s.rollback_turn(false).unwrap();
         assert_eq!(s.state(), SessionState::Idle);
@@ -616,8 +621,11 @@ mod tests {
         // Create 3 turns
         for i in 0..3 {
             s.start_turn(format!("q{i}")).unwrap();
-            s.stage_message(MessageSource::ModelGeneration, Message::assistant(format!("a{i}")))
-                .unwrap();
+            s.stage_message(
+                MessageSource::ModelGeneration,
+                Message::assistant(format!("a{i}")),
+            )
+            .unwrap();
             let _ = s.commit_turn().unwrap();
         }
         assert_eq!(s.turn_index(), 3);
@@ -674,8 +682,11 @@ mod tests {
         )
         .unwrap();
         // Final assistant — should BE displayable
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("Beijing is sunny, 25C"))
-            .unwrap();
+        s.stage_message(
+            MessageSource::ModelGeneration,
+            Message::assistant("Beijing is sunny, 25C"),
+        )
+        .unwrap();
         let _token = s.commit_turn().unwrap();
 
         let display: Vec<_> = s.display_message_refs().collect();
@@ -708,7 +719,6 @@ mod tests {
 
     #[test]
     fn test_from_snapshot_normalizes_state() {
-
         // Create a snapshot with some data
         let mut s = make_session();
         s.start_turn("q".to_string()).unwrap();
@@ -718,7 +728,8 @@ mod tests {
         let snap = s.snapshot(&token);
 
         // Even if snapshot somehow had non-Idle data, from_snapshot normalizes
-        let restored = Session::from_snapshot("new-id".to_string(), "restored".to_string(), 1000, snap);
+        let restored =
+            Session::from_snapshot("new-id".to_string(), "restored".to_string(), 1000, snap);
         assert_eq!(restored.state(), SessionState::Idle);
         assert!(restored.staging_user_input().is_none());
         assert_eq!(restored.committed_turns().len(), 1);
@@ -765,5 +776,4 @@ mod tests {
         let ui = s.staging_user_input().unwrap();
         assert_eq!(ui.message.as_ref(), &Message::user("normal"));
     }
-
 }

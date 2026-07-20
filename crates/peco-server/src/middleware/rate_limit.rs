@@ -12,7 +12,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use axum::response::Response;
 use governor::{DefaultKeyedRateLimiter, Quota};
 use tower::{Layer, Service};

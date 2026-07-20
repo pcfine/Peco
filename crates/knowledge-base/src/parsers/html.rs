@@ -8,6 +8,12 @@ use crate::types::DocumentMetadata;
 
 pub struct HtmlParser;
 
+impl Default for HtmlParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HtmlParser {
     pub fn new() -> Self {
         Self

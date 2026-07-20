@@ -14,12 +14,13 @@
 // - [`MemoryStore`] — 个人记忆存取
 // - [`KnowledgeAccess`] — 知识库操作
 
+mod deps;
 mod error;
 mod tool_register;
-mod deps;
+#[allow(clippy::module_inception)]
 mod workspace;
 
+pub use deps::{AgentLoader, KnowledgeAccess, MemoryStore, SkillProvider, ToolDependencies};
 pub use error::WorkspaceError;
 pub use tool_register::ToolRegister;
-pub use deps::{AgentLoader, KnowledgeAccess, MemoryStore, SkillProvider, ToolDependencies};
 pub use workspace::Workspace;

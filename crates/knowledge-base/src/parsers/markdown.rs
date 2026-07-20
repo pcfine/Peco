@@ -10,6 +10,12 @@ use crate::types::DocumentMetadata;
 
 pub struct MarkdownParser;
 
+impl Default for MarkdownParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MarkdownParser {
     pub fn new() -> Self {
         Self
@@ -65,8 +71,8 @@ impl DocumentParser for MarkdownParser {
 fn extract_md_title(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("# ") {
-            return Some(trimmed[2..].trim().to_string());
+        if let Some(stripped) = trimmed.strip_prefix("# ") {
+            return Some(stripped.trim().to_string());
         }
     }
     None

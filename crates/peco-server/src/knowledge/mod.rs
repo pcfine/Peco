@@ -19,16 +19,22 @@ pub mod handler;
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
 use axum::Router;
+use axum::routing::{delete, get, post};
 
 use crate::state::AppState;
 
 /// 构建知识库路由。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(handler::list_knowledge_bases).post(handler::create_knowledge_base))
-        .route("/{id}", get(handler::get_knowledge_base).delete(handler::delete_knowledge_base))
+        .route(
+            "/",
+            get(handler::list_knowledge_bases).post(handler::create_knowledge_base),
+        )
+        .route(
+            "/{id}",
+            get(handler::get_knowledge_base).delete(handler::delete_knowledge_base),
+        )
         .route("/{id}/documents", get(handler::list_documents))
         .route("/{id}/upload", post(handler::upload_document))
         .route("/{id}/sync", post(handler::sync_knowledge_base))

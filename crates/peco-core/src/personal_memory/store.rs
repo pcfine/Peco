@@ -20,7 +20,7 @@ use knowledge_base::{KbConfig, SearchResult};
 use tracing::{info, warn};
 
 use super::config::StorageConfig;
-use super::types::{Importance, MemoryCategory, MemoryFact, MemoryOperation, UserProfile};
+use super::types::{Importance, MemoryCategory, MemoryFact, UserProfile};
 use crate::knowledge::KnowledgeManager;
 
 /// 个人记忆存储 — 封装对 Personal KB 的读写操作。
@@ -34,13 +34,18 @@ pub struct PersonalMemoryStore {
     /// Personal KB 名称（如 `personal_memory_user123`）。
     kb_name: String,
     /// 存储配置。
+    #[allow(dead_code)]
     config: StorageConfig,
 }
 
 impl PersonalMemoryStore {
     /// 创建新的 PersonalMemoryStore。
     pub fn new(km: Arc<KnowledgeManager>, kb_name: String, config: StorageConfig) -> Self {
-        Self { km, kb_name, config }
+        Self {
+            km,
+            kb_name,
+            config,
+        }
     }
 
     /// 确保 Personal KB 已创建（幂等）。
@@ -82,13 +87,13 @@ impl PersonalMemoryStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        if let Some(result) = results.first() {
-            if result.title == "_profile" {
-                if let Ok(profile) = serde_yaml::from_str::<UserProfile>(&result.snippet) {
-                    return Ok(profile);
-                }
-                warn!("Failed to parse profile YAML, returning default");
+        if let Some(result) = results.first()
+            && result.title == "_profile"
+        {
+            if let Ok(profile) = serde_yaml::from_str::<UserProfile>(&result.snippet) {
+                return Ok(profile);
             }
+            warn!("Failed to parse profile YAML, returning default");
         }
 
         Ok(UserProfile::default())

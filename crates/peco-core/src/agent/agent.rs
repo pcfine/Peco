@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use std::sync::RwLock;
 
-use model_provider::{
-    ChatRequest, ChatResponse, ChatStream, DeepSeek, Message, ModelProvider, ToolDefinition, Usage,
-};
 use crate::agent::agent_config::{
     AgentProfile, ModelConfig, ModelConfigBuilder, resolve_api_key, split_frontmatter,
 };
 use crate::agent::error::AgentError;
+use model_provider::{
+    ChatRequest, ChatResponse, ChatStream, DeepSeek, Message, ModelProvider, ToolDefinition, Usage,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,7 @@ impl Agent {
     ///
     /// 所有依赖（ModelProvider、ToolExecutor、McpManager）由调用方构建后传入，
     /// Agent 本身不再执行 I/O 或配置解析。
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         md_path: std::path::PathBuf,
         profile: AgentProfile,
@@ -177,7 +178,8 @@ impl Agent {
             .mcp
             .iter()
             .filter_map(|name| {
-                user_config.mcp
+                user_config
+                    .mcp
                     .get_server(name)
                     .filter(|c| c.enabled)
                     .map(|c| (name.clone(), c.clone()))
@@ -252,9 +254,7 @@ impl Agent {
     pub fn system_prompt(&self) -> String {
         let mut prompt = self.preamble.clone();
         if !self.profile.skills.is_empty() {
-            let skill_list = self.skill_registry
-                .read()
-                .expect("RwLock poisoned");
+            let skill_list = self.skill_registry.read().expect("RwLock poisoned");
             let all_meta = skill_list.all_meta();
 
             let mut section = String::from("\n\n## Available Skills\n\n");
@@ -382,11 +382,13 @@ pub fn build_provider_with_user(
         .as_deref()
         .unwrap_or_else(|| user_config.default_provider_name());
 
-    let entry = user_config.provider_entry(Some(provider_name)).ok_or_else(|| {
-        AgentError::Config(format!(
-            "provider '{provider_name}' not found in providers.toml"
-        ))
-    })?;
+    let entry = user_config
+        .provider_entry(Some(provider_name))
+        .ok_or_else(|| {
+            AgentError::Config(format!(
+                "provider '{provider_name}' not found in providers.toml"
+            ))
+        })?;
 
     let api_key = match &entry.api_key {
         Some(key) => resolve_api_key(key)?,
@@ -414,6 +416,7 @@ pub fn build_provider_with_user(
 // ── 日志辅助函数 ─────────────────────────────────────────────────────────────────
 
 /// 截断字符串用于日志输出，超出长度追加 `…(N more chars)`。
+#[allow(dead_code)]
 fn truncate_for_log(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
@@ -426,6 +429,7 @@ fn truncate_for_log(s: &str, max_len: usize) -> String {
 /// 从 assistant 消息中提取日志摘要信息。
 ///
 /// 返回 `(text_preview, reasoning_preview, tool_call_names)`。
+#[allow(dead_code)]
 fn extract_response_info(message: &Message) -> (String, String, String) {
     let (content, tool_calls, reasoning) = match message {
         Message::Assistant {

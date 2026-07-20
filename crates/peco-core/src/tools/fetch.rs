@@ -43,13 +43,12 @@ pub async fn fetch(
 
     let mut req = client.request(method.clone(), &url);
 
-    if let Some(ref headers_str) = headers {
-        if let Ok(header_map) =
+    if let Some(ref headers_str) = headers
+        && let Ok(header_map) =
             serde_json::from_str::<std::collections::HashMap<String, String>>(headers_str)
-        {
-            for (key, value) in header_map {
-                req = req.header(&key, &value);
-            }
+    {
+        for (key, value) in header_map {
+            req = req.header(&key, &value);
         }
     }
 

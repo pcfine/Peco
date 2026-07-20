@@ -25,11 +25,7 @@ impl CliCommand for HelpCommand {
         "/help [命令名]  —  显示全部命令或单个命令详情"
     }
 
-    fn execute(
-        &self,
-        args: &str,
-        ctx: &mut CommandContext<'_>,
-    ) -> anyhow::Result<CommandResult> {
+    fn execute(&self, args: &str, ctx: &mut CommandContext<'_>) -> anyhow::Result<CommandResult> {
         if args.is_empty() {
             print_all_commands(ctx);
         } else {
@@ -52,9 +48,21 @@ fn print_all_commands(ctx: &mut CommandContext<'_>) {
         let alias_str = if aliases.is_empty() {
             String::new()
         } else {
-            format!("  ({})", aliases.iter().map(|a| format!("/{a}")).collect::<Vec<_>>().join(", "))
+            format!(
+                "  ({})",
+                aliases
+                    .iter()
+                    .map(|a| format!("/{a}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
-        println!("  {:<20}  {}{}", style(name).cyan(), cmd.description(), style(alias_str).dim());
+        println!(
+            "  {:<20}  {}{}",
+            style(name).cyan(),
+            cmd.description(),
+            style(alias_str).dim()
+        );
     }
 
     println!();
@@ -73,10 +81,7 @@ fn print_command_detail(ctx: &mut CommandContext<'_>, name: &str) {
                 println!("  用法: {}", style(cmd.usage()).dim());
             }
             if !cmd.aliases().is_empty() {
-                println!(
-                    "  别名: {}",
-                    style(cmd.aliases().join(", ")).dim()
-                );
+                println!("  别名: {}", style(cmd.aliases().join(", ")).dim());
             }
             println!();
             return;

@@ -13,9 +13,7 @@ use super::error::KnowledgeModuleError;
 fn default_kb_dir() -> PathBuf {
     // 默认：~/.peco/knowledge_bases/
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".peco")
-        .join("knowledge_bases")
+    PathBuf::from(home).join(".peco").join("knowledge_bases")
 }
 
 fn default_backend() -> String {
@@ -95,11 +93,11 @@ impl KnowledgeConfig {
             .base_dir
             .parent()
             .map(|p| p.join("knowledge_config.json"));
-        if let Some(ref path) = config_path {
-            if path.exists() {
-                let data = std::fs::read_to_string(path).map_err(KnowledgeModuleError::Io)?;
-                cfg = serde_json::from_str(&data).map_err(KnowledgeModuleError::Json)?;
-            }
+        if let Some(ref path) = config_path
+            && path.exists()
+        {
+            let data = std::fs::read_to_string(path).map_err(KnowledgeModuleError::Io)?;
+            cfg = serde_json::from_str(&data).map_err(KnowledgeModuleError::Json)?;
         }
 
         // 3. 环境变量覆盖（最高优先级）

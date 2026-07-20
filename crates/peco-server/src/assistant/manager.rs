@@ -24,9 +24,9 @@ use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
 use tokio::sync::mpsc;
 
-use crate::chat::sse::{map_looper_event, ChatSseEvent, UsageData};
+use crate::chat::sse::{ChatSseEvent, UsageData, map_looper_event};
 use crate::error::ApiError;
-use crate::personal_assistant::{build_ppa_components, PpaComponents};
+use crate::personal_assistant::{PpaComponents, build_ppa_components};
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
@@ -71,11 +71,10 @@ impl PersonalAssistantManager {
         Self::ensure_agent_installed(&ws).await?;
 
         // ── 2. 加载 Agent ─────────────────────────────────────────────────
-        let agent = ws.load_agent_cached(PERSONAL_ASSISTANT_AGENT_NAME)
+        let agent = ws
+            .load_agent_cached(PERSONAL_ASSISTANT_AGENT_NAME)
             .map_err(|e| {
-                ApiError::Internal(format!(
-                    "failed to load personal assistant agent: {e}"
-                ))
+                ApiError::Internal(format!("failed to load personal assistant agent: {e}"))
             })?;
 
         // ── 3. 构建 PPA 组件（读: DynamicContext → Profile注入 + 记忆检索
@@ -111,8 +110,10 @@ impl PersonalAssistantManager {
         &self,
         state: &AppState,
         message: &str,
-    ) -> Result<Sse<impl Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>, ApiError>
-    {
+    ) -> Result<
+        Sse<impl Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>,
+        ApiError,
+    > {
         let message = message.trim().to_string();
         if message.is_empty() {
             return Err(ApiError::BadRequest("message is required".into()));
@@ -227,12 +228,11 @@ impl PersonalAssistantManager {
                     }
 
                     Some(event) => {
-                        if let Some(sse_ev) = map_looper_event(event, &conv_id_bg) {
-                            if let Ok(ev) = sse_ev.to_sse_event() {
-                                if sse_tx.send(Ok(ev)).await.is_err() {
-                                    break;
-                                }
-                            }
+                        if let Some(sse_ev) = map_looper_event(event, &conv_id_bg)
+                            && let Ok(ev) = sse_ev.to_sse_event()
+                            && sse_tx.send(Ok(ev)).await.is_err()
+                        {
+                            break;
                         }
                     }
 
@@ -258,9 +258,7 @@ impl PersonalAssistantManager {
     ///
     /// 使用 `include_str!` 将随代码提交的模版编译进二进制，
     /// 首次访问时写入用户 Workspace 的 `agents/个人助理/agent.md`。
-    async fn ensure_agent_installed(
-        ws: &peco_core::workspace::Workspace,
-    ) -> Result<(), ApiError> {
+    async fn ensure_agent_installed(ws: &peco_core::workspace::Workspace) -> Result<(), ApiError> {
         // `save_agent` is idempotent: create_dir_all is a no-op on existing dirs,
         // fs::write is atomic, and the content from include_str! is always identical.
         let content = include_str!("personal_assistant_agent.md");
@@ -298,7 +296,9 @@ pub struct PersonalAssistantMessageFilter {
 
 impl PersonalAssistantMessageFilter {
     pub fn new(max_history_messages: usize) -> Self {
-        Self { max_history_messages }
+        Self {
+            max_history_messages,
+        }
     }
 }
 
@@ -309,9 +309,9 @@ impl MessageFilter for PersonalAssistantMessageFilter {
         }
 
         // ── 1. 定位当前轮起点：最后一个 User 消息的索引 ──────────────
-        let last_user_idx = messages.iter().rposition(|m| {
-            matches!(m.as_ref(), Message::User { .. })
-        });
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| matches!(m.as_ref(), Message::User { .. }));
 
         // 无 User 消息 → 全部视为当前轮，原样返回
         let split_idx = match last_user_idx {
@@ -320,9 +320,9 @@ impl MessageFilter for PersonalAssistantMessageFilter {
         };
 
         // 检查首条是否为 System 消息
-        let system_msg: Option<&Arc<Message>> = messages.first().filter(|m| {
-            matches!(m.as_ref(), Message::System { .. })
-        });
+        let system_msg: Option<&Arc<Message>> = messages
+            .first()
+            .filter(|m| matches!(m.as_ref(), Message::System { .. }));
 
         let system_offset = if system_msg.is_some() { 1 } else { 0 };
 
@@ -355,9 +355,8 @@ impl MessageFilter for PersonalAssistantMessageFilter {
         };
 
         // ── 5. 组装：System + 截断后的历史 + 完整当前轮 ──────────────
-        let mut result: Vec<Arc<Message>> = Vec::with_capacity(
-            1 + recent_history.len() + current_turn.len(),
-        );
+        let mut result: Vec<Arc<Message>> =
+            Vec::with_capacity(1 + recent_history.len() + current_turn.len());
 
         if let Some(sys) = system_msg {
             result.push(Arc::clone(sys));
@@ -446,14 +445,14 @@ mod tests {
     fn test_history_tool_calls_filtered() {
         let filter = PersonalAssistantMessageFilter::new(20);
         let messages = vec![
-            make_system("System prompt"),           // 0: System
-            make_user("历史问题1"),                   // 1: User → 保留
+            make_system("System prompt"),                               // 0: System
+            make_user("历史问题1"),                                     // 1: User → 保留
             make_assistant_tool_call("1", "shell_exec", "ls"), // 2: 含 tool_calls + content → 保留
-            make_tool("1", "..."),                   // 3: Tool → 丢弃
-            make_assistant_text("历史回答1"),          // 4: 纯文本 → 保留
-            make_user("当前问题"),                     // 5: ★ 当前轮起点
+            make_tool("1", "..."),                             // 3: Tool → 丢弃
+            make_assistant_text("历史回答1"),                  // 4: 纯文本 → 保留
+            make_user("当前问题"),                             // 5: ★ 当前轮起点
             make_assistant_tool_call("2", "shell_exec", "cargo build"), // 6: 当前轮 → 保留
-            make_tool("2", "..."),                   // 7: 当前轮 → 保留
+            make_tool("2", "..."),                             // 7: 当前轮 → 保留
         ];
 
         let result = filter.filter(messages);
@@ -464,9 +463,9 @@ mod tests {
         assert!(matches!(result[1].as_ref(), Message::User { .. }));
         assert!(matches!(result[2].as_ref(), Message::Assistant { .. }));
         assert!(matches!(result[3].as_ref(), Message::Assistant { .. }));
-        assert!(matches!(result[4].as_ref(), Message::User { .. }));      // 当前 User
+        assert!(matches!(result[4].as_ref(), Message::User { .. })); // 当前 User
         assert!(matches!(result[5].as_ref(), Message::Assistant { .. })); // 当前 tool_call
-        assert!(matches!(result[6].as_ref(), Message::Tool { .. }));      // 当前 tool_result
+        assert!(matches!(result[6].as_ref(), Message::Tool { .. })); // 当前 tool_result
     }
 
     #[test]
@@ -567,7 +566,10 @@ mod tests {
 
         assert_eq!(result.len(), 5);
         assert!(matches!(result[0].as_ref(), Message::User { .. }));
-        assert!(matches!(result[result.len() - 1].as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[result.len() - 1].as_ref(),
+            Message::User { .. }
+        ));
     }
 
     #[test]
@@ -597,13 +599,13 @@ mod tests {
         // [System][User"问题1"][Asst(tool)][Asst"修复完成"][User"问题2"][Asst"回答2"][User"当前"][Asst(tool)][Tool]
         assert_eq!(result.len(), 9);
         assert!(matches!(result[0].as_ref(), Message::System { .. }));
-        assert!(matches!(result[1].as_ref(), Message::User { .. }));       // "问题1"
-        assert!(matches!(result[2].as_ref(), Message::Assistant { .. }));  // tool_call with content
-        assert!(matches!(result[3].as_ref(), Message::Assistant { .. }));  // "修复完成"
-        assert!(matches!(result[4].as_ref(), Message::User { .. }));       // "问题2"
-        assert!(matches!(result[5].as_ref(), Message::Assistant { .. }));  // "回答2"
-        assert!(matches!(result[6].as_ref(), Message::User { .. }));       // "当前问题" (current)
-        assert!(matches!(result[7].as_ref(), Message::Assistant { .. }));  // current tool_call
-        assert!(matches!(result[8].as_ref(), Message::Tool { .. }));       // current tool_result
+        assert!(matches!(result[1].as_ref(), Message::User { .. })); // "问题1"
+        assert!(matches!(result[2].as_ref(), Message::Assistant { .. })); // tool_call with content
+        assert!(matches!(result[3].as_ref(), Message::Assistant { .. })); // "修复完成"
+        assert!(matches!(result[4].as_ref(), Message::User { .. })); // "问题2"
+        assert!(matches!(result[5].as_ref(), Message::Assistant { .. })); // "回答2"
+        assert!(matches!(result[6].as_ref(), Message::User { .. })); // "当前问题" (current)
+        assert!(matches!(result[7].as_ref(), Message::Assistant { .. })); // current tool_call
+        assert!(matches!(result[8].as_ref(), Message::Tool { .. })); // current tool_result
     }
 }

@@ -2,6 +2,10 @@
 // Session 核心类型定义
 // ============================================================================
 //
+// NOTE: Some types are used by peco-server or planned for future use.
+
+#![allow(dead_code)]
+//
 // 本文件定义了 Session 模块的新核心类型：
 // - MessageId: 每条消息的唯一标识符（单调递增）
 // - MessageSource: 消息来源标记（用于审计和调试）
@@ -130,7 +134,7 @@ impl AnnotatedMessage {
                 ..
             } => {
                 content.as_ref().is_some_and(|c| !c.is_empty())
-                    && !tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                    && tool_calls.as_ref().is_none_or(|t| t.is_empty())
             }
             _ => false,
         }
@@ -141,7 +145,7 @@ impl AnnotatedMessage {
         matches!(self.message.as_ref(),
             Message::Assistant { content, tool_calls, .. }
             if content.as_ref().is_some_and(|c| !c.is_empty())
-                && !tool_calls.as_ref().is_some_and(|t| !t.is_empty())
+                && tool_calls.as_ref().is_none_or(|t| t.is_empty())
         )
     }
 

@@ -25,15 +25,13 @@ pub struct CreateKbParams {
 
 /// 插入新知识库记录。
 pub async fn insert(pool: &SqlitePool, params: &CreateKbParams) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO knowledge_bases (id, user_id, name, description) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&params.id)
-    .bind(&params.user_id)
-    .bind(&params.name)
-    .bind(&params.description)
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO knowledge_bases (id, user_id, name, description) VALUES (?, ?, ?, ?)")
+        .bind(&params.id)
+        .bind(&params.user_id)
+        .bind(&params.name)
+        .bind(&params.description)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

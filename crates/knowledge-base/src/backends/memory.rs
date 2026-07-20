@@ -255,10 +255,10 @@ impl VectorIndex for InMemoryBackend {
         let mut scored: Vec<(f32, String, String)> = vectors
             .iter()
             .filter(|(_, (doc_id, _))| {
-                if let Some(ref f) = filters {
-                    if let Some(ref dids) = f.document_ids {
-                        return dids.contains(doc_id);
-                    }
+                if let Some(f) = filters
+                    && let Some(ref dids) = f.document_ids
+                {
+                    return dids.contains(doc_id);
                 }
                 true
             })
@@ -358,7 +358,7 @@ impl GraphStore for InMemoryBackend {
             let next_depth = depth + 1;
 
             for edge in edges.iter() {
-                if !edge_types.is_empty() && !edge_types.iter().any(|et| *et == edge.edge_type) {
+                if !edge_types.is_empty() && !edge_types.contains(&edge.edge_type) {
                     continue;
                 }
 
@@ -418,7 +418,7 @@ impl GraphStore for InMemoryBackend {
 
             let next_depth = depth + 1;
             for edge in edges.iter() {
-                if !edge_types.is_empty() && !edge_types.iter().any(|et| *et == edge.edge_type) {
+                if !edge_types.is_empty() && !edge_types.contains(&edge.edge_type) {
                     continue;
                 }
 
@@ -512,12 +512,11 @@ impl FullTextIndex for InMemoryBackend {
 
         for (cid, chunk) in chunks.iter() {
             // 应用过滤器。
-            if let Some(ref f) = filters {
-                if let Some(ref dids) = f.document_ids {
-                    if !dids.contains(&chunk.document_id) {
-                        continue;
-                    }
-                }
+            if let Some(f) = filters
+                && let Some(ref dids) = f.document_ids
+                && !dids.contains(&chunk.document_id)
+            {
+                continue;
             }
 
             let doc_tokens = tokenize(&chunk.text);

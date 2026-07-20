@@ -36,10 +36,7 @@ pub fn build_router(state: Arc<state::AppState>) -> Router {
 /// 构建完整的 Axum Router，可选择是否启用限流。
 ///
 /// * `enable_rate_limit` — `true` 时添加 per-user 速率限制。
-pub fn build_router_with_limits(
-    state: Arc<state::AppState>,
-    enable_rate_limit: bool,
-) -> Router {
+pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: bool) -> Router {
     let secret = state.jwt_secret.clone();
 
     // 受保护的路由组（需要认证 + 限流）

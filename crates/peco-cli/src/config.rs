@@ -14,7 +14,12 @@ use peco_core::agent::LooperConfig;
 #[command(name = "peco", version, about, long_about = None)]
 pub struct CliArgs {
     /// agent.md 配置文件路径
-    #[arg(short = 'a', long, default_value = "./agent.md", env = "PECO_AGENT_PATH")]
+    #[arg(
+        short = 'a',
+        long,
+        default_value = "./agent.md",
+        env = "PECO_AGENT_PATH"
+    )]
     pub agent: PathBuf,
 
     /// 恢复指定 ID 的会话
@@ -67,7 +72,9 @@ pub struct CliConfig {
     pub list_sessions: bool,
     pub sessions_dir: Option<PathBuf>,
     pub skills_root: Option<PathBuf>,
+    #[allow(dead_code)]
     pub knowledge_dir: Option<PathBuf>,
+    #[allow(dead_code)]
     pub verbose: bool,
     pub no_color: bool,
     pub show_reasoning: bool,

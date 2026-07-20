@@ -76,11 +76,8 @@ impl AgentExecutor for SingleTurnExecutor {
     }
 
     async fn execute(&self, input: ExecutorInput) -> Result<ExecutorOutput, ExecutorError> {
-        let handle = SimpleAgentLooper::spawn(
-            self.agent.clone(),
-            input.prompt.clone(),
-            self.max_turns,
-        );
+        let handle =
+            SimpleAgentLooper::spawn(self.agent.clone(), input.prompt.clone(), self.max_turns);
 
         let content = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, handle.wait())

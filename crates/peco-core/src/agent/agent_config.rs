@@ -292,7 +292,10 @@ pub fn assemble_agent_md(params: &AssembleAgentMdParams) -> String {
 
     // llm 段
     yaml.push_str("llm:\n");
-    yaml.push_str(&format!("  provider: \"{}\"\n", yaml_escape(&params.provider)));
+    yaml.push_str(&format!(
+        "  provider: \"{}\"\n",
+        yaml_escape(&params.provider)
+    ));
     yaml.push_str(&format!("  model: \"{}\"\n", yaml_escape(&params.model)));
     if let Some(t) = params.temperature {
         yaml.push_str(&format!("  temperature: {}\n", t));
@@ -512,7 +515,10 @@ mod tests {
 
         // 验证 identity
         assert_eq!(profile.agent.name, "test-agent");
-        assert_eq!(profile.agent.description, "A test agent for round-trip verification");
+        assert_eq!(
+            profile.agent.description,
+            "A test agent for round-trip verification"
+        );
 
         // 验证 llm 配置
         let llm = profile.llm.expect("llm section should be present");

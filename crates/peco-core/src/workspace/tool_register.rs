@@ -17,10 +17,7 @@ pub struct ToolRegister;
 
 impl ToolRegister {
     /// 构建完全组装的 ToolExecutor。
-    pub fn build(
-        tool_names: &[String],
-        deps: &ToolDependencies,
-    ) -> Arc<dyn ToolExecutor> {
+    pub fn build(tool_names: &[String], deps: &ToolDependencies) -> Arc<dyn ToolExecutor> {
         let mut tools: Vec<Box<dyn ToolDyn>> = Vec::with_capacity(tool_names.len());
 
         for name in tool_names {
@@ -30,28 +27,20 @@ impl ToolRegister {
                 "fetch" => Some(Box::new(Fetch)),
 
                 // ── Skill 依赖 ──────────────────────────
-                "read_skill" => Some(Box::new(ReadSkill::new(
-                    deps.skill_provider.clone(),
-                ))),
+                "read_skill" => Some(Box::new(ReadSkill::new(deps.skill_provider.clone()))),
 
                 // ── Agent 加载依赖 ──────────────────────
-                "delegate_sub_agent" => Some(Box::new(DelegateSubAgent::new(
-                    deps.agent_loader.clone(),
-                ))),
+                "delegate_sub_agent" => {
+                    Some(Box::new(DelegateSubAgent::new(deps.agent_loader.clone())))
+                }
                 "run_parallel_sub_agents" => Some(Box::new(RunParallelSubAgents::new(
                     deps.agent_loader.clone(),
                 ))),
 
                 // ── Memory 依赖 ─────────────────────────
-                "remember" => Some(Box::new(RememberTool::new(
-                    deps.memory_store.clone(),
-                ))),
-                "recall" => Some(Box::new(RecallTool::new(
-                    deps.memory_store.clone(),
-                ))),
-                "forget" => Some(Box::new(ForgetTool::new(
-                    deps.memory_store.clone(),
-                ))),
+                "remember" => Some(Box::new(RememberTool::new(deps.memory_store.clone()))),
+                "recall" => Some(Box::new(RecallTool::new(deps.memory_store.clone()))),
+                "forget" => Some(Box::new(ForgetTool::new(deps.memory_store.clone()))),
 
                 // ── Knowledge 依赖 ──────────────────────
                 "search_knowledge" => Some(Box::new(SearchKnowledge::new(

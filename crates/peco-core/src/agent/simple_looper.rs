@@ -21,6 +21,12 @@ use model_provider::{Message, ToolCall};
 use super::agent::Agent;
 use super::error::AgentError;
 
+/// Concurrent tool execution result: (index, tool_call, output).
+type ToolExecResult = (usize, ToolCall, Result<String, String>);
+type ToolExecHandle = tokio::task::JoinHandle<ToolExecResult>;
+type SimpleTaskHandle = tokio::task::JoinHandle<Result<String, AgentError>>;
+type SharedSimpleTask = Arc<tokio::sync::Mutex<Option<SimpleTaskHandle>>>;
+
 // ============================================================================
 // SimpleAgentLooper — internal
 // ============================================================================
@@ -154,26 +160,24 @@ impl SimpleAgentLooper {
         let executor = self.agent.mcp_manager().tools_executor().clone();
 
         // Spawn all tools concurrently (with index for order preservation)
-        let handles: Vec<tokio::task::JoinHandle<(usize, ToolCall, Result<String, String>)>> =
-            tool_calls
-                .iter()
-                .enumerate()
-                .map(|(idx, tc)| {
-                    let executor = executor.clone();
-                    let tc = tc.clone();
-                    tokio::spawn(async move {
-                        let result = executor
-                            .execute(&tc.function.name, &tc.function.arguments)
-                            .await;
-                        (idx, tc, result)
-                    })
+        let handles: Vec<ToolExecHandle> = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(idx, tc)| {
+                let executor = executor.clone();
+                let tc = tc.clone();
+                tokio::spawn(async move {
+                    let result = executor
+                        .execute(&tc.function.name, &tc.function.arguments)
+                        .await;
+                    (idx, tc, result)
                 })
-                .collect();
+            })
+            .collect();
 
         // Await in order, checking cancel between each handle
         let mut results: Vec<(usize, Arc<Message>)> = Vec::with_capacity(handles.len());
-        let mut expected_idx = 0usize;
-        for handle in handles {
+        for (expected_idx, handle) in handles.into_iter().enumerate() {
             if self.cancel_flag.load(Ordering::Acquire) {
                 // Remaining handles will be dropped (tokio tasks continue but
                 // their results are discarded)
@@ -192,11 +196,13 @@ impl SimpleAgentLooper {
                     // Insert an error placeholder with estimated index
                     results.push((
                         expected_idx,
-                        Arc::new(Message::tool("unknown", format!("tool panicked: {join_err}"))),
+                        Arc::new(Message::tool(
+                            "unknown",
+                            format!("tool panicked: {join_err}"),
+                        )),
                     ));
                 }
             }
-            expected_idx += 1;
         }
 
         // Sort by original index to preserve model's tool_calls order
@@ -236,8 +242,7 @@ impl SimpleAgentLooper {
 /// auto-cancel.
 pub struct SimpleLooperHandle {
     cancel_flag: Arc<AtomicBool>,
-    join_handle:
-        Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<String, AgentError>>>>>,
+    join_handle: SharedSimpleTask,
 }
 
 impl SimpleLooperHandle {
@@ -261,9 +266,12 @@ impl SimpleLooperHandle {
     ///
     /// Propagates if the background task panicked.
     pub async fn wait(&self) -> Result<String, AgentError> {
-        let handle = self.join_handle.lock().await.take().ok_or_else(|| {
-            AgentError::AgentProtocol("task already consumed".into())
-        })?;
+        let handle = self
+            .join_handle
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| AgentError::AgentProtocol("task already consumed".into()))?;
         match handle.await {
             Ok(result) => result,
             Err(join_err) => Err(AgentError::AgentProtocol(format!(
@@ -319,9 +327,9 @@ mod tests {
     #[test]
     fn test_handle_clone() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let join_handle = Arc::new(tokio::sync::Mutex::new(None::<
-            tokio::task::JoinHandle<Result<String, AgentError>>,
-        >));
+        let join_handle = Arc::new(tokio::sync::Mutex::new(
+            None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
+        ));
         let h1 = SimpleLooperHandle {
             cancel_flag: cancel_flag.clone(),
             join_handle: join_handle.clone(),
@@ -337,9 +345,9 @@ mod tests {
     #[test]
     fn test_handle_is_running_no_task() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let join_handle = Arc::new(tokio::sync::Mutex::new(None::<
-            tokio::task::JoinHandle<Result<String, AgentError>>,
-        >));
+        let join_handle = Arc::new(tokio::sync::Mutex::new(
+            None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
+        ));
         let h = SimpleLooperHandle {
             cancel_flag,
             join_handle,
@@ -351,9 +359,9 @@ mod tests {
     fn test_handle_wait_already_consumed() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let join_handle = Arc::new(tokio::sync::Mutex::new(None::<
-            tokio::task::JoinHandle<Result<String, AgentError>>,
-        >));
+        let join_handle = Arc::new(tokio::sync::Mutex::new(
+            None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
+        ));
         let h = SimpleLooperHandle {
             cancel_flag,
             join_handle,

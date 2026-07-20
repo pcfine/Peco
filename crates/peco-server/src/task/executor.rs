@@ -76,26 +76,26 @@ pub async fn execute_task(
         }
         Err(e) => {
             let _ = task_logs::update_status(
-                &pool, &log_id, "error", "",
+                &pool,
+                &log_id,
+                "error",
+                "",
                 &format!("Failed to query agent: {e}"),
                 &Utc::now().to_rfc3339(),
-            ).await;
+            )
+            .await;
             return;
         }
     };
 
-    let agent = match state
-        .workspace_manager
-        .get_agent(&user_id, &agent_name)
-    {
+    let agent = match state.workspace_manager.get_agent(&user_id, &agent_name) {
         Ok(a) => a,
         Err(e) => {
             let finished_at = Utc::now().to_rfc3339();
             let error_msg = format!("Failed to build agent: {e}");
             tracing::error!(task_id = %task_id, error = %error_msg);
-            let _ = task_logs::update_status(
-                &pool, &log_id, "error", "", &error_msg, &finished_at,
-            ).await;
+            let _ = task_logs::update_status(&pool, &log_id, "error", "", &error_msg, &finished_at)
+                .await;
             return;
         }
     };
@@ -115,8 +115,8 @@ pub async fn execute_task(
         let finished_at = Utc::now().to_rfc3339();
         let error_msg = format!("Failed to send query: {e}");
         tracing::error!(task_id = %task_id, error = %error_msg);
-        let _ = task_logs::update_status(&pool, &log_id, "error", "", &error_msg, &finished_at)
-            .await;
+        let _ =
+            task_logs::update_status(&pool, &log_id, "error", "", &error_msg, &finished_at).await;
         return;
     }
 
@@ -129,28 +129,26 @@ pub async fn execute_task(
 
     loop {
         match handle.recv_event().await {
-            Some(LooperEvent::TurnComplete { outcome, .. }) => {
-                match outcome {
-                    TurnOutcome::Success { text } => {
-                        output = text;
-                    }
-                    TurnOutcome::Failed {
-                        reason,
-                        partial_text,
-                    } => {
-                        had_error = true;
-                        error_text = format!("Turn failed: {reason:?}");
-                        if !partial_text.is_empty() {
-                            output = partial_text;
-                        }
-                        tracing::warn!(
-                            task_id = %task_id,
-                            reason = ?reason,
-                            "Task turn failed"
-                        );
-                    }
+            Some(LooperEvent::TurnComplete { outcome, .. }) => match outcome {
+                TurnOutcome::Success { text } => {
+                    output = text;
                 }
-            }
+                TurnOutcome::Failed {
+                    reason,
+                    partial_text,
+                } => {
+                    had_error = true;
+                    error_text = format!("Turn failed: {reason:?}");
+                    if !partial_text.is_empty() {
+                        output = partial_text;
+                    }
+                    tracing::warn!(
+                        task_id = %task_id,
+                        reason = ?reason,
+                        "Task turn failed"
+                    );
+                }
+            },
             Some(LooperEvent::Shutdown {
                 total_usage,
                 total_turns,
@@ -194,9 +192,7 @@ pub async fn execute_task(
     }
 
     // ── 7. 更新 tasks.last_run_at ─────────────────────────────────────────
-    if let Err(e) =
-        tasks::update_run_timestamps(&pool, &task_id, &started_at.to_rfc3339()).await
-    {
+    if let Err(e) = tasks::update_run_timestamps(&pool, &task_id, &started_at.to_rfc3339()).await {
         tracing::error!(task_id = %task_id, error = %e, "Failed to update task timestamps");
     }
 

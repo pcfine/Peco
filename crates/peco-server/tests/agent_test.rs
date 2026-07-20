@@ -174,11 +174,7 @@ async fn test_get_agent() {
 async fn test_get_agent_not_found() {
     let app = TestApp::new().await;
 
-    let resp = app
-        .get("/api/agents/nonexistent-id")
-        .send()
-        .await
-        .unwrap();
+    let resp = app.get("/api/agents/nonexistent-id").send().await.unwrap();
 
     assert_eq!(resp.status(), 404);
 }
@@ -418,14 +414,29 @@ async fn test_create_agent_with_all_new_fields() {
     assert_eq!(body["icon"], "🧪");
     assert_eq!(body["color"], "#ff6600");
 
-    let tools: Vec<&str> = body["tools"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    let tools: Vec<&str> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
     assert!(tools.contains(&"shell"));
     assert!(tools.contains(&"fetch"));
 
-    let mcp: Vec<&str> = body["mcp_servers"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    let mcp: Vec<&str> = body["mcp_servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
     assert!(mcp.contains(&"filesystem"));
 
-    let skills: Vec<&str> = body["skills"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    let skills: Vec<&str> = body["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
     assert!(skills.contains(&"code-review"));
 }
 
@@ -468,6 +479,11 @@ async fn test_update_partial_fields_preserves_others() {
     assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["temperature"], 0.7);
     assert_eq!(body["max_turns"], 25);
-    let tools: Vec<&str> = body["tools"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    let tools: Vec<&str> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
     assert!(tools.contains(&"shell"));
 }

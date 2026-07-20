@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use model_provider::{ChatResponse, ChatStream, Message, StreamEvent, ToolCall, Usage};
+
+type ModelTaskHandle = tokio::task::JoinHandle<Result<ModelResponse, AgentError>>;
+type SharedModelTask = Arc<tokio::sync::Mutex<Option<ModelTaskHandle>>>;
 use serde::{Deserialize, Serialize};
 
 use super::agent::{Agent, MessageFilter, ModelResponse};
@@ -76,7 +79,7 @@ pub enum ReActState {
 // ============================================================================
 
 /// 内层循环需要的临时数据
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ReActContext {
     /// batch 模式的完整响应
     batch_response: Option<ChatResponse>,
@@ -86,17 +89,6 @@ pub(crate) struct ReActContext {
     assistant_text: String,
     /// 当前轮 assistant 推理内容
     assistant_reasoning: String,
-}
-
-impl Default for ReActContext {
-    fn default() -> Self {
-        Self {
-            batch_response: None,
-            pending_tool_calls: Vec::new(),
-            assistant_text: String::new(),
-            assistant_reasoning: String::new(),
-        }
-    }
 }
 
 /// 单个待执行的 tool call 及其执行结果。
@@ -371,9 +363,7 @@ pub enum UserMsg {
 /// 内部使用 `Arc` 共享所有权。仅最后一个 clone 被 drop 时调用 `abort()`。
 /// `try_lock` 保证与 `wait()` 方法无竞态。
 struct OwnedTask {
-    inner: Arc<
-        tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<ModelResponse, AgentError>>>>,
-    >,
+    inner: SharedModelTask,
     /// 取消标志：drop 时先设置此标志通知 looper 退出，再 abort 任务。
     cancel_flag: Arc<AtomicBool>,
 }
@@ -605,10 +595,7 @@ impl StreamAssembler {
                 }
                 b.arguments.push_str(&arguments);
             })
-            .or_insert_with(|| ToolCallBuilder {
-                name,
-                arguments,
-            });
+            .or_insert_with(|| ToolCallBuilder { name, arguments });
     }
 
     /// 标记一个 tool call 为完整（从 ToolCallComplete 事件）。O(1) 平均。
@@ -1073,7 +1060,9 @@ impl AgentLooper {
                 match user_listener.recv().await {
                     Some(UserMsg::Query(text)) => {
                         // 暂停期间收到的输入放入 pending 队列
-                        tracing::info!("Message queued (looper paused). Will process after resume.");
+                        tracing::info!(
+                            "Message queued (looper paused). Will process after resume."
+                        );
                         self.session.enqueue_pending(text);
                     }
                     Some(UserMsg::Shutdown) => break,
@@ -1142,11 +1131,14 @@ impl AgentLooper {
             .as_ref()
             .map(|r| format!("{:?}", r))
             .unwrap_or_else(|| "done".to_string());
-        Self::emit_event_guaranteed(&self.event_speaker, LooperEvent::Shutdown {
-            reason: shutdown_reason,
-            total_turns: turns,
-            total_usage: usage.clone(),
-        })
+        Self::emit_event_guaranteed(
+            &self.event_speaker,
+            LooperEvent::Shutdown {
+                reason: shutdown_reason,
+                total_turns: turns,
+                total_usage: usage.clone(),
+            },
+        )
         .await;
 
         Ok(self.build_model_response(usage, turns))
@@ -1261,26 +1253,36 @@ impl AgentLooper {
                 let outcome = TurnOutcome::Success {
                     text: std::mem::take(&mut self.react_ctx.assistant_text),
                 };
-                Self::emit_event_guaranteed(&self.event_speaker, LooperEvent::TurnComplete {
-                    turn_index: turn,
-                    outcome: outcome.clone(),
-                    usage: usage.clone(),
-                })
+                Self::emit_event_guaranteed(
+                    &self.event_speaker,
+                    LooperEvent::TurnComplete {
+                        turn_index: turn,
+                        outcome: outcome.clone(),
+                        usage: usage.clone(),
+                    },
+                )
                 .await;
                 Self::invoke_on_turn_complete(
-                    &self.config.hooks, turn, outcome.failure_reason(), &usage,
+                    &self.config.hooks,
+                    turn,
+                    outcome.failure_reason(),
+                    &usage,
                     &self.session,
                 )
                 .await;
 
                 // ★ 持久化：turn 边界触发（commit 后）
                 let snapshot = self.session.snapshot(&_token);
-                if let Err(e) = self.persister.save(
-                    &snapshot,
-                    self.session.id(),
-                    self.session.description(),
-                    self.session.created_at(),
-                ).await {
+                if let Err(e) = self
+                    .persister
+                    .save(
+                        &snapshot,
+                        self.session.id(),
+                        self.session.description(),
+                        self.session.created_at(),
+                    )
+                    .await
+                {
                     tracing::error!(error = %e, "Failed to persist session after turn commit");
                 }
 
@@ -1328,14 +1330,20 @@ impl AgentLooper {
 
                 // Emit TurnComplete + hook
                 let usage = self.session.total_usage();
-                Self::emit_event_guaranteed(&self.event_speaker, LooperEvent::TurnComplete {
-                    turn_index: turn,
-                    outcome: outcome.clone(),
-                    usage: usage.clone(),
-                })
+                Self::emit_event_guaranteed(
+                    &self.event_speaker,
+                    LooperEvent::TurnComplete {
+                        turn_index: turn,
+                        outcome: outcome.clone(),
+                        usage: usage.clone(),
+                    },
+                )
                 .await;
                 Self::invoke_on_turn_complete(
-                    &self.config.hooks, turn, outcome.failure_reason(), &usage,
+                    &self.config.hooks,
+                    turn,
+                    outcome.failure_reason(),
+                    &usage,
                     &self.session,
                 )
                 .await;
@@ -1416,17 +1424,15 @@ impl AgentLooper {
             .map(|am| matches!(am.message.as_ref(), Message::User { .. }))
             .unwrap_or(false);
 
-        if last_is_user {
-            if let Some(dc) = &self.config.dynamic_context {
-                let query_text = refs
-                    .last()
-                    .and_then(|am| match am.message.as_ref() {
-                        Message::User { content } => Some(content.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("");
-                self.dynamic_context = dc.query(query_text).await;
-            }
+        if last_is_user && let Some(dc) = &self.config.dynamic_context {
+            let query_text = refs
+                .last()
+                .and_then(|am| match am.message.as_ref() {
+                    Message::User { content } => Some(content.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            self.dynamic_context = dc.query(query_text).await;
         }
 
         // ── 合并 system prompt ─────────────────────────────────────────
@@ -1471,8 +1477,9 @@ impl AgentLooper {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Streaming chat request failed");
-                    self.failure_reason =
-                        Some(TurnFailureReason::Other(format!("Streaming request failed: {e}")));
+                    self.failure_reason = Some(TurnFailureReason::Other(format!(
+                        "Streaming request failed: {e}"
+                    )));
                     self.react_state = ReActState::Failed;
                 }
             }
@@ -1485,8 +1492,9 @@ impl AgentLooper {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Batch chat request failed");
-                    self.failure_reason =
-                        Some(TurnFailureReason::Other(format!("Chat request failed: {e}")));
+                    self.failure_reason = Some(TurnFailureReason::Other(format!(
+                        "Chat request failed: {e}"
+                    )));
                     self.react_state = ReActState::Failed;
                 }
             }
@@ -1665,13 +1673,21 @@ impl AgentLooper {
                     Message::Assistant {
                         content: Some(std::mem::take(&mut self.react_ctx.assistant_text)),
                         tool_calls: None,
-                        reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+                        reasoning_content: if reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(reasoning)
+                        },
                     }
                 } else {
                     Message::Assistant {
                         content: Some(std::mem::take(&mut self.react_ctx.assistant_text)),
                         tool_calls: Some(tool_calls.clone()),
-                        reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+                        reasoning_content: if reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(reasoning)
+                        },
                     }
                 };
                 let _ = self
@@ -1697,8 +1713,7 @@ impl AgentLooper {
 
             Some(Err(e)) => {
                 tracing::error!(error = %e, "Stream error");
-                self.failure_reason =
-                    Some(TurnFailureReason::Other(format!("Stream error: {e}")));
+                self.failure_reason = Some(TurnFailureReason::Other(format!("Stream error: {e}")));
                 self.react_state = ReActState::Failed;
             }
 
@@ -1715,7 +1730,11 @@ impl AgentLooper {
                     let message = Message::Assistant {
                         content: Some(std::mem::take(&mut self.react_ctx.assistant_text)),
                         tool_calls: None,
-                        reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+                        reasoning_content: if reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(reasoning)
+                        },
                     };
                     let _ = self
                         .session
@@ -1933,7 +1952,7 @@ impl AgentLooper {
                 let all_done = self
                     .active_tool_tasks
                     .as_ref()
-                    .map_or(true, |js| js.is_empty());
+                    .is_none_or(|js| js.is_empty());
                 if all_done {
                     self.active_tool_tasks = None;
                     self.finalize_tool_execution().await;
@@ -1963,14 +1982,12 @@ impl AgentLooper {
     async fn finalize_tool_execution(&mut self) {
         for ptc in &self.react_ctx.pending_tool_calls {
             if let Some(ref result) = ptc.result {
-                let _ = self
-                    .session
-                    .stage_message(
-                        MessageSource::ToolExecution {
-                            tool_name: ptc.call.function.name.clone(),
-                        },
-                        Message::tool(&ptc.call.id, &result.result),
-                    );
+                let _ = self.session.stage_message(
+                    MessageSource::ToolExecution {
+                        tool_name: ptc.call.function.name.clone(),
+                    },
+                    Message::tool(&ptc.call.id, &result.result),
+                );
             }
         }
 
@@ -2038,11 +2055,7 @@ mod tests {
             Some("get_weather".to_string()),
             String::new(),
         );
-        a.apply_delta(
-            "call_1".to_string(),
-            None,
-            r#"{"city":"SF"}"#.to_string(),
-        );
+        a.apply_delta("call_1".to_string(), None, r#"{"city":"SF"}"#.to_string());
         let calls = a.build_tool_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");

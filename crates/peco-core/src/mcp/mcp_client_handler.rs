@@ -157,7 +157,7 @@ impl McpClientHandler {
                 handler
                     .tools_executor
                     .add_tool(Box::new(mcp_tool))
-                    .map_err(|e| McpClientError::ToolRegistrationError(e))?;
+                    .map_err(McpClientError::ToolRegistrationError)?;
                 managed.push(tool_name);
             }
 
@@ -185,62 +185,60 @@ impl rmcp::ClientHandler for McpClientHandler {
     /// 1. Removes all previously registered tools from the executor.
     /// 2. Re-fetches the full tool list from the server.
     /// 3. Registers the updated tools.
-    fn on_tool_list_changed(
+    async fn on_tool_list_changed(
         &self,
         context: rmcp::service::NotificationContext<rmcp::RoleClient>,
-    ) -> impl std::future::Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
-        async move {
-            // 1. Re-fetch the full tool list from the MCP server.
-            let tools = match context.peer.list_all_tools().await {
-                Ok(tools) => tools,
+    ) {
+        // 1. Re-fetch the full tool list from the MCP server.
+        let tools = match context.peer.list_all_tools().await {
+            Ok(tools) => tools,
+            Err(e) => {
+                error!(
+                    server = %self.server_name,
+                    error = %e,
+                    "Failed to re-fetch MCP tool list on list_changed notification"
+                );
+                return;
+            }
+        };
+
+        // 2. Remove old tools and register new ones.
+        //    All operations are synchronous after the initial fetch, so we can
+        //    hold the lock through the entire update.
+        let mut managed = self.managed_tools.lock().unwrap();
+
+        for name in managed.drain(..) {
+            if let Err(e) = self.tools_executor.remove_tool(&name) {
+                warn!(
+                    server = %self.server_name,
+                    tool = %name,
+                    error = %e,
+                    "Failed to remove MCP tool during refresh"
+                );
+            }
+        }
+
+        for tool in tools {
+            let tool_name = tool.name.to_string();
+            let mcp_tool = self.build_tool(tool, context.peer.clone());
+            match self.tools_executor.add_tool(Box::new(mcp_tool)) {
+                Ok(()) => managed.push(tool_name),
                 Err(e) => {
                     error!(
                         server = %self.server_name,
+                        tool = %tool_name,
                         error = %e,
-                        "Failed to re-fetch MCP tool list on list_changed notification"
-                    );
-                    return;
-                }
-            };
-
-            // 2. Remove old tools and register new ones.
-            //    All operations are synchronous after the initial fetch, so we can
-            //    hold the lock through the entire update.
-            let mut managed = self.managed_tools.lock().unwrap();
-
-            for name in managed.drain(..) {
-                if let Err(e) = self.tools_executor.remove_tool(&name) {
-                    warn!(
-                        server = %self.server_name,
-                        tool = %name,
-                        error = %e,
-                        "Failed to remove MCP tool during refresh"
+                        "Failed to register MCP tool during refresh"
                     );
                 }
             }
-
-            for tool in tools {
-                let tool_name = tool.name.to_string();
-                let mcp_tool = self.build_tool(tool, context.peer.clone());
-                match self.tools_executor.add_tool(Box::new(mcp_tool)) {
-                    Ok(()) => managed.push(tool_name),
-                    Err(e) => {
-                        error!(
-                            server = %self.server_name,
-                            tool = %tool_name,
-                            error = %e,
-                            "Failed to register MCP tool during refresh"
-                        );
-                    }
-                }
-            }
-
-            info!(
-                server = %self.server_name,
-                tool_count = managed.len(),
-                "MCP tool list refreshed successfully"
-            );
         }
+
+        info!(
+            server = %self.server_name,
+            tool_count = managed.len(),
+            "MCP tool list refreshed successfully"
+        );
     }
 }
 

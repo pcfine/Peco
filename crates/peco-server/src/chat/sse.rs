@@ -177,9 +177,7 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             })
         }
 
-        LooperEvent::Shutdown {
-            total_usage, ..
-        } => Some(ChatSseEvent::Done {
+        LooperEvent::Shutdown { total_usage, .. } => Some(ChatSseEvent::Done {
             usage: total_usage.into(),
             conversation_id: cid,
         }),

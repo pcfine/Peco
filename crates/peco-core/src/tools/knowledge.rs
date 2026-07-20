@@ -78,32 +78,47 @@ impl ToolDyn for SearchKnowledge {
                 #[serde(default = "default_top_k")]
                 top_k: usize,
             }
-            fn default_top_k() -> usize { 5 }
+            fn default_top_k() -> usize {
+                5
+            }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
 
             let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(|e| string_err(e))?;
+            km.ensure_loaded().await.map_err(string_err)?;
 
             let formatted = if let Some(name) = &parsed.kb_name {
-                let results = km.search_kb(name, &parsed.query, parsed.top_k)
-                    .await.map_err(|e| string_err(e))?;
-                results.iter().map(|r| json!({
-                    "kb": name.clone(), "title": r.title, "snippet": r.snippet,
-                    "score": r.score, "source": r.source_path,
-                })).collect::<Vec<_>>()
+                let results = km
+                    .search_kb(name, &parsed.query, parsed.top_k)
+                    .await
+                    .map_err(string_err)?;
+                results
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "kb": name.clone(), "title": r.title, "snippet": r.snippet,
+                            "score": r.score, "source": r.source_path,
+                        })
+                    })
+                    .collect::<Vec<_>>()
             } else {
-                let all = km.search_all(&parsed.query, parsed.top_k)
-                    .await.map_err(|e| string_err(e))?;
-                all.into_iter().flat_map(|(kb_name, hits)| {
-                    hits.into_iter().map(move |h| json!({
-                        "kb": kb_name.clone(), "title": h.title, "snippet": h.snippet,
-                        "score": h.score, "source": h.source_path,
-                    }))
-                }).collect::<Vec<_>>()
+                let all = km
+                    .search_all(&parsed.query, parsed.top_k)
+                    .await
+                    .map_err(string_err)?;
+                all.into_iter()
+                    .flat_map(|(kb_name, hits)| {
+                        hits.into_iter().map(move |h| {
+                            json!({
+                                "kb": kb_name.clone(), "title": h.title, "snippet": h.snippet,
+                                "score": h.score, "source": h.source_path,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>()
             };
 
-            serde_json::to_string_pretty(&formatted).map_err(|e| string_err(e))
+            serde_json::to_string_pretty(&formatted).map_err(string_err)
         })
     }
 }
@@ -142,16 +157,21 @@ impl ToolDyn for ListKnowledgeBases {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(|e| string_err(e))?;
+            km.ensure_loaded().await.map_err(string_err)?;
 
-            let infos = km.list_kbs().await.map_err(|e| string_err(e))?;
-            let display: Vec<_> = infos.into_iter().map(|i| json!({
-                "name": i.name, "description": i.description, "backend": i.backend,
-                "embedding_model": i.embedding_model, "document_count": i.document_count,
-                "chunk_count": i.chunk_count,
-            })).collect();
+            let infos = km.list_kbs().await.map_err(string_err)?;
+            let display: Vec<_> = infos
+                .into_iter()
+                .map(|i| {
+                    json!({
+                        "name": i.name, "description": i.description, "backend": i.backend,
+                        "embedding_model": i.embedding_model, "document_count": i.document_count,
+                        "chunk_count": i.chunk_count,
+                    })
+                })
+                .collect();
 
-            serde_json::to_string_pretty(&display).map_err(|e| string_err(e))
+            serde_json::to_string_pretty(&display).map_err(string_err)
         })
     }
 }
@@ -178,8 +198,7 @@ impl ToolDyn for AddToKnowledgeBase {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "add_to_knowledge_base".to_string(),
-            description: "添加文本内容到知识库。"
-                .to_string(),
+            description: "添加文本内容到知识库。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -211,10 +230,12 @@ impl ToolDyn for AddToKnowledgeBase {
             let source = parsed.source.unwrap_or_else(|| "manual".to_string());
 
             let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(|e| string_err(e))?;
+            km.ensure_loaded().await.map_err(string_err)?;
 
-            let doc = km.add_text_to_kb(&parsed.kb_name, &parsed.title, &parsed.content, &source)
-                .await.map_err(|e| string_err(e))?;
+            let doc = km
+                .add_text_to_kb(&parsed.kb_name, &parsed.title, &parsed.content, &source)
+                .await
+                .map_err(string_err)?;
 
             Ok(format!("已添加文档: {} (id: {})", doc.title, doc.id))
         })
@@ -261,23 +282,36 @@ impl ToolDyn for SyncKnowledgeBase {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
-            struct Args { kb_name: Option<String> }
+            struct Args {
+                kb_name: Option<String>,
+            }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(|e| string_err(e))?;
+            km.ensure_loaded().await.map_err(string_err)?;
 
             if let Some(name) = parsed.kb_name {
-                let report = km.sync_kb(&name).await.map_err(|e| string_err(e))?;
+                let report = km.sync_kb(&name).await.map_err(string_err)?;
                 Ok(format!(
                     "知识库 '{}' 同步完成:\n- 新增: {} 个文件\n- 更新: {} 个文件\n- 删除: {} 个文件\n- 跳过: {} 个文件\n- 耗时: {}ms",
-                    report.kb_name, report.added, report.updated, report.removed, report.skipped, report.duration_ms
+                    report.kb_name,
+                    report.added,
+                    report.updated,
+                    report.removed,
+                    report.skipped,
+                    report.duration_ms
                 ))
             } else {
-                let all_reports = km.sync_all().await.map_err(|e| string_err(e))?;
-                let lines: Vec<String> = all_reports.iter().map(|(name, report)| {
-                    format!("  '{}': +{}/~{} 跳过{}", name, report.added, report.updated, report.skipped)
-                }).collect();
+                let all_reports = km.sync_all().await.map_err(string_err)?;
+                let lines: Vec<String> = all_reports
+                    .iter()
+                    .map(|(name, report)| {
+                        format!(
+                            "  '{}': +{}/~{} 跳过{}",
+                            name, report.added, report.updated, report.skipped
+                        )
+                    })
+                    .collect();
                 Ok(format!("所有知识库同步完成:\n{}", lines.join("\n")))
             }
         })
@@ -306,8 +340,7 @@ impl ToolDyn for GetKnowledgeBaseDocs {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "get_knowledge_base_docs".to_string(),
-            description: "查看指定知识库中的文档列表。"
-                .to_string(),
+            description: "查看指定知识库中的文档列表。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -324,20 +357,29 @@ impl ToolDyn for GetKnowledgeBaseDocs {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
-            struct Args { kb_name: String }
+            struct Args {
+                kb_name: String,
+            }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(|e| string_err(e))?;
+            km.ensure_loaded().await.map_err(string_err)?;
 
-            let docs = km.list_documents(&parsed.kb_name, 0, 100)
-                .await.map_err(|e| string_err(e))?;
+            let docs = km
+                .list_documents(&parsed.kb_name, 0, 100)
+                .await
+                .map_err(string_err)?;
 
-            let display: Vec<_> = docs.into_iter().map(|d| json!({
-                "id": d.id, "title": d.title, "source": d.source_path,
-            })).collect();
+            let display: Vec<_> = docs
+                .into_iter()
+                .map(|d| {
+                    json!({
+                        "id": d.id, "title": d.title, "source": d.source_path,
+                    })
+                })
+                .collect();
 
-            serde_json::to_string_pretty(&display).map_err(|e| string_err(e))
+            serde_json::to_string_pretty(&display).map_err(string_err)
         })
     }
 }

@@ -6,8 +6,8 @@ mod handler;
 
 use std::sync::Arc;
 
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 
 use crate::state::AppState;
 
@@ -22,5 +22,10 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(handler::list).post(handler::create))
-        .route("/{id}", get(handler::get).patch(handler::update).delete(handler::delete))
+        .route(
+            "/{id}",
+            get(handler::get)
+                .patch(handler::update)
+                .delete(handler::delete),
+        )
 }

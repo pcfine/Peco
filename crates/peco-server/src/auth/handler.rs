@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -106,13 +106,12 @@ pub async fn register(
     }
 
     // ── 检查重复 ──────────────────────────────────────────────────────────
-    let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM users WHERE email = ? OR username = ?",
-    )
-    .bind(email)
-    .bind(username)
-    .fetch_one(&state.db)
-    .await?;
+    let existing =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE email = ? OR username = ?")
+            .bind(email)
+            .bind(username)
+            .fetch_one(&state.db)
+            .await?;
 
     if existing > 0 {
         return Err(ApiError::Conflict(
@@ -132,21 +131,17 @@ pub async fn register(
     // ── 插入用户 ──────────────────────────────────────────────────────────
     let user_id = Uuid::new_v4().to_string();
 
-    sqlx::query(
-        "INSERT INTO users (id, username, email, password_hash) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&user_id)
-    .bind(username)
-    .bind(email)
-    .bind(&password_hash)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("INSERT INTO users (id, username, email, password_hash) VALUES (?, ?, ?, ?)")
+        .bind(&user_id)
+        .bind(username)
+        .bind(email)
+        .bind(&password_hash)
+        .execute(&state.db)
+        .await?;
 
     // ── 签发 JWT ──────────────────────────────────────────────────────────
-    let token =
-        jwt::create_token(&user_id, &state.jwt_secret).map_err(|e| {
-            ApiError::Internal(format!("token generation failed: {e}"))
-        })?;
+    let token = jwt::create_token(&user_id, &state.jwt_secret)
+        .map_err(|e| ApiError::Internal(format!("token generation failed: {e}")))?;
 
     // ── 读取用户完整信息（含 created_at）─────────────────────────────────
     let user = sqlx::query_as::<_, UserPublicRow>(
@@ -211,10 +206,8 @@ pub async fn login(
     }
 
     // ── 签发 JWT ──────────────────────────────────────────────────────────
-    let token =
-        jwt::create_token(&user.id, &state.jwt_secret).map_err(|e| {
-            ApiError::Internal(format!("token generation failed: {e}"))
-        })?;
+    let token = jwt::create_token(&user.id, &state.jwt_secret)
+        .map_err(|e| ApiError::Internal(format!("token generation failed: {e}")))?;
 
     tracing::info!(
         user_id = %user.id,

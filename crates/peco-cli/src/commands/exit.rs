@@ -23,11 +23,7 @@ impl CliCommand for ExitCommand {
         "/exit  —  退出 CLI 聊天助手"
     }
 
-    fn execute(
-        &self,
-        _args: &str,
-        ctx: &mut CommandContext<'_>,
-    ) -> anyhow::Result<CommandResult> {
+    fn execute(&self, _args: &str, ctx: &mut CommandContext<'_>) -> anyhow::Result<CommandResult> {
         ctx.app.request_exit();
         Ok(CommandResult::Exit)
     }

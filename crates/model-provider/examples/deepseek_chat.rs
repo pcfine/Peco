@@ -42,8 +42,12 @@ async fn run_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
     let request = ChatRequest {
         model: DEEPSEEK_V4_PRO.to_string(),
         messages: vec![
-            Arc::new(Message::system("You are a helpful assistant. Keep answers concise.")),
-            Arc::new(Message::user("What are the top 3 programming languages in 2026?")),
+            Arc::new(Message::system(
+                "You are a helpful assistant. Keep answers concise.",
+            )),
+            Arc::new(Message::user(
+                "What are the top 3 programming languages in 2026?",
+            )),
         ],
         tools: vec![],
         temperature: Some(0.7),
@@ -65,7 +69,9 @@ async fn run_stream_chat(provider: &dyn ModelProvider) -> Result<(), ProviderErr
     let request = ChatRequest {
         model: DEEPSEEK_V4_PRO.to_string(),
         messages: vec![
-            Arc::new(Message::system("You are a helpful assistant. Keep answers concise.")),
+            Arc::new(Message::system(
+                "You are a helpful assistant. Keep answers concise.",
+            )),
             Arc::new(Message::user("Write a haiku about Rust programming.")),
         ],
         tools: vec![],
@@ -138,7 +144,9 @@ async fn run_tool_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError
 
     let request = ChatRequest {
         model: DEEPSEEK_V4_PRO.to_string(),
-        messages: vec![Arc::new(Message::user("What's the weather like in San Francisco?"))],
+        messages: vec![Arc::new(Message::user(
+            "What's the weather like in San Francisco?",
+        ))],
         tools: vec![weather_tool],
         temperature: Some(0.0),
         max_tokens: Some(256),

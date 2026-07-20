@@ -221,10 +221,13 @@ impl McpManager {
             return;
         }
 
-        info!(count = pending.len(), "Establishing deferred MCP connections");
+        info!(
+            count = pending.len(),
+            "Establishing deferred MCP connections"
+        );
 
         for (name, config) in &pending {
-            match connect_one(&name, config, self.tools_executor.clone()).await {
+            match connect_one(name, config, self.tools_executor.clone()).await {
                 Ok(service) => {
                     let mut guard = self.services.lock().unwrap();
                     guard.push(McpServerHandler {

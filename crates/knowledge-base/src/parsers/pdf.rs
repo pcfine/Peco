@@ -10,6 +10,12 @@ use crate::types::DocumentMetadata;
 
 pub struct PdfParser;
 
+impl Default for PdfParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PdfParser {
     pub fn new() -> Self {
         Self
@@ -35,7 +41,7 @@ impl DocumentParser for PdfParser {
         })
         .await
         .map_err(|e| KnowledgeError::InvalidInput(format!("spawn_blocking 失败: {e}")))?
-        .map_err(|e| KnowledgeError::InvalidInput(e))?;
+        .map_err(KnowledgeError::InvalidInput)?;
 
         if content.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(

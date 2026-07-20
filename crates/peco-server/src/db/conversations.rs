@@ -28,15 +28,13 @@ pub async fn insert(
     pool: &SqlitePool,
     params: &CreateConversationParams,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO conversations (id, user_id, agent_id, title) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&params.id)
-    .bind(&params.user_id)
-    .bind(&params.agent_id)
-    .bind(&params.title)
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO conversations (id, user_id, agent_id, title) VALUES (?, ?, ?, ?)")
+        .bind(&params.id)
+        .bind(&params.user_id)
+        .bind(&params.agent_id)
+        .bind(&params.title)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -102,13 +100,11 @@ pub async fn update_title(
     conversation_id: &str,
     title: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?",
-    )
-    .bind(title)
-    .bind(conversation_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE conversations SET title = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(title)
+        .bind(conversation_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

@@ -167,19 +167,17 @@ impl syn::parse::Parse for ParamEntry {
 /// Extract the first doc comment (`/// ...`) from a list of attributes.
 fn extract_doc_comment(attrs: &[Attribute]) -> Option<String> {
     for attr in attrs {
-        if attr.path().is_ident("doc") {
-            if let syn::Meta::NameValue(meta_nv) = &attr.meta {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(lit_str),
-                    ..
-                }) = &meta_nv.value
-                {
-                    let doc = lit_str.value();
-                    let trimmed = doc.trim().to_string();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed);
-                    }
-                }
+        if attr.path().is_ident("doc")
+            && let syn::Meta::NameValue(meta_nv) = &attr.meta
+            && let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(lit_str),
+                ..
+            }) = &meta_nv.value
+        {
+            let doc = lit_str.value();
+            let trimmed = doc.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
             }
         }
     }
@@ -188,10 +186,10 @@ fn extract_doc_comment(attrs: &[Attribute]) -> Option<String> {
 
 /// Check if a type is `Option<T>`.
 fn is_option_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            return segment.ident == "Option";
-        }
+    if let Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return segment.ident == "Option";
     }
     false
 }
@@ -216,29 +214,27 @@ fn extract_result_types(
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     match output {
         ReturnType::Type(_, ty) => {
-            if let Type::Path(type_path) = &**ty {
-                if let Some(segment) = type_path.path.segments.last() {
-                    if segment.ident == "Result" {
-                        if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                            let mut types = args.args.iter().filter_map(|a| {
-                                if let syn::GenericArgument::Type(t) = a {
-                                    Some(t)
-                                } else {
-                                    None
-                                }
-                            });
-                            let output_type = types
-                                .next()
-                                .map(|t| quote!(#t))
-                                .unwrap_or_else(|| quote!(()));
-                            let error_type = types
-                                .next()
-                                .map(|t| quote!(#t))
-                                .unwrap_or_else(|| quote!(()));
-                            return (output_type, error_type);
-                        }
+            if let Type::Path(type_path) = &**ty
+                && let Some(segment) = type_path.path.segments.last()
+                && segment.ident == "Result"
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+            {
+                let mut types = args.args.iter().filter_map(|a| {
+                    if let syn::GenericArgument::Type(t) = a {
+                        Some(t)
+                    } else {
+                        None
                     }
-                }
+                });
+                let output_type = types
+                    .next()
+                    .map(|t| quote!(#t))
+                    .unwrap_or_else(|| quote!(()));
+                let error_type = types
+                    .next()
+                    .map(|t| quote!(#t))
+                    .unwrap_or_else(|| quote!(()));
+                return (output_type, error_type);
             }
             (quote!((())), quote!((())))
         }
@@ -310,37 +306,36 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
     let mut field_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for arg in input_fn.sig.inputs.iter() {
-        if let syn::FnArg::Typed(pat_type) = arg {
-            if let syn::Pat::Ident(param_ident) = &*pat_type.pat {
-                let param_name = &param_ident.ident;
-                let param_name_str = param_name.to_string();
-                let ty = &pat_type.ty;
+        if let syn::FnArg::Typed(pat_type) = arg
+            && let syn::Pat::Ident(param_ident) = &*pat_type.pat
+        {
+            let param_name = &param_ident.ident;
+            let param_name_str = param_name.to_string();
+            let ty = &pat_type.ty;
 
-                // Field description: explicit > doc comment on param > default
-                let field_doc = if let Some(explicit) = args.param_descriptions.get(&param_name_str)
-                {
-                    quote! { #[schemars(description = #explicit)] }
-                } else if let Some(doc) = extract_doc_comment(&pat_type.attrs) {
-                    quote! { #[schemars(description = #doc)] }
-                } else {
-                    let default_desc = format!("Parameter `{param_name_str}`");
-                    quote! { #[schemars(description = #default_desc)] }
-                };
+            // Field description: explicit > doc comment on param > default
+            let field_doc = if let Some(explicit) = args.param_descriptions.get(&param_name_str) {
+                quote! { #[schemars(description = #explicit)] }
+            } else if let Some(doc) = extract_doc_comment(&pat_type.attrs) {
+                quote! { #[schemars(description = #doc)] }
+            } else {
+                let default_desc = format!("Parameter `{param_name_str}`");
+                quote! { #[schemars(description = #default_desc)] }
+            };
 
-                // Option<T> → #[serde(default)]
-                let serde_default = if is_option_type(ty) {
-                    quote! { #[serde(default)] }
-                } else {
-                    quote! {}
-                };
+            // Option<T> → #[serde(default)]
+            let serde_default = if is_option_type(ty) {
+                quote! { #[serde(default)] }
+            } else {
+                quote! {}
+            };
 
-                field_tokens.push(quote! {
-                    #field_doc
-                    #serde_default
-                    #vis #param_name: #ty
-                });
-                param_names.push(param_name.clone());
-            }
+            field_tokens.push(quote! {
+                #field_doc
+                #serde_default
+                #vis #param_name: #ty
+            });
+            param_names.push(param_name.clone());
         }
     }
 

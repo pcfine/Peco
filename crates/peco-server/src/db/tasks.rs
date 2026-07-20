@@ -133,7 +133,7 @@ pub async fn update(
         return Ok(false);
     }
 
-    sets.push(format!("updated_at = datetime('now')"));
+    sets.push("updated_at = datetime('now')".to_string());
 
     let sql = format!(
         "UPDATE tasks SET {} WHERE id = ?{}",

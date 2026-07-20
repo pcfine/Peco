@@ -28,6 +28,7 @@ pub enum ToolCallDeltaContent {
 
 /// Token usage record for a single model completion call within an agent run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(dead_code)]
 pub struct ModelUsageRecord {
     /// Zero-based index of this completion call within the agent run.
     pub call_index: usize,

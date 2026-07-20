@@ -7,10 +7,10 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
-use axum::Json;
 use futures::stream::Stream;
 use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent};
 use peco_core::persistence::SessionPersister;
@@ -26,7 +26,7 @@ use crate::personal_assistant::build_ppa_components;
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
-use super::sse::{map_looper_event, ChatSseEvent, UsageData};
+use super::sse::{ChatSseEvent, UsageData, map_looper_event};
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
 
@@ -141,10 +141,7 @@ fn extract_sub_agent_result(tool_result: &str, info: &SubAgentInfo, tool_name: &
 /// 确保用户拥有全能助手（omni-assistant）Agent。
 ///
 /// 若不存在则自动创建，返回 agent_id。
-async fn ensure_omni_agent(
-    state: &Arc<AppState>,
-    user_id: &str,
-) -> Result<String, ApiError> {
+async fn ensure_omni_agent(state: &Arc<AppState>, user_id: &str) -> Result<String, ApiError> {
     // 查找名为 "全能助手" 的 agent
     let existing = agents::find_id_by_name_and_user(&state.db, "全能助手", user_id).await?;
     if let Some(agent_id) = existing {
@@ -166,10 +163,11 @@ async fn ensure_omni_agent(
         mcp_servers: vec![],
         skills: vec![],
         max_turns: 20,
-        system_prompt: "你是一个智能 AI 助手（Omni-Assistant），能够回答各种问题、使用工具完成任务。\
+        system_prompt:
+            "你是一个智能 AI 助手（Omni-Assistant），能够回答各种问题、使用工具完成任务。\
             当遇到专业领域问题时，你可以调用子 Agent 来获取更专业的帮助。\
             请始终使用中文回复用户。"
-            .to_string(),
+                .to_string(),
     };
     let content = peco_core::agent::agent_config::assemble_agent_md(&assemble_params);
 
@@ -190,7 +188,9 @@ async fn ensure_omni_agent(
     if let Err(e) = ws.save_agent("全能助手", &content) {
         // 回滚：删除已写入的 DB 索引
         let _ = agents::delete(&state.db, &agent_id).await;
-        return Err(ApiError::Internal(format!("failed to write omni agent.md: {e}")));
+        return Err(ApiError::Internal(format!(
+            "failed to write omni agent.md: {e}"
+        )));
     }
 
     tracing::info!(
@@ -232,8 +232,7 @@ pub async fn list_conversations(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ConversationListQuery>,
 ) -> Result<Json<Vec<ConversationResponse>>, ApiError> {
-    let rows =
-        conversations::list_by_user(&state.db, &user_id, params.agent_id.as_deref()).await?;
+    let rows = conversations::list_by_user(&state.db, &user_id, params.agent_id.as_deref()).await?;
 
     let mut responses = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -345,8 +344,8 @@ pub async fn get_messages(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
 
-    let rows = messages::list_by_conversation(&state.db, &conv_id, params.offset, params.limit)
-        .await?;
+    let rows =
+        messages::list_by_conversation(&state.db, &conv_id, params.offset, params.limit).await?;
 
     let responses: Vec<MessageResponse> = rows
         .iter()
@@ -458,7 +457,8 @@ pub async fn stream_chat(
 
     // ── 5. 后台执行 AgentLooper ──────────────────────────────────────────
     tokio::spawn(async move {
-        let persister: Arc<dyn SessionPersister> = Arc::new(SqliteSessionPersister::new(db_for_bg.clone()));
+        let persister: Arc<dyn SessionPersister> =
+            Arc::new(SqliteSessionPersister::new(db_for_bg.clone()));
 
         let config = LooperConfig {
             event_buffer: 256,
@@ -510,28 +510,29 @@ pub async fn stream_chat(
             match handle.recv_event().await {
                 Some(LooperEvent::TextDelta { delta }) => {
                     assistant_text.push_str(&delta);
-                    if let Some(sse_ev) = map_looper_event(
-                        LooperEvent::TextDelta { delta },
-                        &conv_id_for_bg,
-                    ) {
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break; // 客户端断开
-                            }
-                        }
+                    if let Some(sse_ev) =
+                        map_looper_event(LooperEvent::TextDelta { delta }, &conv_id_for_bg)
+                        && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break; // 客户端断开
                     }
                 }
 
                 // ── 子 Agent 调用：delegate_sub_agent ─────────────────────
-                Some(LooperEvent::ToolCallStart { ref id, ref name, ref arguments })
-                    if name == "delegate_sub_agent" =>
-                {
+                Some(LooperEvent::ToolCallStart {
+                    ref id,
+                    ref name,
+                    ref arguments,
+                }) if name == "delegate_sub_agent" => {
                     // 解析参数获取 agent_name 和 task
                     if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
                         let agent_name = args["agent_name"].as_str().unwrap_or("unknown");
                         let task = args["prompt"].as_str().unwrap_or("");
                         let agent_id = agents::find_id_by_name_and_user(
-                            &db_for_bg, agent_name, &user_id_for_bg,
+                            &db_for_bg,
+                            agent_name,
+                            &user_id_for_bg,
                         )
                         .await
                         .ok()
@@ -548,16 +549,19 @@ pub async fn stream_chat(
                             task: task.to_string(),
                             conversation_id: conv_id_for_bg.clone(),
                         };
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
+                        if let Ok(ev) = sse_ev.to_sse_event()
+                            && sse_tx.send(Ok(ev)).await.is_err()
+                        {
+                            break;
                         }
-                        sub_agent_registry.insert(id.clone(), vec![SubAgentInfo {
-                            call_id: call_id.clone(),
-                            agent_id,
-                            agent_name: agent_name.to_string(),
-                        }]);
+                        sub_agent_registry.insert(
+                            id.clone(),
+                            vec![SubAgentInfo {
+                                call_id: call_id.clone(),
+                                agent_id,
+                                agent_name: agent_name.to_string(),
+                            }],
+                        );
                     }
                     // 继续发送标准 tool_call_start SSE
                     if let Some(sse_ev) = map_looper_event(
@@ -567,59 +571,60 @@ pub async fn stream_chat(
                             arguments: arguments.clone(),
                         },
                         &conv_id_for_bg,
-                    ) {
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
-                        }
+                    ) && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
                     }
                 }
 
                 // ── 子 Agent 调用：run_parallel_sub_agents ────────────────
-                Some(LooperEvent::ToolCallStart { ref id, ref name, ref arguments })
-                    if name == "run_parallel_sub_agents" =>
-                {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                        if let Some(tasks) = args["tasks"].as_str() {
-                            if let Ok(task_list) = serde_json::from_str::<Vec<serde_json::Value>>(tasks) {
-                                let mut infos = Vec::new();
-                                for (index, task) in task_list.iter().enumerate() {
-                                    let agent_name = task["agent_name"].as_str().unwrap_or("unknown");
-                                    let prompt = task["prompt"].as_str().unwrap_or("");
-                                    let agent_id = agents::find_id_by_name_and_user(
-                                        &db_for_bg, agent_name, &user_id_for_bg,
-                                    )
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| "unknown".to_string());
+                Some(LooperEvent::ToolCallStart {
+                    ref id,
+                    ref name,
+                    ref arguments,
+                }) if name == "run_parallel_sub_agents" => {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                        && let Some(tasks) = args["tasks"].as_str()
+                        && let Ok(task_list) = serde_json::from_str::<Vec<serde_json::Value>>(tasks)
+                    {
+                        let mut infos = Vec::new();
+                        for (index, task) in task_list.iter().enumerate() {
+                            let agent_name = task["agent_name"].as_str().unwrap_or("unknown");
+                            let prompt = task["prompt"].as_str().unwrap_or("");
+                            let agent_id = agents::find_id_by_name_and_user(
+                                &db_for_bg,
+                                agent_name,
+                                &user_id_for_bg,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "unknown".to_string());
 
-                                    // 并行任务的 call_id = tool_call_id + 序号后缀，
-                                    // 确保每个子任务有唯一可配对的标识
-                                    let call_id = format!("{id}:{index}");
+                            // 并行任务的 call_id = tool_call_id + 序号后缀，
+                            // 确保每个子任务有唯一可配对的标识
+                            let call_id = format!("{id}:{index}");
 
-                                    let sse_ev = ChatSseEvent::AgentCallStart {
-                                        call_id: call_id.clone(),
-                                        agent_id: agent_id.clone(),
-                                        agent_name: agent_name.to_string(),
-                                        task: prompt.to_string(),
-                                        conversation_id: conv_id_for_bg.clone(),
-                                    };
-                                    if let Ok(ev) = sse_ev.to_sse_event() {
-                                        if sse_tx.send(Ok(ev)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    infos.push(SubAgentInfo {
-                                        call_id,
-                                        agent_id,
-                                        agent_name: agent_name.to_string(),
-                                    });
-                                }
-                                sub_agent_registry.insert(id.clone(), infos);
+                            let sse_ev = ChatSseEvent::AgentCallStart {
+                                call_id: call_id.clone(),
+                                agent_id: agent_id.clone(),
+                                agent_name: agent_name.to_string(),
+                                task: prompt.to_string(),
+                                conversation_id: conv_id_for_bg.clone(),
+                            };
+                            if let Ok(ev) = sse_ev.to_sse_event()
+                                && sse_tx.send(Ok(ev)).await.is_err()
+                            {
+                                break;
                             }
+                            infos.push(SubAgentInfo {
+                                call_id,
+                                agent_id,
+                                agent_name: agent_name.to_string(),
+                            });
                         }
+                        sub_agent_registry.insert(id.clone(), infos);
                     }
                     // 继续发送标准 tool_call_start SSE
                     if let Some(sse_ev) = map_looper_event(
@@ -629,19 +634,19 @@ pub async fn stream_chat(
                             arguments: arguments.clone(),
                         },
                         &conv_id_for_bg,
-                    ) {
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
-                        }
+                    ) && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
                     }
                 }
 
                 // ── 子 Agent 调用结束 ──────────────────────────────────────
-                Some(LooperEvent::ToolResult { ref id, ref name, ref result })
-                    if name == "delegate_sub_agent" || name == "run_parallel_sub_agents" =>
-                {
+                Some(LooperEvent::ToolResult {
+                    ref id,
+                    ref name,
+                    ref result,
+                }) if name == "delegate_sub_agent" || name == "run_parallel_sub_agents" => {
                     // 从注册表中取出子 Agent 信息（O(1)），发送 AgentCallEnd 事件
                     if let Some(infos) = sub_agent_registry.remove(id.as_str()) {
                         for info in infos {
@@ -654,10 +659,10 @@ pub async fn stream_chat(
                                 result: sub_result,
                                 conversation_id: conv_id_for_bg.clone(),
                             };
-                            if let Ok(ev) = sse_ev.to_sse_event() {
-                                if sse_tx.send(Ok(ev)).await.is_err() {
-                                    break;
-                                }
+                            if let Ok(ev) = sse_ev.to_sse_event()
+                                && sse_tx.send(Ok(ev)).await.is_err()
+                            {
+                                break;
                             }
                         }
                     }
@@ -669,22 +674,17 @@ pub async fn stream_chat(
                             result: String::new(),
                         },
                         &conv_id_for_bg,
-                    ) {
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
-                        }
+                    ) && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
                     }
                 }
 
                 Some(event @ LooperEvent::TurnComplete { .. }) => {
                     // 写入 assistant 概要消息到 messages 表
                     if !assistant_text.is_empty() {
-                        let preview: String = assistant_text
-                            .chars()
-                            .take(500)
-                            .collect();
+                        let preview: String = assistant_text.chars().take(500).collect();
                         let _ = messages::insert(
                             &db_for_bg,
                             &Uuid::new_v4().to_string(),
@@ -696,10 +696,7 @@ pub async fn stream_chat(
                         )
                         .await;
                         // 更新对话标题（使用前50字）
-                        let short: String = assistant_text
-                            .chars()
-                            .take(50)
-                            .collect();
+                        let short: String = assistant_text.chars().take(50).collect();
                         let new_title = if short.len() >= assistant_text.len() {
                             short
                         } else {
@@ -718,12 +715,11 @@ pub async fn stream_chat(
 
                     // ★ 将 TurnComplete 事件也转发给前端，
                     // 让前端可以在流结束前拿到完整的文本内容和 usage 信息。
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg) {
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
-                        }
+                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
+                        && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
                     }
                 }
 
@@ -740,12 +736,11 @@ pub async fn stream_chat(
                 }
 
                 Some(event) => {
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg) {
-                        if let Ok(ev) = sse_ev.to_sse_event() {
-                            if sse_tx.send(Ok(ev)).await.is_err() {
-                                break;
-                            }
-                        }
+                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
+                        && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
                     }
                 }
 
@@ -872,15 +867,13 @@ pub async fn get_session_snapshot(
             };
             (turns, usage)
         }
-        None => {
-            (
-                Vec::new(),
-                UsageData {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                },
-            )
-        }
+        None => (
+            Vec::new(),
+            UsageData {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+        ),
     };
 
     tracing::debug!(

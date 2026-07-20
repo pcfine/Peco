@@ -100,14 +100,12 @@ pub async fn update_status(
     status: &str,
     error_msg: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE documents SET status = ?, error_msg = ? WHERE id = ?",
-    )
-    .bind(status)
-    .bind(error_msg)
-    .bind(doc_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE documents SET status = ?, error_msg = ? WHERE id = ?")
+        .bind(status)
+        .bind(error_msg)
+        .bind(doc_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -122,10 +120,9 @@ pub async fn delete(pool: &SqlitePool, doc_id: &str) -> Result<bool, sqlx::Error
 
 /// 按知识库 ID 统计文档数量。
 pub async fn count_by_kb(pool: &SqlitePool, kb_id: &str) -> Result<i64, sqlx::Error> {
-    let row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM documents WHERE kb_id = ?")
-            .bind(kb_id)
-            .fetch_one(pool)
-            .await?;
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM documents WHERE kb_id = ?")
+        .bind(kb_id)
+        .fetch_one(pool)
+        .await?;
     Ok(row.0)
 }

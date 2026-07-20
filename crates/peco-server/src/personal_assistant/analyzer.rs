@@ -70,7 +70,7 @@ impl MemoryAnalyzer {
         let request = ChatRequest {
             model: self.config.model.clone(),
             messages: vec![
-                Message::system(&build_analyzer_system_prompt()).into(),
+                Message::system(build_analyzer_system_prompt()).into(),
                 Message::user(&conversation_text).into(),
             ],
             tools: vec![],
@@ -124,11 +124,13 @@ impl MemoryAnalyzer {
                 let facts: Vec<MemoryFact> = extraction
                     .facts
                     .into_iter()
-                    .map(|f| MemoryFact::new(
-                        parse_category(&f.category),
-                        parse_importance(&f.importance),
-                        f.content,
-                    ))
+                    .map(|f| {
+                        MemoryFact::new(
+                            parse_category(&f.category),
+                            parse_importance(&f.importance),
+                            f.content,
+                        )
+                    })
                     .collect();
                 Ok(facts)
             }
@@ -203,10 +205,7 @@ fn extract_json_from_text(text: &str) -> String {
     {
         return inner.trim().to_string();
     }
-    if let Some(inner) = text
-        .strip_prefix("```")
-        .and_then(|t| t.strip_suffix("```"))
-    {
+    if let Some(inner) = text.strip_prefix("```").and_then(|t| t.strip_suffix("```")) {
         return inner.trim().to_string();
     }
 
@@ -279,16 +278,14 @@ mod tests {
     #[test]
     fn test_parse_empty_facts() {
         let response_text = r#"{"facts":[]}"#;
-        let extraction: MemoryExtractionResponse =
-            serde_json::from_str(response_text).unwrap();
+        let extraction: MemoryExtractionResponse = serde_json::from_str(response_text).unwrap();
         assert!(extraction.facts.is_empty());
     }
 
     #[test]
     fn test_parse_memory_extraction() {
         let response_text = r#"{"facts":[{"category":"semantic","importance":"medium","content":"用户偏好 Axum 框架","operation":"add","conflicts_with":null}]}"#;
-        let extraction: MemoryExtractionResponse =
-            serde_json::from_str(response_text).unwrap();
+        let extraction: MemoryExtractionResponse = serde_json::from_str(response_text).unwrap();
         assert_eq!(extraction.facts.len(), 1);
         assert_eq!(extraction.facts[0].content, "用户偏好 Axum 框架");
     }

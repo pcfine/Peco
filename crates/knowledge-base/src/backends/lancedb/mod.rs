@@ -300,17 +300,16 @@ impl VectorIndex for LanceDbBackend {
             .distance_type(DistanceType::Cosine)
             .limit(top_k);
 
-        if let Some(f) = filters {
-            if let Some(ref ids) = f.document_ids {
-                if !ids.is_empty() {
-                    let list = ids
-                        .iter()
-                        .map(|d| format!("'{}'", d.replace('\'', "''")))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    vq = vq.only_if(&format!("document_id IN ({})", list));
-                }
-            }
+        if let Some(f) = filters
+            && let Some(ref ids) = f.document_ids
+            && !ids.is_empty()
+        {
+            let list = ids
+                .iter()
+                .map(|d| format!("'{}'", d.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            vq = vq.only_if(format!("document_id IN ({})", list));
         }
 
         let stream = vq
@@ -366,17 +365,16 @@ impl FullTextIndex for LanceDbBackend {
         q = q.full_text_search(FullTextSearchQuery::new(query.to_string()));
         q = q.limit(top_k);
 
-        if let Some(f) = filters {
-            if let Some(ref ids) = f.document_ids {
-                if !ids.is_empty() {
-                    let list = ids
-                        .iter()
-                        .map(|d| format!("'{}'", d.replace('\'', "''")))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    q = q.only_if(&format!("document_id IN ({})", list));
-                }
-            }
+        if let Some(f) = filters
+            && let Some(ref ids) = f.document_ids
+            && !ids.is_empty()
+        {
+            let list = ids
+                .iter()
+                .map(|d| format!("'{}'", d.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            q = q.only_if(format!("document_id IN ({})", list));
         }
 
         let stream = q

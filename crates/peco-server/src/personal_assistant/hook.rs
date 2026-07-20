@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use model_provider::{Message, Usage};
-use peco_core::agent::hooks::{HookAction, LooperHook, ToolHookAction};
 use peco_core::agent::TurnFailureReason;
+use peco_core::agent::hooks::{HookAction, LooperHook, ToolHookAction};
 use peco_core::session::Session;
 use tracing::warn;
 
@@ -99,7 +99,7 @@ impl LooperHook for PpaMemoryHook {
 
         // 分析间隔控制
         let interval = self.config.analyzer.analyze_interval.max(1);
-        if turn_index % interval != 0 {
+        if !turn_index.is_multiple_of(interval) {
             return;
         }
 
@@ -151,9 +151,7 @@ impl LooperHook for PpaMemoryHook {
         }
 
         // 检查是否需要更新 Profile
-        if facts.iter().any(|f| {
-            f.category == MemoryCategory::Profile
-        }) {
+        if facts.iter().any(|f| f.category == MemoryCategory::Profile) {
             let _ = self.store.sync_profile().await;
         }
     }

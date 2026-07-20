@@ -7,8 +7,8 @@ pub(crate) mod sse;
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get};
 use axum::Router;
+use axum::routing::{delete, get};
 
 use crate::state::AppState;
 
@@ -23,7 +23,10 @@ use crate::state::AppState;
 /// - `GET /:id/stream` — SSE 流式对话
 pub fn conversation_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(handler::list_conversations).post(handler::create_conversation))
+        .route(
+            "/",
+            get(handler::list_conversations).post(handler::create_conversation),
+        )
         .route("/{id}", delete(handler::delete_conversation))
         .route("/{id}/messages", get(handler::get_messages))
         .route("/{id}/session", get(handler::get_session_snapshot))

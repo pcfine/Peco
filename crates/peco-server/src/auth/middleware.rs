@@ -48,12 +48,10 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             .ok_or_else(|| ApiError::Unauthorized("invalid authorization format".into()))?;
 
         // 3. 验证 JWT
-        let claims =
-            jwt::verify_token(token, &state.jwt_secret)
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "JWT verification failed");
-                    ApiError::Unauthorized(format!("invalid or expired token: {e}"))
-                })?;
+        let claims = jwt::verify_token(token, &state.jwt_secret).map_err(|e| {
+            tracing::warn!(error = %e, "JWT verification failed");
+            ApiError::Unauthorized(format!("invalid or expired token: {e}"))
+        })?;
 
         // 4. 确认用户存在于数据库中
         let exists = sqlx::query_scalar::<_, i64>(

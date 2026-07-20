@@ -211,8 +211,7 @@ async fn test_sse_stream_basic() {
 
     assert_eq!(resp.status(), 200);
     assert!(
-        resp
-            .headers()
+        resp.headers()
             .get("content-type")
             .map(|v| v.to_str().unwrap().contains("text/event-stream"))
             .unwrap_or(false),

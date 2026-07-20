@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use peco_core::agent::agent_config::{self, AgentProfile, AssembleAgentMdParams};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -99,22 +99,22 @@ pub struct AgentDetail {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub system_prompt: String,         // agent.md body
-    pub model: Option<String>,         // agent.md llm.model（可能未指定）
-    pub provider: Option<String>,      // agent.md llm.provider（可能未指定）
-    pub icon: String,                  // DB only
-    pub color: String,                 // DB only
-    pub status: String,                // DB only
-    pub tools: Vec<String>,            // agent.md tools
-    pub mcp_servers: Vec<String>,      // agent.md mcp
-    pub skills: Vec<String>,           // agent.md skills
-    pub temperature: Option<f64>,      // agent.md llm.temperature
-    pub max_tokens: Option<u64>,       // agent.md llm.max_tokens
-    pub stream: Option<bool>,          // agent.md llm.stream
+    pub system_prompt: String,            // agent.md body
+    pub model: Option<String>,            // agent.md llm.model（可能未指定）
+    pub provider: Option<String>,         // agent.md llm.provider（可能未指定）
+    pub icon: String,                     // DB only
+    pub color: String,                    // DB only
+    pub status: String,                   // DB only
+    pub tools: Vec<String>,               // agent.md tools
+    pub mcp_servers: Vec<String>,         // agent.md mcp
+    pub skills: Vec<String>,              // agent.md skills
+    pub temperature: Option<f64>,         // agent.md llm.temperature
+    pub max_tokens: Option<u64>,          // agent.md llm.max_tokens
+    pub stream: Option<bool>,             // agent.md llm.stream
     pub reasoning_effort: Option<String>, // agent.md llm.reasoning_effort
-    pub max_turns: usize,              // agent.md max_turns
-    pub created_at: String,            // DB
-    pub updated_at: String,            // DB
+    pub max_turns: usize,                 // agent.md max_turns
+    pub created_at: String,               // DB
+    pub updated_at: String,               // DB
 }
 
 /// 简单成功响应。
@@ -161,10 +161,7 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
     AssembleAgentMdParams {
         name: req.name.trim().to_string(),
         description: req.description.trim().to_string(),
-        provider: req
-            .provider
-            .clone()
-            .unwrap_or_else(|| "deepseek".into()),
+        provider: req.provider.clone().unwrap_or_else(|| "deepseek".into()),
         model: req
             .model
             .clone()
@@ -212,8 +209,7 @@ fn merge_agent_profile(
             .unwrap_or_else(|| old_profile.agent.description.clone()),
         provider: merge_opt(&req.provider, old_llm.and_then(|l| l.provider.clone()))
             .unwrap_or_default(),
-        model: merge_opt(&req.model, old_llm.and_then(|l| l.model.clone()))
-            .unwrap_or_default(),
+        model: merge_opt(&req.model, old_llm.and_then(|l| l.model.clone())).unwrap_or_default(),
         temperature: merge_opt(&req.temperature, old_llm.and_then(|l| l.temperature)),
         max_tokens: merge_opt(&req.max_tokens, old_llm.and_then(|l| l.max_tokens)),
         stream: merge_opt(&req.stream, old_llm.and_then(|l| l.stream)),
@@ -221,7 +217,10 @@ fn merge_agent_profile(
             &req.reasoning_effort,
             old_llm.and_then(|l| l.reasoning_effort.clone()),
         ),
-        tools: req.tools.clone().unwrap_or_else(|| old_profile.tools.clone()),
+        tools: req
+            .tools
+            .clone()
+            .unwrap_or_else(|| old_profile.tools.clone()),
         mcp_servers: req
             .mcp_servers
             .clone()
@@ -441,16 +440,20 @@ pub async fn update(
         .ok_or_else(|| ApiError::NotFound(format!("agent '{agent_id}' not found")))?;
 
     // ── 检查名称重复（如果请求中包含新名称）─────────────────────────────
-    let new_name = req.name.as_deref().map(|s| s.trim()).unwrap_or(&existing.name);
-    if !new_name.is_empty() && new_name != existing.name {
-        if agents::find_id_by_name_and_user(&state.db, new_name, &user_id)
+    let new_name = req
+        .name
+        .as_deref()
+        .map(|s| s.trim())
+        .unwrap_or(&existing.name);
+    if !new_name.is_empty()
+        && new_name != existing.name
+        && agents::find_id_by_name_and_user(&state.db, new_name, &user_id)
             .await?
             .is_some()
-        {
-            return Err(ApiError::Conflict(format!(
-                "agent with name '{new_name}' already exists"
-            )));
-        }
+    {
+        return Err(ApiError::Conflict(format!(
+            "agent with name '{new_name}' already exists"
+        )));
     }
 
     // ── 读取现有 agent.md ─────────────────────────────────────────────────

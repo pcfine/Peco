@@ -8,10 +8,12 @@
 // - [`PersonalMemoryStore`] — 记忆存储
 // - [`StorageConfig`] — 存储配置
 
-mod types;
 mod config;
 mod store;
+mod types;
 
-pub use types::{Importance, MemoryCategory, MemoryFact, MemoryOperation, UserProfile, UserPreferences};
 pub use config::StorageConfig;
 pub use store::PersonalMemoryStore;
+pub use types::{
+    Importance, MemoryCategory, MemoryFact, MemoryOperation, UserPreferences, UserProfile,
+};

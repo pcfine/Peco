@@ -2,6 +2,11 @@
 // 分层消息缓冲区
 // ============================================================================
 //
+// NOTE: Some methods on CommittedBuffer and StagingBuffer are public API used
+// by peco-server or planned for future use.
+
+#![allow(dead_code)]
+//
 // - CommittedBuffer: 已确认的 turn 历史（不可变）
 // - StagingBuffer: 当前 turn 的进行中消息（可 rollback）
 //
@@ -200,7 +205,12 @@ mod tests {
     #[test]
     fn test_committed_push_and_iter() {
         let mut cb = CommittedBuffer::new();
-        let am = AnnotatedMessage::new(MessageId(0), 0, Message::user("hello"), MessageSource::UserInput);
+        let am = AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("hello"),
+            MessageSource::UserInput,
+        );
         cb.push_turn(vec![am.clone()]);
         assert_eq!(cb.len(), 1);
         assert_eq!(cb.message_count(), 1);
@@ -212,8 +222,18 @@ mod tests {
     #[test]
     fn test_committed_iter_from() {
         let mut cb = CommittedBuffer::new();
-        let am0 = AnnotatedMessage::new(MessageId(0), 0, Message::user("q0"), MessageSource::UserInput);
-        let am1 = AnnotatedMessage::new(MessageId(1), 1, Message::user("q1"), MessageSource::UserInput);
+        let am0 = AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("q0"),
+            MessageSource::UserInput,
+        );
+        let am1 = AnnotatedMessage::new(
+            MessageId(1),
+            1,
+            Message::user("q1"),
+            MessageSource::UserInput,
+        );
         cb.push_turn(vec![am0]);
         cb.push_turn(vec![am1]);
         assert_eq!(cb.iter_from(0).count(), 2);
@@ -225,7 +245,12 @@ mod tests {
     fn test_committed_truncate_to() {
         let mut cb = CommittedBuffer::new();
         for i in 0..3 {
-            let am = AnnotatedMessage::new(MessageId(i), i as usize, Message::user(&format!("q{i}")), MessageSource::UserInput);
+            let am = AnnotatedMessage::new(
+                MessageId(i),
+                i as usize,
+                Message::user(&format!("q{i}")),
+                MessageSource::UserInput,
+            );
             cb.push_turn(vec![am]);
         }
         assert_eq!(cb.len(), 3);
@@ -237,7 +262,12 @@ mod tests {
     #[test]
     fn test_committed_get_turn() {
         let mut cb = CommittedBuffer::new();
-        let am = AnnotatedMessage::new(MessageId(0), 0, Message::user("q0"), MessageSource::UserInput);
+        let am = AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("q0"),
+            MessageSource::UserInput,
+        );
         cb.push_turn(vec![am]);
         assert!(cb.get_turn(0).is_some());
         assert!(cb.get_turn(1).is_none());
@@ -245,9 +275,12 @@ mod tests {
 
     #[test]
     fn test_committed_from_turns() {
-        let turns = vec![
-            vec![AnnotatedMessage::new(MessageId(0), 0, Message::user("q0"), MessageSource::UserInput)],
-        ];
+        let turns = vec![vec![AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("q0"),
+            MessageSource::UserInput,
+        )]];
         let cb = CommittedBuffer::from_turns(turns);
         assert_eq!(cb.len(), 1);
     }
@@ -266,9 +299,19 @@ mod tests {
     #[test]
     fn test_staging_set_and_iter() {
         let mut sb = StagingBuffer::new();
-        let ui = AnnotatedMessage::new(MessageId(0), 0, Message::user("hi"), MessageSource::UserInput);
+        let ui = AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("hi"),
+            MessageSource::UserInput,
+        );
         sb.set_user_input(ui);
-        let msg = AnnotatedMessage::new(MessageId(1), 0, Message::assistant("hello"), MessageSource::ModelGeneration);
+        let msg = AnnotatedMessage::new(
+            MessageId(1),
+            0,
+            Message::assistant("hello"),
+            MessageSource::ModelGeneration,
+        );
         sb.push(msg);
 
         assert!(!sb.is_empty());
@@ -284,8 +327,18 @@ mod tests {
     #[test]
     fn test_staging_take_all_clears() {
         let mut sb = StagingBuffer::new();
-        sb.set_user_input(AnnotatedMessage::new(MessageId(0), 0, Message::user("q"), MessageSource::UserInput));
-        sb.push(AnnotatedMessage::new(MessageId(1), 0, Message::assistant("a"), MessageSource::ModelGeneration));
+        sb.set_user_input(AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("q"),
+            MessageSource::UserInput,
+        ));
+        sb.push(AnnotatedMessage::new(
+            MessageId(1),
+            0,
+            Message::assistant("a"),
+            MessageSource::ModelGeneration,
+        ));
 
         let taken = sb.take_all();
         assert_eq!(taken.len(), 2);
@@ -295,7 +348,12 @@ mod tests {
     #[test]
     fn test_staging_take_user_input() {
         let mut sb = StagingBuffer::new();
-        sb.set_user_input(AnnotatedMessage::new(MessageId(0), 0, Message::user("q"), MessageSource::UserInput));
+        sb.set_user_input(AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("q"),
+            MessageSource::UserInput,
+        ));
         let ui = sb.take_user_input();
         assert!(ui.is_some());
         assert!(sb.user_input_ref().is_none());
@@ -304,8 +362,18 @@ mod tests {
     #[test]
     fn test_staging_clear() {
         let mut sb = StagingBuffer::new();
-        sb.set_user_input(AnnotatedMessage::new(MessageId(0), 0, Message::user("q"), MessageSource::UserInput));
-        sb.push(AnnotatedMessage::new(MessageId(1), 0, Message::assistant("a"), MessageSource::ModelGeneration));
+        sb.set_user_input(AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            Message::user("q"),
+            MessageSource::UserInput,
+        ));
+        sb.push(AnnotatedMessage::new(
+            MessageId(1),
+            0,
+            Message::assistant("a"),
+            MessageSource::ModelGeneration,
+        ));
         sb.clear();
         assert!(sb.is_empty());
     }

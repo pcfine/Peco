@@ -1,6 +1,11 @@
 // ============================================================================
 // PpaConfig — PPA 全量配置
 // ============================================================================
+//
+// NOTE: This module defines the full PPA configuration schema. Many items are
+// currently only consumed by peco-server or planned for future use.
+
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

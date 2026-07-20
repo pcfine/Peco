@@ -179,21 +179,21 @@ impl IngestionPipeline {
         let chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
 
         // 2. 按分块 ID 移除向量条目
-        if let Some(ref vi) = self.vector_index {
-            if !chunk_ids.is_empty() {
-                vi.remove(&chunk_ids)
-                    .await
-                    .map_err(|e| KnowledgeError::VectorError(e.to_string()))?;
-            }
+        if let Some(ref vi) = self.vector_index
+            && !chunk_ids.is_empty()
+        {
+            vi.remove(&chunk_ids)
+                .await
+                .map_err(|e| KnowledgeError::VectorError(e.to_string()))?;
         }
 
         // 3. 按分块 ID 移除全文条目
-        if let Some(ref ft) = self.fulltext_index {
-            if !chunk_ids.is_empty() {
-                ft.remove(&chunk_ids)
-                    .await
-                    .map_err(|e| KnowledgeError::TextSearchError(e.to_string()))?;
-            }
+        if let Some(ref ft) = self.fulltext_index
+            && !chunk_ids.is_empty()
+        {
+            ft.remove(&chunk_ids)
+                .await
+                .map_err(|e| KnowledgeError::TextSearchError(e.to_string()))?;
         }
 
         // 4. 移除此文档节点的图谱边

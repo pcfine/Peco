@@ -137,8 +137,9 @@ impl ToolDyn for RecallTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "recall".to_string(),
-            description: "搜索关于当前用户的个人记忆。当需要回顾用户偏好、历史决策或之前提到过的信息时使用。"
-                .to_string(),
+            description:
+                "搜索关于当前用户的个人记忆。当需要回顾用户偏好、历史决策或之前提到过的信息时使用。"
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -234,8 +235,7 @@ impl ToolDyn for ForgetTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "forget".to_string(),
-            description: "删除一条关于当前用户的个人记忆。当记忆已过时或不正确时使用。"
-                .to_string(),
+            description: "删除一条关于当前用户的个人记忆。当记忆已过时或不正确时使用。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -16,8 +16,12 @@ use sqlx::sqlite::SqlitePool;
 pub async fn connect(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let pool = SqlitePool::connect(database_url).await?;
     // 启用 WAL 模式和 foreign keys
-    sqlx::raw_sql("PRAGMA journal_mode=WAL;").execute(&pool).await?;
-    sqlx::raw_sql("PRAGMA foreign_keys=ON;").execute(&pool).await?;
+    sqlx::raw_sql("PRAGMA journal_mode=WAL;")
+        .execute(&pool)
+        .await?;
+    sqlx::raw_sql("PRAGMA foreign_keys=ON;")
+        .execute(&pool)
+        .await?;
     tracing::info!("SQLite connection pool established");
     Ok(pool)
 }
@@ -34,7 +38,9 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let trimmed = statement.trim();
         // 跳过空语句和纯注释行
         if trimmed.is_empty()
-            || trimmed.lines().all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+            || trimmed
+                .lines()
+                .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
         {
             continue;
         }
@@ -67,7 +73,9 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         for statement in migration_sql.split(';') {
             let trimmed = statement.trim();
             if trimmed.is_empty()
-                || trimmed.lines().all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+                || trimmed
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
             {
                 continue;
             }
@@ -84,7 +92,10 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
 // ── Server Config (键值对) ───────────────────────────────────────────────────
 
 /// 从 `server_config` 表读取指定 key 的值。
-pub async fn get_server_config(pool: &SqlitePool, key: &str) -> Result<Option<String>, sqlx::Error> {
+pub async fn get_server_config(
+    pool: &SqlitePool,
+    key: &str,
+) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar::<_, String>("SELECT value FROM server_config WHERE key = ?")
         .bind(key)
         .fetch_optional(pool)

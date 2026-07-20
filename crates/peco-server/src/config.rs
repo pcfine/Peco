@@ -106,11 +106,11 @@ fn parse_common_env() -> (String, u16, String, PathBuf) {
 
 /// JWT 密钥解析（无 DB 持久化）：环境变量 > 随机生成。
 fn resolve_jwt_secret_no_db() -> String {
-    if let Ok(secret) = std::env::var("PECO_JWT_SECRET") {
-        if !secret.is_empty() {
-            tracing::info!("Using JWT secret from PECO_JWT_SECRET environment variable");
-            return secret;
-        }
+    if let Ok(secret) = std::env::var("PECO_JWT_SECRET")
+        && !secret.is_empty()
+    {
+        tracing::info!("Using JWT secret from PECO_JWT_SECRET environment variable");
+        return secret;
     }
 
     let secret = uuid::Uuid::new_v4().to_string();
@@ -124,11 +124,11 @@ fn resolve_jwt_secret_no_db() -> String {
 /// JWT 密钥解析（含 DB 持久化）：环境变量 > DB 读取 > 随机生成+持久化到 DB。
 async fn resolve_jwt_secret_with_db(pool: &SqlitePool) -> Result<String, anyhow::Error> {
     // 第一层：环境变量 PECO_JWT_SECRET（生产推荐方式）
-    if let Ok(secret) = std::env::var("PECO_JWT_SECRET") {
-        if !secret.is_empty() {
-            tracing::info!("Using JWT secret from PECO_JWT_SECRET environment variable");
-            return Ok(secret);
-        }
+    if let Ok(secret) = std::env::var("PECO_JWT_SECRET")
+        && !secret.is_empty()
+    {
+        tracing::info!("Using JWT secret from PECO_JWT_SECRET environment variable");
+        return Ok(secret);
     }
 
     // 第二层：从 DB server_config 表读取持久化的密钥

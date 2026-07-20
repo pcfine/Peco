@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -101,10 +101,7 @@ fn default_limit() -> i64 {
 // ── 辅助函数 ────────────────────────────────────────────────────────────────
 
 /// 将 DB 行转为响应体（包含 agent_name）。
-async fn row_to_response(
-    pool: &sqlx::SqlitePool,
-    row: &tasks::TaskRow,
-) -> TaskResponse {
+async fn row_to_response(pool: &sqlx::SqlitePool, row: &tasks::TaskRow) -> TaskResponse {
     let agent_name = crate::db::agents::find_name_by_id(pool, &row.agent_id)
         .await
         .ok()
@@ -319,10 +316,10 @@ pub async fn delete_task(
         .ok_or_else(|| ApiError::NotFound(format!("task '{task_id}' not found")))?;
 
     // 从调度器移除
-    if task.enabled != 0 {
-        if let Err(e) = state.task_scheduler.remove_task(&task_id).await {
-            tracing::error!(task_id = %task_id, error = %e, "Failed to unschedule task");
-        }
+    if task.enabled != 0
+        && let Err(e) = state.task_scheduler.remove_task(&task_id).await
+    {
+        tracing::error!(task_id = %task_id, error = %e, "Failed to unschedule task");
     }
 
     // 删除数据库记录（CASCADE 自动删除 task_logs）

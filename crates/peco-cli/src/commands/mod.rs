@@ -23,6 +23,7 @@ pub enum CommandResult {
     /// 退出 REPL
     Exit,
     /// 刷新 looper（/clear 等需要重启 looper 的命令）
+    #[allow(dead_code)]
     ReloadLooper,
 }
 
@@ -53,11 +54,7 @@ pub trait CliCommand: Send + Sync {
     /// 执行命令。
     ///
     /// `args` 是命令名之后的部分（可能为空字符串）。
-    fn execute(
-        &self,
-        args: &str,
-        ctx: &mut CommandContext<'_>,
-    ) -> anyhow::Result<CommandResult>;
+    fn execute(&self, args: &str, ctx: &mut CommandContext<'_>) -> anyhow::Result<CommandResult>;
 }
 
 // ============================================================================
@@ -93,16 +90,10 @@ impl CommandRegistry {
     /// 解析输入并分发到对应命令。
     ///
     /// 输入格式: `/命令名 [args...]`
-    pub fn dispatch(
-        &self,
-        input: &str,
-        app: &mut CliApp,
-    ) -> anyhow::Result<CommandResult> {
-        let input = input
-            .strip_prefix('/')
-            .unwrap_or(input)
-            .trim();
-        let (name, args) = input.split_once(char::is_whitespace)
+    pub fn dispatch(&self, input: &str, app: &mut CliApp) -> anyhow::Result<CommandResult> {
+        let input = input.strip_prefix('/').unwrap_or(input).trim();
+        let (name, args) = input
+            .split_once(char::is_whitespace)
             .map(|(n, a)| (n, a.trim()))
             .unwrap_or((input, ""));
 
@@ -110,9 +101,7 @@ impl CommandRegistry {
 
         // 按名称或别名查找
         for cmd in &self.commands {
-            if cmd.name() == name_lower
-                || cmd.aliases().iter().any(|a| a == &name_lower)
-            {
+            if cmd.name() == name_lower || cmd.aliases().iter().any(|a| a == &name_lower) {
                 let mut ctx = CommandContext { app };
                 return cmd.execute(args, &mut ctx);
             }

@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::skills::SkillRegistry;
 use crate::workspace::SkillProvider;
 
-use super::{StringError, ToolDyn, ToolError};
+use super::{ToolDyn, ToolError};
 
 pub struct ReadSkill {
     skill_registry: Arc<RwLock<SkillRegistry>>,
@@ -78,7 +78,10 @@ impl ToolDyn for ReadSkill {
 
             let mut output = String::new();
             output.push_str(&format!("# Skill: {}\n\n", skill.frontmatter.name));
-            output.push_str(&format!("**Description**: {}\n\n", skill.frontmatter.description));
+            output.push_str(&format!(
+                "**Description**: {}\n\n",
+                skill.frontmatter.description
+            ));
             output.push_str(&format!(
                 "**Allowed Tools**: {}\n",
                 skill.frontmatter.allowed_tools.join(", ")

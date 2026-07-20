@@ -20,10 +20,7 @@ pub struct JwtClaims {
 /// 为用户签发 JWT Token。
 ///
 /// Token 有效期 7 天，使用 HS256 算法签名。
-pub fn create_token(
-    user_id: &str,
-    secret: &str,
-) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_token(user_id: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = JwtClaims {
         sub: user_id.to_string(),
@@ -41,10 +38,7 @@ pub fn create_token(
 /// 验证 JWT Token 并返回 Claims。
 ///
 /// 验证签名和过期时间，不验证 audience/issuer。
-pub fn verify_token(
-    token: &str,
-    secret: &str,
-) -> Result<JwtClaims, jsonwebtoken::errors::Error> {
+pub fn verify_token(token: &str, secret: &str) -> Result<JwtClaims, jsonwebtoken::errors::Error> {
     let token_data = decode::<JwtClaims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),

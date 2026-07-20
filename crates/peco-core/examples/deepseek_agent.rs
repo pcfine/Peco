@@ -38,32 +38,59 @@ impl AgentLoader for NoopAgentLoader {
     fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
         Err(AgentError::Config("noop agent loader".into()))
     }
-    fn list_agent_names(&self) -> Vec<String> { vec![] }
+    fn list_agent_names(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 struct NoopSkillProvider {
     registry: Arc<std::sync::RwLock<GlobalSkillList>>,
 }
 impl SkillProvider for NoopSkillProvider {
-    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> { &self.registry }
+    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> {
+        &self.registry
+    }
 }
 
 struct NoopMemoryStore;
 #[async_trait::async_trait]
 impl MemoryStore for NoopMemoryStore {
-    async fn save_or_update_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
-    async fn search_semantic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
-    async fn search_episodic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
-    async fn invalidate_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
+    async fn save_or_update_fact(&self, _fact: &MemoryFact) -> Result<(), String> {
+        Ok(())
+    }
+    async fn search_semantic(
+        &self,
+        _query: &str,
+        _top_k: usize,
+        _threshold: f32,
+    ) -> Result<Vec<MemoryFact>, String> {
+        Ok(vec![])
+    }
+    async fn search_episodic(
+        &self,
+        _query: &str,
+        _top_k: usize,
+        _threshold: f32,
+    ) -> Result<Vec<MemoryFact>, String> {
+        Ok(vec![])
+    }
+    async fn invalidate_fact(&self, _fact: &MemoryFact) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct NoopKnowledgeAccess;
 impl KnowledgeAccess for NoopKnowledgeAccess {
-    fn user_id(&self) -> &str { "example-user" }
+    fn user_id(&self) -> &str {
+        "example-user"
+    }
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         // Leaked for simplicity in example — ok for a short-lived example process
-        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> =
-            std::sync::LazyLock::new(|| Arc::new(KnowledgeManager::new(std::env::temp_dir().join("peco-example-kb"))));
+        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> = std::sync::LazyLock::new(|| {
+            Arc::new(KnowledgeManager::new(
+                std::env::temp_dir().join("peco-example-kb"),
+            ))
+        });
         &KM
     }
 }
@@ -149,13 +176,15 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let system_config = SystemConfig::load();
     let user_config = UserConfig::load(&system_config, &dir)?;
 
-    let skill_registry = Arc::new(std::sync::RwLock::new(
-        GlobalSkillList::new(dir.join("skills")),
-    ));
+    let skill_registry = Arc::new(std::sync::RwLock::new(GlobalSkillList::new(
+        dir.join("skills"),
+    )));
 
     let tool_deps = ToolDependencies {
         agent_loader: Arc::new(NoopAgentLoader),
-        skill_provider: Arc::new(NoopSkillProvider { registry: skill_registry.clone() }),
+        skill_provider: Arc::new(NoopSkillProvider {
+            registry: skill_registry.clone(),
+        }),
         memory_store: Arc::new(NoopMemoryStore),
         knowledge_access: Arc::new(NoopKnowledgeAccess),
     };
@@ -194,11 +223,9 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let config = LooperConfig::default();
 
     let persister = Arc::new(
-        peco_core::FileSessionPersister::new(
-            std::env::temp_dir().join("peco-deepseek-example"),
-        )
-        .await
-        .unwrap(),
+        peco_core::FileSessionPersister::new(std::env::temp_dir().join("peco-deepseek-example"))
+            .await
+            .unwrap(),
     );
     let mut looper = AgentLooper::new(
         agent,

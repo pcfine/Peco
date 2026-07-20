@@ -52,6 +52,7 @@ impl CronScheduler {
     ///
     /// `Job::new_async` 的 closure 要求 `FnMut + Send + Sync + 'static`，
     /// 每次触发时 closure 被重复调用，因此所有捕获的变量在 closure 内部 clone。
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_task(
         &self,
         task_id: String,
@@ -113,6 +114,7 @@ impl CronScheduler {
     }
 
     /// 按 task_id 更新 cron 表达式（先移除再新增）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn reschedule(
         &self,
         task_id: String,

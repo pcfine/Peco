@@ -15,6 +15,6 @@ pub mod manager;
 
 // Re-exports
 pub use manager::{
-    PersonalAssistantManager, PersonalAssistantMessageFilter,
-    PERSONAL_ASSISTANT_AGENT_NAME, PERSONAL_ASSISTANT_ID,
+    PERSONAL_ASSISTANT_AGENT_NAME, PERSONAL_ASSISTANT_ID, PersonalAssistantManager,
+    PersonalAssistantMessageFilter,
 };

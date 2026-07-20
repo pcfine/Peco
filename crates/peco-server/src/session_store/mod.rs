@@ -39,8 +39,7 @@ impl SessionPersister for SqliteSessionPersister {
         description: &str,
         created_at: u64,
     ) -> Result<PersistResult, PersistError> {
-        let snapshot_json =
-            serde_json::to_string(snapshot).map_err(PersistError::Serialization)?;
+        let snapshot_json = serde_json::to_string(snapshot).map_err(PersistError::Serialization)?;
 
         let bytes_written = snapshot_json.len() as u64;
 
@@ -60,7 +59,7 @@ impl SessionPersister for SqliteSessionPersister {
         .bind(&snapshot_json)
         .execute(&self.pool)
         .await
-        .map_err(|e| PersistError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| PersistError::Io(std::io::Error::other(e.to_string())))?;
 
         Ok(PersistResult {
             bytes_written,
@@ -87,20 +86,21 @@ impl SessionPersister for SqliteSessionPersister {
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| PersistError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| PersistError::Io(std::io::Error::other(e.to_string())))?;
 
         match row {
             Some(r) => {
-                let snapshot: SessionSnapshot = serde_json::from_str(&r.snapshot_json)
-                    .map_err(PersistError::Serialization)?;
+                let snapshot: SessionSnapshot =
+                    serde_json::from_str(&r.snapshot_json).map_err(PersistError::Serialization)?;
 
                 // 从 snapshot 计算动态字段
                 let tokens_used =
                     (snapshot.total_usage.input_tokens + snapshot.total_usage.output_tokens) as u64;
                 let completed_turns = snapshot.committed_turns.len();
-                let updated_at = chrono::NaiveDateTime::parse_from_str(&r.updated_at, "%Y-%m-%d %H:%M:%S")
-                    .map(|dt| dt.and_utc().timestamp() as u64)
-                    .unwrap_or(r.created_at as u64);
+                let updated_at =
+                    chrono::NaiveDateTime::parse_from_str(&r.updated_at, "%Y-%m-%d %H:%M:%S")
+                        .map(|dt| dt.and_utc().timestamp() as u64)
+                        .unwrap_or(r.created_at as u64);
 
                 let meta = SessionMeta {
                     id: session_id.to_string(),
@@ -122,7 +122,7 @@ impl SessionPersister for SqliteSessionPersister {
             .bind(session_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| PersistError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| PersistError::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
     }
 
@@ -142,19 +142,20 @@ impl SessionPersister for SqliteSessionPersister {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| PersistError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| PersistError::Io(std::io::Error::other(e.to_string())))?;
 
         let mut metas = Vec::with_capacity(rows.len());
         for r in rows {
-            let snapshot: SessionSnapshot = serde_json::from_str(&r.snapshot_json)
-                .map_err(PersistError::Serialization)?;
+            let snapshot: SessionSnapshot =
+                serde_json::from_str(&r.snapshot_json).map_err(PersistError::Serialization)?;
 
             let tokens_used =
                 (snapshot.total_usage.input_tokens + snapshot.total_usage.output_tokens) as u64;
             let completed_turns = snapshot.committed_turns.len();
-            let updated_at = chrono::NaiveDateTime::parse_from_str(&r.updated_at, "%Y-%m-%d %H:%M:%S")
-                .map(|dt| dt.and_utc().timestamp() as u64)
-                .unwrap_or(r.created_at as u64);
+            let updated_at =
+                chrono::NaiveDateTime::parse_from_str(&r.updated_at, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.and_utc().timestamp() as u64)
+                    .unwrap_or(r.created_at as u64);
 
             metas.push(SessionMeta {
                 id: r.conversation_id,

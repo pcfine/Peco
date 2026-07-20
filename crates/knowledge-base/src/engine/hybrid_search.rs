@@ -332,81 +332,81 @@ impl HybridSearchEngine {
         let mut any_success = false;
 
         // ── 向量搜索 ──
-        if should_use_vector(strategy) {
-            if let Some(ref vi) = self.vector_index {
-                match self.embedding.embed_query(&request.query).await {
-                    Ok(query_vec) => match vi
-                        .search(&query_vec, vec_top_k, request.filters.as_ref())
-                        .await
-                    {
-                        Ok(hits) => {
-                            let items = dedup_by_doc_id(
-                                hits.into_iter()
-                                    .filter(|h| h.score >= MIN_VECTOR_SCORE)
-                                    .map(|h| (h.document_id, h.score))
-                                    .collect(),
-                            );
-                            if !items.is_empty() {
-                                ranked_lists.push((vector_weight(strategy), items));
-                                any_success = true;
-                            }
-                        }
-                        Err(e) => warn!("向量搜索失败: {e}"),
-                    },
-                    Err(e) => warn!("嵌入失败: {e}"),
-                }
-            }
-        }
-
-        // ── 全文搜索 ──
-        if should_use_text(strategy) {
-            if let Some(ref ft) = self.fulltext_index {
-                match ft
-                    .search(&request.query, text_top_k, request.filters.as_ref())
+        if should_use_vector(strategy)
+            && let Some(ref vi) = self.vector_index
+        {
+            match self.embedding.embed_query(&request.query).await {
+                Ok(query_vec) => match vi
+                    .search(&query_vec, vec_top_k, request.filters.as_ref())
                     .await
                 {
                     Ok(hits) => {
                         let items = dedup_by_doc_id(
-                            hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
+                            hits.into_iter()
+                                .filter(|h| h.score >= MIN_VECTOR_SCORE)
+                                .map(|h| (h.document_id, h.score))
+                                .collect(),
                         );
                         if !items.is_empty() {
-                            ranked_lists.push((text_weight(strategy), items));
+                            ranked_lists.push((vector_weight(strategy), items));
                             any_success = true;
                         }
                     }
-                    Err(e) => warn!("全文搜索失败: {e}"),
+                    Err(e) => warn!("向量搜索失败: {e}"),
+                },
+                Err(e) => warn!("嵌入失败: {e}"),
+            }
+        }
+
+        // ── 全文搜索 ──
+        if should_use_text(strategy)
+            && let Some(ref ft) = self.fulltext_index
+        {
+            match ft
+                .search(&request.query, text_top_k, request.filters.as_ref())
+                .await
+            {
+                Ok(hits) => {
+                    let items = dedup_by_doc_id(
+                        hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
+                    );
+                    if !items.is_empty() {
+                        ranked_lists.push((text_weight(strategy), items));
+                        any_success = true;
+                    }
                 }
+                Err(e) => warn!("全文搜索失败: {e}"),
             }
         }
 
         // ── 图扩展 ──
-        if should_use_graph(strategy) {
-            if let Some(ref gs) = self.graph_store {
-                let top_chunk_ids: Vec<String> =
-                    self.collect_top_chunk_ids(request, &strategy, 20).await;
+        if should_use_graph(strategy)
+            && let Some(ref gs) = self.graph_store
+        {
+            let top_chunk_ids: Vec<String> =
+                self.collect_top_chunk_ids(request, strategy, 20).await;
 
-                if !top_chunk_ids.is_empty() {
-                    match gs
-                        .expand(&top_chunk_ids, &graph_edge_types, graph_depth)
-                        .await
-                    {
-                        Ok(nodes) => {
-                            let items = dedup_by_doc_id(
-                                nodes
-                                    .into_iter()
-                                    .map(|n| {
-                                        let score = 1.0 / (1.0 + n.distance as f32);
-                                        (n.id, score)
-                                    })
-                                    .collect(),
-                            );
-                            if !items.is_empty() {
-                                ranked_lists.push((graph_weight(strategy), items));
-                                any_success = true;
-                            }
+            if !top_chunk_ids.is_empty() {
+                match gs
+                    .expand(&top_chunk_ids, &graph_edge_types, graph_depth)
+                    .await
+                {
+                    Ok(nodes) => {
+                        let items = dedup_by_doc_id(
+                            nodes
+                                .into_iter()
+                                .map(|n| {
+                                    let score = 1.0 / (1.0 + n.distance as f32);
+                                    (n.id, score)
+                                })
+                                .collect(),
+                        );
+                        if !items.is_empty() {
+                            ranked_lists.push((graph_weight(strategy), items));
+                            any_success = true;
                         }
-                        Err(e) => warn!("图扩展失败: {e}"),
                     }
+                    Err(e) => warn!("图扩展失败: {e}"),
                 }
             }
         }
@@ -516,82 +516,83 @@ impl HybridSearchEngine {
         let mut graph_hits: Vec<(String, f32)> = Vec::new();
 
         // 向量搜索。
-        if vec_top_k > 0 {
-            if let Some(ref vi) = self.vector_index {
-                match self.embedding.embed_query(&request.query).await {
-                    Ok(query_vec) => {
-                        match vi
-                            .search(&query_vec, vec_top_k, request.filters.as_ref())
-                            .await
-                        {
-                            Ok(hits) => {
-                                vector_hits = dedup_by_doc_id(
-                                    hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
-                                );
-                            }
-                            Err(e) => warn!("向量搜索失败: {e}"),
+        if vec_top_k > 0
+            && let Some(ref vi) = self.vector_index
+        {
+            match self.embedding.embed_query(&request.query).await {
+                Ok(query_vec) => {
+                    match vi
+                        .search(&query_vec, vec_top_k, request.filters.as_ref())
+                        .await
+                    {
+                        Ok(hits) => {
+                            vector_hits = dedup_by_doc_id(
+                                hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
+                            );
                         }
+                        Err(e) => warn!("向量搜索失败: {e}"),
                     }
-                    Err(e) => warn!("嵌入失败: {e}"),
                 }
+                Err(e) => warn!("嵌入失败: {e}"),
             }
         }
 
         // 全文搜索。
-        if text_top_k > 0 {
-            if let Some(ref ft) = self.fulltext_index {
-                match ft
-                    .search(&request.query, text_top_k, request.filters.as_ref())
-                    .await
-                {
-                    Ok(hits) => {
-                        text_hits = dedup_by_doc_id(
-                            hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
-                        );
-                    }
-                    Err(e) => warn!("全文搜索失败: {e}"),
+        if text_top_k > 0
+            && let Some(ref ft) = self.fulltext_index
+        {
+            match ft
+                .search(&request.query, text_top_k, request.filters.as_ref())
+                .await
+            {
+                Ok(hits) => {
+                    text_hits = dedup_by_doc_id(
+                        hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
+                    );
                 }
+                Err(e) => warn!("全文搜索失败: {e}"),
             }
         }
 
         // 图扩展。
-        if should_use_graph(strategy) && grph_weight > 0.0 {
-            if let Some(ref gs) = self.graph_store {
-                let top_chunk_ids: Vec<String> =
-                    self.collect_top_chunk_ids(request, &strategy, 20).await;
-                if !top_chunk_ids.is_empty() {
-                    let graph_edge_types = match strategy {
-                        SearchStrategy::FullHybrid { .. } => {
-                            vec![EdgeType::Contains, EdgeType::RelatedTo, EdgeType::BelongsTo]
-                        }
-                        SearchStrategy::GraphOnly { .. } => vec![EdgeType::Contains],
-                        _ => vec![],
-                    };
-                    let graph_depth = match strategy {
-                        SearchStrategy::FullHybrid {
-                            graph_expansion_depth,
-                            ..
-                        } => *graph_expansion_depth,
-                        SearchStrategy::GraphOnly { .. } => 2,
-                        _ => 0,
-                    };
-                    match gs
-                        .expand(&top_chunk_ids, &graph_edge_types, graph_depth)
-                        .await
-                    {
-                        Ok(nodes) => {
-                            graph_hits = dedup_by_doc_id(
-                                nodes
-                                    .into_iter()
-                                    .map(|n| {
-                                        let score = 1.0 / (1.0 + n.distance as f32);
-                                        (n.id, score)
-                                    })
-                                    .collect(),
-                            );
-                        }
-                        Err(e) => warn!("图扩展失败: {e}"),
+        if should_use_graph(strategy)
+            && grph_weight > 0.0
+            && let Some(ref gs) = self.graph_store
+        {
+            let top_chunk_ids: Vec<String> =
+                self.collect_top_chunk_ids(request, strategy, 20).await;
+            if !top_chunk_ids.is_empty() {
+                let graph_edge_types = match strategy {
+                    SearchStrategy::FullHybrid { .. } => {
+                        vec![EdgeType::Contains, EdgeType::RelatedTo, EdgeType::BelongsTo]
                     }
+                    SearchStrategy::GraphOnly { .. } => vec![EdgeType::Contains],
+                    _ => vec![],
+                };
+                let graph_depth = match strategy {
+                    SearchStrategy::FullHybrid {
+                        graph_expansion_depth,
+                        ..
+                    } => *graph_expansion_depth,
+                    SearchStrategy::GraphOnly { .. } => 2,
+                    _ => 0,
+                };
+                match gs
+                    .expand(&top_chunk_ids, &graph_edge_types, graph_depth)
+                    .await
+                {
+                    Ok(nodes) => {
+                        graph_hits = dedup_by_doc_id(
+                            nodes
+                                .into_iter()
+                                .map(|n| {
+                                    let score = 1.0 / (1.0 + n.distance as f32);
+                                    (n.id, score)
+                                })
+                                .collect(),
+                        );
+                    }
+                    Err(e) => warn!("图扩展失败: {e}"),
                 }
             }
         }
@@ -732,25 +733,21 @@ impl HybridSearchEngine {
     ) -> Vec<String> {
         let mut ids = Vec::new();
 
-        if should_use_vector(strategy) {
-            if let Some(ref vi) = self.vector_index {
-                if let Ok(query_vec) = self.embedding.embed_query(&request.query).await {
-                    if let Ok(hits) = vi.search(&query_vec, top_k, request.filters.as_ref()).await {
-                        ids.extend(hits.into_iter().map(|h| h.chunk_id));
-                    }
-                }
-            }
+        if should_use_vector(strategy)
+            && let Some(ref vi) = self.vector_index
+            && let Ok(query_vec) = self.embedding.embed_query(&request.query).await
+            && let Ok(hits) = vi.search(&query_vec, top_k, request.filters.as_ref()).await
+        {
+            ids.extend(hits.into_iter().map(|h| h.chunk_id));
         }
 
-        if should_use_text(strategy) {
-            if let Some(ref ft) = self.fulltext_index {
-                if let Ok(hits) = ft
-                    .search(&request.query, top_k, request.filters.as_ref())
-                    .await
-                {
-                    ids.extend(hits.into_iter().map(|h| h.chunk_id));
-                }
-            }
+        if should_use_text(strategy)
+            && let Some(ref ft) = self.fulltext_index
+            && let Ok(hits) = ft
+                .search(&request.query, top_k, request.filters.as_ref())
+                .await
+        {
+            ids.extend(hits.into_iter().map(|h| h.chunk_id));
         }
 
         ids

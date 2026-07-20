@@ -10,6 +10,12 @@ use crate::types::DocumentMetadata;
 
 pub struct CodeFileParser;
 
+impl Default for CodeFileParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodeFileParser {
     pub fn new() -> Self {
         Self

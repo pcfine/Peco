@@ -10,8 +10,8 @@ pub use middleware::AuthUser;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 
 use crate::state::AppState;
 

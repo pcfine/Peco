@@ -75,13 +75,12 @@ pub async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaCompone
     ));
 
     // 创建 DynamicContext（读路径）
-    let dynamic_context: Option<Arc<dyn peco_core::agent::DynamicContext>> = Some(Arc::new(
-        PpaDynamicContext::new(
+    let dynamic_context: Option<Arc<dyn peco_core::agent::DynamicContext>> =
+        Some(Arc::new(PpaDynamicContext::new(
             store.clone(),
             classifier::QueryClassifier::new(),
             ppa_config.clone(),
-        ),
-    ));
+        )));
 
     // 创建 MemoryAnalyzer（写路径）
     // 使用独立模型分析对话，失败不影响主流程

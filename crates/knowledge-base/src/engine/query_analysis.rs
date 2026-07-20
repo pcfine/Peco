@@ -270,7 +270,7 @@ fn detect_entity(text: &str) -> bool {
     // 纯 CJK 短名称检测（2–4 个表意文字 → 可能是人名、地名）。
     let cjk_count = text.chars().filter(|c| is_cjk(*c)).count();
     let total_chars = text.chars().count();
-    if cjk_count >= 2 && cjk_count <= 4 && cjk_count == total_chars {
+    if (2..=4).contains(&cjk_count) && cjk_count == total_chars {
         return true;
     }
 

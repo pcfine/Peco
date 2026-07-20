@@ -48,7 +48,10 @@ impl Workspace {
             let dir = root.join(subdir);
             if !dir.exists() {
                 std::fs::create_dir_all(&dir).map_err(|e| {
-                    WorkspaceError::WorkspaceDir(format!("failed to create '{}': {e}", dir.display()))
+                    WorkspaceError::WorkspaceDir(format!(
+                        "failed to create '{}': {e}",
+                        dir.display()
+                    ))
                 })?;
             }
         }
@@ -57,10 +60,10 @@ impl Workspace {
 
         let user_skills_dir = root.join("skills");
         let mut registry = GlobalSkillList::new(user_skills_dir.clone());
-        if user_skills_dir.exists() {
-            if let Err(e) = registry.init() {
-                tracing::warn!(error = %e, "Failed to scan user skills");
-            }
+        if user_skills_dir.exists()
+            && let Err(e) = registry.init()
+        {
+            tracing::warn!(error = %e, "Failed to scan user skills");
         }
         let skill_registry = Arc::new(RwLock::new(registry));
 
@@ -87,18 +90,33 @@ impl Workspace {
 
     // ── 访问器 ──────────────────────────────────────────────────────
 
-    pub fn user_id(&self) -> &str { &self.user_id }
-    pub fn root(&self) -> &Path { &self.root }
-    pub fn config(&self) -> &UserConfig { &self.config }
-    pub fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>> { &self.skill_registry }
-    pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> { &self.knowledge_manager }
-    pub fn ppa_store(&self) -> &Arc<PersonalMemoryStore> { &self.ppa_store }
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn config(&self) -> &UserConfig {
+        &self.config
+    }
+    pub fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>> {
+        &self.skill_registry
+    }
+    pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+        &self.knowledge_manager
+    }
+    pub fn ppa_store(&self) -> &Arc<PersonalMemoryStore> {
+        &self.ppa_store
+    }
 
     // ── Agent 操作（缓存版，需要 Arc<Self>）─────────────────────────
 
     /// 从 agents/{name}/agent.md 加载 Agent（带缓存）。
     /// 需要 `Arc<Workspace>` 以构建 ToolDependencies。
-    pub fn load_agent_cached(self: &Arc<Self>, name: &str) -> Result<Arc<Agent>, crate::agent::AgentError> {
+    pub fn load_agent_cached(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<Arc<Agent>, crate::agent::AgentError> {
         {
             let cache = self.agent_cache.read().map_err(|e| {
                 crate::agent::AgentError::Config(format!("agent cache lock poisoned: {e}"))
@@ -214,7 +232,7 @@ impl Workspace {
 
     pub fn save_agent(&self, name: &str, content: &str) -> Result<(), WorkspaceError> {
         crate::agent::agent_config::split_frontmatter(content)
-            .map_err(|e| WorkspaceError::InvalidAgentFormat(e))?;
+            .map_err(WorkspaceError::InvalidAgentFormat)?;
 
         let dir = self.agents_dir().join(name);
         std::fs::create_dir_all(&dir)?;
@@ -237,8 +255,12 @@ impl Workspace {
 
     // ── 路径辅助 ─────────────────────────────────────────────────────
 
-    pub fn agents_dir(&self) -> PathBuf { self.root.join("agents") }
-    pub fn skills_dir(&self) -> PathBuf { self.root.join("skills") }
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
     pub fn agent_md_path(&self, name: &str) -> PathBuf {
         self.agents_dir().join(name).join("agent.md")
     }
@@ -278,7 +300,9 @@ impl MemoryStore for Workspace {
         top_k: usize,
         threshold: f32,
     ) -> Result<Vec<MemoryFact>, String> {
-        self.ppa_store.search_semantic(query, top_k, threshold).await
+        self.ppa_store
+            .search_semantic(query, top_k, threshold)
+            .await
     }
 
     async fn search_episodic(
@@ -287,7 +311,9 @@ impl MemoryStore for Workspace {
         top_k: usize,
         threshold: f32,
     ) -> Result<Vec<MemoryFact>, String> {
-        self.ppa_store.search_episodic(query, top_k, threshold).await
+        self.ppa_store
+            .search_episodic(query, top_k, threshold)
+            .await
     }
 
     async fn invalidate_fact(&self, fact: &MemoryFact) -> Result<(), String> {
@@ -296,8 +322,12 @@ impl MemoryStore for Workspace {
 }
 
 impl KnowledgeAccess for Workspace {
-    fn user_id(&self) -> &str { &self.user_id }
-    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> { &self.knowledge_manager }
+    fn user_id(&self) -> &str {
+        &self.user_id
+    }
+    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+        &self.knowledge_manager
+    }
 }
 
 // ============================================================================
@@ -322,10 +352,16 @@ struct UncachedAgentLoader {
 
 impl AgentLoader for UncachedAgentLoader {
     fn load_agent(&self, name: &str) -> Result<Arc<Agent>, crate::agent::AgentError> {
-        let path = self.workspace.root.join("agents").join(name).join("agent.md");
+        let path = self
+            .workspace
+            .root
+            .join("agents")
+            .join(name)
+            .join("agent.md");
         if !path.exists() {
             return Err(crate::agent::AgentError::Config(format!(
-                "agent '{name}' not found at {}", path.display()
+                "agent '{name}' not found at {}",
+                path.display()
             )));
         }
 
@@ -404,10 +440,20 @@ impl MemoryStore for WsMemoryStore {
     async fn save_or_update_fact(&self, fact: &MemoryFact) -> Result<(), String> {
         self.store.save_or_update_fact(fact).await
     }
-    async fn search_semantic(&self, query: &str, top_k: usize, threshold: f32) -> Result<Vec<MemoryFact>, String> {
+    async fn search_semantic(
+        &self,
+        query: &str,
+        top_k: usize,
+        threshold: f32,
+    ) -> Result<Vec<MemoryFact>, String> {
         self.store.search_semantic(query, top_k, threshold).await
     }
-    async fn search_episodic(&self, query: &str, top_k: usize, threshold: f32) -> Result<Vec<MemoryFact>, String> {
+    async fn search_episodic(
+        &self,
+        query: &str,
+        top_k: usize,
+        threshold: f32,
+    ) -> Result<Vec<MemoryFact>, String> {
         self.store.search_episodic(query, top_k, threshold).await
     }
     async fn invalidate_fact(&self, fact: &MemoryFact) -> Result<(), String> {
@@ -421,6 +467,10 @@ struct WsKnowledgeAccess {
 }
 
 impl KnowledgeAccess for WsKnowledgeAccess {
-    fn user_id(&self) -> &str { &self.user_id }
-    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> { &self.km }
+    fn user_id(&self) -> &str {
+        &self.user_id
+    }
+    fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+        &self.km
+    }
 }

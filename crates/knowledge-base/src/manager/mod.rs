@@ -31,6 +31,13 @@ use crate::types::*;
 
 use self::config::{BackendType, KbConfig, KbConfigsFile, KbInfo};
 
+/// 存储后端组件三元组：(文档存储, 向量索引, 全文索引)
+type BackendComponents = (
+    Arc<dyn DocumentStore>,
+    Option<Arc<dyn VectorIndex>>,
+    Option<Arc<dyn FullTextIndex>>,
+);
+
 // ---------------------------------------------------------------------------
 // KnowledgeBaseManager
 // ---------------------------------------------------------------------------
@@ -210,12 +217,11 @@ impl KnowledgeBaseManager {
 
         let mut results = Vec::new();
         for name in &names {
-            if let Ok(kb) = self.open_kb(name).await {
-                if let Ok(res) = kb.search(query, top_k).await {
-                    if !res.is_empty() {
-                        results.push((name.clone(), res));
-                    }
-                }
+            if let Ok(kb) = self.open_kb(name).await
+                && let Ok(res) = kb.search(query, top_k).await
+                && !res.is_empty()
+            {
+                results.push((name.clone(), res));
             }
         }
         results
@@ -270,11 +276,7 @@ impl KnowledgeBase {
 
         // 构建存储后端
         #[cfg(feature = "lancedb")]
-        let (doc_store, vector_index, fulltext_index): (
-            Arc<dyn DocumentStore>,
-            Option<Arc<dyn VectorIndex>>,
-            Option<Arc<dyn FullTextIndex>>,
-        ) = match &config.backend {
+        let (doc_store, vector_index, fulltext_index): BackendComponents = match &config.backend {
             BackendType::InMemory => {
                 let be = Arc::new(crate::backends::memory::InMemoryBackend::new());
                 (
@@ -300,7 +302,6 @@ impl KnowledgeBase {
             }
             #[cfg(feature = "helixdb")]
             BackendType::HelixDb => {
-                // HelixDB 后端连接需要 URL 配置
                 return Err(KnowledgeError::InvalidInput(
                     "HelixDB 后端需通过高级 API 配置，请使用 HelixDbBackend::connect()".into(),
                 ));
@@ -308,11 +309,7 @@ impl KnowledgeBase {
         };
 
         #[cfg(not(feature = "lancedb"))]
-        let (doc_store, vector_index, fulltext_index): (
-            Arc<dyn DocumentStore>,
-            Option<Arc<dyn VectorIndex>>,
-            Option<Arc<dyn FullTextIndex>>,
-        ) = match &config.backend {
+        let (doc_store, vector_index, fulltext_index): BackendComponents = match &config.backend {
             BackendType::InMemory => {
                 let be = Arc::new(crate::backends::memory::InMemoryBackend::new());
                 (

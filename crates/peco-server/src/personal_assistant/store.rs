@@ -54,7 +54,11 @@ impl PersonalMemoryStore {
     /// `km` 应为已绑定到用户专属 `base_dir` 的 KnowledgeManager 实例。
     /// `kb_name` 为 Personal KB 名称。
     pub fn new(km: Arc<KnowledgeManager>, kb_name: String, config: StorageConfig) -> Self {
-        Self { km, kb_name, config }
+        Self {
+            km,
+            kb_name,
+            config,
+        }
     }
 
     /// 确保 Personal KB 已创建（幂等）。
@@ -105,15 +109,15 @@ impl PersonalMemoryStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        if let Some(result) = results.first() {
-            if result.title == "_profile" {
-                // 从 snippet 中解析 YAML
-                if let Ok(profile) = serde_yaml::from_str::<UserProfile>(&result.snippet) {
-                    return Ok(profile);
-                }
-                // 兼容纯文本格式，尝试解析
-                warn!("Failed to parse profile YAML, returning default");
+        if let Some(result) = results.first()
+            && result.title == "_profile"
+        {
+            // 从 snippet 中解析 YAML
+            if let Ok(profile) = serde_yaml::from_str::<UserProfile>(&result.snippet) {
+                return Ok(profile);
             }
+            // 兼容纯文本格式，尝试解析
+            warn!("Failed to parse profile YAML, returning default");
         }
 
         Ok(UserProfile::default())
@@ -176,7 +180,8 @@ impl PersonalMemoryStore {
         top_k: usize,
         min_score: f32,
     ) -> Result<Vec<MemoryFact>, String> {
-        self.search_facts(query, top_k, min_score, MemoryCategory::Semantic).await
+        self.search_facts(query, top_k, min_score, MemoryCategory::Semantic)
+            .await
     }
 
     /// Episodic 检索。
@@ -186,7 +191,8 @@ impl PersonalMemoryStore {
         top_k: usize,
         min_score: f32,
     ) -> Result<Vec<MemoryFact>, String> {
-        self.search_facts(query, top_k, min_score, MemoryCategory::Episodic).await
+        self.search_facts(query, top_k, min_score, MemoryCategory::Episodic)
+            .await
     }
 
     /// 通用事实检索。

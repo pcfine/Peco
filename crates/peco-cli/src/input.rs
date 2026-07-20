@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 // ============================================================================
 // InputReader

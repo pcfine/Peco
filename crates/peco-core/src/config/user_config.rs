@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use super::merge::merge_providers_config;
 use super::mcp_config::McpConfig;
+use super::merge::merge_providers_config;
 use super::system_config::SystemConfig;
 use super::types::{ProviderEntry, ProvidersConfig};
 use crate::config::ConfigError;
@@ -35,16 +35,12 @@ impl UserConfig {
     /// 3. 若不存在，直接使用 `system.providers`
     /// 4. 尝试读取 `{workspace_root}/mcpconfig.json`
     /// 5. 若存在，使用用户 MCP 配置；否则使用系统兜底
-    pub fn load(
-        system: &SystemConfig,
-        workspace_root: &Path,
-    ) -> Result<Self, ConfigError> {
+    pub fn load(system: &SystemConfig, workspace_root: &Path) -> Result<Self, ConfigError> {
         // ── 加载用户 providers.toml ──────────────────────────────
         let user_providers_path = workspace_root.join("providers.toml");
 
         let providers = if user_providers_path.exists() {
-            let content =
-                std::fs::read_to_string(&user_providers_path).map_err(ConfigError::Io)?;
+            let content = std::fs::read_to_string(&user_providers_path).map_err(ConfigError::Io)?;
             let user_providers: ProvidersConfig =
                 toml::from_str(&content).map_err(ConfigError::TomlParse)?;
             merge_providers_config(&system.providers, &user_providers)

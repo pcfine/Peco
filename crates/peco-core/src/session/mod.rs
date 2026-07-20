@@ -15,6 +15,7 @@
 pub mod buffer;
 pub mod error;
 pub mod metadata;
+#[allow(clippy::module_inception)]
 pub mod session;
 pub mod snapshot;
 pub mod types;

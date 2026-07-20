@@ -1,3 +1,4 @@
+#[allow(clippy::module_inception)]
 pub(crate) mod agent;
 pub mod agent_config;
 pub(crate) mod agent_looper;
@@ -14,8 +15,8 @@ pub use agent_config::{
     assemble_agent_md, parse_agent_md, resolve_api_key, split_frontmatter,
 };
 pub use agent_looper::{
-    AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState, TurnFailureReason,
-    TurnOutcome, UserMsg,
+    AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState,
+    TurnFailureReason, TurnOutcome, UserMsg,
 };
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;

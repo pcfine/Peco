@@ -12,7 +12,9 @@ pub mod tools;
 pub mod utils;
 pub mod workspace;
 
-pub use persistence::{FileSessionPersister, NullSessionPersister, PersistError, PersistResult, SessionPersister};
+pub use persistence::{
+    FileSessionPersister, NullSessionPersister, PersistError, PersistResult, SessionPersister,
+};
 pub use session::{
     AnnotatedMessage, InputPriority, MessageId, MessageSource, PendingInput, Session, SessionError,
     SessionMeta, SessionSnapshot, SessionState, TurnBoundaryToken,

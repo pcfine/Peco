@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use axum_extra::extract::Multipart;
 use knowledge_base::manager::config::{
     BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
@@ -162,8 +162,7 @@ fn is_allowed_mime(mime: &str) -> bool {
             | "text/x-go"
             | "application/javascript"
             | "text/typescript"
-    )
-    || mime.starts_with("text/")
+    ) || mime.starts_with("text/")
 }
 
 /// 获取用户 KnowledgeManager (via Workspace).
@@ -189,18 +188,17 @@ pub async fn list_knowledge_bases(
     let mut responses = Vec::with_capacity(rows.len());
     for row in &rows {
         // 尝试获取知识库统计信息
-        let (doc_count, chunk_count) =
-            match get_user_km(&state, &user_id) {
-                Ok(km) => match km.list_kbs().await {
-                    Ok(infos) => {
-                        let info = infos.iter().find(|i| i.name == row.name);
-                        info.map(|i| (i.document_count, i.chunk_count))
-                            .unwrap_or((0, 0))
-                    }
-                    Err(_) => (0, 0),
-                },
+        let (doc_count, chunk_count) = match get_user_km(&state, &user_id) {
+            Ok(km) => match km.list_kbs().await {
+                Ok(infos) => {
+                    let info = infos.iter().find(|i| i.name == row.name);
+                    info.map(|i| (i.document_count, i.chunk_count))
+                        .unwrap_or((0, 0))
+                }
                 Err(_) => (0, 0),
-            };
+            },
+            Err(_) => (0, 0),
+        };
 
         responses.push(KnowledgeBaseResponse {
             id: row.id.clone(),
@@ -309,18 +307,17 @@ pub async fn get_knowledge_base(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
-    let (doc_count, chunk_count) =
-        match get_user_km(&state, &user_id) {
-            Ok(km) => match km.list_kbs().await {
-                Ok(infos) => {
-                    let info = infos.iter().find(|i| i.name == row.name);
-                    info.map(|i| (i.document_count, i.chunk_count))
-                        .unwrap_or((0, 0))
-                }
-                Err(_) => (0, 0),
-            },
+    let (doc_count, chunk_count) = match get_user_km(&state, &user_id) {
+        Ok(km) => match km.list_kbs().await {
+            Ok(infos) => {
+                let info = infos.iter().find(|i| i.name == row.name);
+                info.map(|i| (i.document_count, i.chunk_count))
+                    .unwrap_or((0, 0))
+            }
             Err(_) => (0, 0),
-        };
+        },
+        Err(_) => (0, 0),
+    };
 
     Ok(Json(KnowledgeBaseResponse {
         id: row.id,
@@ -360,14 +357,14 @@ pub async fn delete_knowledge_base(
     knowledge_bases::delete(&state.db, &kb_id).await?;
 
     // 3. 通过 KnowledgeBaseManager 删除知识库（含磁盘 + LanceDB 数据）
-    if let Ok(km) = get_user_km(&state, &user_id) {
-        if let Err(e) = km.delete_kb(&kb_name).await {
-            tracing::warn!(
-                kb_name = %kb_name,
-                error = %e,
-                "KnowledgeBaseManager failed to delete KB data (may already be removed)"
-            );
-        }
+    if let Ok(km) = get_user_km(&state, &user_id)
+        && let Err(e) = km.delete_kb(&kb_name).await
+    {
+        tracing::warn!(
+            kb_name = %kb_name,
+            error = %e,
+            "KnowledgeBaseManager failed to delete KB data (may already be removed)"
+        );
     }
 
     tracing::info!(
@@ -453,15 +450,16 @@ pub async fn upload_document(
         if name.as_deref() == Some("file") {
             filename = file_name;
             mime_type = content_type;
-            data = field.bytes().await.map_err(|e| {
-                ApiError::BadRequest(format!("failed to read uploaded file: {e}"))
-            })?.to_vec();
+            data = field
+                .bytes()
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("failed to read uploaded file: {e}")))?
+                .to_vec();
         }
     }
 
     let filename = filename.ok_or_else(|| ApiError::BadRequest("file field is required".into()))?;
-    let mime_type =
-        mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
     // 验证 MIME 类型
     if !is_allowed_mime(&mime_type) {
@@ -480,14 +478,14 @@ pub async fn upload_document(
         .join("knowledge")
         .join(sanitized)
         .join("docs");
-    tokio::fs::create_dir_all(&docs_dir).await.map_err(|e| {
-        ApiError::Internal(format!("failed to create docs directory: {e}"))
-    })?;
+    tokio::fs::create_dir_all(&docs_dir)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to create docs directory: {e}")))?;
 
     let filepath = docs_dir.join(&filename);
-    tokio::fs::write(&filepath, &data).await.map_err(|e| {
-        ApiError::Internal(format!("failed to save file: {e}"))
-    })?;
+    tokio::fs::write(&filepath, &data)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to save file: {e}")))?;
 
     // 写入 documents 表（status=pending）
     let doc_id = Uuid::new_v4().to_string();
@@ -513,13 +511,8 @@ pub async fn upload_document(
         match wsm_for_bg.get(&user_id_for_bg) {
             Ok(ws) => match ws.knowledge_manager().sync_kb(&kb_name_for_bg).await {
                 Ok(_report) => {
-                    let _ = documents::update_status(
-                        &db_for_bg,
-                        &doc_id_for_bg,
-                        "ready",
-                        None,
-                    )
-                    .await;
+                    let _ =
+                        documents::update_status(&db_for_bg, &doc_id_for_bg, "ready", None).await;
                     tracing::info!(
                         doc_id = %doc_id_for_bg,
                         kb = %kb_name_for_bg,

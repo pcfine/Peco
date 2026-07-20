@@ -29,39 +29,68 @@ impl AgentLoader for NoopAgentLoader {
     fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
         Err(AgentError::Config("noop agent loader".into()))
     }
-    fn list_agent_names(&self) -> Vec<String> { vec![] }
+    fn list_agent_names(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 struct NoopSkillProvider {
     registry: Arc<std::sync::RwLock<GlobalSkillList>>,
 }
 impl SkillProvider for NoopSkillProvider {
-    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> { &self.registry }
+    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> {
+        &self.registry
+    }
 }
 
 struct NoopMemoryStore;
 #[async_trait::async_trait]
 impl MemoryStore for NoopMemoryStore {
-    async fn save_or_update_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
-    async fn search_semantic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
-    async fn search_episodic(&self, _query: &str, _top_k: usize, _threshold: f32) -> Result<Vec<MemoryFact>, String> { Ok(vec![]) }
-    async fn invalidate_fact(&self, _fact: &MemoryFact) -> Result<(), String> { Ok(()) }
+    async fn save_or_update_fact(&self, _fact: &MemoryFact) -> Result<(), String> {
+        Ok(())
+    }
+    async fn search_semantic(
+        &self,
+        _query: &str,
+        _top_k: usize,
+        _threshold: f32,
+    ) -> Result<Vec<MemoryFact>, String> {
+        Ok(vec![])
+    }
+    async fn search_episodic(
+        &self,
+        _query: &str,
+        _top_k: usize,
+        _threshold: f32,
+    ) -> Result<Vec<MemoryFact>, String> {
+        Ok(vec![])
+    }
+    async fn invalidate_fact(&self, _fact: &MemoryFact) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct NoopKnowledgeAccess;
 impl KnowledgeAccess for NoopKnowledgeAccess {
-    fn user_id(&self) -> &str { "cli-user" }
+    fn user_id(&self) -> &str {
+        "cli-user"
+    }
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
-        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> =
-            std::sync::LazyLock::new(|| Arc::new(KnowledgeManager::new(
-                dirs_next().unwrap_or_else(|| std::env::temp_dir()).join("peco-cli-kb")
-            )));
+        static KM: std::sync::LazyLock<Arc<KnowledgeManager>> = std::sync::LazyLock::new(|| {
+            Arc::new(KnowledgeManager::new(
+                dirs_next()
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("peco-cli-kb"),
+            ))
+        });
         &KM
     }
 }
 
 fn dirs_next() -> Option<std::path::PathBuf> {
-    std::env::var("PECO_KNOWLEDGE_DIR").ok().map(std::path::PathBuf::from)
+    std::env::var("PECO_KNOWLEDGE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
 }
 
 // ============================================================================
@@ -135,42 +164,41 @@ impl CliApp {
         };
 
         // ── 4. 创建或恢复 Session ──────────────────────────────────────
-        let (session, session_id, session_description) =
-            if let Some(ref id) = config.session_id {
-                match persister.load(id).await? {
-                    Some((snapshot, meta)) => {
-                        eprintln!("[init] 恢复会话: {id} ({} turns)", meta.completed_turns);
-                        let s = Session::from_snapshot(
-                            meta.id.clone(),
-                            meta.description.clone(),
-                            meta.created_at,
-                            snapshot,
-                        );
-                        (s, meta.id, meta.description)
-                    }
-                    None => {
-                        anyhow::bail!(
-                            "会话 {id} 不存在。使用 --list-sessions 查看可用会话。"
-                        );
-                    }
+        let (session, session_id, session_description) = if let Some(ref id) = config.session_id {
+            match persister.load(id).await? {
+                Some((snapshot, meta)) => {
+                    eprintln!("[init] 恢复会话: {id} ({} turns)", meta.completed_turns);
+                    let s = Session::from_snapshot(
+                        meta.id.clone(),
+                        meta.description.clone(),
+                        meta.created_at,
+                        snapshot,
+                    );
+                    (s, meta.id, meta.description)
                 }
-            } else {
-                let id = uuid::Uuid::new_v4().to_string();
-                let desc = config
-                    .agent_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("new session")
-                    .to_string();
-                eprintln!("[init] 新建会话: {id}");
-                let s = Session::new(id.clone(), desc.clone());
-                (s, id, desc)
-            };
+                None => {
+                    anyhow::bail!("会话 {id} 不存在。使用 --list-sessions 查看可用会话。");
+                }
+            }
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            let desc = config
+                .agent_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("new session")
+                .to_string();
+            eprintln!("[init] 新建会话: {id}");
+            let s = Session::new(id.clone(), desc.clone());
+            (s, id, desc)
+        };
 
         // ── 5. 构建 ToolDependencies ────────────────────────────────────
         let tool_deps = ToolDependencies {
             agent_loader: Arc::new(NoopAgentLoader),
-            skill_provider: Arc::new(NoopSkillProvider { registry: skill_registry.clone() }),
+            skill_provider: Arc::new(NoopSkillProvider {
+                registry: skill_registry.clone(),
+            }),
             memory_store: Arc::new(NoopMemoryStore),
             knowledge_access: Arc::new(NoopKnowledgeAccess),
         };
@@ -188,12 +216,15 @@ impl CliApp {
             agent.config().agent.name,
             agent.path().display(),
             agent.provider().name(),
-            agent.model_config().model_name.as_deref().unwrap_or("default"),
+            agent
+                .model_config()
+                .model_name
+                .as_deref()
+                .unwrap_or("default"),
         );
 
         // ── 5. 构建渲染器和输入 ────────────────────────────────────────
-        let renderer: Box<dyn Renderer> =
-            Box::new(ConsoleRenderer::new(&config));
+        let renderer: Box<dyn Renderer> = Box::new(ConsoleRenderer::new(&config));
 
         let input = InputReader::new()?;
 
@@ -260,16 +291,19 @@ impl CliApp {
     }
 
     /// 返回会话 ID。
+    #[allow(dead_code)]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
     /// 返回会话持久化器的引用。
+    #[allow(dead_code)]
     pub fn persister(&self) -> &Arc<dyn SessionPersister> {
         &self.persister
     }
 
     /// 返回渲染器的可变引用。
+    #[allow(dead_code)]
     pub fn renderer_mut(&mut self) -> &mut Box<dyn Renderer> {
         &mut self.renderer
     }
@@ -294,8 +328,7 @@ impl CliApp {
 
         // 发送查询
         if let Err(e) = handle.send_query(input).await {
-            self.renderer
-                .render_error(&format!("发送消息失败: {e}"))?;
+            self.renderer.render_error(&format!("发送消息失败: {e}"))?;
             return Ok(());
         }
 
@@ -320,8 +353,7 @@ impl CliApp {
                 }
                 None => {
                     // Channel 关闭 — looper 意外退出
-                    self.renderer
-                        .render_error("Agent 意外退出")?;
+                    self.renderer.render_error("Agent 意外退出")?;
                     break;
                 }
             }
@@ -359,10 +391,7 @@ impl CliApp {
         self.handle = None;
 
         // 创建新 session（空状态，/clear 语义）
-        let session = Session::new(
-            self.session_id.clone(),
-            self.session_description.clone(),
-        );
+        let session = Session::new(self.session_id.clone(), self.session_description.clone());
 
         let looper_config = self.config.to_looper_config();
 
@@ -413,16 +442,16 @@ pub async fn list_sessions_and_exit(config: &CliConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("\n  {:<38}  {:>6}  {:>8}  {}", "会话 ID", "Turns", "Tokens", "描述");
+    println!(
+        "\n  {:<38}  {:>6}  {:>8}  描述",
+        "会话 ID", "Turns", "Tokens"
+    );
     println!("  {:-<38}  {:-<6}  {:-<8}  {:-<30}", "", "", "", "");
 
     for meta in &sessions {
         println!(
             "  {:<38}  {:>6}  {:>8}  {}",
-            meta.id,
-            meta.completed_turns,
-            meta.tokens_used,
-            meta.description,
+            meta.id, meta.completed_turns, meta.tokens_used, meta.description,
         );
     }
     println!();

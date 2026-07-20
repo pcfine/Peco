@@ -121,9 +121,10 @@ impl MultiTurnExecutor {
     async fn ensure_looper(&self) -> Result<(), ExecutorError> {
         let mut guard = self.handle.lock().await;
         if guard.is_none() {
-            let session = self.session.lock().await.take().ok_or_else(|| {
-                ExecutorError::LooperExited("session already consumed".into())
-            })?;
+            let session =
+                self.session.lock().await.take().ok_or_else(|| {
+                    ExecutorError::LooperExited("session already consumed".into())
+                })?;
             let h = AgentLooper::spawn(
                 self.agent.clone(),
                 session,
@@ -219,7 +220,10 @@ impl AgentExecutor for MultiTurnExecutor {
             .iter()
             .find_map(|e| {
                 if let LooperEvent::TurnComplete { outcome, usage, .. } = e {
-                    Some((outcome.text().unwrap_or_default().to_string(), usage.clone()))
+                    Some((
+                        outcome.text().unwrap_or_default().to_string(),
+                        usage.clone(),
+                    ))
                 } else {
                     None
                 }

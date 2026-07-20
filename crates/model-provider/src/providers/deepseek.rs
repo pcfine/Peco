@@ -62,9 +62,8 @@ impl DeepSeek {
     ///
     /// 如果环境变量未设置，返回错误。
     pub fn from_env() -> Result<Self, ProviderError> {
-        let api_key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| {
-            ProviderError::Request("DEEPSEEK_API_KEY 环境变量未设置".to_string())
-        })?;
+        let api_key = std::env::var("DEEPSEEK_API_KEY")
+            .map_err(|_| ProviderError::Request("DEEPSEEK_API_KEY 环境变量未设置".to_string()))?;
         Self::new(api_key)
     }
 
@@ -330,10 +329,11 @@ impl ModelProvider for DeepSeek {
 
         let api_response: DeepSeekResponse = serde_json::from_slice(&response_body)?;
 
-        let choice =
-            api_response.choices.into_iter().next().ok_or_else(|| {
-                ProviderError::Response("响应中不包含任何选项".to_string())
-            })?;
+        let choice = api_response
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProviderError::Response("响应中不包含任何选项".to_string()))?;
 
         let message = convert_api_message(choice.message);
         let usage = api_response.usage.map(convert_usage).unwrap_or_default();
@@ -528,7 +528,10 @@ mod tests {
     fn test_chat_request_serialization() {
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![Arc::new(Message::system("You are helpful.")), Arc::new(Message::user("Hi"))],
+            messages: vec![
+                Arc::new(Message::system("You are helpful.")),
+                Arc::new(Message::user("Hi")),
+            ],
             tools: vec![],
             temperature: Some(0.7),
             max_tokens: Some(1024),
@@ -653,7 +656,10 @@ mod tests {
         // 非流式请求
         let request = ChatRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![Arc::new(Message::system("You are helpful.")), Arc::new(Message::user("Hello"))],
+            messages: vec![
+                Arc::new(Message::system("You are helpful.")),
+                Arc::new(Message::user("Hello")),
+            ],
             tools: vec![],
             temperature: Some(0.7),
             max_tokens: None,

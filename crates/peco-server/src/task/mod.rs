@@ -10,8 +10,8 @@ pub use scheduler::CronScheduler;
 
 use std::sync::Arc;
 
-use axum::routing::{get, patch, post};
 use axum::Router;
+use axum::routing::{get, patch, post};
 
 use crate::state::AppState;
 

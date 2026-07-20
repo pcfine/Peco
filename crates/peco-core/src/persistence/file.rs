@@ -89,7 +89,8 @@ impl SessionPersister for FileSessionPersister {
                 Ok(Some((existing_snapshot, _existing_meta))) => {
                     if existing_snapshot.turn_index < snapshot.turn_index {
                         // 追加新 turn：保留已有，从新 snapshot 中取增量
-                        let mut turns: Vec<Vec<AnnotatedMessage>> = existing_snapshot.committed_turns;
+                        let mut turns: Vec<Vec<AnnotatedMessage>> =
+                            existing_snapshot.committed_turns;
                         let new_turns = &snapshot.committed_turns
                             [existing_snapshot.turn_index..snapshot.turn_index];
                         tracing::debug!(
@@ -176,14 +177,12 @@ impl SessionPersister for FileSessionPersister {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
-                if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                    if let Ok(file) = serde_json::from_str::<SessionFile>(&content) {
-                        if file.format_version == 3 {
-                            metas.push(file.meta);
-                        }
-                    }
-                }
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Ok(content) = tokio::fs::read_to_string(&path).await
+                && let Ok(file) = serde_json::from_str::<SessionFile>(&content)
+                && file.format_version == 3
+            {
+                metas.push(file.meta);
             }
         }
 
@@ -207,8 +206,7 @@ async fn read_session_file(
         Err(e) => return Err(PersistError::Io(e)),
     };
 
-    let file: SessionFile = serde_json::from_str(&raw)
-        .map_err(|_| PersistError::UnknownFormat)?;
+    let file: SessionFile = serde_json::from_str(&raw).map_err(|_| PersistError::UnknownFormat)?;
 
     if file.format_version != 3 {
         return Err(PersistError::UnsupportedFormatVersion(file.format_version));
@@ -276,8 +274,8 @@ fn sanitize_session_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::{Message, Usage};
     use crate::session::{AnnotatedMessage, MessageId, MessageSource};
+    use model_provider::{Message, Usage};
 
     fn temp_dir(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -290,7 +288,9 @@ mod tests {
     async fn setup(test_name: &str) -> FileSessionPersister {
         let dir = temp_dir(test_name);
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        FileSessionPersister::new(dir).await.expect("create temp dir")
+        FileSessionPersister::new(dir)
+            .await
+            .expect("create temp dir")
     }
 
     async fn teardown(persister: &FileSessionPersister) {
@@ -397,12 +397,17 @@ mod tests {
         // Save turn 0
         let snap0 = SessionSnapshot {
             committed_turns: vec![vec![AnnotatedMessage::new(
-                MessageId(0), 0,
+                MessageId(0),
+                0,
                 Message::user("turn0"),
                 MessageSource::UserInput,
             )]],
             turn_index: 1,
-            total_usage: Usage { input_tokens: 5, output_tokens: 10, total_tokens: 15 },
+            total_usage: Usage {
+                input_tokens: 5,
+                output_tokens: 10,
+                total_tokens: 15,
+            },
             next_message_id: 1,
             pending_inputs: Vec::new(),
         };
@@ -411,11 +416,25 @@ mod tests {
         // Save turn 1 (should append incrementally)
         let snap1 = SessionSnapshot {
             committed_turns: vec![
-                vec![AnnotatedMessage::new(MessageId(0), 0, Message::user("turn0"), MessageSource::UserInput)],
-                vec![AnnotatedMessage::new(MessageId(1), 1, Message::user("turn1"), MessageSource::UserInput)],
+                vec![AnnotatedMessage::new(
+                    MessageId(0),
+                    0,
+                    Message::user("turn0"),
+                    MessageSource::UserInput,
+                )],
+                vec![AnnotatedMessage::new(
+                    MessageId(1),
+                    1,
+                    Message::user("turn1"),
+                    MessageSource::UserInput,
+                )],
             ],
             turn_index: 2,
-            total_usage: Usage { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
+            total_usage: Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                total_tokens: 30,
+            },
             next_message_id: 2,
             pending_inputs: Vec::new(),
         };

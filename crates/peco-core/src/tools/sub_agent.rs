@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::Future;
 use model_provider::ToolDefinition;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent::simple_looper::SimpleAgentLooper;
@@ -74,8 +74,7 @@ impl ToolDyn for DelegateSubAgent {
                 prompt: String,
             }
 
-            let parsed: SubAgentArgs =
-                serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            let parsed: SubAgentArgs = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
 
             let agent_name = parsed.agent_name.trim();
             if agent_name.is_empty() {
@@ -178,7 +177,8 @@ impl ToolDyn for RunParallelSubAgents {
             for td in &task_defs {
                 let agent = self.agent_loader.load_agent(&td.agent_name).map_err(|e| {
                     ToolError::ToolCallError(Box::new(StringError(format!(
-                        "failed to load agent '{}': {e}", td.agent_name
+                        "failed to load agent '{}': {e}",
+                        td.agent_name
                     ))))
                 })?;
                 agent_pairs.push((td.agent_name.clone(), td.prompt.clone(), agent));

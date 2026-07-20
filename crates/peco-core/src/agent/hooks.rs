@@ -329,7 +329,8 @@ mod tests {
             input_tokens: 200,
             output_tokens: 300,
         };
-        hook.on_turn_complete(0, None, &usage, &Session::new("test".into(), "test".into())).await;
+        hook.on_turn_complete(0, None, &usage, &Session::new("test".into(), "test".into()))
+            .await;
         assert_eq!(hook.accumulated().await, 500);
     }
 }

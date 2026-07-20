@@ -143,12 +143,12 @@ pub async fn scan_supported_files(
         if path.is_dir() && recursive {
             let sub_files = Box::pin(scan_supported_files(&path, recursive)).await?;
             files.extend(sub_files);
-        } else if path.is_file() {
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                if SUPPORTED_EXTENSIONS.contains(&ext_str.as_str()) {
-                    files.push(path);
-                }
+        } else if path.is_file()
+            && let Some(ext) = path.extension()
+        {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            if SUPPORTED_EXTENSIONS.contains(&ext_str.as_str()) {
+                files.push(path);
             }
         }
     }

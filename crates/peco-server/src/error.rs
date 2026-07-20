@@ -2,9 +2,9 @@
 // ApiError — 统一错误类型，实现 axum::response::IntoResponse
 // ============================================================================
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 /// 统一 API 错误类型。
@@ -84,10 +84,10 @@ impl From<sqlx::Error> for ApiError {
         match &e {
             sqlx::Error::RowNotFound => ApiError::NotFound("resource not found".into()),
             _ => {
-                if let Some(db_err) = e.as_database_error() {
-                    if db_err.is_unique_violation() {
-                        return ApiError::Conflict("resource already exists".into());
-                    }
+                if let Some(db_err) = e.as_database_error()
+                    && db_err.is_unique_violation()
+                {
+                    return ApiError::Conflict("resource already exists".into());
                 }
                 ApiError::Internal(format!("database error: {e}"))
             }

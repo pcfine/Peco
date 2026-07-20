@@ -39,15 +39,18 @@ pub enum ContextStrategy {
 impl std::fmt::Debug for ContextStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SlidingWindow { max_turns } => {
-                f.debug_struct("SlidingWindow").field("max_turns", max_turns).finish()
-            }
-            Self::TokenBudget { max_tokens, summarize_overflow } => {
-                f.debug_struct("TokenBudget")
-                    .field("max_tokens", max_tokens)
-                    .field("summarize_overflow", summarize_overflow)
-                    .finish()
-            }
+            Self::SlidingWindow { max_turns } => f
+                .debug_struct("SlidingWindow")
+                .field("max_turns", max_turns)
+                .finish(),
+            Self::TokenBudget {
+                max_tokens,
+                summarize_overflow,
+            } => f
+                .debug_struct("TokenBudget")
+                .field("max_tokens", max_tokens)
+                .field("summarize_overflow", summarize_overflow)
+                .finish(),
             Self::FullHistory => write!(f, "FullHistory"),
             Self::Custom(_) => write!(f, "Custom(...)"),
         }
@@ -63,11 +66,7 @@ impl std::fmt::Debug for ContextStrategy {
 /// 实现者负责从消息引用列表中选择/转换需要发送给 LLM 的消息。
 pub trait ContextFilter: Send + Sync {
     /// 从消息引用和可选的 system prompt 构建 `ContextResult`。
-    fn apply(
-        &self,
-        messages: &[&AnnotatedMessage],
-        system_prompt: Option<&str>,
-    ) -> ContextResult;
+    fn apply(&self, messages: &[&AnnotatedMessage], system_prompt: Option<&str>) -> ContextResult;
 }
 
 // ============================================================================
@@ -111,15 +110,12 @@ pub fn build_context(
         ContextStrategy::SlidingWindow { max_turns } => {
             build_sliding_window(messages, system_prompt, *max_turns)
         }
-        ContextStrategy::TokenBudget { max_tokens, summarize_overflow } => {
-            build_token_budget(messages, system_prompt, *max_tokens, *summarize_overflow)
-        }
-        ContextStrategy::FullHistory => {
-            build_full_history(messages, system_prompt)
-        }
-        ContextStrategy::Custom(filter) => {
-            filter.apply(messages, system_prompt)
-        }
+        ContextStrategy::TokenBudget {
+            max_tokens,
+            summarize_overflow,
+        } => build_token_budget(messages, system_prompt, *max_tokens, *summarize_overflow),
+        ContextStrategy::FullHistory => build_full_history(messages, system_prompt),
+        ContextStrategy::Custom(filter) => filter.apply(messages, system_prompt),
     }
 }
 
@@ -132,16 +128,15 @@ fn build_full_history(
     messages: &[&AnnotatedMessage],
     system_prompt: Option<&str>,
 ) -> ContextResult {
-    let mut result: Vec<Arc<Message>> = Vec::with_capacity(messages.len() + system_prompt.iter().count());
+    let mut result: Vec<Arc<Message>> =
+        Vec::with_capacity(messages.len() + system_prompt.iter().count());
 
     if let Some(prompt) = system_prompt {
         result.push(Arc::new(Message::system(prompt)));
     }
 
-    let turn_set: std::collections::BTreeSet<usize> = messages
-        .iter()
-        .map(|am| am.turn_index)
-        .collect();
+    let turn_set: std::collections::BTreeSet<usize> =
+        messages.iter().map(|am| am.turn_index).collect();
 
     for am in messages {
         result.push(Arc::clone(&am.message));
@@ -238,17 +233,24 @@ fn build_token_budget(
     }
 
     // 收集所有消息到 Vec（按时间顺序）
-    let all_messages: Vec<&AnnotatedMessage> = messages.iter().copied().collect();
+    let all_messages: Vec<&AnnotatedMessage> = messages.to_vec();
 
-    let max_turn = all_messages.iter().map(|am| am.turn_index).max().unwrap_or(0);
+    let max_turn = all_messages
+        .iter()
+        .map(|am| am.turn_index)
+        .max()
+        .unwrap_or(0);
 
     // System prompt 的 token 开销
-    let system_tokens: usize = system_prompt.map(|s| (s.len() as f64 * 0.3) as usize).unwrap_or(0);
+    let system_tokens: usize = system_prompt
+        .map(|s| (s.len() as f64 * 0.3) as usize)
+        .unwrap_or(0);
     let mut budget_remaining = max_tokens.saturating_sub(system_tokens);
 
     // 从后往前扫描，按 turn 分组累积
     // 找到每轮 turn 的起止索引
-    let turn_ranges: Vec<(usize, usize, usize)> = {  // (turn_index, start_idx, end_idx_exclusive)
+    let turn_ranges: Vec<(usize, usize, usize)> = {
+        // (turn_index, start_idx, end_idx_exclusive)
         let mut ranges = Vec::new();
         let mut current_turn = None;
         let mut start_idx = 0;
@@ -273,17 +275,19 @@ fn build_token_budget(
     for (turn, start, end) in turn_ranges.iter().rev() {
         let turn_tokens: usize = all_messages[*start..*end]
             .iter()
-            .map(|am| {
-                match am.message.as_ref() {
-                    Message::User { content } => (content.len() as f64 * 0.3) as usize,
-                    Message::Assistant { content, reasoning_content, .. } => {
-                        let c = content.as_ref().map(|s| s.len()).unwrap_or(0);
-                        let r = reasoning_content.as_ref().map(|s| s.len()).unwrap_or(0);
-                        ((c + r) as f64 * 0.3) as usize
-                    }
-                    Message::Tool { content, .. } => (content.len() as f64 * 0.3) as usize,
-                    Message::System { content } => (content.len() as f64 * 0.3) as usize,
+            .map(|am| match am.message.as_ref() {
+                Message::User { content } => (content.len() as f64 * 0.3) as usize,
+                Message::Assistant {
+                    content,
+                    reasoning_content,
+                    ..
+                } => {
+                    let c = content.as_ref().map(|s| s.len()).unwrap_or(0);
+                    let r = reasoning_content.as_ref().map(|s| s.len()).unwrap_or(0);
+                    ((c + r) as f64 * 0.3) as usize
                 }
+                Message::Tool { content, .. } => (content.len() as f64 * 0.3) as usize,
+                Message::System { content } => (content.len() as f64 * 0.3) as usize,
             })
             .sum();
 
@@ -301,7 +305,8 @@ fn build_token_budget(
 
     // 包含的 turn 中最早的那个
     let min_included_turn = included_turns.iter().min().copied().unwrap_or(max_turn);
-    let truncated = min_included_turn > 0 && min_included_turn > all_messages.first().map(|am| am.turn_index).unwrap_or(0);
+    let truncated = min_included_turn > 0
+        && min_included_turn > all_messages.first().map(|am| am.turn_index).unwrap_or(0);
 
     // 构建结果
     let mut result: Vec<Arc<Message>> = Vec::new();
@@ -340,16 +345,18 @@ fn build_token_budget(
 fn estimate_tokens_arc(messages: &[Arc<Message>]) -> usize {
     let char_count: usize = messages
         .iter()
-        .map(|m| {
-            match m.as_ref() {
-                Message::User { content } => content.len(),
-                Message::Assistant { content, reasoning_content, .. } => {
-                    content.as_ref().map(|c| c.len()).unwrap_or(0)
-                        + reasoning_content.as_ref().map(|r| r.len()).unwrap_or(0)
-                }
-                Message::Tool { content, .. } => content.len(),
-                Message::System { content } => content.len(),
+        .map(|m| match m.as_ref() {
+            Message::User { content } => content.len(),
+            Message::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => {
+                content.as_ref().map(|c| c.len()).unwrap_or(0)
+                    + reasoning_content.as_ref().map(|r| r.len()).unwrap_or(0)
             }
+            Message::Tool { content, .. } => content.len(),
+            Message::System { content } => content.len(),
         })
         .sum();
     (char_count as f64 * 0.3) as usize
@@ -360,16 +367,18 @@ fn estimate_tokens_arc(messages: &[Arc<Message>]) -> usize {
 fn estimate_tokens(messages: &[Message]) -> usize {
     let char_count: usize = messages
         .iter()
-        .map(|m| {
-            match m {
-                Message::User { content } => content.len(),
-                Message::Assistant { content, reasoning_content, .. } => {
-                    content.as_ref().map(|c| c.len()).unwrap_or(0)
-                        + reasoning_content.as_ref().map(|r| r.len()).unwrap_or(0)
-                }
-                Message::Tool { content, .. } => content.len(),
-                Message::System { content } => content.len(),
+        .map(|m| match m {
+            Message::User { content } => content.len(),
+            Message::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => {
+                content.as_ref().map(|c| c.len()).unwrap_or(0)
+                    + reasoning_content.as_ref().map(|r| r.len()).unwrap_or(0)
             }
+            Message::Tool { content, .. } => content.len(),
+            Message::System { content } => content.len(),
         })
         .sum();
     (char_count as f64 * 0.3) as usize
@@ -406,9 +415,16 @@ mod tests {
     fn test_full_history_with_prompt() {
         let msgs = vec![make_annotated(0, 0, Message::user("hello"))];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
-        let result = build_context(&refs, Some("You are helpful."), &ContextStrategy::FullHistory);
+        let result = build_context(
+            &refs,
+            Some("You are helpful."),
+            &ContextStrategy::FullHistory,
+        );
         assert_eq!(result.messages.len(), 2);
-        assert!(matches!(result.messages[0].as_ref(), Message::System { .. }));
+        assert!(matches!(
+            result.messages[0].as_ref(),
+            Message::System { .. }
+        ));
     }
 
     #[test]
@@ -419,7 +435,11 @@ mod tests {
             make_annotated(2, 2, Message::user("q2")),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
-        let result = build_context(&refs, None, &ContextStrategy::SlidingWindow { max_turns: 2 });
+        let result = build_context(
+            &refs,
+            None,
+            &ContextStrategy::SlidingWindow { max_turns: 2 },
+        );
         // Only turns 1 and 2 should be included (last 2 turns)
         assert_eq!(result.messages.len(), 2);
         assert_eq!(result.turns_included, 2);
@@ -433,7 +453,11 @@ mod tests {
             make_annotated(1, 1, Message::user("q1")),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
-        let result = build_context(&refs, None, &ContextStrategy::SlidingWindow { max_turns: 5 });
+        let result = build_context(
+            &refs,
+            None,
+            &ContextStrategy::SlidingWindow { max_turns: 5 },
+        );
         assert_eq!(result.messages.len(), 2);
         assert!(!result.truncated);
     }
@@ -442,7 +466,11 @@ mod tests {
     fn test_sliding_window_zero() {
         let msgs = vec![make_annotated(0, 0, Message::user("q0"))];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
-        let result = build_context(&refs, Some("prompt"), &ContextStrategy::SlidingWindow { max_turns: 0 });
+        let result = build_context(
+            &refs,
+            Some("prompt"),
+            &ContextStrategy::SlidingWindow { max_turns: 0 },
+        );
         assert_eq!(result.messages.len(), 1);
         assert!(result.truncated);
     }
@@ -451,12 +479,27 @@ mod tests {
     fn test_token_budget_keeps_at_least_one_turn() {
         // Long messages to ensure non-zero token estimates
         let msgs = vec![
-            make_annotated(0, 0, Message::user("this is the first user query with enough characters to count")),
-            make_annotated(1, 1, Message::user("this is the second user query also with content")),
+            make_annotated(
+                0,
+                0,
+                Message::user("this is the first user query with enough characters to count"),
+            ),
+            make_annotated(
+                1,
+                1,
+                Message::user("this is the second user query also with content"),
+            ),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
         // Very small budget — should still keep at least 1 turn
-        let result = build_context(&refs, None, &ContextStrategy::TokenBudget { max_tokens: 1, summarize_overflow: false });
+        let result = build_context(
+            &refs,
+            None,
+            &ContextStrategy::TokenBudget {
+                max_tokens: 1,
+                summarize_overflow: false,
+            },
+        );
         assert!(result.turns_included >= 1);
         assert!(result.truncated);
     }
@@ -464,12 +507,25 @@ mod tests {
     #[test]
     fn test_token_budget_truncates_correctly() {
         let msgs = vec![
-            make_annotated(0, 0, Message::user("this is a very long first query that should be truncated away due to token budget constraints")),
+            make_annotated(
+                0,
+                0,
+                Message::user(
+                    "this is a very long first query that should be truncated away due to token budget constraints",
+                ),
+            ),
             make_annotated(1, 1, Message::user("short")),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
         // Budget of ~5 tokens — only "short" (~2 tokens) fits
-        let result = build_context(&refs, None, &ContextStrategy::TokenBudget { max_tokens: 5, summarize_overflow: false });
+        let result = build_context(
+            &refs,
+            None,
+            &ContextStrategy::TokenBudget {
+                max_tokens: 5,
+                summarize_overflow: false,
+            },
+        );
         assert_eq!(result.turns_included, 1);
         assert!(result.truncated);
         // Should only have the "short" message
@@ -479,11 +535,26 @@ mod tests {
     #[test]
     fn test_token_budget_with_summarize() {
         let msgs = vec![
-            make_annotated(0, 0, Message::user("first turn with enough text to require budget consideration")),
-            make_annotated(1, 1, Message::user("second turn that should also be counted")),
+            make_annotated(
+                0,
+                0,
+                Message::user("first turn with enough text to require budget consideration"),
+            ),
+            make_annotated(
+                1,
+                1,
+                Message::user("second turn that should also be counted"),
+            ),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
-        let result = build_context(&refs, None, &ContextStrategy::TokenBudget { max_tokens: 5, summarize_overflow: true });
+        let result = build_context(
+            &refs,
+            None,
+            &ContextStrategy::TokenBudget {
+                max_tokens: 5,
+                summarize_overflow: true,
+            },
+        );
         // Should include a summary system message + the last turn
         assert!(result.turns_included >= 1);
         assert!(!result.messages.is_empty());

@@ -17,9 +17,8 @@ async fn main() -> anyhow::Result<()> {
     // ── 1. 初始化 tracing ──────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new("peco_server=info,tower_http=info")
-            }),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("peco_server=info,tower_http=info")),
         )
         .init();
 
@@ -112,7 +111,10 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start CronScheduler: {e}"))?;
-    tracing::info!(job_count = cron_scheduler.job_count().await, "CronScheduler started");
+    tracing::info!(
+        job_count = cron_scheduler.job_count().await,
+        "CronScheduler started"
+    );
 
     // ── 11. 构建 Router（启用 API 限流）───────────────────────────────────
     let app = peco_server::build_router_with_limits(state, true);

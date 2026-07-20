@@ -16,10 +16,7 @@ use std::collections::HashMap;
 /// 用户配置中的 provider entries 按名称覆盖系统配置的同名 entry。
 /// 用户有而系统没有的 provider 直接追加。
 /// 系统有而用户没有的 provider 原样保留。
-pub fn merge_providers_config(
-    system: &ProvidersConfig,
-    user: &ProvidersConfig,
-) -> ProvidersConfig {
+pub fn merge_providers_config(system: &ProvidersConfig, user: &ProvidersConfig) -> ProvidersConfig {
     let mut merged_providers: HashMap<String, ProviderEntry> = HashMap::new();
 
     // 先插入所有系统 provider
@@ -42,15 +39,14 @@ pub fn merge_providers_config(
     }
 
     // default_provider：用户优先，未配置则用系统值
-    let default_provider = if user.default_provider.is_empty()
-        || user.default_provider == system.default_provider
-    {
-        system.default_provider.clone()
-    } else if merged_providers.contains_key(&user.default_provider) {
-        user.default_provider.clone()
-    } else {
-        system.default_provider.clone()
-    };
+    let default_provider =
+        if user.default_provider.is_empty() || user.default_provider == system.default_provider {
+            system.default_provider.clone()
+        } else if merged_providers.contains_key(&user.default_provider) {
+            user.default_provider.clone()
+        } else {
+            system.default_provider.clone()
+        };
 
     ProvidersConfig {
         default_provider,
@@ -63,12 +59,12 @@ pub fn merge_providers_config(
 /// - 标量字段（provider_type, api_key, base_url）：用户 Some 覆盖系统
 /// - 嵌套字段（default: LlmApiParams）：递归合并每个子字段
 fn merge_provider_entry(system: &ProviderEntry, user: &ProviderEntry) -> ProviderEntry {
-    let provider_type = if user.provider_type.is_empty() || user.provider_type == system.provider_type
-    {
-        system.provider_type.clone()
-    } else {
-        user.provider_type.clone()
-    };
+    let provider_type =
+        if user.provider_type.is_empty() || user.provider_type == system.provider_type {
+            system.provider_type.clone()
+        } else {
+            user.provider_type.clone()
+        };
 
     let api_key = user.api_key.clone().or_else(|| system.api_key.clone());
     let base_url = user.base_url.clone().or_else(|| system.base_url.clone());
@@ -104,7 +100,10 @@ fn merge_llm_params(system: &LlmApiParams, user: &LlmApiParams) -> LlmApiParams 
         temperature: user.temperature.or(system.temperature),
         max_tokens: user.max_tokens.or(system.max_tokens),
         stream: user.stream.or(system.stream),
-        reasoning_effort: user.reasoning_effort.clone().or_else(|| system.reasoning_effort.clone()),
+        reasoning_effort: user
+            .reasoning_effort
+            .clone()
+            .or_else(|| system.reasoning_effort.clone()),
     }
 }
 

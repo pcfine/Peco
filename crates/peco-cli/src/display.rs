@@ -7,7 +7,7 @@
 
 use std::io::{self, Write};
 
-use console::{style, Term};
+use console::{Term, style};
 use peco_core::agent::{LooperEvent, TurnOutcome};
 
 use crate::config::CliConfig;
@@ -248,14 +248,22 @@ impl ConsoleRenderer {
 impl Renderer for ConsoleRenderer {
     fn render_greeting(&mut self, session_id: &str) -> io::Result<()> {
         if self.color {
-            writeln!(self.term, "{}", style("╔══════════════════════════════════════════════╗").dim())?;
+            writeln!(
+                self.term,
+                "{}",
+                style("╔══════════════════════════════════════════════╗").dim()
+            )?;
             writeln!(
                 self.term,
                 "{}  {}",
                 style("║  peco CLI 聊天助手").bold(),
                 style(format!("会话: {session_id}")).dim()
             )?;
-            writeln!(self.term, "{}", style("╚══════════════════════════════════════════════╝").dim())?;
+            writeln!(
+                self.term,
+                "{}",
+                style("╚══════════════════════════════════════════════╝").dim()
+            )?;
         } else {
             writeln!(self.term, "peco CLI 聊天助手 — 会话: {session_id}")?;
         }
@@ -300,9 +308,7 @@ impl Renderer for ConsoleRenderer {
             }
 
             // ── Tool 结果 ──
-            LooperEvent::ToolResult {
-                name, result, ..
-            } => {
+            LooperEvent::ToolResult { name, result, .. } => {
                 if self.show_tool_results {
                     let preview = Self::truncate(result, 10, 500);
                     self.write_segment(&Segment::new(
@@ -521,4 +527,3 @@ mod tests {
         assert!(result.starts_with("line1\nline2\n  ..."));
     }
 }
-
