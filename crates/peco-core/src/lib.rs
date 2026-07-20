@@ -4,7 +4,6 @@ pub mod executor;
 pub mod knowledge;
 pub mod mcp;
 pub mod persistence;
-pub mod personal_memory;
 pub mod session;
 pub mod skills;
 

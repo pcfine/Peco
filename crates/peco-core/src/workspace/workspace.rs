@@ -9,10 +9,9 @@ use std::sync::{Arc, RwLock};
 use crate::agent::Agent;
 use crate::config::{SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
-use crate::personal_memory::{MemoryFact, PersonalMemoryStore, StorageConfig};
 use crate::skills::GlobalSkillList;
 
-use super::deps::{AgentLoader, KnowledgeAccess, MemoryStore, SkillProvider, ToolDependencies};
+use super::deps::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 use super::error::WorkspaceError;
 use super::tool_register::ToolRegister;
 use crate::tools::ToolExecutor;
@@ -27,7 +26,6 @@ pub struct Workspace {
     config: UserConfig,
     skill_registry: Arc<RwLock<GlobalSkillList>>,
     knowledge_manager: Arc<KnowledgeManager>,
-    ppa_store: Arc<PersonalMemoryStore>,
     agent_cache: RwLock<HashMap<String, Arc<Agent>>>,
 }
 
@@ -70,20 +68,12 @@ impl Workspace {
         let kb_dir = root.join("knowledge");
         let knowledge_manager = Arc::new(KnowledgeManager::new(kb_dir));
 
-        let ppa_kb_name = format!("personal_memory_{}", user_id);
-        let ppa_store = Arc::new(PersonalMemoryStore::new(
-            knowledge_manager.clone(),
-            ppa_kb_name,
-            StorageConfig::default(),
-        ));
-
         Ok(Self {
             user_id,
             root,
             config,
             skill_registry,
             knowledge_manager,
-            ppa_store,
             agent_cache: RwLock::new(HashMap::new()),
         })
     }
@@ -104,9 +94,6 @@ impl Workspace {
     }
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
-    }
-    pub fn ppa_store(&self) -> &Arc<PersonalMemoryStore> {
-        &self.ppa_store
     }
 
     // ── Agent 操作（缓存版，需要 Arc<Self>）─────────────────────────
@@ -166,7 +153,6 @@ impl Workspace {
                 config: self.config.clone(),
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
-                ppa_store: self.ppa_store.clone(),
             },
         });
 
@@ -174,9 +160,6 @@ impl Workspace {
             agent_loader,
             skill_provider: Arc::new(WsSkillProvider {
                 registry: self.skill_registry.clone(),
-            }),
-            memory_store: Arc::new(WsMemoryStore {
-                store: self.ppa_store.clone(),
             }),
             knowledge_access: Arc::new(WsKnowledgeAccess {
                 user_id: self.user_id.clone(),
@@ -218,7 +201,6 @@ impl Workspace {
         ToolDependencies {
             agent_loader: self.clone() as Arc<dyn AgentLoader>,
             skill_provider: self.clone() as Arc<dyn SkillProvider>,
-            memory_store: self.clone() as Arc<dyn MemoryStore>,
             knowledge_access: self.clone() as Arc<dyn KnowledgeAccess>,
         }
     }
@@ -288,39 +270,6 @@ impl SkillProvider for Workspace {
     }
 }
 
-#[async_trait::async_trait]
-impl MemoryStore for Workspace {
-    async fn save_or_update_fact(&self, fact: &MemoryFact) -> Result<(), String> {
-        self.ppa_store.save_or_update_fact(fact).await
-    }
-
-    async fn search_semantic(
-        &self,
-        query: &str,
-        top_k: usize,
-        threshold: f32,
-    ) -> Result<Vec<MemoryFact>, String> {
-        self.ppa_store
-            .search_semantic(query, top_k, threshold)
-            .await
-    }
-
-    async fn search_episodic(
-        &self,
-        query: &str,
-        top_k: usize,
-        threshold: f32,
-    ) -> Result<Vec<MemoryFact>, String> {
-        self.ppa_store
-            .search_episodic(query, top_k, threshold)
-            .await
-    }
-
-    async fn invalidate_fact(&self, fact: &MemoryFact) -> Result<(), String> {
-        self.ppa_store.invalidate_fact(fact).await
-    }
-}
-
 impl KnowledgeAccess for Workspace {
     fn user_id(&self) -> &str {
         &self.user_id
@@ -341,7 +290,6 @@ struct WorkspaceRef {
     config: UserConfig,
     skill_registry: Arc<RwLock<GlobalSkillList>>,
     knowledge_manager: Arc<KnowledgeManager>,
-    ppa_store: Arc<PersonalMemoryStore>,
 }
 
 /// AgentLoader implementation used inside `build_deps_direct`.
@@ -365,7 +313,7 @@ impl AgentLoader for UncachedAgentLoader {
             )));
         }
 
-        // Build deps re-using the Workspace's shared KnowledgeManager and PPA store.
+        // Build deps re-using the Workspace's shared KnowledgeManager.
         let deps = ToolDependencies {
             agent_loader: Arc::new(UncachedAgentLoader {
                 workspace: WorkspaceRef {
@@ -374,14 +322,10 @@ impl AgentLoader for UncachedAgentLoader {
                     config: self.workspace.config.clone(),
                     skill_registry: self.workspace.skill_registry.clone(),
                     knowledge_manager: self.workspace.knowledge_manager.clone(),
-                    ppa_store: self.workspace.ppa_store.clone(),
                 },
             }),
             skill_provider: Arc::new(WsSkillProvider {
                 registry: self.workspace.skill_registry.clone(),
-            }),
-            memory_store: Arc::new(WsMemoryStore {
-                store: self.workspace.ppa_store.clone(),
             }),
             knowledge_access: Arc::new(WsKnowledgeAccess {
                 user_id: self.workspace.user_id.clone(),
@@ -428,36 +372,6 @@ struct WsSkillProvider {
 impl SkillProvider for WsSkillProvider {
     fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>> {
         &self.registry
-    }
-}
-
-struct WsMemoryStore {
-    store: Arc<PersonalMemoryStore>,
-}
-
-#[async_trait::async_trait]
-impl MemoryStore for WsMemoryStore {
-    async fn save_or_update_fact(&self, fact: &MemoryFact) -> Result<(), String> {
-        self.store.save_or_update_fact(fact).await
-    }
-    async fn search_semantic(
-        &self,
-        query: &str,
-        top_k: usize,
-        threshold: f32,
-    ) -> Result<Vec<MemoryFact>, String> {
-        self.store.search_semantic(query, top_k, threshold).await
-    }
-    async fn search_episodic(
-        &self,
-        query: &str,
-        top_k: usize,
-        threshold: f32,
-    ) -> Result<Vec<MemoryFact>, String> {
-        self.store.search_episodic(query, top_k, threshold).await
-    }
-    async fn invalidate_fact(&self, fact: &MemoryFact) -> Result<(), String> {
-        self.store.invalidate_fact(fact).await
     }
 }
 

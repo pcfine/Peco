@@ -4,11 +4,8 @@
 
 use std::sync::{Arc, RwLock};
 
-use async_trait::async_trait;
-
 use crate::agent::{Agent, AgentError};
 use crate::knowledge::KnowledgeManager;
-use crate::personal_memory::MemoryFact;
 use crate::skills::GlobalSkillList;
 
 // ============================================================================
@@ -29,28 +26,6 @@ pub trait SkillProvider: Send + Sync {
 }
 
 // ============================================================================
-// MemoryStore — RememberTool / RecallTool / ForgetTool 需要
-// ============================================================================
-
-#[async_trait]
-pub trait MemoryStore: Send + Sync {
-    async fn save_or_update_fact(&self, fact: &MemoryFact) -> Result<(), String>;
-    async fn search_semantic(
-        &self,
-        query: &str,
-        top_k: usize,
-        threshold: f32,
-    ) -> Result<Vec<MemoryFact>, String>;
-    async fn search_episodic(
-        &self,
-        query: &str,
-        top_k: usize,
-        threshold: f32,
-    ) -> Result<Vec<MemoryFact>, String>;
-    async fn invalidate_fact(&self, fact: &MemoryFact) -> Result<(), String>;
-}
-
-// ============================================================================
 // KnowledgeAccess — 5 个知识工具需要
 // ============================================================================
 
@@ -66,7 +41,6 @@ pub trait KnowledgeAccess: Send + Sync {
 pub struct ToolDependencies {
     pub agent_loader: Arc<dyn AgentLoader>,
     pub skill_provider: Arc<dyn SkillProvider>,
-    pub memory_store: Arc<dyn MemoryStore>,
     pub knowledge_access: Arc<dyn KnowledgeAccess>,
 }
 
@@ -75,7 +49,6 @@ impl Clone for ToolDependencies {
         Self {
             agent_loader: self.agent_loader.clone(),
             skill_provider: self.skill_provider.clone(),
-            memory_store: self.memory_store.clone(),
             knowledge_access: self.knowledge_access.clone(),
         }
     }

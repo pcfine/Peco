@@ -4,7 +4,6 @@
 
 mod fetch;
 mod knowledge;
-mod memory;
 mod shell;
 mod skill;
 mod sub_agent;
@@ -15,7 +14,6 @@ pub use knowledge::{
     AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases, SearchKnowledge,
     SyncKnowledgeBase,
 };
-pub use memory::{ForgetTool, RecallTool, RememberTool};
 pub use shell::ShellExec;
 pub use skill::ReadSkill;
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
