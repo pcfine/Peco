@@ -48,6 +48,7 @@ async fn run_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
         tools: vec![],
         temperature: Some(0.7),
         max_tokens: Some(256),
+        reasoning_effort: None,
         additional_params: None,
     };
 
@@ -70,6 +71,7 @@ async fn run_stream_chat(provider: &dyn ModelProvider) -> Result<(), ProviderErr
         tools: vec![],
         temperature: Some(0.9),
         max_tokens: Some(128),
+        reasoning_effort: None,
         additional_params: None,
     };
 
@@ -140,6 +142,7 @@ async fn run_tool_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError
         tools: vec![weather_tool],
         temperature: Some(0.0),
         max_tokens: Some(256),
+        reasoning_effort: None,
         additional_params: None,
     };
 

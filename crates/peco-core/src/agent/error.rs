@@ -6,8 +6,14 @@
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     /// 读取文件失败
-    #[error("failed to read file: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("failed to read file '{path}': {source}")]
+    Io {
+        /// 被读取的文件路径
+        path: std::path::PathBuf,
+        /// 底层 I/O 错误
+        #[source]
+        source: std::io::Error,
+    },
 
     /// YAML 解析失败（agent.md 格式）
     #[error("failed to parse YAML: {0}")]

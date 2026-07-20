@@ -192,7 +192,10 @@ pub struct ChatRequest {
     /// 可选的生成 token 最大数量。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    /// 提供商标定的额外参数。
+    /// 推理力度 `"low"`, `"high"`, `"max"`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// 提供商标定的额外参数
     #[serde(skip_serializing_if = "Option::is_none", flatten)]
     pub additional_params: Option<serde_json::Value>,
 }

@@ -46,8 +46,13 @@ impl DeepSeek {
     ///
     /// 使用默认的基础 URL（`https://api.deepseek.com`）。
     pub fn new(api_key: impl Into<String>) -> Result<Self, ProviderError> {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| ProviderError::Request(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
-            http_client: reqwest::Client::new(),
+            http_client,
             api_key: api_key.into(),
             base_url: DEEPSEEK_API_BASE_URL.to_string(),
         })
@@ -111,7 +116,10 @@ struct DeepSeekRequest<'a> {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
-    /// 将额外参数扁平化合并到请求体中
+    /// DeepSeek thinking 配置，由 provider 从 ChatRequest::reasoning_effort 构建。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
+    /// 将额外参数扁平化合并到请求体中（透传 ChatRequest::additional_params）。
     #[serde(flatten)]
     extra: Option<Value>,
 }
@@ -239,6 +247,24 @@ fn build_request_body(request: &ChatRequest, stream: bool) -> Result<Vec<u8>, se
         None
     };
 
+    // - "disabled" / "none" → 显式禁用 thinking
+    // - 其它等级：low, high, max
+    // - 未配置 → 默认启用 thinking（rely on DeepSeek 默认行为）
+    let thinking = match &request.reasoning_effort {
+        Some(effort) if !effort.is_empty() => {
+            let effort_lower = effort.to_lowercase();
+            if effort_lower == "disabled" || effort_lower == "none" {
+                Some(serde_json::json!({"type": "disabled"}))
+            } else {
+                Some(serde_json::json!({"type": "enabled", "effort": effort_lower}))
+            }
+        }
+        _ => {
+            // DeepSeek 默认启用 thinking
+            Some(serde_json::json!({"type": "enabled", "effort": "high"}))
+        }
+    };
+
     let api_request = DeepSeekRequest {
         model: &request.model,
         messages: &request.messages,
@@ -248,6 +274,7 @@ fn build_request_body(request: &ChatRequest, stream: bool) -> Result<Vec<u8>, se
         stream: if stream { Some(true) } else { None },
         stream_options,
         tool_choice: None,
+        thinking,
         extra: request.additional_params.clone(),
     };
 
@@ -505,6 +532,7 @@ mod tests {
             tools: vec![],
             temperature: Some(0.7),
             max_tokens: Some(1024),
+            reasoning_effort: None,
             additional_params: None,
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -629,6 +657,7 @@ mod tests {
             tools: vec![],
             temperature: Some(0.7),
             max_tokens: None,
+            reasoning_effort: None,
             additional_params: None,
         };
         let body = build_request_body(&request, false).unwrap();
@@ -657,6 +686,7 @@ mod tests {
             tools: vec![tool],
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             additional_params: None,
         };
         let body = build_request_body(&request, false).unwrap();

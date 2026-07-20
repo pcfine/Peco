@@ -159,7 +159,7 @@ impl Default for LooperConfig {
     fn default() -> Self {
         Self {
             event_buffer: 256,
-            per_turn_timeout: None,
+            per_turn_timeout: Some(Duration::from_secs(180)),
             total_timeout: None,
             hooks: Vec::new(),
             dynamic_context: None,

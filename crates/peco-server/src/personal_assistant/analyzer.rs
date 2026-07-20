@@ -76,6 +76,7 @@ impl MemoryAnalyzer {
             tools: vec![],
             temperature: Some(0.1), // 低温度，追求一致性
             max_tokens: Some(1024),
+            reasoning_effort: None,
             additional_params: None,
         };
 

@@ -134,7 +134,10 @@ impl Agent {
     ) -> Result<Self, AgentError> {
         let path = path.as_ref();
         // ── 解析 agent.md ──────────────────────────────────────────────
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(path).map_err(|source| AgentError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         tracing::info!("read agent file: {}", path.to_string_lossy());
         let (frontmatter_str, body) =
             split_frontmatter(&raw).map_err(AgentError::InvalidFrontmatter)?;
@@ -281,32 +284,14 @@ impl Agent {
         messages: Vec<Arc<Message>>,
         tools: Vec<ToolDefinition>,
     ) -> ChatRequest {
-        // 构建 additional_params：
-        // - 若 reasoning_effort 配置了值，则按配置传递 thinking 参数
-        // - 若未配置 reasoning_effort，则显式禁用 thinking 模式，
-        //   避免 DeepSeek V4 系列模型默认开启 thinking 导致输出进入 reasoning_content
-        let additional_params = match &self.model_config.reasoning_effort {
-            Some(effort) if !effort.is_empty() => {
-                let effort_lower = effort.to_lowercase();
-                if effort_lower == "disabled" || effort_lower == "none" {
-                    Some(serde_json::json!({"thinking": {"type": "disabled"}}))
-                } else {
-                    Some(serde_json::json!({"thinking": {"type": "enabled", "effort": effort_lower}}))
-                }
-            }
-            _ => {
-                // 默认禁用 thinking，防止模型输出进入 reasoning_content
-                Some(serde_json::json!({"thinking": {"type": "disabled"}}))
-            }
-        };
-
         ChatRequest {
             model: self.model_config.model_name.clone().unwrap_or_default(),
             messages,
             tools,
             temperature: self.model_config.temperature.map(|t| t as f64),
             max_tokens: self.model_config.max_tokens.map(|t| t as u64),
-            additional_params,
+            reasoning_effort: self.model_config.reasoning_effort.clone(),
+            additional_params: None,
         }
     }
 

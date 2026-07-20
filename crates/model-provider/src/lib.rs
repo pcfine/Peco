@@ -23,6 +23,7 @@
 //!         tools: vec![],
 //!         temperature: None,
 //!         max_tokens: None,
+//!         reasoning_effort: None,
 //!         additional_params: None,
 //!     };
 //!
