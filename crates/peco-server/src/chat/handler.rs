@@ -185,7 +185,7 @@ async fn ensure_omni_agent(state: &Arc<AppState>, user_id: &str) -> Result<Strin
     agents::insert(&state.db, &db_params).await?;
 
     // ── 后写 agent.md 文件 ─────────────────────────────────────────────────
-    if let Err(e) = ws.save_agent("全能助手", &content) {
+    if let Err(e) = ws.agent_manager().save("全能助手", &content) {
         // 回滚：删除已写入的 DB 索引
         let _ = agents::delete(&state.db, &agent_id).await;
         return Err(ApiError::Internal(format!(

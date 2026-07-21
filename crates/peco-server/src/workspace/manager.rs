@@ -76,7 +76,7 @@ impl WorkspaceManager {
     /// 获取 Agent（委托给 Workspace::load_agent_cached，带两级缓存）。
     pub fn get_agent(&self, user_id: &str, agent_name: &str) -> Result<Arc<Agent>, ApiError> {
         let ws = self.get(user_id)?;
-        ws.load_agent_cached(agent_name)
+        ws.agent_manager().load_cached(agent_name)
             .map_err(|e| ApiError::Internal(format!("failed to load agent '{agent_name}': {e}")))
     }
 
@@ -90,7 +90,7 @@ impl WorkspaceManager {
     /// 使指定用户的指定 Agent 缓存失效。
     pub fn invalidate_agent(&self, user_id: &str, agent_name: &str) -> Result<(), ApiError> {
         let ws = self.get(user_id)?;
-        ws.invalidate_agent_cache(agent_name);
+        ws.agent_manager().invalidate(agent_name);
         Ok(())
     }
 

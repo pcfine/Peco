@@ -69,7 +69,11 @@ impl CliApp {
         eprintln!(
             "[init] Workspace 已打开: root={}, skills={}",
             workspace.root().display(),
-            workspace.skill_registry().read().map(|r| r.stats().registered).unwrap_or(0),
+            workspace
+                .skill_registry()
+                .read()
+                .map(|r| r.stats().registered)
+                .unwrap_or(0),
         );
 
         // ── 3. 加载 Agent ─────────────────────────────────────────────
@@ -335,11 +339,8 @@ fn load_agent_from_config(
 ) -> anyhow::Result<Arc<Agent>> {
     if config.agent_path.is_file() {
         // 直接路径模式（向后兼容）
-        eprintln!(
-            "[init] 从文件加载 Agent: {}",
-            config.agent_path.display()
-        );
-        let deps = workspace.tool_dependencies();
+        eprintln!("[init] 从文件加载 Agent: {}", config.agent_path.display());
+        let deps = workspace.agent_manager().build_deps();
         let agent = Agent::from_file(
             &config.agent_path,
             workspace.config(),
@@ -356,7 +357,8 @@ fn load_agent_from_config(
             .unwrap_or("personal-assistant");
         eprintln!("[init] 从 workspace 加载 Agent: {name}");
         workspace
-            .load_agent_cached(name)
+            .agent_manager()
+            .load_cached(name)
             .map_err(|e| anyhow::anyhow!("加载 Agent '{}' 失败: {e}", name))
     }
 }

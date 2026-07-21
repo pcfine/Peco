@@ -318,7 +318,7 @@ pub async fn create(
     agents::insert(&state.db, &db_params).await?;
 
     // ── 后写 agent.md 文件（真相源）─────────────────────────────────────
-    if let Err(e) = ws.save_agent(name, &content) {
+    if let Err(e) = ws.agent_manager().save(name, &content) {
         // 回滚：删除已写入的 DB 索引记录
         let _ = agents::delete(&state.db, &agent_id).await;
         return Err(ApiError::Internal(format!("failed to write agent.md: {e}")));
@@ -394,7 +394,7 @@ pub async fn get(
 
     // ── 从 agent.md 读取完整配置 ─────────────────────────────────────────
     let ws = state.workspace_manager.get(&user_id)?;
-    let md_path = ws.agent_md_path(&db_row.name);
+    let md_path = ws.agent_manager().md_path(&db_row.name);
     let content = std::fs::read_to_string(&md_path).map_err(|e| {
         ApiError::Internal(format!(
             "failed to read agent.md for '{}': {e}",
@@ -458,7 +458,7 @@ pub async fn update(
 
     // ── 读取现有 agent.md ─────────────────────────────────────────────────
     let ws = state.workspace_manager.get(&user_id)?;
-    let old_path = ws.agent_md_path(&existing.name);
+    let old_path = ws.agent_manager().md_path(&existing.name);
     let old_content = std::fs::read_to_string(&old_path).map_err(|e| {
         ApiError::Internal(format!(
             "failed to read agent.md for '{}': {e}",
@@ -473,12 +473,12 @@ pub async fn update(
     let new_content = agent_config::assemble_agent_md(&merged);
 
     // ── 写 agent.md（若 name 变更则写入新目录）───────────────────────────
-    ws.save_agent(new_name, &new_content)
+    ws.agent_manager().save(new_name, &new_content)
         .map_err(|e| ApiError::Internal(format!("failed to write agent.md: {e}")))?;
 
     // 若 name 变更，删除旧目录
     if new_name != existing.name {
-        let _ = ws.delete_agent(&existing.name);
+        let _ = ws.agent_manager().delete(&existing.name);
     }
 
     // ── 更新 DB 索引 ──────────────────────────────────────────────────────
@@ -571,7 +571,7 @@ pub async fn delete(
 
     // ── 删除 agent 文件目录 ───────────────────────────────────────────────
     let ws = state.workspace_manager.get(&user_id)?;
-    if let Err(e) = ws.delete_agent(&existing.name) {
+    if let Err(e) = ws.agent_manager().delete(&existing.name) {
         tracing::warn!(error = %e, agent = %existing.name, "Failed to delete agent files");
     }
 

@@ -283,10 +283,7 @@ impl PersonalMemoryStore {
     ///
     /// 与 `save_or_update_fact`（文档路径）并行使用，
     /// 将 MemoryFact 转换为 knowledge_base::Fact 写入图谱。
-    pub async fn save_facts_as_graph(
-        &self,
-        facts: &[knowledge_base::Fact],
-    ) -> Result<(), String> {
+    pub async fn save_facts_as_graph(&self, facts: &[knowledge_base::Fact]) -> Result<(), String> {
         if facts.is_empty() {
             return Ok(());
         }

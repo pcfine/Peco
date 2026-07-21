@@ -1,17 +1,17 @@
 pub mod config;
-pub mod knowledge_base;
 pub mod kb_manager;
+pub mod knowledge_base;
 
-pub use knowledge_base::KnowledgeBase;
 pub use kb_manager::KnowledgeBaseManager;
+pub use knowledge_base::KnowledgeBase;
 
 // 测试所需导入（通过 `use super::*` 在 test 模块中可用）
-#[cfg(test)]
-use std::collections::HashMap;
 #[cfg(test)]
 use crate::traits::*;
 #[cfg(test)]
 use crate::types::*;
+#[cfg(test)]
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // 测试
@@ -73,10 +73,7 @@ mod tests {
     async fn test_add_facts_and_query() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
-        let kb = mgr
-            .create_kb(make_kb_config("facts-test"))
-            .await
-            .unwrap();
+        let kb = mgr.create_kb(make_kb_config("facts-test")).await.unwrap();
 
         let facts = vec![
             Fact::new("用户", "prefers", "Rust", 0.9),
@@ -104,10 +101,7 @@ mod tests {
     async fn test_add_entities_and_relation_path() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
-        let kb = mgr
-            .create_kb(make_kb_config("entity-test"))
-            .await
-            .unwrap();
+        let kb = mgr.create_kb(make_kb_config("entity-test")).await.unwrap();
 
         // 添加实体（使用统一的 "Entity" 类型以匹配 add_facts）
         let person_id = compute_entity_id("张三", "Entity");
@@ -154,5 +148,4 @@ mod tests {
         assert_eq!(path[0].node.id, person_id);
         assert_eq!(path.last().unwrap().node.id, dept_id);
     }
-
 }

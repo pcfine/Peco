@@ -61,14 +61,14 @@
 
 pub mod config;
 pub mod error;
-pub mod skill_register;
 pub mod loader;
+pub mod skill_register;
 
 // Re-export the main public types for convenience
 pub use config::{Skill, SkillFrontmatter, SkillMeta, validate_name};
 pub use error::SkillError;
-pub use skill_register::{SkillRegister, SkillRegisterStats};
 pub use loader::SkillLoader;
+pub use skill_register::{SkillRegister, SkillRegisterStats};
 
 /// Alias for [`SkillRegister`] — legacy name kept for compatibility.
 pub type SkillRegistry = SkillRegister;

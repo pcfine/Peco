@@ -118,9 +118,7 @@ impl IngestionPipeline {
             .map_err(|e| KnowledgeError::StoreError(e.to_string()))?;
 
         // 4. 更新插入向量
-        if need_vector
-            && let Some(ref vi) = self.vector_index
-        {
+        if need_vector && let Some(ref vi) = self.vector_index {
             let entries: Vec<VectorEntry> = chunks
                 .iter()
                 .map(|c| VectorEntry {
@@ -136,9 +134,7 @@ impl IngestionPipeline {
         }
 
         // 5. 索引文本
-        if need_text
-            && let Some(ref ft) = self.fulltext_index
-        {
+        if need_text && let Some(ref ft) = self.fulltext_index {
             let mut entries: Vec<FullTextEntry> = chunks
                 .iter()
                 .map(|c| FullTextEntry {
@@ -158,9 +154,7 @@ impl IngestionPipeline {
         }
 
         // 6. 构建结构化图边（CONTAINS + NEXT_CHUNK）
-        if need_graph
-            && let Some(ref gs) = self.graph_store
-        {
+        if need_graph && let Some(ref gs) = self.graph_store {
             let builder = KnowledgeGraphBuilder::new();
             let edges = builder.build_structural_edges(&doc, &chunks);
             if !edges.is_empty() {

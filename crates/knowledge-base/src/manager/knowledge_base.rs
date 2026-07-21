@@ -59,64 +59,66 @@ impl KnowledgeBase {
 
         // 构建存储后端
         #[cfg(feature = "lancedb")]
-        let (doc_store, vector_index, fulltext_index, graph_store): BackendComponents = match &config.backend {
-            BackendType::InMemory => {
-                let be = Arc::new(crate::backends::memory::InMemoryBackend::new());
-                (
-                    be.clone() as Arc<dyn DocumentStore>,
-                    Some(be.clone() as Arc<dyn VectorIndex>),
-                    Some(be.clone() as Arc<dyn FullTextIndex>),
-                    Some(be.clone() as Arc<dyn GraphStore>),
-                )
-            }
-            BackendType::LanceDb => {
-                let be = Arc::new(
-                    crate::backends::lancedb::LanceDbBackend::connect(
-                        &kb_dir,
-                        &crate::sanitize_kb_name(&config.name),
-                        ndims,
+        let (doc_store, vector_index, fulltext_index, graph_store): BackendComponents =
+            match &config.backend {
+                BackendType::InMemory => {
+                    let be = Arc::new(crate::backends::memory::InMemoryBackend::new());
+                    (
+                        be.clone() as Arc<dyn DocumentStore>,
+                        Some(be.clone() as Arc<dyn VectorIndex>),
+                        Some(be.clone() as Arc<dyn FullTextIndex>),
+                        Some(be.clone() as Arc<dyn GraphStore>),
                     )
-                    .await?,
-                );
-                let graph = Arc::new(crate::backends::memory_graph::MemoryGraphStore::new());
-                (
-                    be.clone() as Arc<dyn DocumentStore>,
-                    Some(be.clone() as Arc<dyn VectorIndex>),
-                    Some(be.clone() as Arc<dyn FullTextIndex>),
-                    Some(graph as Arc<dyn GraphStore>),
-                )
-            }
-            #[cfg(feature = "helixdb")]
-            BackendType::HelixDb => {
-                return Err(KnowledgeError::InvalidInput(
-                    "HelixDB 后端需通过高级 API 配置，请使用 HelixDbBackend::connect()".into(),
-                ));
-            }
-        };
+                }
+                BackendType::LanceDb => {
+                    let be = Arc::new(
+                        crate::backends::lancedb::LanceDbBackend::connect(
+                            &kb_dir,
+                            &crate::sanitize_kb_name(&config.name),
+                            ndims,
+                        )
+                        .await?,
+                    );
+                    let graph = Arc::new(crate::backends::memory_graph::MemoryGraphStore::new());
+                    (
+                        be.clone() as Arc<dyn DocumentStore>,
+                        Some(be.clone() as Arc<dyn VectorIndex>),
+                        Some(be.clone() as Arc<dyn FullTextIndex>),
+                        Some(graph as Arc<dyn GraphStore>),
+                    )
+                }
+                #[cfg(feature = "helixdb")]
+                BackendType::HelixDb => {
+                    return Err(KnowledgeError::InvalidInput(
+                        "HelixDB 后端需通过高级 API 配置，请使用 HelixDbBackend::connect()".into(),
+                    ));
+                }
+            };
 
         #[cfg(not(feature = "lancedb"))]
-        let (doc_store, vector_index, fulltext_index, graph_store): BackendComponents = match &config.backend {
-            BackendType::InMemory => {
-                let be = Arc::new(crate::backends::memory::InMemoryBackend::new());
-                (
-                    be.clone() as Arc<dyn DocumentStore>,
-                    Some(be.clone() as Arc<dyn VectorIndex>),
-                    Some(be.clone() as Arc<dyn FullTextIndex>),
-                    Some(be.clone() as Arc<dyn GraphStore>),
-                )
-            }
-            #[cfg(feature = "helixdb")]
-            BackendType::HelixDb => {
-                return Err(KnowledgeError::InvalidInput(
-                    "HelixDB 后端需通过高级 API 配置".into(),
-                ));
-            }
-            _ => {
-                return Err(KnowledgeError::InvalidInput(
-                    "LanceDB feature 未启用".into(),
-                ));
-            }
-        };
+        let (doc_store, vector_index, fulltext_index, graph_store): BackendComponents =
+            match &config.backend {
+                BackendType::InMemory => {
+                    let be = Arc::new(crate::backends::memory::InMemoryBackend::new());
+                    (
+                        be.clone() as Arc<dyn DocumentStore>,
+                        Some(be.clone() as Arc<dyn VectorIndex>),
+                        Some(be.clone() as Arc<dyn FullTextIndex>),
+                        Some(be.clone() as Arc<dyn GraphStore>),
+                    )
+                }
+                #[cfg(feature = "helixdb")]
+                BackendType::HelixDb => {
+                    return Err(KnowledgeError::InvalidInput(
+                        "HelixDB 后端需通过高级 API 配置".into(),
+                    ));
+                }
+                _ => {
+                    return Err(KnowledgeError::InvalidInput(
+                        "LanceDB feature 未启用".into(),
+                    ));
+                }
+            };
 
         // 构建 IngestionPipeline
         let pipeline = IngestionPipeline::new(
@@ -294,9 +296,10 @@ impl KnowledgeBase {
         facts: &[Fact],
         index_text: bool,
     ) -> Result<Vec<Fact>, KnowledgeError> {
-        let gs = self.graph_store.as_ref().ok_or_else(|| {
-            KnowledgeError::InvalidInput("当前后端不支持图存储".into())
-        })?;
+        let gs = self
+            .graph_store
+            .as_ref()
+            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
 
         let mut edges = Vec::with_capacity(facts.len());
         let mut seen_fact_ids: std::collections::HashSet<&str> =
@@ -363,9 +366,7 @@ impl KnowledgeBase {
             .collect();
 
         // 可选：全文索引事实文本
-        if index_text
-            && let Some(ref ft) = self.fulltext_index
-        {
+        if index_text && let Some(ref ft) = self.fulltext_index {
             let entries: Vec<FullTextEntry> = stored
                 .iter()
                 .map(|f| FullTextEntry {
@@ -388,9 +389,10 @@ impl KnowledgeBase {
 
     /// 批量添加实体节点到图谱。
     pub async fn add_entities(&self, entities: &[Entity]) -> Result<(), KnowledgeError> {
-        let gs = self.graph_store.as_ref().ok_or_else(|| {
-            KnowledgeError::InvalidInput("当前后端不支持图存储".into())
-        })?;
+        let gs = self
+            .graph_store
+            .as_ref()
+            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
 
         for entity in entities {
             let node = GraphNode {
@@ -400,10 +402,7 @@ impl KnowledgeBase {
                     let mut props = entity.properties.clone();
                     props.insert("name".into(), entity.name.clone());
                     // 固定格式避免 locale 差异（某些地区用逗号作小数点）
-                    props.insert(
-                        "confidence".into(),
-                        format!("{:.6}", entity.confidence),
-                    );
+                    props.insert("confidence".into(), format!("{:.6}", entity.confidence));
                     props.insert("source_chunk_id".into(), entity.source_chunk_id.clone());
                     props
                 },
@@ -416,9 +415,10 @@ impl KnowledgeBase {
 
     /// 批量添加自定义关系边到图谱。
     pub async fn add_relation_edges(&self, edges: &[KnowledgeEdge]) -> Result<(), KnowledgeError> {
-        let gs = self.graph_store.as_ref().ok_or_else(|| {
-            KnowledgeError::InvalidInput("当前后端不支持图存储".into())
-        })?;
+        let gs = self
+            .graph_store
+            .as_ref()
+            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
 
         gs.add_edges(edges).await?;
         Ok(())
@@ -445,9 +445,10 @@ impl KnowledgeBase {
         entity_type: &str,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        let gs = self.graph_store.as_ref().ok_or_else(|| {
-            KnowledgeError::InvalidInput("当前后端不支持图存储".into())
-        })?;
+        let gs = self
+            .graph_store
+            .as_ref()
+            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
 
         let entity_id = compute_entity_id(entity_name, entity_type);
         gs.traverse(&entity_id, &[], TraversalDirection::Both, max_depth)
@@ -473,9 +474,10 @@ impl KnowledgeBase {
         to_entity: &str,
         entity_type: &str,
     ) -> Result<Option<Vec<TraversalStep>>, KnowledgeError> {
-        let gs = self.graph_store.as_ref().ok_or_else(|| {
-            KnowledgeError::InvalidInput("当前后端不支持图存储".into())
-        })?;
+        let gs = self
+            .graph_store
+            .as_ref()
+            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
 
         let from_id = compute_entity_id(from_entity, entity_type);
         let to_id = compute_entity_id(to_entity, entity_type);

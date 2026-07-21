@@ -327,7 +327,10 @@ pub fn mode_requires_chunks(mode: &StorageMode) -> bool {
 pub fn mode_requires_embed(mode: &StorageMode) -> bool {
     matches!(
         mode,
-        StorageMode::Full | StorageMode::VectorOnly | StorageMode::VectorAndText | StorageMode::VectorAndGraph
+        StorageMode::Full
+            | StorageMode::VectorOnly
+            | StorageMode::VectorAndText
+            | StorageMode::VectorAndGraph
     )
 }
 
@@ -335,7 +338,10 @@ pub fn mode_requires_embed(mode: &StorageMode) -> bool {
 pub fn mode_requires_vector(mode: &StorageMode) -> bool {
     matches!(
         mode,
-        StorageMode::Full | StorageMode::VectorOnly | StorageMode::VectorAndText | StorageMode::VectorAndGraph
+        StorageMode::Full
+            | StorageMode::VectorOnly
+            | StorageMode::VectorAndText
+            | StorageMode::VectorAndGraph
     )
 }
 
@@ -343,7 +349,10 @@ pub fn mode_requires_vector(mode: &StorageMode) -> bool {
 pub fn mode_requires_text(mode: &StorageMode) -> bool {
     matches!(
         mode,
-        StorageMode::Full | StorageMode::TextOnly | StorageMode::VectorAndText | StorageMode::TextAndGraph
+        StorageMode::Full
+            | StorageMode::TextOnly
+            | StorageMode::VectorAndText
+            | StorageMode::TextAndGraph
     )
 }
 
@@ -351,7 +360,10 @@ pub fn mode_requires_text(mode: &StorageMode) -> bool {
 pub fn mode_requires_graph(mode: &StorageMode) -> bool {
     matches!(
         mode,
-        StorageMode::Full | StorageMode::GraphOnly | StorageMode::VectorAndGraph | StorageMode::TextAndGraph
+        StorageMode::Full
+            | StorageMode::GraphOnly
+            | StorageMode::VectorAndGraph
+            | StorageMode::TextAndGraph
     )
 }
 

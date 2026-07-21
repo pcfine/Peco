@@ -351,8 +351,7 @@ impl GraphStore for InMemoryBackend {
         });
 
         // BFS
-        let mut frontier: VecDeque<(String, u32)> =
-            VecDeque::from([(start_node.to_string(), 0)]);
+        let mut frontier: VecDeque<(String, u32)> = VecDeque::from([(start_node.to_string(), 0)]);
 
         while let Some((current, depth)) = frontier.pop_front() {
             if depth >= max_depth {

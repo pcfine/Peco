@@ -250,7 +250,13 @@ impl ToolDyn for AddToKnowledgeBase {
             km.ensure_loaded().await.map_err(string_err)?;
 
             let doc = km
-                .add_text_to_kb_with_mode(&parsed.kb_name, &parsed.title, &parsed.content, &source, mode)
+                .add_text_to_kb_with_mode(
+                    &parsed.kb_name,
+                    &parsed.title,
+                    &parsed.content,
+                    &source,
+                    mode,
+                )
                 .await
                 .map_err(string_err)?;
 
@@ -424,7 +430,8 @@ impl ToolDyn for AddFactsToKnowledgeBase {
         ToolDefinition {
             name: "add_facts_to_knowledge_base".to_string(),
             description: "将结构化事实（三元组）直接写入知识图谱，跳过文档分块和嵌入。\
-                          适合存储用户偏好、关系、事件等离散知识。".to_string(),
+                          适合存储用户偏好、关系、事件等离散知识。"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

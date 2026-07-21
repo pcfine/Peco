@@ -2,6 +2,7 @@
 pub(crate) mod agent;
 pub mod agent_config;
 pub(crate) mod agent_looper;
+pub(crate) mod agent_manager;
 pub(crate) mod context;
 pub(crate) mod dynamic_context;
 pub(crate) mod error;
@@ -18,6 +19,8 @@ pub use agent_looper::{
     AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState,
     TurnFailureReason, TurnOutcome, UserMsg,
 };
+pub use agent_manager::AgentManager;
+pub use agent_manager::AgentMeta;
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;
 pub use hooks::{HookAction, LooperHook, TokenBudgetHook, ToolAllowlistHook, ToolHookAction};

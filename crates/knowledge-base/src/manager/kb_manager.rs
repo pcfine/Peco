@@ -21,8 +21,8 @@ use tracing::info;
 use crate::error::KnowledgeError;
 use crate::types::SearchResult;
 
-use super::config::{BackendType, KbConfig, KbConfigsFile, KbInfo};
 use super::KnowledgeBase;
+use super::config::{BackendType, KbConfig, KbConfigsFile, KbInfo};
 
 // ---------------------------------------------------------------------------
 // KnowledgeBaseManager

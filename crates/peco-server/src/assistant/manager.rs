@@ -74,7 +74,8 @@ impl PersonalAssistantManager {
 
         // ── 2. 加载 Agent ─────────────────────────────────────────────────
         let agent = ws
-            .load_agent_cached(PERSONAL_ASSISTANT_AGENT_NAME)
+            .agent_manager()
+            .load_cached(PERSONAL_ASSISTANT_AGENT_NAME)
             .map_err(|e| {
                 ApiError::Internal(format!("failed to load personal assistant agent: {e}"))
             })?;
@@ -265,7 +266,7 @@ impl PersonalAssistantManager {
         // fs::write is atomic, and the content from include_str! is always identical.
         let content = include_str!("personal_assistant_agent.md");
 
-        ws.save_agent(PERSONAL_ASSISTANT_AGENT_NAME, content)
+        ws.agent_manager().save(PERSONAL_ASSISTANT_AGENT_NAME, content)
             .map_err(|e| {
                 ApiError::Internal(format!(
                     "failed to install personal assistant agent.md: {e}"

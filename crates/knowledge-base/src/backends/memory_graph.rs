@@ -90,8 +90,7 @@ impl GraphStore for MemoryGraphStore {
         });
 
         // BFS
-        let mut frontier: VecDeque<(String, u32)> =
-            VecDeque::from([(start_node.to_string(), 0)]);
+        let mut frontier: VecDeque<(String, u32)> = VecDeque::from([(start_node.to_string(), 0)]);
 
         while let Some((current, depth)) = frontier.pop_front() {
             if depth >= max_depth {
@@ -332,10 +331,7 @@ mod tests {
     async fn test_shortest_path_not_found() {
         let gs = MemoryGraphStore::new();
 
-        let path = gs
-            .shortest_path("A", "Z", &[], 10)
-            .await
-            .unwrap();
+        let path = gs.shortest_path("A", "Z", &[], 10).await.unwrap();
 
         assert!(path.is_none());
     }
