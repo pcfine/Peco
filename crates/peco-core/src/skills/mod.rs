@@ -13,10 +13,10 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use peco_core::skills::GlobalSkillList;
+//! use peco_core::skills::SkillRegister;
 //!
 //! # fn example() -> Result<(), peco_core::skills::SkillError> {
-//! let mut list = GlobalSkillList::new("./skills");
+//! let mut list = SkillRegister::new("./skills");
 //! list.init()?;
 //!
 //! for meta in list.all_meta() {
@@ -61,14 +61,14 @@
 
 pub mod config;
 pub mod error;
-pub mod global_skill_list;
+pub mod skill_register;
 pub mod loader;
 
 // Re-export the main public types for convenience
 pub use config::{Skill, SkillFrontmatter, SkillMeta, validate_name};
 pub use error::SkillError;
-pub use global_skill_list::{GlobalSkillList, GlobalSkillListStats};
+pub use skill_register::{SkillRegister, SkillRegisterStats};
 pub use loader::SkillLoader;
 
-/// Alias for [`GlobalSkillList`] — the new design name.
-pub type SkillRegistry = GlobalSkillList;
+/// Alias for [`SkillRegister`] — legacy name kept for compatibility.
+pub type SkillRegistry = SkillRegister;

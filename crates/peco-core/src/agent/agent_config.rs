@@ -44,7 +44,7 @@ pub struct AgentProfile {
     #[serde(default)]
     pub mcp: Vec<String>,
 
-    /// Skill 名称列表（GlobalSkillList 中的 skill）。
+    /// Skill 名称列表（SkillRegister 中的 skill）。
     #[serde(default)]
     pub skills: Vec<String>,
 

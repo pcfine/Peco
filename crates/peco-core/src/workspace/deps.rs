@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::agent::{Agent, AgentError};
 use crate::knowledge::KnowledgeManager;
-use crate::skills::GlobalSkillList;
+use crate::skills::SkillRegister;
 
 // ============================================================================
 // AgentLoader — DelegateSubAgent / RunParallelSubAgents 需要
@@ -22,7 +22,7 @@ pub trait AgentLoader: Send + Sync {
 // ============================================================================
 
 pub trait SkillProvider: Send + Sync {
-    fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>>;
+    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>>;
 }
 
 // ============================================================================

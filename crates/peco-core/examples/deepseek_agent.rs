@@ -24,7 +24,7 @@ use std::sync::atomic::AtomicBool;
 use peco_core::agent::{Agent, AgentError, AgentLooper, LooperConfig, LooperEvent, UserMsg};
 use peco_core::config::{SystemConfig, UserConfig};
 use peco_core::knowledge::KnowledgeManager;
-use peco_core::skills::GlobalSkillList;
+use peco_core::skills::SkillRegister;
 use peco_core::utils::intercom::make_async_intercom_pair;
 use peco_core::workspace::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 
@@ -41,10 +41,10 @@ impl AgentLoader for NoopAgentLoader {
 }
 
 struct NoopSkillProvider {
-    registry: Arc<std::sync::RwLock<GlobalSkillList>>,
+    registry: Arc<std::sync::RwLock<SkillRegister>>,
 }
 impl SkillProvider for NoopSkillProvider {
-    fn skill_registry(&self) -> &Arc<std::sync::RwLock<GlobalSkillList>> {
+    fn skill_registry(&self) -> &Arc<std::sync::RwLock<SkillRegister>> {
         &self.registry
     }
 }
@@ -146,7 +146,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let system_config = SystemConfig::load();
     let user_config = UserConfig::load(&system_config, &dir)?;
 
-    let skill_registry = Arc::new(std::sync::RwLock::new(GlobalSkillList::new(
+    let skill_registry = Arc::new(std::sync::RwLock::new(SkillRegister::new(
         dir.join("skills"),
     )));
 

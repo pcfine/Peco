@@ -69,3 +69,8 @@ pub trait ModelProvider: Send + Sync {
     /// 逐条产出 [`StreamEvent`] 项。
     async fn stream_chat(&self, request: &ChatRequest) -> Result<ChatStream, ProviderError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio as _;
+}

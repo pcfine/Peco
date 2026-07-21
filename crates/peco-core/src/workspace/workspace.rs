@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use crate::agent::Agent;
 use crate::config::{SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
-use crate::skills::GlobalSkillList;
+use crate::skills::SkillRegister;
 
 use super::deps::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 use super::error::WorkspaceError;
@@ -24,7 +24,7 @@ pub struct Workspace {
     user_id: String,
     root: PathBuf,
     config: UserConfig,
-    skill_registry: Arc<RwLock<GlobalSkillList>>,
+    skill_registry: Arc<RwLock<SkillRegister>>,
     knowledge_manager: Arc<KnowledgeManager>,
     agent_cache: RwLock<HashMap<String, Arc<Agent>>>,
 }
@@ -57,7 +57,7 @@ impl Workspace {
         let config = UserConfig::load(system_config, &root)?;
 
         let user_skills_dir = root.join("skills");
-        let mut registry = GlobalSkillList::new(user_skills_dir.clone());
+        let mut registry = SkillRegister::new(user_skills_dir.clone());
         if user_skills_dir.exists()
             && let Err(e) = registry.init()
         {
@@ -89,7 +89,7 @@ impl Workspace {
     pub fn config(&self) -> &UserConfig {
         &self.config
     }
-    pub fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>> {
+    pub fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
         &self.skill_registry
     }
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
@@ -265,7 +265,7 @@ impl AgentLoader for Workspace {
 }
 
 impl SkillProvider for Workspace {
-    fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>> {
+    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
         &self.skill_registry
     }
 }
@@ -288,7 +288,7 @@ struct WorkspaceRef {
     user_id: String,
     root: PathBuf,
     config: UserConfig,
-    skill_registry: Arc<RwLock<GlobalSkillList>>,
+    skill_registry: Arc<RwLock<SkillRegister>>,
     knowledge_manager: Arc<KnowledgeManager>,
 }
 
@@ -366,11 +366,11 @@ impl AgentLoader for UncachedAgentLoader {
 // ── Concrete wrapper structs for the other traits ─────────────────────
 
 struct WsSkillProvider {
-    registry: Arc<RwLock<GlobalSkillList>>,
+    registry: Arc<RwLock<SkillRegister>>,
 }
 
 impl SkillProvider for WsSkillProvider {
-    fn skill_registry(&self) -> &Arc<RwLock<GlobalSkillList>> {
+    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
         &self.registry
     }
 }

@@ -9,7 +9,7 @@ Workspace（用户隔离核心）
 ├── SystemConfig          ← 系统级配置（providers.toml + mcpconfig.json）
 ├── UserConfig            ← 用户级配置（Merge 深递归合并）
 ├── ToolFactory           ← 内置工具注册表（13 个工具）
-├── GlobalSkillList       ← Skill 发现与生命周期管理
+├── SkillRegister          ← Skill 发现与生命周期管理
 ├── KnowledgeManager      ← 知识库管理（增量同步 + 混合检索）
 ├── PersonalMemoryStore   ← PPA 个人记忆存储（三层记忆模型）
 └── [create_agent()]      ← 从 agent.md 组装完整 Agent 实例
@@ -296,7 +296,7 @@ Session 不包含内部锁，由 `AgentLooper` 以 `Box<Session>` 独占所有�
 | 组件 | 并发原语 | 保证 |
 |------|---------|------|
 | `Workspace` | `Arc` 共享 | 用户级资源隔离，Clone 语义 |
-| `GlobalSkillList` | `RwLock` | 读多写少，Tier 1 加载后极少写入 |
+| `SkillRegister` | `RwLock` | 读多写少，Tier 1 加载后极少写入 |
 | `KnowledgeManager` 底层 | `Mutex<Option<...>>` | 延迟初始化，初始化后不可变借用 |
 | `LooperHandle` | `Arc` + `AtomicBool`（cancel/pause flag） | Clone 语义，多持有者共享控制 |
 | `DefaultToolsExecutor` | `RwLock<HashMap>` | MCP 热重载时动态添加/移除工具 |
@@ -500,7 +500,7 @@ src/
 │   ├── sync.rs             # SyncReport + 增量同步逻辑
 │   └── error.rs            # KnowledgeModuleError
 ├── skills/
-│   ├── global_skill_list.rs # GlobalSkillList（三层渐进式加载）
+│   ├── global_skill_list.rs # SkillRegister（三层渐进式加载）
 │   ├── loader.rs            # SkillLoader（SKILL.md 解析）
 │   ├── config.rs            # Skill、SkillFrontmatter、SkillMeta
 │   └── error.rs             # SkillError

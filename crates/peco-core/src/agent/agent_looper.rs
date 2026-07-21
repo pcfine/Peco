@@ -2091,7 +2091,7 @@ mod tests {
     fn test_looper_config_default() {
         let config = LooperConfig::default();
         assert_eq!(config.event_buffer, 256);
-        assert!(config.per_turn_timeout.is_none());
+        assert_eq!(config.per_turn_timeout, Some(Duration::from_secs(180)));
         assert!(config.total_timeout.is_none());
         assert!(config.hooks.is_empty());
     }

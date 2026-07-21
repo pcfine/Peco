@@ -19,8 +19,6 @@
 // }
 // ```
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use peco_server::build_router;
@@ -41,12 +39,14 @@ pub struct TestApp {
     /// 服务端地址（如 `http://127.0.0.1:45678`）。
     pub base_url: String,
     /// 应用全局状态（可直接操作 DB 准备/验证数据）。
+    #[allow(dead_code)]
     pub state: Arc<AppState>,
     /// 预配置的 HTTP 客户端。
     pub client: Client,
     /// 预注册测试用户的 JWT token。
     pub user_token: String,
     /// 预注册测试用户的 user_id。
+    #[allow(dead_code)]
     pub user_id: String,
     /// 测试数据目录（Drop 时清理）。
     _temp_dir: tempfile::TempDir,
@@ -176,6 +176,7 @@ impl TestApp {
     // ── 辅助方法 ──────────────────────────────────────────────────────────────
 
     /// 注册第二个用户，返回 (user_id, token)。用于权限隔离测试。
+    #[allow(dead_code)]
     pub async fn register_user2(&self) -> (String, String) {
         #[derive(Deserialize)]
         struct AuthResponse {
@@ -211,6 +212,7 @@ impl TestApp {
     }
 
     /// 发送带认证的 POST 请求。
+    #[allow(dead_code)]
     pub fn post(&self, path: &str) -> reqwest::RequestBuilder {
         self.client
             .post(format!("{}{}", self.base_url, path))
@@ -226,6 +228,7 @@ impl TestApp {
     }
 
     /// 发送带认证的 DELETE 请求。
+    #[allow(dead_code)]
     pub fn delete(&self, path: &str) -> reqwest::RequestBuilder {
         self.client
             .delete(format!("{}{}", self.base_url, path))

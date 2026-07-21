@@ -15,6 +15,8 @@
 //! 4. 流式 `stream_chat()` 调用，逐条输出增量内容
 //! 5. 将提供商作为 `Box<dyn ModelProvider>` 传递
 
+#![allow(unused_crate_dependencies)]
+
 use std::sync::Arc;
 
 use model_provider::providers::deepseek::DEEPSEEK_V4_PRO;
