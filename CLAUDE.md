@@ -47,7 +47,7 @@ Peco 是一个全栈 AI Agent 平台：**Rust 后端**（Axum + Tokio）+ **Reac
 
 ```
 peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
-  ├── peco-core (Agent 引擎: Agent, Session, ReAct 循环, Workspace, MCP, Skills, Tools, PPA)
+  ├── peco-core (Agent 引擎: Agent, Session, ReAct 循环, WorkSpace, MCP, Skills, Tools, PPA)
   │     ├── model-provider (LLM 抽象层: ModelProvider trait, DeepSeek 实现)
   │     ├── knowledge-base (RAG: LanceDB + FastEmbed + BM25 + 知识图谱)
   │     └── peco-derive (#[peco_tool] 过程宏)
@@ -95,9 +95,9 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
 - `#[peco_tool]` 宏（来自 `peco-derive`）：标注一个 async fn，生成实现 `Tool` 的零大小结构体、带有 `#[derive(Deserialize, JsonSchema)]` 的类型化 `Parameters` 结构体，以及 `static TOOL_NAME` 常量。
 - `DefaultToolsExecutor` 是标准实现：持有 `HashMap<String, Box<dyn ToolDyn>>` 并按名称分发。
 
-**Workspace**（[crates/peco-core/src/workspace/](crates/peco-core/src/workspace/)）：
-- 按用户隔离的边界。每个 `Workspace` 持有 `ToolRegister`、`Config`（用户级别）、`SkillRegistry`、`PersonalMemoryStore` 和知识库访问。
-- `ToolDependencies` trait：窄依赖注入接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），使工具可以在不知道完整 `Workspace` 类型的情况下构建。
+**WorkSpace**（[crates/peco-core/src/workspace/](crates/peco-core/src/workspace/)）：
+- 按用户隔离的边界。每个 `WorkSpace` 持有 `ToolRegister`、`Config`（用户级别）、`SkillRegistry`、`PersonalMemoryStore` 和知识库访问。
+- `ToolDependencies` trait：窄依赖注入接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），使工具可以在不知道完整 `WorkSpace` 类型的情况下构建。
 - `ToolRegister`：使用 `ToolDependencies` 组装工具，一次性构建完整的工具集。
 
 **MCP**（[crates/peco-core/src/mcp/](crates/peco-core/src/mcp/)）：
@@ -232,7 +232,7 @@ max_turns: 30
 
 ## 核心设计模式
 
-1. **窄 trait 接口实现依赖注入**：`ToolDependencies` 暴露 `AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess` — 工具依赖这些窄 trait，而非直接依赖 `Workspace`。
+1. **窄 trait 接口实现依赖注入**：`ToolDependencies` 暴露 `AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess` — 工具依赖这些窄 trait，而非直接依赖 `WorkSpace`。
 
 2. **Session 独立于 Looper**：Looper 将消息推入 `Session`，并在轮次边界调用 `persister.save()`。Session 有自己的状态机，不知道 Looper 的存在。
 
@@ -240,7 +240,7 @@ max_turns: 30
 
 4. **MCP 工具自动发现**：`McpClientHandler` 在连接时调用 `list_all_tools()`，并在 `list_changed` 通知时重新同步。MCP 工具包装为 `McpTool`（实现 `ToolDyn`）。
 
-5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `Workspace` 实例 LRU 缓存（128 条目）。每个 workspace 延迟初始化其 `ToolRegister`、`SkillRegistry` 和 `PersonalMemoryStore`。
+5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `WorkSpace` 实例 LRU 缓存（128 条目）。每个 workspace 延迟初始化其 `ToolRegister`、`SkillRegistry` 和 `PersonalMemoryStore`。
 
 6. **错误处理**：`AgentError` 覆盖完整生命周期（IO、YAML 解析、缺失字段、环境变量、配置、工具执行、超过最大轮次、协议违规）。`?` 运算符可在各处使用，因为它为常见错误类型实现了 `From`。
 
@@ -248,5 +248,5 @@ max_turns: 30
 
 - Rust edition **2024**（在 workspace `Cargo.toml` 中设置）
 - 需要 Rust 1.85+
-- Workspace resolver v3
+- WorkSpace resolver v3
 - `unused_crate_dependencies = "warn"`（workspace 级别）

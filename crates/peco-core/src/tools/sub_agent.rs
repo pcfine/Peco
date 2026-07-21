@@ -4,8 +4,8 @@
 //
 // Both CLI and Web use the same tool implementations.
 // Difference is only in how the AgentLoader is constructed:
-// - CLI: Workspace reads agents/ from local filesystem
-// - Web: Workspace reads agents/ from user workspace directory
+// - CLI: WorkSpace reads agents/ from local filesystem
+// - Web: WorkSpace reads agents/ from user workspace directory
 
 use std::pin::Pin;
 use std::sync::Arc;

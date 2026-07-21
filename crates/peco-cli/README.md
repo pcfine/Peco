@@ -1,6 +1,6 @@
 # peco-cli — 命令行 AI 助手
 
-基于 [peco-core](../peco-core/) Agent 引擎的交互式终端 AI 助手。通过 Workspace 统一管理 Agent、Skills 和知识库，在终端中直接与 AI 对话。
+基于 [peco-core](../peco-core/) Agent 引擎的交互式终端 AI 助手。通过 WorkSpace 统一管理 Agent、Skills 和知识库，在终端中直接与 AI 对话。
 
 ## 快速开始
 
@@ -23,7 +23,7 @@ cargo run -p peco-cli
 │         REPL Loop · Console Renderer        │
 ├────────────────────────────────────────────┤
 │              peco-core                      │
-│   Workspace · Agent · ReAct Loop · Session  │
+│   WorkSpace · Agent · ReAct Loop · Session  │
 ├──────────────┬──────────────┬──────────────┤
 │   agents/    │   skills/    │  knowledge/   │
 │  agent.md   │  SKILL.md   │  LanceDB +    │
@@ -33,9 +33,9 @@ cargo run -p peco-cli
 
 peco-cli 与 [peco-server](../peco-server/) 共享同一个 `peco-core` 引擎层，区别在于它省去了 Web 服务、数据库和前端层，直接通过终端提供完整的 Agent 体验。
 
-## Workspace 目录结构
+## WorkSpace 目录结构
 
-peco-cli 使用 **Workspace** 管理所有 Agent、Skill 和知识库。默认 workspace 根目录为当前目录（`./`），可通过 `--workspace` / `-w` 指定。
+peco-cli 使用 **WorkSpace** 管理所有 Agent、Skill 和知识库。默认 workspace 根目录为当前目录（`./`），可通过 `--workspace` / `-w` 指定。
 
 ```
 <workspace>/
@@ -66,7 +66,7 @@ cargo run -p peco-cli
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|---------|--------|------|
 | `-a`, `--agent` | `PECO_AGENT_PATH` | `personal-assistant` | Agent 名称（从 workspace 的 `agents/` 目录加载）或 `agent.md` 文件路径 |
-| `-w`, `--workspace` | `PECO_WORKSPACE` | `./` | Workspace 根目录 |
+| `-w`, `--workspace` | `PECO_WORKSPACE` | `./` | WorkSpace 根目录 |
 | `-s`, `--session` | — | — | 恢复指定 ID 的会话 |
 | `--no-persist` | — | false | 禁用会话持久化 |
 | `--list-sessions` | — | — | 列出已保存的会话并退出 |
@@ -160,7 +160,7 @@ peco --list-sessions
 
 ## Provider 配置
 
-LLM Provider 通过 `providers.toml` 配置。Workspace 内的配置（`<workspace>/providers.toml`）优先级高于系统级配置（`~/.config/peco/providers.toml`）。
+LLM Provider 通过 `providers.toml` 配置。WorkSpace 内的配置（`<workspace>/providers.toml`）优先级高于系统级配置（`~/.config/peco/providers.toml`）。
 
 ```toml
 default_provider = "deepseek"

@@ -13,7 +13,7 @@
 │      REST API · SSE 流 · JWT 认证 · 限流 · OpenAPI/Swagger   │
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent 引擎)                       │
-│  Agent · Session · ReAct Loop · Workspace · PPA · MCP · Skills · Tools · KB │
+│  Agent · Session · ReAct Loop · WorkSpace · PPA · MCP · Skills · Tools · KB │
 ├────────────────────────┬────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │   (LLM 统一抽象层)       │   (RAG: 向量+BM25+知识图谱)          │
@@ -115,7 +115,7 @@ cargo run -p peco-cli -- --agent <agent-name>
 ```
 peco/
 ├── crates/
-│   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、Workspace、PPA、MCP、Skills、Tools
+│   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、WorkSpace、PPA、MCP、Skills、Tools
 │   ├── peco-server/            # Web 服务：Axum REST API、SSE、JWT、Cron 调度
 │   ├── peco-cli/               # 命令行 AI 助手
 │   ├── model-provider/         # LLM 统一抽象层（当前仅实现 DeepSeek）
@@ -262,7 +262,7 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 │      REST API · SSE · JWT Auth · Rate Limit · OpenAPI        │
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent Engine)                     │
-│  Agent · Session · ReAct Loop · Workspace · PPA · MCP · Skills · Tools · KB │
+│  Agent · Session · ReAct Loop · WorkSpace · PPA · MCP · Skills · Tools · KB │
 ├────────────────────────┬────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │     (LLM Abstraction)   │   (RAG: Vector+BM25+Graph)         │

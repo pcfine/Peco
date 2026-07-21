@@ -1,8 +1,8 @@
 // ============================================================================
-// SystemConfig — 进程级共享配置（所有 Workspace 共享）
+// SystemConfig — 进程级共享配置（所有 WorkSpace 共享）
 // ============================================================================
 //
-// 这是进程级共享配置，所有 Workspace 共享。
+// 这是进程级共享配置，所有 WorkSpace 共享。
 // 不包含任何用户数据（api_key 为空）。
 
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use super::mcp_config::McpConfig;
 use super::types::{LlmApiParams, ProviderEntry, ProvidersConfig};
 
-/// 系统级配置 — 进程生命周期内不变，所有 Workspace 共享。
+/// 系统级配置 — 进程生命周期内不变，所有 WorkSpace 共享。
 ///
 /// 包含 providers.toml 的基础配置（api_key 为空）、MCP 服务器注册表、
 /// skills 根目录和知识库根目录。

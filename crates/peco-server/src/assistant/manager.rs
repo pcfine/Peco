@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // 职责：
-//   1. 确保个人助理 agent.md 存在于用户 Workspace 中（首次访问时从模版安装）
+//   1. 确保个人助理 agent.md 存在于用户 WorkSpace 中（首次访问时从模版安装）
 //   2. 加载 Agent 实例（从 agent.md）
 //   3. 构建 LooperConfig（注入 PPA 读/写路径 + MessageFilter）
 //   4. 提供 stream_chat() → SSE 流式对话
@@ -43,7 +43,7 @@ pub const PERSONAL_ASSISTANT_AGENT_NAME: &str = "个人助理";
 
 /// 个人助理管理器。
 ///
-/// 每个用户拥有一个独立的 Agent 实例（来自其 Workspace 中的 agent.md），
+/// 每个用户拥有一个独立的 Agent 实例（来自其 WorkSpace 中的 agent.md），
 /// PPA 组件（记忆读写）和 MessageFilter 在每次 `stream_chat` 时注入 LooperConfig。
 ///
 /// # 使用方式
@@ -64,11 +64,11 @@ pub struct PersonalAssistantManager {
 impl PersonalAssistantManager {
     /// 创建新的 PersonalAssistantManager。
     ///
-    /// 首次调用时会将随代码提交的 agent.md 模版安装到用户 Workspace 中
+    /// 首次调用时会将随代码提交的 agent.md 模版安装到用户 WorkSpace 中
     /// （通过 `include_str!` 编译期嵌入）。
-    /// 后续调用直接从 Workspace 加载已有 Agent。
+    /// 后续调用直接从 WorkSpace 加载已有 Agent。
     pub async fn new(state: &AppState, user_id: &str) -> Result<Self, ApiError> {
-        // ── 1. 确保 agent.md 存在于用户 Workspace ──────────────────────────
+        // ── 1. 确保 agent.md 存在于用户 WorkSpace ──────────────────────────
         let ws = state.workspace_manager.get(user_id)?;
         Self::ensure_agent_installed(&ws).await?;
 
@@ -257,11 +257,11 @@ impl PersonalAssistantManager {
 
     // ── 私有方法 ──────────────────────────────────────────────────────
 
-    /// 确保个人助理 agent.md 存在于用户 Workspace 中。
+    /// 确保个人助理 agent.md 存在于用户 WorkSpace 中。
     ///
     /// 使用 `include_str!` 将随代码提交的模版编译进二进制，
-    /// 首次访问时写入用户 Workspace 的 `agents/个人助理/agent.md`。
-    async fn ensure_agent_installed(ws: &peco_core::workspace::Workspace) -> Result<(), ApiError> {
+    /// 首次访问时写入用户 WorkSpace 的 `agents/个人助理/agent.md`。
+    async fn ensure_agent_installed(ws: &peco_core::workspace::WorkSpace) -> Result<(), ApiError> {
         // `save_agent` is idempotent: create_dir_all is a no-op on existing dirs,
         // fs::write is atomic, and the content from include_str! is always identical.
         let content = include_str!("personal_assistant_agent.md");

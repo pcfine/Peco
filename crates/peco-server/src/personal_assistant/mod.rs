@@ -54,7 +54,7 @@ pub async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaCompone
         };
     }
 
-    // 获取 per-user KnowledgeManager (via Workspace)
+    // 获取 per-user KnowledgeManager (via WorkSpace)
     let ws = match state.workspace_manager.get(user_id) {
         Ok(ws) => ws,
         Err(e) => {

@@ -165,7 +165,7 @@ fn is_allowed_mime(mime: &str) -> bool {
     ) || mime.starts_with("text/")
 }
 
-/// 获取用户 KnowledgeManager (via Workspace).
+/// 获取用户 KnowledgeManager (via WorkSpace).
 fn get_user_km(
     state: &AppState,
     user_id: &str,

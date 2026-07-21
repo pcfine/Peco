@@ -105,8 +105,8 @@ src/
 │   └── executor.rs          # 任务执行逻辑
 │
 ├── workspace/
-│   ├── mod.rs               # Workspace 模块入口
-│   └── manager.rs           # WorkspaceManager — LRU 缓存 Workspace 生命周期
+│   ├── mod.rs               # WorkSpace 模块入口
+│   └── manager.rs           # WorkspaceManager — LRU 缓存 WorkSpace 生命周期
 │
 ├── db/
 │   ├── mod.rs               # 连接池 + 迁移 + server_config 存取
@@ -397,12 +397,12 @@ Agent 以 `agent.md`（YAML frontmatter + Markdown body）为唯一真相源：
 - `assemble_agent_md()` / `parse_agent_md()` 负责序列化与反序列化
 - 迁移 `002_slim_agents.sql` 安全地将旧宽表迁移到新轻量表
 
-### Workspace 隔离
+### WorkSpace 隔离
 
-`WorkspaceManager` 封装 LRU 缓存（默认容量 128），管理用户级 Workspace 生命周期：
+`WorkspaceManager` 封装 LRU 缓存（默认容量 128），管理用户级 WorkSpace 生命周期：
 
-- 每个 Workspace 持有该用户的 `ToolRegister`、`PersonalMemoryStore`、知识库访问等资源
-- `Workspace` 下移到 `peco-core`，提供 `ToolDependencies` 窄 trait 接口实现依赖注入
+- 每个 WorkSpace 持有该用户的 `ToolRegister`、`PersonalMemoryStore`、知识库访问等资源
+- `WorkSpace` 下移到 `peco-core`，提供 `ToolDependencies` 窄 trait 接口实现依赖注入
 - Server 层通过 `WorkspaceManager` 管理缓存、构建和销毁
 
 ### Personal Memory（PPA）
@@ -556,7 +556,7 @@ cargo test -p peco-server --test task_test
 
 ```
 peco-server
-├── peco-core          # Agent/Session/Workspace/PPA/Tools/MCP/Skills 核心抽象
+├── peco-core          # Agent/Session/WorkSpace/PPA/Tools/MCP/Skills 核心抽象
 ├── model-provider       # LLM Provider 抽象层 (DeepSeek / OpenAI)
 ├── knowledge-base       # 本地文档向量化、混合检索、PDF 解析
 ├── knowledge-helixdb    # HelixDB 知识图谱后端（可选扩展）

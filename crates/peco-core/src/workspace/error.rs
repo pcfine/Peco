@@ -1,10 +1,10 @@
 // ============================================================================
-// WorkspaceError — Workspace 操作的所有错误类型
+// WorkspaceError — WorkSpace 操作的所有错误类型
 // ============================================================================
 
 use std::io;
 
-/// Workspace 操作产生的错误。
+/// WorkSpace 操作产生的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     /// 配置加载或合并错误。

@@ -1,5 +1,5 @@
 // ============================================================================
-// WorkspaceManager — 多用户 Workspace LRU 缓存管理
+// WorkspaceManager — 多用户 WorkSpace LRU 缓存管理
 // ============================================================================
 
 use std::num::NonZeroUsize;
@@ -11,23 +11,23 @@ use std::sync::RwLock;
 use lru::LruCache;
 use peco_core::agent::Agent;
 use peco_core::config::SystemConfig;
-use peco_core::workspace::Workspace;
+use peco_core::workspace::WorkSpace;
 
 use crate::error::ApiError;
 
-/// 工作空间管理器 — LRU 缓存 Workspace 实例。
+/// 工作空间管理器 — LRU 缓存 WorkSpace 实例。
 ///
-/// peco-server 特有（CLI 直接使用 Workspace::open()）。
+/// peco-server 特有（CLI 直接使用 WorkSpace::open()）。
 /// 两级缓存架构：
-/// - WorkspaceManager 缓存 Workspace（LRU）
-/// - Workspace 内部缓存 Agent（HashMap）
+/// - WorkspaceManager 缓存 WorkSpace（LRU）
+/// - WorkSpace 内部缓存 Agent（HashMap）
 pub struct WorkspaceManager {
     /// 数据根目录。
     data_dir: PathBuf,
-    /// 系统级配置（所有 Workspace 共享）。
+    /// 系统级配置（所有 WorkSpace 共享）。
     system_config: Arc<SystemConfig>,
-    /// LRU: user_id → Arc<Workspace>
-    cache: RwLock<LruCache<String, Arc<Workspace>>>,
+    /// LRU: user_id → Arc<WorkSpace>
+    cache: RwLock<LruCache<String, Arc<WorkSpace>>>,
 }
 
 impl WorkspaceManager {
@@ -41,8 +41,8 @@ impl WorkspaceManager {
         }
     }
 
-    /// 获取或初始化用户 Workspace（同步）。
-    pub fn get(&self, user_id: &str) -> Result<Arc<Workspace>, ApiError> {
+    /// 获取或初始化用户 WorkSpace（同步）。
+    pub fn get(&self, user_id: &str) -> Result<Arc<WorkSpace>, ApiError> {
         // Use write lock + get() (not peek) to correctly track LRU recency.
         {
             let mut cache = self.cache.write().unwrap();
@@ -54,7 +54,7 @@ impl WorkspaceManager {
 
         // Create workspace
         let root = self.workspace_dir(user_id);
-        let ws = Workspace::open(root, user_id.to_string(), &self.system_config)
+        let ws = WorkSpace::open(root, user_id.to_string(), &self.system_config)
             .map_err(|e| ApiError::Internal(format!("failed to open workspace: {e}")))?;
 
         let ws = Arc::new(ws);
@@ -69,22 +69,22 @@ impl WorkspaceManager {
             cache.put(user_id.to_string(), ws.clone());
         }
 
-        tracing::info!(user_id = %user_id, "Workspace opened and cached");
+        tracing::info!(user_id = %user_id, "WorkSpace opened and cached");
         Ok(ws)
     }
 
-    /// 获取 Agent（委托给 Workspace::load_agent_cached，带两级缓存）。
+    /// 获取 Agent（委托给 WorkSpace::load_agent_cached，带两级缓存）。
     pub fn get_agent(&self, user_id: &str, agent_name: &str) -> Result<Arc<Agent>, ApiError> {
         let ws = self.get(user_id)?;
         ws.agent_manager().load_cached(agent_name)
             .map_err(|e| ApiError::Internal(format!("failed to load agent '{agent_name}': {e}")))
     }
 
-    /// 使指定用户的 Workspace 缓存失效。
+    /// 使指定用户的 WorkSpace 缓存失效。
     pub fn invalidate_user(&self, user_id: &str) {
         let mut cache = self.cache.write().unwrap();
         cache.pop(user_id);
-        tracing::debug!(user_id = %user_id, "Workspace cache invalidated");
+        tracing::debug!(user_id = %user_id, "WorkSpace cache invalidated");
     }
 
     /// 使指定用户的指定 Agent 缓存失效。
@@ -99,7 +99,7 @@ impl WorkspaceManager {
         self.data_dir.join("workspaces").join(user_id)
     }
 
-    /// 返回当前缓存的 Workspace 数量。
+    /// 返回当前缓存的 WorkSpace 数量。
     #[allow(dead_code)]
     pub fn cache_size(&self) -> usize {
         self.cache.read().unwrap().len()

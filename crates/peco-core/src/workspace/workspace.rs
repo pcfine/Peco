@@ -1,5 +1,5 @@
 // ============================================================================
-// Workspace — 用户隔离的核心抽象
+// WorkSpace — 用户隔离的核心抽象
 // ============================================================================
 
 use std::path::{Path, PathBuf};
@@ -16,10 +16,10 @@ use super::tool_register::ToolRegister;
 use crate::tools::ToolExecutor;
 
 // ============================================================================
-// Workspace
+// WorkSpace
 // ============================================================================
 
-pub struct Workspace {
+pub struct WorkSpace {
     user_id: String,
     root: PathBuf,
     config: UserConfig,
@@ -28,7 +28,7 @@ pub struct Workspace {
     agent_manager: Arc<AgentManager>,
 }
 
-impl Workspace {
+impl WorkSpace {
     pub fn open(
         root: PathBuf,
         user_id: String,
@@ -128,10 +128,10 @@ impl Workspace {
 }
 
 // ============================================================================
-// Narrow trait implementations — Workspace 作为编排者
+// Narrow trait implementations — WorkSpace 作为编排者
 // ============================================================================
 
-impl AgentLoader for Workspace {
+impl AgentLoader for WorkSpace {
     fn load_agent(
         &self,
         name: &str,
@@ -144,13 +144,13 @@ impl AgentLoader for Workspace {
     }
 }
 
-impl SkillProvider for Workspace {
+impl SkillProvider for WorkSpace {
     fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
         &self.skill_registry
     }
 }
 
-impl KnowledgeAccess for Workspace {
+impl KnowledgeAccess for WorkSpace {
     fn user_id(&self) -> &str {
         &self.user_id
     }

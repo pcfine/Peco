@@ -93,7 +93,7 @@ pub struct Agent {
     /// 根据profile.mcp构建的MCP管理器，用于管理MCP连接
     mcp_manager: Arc<McpManager>,
 
-    /// Skill 注册表（从 Workspace 注入）。
+    /// Skill 注册表（从 WorkSpace 注入）。
     skill_registry: Arc<RwLock<SkillRegistry>>,
 }
 

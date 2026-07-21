@@ -12,7 +12,7 @@ use crate::config::ConfigError;
 
 /// 用户级配置 — providers.toml 深递归合并结果 + MCP 配置。
 ///
-/// 在 Workspace 打开时从 `{workspace_root}/providers.toml` 和
+/// 在 WorkSpace 打开时从 `{workspace_root}/providers.toml` 和
 /// `{workspace_root}/mcpconfig.json` 加载，并与系统配置做深递归合并。
 #[derive(Debug, Clone)]
 pub struct UserConfig {

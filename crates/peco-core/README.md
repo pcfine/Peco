@@ -5,7 +5,7 @@ AI Agent 核心框架 — 提供 Agent 组装、会话管理、知识库、MCP �
 ## 架构总览
 
 ```
-Workspace（用户隔离核心）
+WorkSpace（用户隔离核心）
 ├── SystemConfig          ← 系统级配置（providers.toml + mcpconfig.json）
 ├── UserConfig            ← 用户级配置（Merge 深递归合并）
 ├── ToolFactory           ← 内置工具注册表（13 个工具）
@@ -28,7 +28,7 @@ Workspace（用户隔离核心）
 - **AgentLooper / SimpleAgentLooper 是仅有的两个引擎** — AgentExecutor 不直接调用 `Agent.chat()`
 - **Agent 内部接口不对外** — `Agent.chat()` / `Agent.stream_chat()` 为 `pub(crate)`
 - **Executor 可注册为 Tool** — `AgentExecutorTool` 让一个 agent 把另一个 agent 当工具调用
-- **Workspace 是用户隔离边界** — 所有用户级资源（工具、知识库、记忆）通过 Workspace 管理
+- **WorkSpace 是用户隔离边界** — 所有用户级资源（工具、知识库、记忆）通过 WorkSpace 管理
 
 ## 模块地图
 
@@ -37,7 +37,7 @@ Workspace（用户隔离核心）
 | [`agent`](src/agent/mod.rs) | Agent 组装（从 agent.md 配置 → LLM provider + 工具 + MCP + Skill），含 DynamicContext trait |
 | [`executor`](src/executor/mod.rs) | AgentExecutor 外观层：SingleTurn / MultiTurn / agent-as-tool |
 | [`config`](src/config/mod.rs) | 配置系统：SystemConfig + UserConfig + Merge 深递归合并，providers.toml + MCP 注册表 |
-| [`workspace`](src/workspace/mod.rs) | 用户隔离核心：Workspace、ToolRegister、ToolDependencies 窄 trait 依赖注入 |
+| [`workspace`](src/workspace/mod.rs) | 用户隔离核心：WorkSpace、ToolRegister、ToolDependencies 窄 trait 依赖注入 |
 | [`personal_memory`](src/personal_memory/mod.rs) | PPA 个人记忆：PersonalMemoryStore、MemoryFact/UserProfile/TurnContext 类型与配置 |
 | [`knowledge`](src/knowledge/mod.rs) | 知识库管理：文件哈希追踪、增量同步（工具移至 `tools/knowledge.rs`） |
 | [`mcp`](src/mcp/mod.rs) | MCP 客户端：连接管理、工具自动同步、热重载 |
@@ -116,7 +116,7 @@ agent.md
 
 配置优先级：**agent.md 显式设置 > providers.toml provider 默认值**
 
-> **注意**：`Agent::from_file` 内部通过 `Workspace` 获取 MCP 配置、Skill 列表和工具依赖。
+> **注意**：`Agent::from_file` 内部通过 `WorkSpace` 获取 MCP 配置、Skill 列表和工具依赖。
 > 在测试中可通过 `AgentBuilder` 注入 mock 依赖。
 
 ### Agent 运行循环
@@ -155,20 +155,20 @@ agent.md
 | `RouterExecutor` | — | 路由分发 | 🔜 Phase 2 |
 | `ParallelExecutor` | — | 并行执行 | 🔜 Phase 2 |
 
-### Workspace 用户隔离
+### WorkSpace 用户隔离
 
-[`Workspace`](src/workspace/workspace.rs) 是用户隔离的核心抽象，替代了旧的 `GlobalHandler` 全局单例：
+[`WorkSpace`](src/workspace/workspace.rs) 是用户隔离的核心抽象，替代了旧的 `GlobalHandler` 全局单例：
 
-- **Workspace** 持有用户级资源：`ToolRegister`、`PersonalMemoryStore`、知识库访问、Agent 加载
+- **WorkSpace** 持有用户级资源：`ToolRegister`、`PersonalMemoryStore`、知识库访问、Agent 加载
 - **ToolDependencies** 定义窄 trait 接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），实现依赖注入
 - **ToolRegister** 基于依赖一次构建到位，避免重复创建工具实例
 - **SystemConfig + UserConfig** 分层配置，`merge.rs` 提供深递归合并策略
 
 ```rust
-use peco_core::workspace::{Workspace, ToolDependencies};
+use peco_core::workspace::{WorkSpace, ToolDependencies};
 
-// 构建用户 Workspace
-let workspace = Workspace::builder()
+// 构建用户 WorkSpace
+let workspace = WorkSpace::builder()
     .system_config(system_config)
     .user_config(user_config)
     .tool_deps(tool_deps)  // 注入 AgentLoader, KnowledgeAccess, MemoryStore 等
@@ -295,7 +295,7 @@ Session 不包含内部锁，由 `AgentLooper` 以 `Box<Session>` 独占所有�
 
 | 组件 | 并发原语 | 保证 |
 |------|---------|------|
-| `Workspace` | `Arc` 共享 | 用户级资源隔离，Clone 语义 |
+| `WorkSpace` | `Arc` 共享 | 用户级资源隔离，Clone 语义 |
 | `SkillRegister` | `RwLock` | 读多写少，Tier 1 加载后极少写入 |
 | `KnowledgeManager` 底层 | `Mutex<Option<...>>` | 延迟初始化，初始化后不可变借用 |
 | `LooperHandle` | `Arc` + `AtomicBool`（cancel/pause flag） | Clone 语义，多持有者共享控制 |
@@ -359,7 +359,7 @@ search_kb() 混合检索（语义 + 关键词 + 图谱 + RRF 融合）
 - **文件哈希追踪**：[`FileHashManifest`](src/knowledge/hash_manifest.rs) 记录 SHA-256，对比检测新增/更新/删除
 - **增量同步**：只处理变更文件，错误累积不中断
 - **多知识库并发搜索**：`search_all()` 使用 `futures::join_all` 并行检索
-- **延迟加载**：`Mutex<Option<KnowledgeBaseManager>>` 确保与 Workspace 初始化兼容
+- **延迟加载**：`Mutex<Option<KnowledgeBaseManager>>` 确保与 WorkSpace 初始化兼容
 - **多后端支持**：LanceDB（默认，本地）和 HelixDB（feature-gated：`helixdb` feature，需额外配置 URL 连接）
 - **Agent 工具**：5 个知识库工具位于 [`tools/knowledge.rs`](src/tools/knowledge.rs)，通过 `ToolDependencies` 注入用户隔离
 
@@ -388,7 +388,7 @@ search_kb() 混合检索（语义 + 关键词 + 图谱 + RRF 融合）
 
 | 稳定性等级 | 范围 | 说明 |
 |-----------|------|------|
-| **相对稳定** | `Session`、`SessionPersister`、`Tool`/`ToolDyn` trait、`Workspace` | 核心抽象已稳定，预计不会有大的接口变更 |
+| **相对稳定** | `Session`、`SessionPersister`、`Tool`/`ToolDyn` trait、`WorkSpace` | 核心抽象已稳定，预计不会有大的接口变更 |
 | **可能变更** | `AgentExecutor` trait、`LooperHandle`、`LooperEvent`、`DynamicContext` | 正在根据实际使用反馈迭代 |
 | **实验性** | `ExecutorType` 中标记 Phase 2 的 variant、HelixDB 后端、`PersonalMemoryStore` | 接口仅为占位，实现和 API 均可能大幅调整 |
 
@@ -474,8 +474,8 @@ src/
 │   ├── mcp_config.rs       # McpConfig、McpServerConfig、TransportType
 │   └── error.rs            # ConfigError
 ├── workspace/
-│   ├── mod.rs              # Workspace 模块入口
-│   ├── workspace.rs        # Workspace（用户隔离边界，持有 ToolRegister + 用户资源）
+│   ├── mod.rs              # WorkSpace 模块入口
+│   ├── workspace.rs        # WorkSpace（用户隔离边界，持有 ToolRegister + 用户资源）
 │   ├── tool_register.rs    # ToolRegister（基于 ToolDependencies 一次构建）
 │   ├── deps.rs             # ToolDependencies 窄 trait（AgentLoader/SkillProvider/MemoryStore/KnowledgeAccess）
 │   └── error.rs            # WorkspaceError

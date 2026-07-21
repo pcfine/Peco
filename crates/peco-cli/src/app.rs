@@ -10,7 +10,7 @@ use peco_core::agent::{Agent, AgentLooper, LooperEvent, LooperHandle};
 use peco_core::config::SystemConfig;
 use peco_core::persistence::{FileSessionPersister, NullSessionPersister, SessionPersister};
 use peco_core::session::Session;
-use peco_core::workspace::Workspace;
+use peco_core::workspace::WorkSpace;
 
 use crate::commands::{self, CommandRegistry, CommandResult};
 use crate::config::CliConfig;
@@ -25,9 +25,9 @@ use crate::input::InputReader;
 pub struct CliApp {
     /// CLI 配置
     config: CliConfig,
-    /// Workspace 实例（管理 agents/skills/knowledge，保持生命周期）
+    /// WorkSpace 实例（管理 agents/skills/knowledge，保持生命周期）
     #[allow(dead_code)]
-    workspace: Arc<Workspace>,
+    workspace: Arc<WorkSpace>,
     /// Agent 实例
     agent: Arc<Agent>,
     /// AgentLooper 控制句柄（spawn 后持有）
@@ -56,18 +56,18 @@ impl CliApp {
         // ── 1. 加载系统配置 ────────────────────────────────────────────
         let system_config = SystemConfig::load();
 
-        // ── 2. 创建 Workspace ──────────────────────────────────────────
+        // ── 2. 创建 WorkSpace ──────────────────────────────────────────
         let user_id = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "cli-user".to_string());
 
         let workspace = Arc::new(
-            Workspace::open(config.workspace_root.clone(), user_id, &system_config)
-                .map_err(|e| anyhow::anyhow!("Workspace 创建失败: {e}"))?,
+            WorkSpace::open(config.workspace_root.clone(), user_id, &system_config)
+                .map_err(|e| anyhow::anyhow!("WorkSpace 创建失败: {e}"))?,
         );
 
         eprintln!(
-            "[init] Workspace 已打开: root={}, skills={}",
+            "[init] WorkSpace 已打开: root={}, skills={}",
             workspace.root().display(),
             workspace
                 .skill_registry()
@@ -334,7 +334,7 @@ impl CliApp {
 ///   使用 workspace 提供的 ToolDependencies。
 /// - 否则 → 视为 workspace 内的 Agent 名称，通过 workspace 加载。
 fn load_agent_from_config(
-    workspace: &Arc<Workspace>,
+    workspace: &Arc<WorkSpace>,
     config: &CliConfig,
 ) -> anyhow::Result<Arc<Agent>> {
     if config.agent_path.is_file() {
@@ -349,7 +349,7 @@ fn load_agent_from_config(
         )?;
         Ok(Arc::new(agent))
     } else {
-        // Workspace 内 Agent 名称模式
+        // WorkSpace 内 Agent 名称模式
         let name = config
             .agent_path
             .file_name()

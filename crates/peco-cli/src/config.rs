@@ -22,7 +22,7 @@ pub struct CliArgs {
     )]
     pub agent: PathBuf,
 
-    /// Workspace 根目录（包含 agents/、skills/、knowledge/ 子目录）
+    /// WorkSpace 根目录（包含 agents/、skills/、knowledge/ 子目录）
     #[arg(short = 'w', long, default_value = "./", env = "PECO_WORKSPACE")]
     pub workspace: PathBuf,
 
