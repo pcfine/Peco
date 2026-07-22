@@ -74,14 +74,17 @@ impl KnowledgeBaseManager {
                 if !kb_config_path.exists() {
                     continue;
                 }
-                if let Some(config) = read_kb_config_json(&entry.path()).await.unwrap_or_else(|e| {
-                    tracing::warn!(
-                        dir = %entry.path().display(),
-                        error = %e,
-                        "读取 kb_config.json 失败，跳过此目录"
-                    );
-                    None
-                }) {
+                if let Some(config) = read_kb_config_json(&entry.path())
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            dir = %entry.path().display(),
+                            error = %e,
+                            "读取 kb_config.json 失败，跳过此目录"
+                        );
+                        None
+                    })
+                {
                     // 以 config.name 为 key — 与 create_kb/open_kb/delete_kb
                     // 的查找键保持一致（这些方法均使用原始名称，而非 sanitize 后的目录名）
                     config_map.insert(config.name.clone(), config);

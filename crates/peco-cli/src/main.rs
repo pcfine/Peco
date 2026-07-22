@@ -10,6 +10,8 @@ mod commands;
 mod config;
 mod display;
 mod input;
+mod menu;
+mod session_map;
 
 use config::CliConfig;
 use peco_core::config::SystemConfig;
@@ -32,18 +34,7 @@ async fn main() {
         }
     };
 
-    // --list-sessions 特殊路径
-    if config.list_sessions {
-        match app::list_sessions_and_exit(&config).await {
-            Ok(()) => process::exit(0),
-            Err(e) => {
-                eprintln!("列出会话失败: {e:#}");
-                process::exit(1);
-            }
-        }
-    }
-
-    // --template 模板初始化路径
+    // --template 模板初始化路径（显式，不变）
     if let Some(ref template_name) = config.init_template {
         match init_template_workspace(&config, template_name).await {
             Ok(()) => process::exit(0),
@@ -54,7 +45,13 @@ async fn main() {
         }
     }
 
-    // 启动 CLI
+    // 首次启动自动初始化 personal 模板
+    if let Err(e) = ensure_workspace_initialized(&config).await {
+        eprintln!("自动初始化失败: {e:#}");
+        process::exit(1);
+    }
+
+    // 交互启动 CLI
     let mut cli_app = match app::CliApp::new(config).await {
         Ok(a) => a,
         Err(e) => {
@@ -115,6 +112,30 @@ async fn init_template_workspace(config: &CliConfig, template_name: &str) -> any
     }
 
     Ok(())
+}
+
+/// 首次启动自动初始化：若 workspace 的 agents/ 目录无有效 Agent，
+/// 自动应用 personal 内置模板，确保至少有一个 Agent 可用。
+async fn ensure_workspace_initialized(config: &CliConfig) -> anyhow::Result<()> {
+    let agents_dir = config.workspace_root.join("agents");
+
+    let has_agents = if agents_dir.exists() {
+        std::fs::read_dir(&agents_dir)?
+            .filter_map(|e| e.ok())
+            .any(|entry| {
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && entry.path().join("agent.md").exists()
+            })
+    } else {
+        false
+    };
+
+    if has_agents {
+        return Ok(());
+    }
+
+    eprintln!("[init] 首次启动，自动应用 personal 模板...");
+    init_template_workspace(config, "personal").await
 }
 
 /// 初始化 `tracing_subscriber`，日志级别由 `RUST_LOG` 环境变量控制。

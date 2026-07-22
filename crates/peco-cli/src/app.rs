@@ -2,13 +2,13 @@
 // app — CLI 应用主循环
 // ============================================================================
 //
-// CliApp 持有所有运行时组件，驱动 REPL 循环和事件分发。
+// CliApp 持有所有运行时组件，驱动交互启动流程和 REPL 循环。
 
 use std::sync::Arc;
 
 use peco_core::agent::{Agent, AgentLooper, LooperEvent, LooperHandle};
 use peco_core::config::SystemConfig;
-use peco_core::persistence::{FileSessionPersister, NullSessionPersister, SessionPersister};
+use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
 use peco_core::workspace::WorkSpace;
 
@@ -16,28 +16,33 @@ use crate::commands::{self, CommandRegistry, CommandResult};
 use crate::config::CliConfig;
 use crate::display::{ConsoleRenderer, Renderer};
 use crate::input::InputReader;
+use crate::menu;
+use crate::session_map::AgentAwareSessionPersister;
 
 // ============================================================================
 // CliApp
 // ============================================================================
 
 /// CLI 应用主结构。
+///
+/// 构造时仅打开 WorkSpace 和持久化器，Agent 和 Session 在 `run()` 中
+/// 通过终端菜单交互选择。
 pub struct CliApp {
     /// CLI 配置
     config: CliConfig,
     /// WorkSpace 实例（管理 agents/skills/knowledge，保持生命周期）
     #[allow(dead_code)]
     workspace: Arc<WorkSpace>,
-    /// Agent 实例
-    agent: Arc<Agent>,
+    /// Agent 实例（`run()` 中通过菜单选择后设置）
+    agent: Option<Arc<Agent>>,
     /// AgentLooper 控制句柄（spawn 后持有）
     handle: Option<LooperHandle>,
     /// 当前会话 ID
     session_id: String,
     /// 当前会话描述
     session_description: String,
-    /// 持久化器
-    persister: Arc<dyn SessionPersister>,
+    /// 持久化器（带 agent 感知能力的 wrapper）
+    persister: Arc<AgentAwareSessionPersister>,
     /// 命令注册表
     command_registry: CommandRegistry,
     /// 渲染器
@@ -46,12 +51,14 @@ pub struct CliApp {
     input: InputReader,
     /// 退出标志
     should_exit: bool,
-    /// 初始 session — `new()` 中创建，`run()` 中首次 spawn 时消费
+    /// 初始 session — `run()` 中创建，spawn 时消费
     initial_session: Option<Session>,
 }
 
 impl CliApp {
-    /// 创建 CliApp 实例。
+    /// 创建 CliApp 实例 — 仅打开 WorkSpace 和持久化器。
+    ///
+    /// Agent 和 Session 在 `run()` 中通过交互菜单选择。
     pub async fn new(config: CliConfig) -> anyhow::Result<Self> {
         // ── 1. 加载系统配置 ────────────────────────────────────────────
         let system_config = SystemConfig::load();
@@ -76,92 +83,53 @@ impl CliApp {
                 .unwrap_or(0),
         );
 
-        // ── 3. 加载 Agent ─────────────────────────────────────────────
-        let agent = load_agent_from_config(&workspace, &config)?;
+        // ── 3. 创建持久化器 ────────────────────────────────────────────
+        let sessions_dir = config.workspace_root.join(".peco").join("sessions");
+        let persister: Arc<AgentAwareSessionPersister> =
+            Arc::new(
+                AgentAwareSessionPersister::new(sessions_dir, config.workspace_root.as_path())
+                    .await?,
+            );
 
-        eprintln!(
-            "[init] Agent 已加载: name={}, path={}, provider={}, model={}",
-            agent.config().agent.name,
-            agent.path().display(),
-            agent.provider().name(),
-            agent
-                .model_config()
-                .model_name
-                .as_deref()
-                .unwrap_or("default"),
-        );
-
-        // ── 4. 创建持久化器 ────────────────────────────────────────────
-        let persister: Arc<dyn SessionPersister> = if config.no_persist {
-            Arc::new(NullSessionPersister)
-        } else {
-            match &config.sessions_dir {
-                Some(dir) => Arc::new(FileSessionPersister::new(dir.clone()).await?),
-                None => Arc::new(FileSessionPersister::from_env().await?),
-            }
-        };
-
-        // ── 5. 创建或恢复 Session ──────────────────────────────────────
-        let (session, session_id, session_description) = if let Some(ref id) = config.session_id {
-            match persister.load(id).await? {
-                Some((snapshot, meta)) => {
-                    eprintln!("[init] 恢复会话: {id} ({} turns)", meta.completed_turns);
-                    let s = Session::from_snapshot(
-                        meta.id.clone(),
-                        meta.description.clone(),
-                        meta.created_at,
-                        snapshot,
-                    );
-                    (s, meta.id, meta.description)
-                }
-                None => {
-                    anyhow::bail!("会话 {id} 不存在。使用 --list-sessions 查看可用会话。");
-                }
-            }
-        } else {
-            let id = uuid::Uuid::new_v4().to_string();
-            let desc = agent.config().agent.name.clone();
-            eprintln!("[init] 新建会话: {id}");
-            let s = Session::new(id.clone(), desc.clone());
-            (s, id, desc)
-        };
-
-        // ── 6. 构建渲染器和输入 ────────────────────────────────────────
+        // ── 4. 构建渲染器和输入（不依赖 Agent 选择）────────────────────
         let renderer: Box<dyn Renderer> = Box::new(ConsoleRenderer::new(&config));
-
         let input = InputReader::new()?;
 
         Ok(Self {
             config,
             workspace,
-            agent,
+            agent: None,
             handle: None,
-            session_id,
-            session_description,
+            session_id: String::new(),
+            session_description: String::new(),
             persister,
             command_registry: commands::create_registry(),
             renderer,
             input,
             should_exit: false,
-            initial_session: Some(session),
+            initial_session: None,
         })
     }
 
-    /// 运行 REPL 主循环。
+    /// 运行完整启动流程：交互选择 Agent → 交互选择 Session → REPL。
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        // ── Spawn looper（首次使用 initial_session）─────────────────────
+        // ── Phase 1: 选择 Agent ────────────────────────────────────────
+        self.init_agent().await?;
+
+        // ── Phase 2: 选择/创建 Session ─────────────────────────────────
+        self.init_session().await?;
+
+        // ── Phase 3: Spawn looper ──────────────────────────────────────
         self.spawn_looper().await?;
 
-        // ── 打印问候 ───────────────────────────────────────────────────
-        let sid = self.session_id.clone();
-        self.renderer.render_greeting(&sid)?;
+        // ── Phase 4: 打印问候 ──────────────────────────────────────────
+        self.renderer.render_greeting(&self.session_id)?;
 
-        // ── REPL ───────────────────────────────────────────────────────
+        // ── Phase 5: REPL ──────────────────────────────────────────────
         while !self.should_exit {
             match self.input.read_line("> ")? {
                 Some(line) if line.is_empty() => continue,
                 Some(line) if line.starts_with('/') => {
-                    // 交换出 registry 以解决 borrow checker 冲突
                     let registry = std::mem::take(&mut self.command_registry);
                     let result = registry.dispatch(&line, self)?;
                     self.command_registry = registry;
@@ -187,6 +155,101 @@ impl CliApp {
         Ok(())
     }
 
+    // ── 交互初始化 ────────────────────────────────────────────────────────
+
+    /// 显示 Agent 选择菜单并加载选中的 Agent。
+    async fn init_agent(&mut self) -> anyhow::Result<()> {
+        let metas = self.workspace.agent_manager().list_meta();
+
+        if metas.is_empty() {
+            anyhow::bail!(
+                "workspace 中没有可用的 Agent。\n\
+                 请使用 peco -t personal 初始化 workspace。\n\
+                 workspace: {}",
+                self.config.workspace_root.display()
+            );
+        }
+
+        let workspace_root = self.config.workspace_root.display().to_string();
+        let name = menu::pick_agent(&metas, &workspace_root)?;
+
+        let agent = self
+            .workspace
+            .agent_manager()
+            .load_cached(&name)
+            .map_err(|e| anyhow::anyhow!("加载 Agent '{}' 失败: {e}", name))?;
+
+        eprintln!(
+            "[init] Agent 已加载: name={}, provider={}, model={}",
+            agent.config().agent.name,
+            agent.provider().name(),
+            agent
+                .model_config()
+                .model_name
+                .as_deref()
+                .unwrap_or("default"),
+        );
+
+        self.agent = Some(agent);
+        Ok(())
+    }
+
+    /// 显示 Session 选择菜单，恢复已有会话或创建新会话。
+    async fn init_session(&mut self) -> anyhow::Result<()> {
+        let agent = self
+            .agent
+            .as_ref()
+            .expect("agent must be initialized before session");
+
+        let agent_name = agent.config().agent.name.clone();
+
+        // 按 agent 过滤已有会话
+        let agent_sessions = self
+            .persister
+            .list_by_agent(&agent_name)
+            .await
+            .map_err(|e| anyhow::anyhow!("列出会话失败: {e}"))?;
+
+        let picked = menu::pick_session(&agent_name, &agent_sessions)?;
+
+        match picked {
+            Some(id) => match self.persister.load(&id).await? {
+                Some((snapshot, meta)) => {
+                    eprintln!(
+                        "[init] 恢复会话: {} ({} turns)",
+                        &meta.id, meta.completed_turns
+                    );
+                    let session = Session::from_snapshot(
+                        meta.id.clone(),
+                        meta.description.clone(),
+                        meta.created_at,
+                        snapshot,
+                    );
+                    self.session_id = meta.id;
+                    self.session_description = meta.description;
+                    self.initial_session = Some(session);
+                }
+                None => {
+                    anyhow::bail!("会话 {} 不存在（可能已被删除）。", id);
+                }
+            },
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                eprintln!("[init] 新建会话: {id}");
+                // 注册 session → agent 映射
+                self.persister
+                    .register_session(&id, &agent_name)
+                    .await?;
+                let session = Session::new(id.clone(), String::new());
+                self.session_id = id;
+                self.session_description = String::new();
+                self.initial_session = Some(session);
+            }
+        }
+
+        Ok(())
+    }
+
     // ── 公开访问器 ────────────────────────────────────────────────────────
 
     /// 返回命令注册表的引用。
@@ -202,7 +265,7 @@ impl CliApp {
 
     /// 返回会话持久化器的引用。
     #[allow(dead_code)]
-    pub fn persister(&self) -> &Arc<dyn SessionPersister> {
+    pub fn persister(&self) -> &Arc<AgentAwareSessionPersister> {
         &self.persister
     }
 
@@ -221,7 +284,6 @@ impl CliApp {
 
     /// 发送用户消息并进入事件循环。
     async fn dispatch_user_message(&mut self, input: String) -> anyhow::Result<()> {
-        // Clone handle 避免 borrow checker 冲突
         let handle = match self.handle.as_ref() {
             Some(h) => h.clone(),
             None => {
@@ -273,10 +335,16 @@ impl CliApp {
             .take()
             .ok_or_else(|| anyhow::anyhow!("initial_session 已被消费"))?;
 
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("agent 未初始化"))?
+            .clone();
+
         let looper_config = self.config.to_looper_config();
 
         let handle = AgentLooper::spawn(
-            self.agent.clone(),
+            agent,
             Box::new(session),
             looper_config,
             self.persister.clone(),
@@ -295,12 +363,19 @@ impl CliApp {
         self.handle = None;
 
         // 创建新 session（空状态，/clear 语义）
-        let session = Session::new(self.session_id.clone(), self.session_description.clone());
+        // description 置空 — 由 persister wrapper 在首次 save 时从 query 提取
+        let session = Session::new(self.session_id.clone(), String::new());
+
+        let agent = self
+            .agent
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("agent 未初始化"))?
+            .clone();
 
         let looper_config = self.config.to_looper_config();
 
         let handle = AgentLooper::spawn(
-            self.agent.clone(),
+            agent,
             Box::new(session),
             looper_config,
             self.persister.clone(),
@@ -322,78 +397,4 @@ impl CliApp {
 
         Ok(())
     }
-}
-
-// ============================================================================
-// 辅助函数
-// ============================================================================
-
-/// 根据 CliConfig 解析并加载 Agent。
-///
-/// - 如果 `agent_path` 指向一个已存在的文件 → 直接从文件加载（向后兼容），
-///   使用 workspace 提供的 ToolDependencies。
-/// - 否则 → 视为 workspace 内的 Agent 名称，通过 workspace 加载。
-fn load_agent_from_config(
-    workspace: &Arc<WorkSpace>,
-    config: &CliConfig,
-) -> anyhow::Result<Arc<Agent>> {
-    if config.agent_path.is_file() {
-        // 直接路径模式（向后兼容）
-        eprintln!("[init] 从文件加载 Agent: {}", config.agent_path.display());
-        let deps = workspace.agent_manager().build_deps();
-        let agent = Agent::from_file(
-            &config.agent_path,
-            workspace.config(),
-            workspace.skill_registry(),
-            &deps,
-        )?;
-        Ok(Arc::new(agent))
-    } else {
-        // WorkSpace 内 Agent 名称模式
-        let name = config
-            .agent_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("personal-assistant");
-        eprintln!("[init] 从 workspace 加载 Agent: {name}");
-        workspace
-            .agent_manager()
-            .load_cached(name)
-            .map_err(|e| anyhow::anyhow!("加载 Agent '{}' 失败: {e}", name))
-    }
-}
-
-/// 列出已保存的会话并退出。
-pub async fn list_sessions_and_exit(config: &CliConfig) -> anyhow::Result<()> {
-    let persister: Arc<dyn SessionPersister> = if config.no_persist {
-        Arc::new(NullSessionPersister)
-    } else {
-        match &config.sessions_dir {
-            Some(dir) => Arc::new(FileSessionPersister::new(dir.clone()).await?),
-            None => Arc::new(FileSessionPersister::from_env().await?),
-        }
-    };
-
-    let sessions = persister.list().await?;
-
-    if sessions.is_empty() {
-        println!("没有已保存的会话。");
-        return Ok(());
-    }
-
-    println!(
-        "\n  {:<38}  {:>6}  {:>8}  描述",
-        "会话 ID", "Turns", "Tokens"
-    );
-    println!("  {:-<38}  {:-<6}  {:-<8}  {:-<30}", "", "", "", "");
-
-    for meta in &sessions {
-        println!(
-            "  {:<38}  {:>6}  {:>8}  {}",
-            meta.id, meta.completed_turns, meta.tokens_used, meta.description,
-        );
-    }
-    println!();
-
-    Ok(())
 }
