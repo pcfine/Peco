@@ -7,6 +7,7 @@ members = [
   "crates/peco-core",
   "crates/peco-cli",
   "crates/peco-server",
+  "crates/peco-agents",
 ]
 exclude = ["example"]
 

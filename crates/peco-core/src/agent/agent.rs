@@ -171,7 +171,10 @@ impl Agent {
         );
 
         // ── 2. 构建 ToolExecutor（通过 ToolRegister，依赖注入）────────────
-        let tool_executor = crate::workspace::ToolRegister::build(&profile.tools, tool_deps);
+        // 从 agent profile 覆盖 KB 白名单（按 Agent 隔离）
+        let mut tool_deps = tool_deps.clone();
+        tool_deps.allowed_kbs = profile.knowledge_bases.clone();
+        let tool_executor = crate::workspace::ToolRegister::build(&profile.tools, &tool_deps);
 
         tracing::info!(
             tool_count = tool_executor.definitions().len(),

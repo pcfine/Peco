@@ -22,4 +22,4 @@ mod workspace;
 pub use deps::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 pub use error::WorkspaceError;
 pub use tool_register::ToolRegister;
-pub use workspace::WorkSpace;
+pub use workspace::{TemplateInitReport, WorkSpace};

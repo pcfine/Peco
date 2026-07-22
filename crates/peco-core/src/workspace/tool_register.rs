@@ -40,21 +40,27 @@ impl ToolRegister {
                 // ── Knowledge 依赖 ──────────────────────
                 "search_knowledge" => Some(Box::new(SearchKnowledge::new(
                     deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
                 ))),
                 "list_knowledge_bases" => Some(Box::new(ListKnowledgeBases::new(
                     deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
                 ))),
                 "add_to_knowledge_base" => Some(Box::new(AddToKnowledgeBase::new(
                     deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
                 ))),
                 "sync_knowledge_base" => Some(Box::new(SyncKnowledgeBase::new(
                     deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
                 ))),
                 "get_knowledge_base_docs" => Some(Box::new(GetKnowledgeBaseDocs::new(
                     deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
                 ))),
                 "add_facts_to_knowledge_base" => Some(Box::new(AddFactsToKnowledgeBase::new(
                     deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
                 ))),
 
                 _ => {

@@ -42,6 +42,8 @@ pub struct ToolDependencies {
     pub agent_loader: Arc<dyn AgentLoader>,
     pub skill_provider: Arc<dyn SkillProvider>,
     pub knowledge_access: Arc<dyn KnowledgeAccess>,
+    /// 来自 agent.md `knowledge_bases` 的 KB 白名单。空 = 无权访问任何 KB。
+    pub allowed_kbs: Vec<String>,
 }
 
 impl Clone for ToolDependencies {
@@ -50,6 +52,7 @@ impl Clone for ToolDependencies {
             agent_loader: self.agent_loader.clone(),
             skill_provider: self.skill_provider.clone(),
             knowledge_access: self.knowledge_access.clone(),
+            allowed_kbs: self.allowed_kbs.clone(),
         }
     }
 }

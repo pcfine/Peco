@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 peco-core = { path = "../peco-core" }
+peco-agents = { path = "../peco-agents" }
 
 # CLI 框架
 clap = { version = "4", features = ["derive", "env"] }

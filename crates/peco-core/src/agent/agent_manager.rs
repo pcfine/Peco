@@ -194,6 +194,7 @@ impl AgentManager {
             agent_loader: self.clone() as Arc<dyn AgentLoader>,
             skill_provider: self.clone() as Arc<dyn SkillProvider>,
             knowledge_access: self.clone() as Arc<dyn KnowledgeAccess>,
+            allowed_kbs: Vec::new(),
         }
     }
 
@@ -221,6 +222,7 @@ impl AgentManager {
                 user_id: self.user_id.clone(),
                 km: self.knowledge_manager.clone(),
             }),
+            allowed_kbs: Vec::new(),
         }
     }
 
@@ -381,6 +383,7 @@ impl AgentLoader for AmAgentLoader {
                 user_id: self.am.user_id.clone(),
                 km: self.am.knowledge_manager.clone(),
             }),
+            allowed_kbs: Vec::new(),
         };
 
         let agent = Agent::from_file(&path, &self.am.user_config, &self.am.skill_registry, &deps)?;

@@ -52,6 +52,8 @@ pub struct CreateAgentRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub max_turns: Option<usize>,
+    #[serde(default)]
+    pub knowledge_bases: Option<Vec<String>>,
 }
 
 fn default_icon() -> String {
@@ -79,6 +81,7 @@ pub struct UpdateAgentRequest {
     pub stream: Option<Option<bool>>,
     pub reasoning_effort: Option<Option<String>>,
     pub max_turns: Option<usize>,
+    pub knowledge_bases: Option<Vec<String>>,
 }
 
 /// Agent 列表项响应（轻量：不含 system_prompt/model/tools）。
@@ -108,6 +111,7 @@ pub struct AgentDetail {
     pub tools: Vec<String>,               // agent.md tools
     pub mcp_servers: Vec<String>,         // agent.md mcp
     pub skills: Vec<String>,              // agent.md skills
+    pub knowledge_bases: Vec<String>,     // agent.md knowledge_bases
     pub temperature: Option<f64>,         // agent.md llm.temperature
     pub max_tokens: Option<u64>,          // agent.md llm.max_tokens
     pub stream: Option<bool>,             // agent.md llm.stream
@@ -146,6 +150,7 @@ fn agent_detail_from_profile(
         tools: profile.tools.clone(),
         mcp_servers: profile.mcp.clone(),
         skills: profile.skills.clone(),
+        knowledge_bases: profile.knowledge_bases.clone(),
         temperature: llm.and_then(|l| l.temperature),
         max_tokens: llm.and_then(|l| l.max_tokens),
         stream: llm.and_then(|l| l.stream),
@@ -173,6 +178,7 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
         tools: req.tools.clone(),
         mcp_servers: req.mcp_servers.clone(),
         skills: req.skills.clone(),
+        knowledge_bases: req.knowledge_bases.clone().unwrap_or_default(),
         max_turns: req.max_turns.unwrap_or(20),
         system_prompt: req.system_prompt.trim().to_string(),
     }
@@ -229,6 +235,10 @@ fn merge_agent_profile(
             .skills
             .clone()
             .unwrap_or_else(|| old_profile.skills.clone()),
+        knowledge_bases: req
+            .knowledge_bases
+            .clone()
+            .unwrap_or_else(|| old_profile.knowledge_bases.clone()),
         max_turns: req.max_turns.unwrap_or(old_profile.max_turns),
         system_prompt: req
             .system_prompt
@@ -367,6 +377,7 @@ pub async fn create(
         tools: assemble_params.tools,
         mcp_servers: assemble_params.mcp_servers,
         skills: assemble_params.skills,
+        knowledge_bases: assemble_params.knowledge_bases,
         temperature: assemble_params.temperature,
         max_tokens: assemble_params.max_tokens,
         stream: assemble_params.stream,
@@ -473,7 +484,8 @@ pub async fn update(
     let new_content = agent_config::assemble_agent_md(&merged);
 
     // ── 写 agent.md（若 name 变更则写入新目录）───────────────────────────
-    ws.agent_manager().save(new_name, &new_content)
+    ws.agent_manager()
+        .save(new_name, &new_content)
         .map_err(|e| ApiError::Internal(format!("failed to write agent.md: {e}")))?;
 
     // 若 name 变更，删除旧目录
@@ -536,6 +548,7 @@ pub async fn update(
         tools: merged.tools,
         mcp_servers: merged.mcp_servers,
         skills: merged.skills,
+        knowledge_bases: merged.knowledge_bases,
         temperature: merged.temperature,
         max_tokens: merged.max_tokens,
         stream: merged.stream,

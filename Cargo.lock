@@ -5100,6 +5100,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "peco-agents"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "peco-cli"
 version = "0.1.0"
 dependencies = [
@@ -5110,6 +5117,7 @@ dependencies = [
  "console",
  "dotenvy",
  "futures",
+ "peco-agents",
  "peco-core",
  "rustyline",
  "serde",

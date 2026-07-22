@@ -162,6 +162,7 @@ async fn ensure_omni_agent(state: &Arc<AppState>, user_id: &str) -> Result<Strin
         tools: vec!["shell_exec".to_string(), "fetch".to_string()],
         mcp_servers: vec![],
         skills: vec![],
+        knowledge_bases: vec![],
         max_turns: 20,
         system_prompt:
             "你是一个智能 AI 助手（Omni-Assistant），能够回答各种问题、使用工具完成任务。\

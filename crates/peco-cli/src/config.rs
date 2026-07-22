@@ -53,6 +53,10 @@ pub struct CliArgs {
     /// 显示工具调用
     #[arg(long, default_value = "true")]
     pub show_tools: bool,
+
+    /// 从内置模板初始化 workspace（personal / minimal / developer）
+    #[arg(short = 't', long, env = "PECO_INIT_TEMPLATE")]
+    pub init_template: Option<String>,
 }
 
 /// CLI 完整配置，聚合所有配置来源。
@@ -67,6 +71,7 @@ pub struct CliConfig {
     pub no_color: bool,
     pub show_reasoning: bool,
     pub show_tools: bool,
+    pub init_template: Option<String>,
 }
 
 impl CliConfig {
@@ -84,6 +89,7 @@ impl CliConfig {
             no_color: args.no_color,
             show_reasoning: args.show_reasoning,
             show_tools: args.show_tools,
+            init_template: args.init_template,
         })
     }
 

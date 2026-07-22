@@ -1,0 +1,13 @@
+{
+  "name": "_private_memory",
+  "description": "个人记忆知识库 — 存储偏好、事实、事件、关系",
+  "embedding_model": "b-g-e-small-z-h-v15",
+  "chunking": {
+    "type": "overlapping-window",
+    "size": 800,
+    "overlap": 200
+  },
+  "backend": "LanceDb",
+  "storage_path": null,
+  "default_storage_mode": "full"
+}

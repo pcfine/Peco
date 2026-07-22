@@ -1,0 +1,13 @@
+{
+  "name": "project_docs",
+  "description": "项目文档知识库 — 存储项目上下文、设计决策、代码模式",
+  "embedding_model": "b-g-e-small-z-h-v15",
+  "chunking": {
+    "type": "overlapping-window",
+    "size": 800,
+    "overlap": 200
+  },
+  "backend": "LanceDb",
+  "storage_path": null,
+  "default_storage_mode": "full"
+}

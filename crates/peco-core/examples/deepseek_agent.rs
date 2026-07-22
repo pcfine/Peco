@@ -156,6 +156,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
             registry: skill_registry.clone(),
         }),
         knowledge_access: Arc::new(NoopKnowledgeAccess),
+        allowed_kbs: Vec::new(),
     };
 
     let agent = Arc::new(Agent::from_file(

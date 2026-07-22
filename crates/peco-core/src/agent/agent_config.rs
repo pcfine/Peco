@@ -48,6 +48,10 @@ pub struct AgentProfile {
     #[serde(default)]
     pub skills: Vec<String>,
 
+    /// 知识库访问白名单。空列表 = 无权访问任何知识库。
+    #[serde(default)]
+    pub knowledge_bases: Vec<String>,
+
     /// 单次响应最大对话轮数。未配置时默认为 20。
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
@@ -249,6 +253,7 @@ pub struct AssembleAgentMdParams {
     pub tools: Vec<String>,
     pub mcp_servers: Vec<String>,
     pub skills: Vec<String>,
+    pub knowledge_bases: Vec<String>,
     pub max_turns: usize,
     pub system_prompt: String,
 }
@@ -331,6 +336,14 @@ pub fn assemble_agent_md(params: &AssembleAgentMdParams) -> String {
         yaml.push_str("skills:\n");
         for s in &params.skills {
             yaml.push_str(&format!("  - \"{}\"\n", yaml_escape(s)));
+        }
+    }
+
+    // knowledge_bases
+    if !params.knowledge_bases.is_empty() {
+        yaml.push_str("knowledge_bases:\n");
+        for kb in &params.knowledge_bases {
+            yaml.push_str(&format!("  - \"{}\"\n", yaml_escape(kb)));
         }
     }
 
@@ -506,6 +519,7 @@ mod tests {
             tools: vec!["shell".into(), "fetch".into()],
             mcp_servers: vec!["filesystem".into()],
             skills: vec!["code-review".into()],
+            knowledge_bases: vec!["test-kb".into()],
             max_turns: 30,
             system_prompt: "You are a helpful assistant.\nBe concise.".into(),
         };
@@ -533,6 +547,7 @@ mod tests {
         assert_eq!(profile.tools, vec!["shell", "fetch"]);
         assert_eq!(profile.mcp, vec!["filesystem"]);
         assert_eq!(profile.skills, vec!["code-review"]);
+        assert_eq!(profile.knowledge_bases, vec!["test-kb"]);
 
         // 验证 max_turns 和 body
         assert_eq!(profile.max_turns, 30);
@@ -553,6 +568,7 @@ mod tests {
             tools: vec![],
             mcp_servers: vec![],
             skills: vec![],
+            knowledge_bases: vec![],
             max_turns: 20, // 默认值，不应写入
             system_prompt: "Be helpful.".into(),
         };
@@ -592,6 +608,7 @@ mod tests {
             tools: vec!["shell".into()],
             mcp_servers: vec![],
             skills: vec![],
+            knowledge_bases: vec![],
             max_turns: 20,
             system_prompt: "You are helpful.".into(),
         };

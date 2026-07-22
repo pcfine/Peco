@@ -21,17 +21,34 @@ fn string_err(msg: impl ToString) -> ToolError {
     ToolError::ToolCallError(Box::new(StringError(msg.to_string())))
 }
 
+/// 检查指定的知识库是否在 Agent 的访问白名单中。
+///
+/// `allowed` 为空时，拒绝一切 KB 访问。
+fn check_kb_access(allowed: &[String], kb_name: &str) -> Result<(), ToolError> {
+    if !allowed.contains(&kb_name.to_string()) {
+        return Err(ToolError::ToolCallError(Box::new(StringError(format!(
+            "访问被拒绝：知识库 '{kb_name}' 不在 Agent 的 knowledge_bases 列表中。\
+             请在 agent.md 中声明此 Agent 可访问的知识库。"
+        )))));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // SearchKnowledge
 // ============================================================================
 
 pub struct SearchKnowledge {
     access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
 }
 
 impl SearchKnowledge {
-    pub fn new(access: Arc<dyn KnowledgeAccess>) -> Self {
-        Self { access }
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
     }
 }
 
@@ -88,6 +105,7 @@ impl ToolDyn for SearchKnowledge {
             km.ensure_loaded().await.map_err(string_err)?;
 
             let formatted = if let Some(name) = &parsed.kb_name {
+                check_kb_access(&self.allowed_kbs, name)?;
                 let results = km
                     .search_kb(name, &parsed.query, parsed.top_k)
                     .await
@@ -102,11 +120,13 @@ impl ToolDyn for SearchKnowledge {
                     })
                     .collect::<Vec<_>>()
             } else {
+                // search_all → 仅保留允许列表中的 KB
                 let all = km
                     .search_all(&parsed.query, parsed.top_k)
                     .await
                     .map_err(string_err)?;
                 all.into_iter()
+                    .filter(|(kb_name, _)| self.allowed_kbs.contains(kb_name))
                     .flat_map(|(kb_name, hits)| {
                         hits.into_iter().map(move |h| {
                             json!({
@@ -129,11 +149,15 @@ impl ToolDyn for SearchKnowledge {
 
 pub struct ListKnowledgeBases {
     access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
 }
 
 impl ListKnowledgeBases {
-    pub fn new(access: Arc<dyn KnowledgeAccess>) -> Self {
-        Self { access }
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
     }
 }
 
@@ -162,6 +186,7 @@ impl ToolDyn for ListKnowledgeBases {
             let infos = km.list_kbs().await.map_err(string_err)?;
             let display: Vec<_> = infos
                 .into_iter()
+                .filter(|i| self.allowed_kbs.contains(&i.name))
                 .map(|i| {
                     json!({
                         "name": i.name, "description": i.description, "backend": i.backend,
@@ -182,11 +207,15 @@ impl ToolDyn for ListKnowledgeBases {
 
 pub struct AddToKnowledgeBase {
     access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
 }
 
 impl AddToKnowledgeBase {
-    pub fn new(access: Arc<dyn KnowledgeAccess>) -> Self {
-        Self { access }
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
     }
 }
 
@@ -246,6 +275,8 @@ impl ToolDyn for AddToKnowledgeBase {
                 _ => knowledge_base::StorageMode::Full,
             };
 
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+
             let km = self.access.knowledge_manager();
             km.ensure_loaded().await.map_err(string_err)?;
 
@@ -271,11 +302,15 @@ impl ToolDyn for AddToKnowledgeBase {
 
 pub struct SyncKnowledgeBase {
     access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
 }
 
 impl SyncKnowledgeBase {
-    pub fn new(access: Arc<dyn KnowledgeAccess>) -> Self {
-        Self { access }
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
     }
 }
 
@@ -314,6 +349,7 @@ impl ToolDyn for SyncKnowledgeBase {
             km.ensure_loaded().await.map_err(string_err)?;
 
             if let Some(name) = parsed.kb_name {
+                check_kb_access(&self.allowed_kbs, &name)?;
                 let report = km.sync_kb(&name).await.map_err(string_err)?;
                 Ok(format!(
                     "知识库 '{}' 同步完成:\n- 新增: {} 个文件\n- 更新: {} 个文件\n- 删除: {} 个文件\n- 跳过: {} 个文件\n- 耗时: {}ms",
@@ -325,8 +361,19 @@ impl ToolDyn for SyncKnowledgeBase {
                     report.duration_ms
                 ))
             } else {
-                let all_reports = km.sync_all().await.map_err(string_err)?;
-                let lines: Vec<String> = all_reports
+                // 仅在允许列表中的 KB 上执行同步
+                let mut reports = Vec::new();
+                let mut errors = Vec::new();
+                for kb_name in &self.allowed_kbs {
+                    match km.sync_kb(kb_name).await {
+                        Ok(report) => reports.push((kb_name.clone(), report)),
+                        Err(e) => {
+                            tracing::warn!(kb = %kb_name, error = %e, "同步失败");
+                            errors.push((kb_name.clone(), e.to_string()));
+                        }
+                    }
+                }
+                let mut lines: Vec<String> = reports
                     .iter()
                     .map(|(name, report)| {
                         format!(
@@ -335,7 +382,14 @@ impl ToolDyn for SyncKnowledgeBase {
                         )
                     })
                     .collect();
-                Ok(format!("所有知识库同步完成:\n{}", lines.join("\n")))
+                if !errors.is_empty() {
+                    lines.push(String::new());
+                    lines.push("以下知识库同步失败:".to_string());
+                    for (name, err) in &errors {
+                        lines.push(format!("  '{}': {err}", name));
+                    }
+                }
+                Ok(format!("知识库同步完成:\n{}", lines.join("\n")))
             }
         })
     }
@@ -347,11 +401,15 @@ impl ToolDyn for SyncKnowledgeBase {
 
 pub struct GetKnowledgeBaseDocs {
     access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
 }
 
 impl GetKnowledgeBaseDocs {
-    pub fn new(access: Arc<dyn KnowledgeAccess>) -> Self {
-        Self { access }
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
     }
 }
 
@@ -385,6 +443,7 @@ impl ToolDyn for GetKnowledgeBaseDocs {
             }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
             let km = self.access.knowledge_manager();
             km.ensure_loaded().await.map_err(string_err)?;
 
@@ -413,11 +472,15 @@ impl ToolDyn for GetKnowledgeBaseDocs {
 
 pub struct AddFactsToKnowledgeBase {
     access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
 }
 
 impl AddFactsToKnowledgeBase {
-    pub fn new(access: Arc<dyn KnowledgeAccess>) -> Self {
-        Self { access }
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
     }
 }
 
@@ -516,6 +579,8 @@ impl ToolDyn for AddFactsToKnowledgeBase {
                     )
                 })
                 .collect();
+
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
 
             let km = self.access.knowledge_manager();
             km.ensure_loaded().await.map_err(string_err)?;

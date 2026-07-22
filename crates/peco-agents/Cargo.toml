@@ -1,0 +1,8 @@
+[package]
+name = "peco-agents"
+version.workspace = true
+edition.workspace = true
+description = "Built-in template data provider for Peco workspace initialization"
+
+[dependencies]
+tempfile = "3"
