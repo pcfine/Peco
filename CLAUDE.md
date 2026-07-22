@@ -51,10 +51,19 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
   │     ├── model-provider (LLM 抽象层: ModelProvider trait, DeepSeek 实现)
   │     ├── knowledge-base (RAG: LanceDB + FastEmbed + BM25 + 知识图谱)
   │     └── peco-derive (#[peco_tool] 过程宏)
-  └── peco-cli (终端对话 — 独立使用 peco-core)
+  ├── peco-cli (终端对话 — 独立使用 peco-core)
+  └── peco-agents (编译时嵌入的 Workspace 模板 — 无 peco-core 依赖)
 ```
 
-**核心原则**：`peco-core` 是引擎 — 不感知 HTTP、数据库连接或 Web。`peco-server` 通过 `AppState` 和 `WorkspaceManager` 将其接入 Web。`peco-cli` 是围绕 `peco-core` 的轻量 TUI 外壳。
+**核心原则**：`peco-core` 是引擎 — 不感知 HTTP、数据库连接或 Web。`peco-server` 通过 `AppState` 和 `WorkspaceManager` 将其接入 Web。`peco-cli` 是围绕 `peco-core` 的轻量 TUI 外壳。`peco-agents` 提供编译时嵌入的模板数据，不依赖 `peco-core`。
+
+### peco-agents：Workspace 模板
+
+- `BuiltinTemplate` 结构体：编译时通过 `include_bytes!` 嵌入的模板文件集合。
+- 三套内置模板：`personal`（个人助手 + 记忆管理）、`minimal`（最轻量对话）、`developer`（编码助手 + 项目记忆）。
+- `materialize()` 将模板解压到临时目录。
+- `WorkSpace::init_from_template()` 执行幂等安装：已存在的 Agent 和 KB 不会被覆盖，错误收集到 `TemplateInitReport` 中。
+- CLI 入口：`cargo run -p peco-cli -- --init-template personal` 或 `-t personal`。
 
 ### peco-core：Agent 引擎
 
@@ -91,7 +100,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
 - 双 trait 设计：`Tool`（静态、泛型、类型化）和 `ToolDyn`（对象安全，`Pin<Box<dyn Future>>`）。
 - blanket impl `impl<T: Tool> ToolDyn for T` 桥接二者。
 - `ToolExecutor` trait：运行时接口 — `execute(name, args) -> Result<String, String>` + `definitions() -> Vec<ToolDefinition>`。
-- 内置工具：`shell`、`fetch`、`read_skill`、`DelegateSubAgent`、`RunParallelSubAgents`、`SearchKnowledge`、`AddToKnowledgeBase`、`GetKnowledgeBaseDocs`、`ListKnowledgeBases`、`SyncKnowledgeBase`、`RememberTool`、`RecallTool`、`ForgetTool`。
+- 内置工具：`shell`、`fetch`、`read_skill`、`DelegateSubAgent`、`RunParallelSubAgents`、`SearchKnowledge`、`AddToKnowledgeBase`、`AddFactsToKnowledgeBase`、`GetKnowledgeBaseDocs`、`ListKnowledgeBases`、`SyncKnowledgeBase`、`QueryEntityFacts`、`RememberTool`、`RecallTool`、`ForgetTool`。
+- KB 工具通过 `check_kb_access()` 执行 Agent 级别访问控制（基于 agent.md `knowledge_bases` 白名单）。
 - `#[peco_tool]` 宏（来自 `peco-derive`）：标注一个 async fn，生成实现 `Tool` 的零大小结构体、带有 `#[derive(Deserialize, JsonSchema)]` 的类型化 `Parameters` 结构体，以及 `static TOOL_NAME` 常量。
 - `DefaultToolsExecutor` 是标准实现：持有 `HashMap<String, Box<dyn ToolDyn>>` 并按名称分发。
 
@@ -183,6 +193,9 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
 - **基于 trait 的后端抽象**：5 个 trait（`DocumentStore`、`VectorIndex`、`FullTextIndex`、`GraphStore`、`CombinedSearch`）。三种后端：`InMemoryBackend`（测试用，暴力余弦 + CJK 感知分词器）、`LanceDbBackend`（生产用，基于 Arrow）、`HelixDbBackend`（feature-gated，HTTP 客户端，带 `CombinedSearch` 快速路径实现单次往返多路搜索）。
 - **自适应 4 层检索**（`QueryAnalyzer` → `PathCalibration` → `CrossValidation` → `AdaptiveFusion`）：分类查询意图（FactLookup/Conceptual/Relational/Exploratory/ShortKeyword），校准每条路径的分数分布，跨路径交叉验证（StrongAgreement/WeakAgreement/SinglePath），并相应调整 RRF 融合权重和置信度。当 `QueryAnalyzer` 不存在时优雅降级。
 - `KnowledgeBaseManager`：管理多个知识库，每个知识库有自己的 `KbConfig`（后端类型、分块策略、嵌入模型）。支持并发跨知识库 `search_all()`。
+- **配置存储**：每个 KB 目录内自包含 `kb_config.json` 文件。`load()` 扫描 `knowledge/*/kb_config.json` 子目录发现 KB。旧的中心化 `kb_configs.json` 格式在 `load()` 时自动迁移并重命名为 `.bak`。
+- **双重命名**：`KbConfig.name` 是对外名称（API、agent.md `knowledge_bases`），目录名是对内的 sanitize 形式（`sanitize_kb_name()` — 去除非 ASCII 字符）。HashMap key 始终使用 `config.name`，读写路径必须一致。
+- **Agent 级别 KB 访问控制**：Agent profile 的 `knowledge_bases` 字段为每个 Agent 声明可访问的 KB 白名单。空列表 = 无权访问任何 KB。`ToolDependencies.allowed_kbs` 将白名单注入所有 KB 工具，通过 `check_kb_access()` 守卫执行。
 
 ### webui：React 前端
 
@@ -224,6 +237,7 @@ llm:
 tools: [shell, fetch, search_knowledge]
 mcp: [helixdb-docs]
 skills: [code-review]
+knowledge_bases: [project_docs]
 max_turns: 30
 ---
 # 系统提示词

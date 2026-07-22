@@ -14,7 +14,7 @@
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent 引擎)                       │
 │  Agent · Session · ReAct Loop · WorkSpace · PPA · MCP · Skills · Tools · KB │
-├────────────────────────┬────────────────────────────────────┤
+├────────────────────────┼────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │   (LLM 统一抽象层)       │   (RAG: 向量+BM25+知识图谱)          │
 ├────────────────────────┴────────────────────────────────────┤
@@ -25,10 +25,11 @@
 ## 核心特性
 
 ### Agent 引擎
-- **声明式定义**：通过 `agent.md`（YAML frontmatter + Markdown）定义 Agent 的模型、工具、MCP 和 Skills
+- **声明式定义**：通过 `agent.md`（YAML frontmatter + Markdown）定义 Agent 的模型、工具、MCP、Skills 和 KB 访问白名单
 - **ReAct 执行循环**：Think → Act → Observe，自动处理多轮工具调用
 - **子 Agent 编排**：支持串行委派 (`delegate_sub_agent`) 和并行执行 (`run_parallel_sub_agents`)，前端可视化追踪
 - **Session 管理**：状态机驱动（Idle → Active → Commit/Rollback/Cancel），支持 turn 回滚、中断队列、自动持久化
+- **模板初始化**：内置 3 套 Workspace 模板（personal / minimal / developer），`--init-template` 一键初始化
 
 ### 工具系统
 - **13 个内置工具**：`shell`、`fetch`、`read_skill`、子 Agent 委派/并行、知识库 CRUD 与搜索、PPA 记忆（`remember` / `recall` / `forget`）
@@ -107,6 +108,12 @@ sudo -E bash scripts/deploy.sh
 ### 4. CLI 模式
 
 ```bash
+# 从内置模板初始化 Workspace
+cargo run -p peco-cli -- -t personal     # 个人助手
+cargo run -p peco-cli -- -t developer    # 开发辅助
+cargo run -p peco-cli -- -t minimal      # 最轻量对话
+
+# 启动交互式对话
 cargo run -p peco-cli -- --agent <agent-name>
 ```
 
@@ -120,6 +127,7 @@ peco/
 │   ├── peco-cli/               # 命令行 AI 助手
 │   ├── model-provider/         # LLM 统一抽象层（当前仅实现 DeepSeek）
 │   ├── knowledge-base/         # RAG 引擎：解析→分块→嵌入→混合检索
+│   ├── peco-agents/            # 内置 Workspace 模板（编译时嵌入）
 │   └── peco-derive/            # 过程宏（#[peco_tool]）
 ├── webui/                      # React 19 前端
 │   ├── src/
@@ -157,6 +165,8 @@ mcp:
   - helixdb-docs
 skills:
   - code-review
+knowledge_bases:
+  - project_docs
 max_turns: 30
 ---
 
@@ -273,7 +283,7 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 
 ### Key Features
 
-- **Agent Engine**: Declarative `agent.md` definitions, ReAct execution loop, sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue
+- **Agent Engine**: Declarative `agent.md` definitions, ReAct execution loop, sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue, built-in workspace templates (`--init-template`)
 - **Tool System**: 13 built-in tools, full MCP protocol support (stdio + HTTP Streamable), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design
 - **Personal Memory (PPA)**: Auto memory extraction via Flash model, three-tier memory (Profile → Semantic → Episodic), `remember`/`recall`/`forget` tools
 - **RAG Knowledge Base**: Multi-format parsing (PDF/DOCX/HTML/MD/Code/TXT), intelligent chunking, hybrid search (vector + BM25 + knowledge graph), adaptive RRF fusion, local ONNX embeddings with Chinese-optimized `bge-small-zh-v1.5`
@@ -300,7 +310,8 @@ sudo -E bash scripts/deploy.sh
 # Visit http://localhost
 
 # CLI mode
-cargo run -p peco-cli -- --agent <agent-name>
+cargo run -p peco-cli -- -t personal          # init workspace from template
+cargo run -p peco-cli -- --agent <agent-name> # interactive chat
 ```
 
 ### Tech Stack
