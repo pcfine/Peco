@@ -356,10 +356,12 @@ impl Drop for SimpleLooperHandle {
     fn drop(&mut self) {
         // strong_count == 1 → this is the last reference
         if Arc::strong_count(&self.join_handle) == 1 {
+            // 设置取消标志作为安全网：若 looper 仍在运行，会在下个循环迭代中正常退出。
+            // looper 可能已通过 wait() 正常结束，此时 cancel_flag 无实际作用。
             self.cancel_flag.store(true, Ordering::Release);
-            tracing::warn!(
-                "SimpleLooperHandle dropped without calling wait(). \
-                 Cancel flag set; looper will exit gracefully on next loop iteration."
+            tracing::debug!(
+                "SimpleLooperHandle dropped (last reference). \
+                 Cancel flag set as safety net for any still-running looper."
             );
         }
     }

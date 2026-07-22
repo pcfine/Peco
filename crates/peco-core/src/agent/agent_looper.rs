@@ -381,12 +381,12 @@ impl Drop for OwnedTask {
     fn drop(&mut self) {
         // strong_count == 1 表示这是最后一个引用
         if Arc::strong_count(&self.inner) == 1 {
-            // ★ 通知 looper 取消，looper 检测到 cancel_flag 后会在 run() 中正常退出，
-            //    走完整清理流程（emit Shutdown 事件、写入会话等），不强行 abort。
+            // 设置取消标志作为安全网：若 looper 仍在运行，会在下个循环迭代中正常退出。
+            // looper 可能已通过 shutdown()/wait() 正常结束，此时 cancel_flag 无实际作用。
             self.cancel_flag.store(true, Ordering::Release);
-            tracing::warn!(
-                "LooperHandle dropped without calling shutdown() or wait(). \
-                 Cancel flag set; looper will exit gracefully on next loop iteration."
+            tracing::debug!(
+                "LooperHandle dropped (last reference). \
+                 Cancel flag set as safety net for any still-running looper."
             );
         }
     }
