@@ -1,6 +1,6 @@
 ---
 agent:
-  name: "coding-assistant"
+  name: "@coding-assistant"
   description: "编码助手 — 代码生成、审查、重构、调试"
 llm:
   provider: "deepseek"
@@ -39,4 +39,8 @@ max_turns: 30
 
 ## 记忆管理
 
-需要记忆时通过 `delegate_sub_agent` 调用 `memory` agent。
+当需要查询或存储项目开发记忆时，使用 `delegate_sub_agent` 调用 `@memory` agent：
+
+- `[RECALL] 查询内容` — 搜索已有项目记忆（设计决策、Bug 修复方案、代码规范等）
+- `[REMEMBER] 要记住的内容` — 存储新项目记忆
+- `[ORGANIZE]` — 整理和去重项目记忆

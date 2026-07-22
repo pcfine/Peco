@@ -104,15 +104,11 @@ mod tests {
     fn test_materialize_personal() {
         let t = BuiltinTemplate::personal().clone();
         let tmp = t.materialize().unwrap();
+        assert!(tmp.path().join("agents/@assistant/agent.md").exists());
+        assert!(tmp.path().join("agents/@memory/agent.md").exists());
         assert!(
             tmp.path()
-                .join("agents/personal-assistant/agent.md")
-                .exists()
-        );
-        assert!(tmp.path().join("agents/memory/agent.md").exists());
-        assert!(
-            tmp.path()
-                .join("knowledge/_private_memory/kb_config.json")
+                .join("knowledge/@private_memory/kb_config.json")
                 .exists()
         );
     }
@@ -122,5 +118,22 @@ mod tests {
         let t = BuiltinTemplate::minimal().clone();
         let tmp = t.materialize().unwrap();
         assert!(tmp.path().join("agents/basic-chat/agent.md").exists());
+    }
+
+    #[test]
+    fn test_materialize_developer() {
+        let t = BuiltinTemplate::developer().clone();
+        let tmp = t.materialize().unwrap();
+        assert!(
+            tmp.path()
+                .join("agents/@coding-assistant/agent.md")
+                .exists()
+        );
+        assert!(tmp.path().join("agents/@memory/agent.md").exists());
+        assert!(
+            tmp.path()
+                .join("knowledge/@project_docs/kb_config.json")
+                .exists()
+        );
     }
 }
