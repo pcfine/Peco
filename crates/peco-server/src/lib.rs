@@ -20,6 +20,7 @@ pub mod error;
 pub mod knowledge;
 pub mod middleware;
 pub mod openapi;
+pub mod personal_agent;
 pub mod personal_assistant;
 pub mod session_store;
 pub mod state;
@@ -44,7 +45,8 @@ pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: 
         .nest("/api/agents", agent::router())
         .nest("/api/conversations", chat::conversation_router())
         .nest("/api/knowledge", knowledge::router())
-        .nest("/api/tasks", task::router());
+        .nest("/api/tasks", task::router())
+        .nest("/api/personal-agent", personal_agent::handler::router());
 
     let protected_routes = if enable_rate_limit {
         protected_routes.layer(middleware::rate_limit::rate_limit_layer(&secret))

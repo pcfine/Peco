@@ -5191,6 +5191,7 @@ dependencies = [
  "knowledge-base",
  "lru",
  "model-provider",
+ "peco-agents",
  "peco-core",
  "reqwest 0.12.28",
  "serde",

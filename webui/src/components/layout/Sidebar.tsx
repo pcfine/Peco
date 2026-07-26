@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import {
+  Sparkles,
   MessageSquare,
   Bot,
   BookOpen,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react'
 
 const NAV_ITEMS = [
+  { to: '/personal', label: '个人助理', icon: Sparkles },
   { to: '/chat', label: '对话', icon: MessageSquare },
   { to: '/agents', label: 'Agent 管理', icon: Bot },
   { to: '/knowledge', label: '知识库', icon: BookOpen },

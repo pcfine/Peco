@@ -166,7 +166,7 @@ mcp:
 skills:
   - code-review
 knowledge_bases:
-  - project_docs
+  - @project_docs
 max_turns: 30
 ---
 

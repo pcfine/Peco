@@ -237,7 +237,7 @@ llm:
 tools: [shell, fetch, search_knowledge]
 mcp: [helixdb-docs]
 skills: [code-review]
-knowledge_bases: [project_docs]
+knowledge_bases: [@project_docs]
 max_turns: 30
 ---
 # 系统提示词

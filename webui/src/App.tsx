@@ -8,6 +8,7 @@ import { AppLayout } from '@/components/layout/AppLayout'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
+import { PersonalAgentPage } from '@/pages/personal/PersonalAgentPage'
 import { ChatListPage } from '@/pages/chat/ChatListPage'
 import { ChatDetailPage } from '@/pages/chat/ChatDetailPage'
 import { AgentListPage } from '@/pages/agents/AgentListPage'
@@ -31,7 +32,8 @@ export default function App() {
               <Route path="/register" element={<RegisterPage />} />
               <Route element={<ProtectedRoute />}>
                 <Route element={<AppLayout />}>
-                  <Route path="/" element={<Navigate to="/chat" replace />} />
+                  <Route path="/" element={<Navigate to="/personal" replace />} />
+                  <Route path="/personal" element={<PersonalAgentPage />} />
                   <Route path="/chat" element={<ChatListPage />} />
                   <Route path="/chat/:conversationId" element={<ChatDetailPage />} />
                   <Route path="/agents" element={<AgentListPage />} />

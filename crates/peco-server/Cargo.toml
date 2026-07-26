@@ -9,6 +9,7 @@ description = "Axum web backend for peco — RESTful API + SSE streaming"
 peco-core = { path = "../peco-core" }
 model-provider = { path = "../model-provider" }
 knowledge-base = { path = "../knowledge-base" }
+peco-agents = { path = "../peco-agents" }
 
 # Web framework
 axum = { workspace = true }
