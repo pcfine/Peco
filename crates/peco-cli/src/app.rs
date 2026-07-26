@@ -85,11 +85,9 @@ impl CliApp {
 
         // ── 3. 创建持久化器 ────────────────────────────────────────────
         let sessions_dir = config.workspace_root.join(".peco").join("sessions");
-        let persister: Arc<AgentAwareSessionPersister> =
-            Arc::new(
-                AgentAwareSessionPersister::new(sessions_dir, config.workspace_root.as_path())
-                    .await?,
-            );
+        let persister: Arc<AgentAwareSessionPersister> = Arc::new(
+            AgentAwareSessionPersister::new(sessions_dir, config.workspace_root.as_path()).await?,
+        );
 
         // ── 4. 构建渲染器和输入（不依赖 Agent 选择）────────────────────
         let renderer: Box<dyn Renderer> = Box::new(ConsoleRenderer::new(&config));
@@ -237,9 +235,7 @@ impl CliApp {
                 let id = uuid::Uuid::new_v4().to_string();
                 eprintln!("[init] 新建会话: {id}");
                 // 注册 session → agent 映射
-                self.persister
-                    .register_session(&id, &agent_name)
-                    .await?;
+                self.persister.register_session(&id, &agent_name).await?;
                 let session = Session::new(id.clone(), String::new());
                 self.session_id = id;
                 self.session_description = String::new();

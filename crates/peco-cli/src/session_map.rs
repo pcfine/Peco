@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use model_provider::Message;
-use peco_core::persistence::{
-    FileSessionPersister, PersistError, PersistResult, SessionPersister,
-};
+use peco_core::persistence::{FileSessionPersister, PersistError, PersistResult, SessionPersister};
 use peco_core::session::{SessionMeta, SessionSnapshot};
 use tokio::sync::RwLock;
 
@@ -36,9 +34,7 @@ pub struct SessionAgentMap {
 impl SessionAgentMap {
     /// 从 workspace 的 `.peco/session_agent_map.json` 加载映射。
     pub async fn load(workspace_root: &Path) -> anyhow::Result<Self> {
-        let path = workspace_root
-            .join(".peco")
-            .join("session_agent_map.json");
+        let path = workspace_root.join(".peco").join("session_agent_map.json");
 
         let map: HashMap<String, String> = if path.exists() {
             let content = tokio::fs::read_to_string(&path).await?;
@@ -99,32 +95,19 @@ pub struct AgentAwareSessionPersister {
 
 impl AgentAwareSessionPersister {
     /// 创建实例。
-    pub async fn new(
-        sessions_dir: PathBuf,
-        workspace_root: &Path,
-    ) -> anyhow::Result<Self> {
+    pub async fn new(sessions_dir: PathBuf, workspace_root: &Path) -> anyhow::Result<Self> {
         let inner = FileSessionPersister::new(sessions_dir).await?;
         let session_map = SessionAgentMap::load(workspace_root).await?;
-        Ok(Self {
-            inner,
-            session_map,
-        })
+        Ok(Self { inner, session_map })
     }
 
     /// 注册新 session 的 agent 归属关系。
-    pub async fn register_session(
-        &self,
-        session_id: &str,
-        agent_name: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn register_session(&self, session_id: &str, agent_name: &str) -> anyhow::Result<()> {
         self.session_map.insert(session_id, agent_name).await
     }
 
     /// 按 agent 名称过滤已保存的会话列表。
-    pub async fn list_by_agent(
-        &self,
-        agent_name: &str,
-    ) -> Result<Vec<SessionMeta>, PersistError> {
+    pub async fn list_by_agent(&self, agent_name: &str) -> Result<Vec<SessionMeta>, PersistError> {
         let agent_sessions = self.session_map.sessions_for_agent(agent_name).await;
         let all = self.inner.list().await?;
         Ok(all

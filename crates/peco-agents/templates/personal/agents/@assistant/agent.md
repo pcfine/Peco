@@ -1,20 +1,17 @@
 ---
 agent:
-  name: "personal-assistant"
+  name: "@assistant"
   description: "个人助手 — 帮助处理日常任务：代码审查、文件整理、网络调研、Shell 操作等"
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-pro"
+  model: "deepseek-v4-flash"
   temperature: 0.7
   max_tokens: 4096
   stream: true
-  reasoning_effort: "medium"
 tools:
   - shell
   - fetch
   - delegate_sub_agent
-  - search_knowledge
-  - list_knowledge_bases
 skills: []
 max_turns: 30
 ---
@@ -32,7 +29,7 @@ max_turns: 30
 
 ## 记忆管理
 
-当需要查询或存储个人记忆时，使用 `delegate_sub_agent` 调用 `memory` agent：
+当需要查询或存储个人记忆时，使用 `delegate_sub_agent` 调用 `@memory` agent：
 
 - `[RECALL] 查询内容` — 搜索已有记忆
 - `[REMEMBER] 要记住的内容` — 存储新记忆

@@ -4,3 +4,9 @@ node_modules/
 node_modules.bak/
 dist/
 .env
+
+# LanceDB runtime data — 索引、事务日志、版本清单属于运行时状态，
+# 不应提交到版本控制。仅保留 kb_config.json（KB 配置）。
+**/knowledge/**/__manifest/
+**/knowledge/**/*.lance/
+**/knowledge/**/file_hashes.json

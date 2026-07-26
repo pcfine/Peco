@@ -40,7 +40,7 @@ peco-cli 使用 **WorkSpace** 管理所有 Agent、Skill 和知识库。默认 w
 ```
 <workspace>/
 ├── agents/                          # Agent 定义目录
-│   ├── personal-assistant/
+│   ├── @assistant/
 │   │   └── agent.md                 # Agent 配置 + System Prompt
 │   └── code-reviewer/
 │       └── agent.md
@@ -65,7 +65,7 @@ cargo run -p peco-cli
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|---------|--------|------|
-| `-a`, `--agent` | `PECO_AGENT_PATH` | `personal-assistant` | Agent 名称（从 workspace 的 `agents/` 目录加载）或 `agent.md` 文件路径 |
+| `-a`, `--agent` | `PECO_AGENT_PATH` | `@assistant` | Agent 名称（从 workspace 的 `agents/` 目录加载）或 `agent.md` 文件路径 |
 | `-w`, `--workspace` | `PECO_WORKSPACE` | `./` | WorkSpace 根目录 |
 | `-s`, `--session` | — | — | 恢复指定 ID 的会话 |
 | `--no-persist` | — | false | 禁用会话持久化 |
@@ -124,7 +124,7 @@ max_turns: 30
 ## 使用示例
 
 ```bash
-# 使用默认 workspace（./）和默认 Agent（personal-assistant）
+# 使用默认 workspace（./）和默认 Agent（@assistant）
 peco
 
 # 使用指定的 Agent 名称（从 workspace 的 agents/ 目录加载）
@@ -134,7 +134,7 @@ peco --agent code-reviewer
 peco --agent /path/to/my-agent.md
 
 # 指定 workspace 目录
-peco --workspace ~/my-peco-workspace --agent personal-assistant
+peco --workspace ~/my-peco-workspace --agent @assistant
 
 # 恢复之前的会话
 peco --session <session-id>
