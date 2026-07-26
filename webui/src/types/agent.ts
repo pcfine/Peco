@@ -3,12 +3,12 @@ export interface AgentListItem {
   id: string
   name: string
   description: string
-  model: string
-  provider: string
+  model?: string
+  provider?: string
   icon: string
   color: string
   status: string
-  tools: string[]
+  tools?: string[]
   created_at: string
 }
 

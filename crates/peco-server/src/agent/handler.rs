@@ -84,15 +84,18 @@ pub struct UpdateAgentRequest {
     pub knowledge_bases: Option<Vec<String>>,
 }
 
-/// Agent 列表项响应（轻量：不含 system_prompt/model/tools）。
+/// Agent 列表项响应（含 model/provider/tools 便于列表页展示，不含 system_prompt）。
 #[derive(Debug, Serialize)]
 pub struct AgentListItem {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub model: Option<String>,
+    pub provider: Option<String>,
     pub icon: String,
     pub color: String,
     pub status: String,
+    pub tools: Vec<String>,
     pub created_at: String,
 }
 
@@ -251,25 +254,53 @@ fn merge_agent_profile(
 
 /// `GET /api/agents`
 ///
-/// 返回当前用户的 Agent 列表（轻量：不含 model/tools/system_prompt）。
+/// 返回当前用户的 Agent 列表（含 model/provider/tools 便于列表页展示，
+/// 不含 system_prompt 等大字段）。
 pub async fn list(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<AgentListItem>>, ApiError> {
     let rows = agents::list_index_by_user(&state.db, &user_id).await?;
-    let items: Vec<AgentListItem> = rows
-        .iter()
-        .map(|r| AgentListItem {
+    let ws = state.workspace_manager.get(&user_id)?;
+
+    let mut items: Vec<AgentListItem> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        // 尝试从 agent.md 读取 tools/model/provider（失败则使用空默认值）
+        let (tools, model, provider) = read_agent_md_light(ws.agent_manager(), &r.name);
+        items.push(AgentListItem {
             id: r.id.clone(),
             name: r.name.clone(),
             description: r.description.clone(),
+            model,
+            provider,
             icon: r.icon.clone(),
             color: r.color.clone(),
             status: r.status.clone(),
+            tools,
             created_at: r.created_at.clone(),
-        })
-        .collect();
+        });
+    }
     Ok(Json(items))
+}
+
+/// 从 agent.md 读取轻量字段（tools, model, provider）。
+/// 读取失败时返回空默认值，不阻塞列表渲染。
+fn read_agent_md_light(
+    agent_manager: &peco_core::agent::AgentManager,
+    name: &str,
+) -> (Vec<String>, Option<String>, Option<String>) {
+    let path = agent_manager.md_path(name);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (Vec::new(), None, None),
+    };
+    let (profile, _body) = match peco_core::agent::agent_config::parse_agent_md(&content) {
+        Ok(p) => p,
+        Err(_) => return (Vec::new(), None, None),
+    };
+    let model = profile.llm.as_ref().and_then(|l| l.model.clone());
+    let provider = profile.llm.as_ref().and_then(|l| l.provider.clone());
+    (profile.tools, model, provider)
 }
 
 /// `POST /api/agents`

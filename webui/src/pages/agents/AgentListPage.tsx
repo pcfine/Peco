@@ -55,9 +55,9 @@ export function AgentListPage() {
                 </div>
                 <div className="flex-1 min-w-0">
                   <p className="font-medium truncate">{a.name}</p>
-                  <p className="text-xs text-muted-foreground truncate">{a.description || a.model}</p>
+                  <p className="text-xs text-muted-foreground truncate">{a.description || a.model || ''}</p>
                   <div className="flex gap-1 mt-1">
-                    {a.tools.slice(0, 3).map((t) => (
+                    {(a.tools ?? []).slice(0, 3).map((t) => (
                       <span key={t} className="rounded bg-accent px-1.5 py-0.5 text-xs">{t}</span>
                     ))}
                   </div>

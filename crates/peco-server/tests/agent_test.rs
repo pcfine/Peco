@@ -118,10 +118,11 @@ async fn test_list_agents() {
 
     let body: Vec<serde_json::Value> = resp.json().await.unwrap();
     assert!(body.len() >= 2);
-    // list 不含 model/tools/system_prompt（轻量索引）
+    // list 含 model/tools（来自 agent.md），不含 system_prompt
     let first = &body[0];
-    assert!(first.get("model").is_none());
-    assert!(first.get("tools").is_none());
+    assert!(first.get("model").is_some());
+    assert!(first.get("tools").is_some_and(|v| v.is_array()));
+    assert!(first.get("system_prompt").is_none());
 }
 
 #[tokio::test]
