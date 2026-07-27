@@ -106,7 +106,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
 - `DefaultToolsExecutor` 是标准实现：持有 `HashMap<String, Box<dyn ToolDyn>>` 并按名称分发。
 
 **WorkSpace**（[crates/peco-core/src/workspace/](crates/peco-core/src/workspace/)）：
-- 按用户隔离的边界。每个 `WorkSpace` 持有 `ToolRegister`、`Config`（用户级别）、`SkillRegistry`、`PersonalMemoryStore` 和知识库访问。
+- 按用户隔离的边界。每个 `WorkSpace` 持有 `ToolRegister`、`Config`（用户级别）、`SkillRegister`、`PersonalMemoryStore` 和知识库访问。
 - `ToolDependencies` trait：窄依赖注入接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），使工具可以在不知道完整 `WorkSpace` 类型的情况下构建。
 - `ToolRegister`：使用 `ToolDependencies` 组装工具，一次性构建完整的工具集。
 
@@ -254,7 +254,7 @@ max_turns: 30
 
 4. **MCP 工具自动发现**：`McpClientHandler` 在连接时调用 `list_all_tools()`，并在 `list_changed` 通知时重新同步。MCP 工具包装为 `McpTool`（实现 `ToolDyn`）。
 
-5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `WorkSpace` 实例 LRU 缓存（128 条目）。每个 workspace 延迟初始化其 `ToolRegister`、`SkillRegistry` 和 `PersonalMemoryStore`。
+5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `WorkSpace` 实例 LRU 缓存（128 条目）。每个 workspace 延迟初始化其 `ToolRegister`、`SkillRegister` 和 `PersonalMemoryStore`。
 
 6. **错误处理**：`AgentError` 覆盖完整生命周期（IO、YAML 解析、缺失字段、环境变量、配置、工具执行、超过最大轮次、协议违规）。`?` 运算符可在各处使用，因为它为常见错误类型实现了 `From`。
 

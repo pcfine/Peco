@@ -3,7 +3,7 @@
 // ============================================================================
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::agent::AgentManager;
 use crate::config::{SystemConfig, UserConfig};
@@ -45,7 +45,7 @@ pub struct WorkSpace {
     user_id: String,
     root: PathBuf,
     config: UserConfig,
-    skill_registry: Arc<RwLock<SkillRegister>>,
+    skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
     agent_manager: Arc<AgentManager>,
 }
@@ -78,13 +78,13 @@ impl WorkSpace {
         let config = UserConfig::load(system_config, &root)?;
 
         let user_skills_dir = root.join("skills");
-        let mut registry = SkillRegister::new(user_skills_dir.clone());
-        if user_skills_dir.exists()
-            && let Err(e) = registry.init()
-        {
-            tracing::warn!(error = %e, "Failed to scan user skills");
-        }
-        let skill_registry = Arc::new(RwLock::new(registry));
+        let skill_registry = match SkillRegister::new(user_skills_dir.clone()) {
+            Ok(registry) => Arc::new(registry),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to scan user skills, using empty registry");
+                Arc::new(SkillRegister::empty())
+            }
+        };
 
         let kb_dir = root.join("knowledge");
         let knowledge_manager = Arc::new(KnowledgeManager::new(kb_dir));
@@ -122,7 +122,7 @@ impl WorkSpace {
     pub fn config(&self) -> &UserConfig {
         &self.config
     }
-    pub fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
+    pub fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
     }
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
@@ -306,7 +306,7 @@ impl AgentLoader for WorkSpace {
 }
 
 impl SkillProvider for WorkSpace {
-    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
+    fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
     }
 }

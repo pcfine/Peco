@@ -2,7 +2,7 @@
 // 窄 Trait 接口 — 替代 Arc<WorkSpace> 注入
 // ============================================================================
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::agent::{Agent, AgentError};
 use crate::knowledge::KnowledgeManager;
@@ -22,7 +22,7 @@ pub trait AgentLoader: Send + Sync {
 // ============================================================================
 
 pub trait SkillProvider: Send + Sync {
-    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>>;
+    fn skill_registry(&self) -> &Arc<SkillRegister>;
 }
 
 // ============================================================================

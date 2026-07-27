@@ -41,10 +41,10 @@ impl AgentLoader for NoopAgentLoader {
 }
 
 struct NoopSkillProvider {
-    registry: Arc<std::sync::RwLock<SkillRegister>>,
+    registry: Arc<SkillRegister>,
 }
 impl SkillProvider for NoopSkillProvider {
-    fn skill_registry(&self) -> &Arc<std::sync::RwLock<SkillRegister>> {
+    fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.registry
     }
 }
@@ -146,9 +146,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let system_config = SystemConfig::load();
     let user_config = UserConfig::load(&system_config, &dir)?;
 
-    let skill_registry = Arc::new(std::sync::RwLock::new(SkillRegister::new(
-        dir.join("skills"),
-    )));
+    let skill_registry = Arc::new(SkillRegister::new(dir.join("skills"))?);
 
     let tool_deps = ToolDependencies {
         agent_loader: Arc::new(NoopAgentLoader),
@@ -162,7 +160,6 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let agent = Arc::new(Agent::from_file(
         &agent_md,
         &user_config,
-        &skill_registry,
         &tool_deps,
     )?);
     println!(

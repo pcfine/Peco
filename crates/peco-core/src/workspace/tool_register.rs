@@ -27,7 +27,9 @@ impl ToolRegister {
                 "fetch" => Some(Box::new(Fetch)),
 
                 // ── Skill 依赖 ──────────────────────────
-                "read_skill" => Some(Box::new(ReadSkill::new(deps.skill_provider.clone()))),
+                "read_skill" => Some(Box::new(ReadSkill::new(
+                    deps.skill_provider.skill_registry().clone(),
+                ))),
 
                 // ── Agent 加载依赖 ──────────────────────
                 "delegate_sub_agent" => {

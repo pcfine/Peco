@@ -3,26 +3,21 @@
 // ============================================================================
 
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use futures::Future;
 use model_provider::ToolDefinition;
 use serde_json::json;
 
-use crate::skills::SkillRegistry;
-use crate::workspace::SkillProvider;
-
 use super::{ToolDyn, ToolError};
 
 pub struct ReadSkill {
-    skill_registry: Arc<RwLock<SkillRegistry>>,
+    skill_registry: Arc<crate::skills::SkillRegister>,
 }
 
 impl ReadSkill {
-    pub fn new(skill_provider: Arc<dyn SkillProvider>) -> Self {
-        Self {
-            skill_registry: skill_provider.skill_registry().clone(),
-        }
+    pub fn new(skill_registry: Arc<crate::skills::SkillRegister>) -> Self {
+        Self { skill_registry }
     }
 }
 
@@ -64,13 +59,7 @@ impl ToolDyn for ReadSkill {
             let parsed: ReadSkillArgs =
                 serde_json::from_str(&args).map_err(ToolError::JsonError)?;
 
-            let mut registry = self.skill_registry.write().map_err(|e| {
-                ToolError::ToolCallError(
-                    format!("failed to acquire skill registry lock: {e}").into(),
-                )
-            })?;
-
-            let skill = registry.activate(&parsed.name).map_err(|e| {
+            let skill = self.skill_registry.activate(&parsed.name).map_err(|e| {
                 ToolError::ToolCallError(
                     format!("failed to read skill '{}': {e}", parsed.name).into(),
                 )

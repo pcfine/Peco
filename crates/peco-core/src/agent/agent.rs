@@ -4,8 +4,6 @@
 
 use std::sync::Arc;
 
-use std::sync::RwLock;
-
 use crate::agent::agent_config::{
     AgentProfile, ModelConfig, ModelConfigBuilder, resolve_api_key, split_frontmatter,
 };
@@ -18,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{McpServerConfig, UserConfig};
 use crate::mcp::McpManager;
-use crate::skills::SkillRegistry;
+use crate::skills::SkillRegister;
 use crate::tools::ToolExecutor;
 use crate::workspace::ToolDependencies;
 
@@ -93,8 +91,8 @@ pub struct Agent {
     /// 根据profile.mcp构建的MCP管理器，用于管理MCP连接
     mcp_manager: Arc<McpManager>,
 
-    /// Skill 注册表（从 WorkSpace 注入）。
-    skill_registry: Arc<RwLock<SkillRegistry>>,
+    /// Skill 注册表（从 WorkSpace 注入）。None 表示此 Agent 不使用 Skill。
+    skill_registry: Option<Arc<SkillRegister>>,
 }
 
 impl Agent {
@@ -111,7 +109,7 @@ impl Agent {
         model_config: ModelConfig,
         tool_executor: Arc<dyn ToolExecutor>,
         mcp_manager: Arc<McpManager>,
-        skill_registry: Arc<RwLock<SkillRegistry>>,
+        skill_registry: Option<Arc<SkillRegister>>,
     ) -> Self {
         Agent {
             md_path,
@@ -129,14 +127,13 @@ impl Agent {
     ///
     /// 接收显式依赖作为参数，内部完成：
     /// 1. 解析 agent.md → profile + preamble
-    /// 2. 通过 ToolRegister 构建 tool_executor
-    /// 3. 通过 user_config 构建 ModelProvider
-    /// 4. 注入 skill_registry
+    /// 2. 从 `profile.skills` 推导是否注入 SkillRegister（非空时从 tool_deps 取）
+    /// 3. 通过 ToolRegister 构建 tool_executor
+    /// 4. 通过 user_config 构建 ModelProvider
     /// 5. 构建 McpManager（MCP 连接延迟到首次使用时建立）
     pub fn from_file(
         path: impl AsRef<std::path::Path>,
         user_config: &UserConfig,
-        skill_registry: &Arc<RwLock<SkillRegistry>>,
         tool_deps: &ToolDependencies,
     ) -> Result<Self, AgentError> {
         let path = path.as_ref();
@@ -150,6 +147,13 @@ impl Agent {
             split_frontmatter(&raw).map_err(AgentError::InvalidFrontmatter)?;
         let profile: AgentProfile = serde_yaml::from_str(frontmatter_str)?;
         let preamble = body.to_string();
+
+        // 从 profile.skills 推导是否需要 SkillRegister：非空时从 tool_deps 注入
+        let skill_registry = if profile.skills.is_empty() {
+            None
+        } else {
+            Some(tool_deps.skill_provider.skill_registry().clone())
+        };
 
         // 构建最终生效的模型配置：agent.md 覆盖 → 合并 UserConfig
         let model_config = build_model_config_with_user(&profile, user_config);
@@ -220,7 +224,7 @@ impl Agent {
             model_config,
             tool_executor,
             mcp_manager,
-            skill_registry: skill_registry.clone(),
+            skill_registry,
         })
     }
 
@@ -262,9 +266,10 @@ impl Agent {
     /// 综合前缀和 skill 描述，返回完整的 system prompt。
     pub fn system_prompt(&self) -> String {
         let mut prompt = self.preamble.clone();
-        if !self.profile.skills.is_empty() {
-            let skill_list = self.skill_registry.read().expect("RwLock poisoned");
-            let all_meta = skill_list.all_meta();
+        if !self.profile.skills.is_empty()
+            && let Some(ref skill_registry) = self.skill_registry
+        {
+            let all_meta = skill_registry.all_meta();
 
             let mut section = String::from("\n\n## Available Skills\n\n");
             for skill_name in &self.profile.skills {
@@ -275,7 +280,7 @@ impl Agent {
                     None => {
                         tracing::warn!(
                             skill = %skill_name,
-                            "Skill declared in agent.md but not found in SkillRegistry"
+                            "Skill declared in agent.md but not found in SkillRegister"
                         );
                     }
                 }

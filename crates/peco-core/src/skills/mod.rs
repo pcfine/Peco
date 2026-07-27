@@ -16,8 +16,7 @@
 //! use peco_core::skills::SkillRegister;
 //!
 //! # fn example() -> Result<(), peco_core::skills::SkillError> {
-//! let mut list = SkillRegister::new("./skills");
-//! list.init()?;
+//! let list = SkillRegister::new("./skills")?;
 //!
 //! for meta in list.all_meta() {
 //!     println!("[{}] {}", meta.name, meta.description);
@@ -69,6 +68,3 @@ pub use config::{Skill, SkillFrontmatter, SkillMeta, validate_name};
 pub use error::SkillError;
 pub use loader::SkillLoader;
 pub use skill_register::{SkillRegister, SkillRegisterStats};
-
-/// Alias for [`SkillRegister`] — legacy name kept for compatibility.
-pub type SkillRegistry = SkillRegister;

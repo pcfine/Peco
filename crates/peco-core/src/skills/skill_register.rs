@@ -2,15 +2,19 @@
 //!
 //! [`SkillRegister`] is the top-level API that consumers interact with:
 //!
-//! 1. **Startup**: [`init()`](SkillRegister::init) scans and loads Tier-1 metadata.
+//! 1. **Startup**: [`new()`](SkillRegister::new) scans and loads Tier-1 metadata.
 //! 2. **Selection**: [`all_meta()`](SkillRegister::all_meta) provides the model with a list
 //!    of available Skills for relevance matching.
 //! 3. **Activation**: [`activate()`](SkillRegister::activate) loads the full Tier-2 content.
 //! 4. **Resources**: Tier-3 resources (scripts, references, assets) are read on demand
 //!    via [`Skill::read_resource()`](super::Skill::read_resource).
+//!
+//! All methods take `&self` — internal synchronisation is handled by an `RwLock`
+//! so the register can be shared across threads via `Arc<SkillRegister>`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use tracing::{info, warn};
 
@@ -31,13 +35,27 @@ pub struct SkillRegisterStats {
     pub errors: usize,
 }
 
+// ── Inner (lock-protected state) ─────────────────────────────────────────────
+
+struct Inner {
+    /// Tier-1 metadata keyed by Skill name.
+    metas: HashMap<String, SkillMeta>,
+    /// Tier-2 fully-loaded Skills keyed by Skill name.
+    activated: HashMap<String, Arc<Skill>>,
+    /// The loader used for discovery and I/O.
+    loader: SkillLoader,
+    /// Number of errors encountered during initialisation.
+    error_count: usize,
+}
+
 // ── SkillRegister ──────────────────────────────────────────────────────────
 
 /// Central register managing the lifecycle of all Skills in the program.
 ///
-/// Watches a `skills_root` directory; when the root path is updated via
-/// [`set_skills_root`](Self::set_skills_root), the internal Skill list is
-/// automatically re-scanned and reloaded.
+/// Created via [`new()`](Self::new), which immediately scans the given
+/// skills root directory and loads Tier-1 metadata. All methods are `&self`
+/// — the register uses an internal `RwLock` so it can be freely shared
+/// behind an `Arc`.
 ///
 /// # Example
 ///
@@ -45,9 +63,8 @@ pub struct SkillRegisterStats {
 /// use peco_core::skills::SkillRegister;
 ///
 /// # fn example() -> Result<(), peco_core::skills::SkillError> {
-/// let mut list = SkillRegister::new("./skills");
-/// let count = list.init()?;
-/// println!("Loaded {} skills", count);
+/// let list = SkillRegister::new("./skills")?;
+/// println!("Loaded {} skills", list.stats().registered);
 ///
 /// // Get metadata for model selection
 /// for meta in list.all_meta() {
@@ -57,160 +74,109 @@ pub struct SkillRegisterStats {
 /// // Activate a specific skill
 /// let skill = list.activate("pdf-form-filler")?;
 /// println!("Body length: {} chars", skill.body.len());
-///
-/// // Update the skills root — auto-reloads the skill list
-/// list.set_skills_root("./new-skills")?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct SkillRegister {
-    /// Tier-1 metadata keyed by Skill name.
-    metas: HashMap<String, SkillMeta>,
-    /// Tier-2 fully-loaded Skills keyed by Skill name.
-    activated: HashMap<String, Skill>,
-    /// The loader used for discovery and I/O.
-    loader: SkillLoader,
-    /// Number of errors encountered during [`init`](Self::init).
-    error_count: usize,
+    inner: RwLock<Inner>,
 }
 
 impl SkillRegister {
     // ── Construction ─────────────────────────────────────────────────────
 
-    /// Create a new list pointing at the given skills root directory.
+    /// Create a new register by scanning the given skills root directory.
     ///
-    /// The list is empty until [`init()`](Self::init) is called.
-    pub fn new(skills_root: impl Into<PathBuf>) -> Self {
-        Self {
-            metas: HashMap::new(),
-            activated: HashMap::new(),
-            loader: SkillLoader::new(skills_root),
-            error_count: 0,
-        }
-    }
-
-    /// Return the skills root path this list was created with.
-    pub fn skills_root(&self) -> &PathBuf {
-        &self.loader.skills_root
-    }
-
-    /// Update the skills root path and automatically re-scan for Skills.
+    /// This discovers all Skill directories, loads their frontmatter (Tier 1),
+    /// and makes them queryable via [`all_meta()`](Self::all_meta).
     ///
-    /// This replaces the loader's root directory, clears all registered
-    /// and activated Skills, then calls [`init()`](Self::init) to reload
-    /// from the new location. Activated Skills from the old root are
-    /// dropped.
-    ///
-    /// Returns the number of Skills loaded from the new root.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use peco_core::skills::SkillRegister;
-    /// # fn example() -> Result<(), peco_core::skills::SkillError> {
-    /// let mut list = SkillRegister::new("./skills");
-    /// list.init()?;
-    ///
-    /// // Later, switch to a different skills directory:
-    /// let count = list.set_skills_root("/etc/peco/skills")?;
-    /// println!("Reloaded {count} skills from new root");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn set_skills_root(&mut self, new_root: impl Into<PathBuf>) -> Result<usize, SkillError> {
-        let new_root = new_root.into();
+    /// Individual Skill load failures are logged as warnings — they do not
+    /// prevent other Skills from loading or the register from operating.
+    pub fn new(skills_root: impl Into<PathBuf>) -> Result<Self, SkillError> {
+        let loader = SkillLoader::new(skills_root);
 
-        // Skip if the root hasn't changed
-        if self.loader.skills_root == new_root {
-            info!(
-                "skills root unchanged ({}), skipping reload",
-                new_root.display()
-            );
-            return Ok(self.metas.len());
-        }
-
-        info!(
-            "skills root updated: {} -> {}",
-            self.loader.skills_root.display(),
-            new_root.display()
-        );
-
-        // Clear all state
-        self.metas.clear();
-        self.activated.clear();
-        self.error_count = 0;
-
-        // Update loader and re-initialize
-        self.loader = SkillLoader::new(new_root);
-        self.init()
-    }
-
-    // ── Tier 1: Initialisation ───────────────────────────────────────────
-
-    /// Scan the skills root and load all Skill metadata (Tier 1).
-    ///
-    /// Individual Skill load failures are logged as warnings and counted
-    /// in the returned stats — they do not prevent other Skills from
-    /// loading or the list from operating.
-    ///
-    /// Returns the number of successfully registered Skills.
-    pub fn init(&mut self) -> Result<usize, SkillError> {
         info!(
             "Scanning for skills in {}",
-            self.loader.skills_root.display()
+            loader.skills_root.display()
         );
 
-        let (metas, errors) = self.loader.load_all_meta();
+        let (metas, errors) = loader.load_all_meta();
 
-        self.error_count = errors.len();
-
-        for meta in metas {
+        for meta in &metas {
             info!(
                 "Tier1 loaded: {} — {}",
                 meta.name,
-                // Truncate long descriptions in log output
                 if meta.description.len() > 80 {
                     format!("{}...", &meta.description[..77])
                 } else {
                     meta.description.clone()
                 }
             );
-            self.metas.insert(meta.name.clone(), meta);
         }
 
         for (_dir, err) in &errors {
             warn!("{err}");
         }
 
+        let registered = metas.len();
+        let error_count = errors.len();
+
         info!(
-            "Tier1 complete: {} skills loaded, {} errors",
-            self.metas.len(),
-            errors.len()
+            "Tier1 complete: {registered} skills loaded, {error_count} errors"
         );
 
-        Ok(self.metas.len())
+        let mut metas_map = HashMap::with_capacity(metas.len());
+        for meta in metas {
+            metas_map.insert(meta.name.clone(), meta);
+        }
+
+        Ok(Self {
+            inner: RwLock::new(Inner {
+                metas: metas_map,
+                activated: HashMap::new(),
+                loader,
+                error_count,
+            }),
+        })
+    }
+
+    /// Create an empty register with no skills.
+    ///
+    /// This is a zero-scan constructor — useful as a fallback when the
+    /// skills directory is unavailable, or for contexts where skills are
+    /// known to be absent.
+    pub fn empty() -> Self {
+        Self {
+            inner: RwLock::new(Inner {
+                metas: HashMap::new(),
+                activated: HashMap::new(),
+                loader: SkillLoader::new(std::path::PathBuf::new()),
+                error_count: 0,
+            }),
+        }
     }
 
     // ── Tier 1: Queries ──────────────────────────────────────────────────
 
-    /// Return all registered Skill metadata (Tier 1).
+    /// Return all registered Skill metadata (Tier 1) as an owned `Vec`.
     ///
-    /// The returned slice is suitable for passing to a model's context
-    /// so it can select relevant Skills for the current task.
-    pub fn all_meta(&self) -> Vec<&SkillMeta> {
-        let mut metas: Vec<_> = self.metas.values().collect();
+    /// Suitable for passing to a model's context so it can select relevant
+    /// Skills for the current task.
+    pub fn all_meta(&self) -> Vec<SkillMeta> {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        let mut metas: Vec<_> = inner.metas.values().cloned().collect();
         metas.sort_by(|a, b| a.name.cmp(&b.name));
         metas
     }
 
     /// Check whether a Skill with the given name has been registered.
     pub fn has_skill(&self, name: &str) -> bool {
-        self.metas.contains_key(name)
+        self.inner.read().expect("RwLock poisoned").metas.contains_key(name)
     }
 
     /// Return the names of all registered Skills.
-    pub fn skill_names(&self) -> Vec<&str> {
-        let mut names: Vec<_> = self.metas.keys().map(|s| s.as_str()).collect();
+    pub fn skill_names(&self) -> Vec<String> {
+        let inner = self.inner.read().expect("RwLock poisoned");
+        let mut names: Vec<String> = inner.metas.keys().cloned().collect();
         names.sort();
         names
     }
@@ -219,51 +185,58 @@ impl SkillRegister {
 
     /// Activate a Skill by loading its full content (Tier 2).
     ///
-    /// If the Skill is already activated, returns a reference to the
-    /// cached instance.
+    /// If the Skill is already activated, returns a clone of the cached
+    /// `Arc<Skill>` (cheap reference-count bump).
     ///
     /// # Errors
     ///
     /// - [`SkillError::NotRegistered`] if the Skill name was not discovered
-    ///   during [`init()`](Self::init).
+    ///   during construction.
     /// - [`SkillError::SkillMdNotFound`], [`SkillError::Io`],
     ///   [`SkillError::InvalidFrontmatter`], etc. if loading the full
     ///   SKILL.md fails.
-    pub fn activate(&mut self, name: &str) -> Result<&Skill, SkillError> {
-        // Load on cache miss (mutable operations are scoped to this block).
-        if !self.activated.contains_key(name) {
-            // Must be registered first
-            if !self.metas.contains_key(name) {
-                return Err(SkillError::NotRegistered(name.to_string()));
-            }
+    pub fn activate(&self, name: &str) -> Result<Arc<Skill>, SkillError> {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
 
-            // Load full content
-            let skill = self.loader.load_skill_by_name(name)?;
-
-            info!(
-                "Tier2 activated: {} (allowed tools: [{}], {} scripts, {} refs, {} assets)",
-                name,
-                skill.frontmatter.allowed_tools.join(", "),
-                skill.list_scripts().len(),
-                skill.list_references().len(),
-                skill.list_assets().len(),
-            );
-
-            self.activated.insert(name.to_string(), skill);
+        // Cache hit — return clone of Arc (cheap reference-count bump).
+        if let Some(skill) = inner.activated.get(name) {
+            return Ok(Arc::clone(skill));
         }
 
-        // At this point the entry is guaranteed to exist.
-        Ok(self.activated.get(name).unwrap())
+        // Must be registered first.
+        if !inner.metas.contains_key(name) {
+            return Err(SkillError::NotRegistered(name.to_string()));
+        }
+
+        let skill = inner.loader.load_skill_by_name(name)?;
+
+        info!(
+            "Tier2 activated: {} (allowed tools: [{}], {} scripts, {} refs, {} assets)",
+            name,
+            skill.frontmatter.allowed_tools.join(", "),
+            skill.list_scripts().len(),
+            skill.list_references().len(),
+            skill.list_assets().len(),
+        );
+
+        let skill = Arc::new(skill);
+        inner.activated.insert(name.to_string(), Arc::clone(&skill));
+        Ok(skill)
     }
 
     /// Check whether a Skill has been fully loaded (Tier 2).
     pub fn is_activated(&self, name: &str) -> bool {
-        self.activated.contains_key(name)
+        self.inner.read().expect("RwLock poisoned").activated.contains_key(name)
     }
 
-    /// Return a reference to an activated Skill, if available.
-    pub fn get_activated(&self, name: &str) -> Option<&Skill> {
-        self.activated.get(name)
+    /// Return a clone of the activated Skill, if available.
+    pub fn get_activated(&self, name: &str) -> Option<Arc<Skill>> {
+        self.inner
+            .read()
+            .expect("RwLock poisoned")
+            .activated
+            .get(name)
+            .cloned()
     }
 
     // ── Tier 3: Resource Access ──────────────────────────────────────────
@@ -276,7 +249,8 @@ impl SkillRegister {
         skill_name: &str,
         relative_path: &std::path::Path,
     ) -> Result<String, SkillError> {
-        let skill = self
+        let inner = self.inner.read().expect("RwLock poisoned");
+        let skill = inner
             .activated
             .get(skill_name)
             .ok_or_else(|| SkillError::NotRegistered(skill_name.to_string()))?;
@@ -290,12 +264,13 @@ impl SkillRegister {
 
     // ── Statistics ───────────────────────────────────────────────────────
 
-    /// Return current list statistics.
+    /// Return current register statistics.
     pub fn stats(&self) -> SkillRegisterStats {
+        let inner = self.inner.read().expect("RwLock poisoned");
         SkillRegisterStats {
-            registered: self.metas.len(),
-            activated: self.activated.len(),
-            errors: self.error_count,
+            registered: inner.metas.len(),
+            activated: inner.activated.len(),
+            errors: inner.error_count,
         }
     }
 }
@@ -307,17 +282,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_skills_root_accessor() {
-        let list = SkillRegister::new("./my-skills");
-        assert_eq!(list.skills_root(), &PathBuf::from("./my-skills"));
-    }
-
-    #[test]
     fn test_list_empty_when_root_missing() {
-        let mut list = SkillRegister::new("/nonexistent/path/to/skills");
-        // init should still succeed but return 0 skills
-        let count = list.init().unwrap();
-        assert_eq!(count, 0);
+        let list = SkillRegister::new("/nonexistent/path/to/skills").unwrap();
         assert!(list.all_meta().is_empty());
+        assert_eq!(list.stats().registered, 0);
     }
 }

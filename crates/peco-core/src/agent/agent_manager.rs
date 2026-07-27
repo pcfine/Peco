@@ -46,7 +46,7 @@ pub struct AgentManager {
     agents_dir: PathBuf,
     user_id: String,
     user_config: UserConfig,
-    skill_registry: Arc<RwLock<SkillRegister>>,
+    skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
     /// Tier-1 元数据缓存（name → AgentMeta）
     metas: RwLock<HashMap<String, AgentMeta>>,
@@ -62,7 +62,7 @@ impl AgentManager {
         agents_dir: PathBuf,
         user_id: String,
         user_config: UserConfig,
-        skill_registry: Arc<RwLock<SkillRegister>>,
+        skill_registry: Arc<SkillRegister>,
         knowledge_manager: Arc<KnowledgeManager>,
     ) -> Self {
         Self {
@@ -179,7 +179,7 @@ impl AgentManager {
                 path.display()
             )));
         }
-        Agent::from_file(&path, &self.user_config, &self.skill_registry, &deps)
+        Agent::from_file(&path, &self.user_config, &deps)
     }
 
     // ── 依赖构建 ────────────────────────────────────────────────────
@@ -315,7 +315,7 @@ impl AgentLoader for AgentManager {
 }
 
 impl SkillProvider for AgentManager {
-    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
+    fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
     }
 }
@@ -344,7 +344,7 @@ struct AmRef {
     agents_dir: PathBuf,
     user_id: String,
     user_config: UserConfig,
-    skill_registry: Arc<RwLock<SkillRegister>>,
+    skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
 }
 
@@ -386,7 +386,7 @@ impl AgentLoader for AmAgentLoader {
             allowed_kbs: Vec::new(),
         };
 
-        let agent = Agent::from_file(&path, &self.am.user_config, &self.am.skill_registry, &deps)?;
+        let agent = Agent::from_file(&path, &self.am.user_config, &deps)?;
         Ok(Arc::new(agent))
     }
 
@@ -408,11 +408,11 @@ impl AgentLoader for AmAgentLoader {
 }
 
 struct AmSkillProvider {
-    registry: Arc<RwLock<SkillRegister>>,
+    registry: Arc<SkillRegister>,
 }
 
 impl SkillProvider for AmSkillProvider {
-    fn skill_registry(&self) -> &Arc<RwLock<SkillRegister>> {
+    fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.registry
     }
 }

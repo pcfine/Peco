@@ -78,9 +78,8 @@ impl CliApp {
             workspace.root().display(),
             workspace
                 .skill_registry()
-                .read()
-                .map(|r| r.stats().registered)
-                .unwrap_or(0),
+                .stats()
+                .registered,
         );
 
         // ── 3. 创建持久化器 ────────────────────────────────────────────
