@@ -24,17 +24,20 @@ use peco_core::executor::ExecutorInput;
 use peco_core::executor::StructuredOutputExecutor;
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::skills::SkillRegister;
-use peco_core::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+use peco_core::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
 
 // ── Noop trait implementations（本示例无需真实子 agent / KB / skill）─────────
 
-struct NoopAgentLoader;
-impl AgentLoader for NoopAgentLoader {
+struct NoopAgentAccess;
+impl AgentAccess for NoopAgentAccess {
     fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
         Err(AgentError::Config("noop agent loader".into()))
     }
     fn list_agent_names(&self) -> Vec<String> {
         vec![]
+    }
+    fn save_agent(&self, _name: &str, _content: &str) -> Result<(), String> {
+        Err("noop agent writer".into())
     }
 }
 
@@ -70,7 +73,7 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
     let skill_registry = Arc::new(SkillRegister::new(agent_dir.join("skills"))?);
 
     let tool_deps = ToolDependencies {
-        agent_loader: Arc::new(NoopAgentLoader),
+        agent_access: Arc::new(NoopAgentAccess),
         skill_provider: Arc::new(NoopSkillProvider {
             registry: skill_registry.clone(),
         }),

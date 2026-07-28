@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // Both CLI and Web use the same tool implementations.
-// Difference is only in how the AgentLoader is constructed:
+// Difference is only in how the AgentAccess is constructed:
 // - CLI: WorkSpace reads agents/ from local filesystem
 // - Web: WorkSpace reads agents/ from user workspace directory
 
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent::simple_looper::SimpleAgentLooper;
-use super::deps::AgentLoader;
+use super::deps::AgentAccess;
 
 use super::{StringError, ToolDyn, ToolError};
 
@@ -25,12 +25,12 @@ use super::{StringError, ToolDyn, ToolError};
 // ============================================================================
 
 pub struct DelegateSubAgent {
-    agent_loader: Arc<dyn AgentLoader>,
+    agent_access: Arc<dyn AgentAccess>,
 }
 
 impl DelegateSubAgent {
-    pub fn new(agent_loader: Arc<dyn AgentLoader>) -> Self {
-        Self { agent_loader }
+    pub fn new(agent_access: Arc<dyn AgentAccess>) -> Self {
+        Self { agent_access }
     }
 }
 
@@ -83,7 +83,7 @@ impl ToolDyn for DelegateSubAgent {
                 ))));
             }
 
-            let agent = self.agent_loader.load_agent(agent_name).map_err(|e| {
+            let agent = self.agent_access.load_agent(agent_name).map_err(|e| {
                 ToolError::ToolCallError(Box::new(StringError(format!(
                     "failed to load agent '{agent_name}': {e}"
                 ))))
@@ -106,12 +106,12 @@ impl ToolDyn for DelegateSubAgent {
 // ============================================================================
 
 pub struct RunParallelSubAgents {
-    agent_loader: Arc<dyn AgentLoader>,
+    agent_access: Arc<dyn AgentAccess>,
 }
 
 impl RunParallelSubAgents {
-    pub fn new(agent_loader: Arc<dyn AgentLoader>) -> Self {
-        Self { agent_loader }
+    pub fn new(agent_access: Arc<dyn AgentAccess>) -> Self {
+        Self { agent_access }
     }
 }
 
@@ -175,7 +175,7 @@ impl ToolDyn for RunParallelSubAgents {
             // Load all agents
             let mut agent_pairs = Vec::with_capacity(task_defs.len());
             for td in &task_defs {
-                let agent = self.agent_loader.load_agent(&td.agent_name).map_err(|e| {
+                let agent = self.agent_access.load_agent(&td.agent_name).map_err(|e| {
                     ToolError::ToolCallError(Box::new(StringError(format!(
                         "failed to load agent '{}': {e}",
                         td.agent_name

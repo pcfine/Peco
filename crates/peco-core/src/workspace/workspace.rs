@@ -11,7 +11,7 @@ use crate::knowledge::KnowledgeManager;
 use crate::skills::SkillRegister;
 
 use super::error::WorkspaceError;
-use crate::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolExecutor, ToolRegister};
+use crate::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolExecutor, ToolRegister};
 
 // ============================================================================
 // TemplateInitReport
@@ -293,13 +293,19 @@ impl WorkSpace {
 // Narrow trait implementations — WorkSpace 作为编排者
 // ============================================================================
 
-impl AgentLoader for WorkSpace {
+impl AgentAccess for WorkSpace {
     fn load_agent(&self, name: &str) -> Result<Arc<crate::agent::Agent>, crate::agent::AgentError> {
         self.agent_manager.load_agent(name)
     }
 
     fn list_agent_names(&self) -> Vec<String> {
         self.agent_manager.list_names()
+    }
+
+    fn save_agent(&self, name: &str, content: &str) -> Result<(), String> {
+        self.agent_manager
+            .save(name, content)
+            .map_err(|e| e.to_string())
     }
 }
 

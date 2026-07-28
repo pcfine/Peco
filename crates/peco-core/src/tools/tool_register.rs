@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, DefaultToolsExecutor, DelegateSubAgent, Fetch,
     GetKnowledgeBaseDocs, ListKnowledgeBases, QueryEntityFacts, ReadSkill, RunParallelSubAgents,
-    SearchKnowledge, ShellExec, SyncKnowledgeBase, ToolDyn, ToolExecutor,
+    SaveAgent, SearchKnowledge, ShellExec, SyncKnowledgeBase, ToolDyn, ToolExecutor,
 };
 
 use super::deps::ToolDependencies;
@@ -33,11 +33,12 @@ impl ToolRegister {
 
                 // ── Agent 加载依赖 ──────────────────────
                 "delegate_sub_agent" => {
-                    Some(Box::new(DelegateSubAgent::new(deps.agent_loader.clone())))
+                    Some(Box::new(DelegateSubAgent::new(deps.agent_access.clone())))
                 }
                 "run_parallel_sub_agents" => Some(Box::new(RunParallelSubAgents::new(
-                    deps.agent_loader.clone(),
+                    deps.agent_access.clone(),
                 ))),
+                "save_agent" => Some(Box::new(SaveAgent::new(deps.agent_access.clone()))),
 
                 // ── Knowledge 依赖 ──────────────────────
                 "search_knowledge" => Some(Box::new(SearchKnowledge::new(

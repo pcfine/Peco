@@ -26,17 +26,20 @@ use peco_core::config::{SystemConfig, UserConfig};
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::skills::SkillRegister;
 use peco_core::utils::intercom::make_async_intercom_pair;
-use peco_core::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+use peco_core::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
 
 // ── Noop trait implementations for the example (agent has tools: []) ─────
 
-struct NoopAgentLoader;
-impl AgentLoader for NoopAgentLoader {
+struct NoopAgentAccess;
+impl AgentAccess for NoopAgentAccess {
     fn load_agent(&self, _name: &str) -> Result<Arc<Agent>, AgentError> {
         Err(AgentError::Config("noop agent loader".into()))
     }
     fn list_agent_names(&self) -> Vec<String> {
         vec![]
+    }
+    fn save_agent(&self, _name: &str, _content: &str) -> Result<(), String> {
+        Err("noop agent writer".into())
     }
 }
 
@@ -64,6 +67,7 @@ impl KnowledgeAccess for NoopKnowledgeAccess {
         &KM
     }
 }
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -149,7 +153,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let skill_registry = Arc::new(SkillRegister::new(dir.join("skills"))?);
 
     let tool_deps = ToolDependencies {
-        agent_loader: Arc::new(NoopAgentLoader),
+        agent_access: Arc::new(NoopAgentAccess),
         skill_provider: Arc::new(NoopSkillProvider {
             registry: skill_registry.clone(),
         }),

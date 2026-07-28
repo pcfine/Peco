@@ -6,7 +6,7 @@
 // - 扫描 agents/ 目录，缓存 Tier-1 元数据（name + description）
 // - 加载完整 Agent 并缓存（Tier-2）
 // - Agent 文件 CRUD（save / delete）
-// - 实现 AgentLoader / SkillProvider / KnowledgeAccess trait，供 ToolDependencies 使用
+// - 实现 AgentAccess / SkillProvider / KnowledgeAccess trait，供 ToolDependencies 使用
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use crate::config::UserConfig;
 use crate::knowledge::KnowledgeManager;
 use crate::skills::SkillRegister;
 use crate::workspace::{
-    AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies, WorkspaceError,
+    AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, WorkspaceError,
 };
 
 // ── AgentMeta ──────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ pub struct AgentMeta {
 /// - Tier 1：`metas` — 扫描目录时缓存的 frontmatter 摘要（name + description）
 /// - Tier 2：`cache` — 完整加载的 Agent 实例
 ///
-/// 同时实现 [`AgentLoader`]、[`SkillProvider`]、[`KnowledgeAccess`]，
+/// 同时实现 [`AgentAccess`]、[`SkillProvider`]、[`KnowledgeAccess`]，
 /// 可直接作为 [`ToolDependencies`] 的组成部分。
 pub struct AgentManager {
     agents_dir: PathBuf,
@@ -163,7 +163,7 @@ impl AgentManager {
         Ok(agent)
     }
 
-    /// 非缓存加载（供 [`AgentLoader`] trait 实现路径使用）。
+    /// 非缓存加载（供 [`AgentAccess`] trait 实现路径使用）。
     fn load_uncached(&self, name: &str) -> Result<Arc<Agent>, AgentError> {
         let deps = self.build_deps_direct();
         let agent = self.load_from_file(name, deps)?;
@@ -186,12 +186,12 @@ impl AgentManager {
 
     /// 构建 [`ToolDependencies`]（缓存路径）。
     ///
-    /// 通过 `Arc<Self>` 将 `AgentManager` 自身作为 `dyn AgentLoader` 注入。
+    /// 通过 `Arc<Self>` 将 `AgentManager` 自身作为 `dyn AgentAccess` 注入。
     /// 注意：trait 分发走 [`load_uncached`](Self::load_uncached)（非缓存路径）；
     /// Tier-2 缓存仅对直接调用 [`load_cached`](Self::load_cached) 的调用方生效。
     pub fn build_deps(self: &Arc<Self>) -> ToolDependencies {
         ToolDependencies {
-            agent_loader: self.clone() as Arc<dyn AgentLoader>,
+            agent_access: self.clone() as Arc<dyn AgentAccess>,
             skill_provider: self.clone() as Arc<dyn SkillProvider>,
             knowledge_access: self.clone() as Arc<dyn KnowledgeAccess>,
             allowed_kbs: Vec::new(),
@@ -201,20 +201,16 @@ impl AgentManager {
     /// 构建 [`ToolDependencies`]（非缓存路径）。
     ///
     /// 使用轻量 ref 结构避免 `Arc<Self>` 循环依赖，
-    /// 供 [`AgentLoader`] trait 的 `load_agent(&self)` 实现使用。
+    /// 供 [`AgentAccess`] trait 的 `load_agent(&self)` 实现使用。
     fn build_deps_direct(&self) -> ToolDependencies {
-        let agent_loader: Arc<dyn AgentLoader> = Arc::new(AmAgentLoader {
-            am: AmRef {
+        ToolDependencies {
+            agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
                 user_id: self.user_id.clone(),
                 user_config: self.user_config.clone(),
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
-            },
-        });
-
-        ToolDependencies {
-            agent_loader,
+            }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
             }),
@@ -304,13 +300,17 @@ impl AgentManager {
 
 // ── Trait 实现：Arc<AgentManager> 可直接作为 ToolDependencies 的组成部分 ─
 
-impl AgentLoader for AgentManager {
+impl AgentAccess for AgentManager {
     fn load_agent(&self, name: &str) -> Result<Arc<Agent>, AgentError> {
         self.load_uncached(name)
     }
 
     fn list_agent_names(&self) -> Vec<String> {
         self.list_names()
+    }
+
+    fn save_agent(&self, name: &str, content: &str) -> Result<(), String> {
+        self.save(name, content).map_err(|e| e.to_string())
     }
 }
 
@@ -331,16 +331,20 @@ impl KnowledgeAccess for AgentManager {
 }
 
 // ============================================================================
-// 内部辅助结构 — 非缓存 AgentLoader trait 路径
+// 内部辅助结构 — 非缓存 AgentAccess trait 路径
 // ============================================================================
 //
-// 当通过 `AgentLoader::load_agent(&self)` 加载子 Agent 时，
+// 当通过 `AgentAccess::load_agent(&self)` 加载子 Agent 时，
 // 方法签名只提供 `&self`，无法获得 `Arc<Self>`。
-// 因此使用轻量的字段快照 `AmRef` 来构建递归的 ToolDependencies，
+// 因此使用轻量的字段快照来构建递归的 ToolDependencies，
 // 避免 Arc 循环依赖。
 
-/// AgentManager 字段快照，供 [`AmAgentLoader`] 递归加载使用。
-struct AmRef {
+/// 非缓存的 AgentAccess 实现（用于递归子 Agent 加载）。
+///
+/// 每次调用 `load_agent` 都会重新解析 agent.md 并组装完整的 Agent，
+/// 不经过 Tier-2 缓存。`save_agent` 直接写入文件系统，
+/// 不刷新 AgentManager 缓存（这些路径下 Agent 总是从磁盘加载）。
+struct AmAgentAccess {
     agents_dir: PathBuf,
     user_id: String,
     user_config: UserConfig,
@@ -348,17 +352,9 @@ struct AmRef {
     knowledge_manager: Arc<KnowledgeManager>,
 }
 
-/// 非缓存的 AgentLoader 实现（用于递归子 Agent 加载）。
-///
-/// 每次调用 `load_agent` 都会重新解析 agent.md 并组装完整的 Agent，
-/// 不经过 Tier-2 缓存。
-struct AmAgentLoader {
-    am: AmRef,
-}
-
-impl AgentLoader for AmAgentLoader {
+impl AgentAccess for AmAgentAccess {
     fn load_agent(&self, name: &str) -> Result<Arc<Agent>, AgentError> {
-        let path = self.am.agents_dir.join(name).join("agent.md");
+        let path = self.agents_dir.join(name).join("agent.md");
         if !path.exists() {
             return Err(AgentError::Config(format!(
                 "agent '{name}' not found at {}",
@@ -367,32 +363,30 @@ impl AgentLoader for AmAgentLoader {
         }
 
         let deps = ToolDependencies {
-            agent_loader: Arc::new(AmAgentLoader {
-                am: AmRef {
-                    agents_dir: self.am.agents_dir.clone(),
-                    user_id: self.am.user_id.clone(),
-                    user_config: self.am.user_config.clone(),
-                    skill_registry: self.am.skill_registry.clone(),
-                    knowledge_manager: self.am.knowledge_manager.clone(),
-                },
+            agent_access: Arc::new(AmAgentAccess {
+                agents_dir: self.agents_dir.clone(),
+                user_id: self.user_id.clone(),
+                user_config: self.user_config.clone(),
+                skill_registry: self.skill_registry.clone(),
+                knowledge_manager: self.knowledge_manager.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
-                registry: self.am.skill_registry.clone(),
+                registry: self.skill_registry.clone(),
             }),
             knowledge_access: Arc::new(AmKnowledgeAccess {
-                user_id: self.am.user_id.clone(),
-                km: self.am.knowledge_manager.clone(),
+                user_id: self.user_id.clone(),
+                km: self.knowledge_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
         };
 
-        let agent = Agent::from_file(&path, &self.am.user_config, &deps)?;
+        let agent = Agent::from_file(&path, &self.user_config, &deps)?;
         Ok(Arc::new(agent))
     }
 
     fn list_agent_names(&self) -> Vec<String> {
         let mut names = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.am.agents_dir) {
+        if let Ok(entries) = std::fs::read_dir(&self.agents_dir) {
             for entry in entries.flatten() {
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -404,6 +398,19 @@ impl AgentLoader for AmAgentLoader {
         }
         names.sort();
         names
+    }
+
+    fn save_agent(&self, name: &str, content: &str) -> Result<(), String> {
+        split_frontmatter(content)
+            .map_err(|e| format!("Invalid agent.md format: {e}"))?;
+
+        let dir = self.agents_dir.join(name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create agent directory: {e}"))?;
+        std::fs::write(dir.join("agent.md"), content)
+            .map_err(|e| format!("Failed to write agent.md: {e}"))?;
+
+        Ok(())
     }
 }
 

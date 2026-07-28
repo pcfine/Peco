@@ -5,18 +5,20 @@
 mod deps;
 mod fetch;
 mod knowledge;
+mod save_agent;
 mod shell;
 mod skill;
 mod sub_agent;
 mod tool_factory;
 mod tool_register;
 
-pub use deps::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+pub use deps::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
 pub use fetch::Fetch;
 pub use knowledge::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
+pub use save_agent::SaveAgent;
 pub use shell::ShellExec;
 pub use skill::ReadSkill;
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
