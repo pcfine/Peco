@@ -79,11 +79,13 @@ impl KnowledgeManager {
 
     /// 如配置了 `auto_sync_on_start`，执行一次自动同步（仅首次调用生效）。
     ///
-    /// 应在 `ensure_loaded()` 之后调用。幂等 — 第二次调用不会有任何效果。
+    /// 幂等 — 第二次调用不会有任何效果。
     pub async fn maybe_auto_sync(&self) -> Result<(), KnowledgeModuleError> {
         if !self.config.auto_sync_on_start || self.auto_sync_done.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+
+        self.ensure_loaded().await?;
 
         let names: Vec<String> = {
             let guard = self.underlying.lock().await;
@@ -93,7 +95,7 @@ impl KnowledgeManager {
 
         let mut total_changes = 0usize;
         for name in &names {
-            match self.sync_kb_inner(name).await {
+            match self.sync_kb_impl(name).await {
                 Ok(report) => total_changes += report.total_changes(),
                 Err(e) => tracing::warn!(kb = %name, error = %e, "auto_sync 失败"),
             }
@@ -193,10 +195,11 @@ impl KnowledgeManager {
         Ok(kb.search(query, top_k).await?)
     }
 
-    /// 跨所有知识库并发生成嵌入 → 并行搜索 → 合并排序。
+    /// 跨所有知识库并发搜索。
     ///
-    /// 首先获取所有知识库的 `Arc<KnowledgeBase>` 引用（释放管理器锁），
-    /// 然后真正并发执行搜索，实现并行查询。
+    /// 委托给 [`KnowledgeBaseManager::search_all()`](knowledge_base::KnowledgeBaseManager::search_all)，
+    /// 其内部通过 `futures::future::join_all` 并发轮询实现非阻塞查询。
+    /// 单个 KB 搜索失败时自动记录 warning 并跳过，不影响其他 KB。
     pub async fn search_all(
         &self,
         query: &str,
@@ -204,49 +207,9 @@ impl KnowledgeManager {
     ) -> Result<Vec<(String, Vec<knowledge_base::SearchResult>)>, KnowledgeModuleError> {
         self.ensure_loaded().await?;
 
-        // 第一步：获取所有 KB 的 Arc 引用（持锁时间短）
-        let kb_entries: Vec<(String, Arc<knowledge_base::KnowledgeBase>)> = {
-            let guard = self.underlying.lock().await;
-            let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
-            let infos = mgr.list_kbs().await?;
-            let mut entries = Vec::new();
-            for info in infos {
-                if let Ok(kb) = mgr.open_kb(&info.name).await {
-                    entries.push((info.name, kb));
-                }
-            }
-            entries
-        };
-        // 锁已释放
-
-        // 第二步：并发搜索所有 KB
-        let query_str = query.to_string();
-        let handles: Vec<_> = kb_entries
-            .into_iter()
-            .map(|(name, kb)| {
-                let q = query_str.clone();
-                tokio::spawn(async move {
-                    match kb.search(&q, top_k).await {
-                        Ok(hits) if !hits.is_empty() => Some((name, hits)),
-                        Ok(_) => None,
-                        Err(e) => {
-                            tracing::warn!(kb = %name, error = %e, "搜索失败，跳过");
-                            None
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        let results = futures::future::join_all(handles).await;
-        let mut merged = Vec::new();
-        for result in results {
-            if let Ok(Some(entry)) = result {
-                merged.push(entry);
-            }
-        }
-
-        Ok(merged)
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+        Ok(mgr.search_all(query, top_k).await)
     }
 
     // ── 文档列表 ────────────────────────────────────────────────────────────
@@ -393,11 +356,11 @@ impl KnowledgeManager {
     /// 5. 更新哈希清单
     pub async fn sync_kb(&self, name: &str) -> Result<SyncReport, KnowledgeModuleError> {
         self.ensure_loaded().await?;
-        self.sync_kb_inner(name).await
+        self.sync_kb_impl(name).await
     }
 
-    /// 内部同步逻辑（不调用 ensure_loaded，供 maybe_auto_sync 使用）。
-    async fn sync_kb_inner(&self, name: &str) -> Result<SyncReport, KnowledgeModuleError> {
+    /// 内部同步实现 — 调用方需先确保 `ensure_loaded()` 已完成。
+    async fn sync_kb_impl(&self, name: &str) -> Result<SyncReport, KnowledgeModuleError> {
         let start = std::time::Instant::now();
 
         let kb_dir = self.base_dir.join(knowledge_base::sanitize_kb_name(name));
@@ -507,7 +470,7 @@ impl KnowledgeManager {
 
         let mut results = Vec::new();
         for name in names {
-            match self.sync_kb(&name).await {
+            match self.sync_kb_impl(&name).await {
                 Ok(report) => results.push((name, report)),
                 Err(e) => tracing::warn!(kb = %name, error = %e, "同步失败，跳过"),
             }

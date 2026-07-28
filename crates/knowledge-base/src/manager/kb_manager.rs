@@ -265,19 +265,42 @@ impl KnowledgeBaseManager {
         self.open_kb(name).await.ok()
     }
 
-    /// 跨知识库搜索（并发查询所有 KB，合并结果）。
+    /// 跨知识库并发搜索。
+    ///
+    /// 通过 [`futures::future::join_all`] 并发轮询多个异步 future，
+    /// 在单个运行时线程上交替推进，实现非阻塞并发查询。
+    /// 单个 KB 搜索失败时记录 warning 并跳过，不影响其他 KB。
+    /// 空结果集会被过滤掉。
     pub async fn search_all(&self, query: &str, top_k: usize) -> Vec<(String, Vec<SearchResult>)> {
         let configs = self.configs.read().await;
         let names: Vec<String> = configs.keys().cloned().collect();
         drop(configs);
 
+        // 收集异步 future（不 spawn，由 join_all 并发驱动）
+        let query = query.to_string();
+        let futures: Vec<_> = names
+            .into_iter()
+            .map(|name| {
+                let q = query.clone();
+                async move {
+                    let kb = self.open_kb(&name).await?;
+                    let res = kb.search(&q, top_k).await?;
+                    let entry: Option<(String, Vec<SearchResult>)> =
+                        if res.is_empty() { None } else { Some((name, res)) };
+                    Ok(entry) as Result<_, KnowledgeError>
+                }
+            })
+            .collect();
+
+        // join_all 并发轮询所有 future（在单线程上交替推进）
         let mut results = Vec::new();
-        for name in &names {
-            if let Ok(kb) = self.open_kb(name).await
-                && let Ok(res) = kb.search(query, top_k).await
-                && !res.is_empty()
-            {
-                results.push((name.clone(), res));
+        for result in futures::future::join_all(futures).await {
+            match result {
+                Ok(Some(entry)) => results.push(entry),
+                Ok(None) => { /* 空结果，跳过 */ }
+                Err(e) => {
+                    tracing::warn!(error = %e, "并发搜索知识库失败，跳过");
+                }
             }
         }
         results

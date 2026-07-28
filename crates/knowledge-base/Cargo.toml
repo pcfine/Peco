@@ -12,7 +12,7 @@ path = "src/lib.rs"
 default = ["fastembed-embedding", "pdf", "lancedb"]
 fastembed-embedding = ["dep:fastembed"]
 pdf = ["dep:pdf-extract"]
-lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
+lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 helixdb = ["dep:reqwest"]
 # docx = ["dep:docx-rs"]   # Phase 2
 
@@ -34,7 +34,7 @@ fastembed = { workspace = true, optional = true }
 lancedb = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
+futures = { workspace = true }
 
 # 文档解析（可选）
 pdf-extract = { version = "0.9", optional = true }
