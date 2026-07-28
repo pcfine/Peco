@@ -12,7 +12,7 @@ mod tool_factory;
 pub use fetch::Fetch;
 pub use knowledge::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
-    SearchKnowledge, SyncKnowledgeBase,
+    QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use shell::ShellExec;
 pub use skill::ReadSkill;

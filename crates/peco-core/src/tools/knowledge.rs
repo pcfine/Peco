@@ -593,3 +593,101 @@ impl ToolDyn for AddFactsToKnowledgeBase {
         })
     }
 }
+
+// ============================================================================
+// QueryEntityFacts
+// ============================================================================
+
+pub struct QueryEntityFacts {
+    access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
+}
+
+impl QueryEntityFacts {
+    pub fn new(access: Arc<dyn KnowledgeAccess>, allowed_kbs: Vec<String>) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+        }
+    }
+}
+
+impl ToolDyn for QueryEntityFacts {
+    fn name(&self) -> String {
+        "query_entity_facts".to_string()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "query_entity_facts".to_string(),
+            description: "查询知识图谱中某个实体的相关事实。从指定实体出发，沿边遍历图谱，\
+                          返回可达节点及其关系边。适合探索实体间的关联关系。"
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kb_name": {
+                        "type": "string",
+                        "description": "目标知识库名称"
+                    },
+                    "entity_name": {
+                        "type": "string",
+                        "description": "实体名称（如 '用户'、'张三'）"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "最大遍历深度（跳数），默认 2"
+                    }
+                },
+                "required": ["kb_name", "entity_name"]
+            }),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Args {
+                kb_name: String,
+                entity_name: String,
+                #[serde(default = "default_max_depth")]
+                max_depth: u32,
+            }
+            fn default_max_depth() -> u32 {
+                2
+            }
+
+            let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+
+            let km = self.access.knowledge_manager();
+            km.ensure_loaded().await.map_err(string_err)?;
+
+            let steps = km
+                .query_entity_facts(&parsed.kb_name, &parsed.entity_name, parsed.max_depth)
+                .await
+                .map_err(string_err)?;
+
+            let display: Vec<_> = steps
+                .iter()
+                .map(|step| {
+                    json!({
+                        "node": {
+                            "id": step.node.id,
+                            "labels": step.node.labels,
+                            "properties": step.node.properties,
+                            "distance": step.node.distance,
+                        },
+                        "via_edge": step.via_edge.as_ref().map(|e| e.as_label()),
+                    })
+                })
+                .collect();
+
+            serde_json::to_string_pretty(&display).map_err(string_err)
+        })
+    }
+}

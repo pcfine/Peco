@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, DefaultToolsExecutor, DelegateSubAgent, Fetch,
-    GetKnowledgeBaseDocs, ListKnowledgeBases, ReadSkill, RunParallelSubAgents, SearchKnowledge,
-    ShellExec, SyncKnowledgeBase, ToolDyn, ToolExecutor,
+    GetKnowledgeBaseDocs, ListKnowledgeBases, QueryEntityFacts, ReadSkill, RunParallelSubAgents,
+    SearchKnowledge, ShellExec, SyncKnowledgeBase, ToolDyn, ToolExecutor,
 };
 
 use super::deps::ToolDependencies;
@@ -61,6 +61,10 @@ impl ToolRegister {
                     deps.allowed_kbs.clone(),
                 ))),
                 "add_facts_to_knowledge_base" => Some(Box::new(AddFactsToKnowledgeBase::new(
+                    deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
+                ))),
+                "query_entity_facts" => Some(Box::new(QueryEntityFacts::new(
                     deps.knowledge_access.clone(),
                     deps.allowed_kbs.clone(),
                 ))),
