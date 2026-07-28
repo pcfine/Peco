@@ -18,7 +18,7 @@ use crate::config::{McpServerConfig, UserConfig};
 use crate::mcp::McpManager;
 use crate::skills::SkillRegister;
 use crate::tools::ToolExecutor;
-use crate::workspace::ToolDependencies;
+use crate::tools::ToolDependencies;
 
 /// The response from a completed agent run.
 ///
@@ -178,7 +178,7 @@ impl Agent {
         // 从 agent profile 覆盖 KB 白名单（按 Agent 隔离）
         let mut tool_deps = tool_deps.clone();
         tool_deps.allowed_kbs = profile.knowledge_bases.clone();
-        let tool_executor = crate::workspace::ToolRegister::build(&profile.tools, &tool_deps);
+        let tool_executor = crate::tools::ToolRegister::build(&profile.tools, &tool_deps);
 
         tracing::info!(
             tool_count = tool_executor.definitions().len(),

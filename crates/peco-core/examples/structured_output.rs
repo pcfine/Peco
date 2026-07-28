@@ -24,7 +24,7 @@ use peco_core::executor::ExecutorInput;
 use peco_core::executor::StructuredOutputExecutor;
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::skills::SkillRegister;
-use peco_core::workspace::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+use peco_core::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 
 // ── Noop trait implementations（本示例无需真实子 agent / KB / skill）─────────
 

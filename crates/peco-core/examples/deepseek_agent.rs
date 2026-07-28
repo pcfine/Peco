@@ -26,7 +26,7 @@ use peco_core::config::{SystemConfig, UserConfig};
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::skills::SkillRegister;
 use peco_core::utils::intercom::make_async_intercom_pair;
-use peco_core::workspace::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+use peco_core::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 
 // ── Noop trait implementations for the example (agent has tools: []) ─────
 

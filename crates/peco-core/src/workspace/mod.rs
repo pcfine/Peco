@@ -4,22 +4,20 @@
 //
 // 提供：
 // - [`WorkSpace`] — 用户工作空间，持有所有用户级资源
-// - [`ToolRegister`] — 工具组装器，基于依赖注入一次构建到位
-// - [`ToolDependencies`] — 工具构造时的窄 trait 依赖集合
 // - [`WorkspaceError`] — WorkSpace 相关错误类型
 //
-// 窄 trait 接口（`deps` 模块）：
-// - [`AgentLoader`] — Agent 加载能力
-// - [`SkillProvider`] — Skill 读取能力
-// - [`KnowledgeAccess`] — 知识库操作
+// Tool 组装相关的 trait 和工厂已迁移到 [`crate::tools`] 模块：
+// - [`crate::tools::ToolRegister`] — 工具组装器
+// - [`crate::tools::ToolDependencies`] — 工具构造时的窄 trait 依赖集合
+// - [`crate::tools::AgentLoader`] — Agent 加载能力
+// - [`crate::tools::SkillProvider`] — Skill 读取能力
+// - [`crate::tools::KnowledgeAccess`] — 知识库操作
 
-mod deps;
 mod error;
-mod tool_register;
 #[allow(clippy::module_inception)]
 mod workspace;
 
-pub use deps::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
+// 向后兼容：重新导出已迁移到 tools 的符号
+pub use crate::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies, ToolRegister};
 pub use error::WorkspaceError;
-pub use tool_register::ToolRegister;
 pub use workspace::{TemplateInitReport, WorkSpace};

@@ -2,13 +2,16 @@
 // tools — peco-core's tool abstraction + concrete implementations
 // ============================================================================
 
+mod deps;
 mod fetch;
 mod knowledge;
 mod shell;
 mod skill;
 mod sub_agent;
 mod tool_factory;
+mod tool_register;
 
+pub use deps::{AgentLoader, KnowledgeAccess, SkillProvider, ToolDependencies};
 pub use fetch::Fetch;
 pub use knowledge::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
@@ -18,6 +21,7 @@ pub use shell::ShellExec;
 pub use skill::ReadSkill;
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
 pub use tool_factory::{DefaultToolsExecutor, StringError};
+pub use tool_register::ToolRegister;
 
 use async_trait::async_trait;
 use std::future::Future;

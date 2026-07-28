@@ -13,7 +13,7 @@ use model_provider::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::workspace::KnowledgeAccess;
+use super::deps::KnowledgeAccess;
 
 use super::{StringError, ToolDyn, ToolError};
 

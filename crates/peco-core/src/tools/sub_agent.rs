@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent::simple_looper::SimpleAgentLooper;
-use crate::workspace::AgentLoader;
+use super::deps::AgentLoader;
 
 use super::{StringError, ToolDyn, ToolError};
 

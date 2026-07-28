@@ -37,7 +37,7 @@ WorkSpace（用户隔离核心）
 | [`agent`](src/agent/mod.rs) | Agent 组装（从 agent.md 配置 → LLM provider + 工具 + MCP + Skill），含 DynamicContext trait |
 | [`executor`](src/executor/mod.rs) | AgentExecutor 外观层：SingleTurn / MultiTurn / agent-as-tool |
 | [`config`](src/config/mod.rs) | 配置系统：SystemConfig + UserConfig + Merge 深递归合并，providers.toml + MCP 注册表 |
-| [`workspace`](src/workspace/mod.rs) | 用户隔离核心：WorkSpace、ToolRegister、ToolDependencies 窄 trait 依赖注入 |
+| [`workspace`](src/workspace/mod.rs) | 用户隔离核心：WorkSpace、WorkspaceError、模板初始化 |
 | [`personal_memory`](src/personal_memory/mod.rs) | PPA 个人记忆：PersonalMemoryStore、MemoryFact/UserProfile/TurnContext 类型与配置 |
 | [`knowledge`](src/knowledge/mod.rs) | 知识库管理：文件哈希追踪、增量同步（工具移至 `tools/knowledge.rs`） |
 | [`mcp`](src/mcp/mod.rs) | MCP 客户端：连接管理、工具自动同步、热重载 |
@@ -159,13 +159,13 @@ agent.md
 
 [`WorkSpace`](src/workspace/workspace.rs) 是用户隔离的核心抽象，替代了旧的 `GlobalHandler` 全局单例：
 
-- **WorkSpace** 持有用户级资源：`ToolRegister`、`PersonalMemoryStore`、知识库访问、Agent 加载
-- **ToolDependencies** 定义窄 trait 接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），实现依赖注入
-- **ToolRegister** 基于依赖一次构建到位，避免重复创建工具实例
+- **WorkSpace** 持有用户级资源：`SkillRegister`、`KnowledgeManager`、`AgentManager`，实现 `tools::deps` 中的 DI trait（`AgentLoader`、`SkillProvider`、`KnowledgeAccess`），通过 `tools::ToolRegister::build()` 按需为 Agent 组装工具执行器
+- **ToolDependencies** 在 `tools::deps` 中定义窄 trait 接口（`AgentLoader`、`SkillProvider`、`KnowledgeAccess`），实现依赖注入，工具只依赖 trait 不依赖 WorkSpace
+- **ToolRegister** 在 `tools` 模块中作为工厂，基于 `ToolDependencies` 一次构建到位
 - **SystemConfig + UserConfig** 分层配置，`merge.rs` 提供深递归合并策略
 
 ```rust
-use peco_core::workspace::{WorkSpace, ToolDependencies};
+use peco_core::tools::ToolDependencies;
 
 // 构建用户 WorkSpace
 let workspace = WorkSpace::builder()
@@ -239,7 +239,7 @@ DefaultToolsExecutor               ← 按名称分发执行
 1. 创建工具函数并用 `#[peco_tool]` 注解
 2. 在 `tools/mod.rs` 中声明模块并 `pub use`
 3. 在 [`ToolFactory::init()`](src/tools/tool_factory.rs) 中注册
-4. 如需外部依赖（知识库、记忆、Agent 加载），通过 `ToolDependencies` trait 注入
+4. 如需外部依赖（知识库、Agent 加载），通过 `tools::deps` 中的 trait 注入
 
 ### Skill 系统
 
@@ -361,7 +361,7 @@ search_kb() 混合检索（语义 + 关键词 + 图谱 + RRF 融合）
 - **多知识库并发搜索**：`search_all()` 使用 `futures::join_all` 并行检索
 - **延迟加载**：`Mutex<Option<KnowledgeBaseManager>>` 确保与 WorkSpace 初始化兼容
 - **多后端支持**：LanceDB（默认，本地）和 HelixDB（feature-gated：`helixdb` feature，需额外配置 URL 连接）
-- **Agent 工具**：5 个知识库工具位于 [`tools/knowledge.rs`](src/tools/knowledge.rs)，通过 `ToolDependencies` 注入用户隔离
+- **Agent 工具**：知识库工具位于 [`tools/knowledge.rs`](src/tools/knowledge.rs)，通过 `tools::deps::KnowledgeAccess` 注入用户隔离
 
 ## 测试策略
 
@@ -475,9 +475,7 @@ src/
 │   └── error.rs            # ConfigError
 ├── workspace/
 │   ├── mod.rs              # WorkSpace 模块入口
-│   ├── workspace.rs        # WorkSpace（用户隔离边界，持有 ToolRegister + 用户资源）
-│   ├── tool_register.rs    # ToolRegister（基于 ToolDependencies 一次构建）
-│   ├── deps.rs             # ToolDependencies 窄 trait（AgentLoader/SkillProvider/MemoryStore/KnowledgeAccess）
+│   ├── workspace.rs        # WorkSpace（用户隔离边界，实现 tools 中的 DI trait）
 │   └── error.rs            # WorkspaceError
 ├── personal_memory/
 │   ├── mod.rs              # PPA 记忆模块入口
@@ -486,11 +484,13 @@ src/
 │   └── config.rs           # PpaConfig 及子配置
 ├── tools/
 │   ├── mod.rs              # Tool/ToolDyn trait、ToolExecutor、ToolError
+│   ├── deps.rs             # ToolDependencies 窄 trait（AgentLoader/SkillProvider/KnowledgeAccess）
+│   ├── tool_register.rs    # ToolRegister（基于 ToolDependencies 一次构建工具执行器）
 │   ├── tool_factory.rs     # ToolFactory 全局注册表 + DefaultToolsExecutor
 │   ├── shell.rs            # shell 工具
 │   ├── fetch.rs            # fetch 工具
 │   ├── skill.rs            # read_skill 工具
-│   ├── knowledge.rs        # 5 个知识库工具（search/list/add/sync/getDocs）
+│   ├── knowledge.rs        # 知识库工具（search/list/add/sync/getDocs/addFacts/queryEntityFacts）
 │   ├── memory.rs           # 3 个 PPA 记忆工具（remember/recall/forget）
 │   └── sub_agent.rs        # delegate_sub_agent + run_parallel_sub_agents 工具
 ├── knowledge/

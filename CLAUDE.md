@@ -100,15 +100,15 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
 - 双 trait 设计：`Tool`（静态、泛型、类型化）和 `ToolDyn`（对象安全，`Pin<Box<dyn Future>>`）。
 - blanket impl `impl<T: Tool> ToolDyn for T` 桥接二者。
 - `ToolExecutor` trait：运行时接口 — `execute(name, args) -> Result<String, String>` + `definitions() -> Vec<ToolDefinition>`。
+- **DI 契约**（`deps.rs`）：定义 3 个窄 trait — `AgentLoader`、`SkillProvider`、`KnowledgeAccess` — 以及聚合结构体 `ToolDependencies`。工具只依赖这些 trait，不直接依赖 `WorkSpace`。
+- **工具组装**（`tool_register.rs`）：`ToolRegister::build()` 根据 tool_names 和 `ToolDependencies` 一次性构建包含所有工具的 `ToolExecutor`。
 - 内置工具：`shell`、`fetch`、`read_skill`、`DelegateSubAgent`、`RunParallelSubAgents`、`SearchKnowledge`、`AddToKnowledgeBase`、`AddFactsToKnowledgeBase`、`GetKnowledgeBaseDocs`、`ListKnowledgeBases`、`SyncKnowledgeBase`、`QueryEntityFacts`、`RememberTool`、`RecallTool`、`ForgetTool`。
 - KB 工具通过 `check_kb_access()` 执行 Agent 级别访问控制（基于 agent.md `knowledge_bases` 白名单）。
 - `#[peco_tool]` 宏（来自 `peco-derive`）：标注一个 async fn，生成实现 `Tool` 的零大小结构体、带有 `#[derive(Deserialize, JsonSchema)]` 的类型化 `Parameters` 结构体，以及 `static TOOL_NAME` 常量。
 - `DefaultToolsExecutor` 是标准实现：持有 `HashMap<String, Box<dyn ToolDyn>>` 并按名称分发。
 
 **WorkSpace**（[crates/peco-core/src/workspace/](crates/peco-core/src/workspace/)）：
-- 按用户隔离的边界。每个 `WorkSpace` 持有 `ToolRegister`、`Config`（用户级别）、`SkillRegister`、`PersonalMemoryStore` 和知识库访问。
-- `ToolDependencies` trait：窄依赖注入接口（`AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess`），使工具可以在不知道完整 `WorkSpace` 类型的情况下构建。
-- `ToolRegister`：使用 `ToolDependencies` 组装工具，一次性构建完整的工具集。
+- 按用户隔离的边界。每个 `WorkSpace` 持有 `Config`（用户级别）、`SkillRegister`、`KnowledgeManager`、`AgentManager`。实现 `tools` 模块中定义的 DI trait（`AgentLoader`、`SkillProvider`、`KnowledgeAccess`），通过 `build_tool_executor()` 委托给 `ToolRegister::build()` 完成工具组装。
 
 **MCP**（[crates/peco-core/src/mcp/](crates/peco-core/src/mcp/)）：
 - `McpManager`：每个 Agent 的 MCP 连接编排器。接收已解析的 `(name, McpServerConfig)` 对，创建传输层（通过 `rmcp` 的 stdio 或 HTTP Streamable），连接、发现工具，并将其注册为 `McpTool` 包装器。
@@ -246,7 +246,7 @@ max_turns: 30
 
 ## 核心设计模式
 
-1. **窄 trait 接口实现依赖注入**：`ToolDependencies` 暴露 `AgentLoader`、`SkillProvider`、`MemoryStore`、`KnowledgeAccess` — 工具依赖这些窄 trait，而非直接依赖 `WorkSpace`。
+1. **窄 trait 接口实现依赖注入**：`tools::deps` 定义 `AgentLoader`、`SkillProvider`、`KnowledgeAccess` 三个窄 trait 及聚合结构体 `ToolDependencies` — 工具只依赖这些 trait，`WorkSpace` 实现它们，解耦工具与 workspace 的直接耦合。
 
 2. **Session 独立于 Looper**：Looper 将消息推入 `Session`，并在轮次边界调用 `persister.save()`。Session 有自己的状态机，不知道 Looper 的存在。
 
@@ -254,7 +254,7 @@ max_turns: 30
 
 4. **MCP 工具自动发现**：`McpClientHandler` 在连接时调用 `list_all_tools()`，并在 `list_changed` 通知时重新同步。MCP 工具包装为 `McpTool`（实现 `ToolDyn`）。
 
-5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `WorkSpace` 实例 LRU 缓存（128 条目）。每个 workspace 延迟初始化其 `ToolRegister`、`SkillRegister` 和 `PersonalMemoryStore`。
+5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `WorkSpace` 实例 LRU 缓存（128 条目）。每个 workspace 持有 `SkillRegister`、`KnowledgeManager`、`AgentManager`，并通过 `tools::ToolRegister::build()` 按需为 Agent 组装 `ToolExecutor`。
 
 6. **错误处理**：`AgentError` 覆盖完整生命周期（IO、YAML 解析、缺失字段、环境变量、配置、工具执行、超过最大轮次、协议违规）。`?` 运算符可在各处使用，因为它为常见错误类型实现了 `From`。
 

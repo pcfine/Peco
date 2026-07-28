@@ -10,10 +10,8 @@ use crate::config::{SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::skills::SkillRegister;
 
-use super::deps::{AgentLoader, KnowledgeAccess, SkillProvider};
 use super::error::WorkspaceError;
-use super::tool_register::ToolRegister;
-use crate::tools::ToolExecutor;
+use crate::tools::{AgentLoader, KnowledgeAccess, SkillProvider, ToolExecutor, ToolRegister};
 
 // ============================================================================
 // TemplateInitReport
