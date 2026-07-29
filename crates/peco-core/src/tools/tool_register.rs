@@ -9,6 +9,8 @@ use crate::tools::{
     GetKnowledgeBaseDocs, ListKnowledgeBases, QueryEntityFacts, ReadSkill, RunParallelSubAgents,
     SaveAgent, SearchKnowledge, ShellExec, SyncKnowledgeBase, ToolDyn, ToolExecutor,
 };
+use crate::workflow::persistence::NullWorkflowPersister;
+use crate::workflow::tools::ExecuteWorkflow;
 
 use super::deps::ToolDependencies;
 
@@ -39,6 +41,18 @@ impl ToolRegister {
                     deps.agent_access.clone(),
                 ))),
                 "save_agent" => Some(Box::new(SaveAgent::new(deps.agent_access.clone()))),
+
+                // ── Workflow 依赖 ──────────────────────
+                "execute_workflow" => {
+                    let wa = deps.workflow_access.clone().expect(
+                        "execute_workflow tool requires workflow_access in ToolDependencies",
+                    );
+                    Some(Box::new(ExecuteWorkflow::new(
+                        wa,
+                        deps.agent_access.clone(),
+                        Arc::new(NullWorkflowPersister),
+                    )))
+                }
 
                 // ── Knowledge 依赖 ──────────────────────
                 "search_knowledge" => Some(Box::new(SearchKnowledge::new(

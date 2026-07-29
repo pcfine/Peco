@@ -9,6 +9,7 @@ pub mod skills;
 
 pub mod tools;
 pub mod utils;
+pub mod workflow;
 pub mod workspace;
 
 pub use persistence::{

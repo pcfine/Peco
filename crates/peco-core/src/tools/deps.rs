@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::agent::{Agent, AgentError};
 use crate::knowledge::KnowledgeManager;
 use crate::skills::SkillRegister;
+use crate::workflow::WorkflowAccess;
 
 // ============================================================================
 // AgentAccess — 所有 Agent 相关工具需要（加载、创建、列表）
@@ -47,6 +48,8 @@ pub struct ToolDependencies {
     pub knowledge_access: Arc<dyn KnowledgeAccess>,
     /// 来自 agent.md `knowledge_bases` 的 KB 白名单。空 = 无权访问任何 KB。
     pub allowed_kbs: Vec<String>,
+    /// Workflow 支持（Phase 2 新增）。Optional 以保持向后兼容性。
+    pub workflow_access: Option<Arc<dyn WorkflowAccess>>,
 }
 
 impl Clone for ToolDependencies {
@@ -56,6 +59,7 @@ impl Clone for ToolDependencies {
             skill_provider: self.skill_provider.clone(),
             knowledge_access: self.knowledge_access.clone(),
             allowed_kbs: self.allowed_kbs.clone(),
+            workflow_access: self.workflow_access.clone(),
         }
     }
 }

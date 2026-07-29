@@ -9,6 +9,8 @@ use crate::agent::AgentManager;
 use crate::config::{SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::skills::SkillRegister;
+use crate::workflow::persistence::NullWorkflowPersister;
+use crate::workflow::{WorkflowAccess, WorkflowManager};
 
 use super::error::WorkspaceError;
 use crate::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolExecutor, ToolRegister};
@@ -46,6 +48,7 @@ pub struct WorkSpace {
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
     agent_manager: Arc<AgentManager>,
+    workflow_manager: Arc<WorkflowManager>,
 }
 
 impl WorkSpace {
@@ -61,7 +64,7 @@ impl WorkSpace {
             ))
         })?;
 
-        for subdir in &["skills", "knowledge", "agents"] {
+        for subdir in &["skills", "knowledge", "agents", "workflows"] {
             let dir = root.join(subdir);
             if !dir.exists() {
                 std::fs::create_dir_all(&dir).map_err(|e| {
@@ -99,6 +102,15 @@ impl WorkSpace {
             tracing::warn!(error = %e, "Failed to scan agent metadata");
         }
 
+        let workflows_dir = root.join("workflows");
+        let workflow_manager = Arc::new(WorkflowManager::new(
+            workflows_dir,
+            Arc::new(NullWorkflowPersister),
+        ));
+        if let Err(e) = workflow_manager.init() {
+            tracing::warn!(error = %e, "Failed to scan workflow metadata");
+        }
+
         Ok(Self {
             user_id,
             root,
@@ -106,6 +118,7 @@ impl WorkSpace {
             skill_registry,
             knowledge_manager,
             agent_manager,
+            workflow_manager,
         })
     }
 
@@ -129,11 +142,15 @@ impl WorkSpace {
     pub fn agent_manager(&self) -> &Arc<AgentManager> {
         &self.agent_manager
     }
+    pub fn workflow_manager(&self) -> &Arc<WorkflowManager> {
+        &self.workflow_manager
+    }
 
     // ── Tool 组装 ────────────────────────────────────────────────────
 
     pub fn build_tool_executor(self: &Arc<Self>, tool_names: &[String]) -> Arc<dyn ToolExecutor> {
-        let deps = self.agent_manager.build_deps();
+        let mut deps = self.agent_manager.build_deps();
+        deps.workflow_access = Some(self.clone() as Arc<dyn WorkflowAccess>);
         ToolRegister::build(tool_names, &deps)
     }
 
@@ -321,5 +338,23 @@ impl KnowledgeAccess for WorkSpace {
     }
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
+    }
+}
+
+impl WorkflowAccess for WorkSpace {
+    fn load_workflow(
+        &self,
+        name: &str,
+    ) -> Result<crate::workflow::WorkflowDefinition, crate::workflow::WorkflowError> {
+        self.workflow_manager.load(name)
+    }
+    fn list_workflow_names(&self) -> Vec<String> {
+        self.workflow_manager.list_names()
+    }
+    fn reload_workflow(
+        &self,
+        name: &str,
+    ) -> Result<crate::workflow::WorkflowDefinition, crate::workflow::WorkflowError> {
+        self.workflow_manager.reload(name)
     }
 }

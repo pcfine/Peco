@@ -18,6 +18,9 @@ mod error;
 mod workspace;
 
 // 向后兼容：重新导出已迁移到 tools 的符号
-pub use crate::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, ToolRegister};
+pub use crate::tools::{
+    AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, ToolRegister,
+};
+pub use crate::workflow::WorkflowAccess;
 pub use error::WorkspaceError;
 pub use workspace::{TemplateInitReport, WorkSpace};
