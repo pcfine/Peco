@@ -13,7 +13,7 @@
 │      REST API · SSE 流 · JWT 认证 · 限流 · OpenAPI/Swagger   │
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent 引擎)                       │
-│  Agent · Session · ReAct Loop · WorkSpace · PPA · MCP · Skills · Tools · KB │
+│  Agent · Session · ReAct Loop · Workflow · WorkSpace · PPA · MCP · Skills · Tools · KB │
 ├────────────────────────┼────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │   (LLM 统一抽象层)       │   (RAG: 向量+BM25+知识图谱)          │
@@ -27,12 +27,13 @@
 ### Agent 引擎
 - **声明式定义**：通过 `agent.md`（YAML frontmatter + Markdown）定义 Agent 的模型、工具、MCP、Skills 和 KB 访问白名单
 - **ReAct 执行循环**：Think → Act → Observe，自动处理多轮工具调用
+- **Workflow 编排**：声明式 DAG 工作流（`workflow.md`），拓扑分层并行执行，支持条件门控、模板变量传递（minijinja）、失败策略（Continue/Abort/Pause/Retry）和人工审批暂停/恢复
 - **子 Agent 编排**：支持串行委派 (`delegate_sub_agent`) 和并行执行 (`run_parallel_sub_agents`)，前端可视化追踪
 - **Session 管理**：状态机驱动（Idle → Active → Commit/Rollback/Cancel），支持 turn 回滚、中断队列、自动持久化
 - **模板初始化**：内置 3 套 Workspace 模板（personal / minimal / developer），`--init-template` 一键初始化
 
 ### 工具系统
-- **13 个内置工具**：`shell`、`fetch`、`read_skill`、子 Agent 委派/并行、知识库 CRUD 与搜索、PPA 记忆（`remember` / `recall` / `forget`）
+- **14 个内置工具**：`shell`、`fetch`、`read_skill`、`execute_workflow`、子 Agent 委派/并行、知识库 CRUD 与搜索、PPA 记忆（`remember` / `recall` / `forget`）
 - **MCP 协议**：完整实现 Model Context Protocol，支持 stdio 和 HTTP Streamable 传输，工具自动发现与同步
 - **可扩展**：`#[peco_tool]` 宏自动生成工具定义，`Tool`/`ToolDyn` 双 trait 设计
 
@@ -115,6 +116,9 @@ cargo run -p peco-cli -- -t minimal      # 最轻量对话
 
 # 启动交互式对话
 cargo run -p peco-cli -- --agent <agent-name>
+
+# 运行 Workflow 演示
+cargo run -p peco-core --example workflow_demo
 ```
 
 ## 项目结构
@@ -122,7 +126,7 @@ cargo run -p peco-cli -- --agent <agent-name>
 ```
 peco/
 ├── crates/
-│   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、WorkSpace、PPA、MCP、Skills、Tools
+│   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、Workflow、WorkSpace、PPA、MCP、Skills、Tools
 │   ├── peco-server/            # Web 服务：Axum REST API、SSE、JWT、Cron 调度
 │   ├── peco-cli/               # 命令行 AI 助手
 │   ├── model-provider/         # LLM 统一抽象层（当前仅实现 DeepSeek）
@@ -140,6 +144,8 @@ peco/
 ├── scripts/
 │   ├── dev.sh                  # 开发环境一键启动
 │   └── deploy.sh               # 生产部署脚本
+├── docs/
+│   └── workflow-design.md       # Workflow 模块技术方案
 ├── Cargo.toml                  # Rust workspace
 └── .env                        # 环境变量（API Key 等）
 ```
@@ -185,6 +191,46 @@ max_turns: 30
 - 评估代码可维护性和可测试性
 ```
 
+### Workflow 定义示例
+
+创建 `workflow.md` 文件定义声明式 DAG 工作流：
+
+```yaml
+---
+workflow:
+  name: "ci-pipeline"
+  description: "CI 流水线：Lint → Test → Build"
+  version: "1.0"
+  timeout_seconds: 300
+steps:
+  - id: "lint"
+    name: "Lint"
+    type: shell
+    config:
+      command: "cargo clippy -- -D warnings 2>&1"
+    on_failure: "continue"
+
+  - id: "test"
+    name: "Test"
+    type: shell
+    config:
+      command: "cargo test --workspace 2>&1"
+    depends_on: ["lint"]
+    condition: "{{ steps.lint.success }}"
+    on_failure: "abort"
+
+  - id: "build"
+    name: "Build"
+    type: shell
+    config:
+      command: "cargo build --release 2>&1"
+    depends_on: ["test"]
+    on_failure: "pause"
+---
+```
+
+Workflow 支持 Shell、Agent 两种步骤类型，通过 `depends_on` 定义 DAG 拓扑，`condition` 控制条件执行，`{{ steps.X.output }}` 在步骤间传递数据。
+
 ## 配置
 
 ### 环境变量
@@ -224,6 +270,7 @@ cargo test --workspace
 
 # 运行特定 crate 测试
 cargo test -p peco-core
+cargo test -p peco-core -- workflow  # 仅 Workflow 模块测试
 cargo test -p peco-server
 cargo test -p knowledge-base
 
@@ -240,9 +287,11 @@ cd webui && npx prettier --write src/
 
 ## 扩展计划
 
+- [x] 声明式 Workflow 编排引擎（DAG 拓扑 + 模板变量 + 条件门控 + 失败策略）— Phase 1–2 ✅
+- [ ] Workflow peco-server 集成（REST API + SSE 流式 + SQLite 持久化 + Cron 触发）— Phase 3
+- [ ] Workflow 高级特性（Llm/Tool 步骤类型、重试、HumanApproval、子 Workflow 嵌套）— Phase 4
 - [ ] OpenAI / Anthropic / 本地模型 Provider 支持
 - [ ] 结构化输出（Structured Output Executor）
-- [ ] 链式编排（Chain Executor）与并行路由（Router / Parallel Executor）
 - [ ] 对话分支（Branching）与 A/B 对比
 - [ ] 更丰富的 MCP 传输（WebSocket）
 
@@ -272,7 +321,7 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 │      REST API · SSE · JWT Auth · Rate Limit · OpenAPI        │
 ├─────────────────────────────────────────────────────────────┤
 │                  peco-core (Agent Engine)                     │
-│  Agent · Session · ReAct Loop · WorkSpace · PPA · MCP · Skills · Tools · KB │
+│ Agent · Session · ReAct Loop · Workflow · WorkSpace · PPA · MCP · Skills · Tools · KB │
 ├────────────────────────┬────────────────────────────────────┤
 │     model-provider      │       knowledge-base               │
 │     (LLM Abstraction)   │   (RAG: Vector+BM25+Graph)         │
@@ -283,8 +332,8 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 
 ### Key Features
 
-- **Agent Engine**: Declarative `agent.md` definitions, ReAct execution loop, sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue, built-in workspace templates (`--init-template`)
-- **Tool System**: 13 built-in tools, full MCP protocol support (stdio + HTTP Streamable), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design
+- **Agent Engine**: Declarative `agent.md` definitions, ReAct execution loop, DAG workflow orchestration (`workflow.md` with topology-level parallelism, condition gating, template variables, failure policies), sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue, built-in workspace templates (`--init-template`)
+- **Tool System**: 14 built-in tools, full MCP protocol support (stdio + HTTP Streamable), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design
 - **Personal Memory (PPA)**: Auto memory extraction via Flash model, three-tier memory (Profile → Semantic → Episodic), `remember`/`recall`/`forget` tools
 - **RAG Knowledge Base**: Multi-format parsing (PDF/DOCX/HTML/MD/Code/TXT), intelligent chunking, hybrid search (vector + BM25 + knowledge graph), adaptive RRF fusion, local ONNX embeddings with Chinese-optimized `bge-small-zh-v1.5`
 - **Skill System**: 3-tier progressive loading, `SKILL.md` format, automatic directory discovery
@@ -312,6 +361,7 @@ sudo -E bash scripts/deploy.sh
 # CLI mode
 cargo run -p peco-cli -- -t personal          # init workspace from template
 cargo run -p peco-cli -- --agent <agent-name> # interactive chat
+cargo run -p peco-core --example workflow_demo # workflow demo
 ```
 
 ### Tech Stack
