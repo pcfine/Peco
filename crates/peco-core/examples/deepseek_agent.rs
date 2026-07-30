@@ -25,8 +25,8 @@ use peco_core::agent::{Agent, AgentError, AgentLooper, LooperConfig, LooperEvent
 use peco_core::config::{SystemConfig, UserConfig};
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::skills::SkillRegister;
-use peco_core::utils::intercom::make_async_intercom_pair;
 use peco_core::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
+use peco_core::utils::intercom::make_async_intercom_pair;
 
 // ── Noop trait implementations for the example (agent has tools: []) ─────
 
@@ -67,7 +67,6 @@ impl KnowledgeAccess for NoopKnowledgeAccess {
         &KM
     }
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -159,13 +158,10 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
         }),
         knowledge_access: Arc::new(NoopKnowledgeAccess),
         allowed_kbs: Vec::new(),
+        workflow_access: None,
     };
 
-    let agent = Arc::new(Agent::from_file(
-        &agent_md,
-        &user_config,
-        &tool_deps,
-    )?);
+    let agent = Arc::new(Agent::from_file(&agent_md, &user_config, &tool_deps)?);
     println!(
         "Agent built successfully: name={}, provider={}",
         agent.config().agent.name,

@@ -15,8 +15,8 @@ use model_provider::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::agent::simple_looper::SimpleAgentLooper;
 use super::deps::AgentAccess;
+use crate::agent::simple_looper::SimpleAgentLooper;
 
 use super::{StringError, ToolDyn, ToolError};
 

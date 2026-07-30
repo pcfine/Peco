@@ -94,10 +94,7 @@ impl SkillRegister {
     pub fn new(skills_root: impl Into<PathBuf>) -> Result<Self, SkillError> {
         let loader = SkillLoader::new(skills_root);
 
-        info!(
-            "Scanning for skills in {}",
-            loader.skills_root.display()
-        );
+        info!("Scanning for skills in {}", loader.skills_root.display());
 
         let (metas, errors) = loader.load_all_meta();
 
@@ -120,9 +117,7 @@ impl SkillRegister {
         let registered = metas.len();
         let error_count = errors.len();
 
-        info!(
-            "Tier1 complete: {registered} skills loaded, {error_count} errors"
-        );
+        info!("Tier1 complete: {registered} skills loaded, {error_count} errors");
 
         let mut metas_map = HashMap::with_capacity(metas.len());
         for meta in metas {
@@ -170,7 +165,11 @@ impl SkillRegister {
 
     /// Check whether a Skill with the given name has been registered.
     pub fn has_skill(&self, name: &str) -> bool {
-        self.inner.read().expect("RwLock poisoned").metas.contains_key(name)
+        self.inner
+            .read()
+            .expect("RwLock poisoned")
+            .metas
+            .contains_key(name)
     }
 
     /// Return the names of all registered Skills.
@@ -226,7 +225,11 @@ impl SkillRegister {
 
     /// Check whether a Skill has been fully loaded (Tier 2).
     pub fn is_activated(&self, name: &str) -> bool {
-        self.inner.read().expect("RwLock poisoned").activated.contains_key(name)
+        self.inner
+            .read()
+            .expect("RwLock poisoned")
+            .activated
+            .contains_key(name)
     }
 
     /// Return a clone of the activated Skill, if available.

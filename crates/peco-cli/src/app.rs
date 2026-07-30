@@ -76,10 +76,7 @@ impl CliApp {
         eprintln!(
             "[init] WorkSpace 已打开: root={}, skills={}",
             workspace.root().display(),
-            workspace
-                .skill_registry()
-                .stats()
-                .registered,
+            workspace.skill_registry().stats().registered,
         );
 
         // ── 3. 创建持久化器 ────────────────────────────────────────────

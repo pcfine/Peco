@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::{McpServerConfig, UserConfig};
 use crate::mcp::McpManager;
 use crate::skills::SkillRegister;
-use crate::tools::ToolExecutor;
 use crate::tools::ToolDependencies;
+use crate::tools::ToolExecutor;
 
 /// The response from a completed agent run.
 ///

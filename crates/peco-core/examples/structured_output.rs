@@ -79,14 +79,11 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
         }),
         knowledge_access: Arc::new(NoopKnowledgeAccess),
         allowed_kbs: Vec::new(),
+        workflow_access: None,
     };
 
     let agent_md = agent_dir.join("agent.md");
-    let agent = Arc::new(Agent::from_file(
-        &agent_md,
-        &user_config,
-        &tool_deps,
-    )?);
+    let agent = Arc::new(Agent::from_file(&agent_md, &user_config, &tool_deps)?);
 
     println!(
         "Agent built: name={}, provider={}, model={}",
@@ -138,7 +135,8 @@ async fn example_weather_info(agent: Arc<Agent>) -> Result<(), Box<dyn std::erro
         .with_max_turns(10);
 
     // 3. 执行
-    let input = ExecutorInput::with_schema("北京今天天气怎么样？请根据你的知识给出合理估计。", schema);
+    let input =
+        ExecutorInput::with_schema("北京今天天气怎么样？请根据你的知识给出合理估计。", schema);
     let output = executor.execute(input).await?;
 
     println!("── 最终文本 ──");
@@ -207,9 +205,8 @@ pub fn create_user(name: String, email: String, age: u32) -> User {
 }
 "#;
 
-    let prompt = format!(
-        "分析以下 Rust 代码，提取其中所有函数的信息：\n\n```rust\n{code_snippet}\n```"
-    );
+    let prompt =
+        format!("分析以下 Rust 代码，提取其中所有函数的信息：\n\n```rust\n{code_snippet}\n```");
     let input = ExecutorInput::with_schema(prompt, schema);
     let output = executor.execute(input).await?;
 
@@ -282,8 +279,7 @@ async fn example_retry_on_missing_submit(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -297,7 +293,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── 准备临时配置文件 ───────────────────────────────────────────────────
-    let dir = std::env::temp_dir().join(format!("peco-structured-output-example-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "peco-structured-output-example-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir)?;
     println!("Config dir: {}", dir.display());
 

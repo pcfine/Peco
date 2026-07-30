@@ -285,8 +285,11 @@ impl KnowledgeBaseManager {
                 async move {
                     let kb = self.open_kb(&name).await?;
                     let res = kb.search(&q, top_k).await?;
-                    let entry: Option<(String, Vec<SearchResult>)> =
-                        if res.is_empty() { None } else { Some((name, res)) };
+                    let entry: Option<(String, Vec<SearchResult>)> = if res.is_empty() {
+                        None
+                    } else {
+                        Some((name, res))
+                    };
                     Ok(entry) as Result<_, KnowledgeError>
                 }
             })

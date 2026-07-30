@@ -195,6 +195,7 @@ impl AgentManager {
             skill_provider: self.clone() as Arc<dyn SkillProvider>,
             knowledge_access: self.clone() as Arc<dyn KnowledgeAccess>,
             allowed_kbs: Vec::new(),
+            workflow_access: None,
         }
     }
 
@@ -219,6 +220,7 @@ impl AgentManager {
                 km: self.knowledge_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
+            workflow_access: None,
         }
     }
 
@@ -378,6 +380,7 @@ impl AgentAccess for AmAgentAccess {
                 km: self.knowledge_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
+            workflow_access: None,
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;
@@ -401,8 +404,7 @@ impl AgentAccess for AmAgentAccess {
     }
 
     fn save_agent(&self, name: &str, content: &str) -> Result<(), String> {
-        split_frontmatter(content)
-            .map_err(|e| format!("Invalid agent.md format: {e}"))?;
+        split_frontmatter(content).map_err(|e| format!("Invalid agent.md format: {e}"))?;
 
         let dir = self.agents_dir.join(name);
         std::fs::create_dir_all(&dir)
