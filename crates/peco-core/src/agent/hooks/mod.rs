@@ -5,6 +5,8 @@
 // Hook 在 looper 的 async context 中按注册顺序依次调用。
 // 第一个返回非 Continue 的 hook 会短路后续 hook 的执行。
 
+pub mod metrics;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

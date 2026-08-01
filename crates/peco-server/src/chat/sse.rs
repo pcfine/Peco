@@ -133,6 +133,97 @@ impl ChatSseEvent {
     }
 }
 
+// ── 子 Agent 事件关联类型 ───────────────────────────────────────────────────────
+
+/// 子 Agent 调用信息，在 ToolCallStart 阶段写入，ToolResult 阶段读取。
+///
+/// `call_id` 是前端配对 `AgentCallStart` ↔ `AgentCallEnd` 的唯一标识。
+#[derive(Debug, Clone)]
+pub struct SubAgentInfo {
+    pub call_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+}
+
+/// 从工具调用参数中解析子 Agent 信息。
+///
+/// - `delegate_sub_agent`：返回单个 SubAgentInfo，`call_id = tool_call_id`
+/// - `run_parallel_sub_agents`：返回多个 SubAgentInfo，`call_id = "{tool_call_id}:{index}"`
+///
+/// `resolve_agent_id` 用于将 agent_name 映射为 agent_id。
+pub fn parse_sub_agent_infos(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &str,
+    resolve_agent_id: impl Fn(&str) -> String,
+) -> Vec<SubAgentInfo> {
+    if tool_name == "delegate_sub_agent" {
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
+            let agent_name = args["agent_name"].as_str().unwrap_or("unknown");
+            return vec![SubAgentInfo {
+                call_id: tool_call_id.to_string(),
+                agent_id: resolve_agent_id(agent_name),
+                agent_name: agent_name.to_string(),
+            }];
+        }
+        return vec![];
+    }
+
+    if tool_name == "run_parallel_sub_agents" {
+        if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+            && let Some(tasks) = args["tasks"].as_str()
+            && let Ok(task_list) = serde_json::from_str::<Vec<serde_json::Value>>(tasks)
+        {
+            return task_list
+                .iter()
+                .enumerate()
+                .map(|(index, task)| {
+                    let agent_name = task["agent_name"].as_str().unwrap_or("unknown");
+                    SubAgentInfo {
+                        call_id: format!("{tool_call_id}:{index}"),
+                        agent_id: resolve_agent_id(agent_name),
+                        agent_name: agent_name.to_string(),
+                    }
+                })
+                .collect();
+        }
+        return vec![];
+    }
+
+    vec![]
+}
+
+/// 从子 Agent tool result 中提取单个子 Agent 的输出。
+///
+/// - `delegate_sub_agent`：result 就是子 Agent 完整输出，直接返回
+/// - `run_parallel_sub_agents`：result 是 JSON 数组，按 agent_name 匹配提取
+pub fn extract_sub_agent_result(tool_result: &str, info: &SubAgentInfo, tool_name: &str) -> String {
+    if tool_name == "delegate_sub_agent" {
+        return tool_result.to_string();
+    }
+
+    if let Ok(results) = serde_json::from_str::<Vec<serde_json::Value>>(tool_result) {
+        for item in &results {
+            if item["agent_name"].as_str() == Some(&info.agent_name) {
+                if let Some(output) = item["output"].as_str() {
+                    return output.to_string();
+                }
+                if let Some(error) = item["error"].as_str() {
+                    return format!("[error] {error}");
+                }
+                return item.to_string();
+            }
+        }
+    }
+
+    let preview: String = tool_result.chars().take(200).collect();
+    if preview.len() < tool_result.len() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 /// 将 `LooperEvent` 映射为 `Option<ChatSseEvent>`。
 ///
 /// 部分 LooperEvent（如状态转换）不产生面向客户端的 SSE 事件，返回 None。

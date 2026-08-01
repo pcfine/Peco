@@ -18,13 +18,18 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod knowledge;
+pub mod mcp_config;
 pub mod middleware;
 pub mod openapi;
+pub mod peco;
 pub mod personal_agent;
 pub mod personal_assistant;
+pub mod provider;
 pub mod session_store;
+pub mod skill;
 pub mod state;
 pub mod task;
+pub mod usage;
 pub mod workspace;
 
 /// 构建完整的 Axum Router（不含限流层，供集成测试使用）。
@@ -42,11 +47,17 @@ pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: 
 
     // 受保护的路由组（需要认证 + 限流）
     let protected_routes = Router::new()
+        .nest("/api/peco", peco::handler::router())
+        .nest("/api/chat", chat::router())
+        .nest("/api/providers", provider::router())
         .nest("/api/agents", agent::router())
-        .nest("/api/conversations", chat::conversation_router())
+        .nest("/api/skills", skill::router())
+        .nest("/api/mcp", mcp_config::router())
         .nest("/api/knowledge", knowledge::router())
         .nest("/api/tasks", task::router())
-        .nest("/api/personal-agent", personal_agent::handler::router());
+        .nest("/api/usage", usage::router())
+        // DEPRECATED since 0.2.0: use /api/chat/:agentId/conversations instead
+        .nest("/api/conversations", chat::conversation_router());
 
     let protected_routes = if enable_rate_limit {
         protected_routes.layer(middleware::rate_limit::rate_limit_layer(&secret))

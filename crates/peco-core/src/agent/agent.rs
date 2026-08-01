@@ -146,7 +146,7 @@ impl Agent {
         let (frontmatter_str, body) =
             split_frontmatter(&raw).map_err(AgentError::InvalidFrontmatter)?;
         let profile: AgentProfile = serde_yaml::from_str(frontmatter_str)?;
-        let preamble = body.to_string();
+        let preamble = crate::config::resolve_env_vars(body);
 
         // 从 profile.skills 推导是否需要 SkillRegister：非空时从 tool_deps 注入
         let skill_registry = if profile.skills.is_empty() {

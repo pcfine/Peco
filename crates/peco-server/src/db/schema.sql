@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     agent_id TEXT,
+    agent_name TEXT NOT NULL DEFAULT 'unknown',
     title TEXT NOT NULL DEFAULT '新对话',
+    archived_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -110,6 +112,20 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Token 用量日志表
+CREATE TABLE IF NOT EXISTS usage_logs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    agent_name TEXT NOT NULL,
+    conversation_id TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_usage_logs_user_created ON usage_logs(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_logs_agent ON usage_logs(agent_name);
+
 -- 服务级配置（键值对存储，如 JWT 密钥等）
 CREATE TABLE IF NOT EXISTS server_config (
     key TEXT PRIMARY KEY,
@@ -120,6 +136,7 @@ CREATE TABLE IF NOT EXISTS server_config (
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_agents_user_id ON agents(user_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_user_agent_active ON conversations(user_id, agent_name, archived_at, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_bases_user_id ON knowledge_bases(user_id);
 CREATE INDEX IF NOT EXISTS idx_documents_kb_id ON documents(kb_id);

@@ -341,9 +341,8 @@ impl WorkflowDefinition {
 
     /// 从纯 YAML 字符串解析（内部方法，要求顶层 `workflow:` 包装格式）。
     fn from_yaml_str(yaml: &str) -> Result<Self, WorkflowError> {
-        let wf: WorkflowFile = serde_yaml::from_str(yaml).map_err(|e| {
-            WorkflowError::Parse(format!("YAML parse error: {e}"))
-        })?;
+        let wf: WorkflowFile = serde_yaml::from_str(yaml)
+            .map_err(|e| WorkflowError::Parse(format!("YAML parse error: {e}")))?;
         Ok(wf.workflow)
     }
 

@@ -26,8 +26,7 @@ async fn test_create_conversation() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["title"], "测试对话");
     assert!(body["id"].as_str().is_some());
-    // 自动分配的全能助手 agent_id
-    assert!(body["agent_id"].as_str().is_some());
+    // agent_id 不再自动分配（ensure_omni_agent 已移除），agent_name 默认为 "unknown"
     assert!(body["agent_name"].as_str().is_some());
 }
 
@@ -66,12 +65,12 @@ async fn test_create_conversation_with_specific_agent() {
     let agent: serde_json::Value = agent_resp.json().await.unwrap();
     let agent_id = agent["id"].as_str().unwrap();
 
-    // 创建绑定该 Agent 的对话
+    // 创建绑定该 Agent 的对话（v2: 使用 agent_name 而非 agent_id）
     let resp = app
         .post("/api/conversations")
         .json(&json!({
             "title": "专用对话",
-            "agent_id": agent_id
+            "agent_name": "专用助手"
         }))
         .send()
         .await

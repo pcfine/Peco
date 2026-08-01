@@ -47,6 +47,12 @@ Peco 是一个全栈 AI Agent 平台：**Rust 后端**（Axum + Tokio）+ **Reac
 
 ```
 peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器)
+  ├── peco      (Peco 永续对话 — /api/peco)
+  ├── chat      (Agent 对话管理 — /api/chat)
+  ├── provider  (Provider 配置管理 — /api/providers)
+  ├── skill     (Skill 管理 — /api/skills)
+  ├── mcp_config(MCP 配置管理 — /api/mcp)
+  ├── usage     (Token 用量统计 — /api/usage)
   ├── peco-core (Agent 引擎: Agent, Session, ReAct 循环, Workflow, WorkSpace, MCP, Skills, Tools, PPA)
   │     ├── model-provider (LLM 抽象层: ModelProvider trait, DeepSeek 实现)
   │     ├── knowledge-base (RAG: LanceDB + FastEmbed + BM25 + 知识图谱)

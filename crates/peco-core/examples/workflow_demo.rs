@@ -28,8 +28,9 @@ use peco_core::agent::{Agent, AgentError};
 use peco_core::tools::AgentAccess;
 use peco_core::tools::ToolDyn;
 use peco_core::workflow::{
-    ApprovalDecision, ApprovalResponse, NullWorkflowPersister, StepConfig, StepType, WorkflowConfig,
-    WorkflowDefinition, WorkflowEngine, WorkflowEvent, WorkflowManager, WorkflowStep,
+    ApprovalDecision, ApprovalResponse, NullWorkflowPersister, StepConfig, StepType,
+    WorkflowConfig, WorkflowDefinition, WorkflowEngine, WorkflowEvent, WorkflowManager,
+    WorkflowStep,
 };
 use peco_core::workflow::{ExecuteWorkflow, OnFailure, WorkflowAccess};
 
@@ -216,9 +217,7 @@ async fn demo_programmatic_workflow() {
                 total_duration_ms,
                 ..
             } => {
-                println!(
-                    "\n  🎉 COMPLETED in {total_duration_ms}ms "
-                );
+                println!("\n  🎉 COMPLETED in {total_duration_ms}ms ");
                 println!(
                     "     completed={steps_completed}, failed={steps_failed}, skipped={steps_skipped}"
                 );
@@ -345,7 +344,13 @@ workflow:
             WorkflowEvent::StepCompleted {
                 step_name, output, ..
             } => {
-                let preview = output.lines().next().unwrap_or("").chars().take(80).collect::<String>();
+                let preview = output
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect::<String>();
                 println!("  ✅ {step_name} → {preview}");
             }
             WorkflowEvent::Completed {
@@ -437,10 +442,9 @@ async fn demo_execute_workflow_tool() {
             &self,
             name: &str,
         ) -> Result<WorkflowDefinition, peco_core::workflow::WorkflowError> {
-            self.defs
-                .get(name)
-                .cloned()
-                .ok_or_else(|| peco_core::workflow::WorkflowError::Parse(format!("not found: {name}")))
+            self.defs.get(name).cloned().ok_or_else(|| {
+                peco_core::workflow::WorkflowError::Parse(format!("not found: {name}"))
+            })
         }
         fn list_workflow_names(&self) -> Vec<String> {
             self.defs.keys().cloned().collect()
@@ -625,7 +629,9 @@ async fn run_and_print(steps: &[WorkflowStep], label: &str) {
             } => {
                 println!("     ❌ {step_name}: {error}  (policy={failure_policy})");
             }
-            WorkflowEvent::StepSkipped { step_name, reason, .. } => {
+            WorkflowEvent::StepSkipped {
+                step_name, reason, ..
+            } => {
                 println!("     ⏭️  {step_name}: {reason}");
             }
             WorkflowEvent::Paused { reason, .. } => {

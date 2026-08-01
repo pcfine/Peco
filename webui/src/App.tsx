@@ -8,9 +8,8 @@ import { AppLayout } from '@/components/layout/AppLayout'
 import { ProtectedRoute } from '@/components/ProtectedRoute'
 import { LoginPage } from '@/pages/auth/LoginPage'
 import { RegisterPage } from '@/pages/auth/RegisterPage'
-import { PersonalAgentPage } from '@/pages/personal/PersonalAgentPage'
-import { ChatListPage } from '@/pages/chat/ChatListPage'
-import { ChatDetailPage } from '@/pages/chat/ChatDetailPage'
+import { PecoChatPage } from '@/pages/peco/PecoChatPage'
+import { AgentChatPage } from '@/pages/chat/AgentChatPage'
 import { AgentListPage } from '@/pages/agents/AgentListPage'
 import { AgentCreatePage } from '@/pages/agents/AgentCreatePage'
 import { AgentEditPage } from '@/pages/agents/AgentEditPage'
@@ -20,6 +19,17 @@ import { TaskListPage } from '@/pages/tasks/TaskListPage'
 import { TaskCreatePage } from '@/pages/tasks/TaskCreatePage'
 import { TaskLogsPage } from '@/pages/tasks/TaskLogsPage'
 import { SettingsPage } from '@/pages/settings/SettingsPage'
+
+// Lazy-loaded management pages (new in v2)
+const ProviderListPage = lazy(() =>
+  import('@/pages/manage/ProviderListPage').then((m) => ({ default: m.ProviderListPage })),
+)
+const SkillListPage = lazy(() =>
+  import('@/pages/manage/SkillListPage').then((m) => ({ default: m.SkillListPage })),
+)
+const McpConfigPage = lazy(() =>
+  import('@/pages/manage/McpConfigPage').then((m) => ({ default: m.McpConfigPage })),
+)
 
 export default function App() {
   return (
@@ -32,18 +42,33 @@ export default function App() {
               <Route path="/register" element={<RegisterPage />} />
               <Route element={<ProtectedRoute />}>
                 <Route element={<AppLayout />}>
-                  <Route path="/" element={<Navigate to="/personal" replace />} />
-                  <Route path="/personal" element={<PersonalAgentPage />} />
-                  <Route path="/chat" element={<ChatListPage />} />
-                  <Route path="/chat/:conversationId" element={<ChatDetailPage />} />
-                  <Route path="/agents" element={<AgentListPage />} />
-                  <Route path="/agents/new" element={<AgentCreatePage />} />
-                  <Route path="/agents/:agentId/edit" element={<AgentEditPage />} />
-                  <Route path="/knowledge" element={<KnowledgeListPage />} />
-                  <Route path="/knowledge/:kbId" element={<KnowledgeDetailPage />} />
+                  {/* Redirect root to Peco */}
+                  <Route path="/" element={<Navigate to="/peco" replace />} />
+                  <Route path="/chat" element={<Navigate to="/peco" replace />} />
+
+                  {/* Peco 永续聊天 */}
+                  <Route path="/peco" element={<PecoChatPage />} />
+
+                  {/* Agent 对话 */}
+                  <Route path="/chat/:agentId" element={<AgentChatPage />} />
+                  <Route path="/chat/:agentId/:conversationId" element={<AgentChatPage />} />
+
+                  {/* 管理 */}
+                  <Route path="/manage/providers" element={<ProviderListPage />} />
+                  <Route path="/manage/agents" element={<AgentListPage />} />
+                  <Route path="/manage/agents/new" element={<AgentCreatePage />} />
+                  <Route path="/manage/agents/:agentId/edit" element={<AgentEditPage />} />
+                  <Route path="/manage/skills" element={<SkillListPage />} />
+                  <Route path="/manage/mcp" element={<McpConfigPage />} />
+                  <Route path="/manage/knowledge" element={<KnowledgeListPage />} />
+                  <Route path="/manage/knowledge/:kbId" element={<KnowledgeDetailPage />} />
+
+                  {/* 任务 */}
                   <Route path="/tasks" element={<TaskListPage />} />
                   <Route path="/tasks/new" element={<TaskCreatePage />} />
                   <Route path="/tasks/:taskId/logs" element={<TaskLogsPage />} />
+
+                  {/* 设置 */}
                   <Route path="/settings" element={<SettingsPage />} />
                 </Route>
               </Route>

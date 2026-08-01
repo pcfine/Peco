@@ -1,16 +1,16 @@
+// ChatView — 共享聊天组件，被 PecoChatPage 和 AgentChatPage 共用
+
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { Button } from '@/components/ui/button'
-import { LoadingSpinner } from '@/components/common/LoadingSpinner'
-import { getPersonalSession, clearPersonalSession, personalStreamUrl } from '@/api/personal-agent'
 import { useAuthStore } from '@/stores/authStore'
 import type { ChatSseEvent, MessageData, TurnData } from '@/types/chat'
-import { Send, Square, Trash2 } from 'lucide-react'
+import { Send, Square } from 'lucide-react'
 import { toast } from 'sonner'
 import { parseSSELines, toChatSseEvent } from '@/api/stream'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-interface ChatMessage {
+export interface ChatMessage {
   role: 'user' | 'assistant' | 'tool' | 'agent-call'
   content: string
   turnIndex: number
@@ -21,37 +21,47 @@ interface ChatMessage {
   callId?: string
 }
 
+export interface ChatViewProps {
+  /** 生成 SSE 流式 URL 的函数，接收用户输入消息，返回完整 URL */
+  streamUrl: (message: string) => string
+  /** 初始消息列表（从快照恢复） */
+  initialMessages?: ChatMessage[]
+  /** 头部右侧操作区（如清除对话按钮、归档按钮） */
+  headerActions?: React.ReactNode
+  /** 头部标题 */
+  headerTitle?: string
+  /** 消息列表为空时显示的欢迎内容 */
+  welcomeMessage?: React.ReactNode
+  /** 提交反馈回调 */
+  onFeedback?: (messageId: string, rating: 'up' | 'down') => Promise<void>
+}
+
 // ── Component ──────────────────────────────────────────────────────────────
 
-export function PersonalAgentPage() {
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+export function ChatView({
+  streamUrl,
+  initialMessages = [],
+  headerActions,
+  headerTitle = '对话',
+  welcomeMessage,
+}: ChatViewProps) {
+  const [messages, setMessages] = useState<ChatMessage[]>(initialMessages)
   const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(true)
   const [streaming, setStreaming] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const token = useAuthStore((s) => s.token)
 
+  // Update messages when initialMessages change (e.g. navigation between conversations)
+  useEffect(() => {
+    setMessages(initialMessages)
+  }, [initialMessages])
+
   // Refs for stable closure access
-  const messagesRef = useRef(messages)
-  messagesRef.current = messages
   const inputRef = useRef(input)
   inputRef.current = input
   const streamingRef = useRef(streaming)
   streamingRef.current = streaming
-
-  // Load session snapshot on mount
-  useEffect(() => {
-    getPersonalSession()
-      .then((snap) => {
-        const msgs = snapshotToMessages(snap.turns)
-        setMessages(msgs)
-      })
-      .catch(() => {
-        // No snapshot yet — first time user
-      })
-      .finally(() => setLoading(false))
-  }, [])
 
   // Auto-scroll
   useEffect(() => {
@@ -74,7 +84,7 @@ export function PersonalAgentPage() {
     abortRef.current = controller
 
     try {
-      const url = personalStreamUrl(currentInput)
+      const url = streamUrl(currentInput)
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
         signal: controller.signal,
@@ -103,44 +113,32 @@ export function PersonalAgentPage() {
       setStreaming(false)
       abortRef.current = null
     }
-  }, [token])
+  }, [token, streamUrl])
 
   const handleStop = () => {
     abortRef.current?.abort()
     setStreaming(false)
   }
 
-  const handleClear = async () => {
-    try {
-      await clearPersonalSession()
-      setMessages([])
-      toast.success('对话已清除')
-    } catch {
-      toast.error('清除失败')
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
     }
   }
-
-  if (loading) return <LoadingSpinner />
 
   return (
     <div className="flex flex-col h-[calc(100vh-7rem)] max-w-4xl mx-auto">
       {/* Header */}
       <div className="flex items-center gap-3 py-3 border-b mb-4">
-        <h2 className="font-semibold flex-1">Peco 个人助理</h2>
-        <Button variant="ghost" size="sm" onClick={handleClear} disabled={streaming}>
-          <Trash2 className="h-4 w-4 mr-1" />
-          清除对话
-        </Button>
+        <h2 className="font-semibold flex-1">{headerTitle}</h2>
+        {headerActions}
       </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto space-y-4 pr-2">
-        {messages.length === 0 && (
-          <div className="text-center text-muted-foreground mt-20">
-            <p className="text-lg">你好！我是你的个人助理 👋</p>
-            <p className="text-sm mt-2">我可以帮你执行命令、管理记忆、回答问题。</p>
-            <p className="text-sm mt-1">试试说："帮我记住我喜欢用 Rust 编程"</p>
-          </div>
+        {messages.length === 0 && welcomeMessage && (
+          <div className="text-center text-muted-foreground mt-20">{welcomeMessage}</div>
         )}
         {messages.map((msg, i) => (
           <ChatBubble key={i} message={msg} />
@@ -155,12 +153,7 @@ export function PersonalAgentPage() {
           placeholder="输入消息..."
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              handleSend()
-            }
-          }}
+          onKeyDown={handleKeyDown}
           disabled={streaming}
         />
         {streaming ? (
@@ -254,10 +247,7 @@ function handleSSEEvent(
       setMessages((prev) => {
         const last = prev[prev.length - 1]
         if (last?.role === 'assistant') {
-          return [
-            ...prev.slice(0, -1),
-            { ...last, content: last.content + event.data.content },
-          ]
+          return [...prev.slice(0, -1), { ...last, content: last.content + event.data.content }]
         }
         return prev
       })
@@ -283,10 +273,7 @@ function handleSSEEvent(
             name: event.data.name,
             arguments: event.data.arguments,
           }
-          return [
-            ...prev.slice(0, -1),
-            { ...last, toolCalls: [...(last.toolCalls ?? []), tc] },
-          ]
+          return [...prev.slice(0, -1), { ...last, toolCalls: [...(last.toolCalls ?? []), tc] }]
         }
         return prev
       })
@@ -319,9 +306,7 @@ function handleSSEEvent(
     case 'agent_call_end':
       setMessages((prev) =>
         prev.map((m) =>
-          m.callId === event.data.call_id
-            ? { ...m, content: event.data.result || '(完成)' }
-            : m,
+          m.callId === event.data.call_id ? { ...m, content: event.data.result || '(完成)' } : m,
         ),
       )
       break
@@ -337,7 +322,7 @@ function handleSSEEvent(
 
 // ── Snapshot to Messages ───────────────────────────────────────────────────
 
-function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
+export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
   return turns.flatMap((turn) =>
     turn.messages.map((md: MessageData): ChatMessage => {
       if (md.role === 'user') {
@@ -346,7 +331,6 @@ function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
       if (md.role === 'tool') {
         return { role: 'tool', content: md.content ?? '', turnIndex: turn.turn_index }
       }
-      // assistant
       return {
         role: 'assistant',
         content: md.content ?? '',

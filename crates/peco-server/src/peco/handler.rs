@@ -1,17 +1,11 @@
 // ============================================================================
-// Personal Agent Handlers — Axum HTTP 端点
+// Peco Handlers — Axum HTTP 端点
 // ============================================================================
 //
 // 提供：
-//   - GET  /api/personal-agent/stream?message=xxx   SSE 流式对话
-//   - GET  /api/personal-agent/session               会话快照
-//   - DELETE /api/personal-agent/session               清除/重置会话
-//
-// 与 chat/handler.rs 的关键差异：
-//   - Sub-agent 事件映射通过 WorkspaceManager::get_agent()（AgentLoader trait）
-//     解析 agent 信息，而非 SQLite agents 表
-//   - 无 conversation CRUD——固定 perpetual session
-//   - 复用 chat::sse 的 ChatSseEvent / map_looper_event（通用，不依赖 DB）
+//   - GET  /api/peco/stream?message=xxx   SSE 流式对话
+//   - GET  /api/peco/session               会话快照
+//   - DELETE /api/peco/session              清除/重置会话
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -23,7 +17,7 @@ use axum::extract::{Query, State};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::routing::get;
 use futures::stream::Stream;
-use peco_core::agent::{AgentLooper, LooperConfig};
+use peco_core::agent::AgentLooper;
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
 use serde::{Deserialize, Serialize};
@@ -35,9 +29,9 @@ use crate::error::ApiError;
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
-use super::manager::PersonalAgentManager;
-use crate::peco::filter::PecoMessageFilter;
-use crate::peco::session::{SESSION_TITLE, private_session_id};
+use super::filter::PecoMessageFilter;
+use super::manager::PecoManager;
+use super::session::{SESSION_TITLE, private_session_id};
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
 
@@ -53,6 +47,17 @@ pub struct SuccessResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// 导出格式查询参数。
+#[derive(Debug, Deserialize)]
+pub struct ExportQuery {
+    #[serde(default = "default_export_format")]
+    pub format: String,
+}
+
+fn default_export_format() -> String {
+    "json".to_string()
 }
 
 /// 工具调用简化格式。
@@ -93,16 +98,15 @@ pub struct SessionSnapshotResponse {
     pub total_usage: UsageData,
 }
 
-// ── Handler: GET /api/personal-agent/stream ────────────────────────────────
+// ── Handler: GET /api/peco/stream ────────────────────────────────────────
 
 /// SSE 流式对话。
 ///
 /// 核心流程：
-/// 1. 初始化 PersonalAgentManager（含幂等模板安装、Agent 加载）
+/// 1. 初始化 PecoManager（含幂等模板安装、Agent 加载）
 /// 2. 加载/创建 Perpetual Session
-/// 3. 创建 SSE channel + 后台 tokio 任务
-/// 4. 构建 LooperConfig（无 PPA 组件）+ AgentLooper
-/// 5. 事件循环：LooperEvent → ChatSseEvent → SSE
+/// 3. 构建 LooperConfig（从 PecoConfig）+ AgentLooper
+/// 4. 事件循环：LooperEvent → ChatSseEvent → SSE
 pub async fn stream_chat(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -114,7 +118,7 @@ pub async fn stream_chat(
     }
 
     // ── 1. 初始化 Manager ──────────────────────────────────────────────
-    let manager = PersonalAgentManager::new(&state, &user_id).await?;
+    let manager = PecoManager::new(&state, &user_id).await?;
 
     let session_id = private_session_id(&user_id);
     let conv_id = session_id.clone();
@@ -126,7 +130,7 @@ pub async fn stream_chat(
             tracing::info!(
                 user_id = %user_id,
                 turns = snapshot.committed_turns.len(),
-                "Personal agent session restored"
+                "Peco session restored"
             );
             let created_at = snapshot
                 .committed_turns
@@ -136,7 +140,7 @@ pub async fn stream_chat(
                 .unwrap_or_else(|| {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+                        .unwrap_or_else(|_| Duration::from_secs(0))
                         .as_secs()
                 });
             Box::new(Session::from_snapshot(
@@ -147,37 +151,30 @@ pub async fn stream_chat(
             ))
         }
         _ => {
-            tracing::info!(user_id = %user_id, "Creating new personal agent session");
+            tracing::info!(user_id = %user_id, "Creating new Peco session");
             Box::new(Session::new(session_id.clone(), SESSION_TITLE.to_string()))
         }
     };
 
-    // ── 3. 创建 SSE channel ─────────────────────────────────────────
+    // ── 3. 创建 SSE channel ─────────────────────────────────────────────
     let (sse_tx, sse_rx) = mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(256);
 
-    // ── 4. 克隆值给后台任务 ────────────────────────────────────────
+    // ── 4. 克隆值给后台任务 ────────────────────────────────────────────
     let agent = Arc::clone(manager.agent());
+    let config = manager.config().clone();
     let conv_id_bg = conv_id.clone();
     let message_bg = message.clone();
-    let db_bg = state.db.clone();
 
     tokio::spawn(async move {
         let persister: Arc<dyn SessionPersister> =
-            Arc::new(SqliteSessionPersister::new(db_bg.clone()));
+            Arc::new(SqliteSessionPersister::new(state.db.clone()));
 
-        // 构建 LooperConfig（无 PPA 组件）
-        let config = LooperConfig {
-            event_buffer: 256,
-            per_turn_timeout: Some(Duration::from_secs(300)),
-            total_timeout: Some(Duration::from_secs(1800)),
-            persist_on_failure: true,
-            dynamic_context: None,
-            hooks: Vec::new(),
-            message_filter: Some(Arc::new(PecoMessageFilter::new(10))),
-            ..LooperConfig::default()
-        };
+        // 构建 LooperConfig（从 PecoConfig + MessageFilter）
+        let looper_config = config.to_looper_config(Arc::new(PecoMessageFilter::new(
+            config.max_history_messages,
+        )));
 
-        let handle = AgentLooper::spawn(agent, session, config, persister.clone());
+        let handle = AgentLooper::spawn(agent, session, looper_config, persister.clone());
 
         // 发送用户消息
         if let Err(e) = handle.send_query(message_bg.clone()).await {
@@ -191,7 +188,7 @@ pub async fn stream_chat(
             return;
         }
 
-        // 事件循环：LooperEvent → SSE
+        // ── 5. 事件循环：LooperEvent → SSE ──────────────────────────────
         loop {
             match handle.recv_event().await {
                 Some(peco_core::agent::LooperEvent::Shutdown { total_usage, .. }) => {
@@ -221,7 +218,7 @@ pub async fn stream_chat(
         drop(handle);
     });
 
-    // ── 5. 返回 SSE 响应 ─────────────────────────────────────────
+    // ── 6. 返回 SSE 响应 ─────────────────────────────────────────────────
     let stream = tokio_stream::wrappers::ReceiverStream::new(sse_rx);
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -230,9 +227,9 @@ pub async fn stream_chat(
     ))
 }
 
-// ── Handler: GET /api/personal-agent/session ──────────────────────────────
+// ── Handler: GET /api/peco/session ──────────────────────────────────────
 
-/// 获取个人助理会话快照。
+/// 获取 Peco 永续会话快照。
 ///
 /// 返回完整的 turn 历史（含 tool calls、reasoning_content），
 /// 供前端刷新页面后重建聊天 UI。
@@ -302,7 +299,7 @@ pub async fn get_session_snapshot(
         user_id = %user_id,
         session_id = %session_id,
         turn_count = turns.len(),
-        "Personal agent session snapshot returned"
+        "Peco session snapshot returned"
     );
 
     Ok(Json(SessionSnapshotResponse {
@@ -312,9 +309,9 @@ pub async fn get_session_snapshot(
     }))
 }
 
-// ── Handler: DELETE /api/personal-agent/session ───────────────────────────
+// ── Handler: DELETE /api/peco/session ───────────────────────────────────
 
-/// 清除个人助理会话（重置对话）。
+/// 清除 Peco 永续会话（重置对话）。
 ///
 /// 删除 session_snapshots 表中的持久化记录。
 /// 下次对话将创建全新的 Session。
@@ -328,12 +325,12 @@ pub async fn clear_session(
     persister
         .delete(&session_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to clear personal agent session: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("failed to clear Peco session: {e}")))?;
 
     tracing::info!(
         user_id = %user_id,
         session_id = %session_id,
-        "Personal agent session cleared"
+        "Peco session cleared"
     );
 
     Ok(Json(SuccessResponse {
@@ -344,14 +341,55 @@ pub async fn clear_session(
 
 // ── Router ─────────────────────────────────────────────────────────────────
 
-/// 构建个人助理路由。
+/// `GET /api/peco/session/export?format=json|markdown`
+pub async fn export_session(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let session_id = private_session_id(&user_id);
+    let persister = SqliteSessionPersister::new(state.db.clone());
+    let snapshot_opt = persister
+        .load(&session_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to load session: {e}")))?;
+
+    match params.format.as_str() {
+        "markdown" => {
+            let md = crate::chat::handler::snapshot_to_markdown(&snapshot_opt, &session_id);
+            Ok(axum::response::Response::builder()
+                .header("Content-Type", "text/markdown; charset=utf-8")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"peco-session-{session_id}.md\""),
+                )
+                .body(axum::body::Body::from(md))
+                .unwrap())
+        }
+        _ => {
+            let json = serde_json::to_string_pretty(&snapshot_opt).unwrap_or_default();
+            Ok(axum::response::Response::builder()
+                .header("Content-Type", "application/json; charset=utf-8")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"peco-session-{session_id}.json\""),
+                )
+                .body(axum::body::Body::from(json))
+                .unwrap())
+        }
+    }
+}
+
+/// 构建 Peco 路由。
 ///
-/// 注册到 `/api/personal-agent`：
+/// 注册到 `/api/peco`：
 /// - `GET /stream` — SSE 流式对话
 /// - `GET /session` — 获取会话快照
 /// - `DELETE /session` — 清除会话
+/// - `GET /session/export` — 导出会话
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
         .route("/session", get(get_session_snapshot).delete(clear_session))
+        .route("/session/export", get(export_session))
 }

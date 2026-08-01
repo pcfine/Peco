@@ -27,6 +27,7 @@ jsonwebtoken = { workspace = true }
 bcrypt = { workspace = true }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+toml = "0.8"
 
 # Serialization
 serde = { workspace = true }

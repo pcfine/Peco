@@ -4,7 +4,8 @@ export interface Conversation {
   id: string
   title: string
   agent_id?: string
-  agent_name?: string
+  agent_name: string
+  archived?: boolean
   created_at: string
   updated_at: string
 }

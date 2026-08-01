@@ -12,6 +12,7 @@ tools:
   - shell
   - fetch
   - delegate_sub_agent
+  - save_agent
 skills: []
 max_turns: 30
 ---
@@ -25,7 +26,8 @@ max_turns: 30
 1. **Shell** — 执行终端命令，进行文件操作、代码编译、测试运行等
 2. **Fetch** — 从互联网获取内容，阅读文档和网页
 3. **Delegate Sub Agent** — 委托子 Agent 处理特定任务
-4. **知识库搜索** — 在个人知识库中检索信息
+4. **Save Agent** — 创建或更新 Agent 配置（agent.md），用户可通过对话创建新的 Agent
+5. **知识库搜索** — 在个人知识库中检索信息
 
 ## 记忆管理
 

@@ -264,7 +264,8 @@ impl PersonalAssistantManager {
     async fn ensure_agent_installed(ws: &peco_core::workspace::WorkSpace) -> Result<(), ApiError> {
         // `save_agent` is idempotent: create_dir_all is a no-op on existing dirs,
         // fs::write is atomic, and the content from include_str! is always identical.
-        let content = include_str!("personal_assistant_agent.md");
+        // DEPRECATED: 使用最小化的内联 agent.md 内容替代已删除的嵌入文件
+        let content = "---\nagent:\n  name: \"个人助理\"\n  description: \"DEPRECATED\"\nllm:\n  provider: \"deepseek\"\n  model: \"deepseek-v4-flash\"\ntools: []\nmax_turns: 20\n---\n# DEPRECATED\nThis module is deprecated. Use crate::peco instead.\n";
 
         ws.agent_manager()
             .save(PERSONAL_ASSISTANT_AGENT_NAME, content)

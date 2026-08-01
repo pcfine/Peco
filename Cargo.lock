@@ -5220,6 +5220,7 @@ dependencies = [
  "tokio",
  "tokio-cron-scheduler",
  "tokio-stream",
+ "toml",
  "tower",
  "tower-http",
  "tracing",
