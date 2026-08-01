@@ -1,41 +1,41 @@
-import { useEffect, useState } from 'react'
-import { ChatView, snapshotToMessages } from '@/components/chat/ChatView'
-import { getPecoSession, clearPecoSession, pecoStreamUrl } from '@/api/peco'
+import { useEffect } from 'react'
+import { ChatView } from '@/components/chat/ChatView'
+import { pecoStreamUrl } from '@/api/peco'
+import { usePecoChatStore } from '@/stores/pecoChatStore'
 import { LoadingSpinner } from '@/components/common/LoadingSpinner'
 import { Button } from '@/components/ui/button'
 import { Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
-import type { ChatMessage } from '@/components/chat/ChatView'
 
 export function PecoChatPage() {
-  const [initialMessages, setInitialMessages] = useState<ChatMessage[]>([])
-  const [loading, setLoading] = useState(true)
-  const [sessionId, setSessionId] = useState(0) // increment to force ChatView remount
+  const messages = usePecoChatStore((s) => s.messages)
+  const loading = usePecoChatStore((s) => s.loading)
+  const loaded = usePecoChatStore((s) => s.loaded)
+  const sessionKey = usePecoChatStore((s) => s.sessionKey)
+  const load = usePecoChatStore((s) => s.load)
+  const clear = usePecoChatStore((s) => s.clear)
 
   useEffect(() => {
-    getPecoSession()
-      .then((snap) => setInitialMessages(snapshotToMessages(snap.turns)))
-      .catch(() => {})
-      .finally(() => setLoading(false))
-  }, [sessionId])
+    load()
+  }, [load])
 
   const handleClear = async () => {
     try {
-      await clearPecoSession()
-      setSessionId((s) => s + 1)
+      await clear()
       toast.success('对话已清除')
     } catch {
       toast.error('清除失败')
     }
   }
 
-  if (loading) return <LoadingSpinner />
+  // 首次加载且无缓存数据时显示 loading
+  if (loading && !loaded) return <LoadingSpinner />
 
   return (
     <ChatView
-      key={sessionId}
+      key={sessionKey}
       streamUrl={pecoStreamUrl}
-      initialMessages={initialMessages}
+      initialMessages={messages}
       headerTitle="Peco"
       headerActions={
         <Button variant="ghost" size="sm" onClick={handleClear}>

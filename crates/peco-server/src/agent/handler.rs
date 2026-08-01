@@ -96,6 +96,7 @@ pub struct AgentListItem {
     pub color: String,
     pub status: String,
     pub tools: Vec<String>,
+    pub knowledge_bases: Vec<String>,
     pub created_at: String,
 }
 
@@ -260,13 +261,51 @@ pub async fn list(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<AgentListItem>>, ApiError> {
-    let rows = agents::list_index_by_user(&state.db, &user_id).await?;
     let ws = state.workspace_manager.get(&user_id)?;
+
+    // ── 自动注册：磁盘上存在但 DB 中缺失的 Agent ─────────────────────
+    // 确保手动创建或模板安装的 Agent 自动出现在列表中。
+    {
+        let db_names: std::collections::HashSet<String> =
+            agents::list_index_by_user(&state.db, &user_id)
+                .await?
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+
+        let disk_metas = ws.agent_manager().list_meta();
+        for meta in &disk_metas {
+            if !db_names.contains(&meta.name) {
+                let params = CreateAgentParams {
+                    id: Uuid::new_v4().to_string(),
+                    user_id: user_id.clone(),
+                    name: meta.name.clone(),
+                    description: meta.description.clone(),
+                    icon: "🤖".to_string(),
+                    color: "#6366f1".to_string(),
+                };
+                if let Err(e) = agents::insert(&state.db, &params).await {
+                    tracing::warn!(
+                        agent = %meta.name,
+                        error = %e,
+                        "Failed to auto-register agent found on disk"
+                    );
+                } else {
+                    tracing::info!(
+                        agent = %meta.name,
+                        "Auto-registered agent from disk"
+                    );
+                }
+            }
+        }
+    }
+
+    let rows = agents::list_index_by_user(&state.db, &user_id).await?;
 
     let mut items: Vec<AgentListItem> = Vec::with_capacity(rows.len());
     for r in &rows {
-        // 尝试从 agent.md 读取 tools/model/provider（失败则使用空默认值）
-        let (tools, model, provider) = read_agent_md_light(ws.agent_manager(), &r.name);
+        // 尝试从 agent.md 读取 tools/model/provider/knowledge_bases（失败则使用空默认值）
+        let (tools, model, provider, knowledge_bases) = read_agent_md_light(ws.agent_manager(), &r.name);
         items.push(AgentListItem {
             id: r.id.clone(),
             name: r.name.clone(),
@@ -277,30 +316,31 @@ pub async fn list(
             color: r.color.clone(),
             status: r.status.clone(),
             tools,
+            knowledge_bases,
             created_at: r.created_at.clone(),
         });
     }
     Ok(Json(items))
 }
 
-/// 从 agent.md 读取轻量字段（tools, model, provider）。
+/// 从 agent.md 读取轻量字段（tools, model, provider, knowledge_bases）。
 /// 读取失败时返回空默认值，不阻塞列表渲染。
 fn read_agent_md_light(
     agent_manager: &peco_core::agent::AgentManager,
     name: &str,
-) -> (Vec<String>, Option<String>, Option<String>) {
+) -> (Vec<String>, Option<String>, Option<String>, Vec<String>) {
     let path = agent_manager.md_path(name);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return (Vec::new(), None, None),
+        Err(_) => return (Vec::new(), None, None, Vec::new()),
     };
     let (profile, _body) = match peco_core::agent::agent_config::parse_agent_md(&content) {
         Ok(p) => p,
-        Err(_) => return (Vec::new(), None, None),
+        Err(_) => return (Vec::new(), None, None, Vec::new()),
     };
     let model = profile.llm.as_ref().and_then(|l| l.model.clone());
     let provider = profile.llm.as_ref().and_then(|l| l.provider.clone());
-    (profile.tools, model, provider)
+    (profile.tools, model, provider, profile.knowledge_bases)
 }
 
 /// `POST /api/agents`

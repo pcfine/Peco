@@ -89,6 +89,10 @@ export function ChatView({
         headers: { Authorization: `Bearer ${token}` },
         signal: controller.signal,
       })
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '')
+        throw new Error(errText || `HTTP ${response.status}`)
+      }
       const reader = response.body!.getReader()
       const decoder = new TextDecoder()
       let buffer = ''

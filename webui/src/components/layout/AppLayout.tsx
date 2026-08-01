@@ -12,7 +12,7 @@ export function AppLayout() {
   const collapsed = useSidebarStore((s) => s.collapsed)
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background">
+    <div className="flex h-full overflow-hidden bg-background">
       {/* Desktop sidebar */}
       <div className="hidden md:block h-full shrink-0">
         <Sidebar />

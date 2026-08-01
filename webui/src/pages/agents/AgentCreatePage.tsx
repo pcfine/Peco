@@ -11,7 +11,7 @@ export function AgentCreatePage() {
     try {
       const agent = await createAgent(data)
       toast.success('Agent 创建成功')
-      navigate(`/agents/${agent.id}/edit`)
+      navigate(`/manage/agents/${agent.id}/edit`)
     } catch {
       toast.error('创建失败')
     }

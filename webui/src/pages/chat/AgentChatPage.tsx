@@ -23,8 +23,18 @@ export function AgentChatPage() {
         .catch(() => {})
         .finally(() => setLoading(false))
     } else {
-      setInitialMessages([])
-      setLoading(false)
+      // 没有 conversationId 时自动创建对话，避免 streamUrl 中出现 "undefined"
+      createConversation(agentId)
+        .then((conv) => {
+          navigate(`/chat/${agentId}/${conv.id}`, { replace: true })
+          setConvId(conv.id)
+          setInitialMessages([])
+          setLoading(false)
+        })
+        .catch(() => {
+          toast.error('创建对话失败')
+          setLoading(false)
+        })
     }
   }, [agentId, convId])
 

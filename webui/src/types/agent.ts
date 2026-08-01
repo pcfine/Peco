@@ -9,6 +9,7 @@ export interface AgentListItem {
   color: string
   status: string
   tools?: string[]
+  knowledge_bases?: string[]
   created_at: string
 }
 
