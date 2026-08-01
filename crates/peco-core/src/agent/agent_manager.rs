@@ -16,8 +16,9 @@ use tracing::{debug, info, warn};
 
 use crate::agent::agent_config::{AgentProfile, split_frontmatter};
 use crate::agent::{Agent, AgentError};
-use crate::config::UserConfig;
+use crate::config::{McpConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
+use crate::mcp::McpConfigStore;
 use crate::skills::SkillRegister;
 use crate::workspace::{
     AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, WorkspaceError,
@@ -46,6 +47,8 @@ pub struct AgentManager {
     agents_dir: PathBuf,
     user_id: String,
     user_config: UserConfig,
+    /// MCP 配置的共享持有者（与 `user_config.mcp` 解耦，支持独立热重载）。
+    mcp_config: McpConfigStore,
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
     /// Tier-1 元数据缓存（name → AgentMeta）
@@ -62,6 +65,7 @@ impl AgentManager {
         agents_dir: PathBuf,
         user_id: String,
         user_config: UserConfig,
+        mcp_config: McpConfigStore,
         skill_registry: Arc<SkillRegister>,
         knowledge_manager: Arc<KnowledgeManager>,
     ) -> Self {
@@ -69,6 +73,7 @@ impl AgentManager {
             agents_dir,
             user_id,
             user_config,
+            mcp_config,
             skill_registry,
             knowledge_manager,
             metas: RwLock::new(HashMap::new()),
@@ -132,6 +137,13 @@ impl AgentManager {
         })
     }
 
+    /// 重新扫描 `agents/` 目录，刷新 Tier-1 元数据缓存。
+    /// 不清除 Tier-2 缓存 — 已加载的 Agent 实例（含 MCP 连接）不受影响。
+    /// 返回重新发现的 Agent 数量。
+    pub fn rescan(&self) -> Result<usize, AgentError> {
+        self.init()
+    }
+
     // ── Agent 加载 ───────────────────────────────────────────────────
 
     /// 加载 Agent（带 Tier-2 缓存）。
@@ -171,6 +183,9 @@ impl AgentManager {
     }
 
     /// 从 agent.md 文件组装 Agent 实例。
+    ///
+    /// 合成 `UserConfig`：providers 不变，mcp 来自 `McpConfigStore` 快照。
+    /// 这样已缓存的 Agent 获取的是加载时的 MCP 配置快照，不受后续热更新影响。
     fn load_from_file(&self, name: &str, deps: ToolDependencies) -> Result<Agent, AgentError> {
         let path = self.md_path(name);
         if !path.exists() {
@@ -179,7 +194,9 @@ impl AgentManager {
                 path.display()
             )));
         }
-        Agent::from_file(&path, &self.user_config, &deps)
+        let mut effective_config = self.user_config.clone();
+        effective_config.mcp = self.mcp_config.get();
+        Agent::from_file(&path, &effective_config, &deps)
     }
 
     // ── 依赖构建 ────────────────────────────────────────────────────
@@ -203,12 +220,16 @@ impl AgentManager {
     ///
     /// 使用轻量 ref 结构避免 `Arc<Self>` 循环依赖，
     /// 供 [`AgentAccess`] trait 的 `load_agent(&self)` 实现使用。
+    ///
+    /// `AmAgentAccess` 在构造时获得 MCP 配置快照，保持"已构造 Agent 不受热更新影响"的语义。
     fn build_deps_direct(&self) -> ToolDependencies {
+        let mut config = self.user_config.clone();
+        config.mcp = self.mcp_config.get();
         ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
                 user_id: self.user_id.clone(),
-                user_config: self.user_config.clone(),
+                user_config: config,
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
             }),
@@ -254,6 +275,12 @@ impl AgentManager {
             cache.remove(name);
             debug!(agent = %name, "Agent cache invalidated");
         }
+    }
+
+    /// 重新加载 MCP 配置。仅影响后续新加载的 Agent；
+    /// 已缓存的 Agent 实例保持原有 MCP 连接。
+    pub fn reload_mcp_config(&self, workspace_root: &Path, system_mcp: &McpConfig) -> usize {
+        self.mcp_config.reload(workspace_root, system_mcp)
     }
 
     // ── 文件 CRUD ───────────────────────────────────────────────────

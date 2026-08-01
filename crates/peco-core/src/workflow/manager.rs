@@ -136,6 +136,13 @@ impl WorkflowManager {
 
     // ── 元数据查询 ──────────────────────────────────────────────────
 
+    /// 重新扫描 `workflows/` 目录，刷新 Tier-1 元数据。
+    /// 不清除 Tier-2 定义缓存 — 已加载的 WorkflowDefinition 实例不受影响。
+    /// 返回重新发现的 Workflow 数量。
+    pub fn rescan(&self) -> Result<usize, WorkflowError> {
+        self.init()
+    }
+
     /// 返回所有已缓存 Workflow 的 Tier-1 元数据列表。
     pub fn list_meta(&self) -> Vec<WorkflowMeta> {
         self.metas

@@ -67,6 +67,7 @@
 pub mod connection;
 pub mod error;
 pub mod mcp_client_handler;
+pub mod mcp_config_store;
 pub mod mcp_manager;
 pub mod tool;
 
@@ -74,5 +75,6 @@ pub mod tool;
 pub use crate::config::{McpConfig, McpServerConfig, TransportType, resolve_env_vars};
 pub use error::{McpClientError, McpError};
 pub use mcp_client_handler::McpClientHandler;
+pub use mcp_config_store::McpConfigStore;
 pub use mcp_manager::McpManager;
 pub use tool::McpTool;

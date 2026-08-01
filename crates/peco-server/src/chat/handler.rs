@@ -412,6 +412,7 @@ pub async fn stream_chat(
 
         let mut assistant_text = String::new();
         let mut sub_agent_registry: HashMap<String, Vec<SubAgentInfo>> = HashMap::new();
+        let mut is_first_turn = true;
 
         let resolve_agent_id = |agent_name: &str| -> String {
             tokio::task::block_in_place(|| {
@@ -526,31 +527,34 @@ pub async fn stream_chat(
 
                 Some(event @ LooperEvent::TurnComplete { .. }) => {
                     if !assistant_text.is_empty() {
-                        let preview: String = assistant_text.chars().take(500).collect();
                         let _ = messages::insert(
                             &db_for_bg,
                             &Uuid::new_v4().to_string(),
                             &conv_id_for_bg,
                             "assistant",
-                            &preview,
+                            &assistant_text,
                             None,
                             None,
                         )
                         .await;
 
-                        let short: String = assistant_text.chars().take(50).collect();
-                        let new_title = if short.len() >= assistant_text.len() {
-                            short
-                        } else {
-                            format!("{short}...")
-                        };
-                        if new_title.len() > 3 {
-                            let _ = conversations::update_title(
-                                &db_for_bg,
-                                &conv_id_for_bg,
-                                &new_title,
-                            )
-                            .await;
+                        // 仅首轮对话时根据 assistant 回复自动生成标题
+                        if is_first_turn {
+                            let short: String = assistant_text.chars().take(50).collect();
+                            let new_title = if short.len() >= assistant_text.len() {
+                                short
+                            } else {
+                                format!("{short}...")
+                            };
+                            if new_title.len() > 3 {
+                                let _ = conversations::update_title(
+                                    &db_for_bg,
+                                    &conv_id_for_bg,
+                                    &new_title,
+                                )
+                                .await;
+                            }
+                            is_first_turn = false;
                         }
                     }
                     assistant_text.clear();
@@ -763,7 +767,10 @@ pub async fn export_conversation(
 }
 
 pub(crate) fn snapshot_to_markdown(
-    snapshot_opt: &Option<(peco_core::session::SessionSnapshot, peco_core::session::SessionMeta)>,
+    snapshot_opt: &Option<(
+        peco_core::session::SessionSnapshot,
+        peco_core::session::SessionMeta,
+    )>,
     conv_id: &str,
 ) -> String {
     let mut md = format!("# 对话记录 — {conv_id}\n\n");
@@ -779,9 +786,7 @@ pub(crate) fn snapshot_to_markdown(
                     }
                     "assistant" => {
                         if let Some(reasoning) = msg.reasoning_content() {
-                            md.push_str(&format!(
-                                "\n> 推理：{reasoning}\n"
-                            ));
+                            md.push_str(&format!("\n> 推理：{reasoning}\n"));
                         }
                         if let Some(tool_calls) = msg.tool_calls() {
                             for tc in tool_calls {

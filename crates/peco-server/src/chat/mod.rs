@@ -168,12 +168,7 @@ async fn session_legacy(
         .await?
         .map(|c| c.agent_name)
         .unwrap_or_else(|| "unknown".to_string());
-    handler::get_session_snapshot(
-        user,
-        state,
-        axum::extract::Path((agent_name, conv_id)),
-    )
-    .await
+    handler::get_session_snapshot(user, state, axum::extract::Path((agent_name, conv_id))).await
 }
 
 async fn stream_legacy(

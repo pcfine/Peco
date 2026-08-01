@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::config::{Skill, SkillMeta};
 use super::error::SkillError;
@@ -275,6 +275,81 @@ impl SkillRegister {
             activated: inner.activated.len(),
             errors: inner.error_count,
         }
+    }
+
+    // ── 热重载 / 缓存管理 ────────────────────────────────────────────
+
+    /// 重新扫描 skills 目录，刷新 Tier-1 元数据。
+    ///
+    /// 磁盘上已不存在的 Skill 会从 Tier-2 缓存中移除
+    ///（Skill 不携带运行时状态，移除是安全的）。
+    /// 仍然有效的已激活 Skill 会被保留。
+    ///
+    /// 返回重新扫描后发现的 Skill 数量。
+    ///
+    /// # 注意
+    ///
+    /// 此方法执行同步 I/O（`fs::read_dir` + `fs::read_to_string`）。
+    /// 不在热路径上 — 调用方应仅在响应显式重载请求时调用，而非正常运行期间。
+    pub fn rescan(&self) -> usize {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+        let (metas, errors) = inner.loader.load_all_meta();
+
+        inner.metas.clear();
+        for meta in metas {
+            inner.metas.insert(meta.name.clone(), meta);
+        }
+        inner.error_count = errors.len();
+
+        // 移除磁盘上已不存在的 Tier-2 条目。
+        // 先收集有效名称，避免 `inner.metas` 的借用
+        // 与 `activated.retain` 的闭包冲突。
+        let valid_names: Vec<String> = inner.metas.keys().cloned().collect();
+        inner.activated.retain(|name, _| valid_names.contains(name));
+
+        let count = inner.metas.len();
+        drop(inner);
+        info!(count, "Skill 注册表已重新扫描");
+        count
+    }
+
+    /// 刷新单个 Skill 的缓存数据。
+    ///
+    /// 使 Tier-2 缓存条目失效，以便下次调用 [`activate`](Self::activate)
+    /// 时从磁盘重新加载完整的 SKILL.md。同时刷新该 Skill 的 Tier-1 元数据。
+    ///
+    /// 若该 Skill 在磁盘上已不存在，则同时移除 Tier-1 和 Tier-2 条目
+    ///（效果等同于 [`remove_one`](Self::remove_one)）。
+    pub fn refresh_one(&self, name: &str) {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+
+        // 使 Tier-2 失效
+        inner.activated.remove(name);
+
+        // 重新加载该 Skill 的 Tier-1 元数据
+        let (metas, _) = inner.loader.load_all_meta();
+        match metas.into_iter().find(|m| m.name == name) {
+            Some(meta) => {
+                inner.metas.insert(name.to_string(), meta);
+                debug!(name = %name, "Skill 缓存已刷新");
+            }
+            None => {
+                // Skill 在磁盘上已不存在 — 完全移除
+                inner.metas.remove(name);
+                debug!(name = %name, "Skill 已从缓存中移除（磁盘上已不存在）");
+            }
+        }
+    }
+
+    /// 从 Tier-1 和 Tier-2 缓存中移除某个 Skill。
+    ///
+    /// 当 Skill 目录被外部删除时使用此方法。
+    /// 不会触碰文件系统。
+    pub fn remove_one(&self, name: &str) {
+        let mut inner = self.inner.write().expect("RwLock poisoned");
+        inner.metas.remove(name);
+        inner.activated.remove(name);
+        debug!(name = %name, "Skill 已从缓存中移除");
     }
 }
 

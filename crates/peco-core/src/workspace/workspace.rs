@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::AgentManager;
-use crate::config::{SystemConfig, UserConfig};
+use crate::config::{McpConfig, SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
+use crate::mcp::McpConfigStore;
 use crate::skills::SkillRegister;
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::{WorkflowAccess, WorkflowManager};
@@ -91,10 +92,12 @@ impl WorkSpace {
         let knowledge_manager = Arc::new(KnowledgeManager::new(kb_dir));
 
         let agents_dir = root.join("agents");
+        let mcp_config_store = McpConfigStore::new(config.mcp.clone());
         let agent_manager = Arc::new(AgentManager::new(
             agents_dir,
             user_id.clone(),
             config.clone(),
+            mcp_config_store,
             skill_registry.clone(),
             knowledge_manager.clone(),
         ));
@@ -144,6 +147,16 @@ impl WorkSpace {
     }
     pub fn workflow_manager(&self) -> &Arc<WorkflowManager> {
         &self.workflow_manager
+    }
+
+    // ── 热重载 ───────────────────────────────────────────────────
+
+    /// 重新加载 MCP 配置（从 workspace 的 `mcpconfig.json`）。
+    ///
+    /// 仅影响后续新加载的 Agent；已缓存的 Agent 保持原有 MCP 连接。
+    /// 注意：此方法不更新 [`config()`](Self::config) 返回值中的 MCP 配置。
+    pub fn reload_mcp_config(&self, system_mcp: &McpConfig) -> usize {
+        self.agent_manager.reload_mcp_config(&self.root, system_mcp)
     }
 
     // ── Tool 组装 ────────────────────────────────────────────────────

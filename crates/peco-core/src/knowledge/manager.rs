@@ -77,6 +77,19 @@ impl KnowledgeManager {
         Ok(())
     }
 
+    /// 丢弃底层 `KnowledgeBaseManager` 并重新加载。
+    ///
+    /// 适用于工作空间下新增或删除了知识库配置后触发全量刷新。
+    /// 注意：若配置了 `auto_sync_on_start`，reload 后允许再次自动同步。
+    pub async fn reload(&self) -> Result<(), KnowledgeModuleError> {
+        let mut guard = self.underlying.lock().await;
+        *guard = None;
+        drop(guard);
+        // 允许重新触发 auto_sync
+        self.auto_sync_done.store(false, Ordering::SeqCst);
+        self.ensure_loaded().await
+    }
+
     /// 如配置了 `auto_sync_on_start`，执行一次自动同步（仅首次调用生效）。
     ///
     /// 幂等 — 第二次调用不会有任何效果。
