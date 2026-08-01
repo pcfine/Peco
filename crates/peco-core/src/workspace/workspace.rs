@@ -159,6 +159,69 @@ impl WorkSpace {
         self.agent_manager.reload_mcp_config(&self.root, system_mcp)
     }
 
+    /// 重新加载单个 Agent 的缓存（Tier-2 失效 + Tier-1 刷新）。
+    ///
+    /// 适用于 agent.md 文件被外部修改（如 IDE 编辑）后的场景。
+    /// 下次 [`AgentManager::load_cached`] 调用将重新解析 agent.md。
+    pub fn reload_agent(&self, name: &str) {
+        self.agent_manager.refresh_one(name);
+    }
+
+    /// 重新扫描所有 Agent（刷新 Tier-1 元数据）。
+    pub fn reload_agents(&self) -> Result<usize, crate::agent::AgentError> {
+        self.agent_manager.rescan()
+    }
+
+    /// 重新加载单个 Skill（Tier-2 失效 + Tier-1 刷新）。
+    ///
+    /// 适用于 SKILL.md 文件被修改后的场景。
+    /// 如果 Skill 目录已被删除，则从注册表中完全移除。
+    pub fn reload_skill(&self, name: &str) {
+        self.skill_registry.refresh_one(name);
+    }
+
+    /// 从 SkillRegister 缓存中移除一个 Skill（不触碰文件系统）。
+    ///
+    /// 适用于 Skill 目录已被外部删除的场景。
+    pub fn remove_skill(&self, name: &str) {
+        self.skill_registry.remove_one(name);
+    }
+
+    /// 重新扫描所有 Skill（刷新 Tier-1 + 清理过期的 Tier-2 条目）。
+    pub fn reload_skills(&self) -> usize {
+        self.skill_registry.rescan()
+    }
+
+    /// 重新加载单个 Workflow（Tier-2 失效 + 重新解析）。
+    pub fn reload_workflow(
+        &self,
+        name: &str,
+    ) -> Result<crate::workflow::WorkflowDefinition, crate::workflow::WorkflowError> {
+        self.workflow_manager.reload(name)
+    }
+
+    /// 重新扫描所有 Workflow（刷新 Tier-1 元数据）。
+    pub fn reload_workflows(&self) -> Result<usize, crate::workflow::WorkflowError> {
+        self.workflow_manager.rescan()
+    }
+
+    /// 重新加载知识库管理器（拆毁并重建底层 KnowledgeBaseManager）。
+    ///
+    /// 适用于 kb_config.json 变更后需要重新发现知识库的场景。
+    pub async fn reload_knowledge(
+        &self,
+    ) -> Result<(), crate::knowledge::KnowledgeModuleError> {
+        self.knowledge_manager.reload().await
+    }
+
+    /// 增量同步单个知识库（扫描 docs/ 目录，对比哈希，更新数据库）。
+    pub async fn sync_knowledge(
+        &self,
+        kb_name: &str,
+    ) -> Result<crate::knowledge::SyncReport, crate::knowledge::KnowledgeModuleError> {
+        self.knowledge_manager.sync_kb(kb_name).await
+    }
+
     // ── Tool 组装 ────────────────────────────────────────────────────
 
     pub fn build_tool_executor(self: &Arc<Self>, tool_names: &[String]) -> Arc<dyn ToolExecutor> {

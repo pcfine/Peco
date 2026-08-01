@@ -39,24 +39,15 @@ pub async fn list(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<SkillInfo>>, ApiError> {
-    let dir = skills_dir(&user_id, &state);
-    let mut skills = Vec::new();
-
-    if dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&dir)
-    {
-        for entry in entries.flatten() {
-            let skill_md = entry.path().join("SKILL.md");
-            if skill_md.exists()
-                && let Ok(content) = std::fs::read_to_string(&skill_md)
-            {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let description = extract_description(&content);
-                skills.push(SkillInfo { name, description });
-            }
-        }
-    }
-
+    let ws = state.workspace_manager.get(&user_id)?;
+    let metas = ws.skill_registry().all_meta();
+    let skills: Vec<SkillInfo> = metas
+        .into_iter()
+        .map(|m| SkillInfo {
+            name: m.name,
+            description: m.description,
+        })
+        .collect();
     Ok(Json(skills))
 }
 
@@ -88,6 +79,11 @@ pub async fn upsert(
     std::fs::write(skill_dir.join("SKILL.md"), &req.content)
         .map_err(|e| ApiError::Internal(format!("failed to write SKILL.md: {e}")))?;
 
+    // 通知 SkillRegister 刷新该 Skill 的缓存
+    if let Ok(ws) = state.workspace_manager.get(&user_id) {
+        ws.reload_skill(&name);
+    }
+
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' saved")),
@@ -104,6 +100,12 @@ pub async fn delete_skill(
         std::fs::remove_dir_all(&skill_dir)
             .map_err(|e| ApiError::Internal(format!("failed to delete skill directory: {e}")))?;
     }
+
+    // 从 SkillRegister 缓存中移除
+    if let Ok(ws) = state.workspace_manager.get(&user_id) {
+        ws.remove_skill(&name);
+    }
+
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' deleted")),
@@ -138,21 +140,14 @@ pub async fn import_skill(
     std::fs::write(skill_dir.join("SKILL.md"), content)
         .map_err(|e| ApiError::Internal(format!("failed to write SKILL.md: {e}")))?;
 
+    // 通知 SkillRegister 刷新该 Skill 的缓存
+    if let Ok(ws) = state.workspace_manager.get(&user_id) {
+        ws.reload_skill(name);
+    }
+
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' imported")),
     }))
 }
 
-fn extract_description(content: &str) -> String {
-    for line in content.lines() {
-        if line.starts_with("description:") {
-            return line
-                .trim_start_matches("description:")
-                .trim()
-                .trim_matches('"')
-                .to_string();
-        }
-    }
-    String::new()
-}

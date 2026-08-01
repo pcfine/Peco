@@ -21,7 +21,7 @@ fn mcp_config_path(user_id: &str, state: &AppState) -> std::path::PathBuf {
     state
         .workspace_manager
         .workspace_dir(user_id)
-        .join("mcp_config.json")
+        .join("mcpconfig.json")
 }
 
 pub async fn get_config(
@@ -53,7 +53,14 @@ pub async fn update_config(
     let content = serde_json::to_string_pretty(&body)
         .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
     std::fs::write(&path, &content)
-        .map_err(|e| ApiError::Internal(format!("failed to write mcp_config.json: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("failed to write mcpconfig.json: {e}")))?;
+
+    // 通知 WorkSpace 热重载 MCP 配置
+    if let Ok(ws) = state.workspace_manager.get(&user_id) {
+        let system_mcp = state.workspace_manager.system_config().mcp.clone();
+        let count = ws.reload_mcp_config(&system_mcp);
+        tracing::info!(count, "MCP config hot-reloaded after API update");
+    }
 
     Ok(Json(SuccessResponse {
         success: true,

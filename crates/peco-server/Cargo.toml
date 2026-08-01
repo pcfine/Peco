@@ -55,6 +55,9 @@ lru = "0.14"
 # Rate limiting
 governor = "0.8"
 
+# File watcher
+notify = { workspace = true }
+
 # Utils
 chrono = { workspace = true }
 anyhow = { workspace = true }

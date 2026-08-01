@@ -14,6 +14,16 @@ use peco_core::config::SystemConfig;
 use peco_core::workspace::WorkSpace;
 
 use crate::error::ApiError;
+use crate::file_watcher::FileWatcher;
+
+/// LRU 缓存条目：WorkSpace + 可选的文件监控句柄。
+///
+/// 当条目被 LRU 驱逐时，`FileWatcher` 的 Drop 会自动停止后台监控任务。
+struct CacheEntry {
+    ws: Arc<WorkSpace>,
+    /// 文件监控句柄。Drop 时发送关闭信号。
+    _watcher: Option<FileWatcher>,
+}
 
 /// 工作空间管理器 — LRU 缓存 WorkSpace 实例。
 ///
@@ -21,13 +31,16 @@ use crate::error::ApiError;
 /// 两级缓存架构：
 /// - WorkspaceManager 缓存 WorkSpace（LRU）
 /// - WorkSpace 内部缓存 Agent（HashMap）
+///
+/// 每个新创建的 WorkSpace 会自动启动文件监控（通过 `notify` crate），
+/// 当 WorkSpace 被 LRU 驱逐时，文件监控自动停止。
 pub struct WorkspaceManager {
     /// 数据根目录。
     data_dir: PathBuf,
     /// 系统级配置（所有 WorkSpace 共享）。
     system_config: Arc<SystemConfig>,
-    /// LRU: user_id → Arc<WorkSpace>
-    cache: RwLock<LruCache<String, Arc<WorkSpace>>>,
+    /// LRU: user_id → CacheEntry (WorkSpace + FileWatcher)
+    cache: RwLock<LruCache<String, CacheEntry>>,
 }
 
 impl WorkspaceManager {
@@ -42,12 +55,14 @@ impl WorkspaceManager {
     }
 
     /// 获取或初始化用户 WorkSpace（同步）。
+    ///
+    /// 首次创建时会自动启动文件监控。
     pub fn get(&self, user_id: &str) -> Result<Arc<WorkSpace>, ApiError> {
         // Use write lock + get() (not peek) to correctly track LRU recency.
         {
             let mut cache = self.cache.write().unwrap();
-            if let Some(ws) = cache.get(user_id) {
-                return Ok(ws.clone());
+            if let Some(entry) = cache.get(user_id) {
+                return Ok(entry.ws.clone());
             }
         }
         // Lock released before expensive I/O.
@@ -59,14 +74,29 @@ impl WorkspaceManager {
 
         let ws = Arc::new(ws);
 
+        // Start file watcher for this workspace
+        let watcher = FileWatcher::start(
+            self.workspace_dir(user_id),
+            Arc::downgrade(&ws),
+        );
+
+        if watcher.is_none() {
+            tracing::warn!(user_id = %user_id, "File watcher failed to start for workspace");
+        }
+
+        let entry = CacheEntry {
+            ws: ws.clone(),
+            _watcher: watcher,
+        };
+
         // Re-acquire write lock and double-check before inserting.
         {
             let mut cache = self.cache.write().unwrap();
             // Another request may have opened the workspace while we were in I/O.
             if let Some(existing) = cache.get(user_id) {
-                return Ok(existing.clone());
+                return Ok(existing.ws.clone());
             }
-            cache.put(user_id.to_string(), ws.clone());
+            cache.put(user_id.to_string(), entry);
         }
 
         tracing::info!(user_id = %user_id, "WorkSpace opened and cached");
@@ -81,9 +111,10 @@ impl WorkspaceManager {
             .map_err(|e| ApiError::Internal(format!("failed to load agent '{agent_name}': {e}")))
     }
 
-    /// 使指定用户的 WorkSpace 缓存失效。
+    /// 使指定用户的 WorkSpace 缓存失效（同时停止文件监控）。
     pub fn invalidate_user(&self, user_id: &str) {
         let mut cache = self.cache.write().unwrap();
+        // LRU::pop 返回 CacheEntry；drop 时 FileWatcher 的 Drop 停止监控
         cache.pop(user_id);
         tracing::debug!(user_id = %user_id, "WorkSpace cache invalidated");
     }
@@ -98,6 +129,11 @@ impl WorkspaceManager {
     /// 获取指定用户的 workspace 目录路径。
     pub fn workspace_dir(&self, user_id: &str) -> PathBuf {
         self.data_dir.join("workspaces").join(user_id)
+    }
+
+    /// 返回系统级配置引用。
+    pub fn system_config(&self) -> &SystemConfig {
+        &self.system_config
     }
 
     /// 返回当前缓存的 WorkSpace 数量。

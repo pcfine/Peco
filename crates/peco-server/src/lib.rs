@@ -2,6 +2,8 @@
 // peco-server — Axum Web 后端
 // ============================================================================
 
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -17,6 +19,7 @@ pub mod chat;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod file_watcher;
 pub mod knowledge;
 pub mod mcp_config;
 pub mod middleware;

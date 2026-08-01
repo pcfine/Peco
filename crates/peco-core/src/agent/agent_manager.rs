@@ -283,6 +283,38 @@ impl AgentManager {
         self.mcp_config.reload(workspace_root, system_mcp)
     }
 
+    /// 刷新单个 Agent 的缓存（Tier-2 失效 + Tier-1 元数据更新）。
+    ///
+    /// 重新解析 agent.md 的 frontmatter 并更新 Tier-1 元数据。
+    /// 同时使 Tier-2 缓存失效，确保下次 [`load_cached`] 重新解析完整 Agent。
+    ///
+    /// 如果 agent.md 文件不存在，则从两级缓存中移除该 Agent。
+    /// 这适用于 agent.md 被外部删除的场景。
+    pub fn refresh_one(&self, name: &str) {
+        self.invalidate(name);
+
+        let md_path = self.md_path(name);
+        if md_path.exists() {
+            match Self::parse_meta(&md_path) {
+                Ok(meta) => {
+                    if let Ok(mut metas) = self.metas.write() {
+                        metas.insert(name.to_string(), meta);
+                    }
+                    debug!(agent = %name, "Agent metadata refreshed from disk");
+                }
+                Err(e) => {
+                    warn!(agent = %name, error = %e, "Failed to parse agent metadata, keeping stale cache");
+                }
+            }
+        } else {
+            // Agent 目录已被删除 — 从两级缓存中清理
+            if let Ok(mut metas) = self.metas.write() {
+                metas.remove(name);
+            }
+            debug!(agent = %name, "Agent removed from caches (directory gone)");
+        }
+    }
+
     // ── 文件 CRUD ───────────────────────────────────────────────────
 
     /// 保存 Agent 的 `agent.md` 文件并刷新缓存。
