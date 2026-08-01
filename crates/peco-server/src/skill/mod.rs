@@ -12,6 +12,7 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(handler::list))
+        .route("/import", post(handler::import_skill))
         .route(
             "/{name}",
             get(handler::get)
@@ -19,5 +20,4 @@ pub fn router() -> Router<Arc<AppState>> {
                 .delete(handler::delete_skill),
         )
         .route("/{name}/export", get(handler::export_skill))
-        .route("/import", post(handler::import_skill))
 }
