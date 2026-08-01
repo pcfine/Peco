@@ -6,7 +6,7 @@ import { LoadingSpinner } from '@/components/common/LoadingSpinner'
 import { EmptyState } from '@/components/common/EmptyState'
 import { listAgents, deleteAgent } from '@/api/agents'
 import type { AgentListItem } from '@/types/agent'
-import { Plus, Trash2, Bot, Pencil, Wrench, Database, Cpu } from 'lucide-react'
+import { Plus, Trash2, Bot, Wrench, Database, Cpu } from 'lucide-react'
 import { toast } from 'sonner'
 
 export function AgentListPage() {
@@ -64,14 +64,6 @@ export function AgentListPage() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="pointer-events-none"
-                        tabIndex={-1}
-                      >
-                        <Pencil className="h-4 w-4" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
                         onClick={(e) => { e.stopPropagation(); e.preventDefault(); handleDelete(a.id) }}
                       >
                         <Trash2 className="h-4 w-4 text-destructive" />
@@ -94,7 +86,7 @@ export function AgentListPage() {
                       <div className="flex items-center gap-1 overflow-hidden">
                         <Wrench className="h-3 w-3 shrink-0 text-muted-foreground" />
                         {(a.tools ?? []).slice(0, 3).map((t) => (
-                          <span key={t} className="rounded bg-accent px-1.5 py-0.5 text-xs truncate max-w-[90px]">{t}</span>
+                          <span key={t} className="rounded bg-accent px-1.5 py-0.5 text-xs truncate max-w-[120px]">{t}</span>
                         ))}
                         {(a.tools ?? []).length > 3 && (
                           <span className="text-xs text-muted-foreground shrink-0">+{(a.tools ?? []).length - 3}</span>
@@ -107,7 +99,7 @@ export function AgentListPage() {
                       <div className="flex items-center gap-1 overflow-hidden">
                         <Database className="h-3 w-3 shrink-0 text-muted-foreground" />
                         {(a.knowledge_bases ?? []).slice(0, 3).map((kb) => (
-                          <span key={kb} className="rounded bg-accent px-1.5 py-0.5 text-xs truncate max-w-[90px]">{kb}</span>
+                          <span key={kb} className="rounded bg-accent px-1.5 py-0.5 text-xs truncate max-w-[120px]">{kb}</span>
                         ))}
                         {(a.knowledge_bases ?? []).length > 3 && (
                           <span className="text-xs text-muted-foreground shrink-0">+{(a.knowledge_bases ?? []).length - 3}</span>

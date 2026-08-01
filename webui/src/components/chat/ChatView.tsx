@@ -7,6 +7,7 @@ import type { ChatSseEvent, MessageData, TurnData } from '@/types/chat'
 import { Send, Square } from 'lucide-react'
 import { toast } from 'sonner'
 import { parseSSELines, toChatSseEvent } from '@/api/stream'
+import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -195,7 +196,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             🤖 子 Agent: {message.agentName}
           </p>
           <p className="text-xs text-muted-foreground">任务: {message.agentTask}</p>
-          {message.content && <p className="mt-1">{message.content}</p>}
+          {message.content && <MarkdownRenderer content={message.content} />}
         </div>
       </div>
     )
@@ -233,7 +234,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             </pre>
           </details>
         ))}
-        {message.content && <p className="whitespace-pre-wrap">{message.content}</p>}
+        {message.content && <MarkdownRenderer content={message.content} />}
       </div>
     </div>
   )

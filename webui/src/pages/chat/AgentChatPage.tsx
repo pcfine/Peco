@@ -36,7 +36,7 @@ export function AgentChatPage() {
           setLoading(false)
         })
     }
-  }, [agentId, convId])
+  }, [agentId, convId, navigate])
 
   const handleNewConversation = useCallback(async () => {
     if (!agentId) return
