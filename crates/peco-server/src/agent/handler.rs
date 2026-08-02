@@ -599,6 +599,13 @@ pub async fn update(
         return Err(ApiError::NotFound(format!("agent '{agent_id}' not found")));
     }
 
+    // ── 清理旧图标文件：若 icon 从上传图片变更为不同值，删除旧文件 ──────
+    if let Some(ref new_icon) = req.icon {
+        if *new_icon != existing.icon && existing.icon.starts_with("/uploads/") {
+            crate::upload::cleanup_uploaded_file(&state.data_dir, &existing.icon);
+        }
+    }
+
     tracing::info!(
         user_id = %user_id,
         agent_id = %agent_id,
@@ -672,6 +679,11 @@ pub async fn delete(
     let ws = state.workspace_manager.get(&user_id)?;
     if let Err(e) = ws.agent_manager().delete(&existing.name) {
         tracing::warn!(error = %e, agent = %existing.name, "Failed to delete agent files");
+    }
+
+    // ── 清理上传的图标文件 ────────────────────────────────────────────────
+    if existing.icon.starts_with("/uploads/") {
+        crate::upload::cleanup_uploaded_file(&state.data_dir, &existing.icon);
     }
 
     tracing::info!(
