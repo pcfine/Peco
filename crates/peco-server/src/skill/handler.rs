@@ -28,18 +28,14 @@ pub struct SuccessResponse {
     pub message: Option<String>,
 }
 
-fn skills_dir(user_id: &str, state: &AppState) -> std::path::PathBuf {
-    state
-        .workspace_manager
-        .workspace_dir(user_id)
-        .join("skills")
-}
-
 pub async fn list(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<SkillInfo>>, ApiError> {
-    let ws = state.workspace_manager.get(&user_id)?;
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
     let metas = ws.skill_registry().all_meta();
     let skills: Vec<SkillInfo> = metas
         .into_iter()
@@ -56,7 +52,11 @@ pub async fn get(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let skill_md = skills_dir(&user_id, &state).join(&name).join("SKILL.md");
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let skill_md = ws.skills_dir().join(&name).join("SKILL.md");
     if !skill_md.exists() {
         return Err(ApiError::NotFound(format!("skill '{name}' not found")));
     }
@@ -73,16 +73,23 @@ pub async fn upsert(
     Path(name): Path<String>,
     Json(req): Json<UpsertSkillRequest>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let skill_dir = skills_dir(&user_id, &state).join(&name);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let skill_dir = ws.skills_dir().join(&name);
     std::fs::create_dir_all(&skill_dir)
         .map_err(|e| ApiError::Internal(format!("failed to create skill directory: {e}")))?;
     std::fs::write(skill_dir.join("SKILL.md"), &req.content)
         .map_err(|e| ApiError::Internal(format!("failed to write SKILL.md: {e}")))?;
 
     // 通知 SkillRegister 刷新该 Skill 的缓存
-    if let Ok(ws) = state.workspace_manager.get(&user_id) {
-        ws.reload_skill(&name);
-    }
+    ws.reload_skill(&name);
+
+    // 更新 skills 模块哈希
+    let skills_hash = peco_core::workspace::hash::compute_skills_hash(&ws.skills_dir());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "skills", &skills_hash).await;
 
     Ok(Json(SuccessResponse {
         success: true,
@@ -95,16 +102,23 @@ pub async fn delete_skill(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let skill_dir = skills_dir(&user_id, &state).join(&name);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let skill_dir = ws.skills_dir().join(&name);
     if skill_dir.exists() {
         std::fs::remove_dir_all(&skill_dir)
             .map_err(|e| ApiError::Internal(format!("failed to delete skill directory: {e}")))?;
     }
 
     // 从 SkillRegister 缓存中移除
-    if let Ok(ws) = state.workspace_manager.get(&user_id) {
-        ws.remove_skill(&name);
-    }
+    ws.remove_skill(&name);
+
+    // 更新 skills 模块哈希
+    let skills_hash = peco_core::workspace::hash::compute_skills_hash(&ws.skills_dir());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "skills", &skills_hash).await;
 
     Ok(Json(SuccessResponse {
         success: true,
@@ -117,7 +131,11 @@ pub async fn export_skill(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Vec<u8>, ApiError> {
-    let skill_dir = skills_dir(&user_id, &state).join(&name);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let skill_dir = ws.skills_dir().join(&name);
     if !skill_dir.exists() {
         return Err(ApiError::NotFound(format!("skill '{name}' not found")));
     }
@@ -134,16 +152,23 @@ pub async fn import_skill(
 ) -> Result<Json<SuccessResponse>, ApiError> {
     let name = req["name"].as_str().unwrap_or("imported-skill");
     let content = req["content"].as_str().unwrap_or("");
-    let skill_dir = skills_dir(&user_id, &state).join(name);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let skill_dir = ws.skills_dir().join(name);
     std::fs::create_dir_all(&skill_dir)
         .map_err(|e| ApiError::Internal(format!("failed to create skill directory: {e}")))?;
     std::fs::write(skill_dir.join("SKILL.md"), content)
         .map_err(|e| ApiError::Internal(format!("failed to write SKILL.md: {e}")))?;
 
     // 通知 SkillRegister 刷新该 Skill 的缓存
-    if let Ok(ws) = state.workspace_manager.get(&user_id) {
-        ws.reload_skill(name);
-    }
+    ws.reload_skill(name);
+
+    // 更新 skills 模块哈希
+    let skills_hash = peco_core::workspace::hash::compute_skills_hash(&ws.skills_dir());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "skills", &skills_hash).await;
 
     Ok(Json(SuccessResponse {
         success: true,

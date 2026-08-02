@@ -43,7 +43,10 @@ impl PersonalAgentManager {
     /// ★ 不使用 PPA 组件（无 DynamicContext、无 MemoryHook）。
     pub async fn new(state: &AppState, user_id: &str) -> Result<Self, ApiError> {
         // ── 1. 获取 WorkSpace ────────────────────────────────────────────
-        let ws = state.workspace_manager.get(user_id)?;
+        let ws = state
+            .workspace_manager
+            .get_synced(user_id, &state.db)
+            .await?;
 
         // ── 2. 幂等安装模板 ──────────────────────────────────────────────
         Self::ensure_template_installed(&ws).await?;

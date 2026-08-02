@@ -36,13 +36,6 @@ pub struct SuccessResponse {
     pub message: Option<String>,
 }
 
-fn providers_path(user_id: &str, state: &AppState) -> std::path::PathBuf {
-    state
-        .workspace_manager
-        .workspace_dir(user_id)
-        .join("providers.toml")
-}
-
 fn load_providers(path: &std::path::Path) -> Result<ProvidersConfig, ApiError> {
     if path.exists() {
         let content = std::fs::read_to_string(path)
@@ -72,7 +65,11 @@ pub async fn list(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ProviderInfo>>, ApiError> {
-    let path = providers_path(&user_id, &state);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let path = ws.root().join("providers.toml");
     let config = load_providers(&path)?;
 
     let providers: Vec<ProviderInfo> = config
@@ -98,7 +95,11 @@ pub async fn get(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ProviderInfo>, ApiError> {
-    let path = providers_path(&user_id, &state);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let path = ws.root().join("providers.toml");
     let config = load_providers(&path)?;
     let entry = config
         .providers
@@ -122,7 +123,11 @@ pub async fn upsert(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpsertProviderRequest>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let path = providers_path(&user_id, &state);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let path = ws.root().join("providers.toml");
     let mut config = load_providers(&path)?;
 
     // Simplified: use provider_type as name
@@ -140,6 +145,12 @@ pub async fn upsert(
     config.providers = providers;
     save_providers(&path, &config)?;
 
+    // 更新 providers 模块哈希
+    let providers_hash = peco_core::workspace::hash::compute_providers_hash(ws.root());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "providers", &providers_hash)
+            .await;
+
     Ok(Json(SuccessResponse {
         success: true,
         message: Some("Provider saved".into()),
@@ -151,10 +162,20 @@ pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let path = providers_path(&user_id, &state);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let path = ws.root().join("providers.toml");
     let mut config = load_providers(&path)?;
     config.providers.remove(&name);
     save_providers(&path, &config)?;
+
+    // 更新 providers 模块哈希
+    let providers_hash = peco_core::workspace::hash::compute_providers_hash(ws.root());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "providers", &providers_hash)
+            .await;
 
     Ok(Json(SuccessResponse {
         success: true,

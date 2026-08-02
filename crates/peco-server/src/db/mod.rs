@@ -7,8 +7,10 @@ pub mod conversations;
 pub mod documents;
 pub mod knowledge_bases;
 pub mod messages;
+pub mod sync;
 pub mod task_logs;
 pub mod tasks;
+pub mod workspace_hashes;
 
 use sqlx::sqlite::SqlitePool;
 

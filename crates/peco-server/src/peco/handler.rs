@@ -98,6 +98,25 @@ pub struct SessionSnapshotResponse {
     pub total_usage: UsageData,
 }
 
+// ── WatcherGuard ──────────────────────────────────────────────────────────
+
+/// Drop 时自动释放 FileWatcher 引用计数，防止 panic 导致泄漏。
+///
+/// SSE spawned task 的 RAII 守卫 — 即使 task 在 event loop 之外 panic，
+/// FileWatcher 也会在 unwinding 时通过 Drop 正确释放。
+struct WatcherGuard {
+    app_state: Option<Arc<AppState>>,
+    user_id: String,
+}
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.app_state.take() {
+            state.workspace_manager.release_watcher(&self.user_id);
+        }
+    }
+}
+
 // ── Handler: GET /api/peco/stream ────────────────────────────────────────
 
 /// SSE 流式对话。
@@ -120,7 +139,11 @@ pub async fn stream_chat(
     // ── 1. 初始化 Manager ──────────────────────────────────────────────
     let manager = PecoManager::new(&state, &user_id).await?;
 
+    // 启动 FileWatcher（SSE 连接建立）
+    state.workspace_manager.acquire_watcher(&user_id, &state.db);
+
     let session_id = private_session_id(&user_id);
+    let app_state = Arc::clone(&state);
     let conv_id = session_id.clone();
 
     // ── 2. 加载或创建 Perpetual Session ──────────────────────────────
@@ -164,10 +187,16 @@ pub async fn stream_chat(
     let config = manager.config().clone();
     let conv_id_bg = conv_id.clone();
     let message_bg = message.clone();
+    let user_id_bg = user_id.clone();
 
     tokio::spawn(async move {
+        // RAII guard：无论 task 如何退出（正常/panic），都释放 FileWatcher
+        let _watcher_guard = WatcherGuard {
+            app_state: Some(app_state.clone()),
+            user_id: user_id_bg,
+        };
         let persister: Arc<dyn SessionPersister> =
-            Arc::new(SqliteSessionPersister::new(state.db.clone()));
+            Arc::new(SqliteSessionPersister::new(app_state.db.clone()));
 
         // 构建 LooperConfig（从 PecoConfig + MessageFilter）
         let looper_config = config.to_looper_config(Arc::new(PecoMessageFilter::new(

@@ -263,49 +263,16 @@ fn merge_agent_profile(
 ///
 /// 返回当前用户的 Agent 列表（含 model/provider/tools 便于列表页展示，
 /// 不含 system_prompt 等大字段）。
+///
+/// `get_synced()` 已在内部完成 DB 双向同步（自动注册 + 僵尸清理 + 描述同步）。
 pub async fn list(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<AgentListItem>>, ApiError> {
-    let ws = state.workspace_manager.get(&user_id)?;
-
-    // ── 自动注册：磁盘上存在但 DB 中缺失的 Agent ─────────────────────
-    // 确保手动创建或模板安装的 Agent 自动出现在列表中。
-    {
-        let db_names: std::collections::HashSet<String> =
-            agents::list_index_by_user(&state.db, &user_id)
-                .await?
-                .into_iter()
-                .map(|r| r.name)
-                .collect();
-
-        let disk_metas = ws.agent_manager().list_meta();
-        for meta in &disk_metas {
-            if !db_names.contains(&meta.name) {
-                let params = CreateAgentParams {
-                    id: Uuid::new_v4().to_string(),
-                    user_id: user_id.clone(),
-                    name: meta.name.clone(),
-                    description: meta.description.clone(),
-                    icon: "🤖".to_string(),
-                    color: "#6366f1".to_string(),
-                    background_color: String::new(),
-                };
-                if let Err(e) = agents::insert(&state.db, &params).await {
-                    tracing::warn!(
-                        agent = %meta.name,
-                        error = %e,
-                        "Failed to auto-register agent found on disk"
-                    );
-                } else {
-                    tracing::info!(
-                        agent = %meta.name,
-                        "Auto-registered agent from disk"
-                    );
-                }
-            }
-        }
-    }
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
 
     let rows = agents::list_index_by_user(&state.db, &user_id).await?;
 
@@ -393,7 +360,10 @@ pub async fn create(
     let assemble_params = assemble_params_from_request(&req);
     let content = agent_config::assemble_agent_md(&assemble_params);
 
-    let ws = state.workspace_manager.get(&user_id)?;
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
     let agent_id = Uuid::new_v4().to_string();
 
     // ── 先写 DB 索引（利用 UNIQUE 约束原子性防止并发竞态）──────────────
@@ -414,6 +384,11 @@ pub async fn create(
         let _ = agents::delete(&state.db, &agent_id).await;
         return Err(ApiError::Internal(format!("failed to write agent.md: {e}")));
     }
+
+    // 更新 agents 模块哈希
+    let agents_hash = peco_core::workspace::hash::compute_agents_hash(&ws.agents_dir());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "agents", &agents_hash).await;
 
     tracing::info!(
         user_id = %user_id,
@@ -487,7 +462,11 @@ pub async fn get(
         .ok_or_else(|| ApiError::NotFound(format!("agent '{agent_id}' not found")))?;
 
     // ── 从 agent.md 读取完整配置 ─────────────────────────────────────────
-    let ws = state.workspace_manager.get(&user_id)?;
+    // get_synced() 已在内部完成描述同步（包括当前 agent）
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
     let md_path = ws.agent_manager().md_path(&db_row.name);
     let content = std::fs::read_to_string(&md_path).map_err(|e| {
         ApiError::Internal(format!(
@@ -498,22 +477,6 @@ pub async fn get(
 
     let (profile, body) = agent_config::parse_agent_md(&content)
         .map_err(|e| ApiError::Internal(format!("agent.md parse error: {e}")))?;
-
-    // ── 自动同步 description（缓解 DB 缓存过期）─────────────────────────
-    if profile.agent.description != db_row.description {
-        let _ = agents::update(
-            &state.db,
-            &agent_id,
-            &UpdateAgentParams {
-                name: None,
-                description: Some(profile.agent.description.clone()),
-                icon: None,
-                color: None,
-                background_color: None,
-            },
-        )
-        .await;
-    }
 
     Ok(Json(agent_detail_from_profile(
         &agent_id, &db_row, &profile, &body,
@@ -552,7 +515,10 @@ pub async fn update(
     }
 
     // ── 读取现有 agent.md ─────────────────────────────────────────────────
-    let ws = state.workspace_manager.get(&user_id)?;
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
     let old_path = ws.agent_manager().md_path(&existing.name);
     let old_content = std::fs::read_to_string(&old_path).map_err(|e| {
         ApiError::Internal(format!(
@@ -600,11 +566,17 @@ pub async fn update(
     }
 
     // ── 清理旧图标文件：若 icon 从上传图片变更为不同值，删除旧文件 ──────
-    if let Some(ref new_icon) = req.icon {
-        if *new_icon != existing.icon && existing.icon.starts_with("/uploads/") {
-            crate::upload::cleanup_uploaded_file(&state.data_dir, &existing.icon);
-        }
+    if let Some(ref new_icon) = req.icon
+        && *new_icon != existing.icon
+        && existing.icon.starts_with("/uploads/")
+    {
+        crate::upload::cleanup_uploaded_file(&state.data_dir, &existing.icon);
     }
+
+    // 更新 agents 模块哈希
+    let agents_hash = peco_core::workspace::hash::compute_agents_hash(&ws.agents_dir());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "agents", &agents_hash).await;
 
     tracing::info!(
         user_id = %user_id,
@@ -676,10 +648,18 @@ pub async fn delete(
         .invalidate_agent(&user_id, &existing.name)?;
 
     // ── 删除 agent 文件目录 ───────────────────────────────────────────────
-    let ws = state.workspace_manager.get(&user_id)?;
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
     if let Err(e) = ws.agent_manager().delete(&existing.name) {
         tracing::warn!(error = %e, agent = %existing.name, "Failed to delete agent files");
     }
+
+    // 更新 agents 模块哈希
+    let agents_hash = peco_core::workspace::hash::compute_agents_hash(&ws.agents_dir());
+    let _ =
+        crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "agents", &agents_hash).await;
 
     // ── 清理上传的图标文件 ────────────────────────────────────────────────
     if existing.icon.starts_with("/uploads/") {

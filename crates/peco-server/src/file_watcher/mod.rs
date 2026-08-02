@@ -5,7 +5,8 @@
 //!
 //! ## 生命周期
 //!
-//! - [`FileWatcher::start`] 创建监控任务，持有 `Weak<WorkSpace>` 引用
+//! - [`FileWatcher::start`] 创建监控任务（无 DB 同步）
+//! - [`FileWatcher::start_with_db`] 创建监控任务（含 DB 哈希 + agent 索引同步）
 //! - 当 LRU 驱逐 WorkSpace 后，`Weak::upgrade()` 返回 `None`，watcher 自动退出
 //! - Drop [`FileWatcher`] 时发送关闭信号，后台 task 优雅退出
 
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Weak;
 
 use peco_core::workspace::WorkSpace;
+use sqlx::SqlitePool;
 use tokio::sync::oneshot;
 
 /// 工作空间文件监控句柄。
@@ -28,13 +30,43 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    /// 启动对指定 workspace 目录的文件监控。
+    /// 启动对指定 workspace 目录的文件监控（无 DB 同步）。
     ///
     /// 后台 task 持有 `Weak<WorkSpace>`，当 WorkSpace 被 LRU 驱逐后自动退出。
     /// watcher 创建失败时记录 error 日志并返回 `None`。
     pub fn start(workspace_root: PathBuf, ws: Weak<WorkSpace>) -> Option<Self> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(watcher::run(workspace_root, ws, shutdown_rx));
+        let task = tokio::spawn(watcher::run(
+            workspace_root,
+            ws,
+            None,
+            String::new(),
+            shutdown_rx,
+        ));
+        Some(Self {
+            shutdown_tx: Some(shutdown_tx),
+            _task: task,
+        })
+    }
+
+    /// 启动文件监控（含 DB 同步能力）。
+    ///
+    /// 文件变更时同步更新 `workspace_hashes` 表哈希，并对 agents 模块
+    /// 执行双向 DB 同步（自动注册新 agent + 清理僵尸记录 + 更新描述）。
+    pub fn start_with_db(
+        workspace_root: PathBuf,
+        ws: Weak<WorkSpace>,
+        db: SqlitePool,
+        user_id: String,
+    ) -> Option<Self> {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(watcher::run(
+            workspace_root,
+            ws,
+            Some(db),
+            user_id,
+            shutdown_rx,
+        ));
         Some(Self {
             shutdown_tx: Some(shutdown_tx),
             _task: task,

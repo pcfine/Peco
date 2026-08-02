@@ -14,6 +14,7 @@
 // - [`crate::tools::KnowledgeAccess`] — 知识库操作
 
 mod error;
+pub mod hash;
 #[allow(clippy::module_inception)]
 mod workspace;
 

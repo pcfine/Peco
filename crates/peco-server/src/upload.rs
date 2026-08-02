@@ -2,7 +2,7 @@
 // 文件上传 Handler — Agent 图标等静态资源
 // ============================================================================
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::Json;
@@ -108,7 +108,7 @@ pub async fn upload(
 ///
 /// `url` 必须以 `/uploads/agents/` 开头，仅允许文件名中的字母数字、连字符、下划线和点。
 /// 返回 `true` 表示文件存在并被删除，`false` 表示文件不存在（不视为错误）。
-pub fn cleanup_uploaded_file(data_dir: &PathBuf, url: &str) -> bool {
+pub fn cleanup_uploaded_file(data_dir: &Path, url: &str) -> bool {
     // 安全校验：仅处理 /uploads/agents/ 下的文件
     let prefix = "/uploads/agents/";
     if !url.starts_with(prefix) {
@@ -143,9 +143,7 @@ pub fn cleanup_uploaded_file(data_dir: &PathBuf, url: &str) -> bool {
             tracing::info!(%url, "Cleaned up old uploaded file");
             true
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            false
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
             tracing::warn!(%url, error = %e, "Failed to clean up uploaded file");
             false

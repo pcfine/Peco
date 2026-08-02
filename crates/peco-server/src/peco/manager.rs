@@ -53,7 +53,10 @@ impl PecoManager {
         config: PecoConfig,
     ) -> Result<Self, ApiError> {
         // ── 1. 获取 WorkSpace ────────────────────────────────────────────
-        let ws = state.workspace_manager.get(user_id)?;
+        let ws = state
+            .workspace_manager
+            .get_synced(user_id, &state.db)
+            .await?;
 
         // ── 2. 幂等安装模板 ──────────────────────────────────────────────
         Self::ensure_template_installed(&ws).await?;

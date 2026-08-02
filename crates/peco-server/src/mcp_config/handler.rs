@@ -17,18 +17,15 @@ pub struct SuccessResponse {
     pub message: Option<String>,
 }
 
-fn mcp_config_path(user_id: &str, state: &AppState) -> std::path::PathBuf {
-    state
-        .workspace_manager
-        .workspace_dir(user_id)
-        .join("mcpconfig.json")
-}
-
 pub async fn get_config(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let path = mcp_config_path(&user_id, &state);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let path = ws.root().join("mcpconfig.json");
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| ApiError::Internal(format!("failed to read mcp_config.json: {e}")))?;
@@ -45,7 +42,11 @@ pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let path = mcp_config_path(&user_id, &state);
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let path = ws.root().join("mcpconfig.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| ApiError::Internal(format!("failed to create directory: {e}")))?;
@@ -56,11 +57,13 @@ pub async fn update_config(
         .map_err(|e| ApiError::Internal(format!("failed to write mcpconfig.json: {e}")))?;
 
     // 通知 WorkSpace 热重载 MCP 配置
-    if let Ok(ws) = state.workspace_manager.get(&user_id) {
-        let system_mcp = state.workspace_manager.system_config().mcp.clone();
-        let count = ws.reload_mcp_config(&system_mcp);
-        tracing::info!(count, "MCP config hot-reloaded after API update");
-    }
+    let system_mcp = state.workspace_manager.system_config().mcp.clone();
+    let count = ws.reload_mcp_config(&system_mcp);
+    tracing::info!(count, "MCP config hot-reloaded after API update");
+
+    // 更新 mcp 模块哈希
+    let mcp_hash = peco_core::workspace::hash::compute_mcp_hash(ws.root());
+    let _ = crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "mcp", &mcp_hash).await;
 
     Ok(Json(SuccessResponse {
         success: true,

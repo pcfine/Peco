@@ -134,6 +134,15 @@ CREATE TABLE IF NOT EXISTS server_config (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 工作空间模块哈希表：追踪各模块文件系统状态，用于增量同步
+CREATE TABLE IF NOT EXISTS workspace_hashes (
+    user_id TEXT NOT NULL,
+    module TEXT NOT NULL,        -- 'agents' | 'skills' | 'mcp' | 'workflows' | 'providers'
+    hash TEXT NOT NULL,          -- SHA-256 hex（64字符）
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, module)
+);
+
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_agents_user_id ON agents(user_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id);

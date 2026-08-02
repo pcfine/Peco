@@ -2,6 +2,10 @@
 //!
 //! 使用 `notify` crate 监听 workspace 目录变更，
 //! 500ms 防抖后根据文件路径触发对应管理器的重载。
+//!
+//! 当通过 `start_with_db` 启动时，文件变更还会：
+//! - 重新计算模块哈希并更新 `workspace_hashes` 表
+//! - Agent 变更时执行双向 DB 同步
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,6 +14,8 @@ use std::time::Duration;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use peco_core::workspace::WorkSpace;
+use peco_core::workspace::hash;
+use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -37,9 +43,14 @@ enum ReloadAction {
 }
 
 /// 主监控循环。
+///
+/// `db` 和 `user_id` 仅在通过 `FileWatcher::start_with_db` 启动时提供；
+/// `FileWatcher::start` 传入 `None` 和空字符串。
 pub async fn run(
     workspace_root: PathBuf,
     ws: Weak<WorkSpace>,
+    db: Option<SqlitePool>,
+    user_id: String,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     // 创建 notify 事件通道
@@ -132,6 +143,13 @@ pub async fn run(
 
                 for action in &ready {
                     execute_action(&ws, action).await;
+                }
+
+                // 如果有 DB 连接，同步哈希和 agent 索引
+                if let Some(ref db) = db {
+                    for action in &ready {
+                        sync_hash_and_db(db, &user_id, &workspace_root, &ws, action).await;
+                    }
                 }
             }
         }
@@ -244,8 +262,6 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
         }
         ReloadAction::McpConfig => {
             debug!("File watcher: reloading MCP config");
-            // 使用系统 MCP 配置作为 fallback（watcher 无法获取 SystemConfig）
-            // WorkSpace 内部会在文件不存在/无效时 fallback 到传入值
             let fallback = peco_core::config::McpConfig {
                 mcp_servers: std::collections::HashMap::new(),
             };
@@ -260,4 +276,59 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
             }
         }
     }
+}
+
+/// 文件变更后同步 DB：更新模块哈希 + agent 索引双向同步。
+async fn sync_hash_and_db(
+    db: &SqlitePool,
+    user_id: &str,
+    workspace_root: &Path,
+    ws: &WorkSpace,
+    action: &ReloadAction,
+) {
+    let module = action_to_module(action);
+    let new_hash = compute_module_hash_for_action(workspace_root, action);
+
+    if let Err(e) = crate::db::workspace_hashes::upsert_hash(db, user_id, module, &new_hash).await {
+        warn!(%user_id, module, error = %e, "File watcher: failed to update hash");
+    } else {
+        debug!(%user_id, module, %new_hash, "File watcher: hash updated");
+    }
+
+    // Agent 模块变更时同步 DB 索引
+    if matches!(action, ReloadAction::Agent(_)) {
+        sync_agents_db(db, user_id, ws).await;
+    }
+}
+
+/// 将 ReloadAction 映射为模块名。
+fn action_to_module(action: &ReloadAction) -> &'static str {
+    match action {
+        ReloadAction::Agent(_) => "agents",
+        ReloadAction::Skill(_) | ReloadAction::SkillRemoved(_) => "skills",
+        ReloadAction::Workflow(_) => "workflows",
+        ReloadAction::McpConfig => "mcp",
+        ReloadAction::KnowledgeSync(_) | ReloadAction::KnowledgeReload => "knowledge",
+    }
+}
+
+/// 根据 action 类型重新计算对应模块的哈希。
+fn compute_module_hash_for_action(workspace_root: &Path, action: &ReloadAction) -> String {
+    match action {
+        ReloadAction::Agent(_) => hash::compute_agents_hash(&workspace_root.join("agents")),
+        ReloadAction::Skill(_) | ReloadAction::SkillRemoved(_) => {
+            hash::compute_skills_hash(&workspace_root.join("skills"))
+        }
+        ReloadAction::Workflow(_) => {
+            hash::compute_workflows_hash(&workspace_root.join("workflows"))
+        }
+        ReloadAction::McpConfig => hash::compute_mcp_hash(workspace_root),
+        // Knowledge 模块暂不纳入 workspace 哈希体系（有独立的 file_hashes.json）
+        ReloadAction::KnowledgeSync(_) | ReloadAction::KnowledgeReload => hash::empty_hash(),
+    }
+}
+
+/// Agent 模块 DB 双向同步 — 委托给 [`db::sync_agents_with_db`]。
+async fn sync_agents_db(db: &SqlitePool, user_id: &str, ws: &WorkSpace) {
+    crate::db::sync::sync_agents_with_db(user_id, db, ws).await;
 }
