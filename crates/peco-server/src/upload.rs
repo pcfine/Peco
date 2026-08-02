@@ -61,7 +61,9 @@ pub async fn upload(
         }
     }
 
-    let mime = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    // 未找到 file 字段
+    let mime = content_type
+        .ok_or_else(|| ApiError::BadRequest("missing 'file' field in upload".into()))?;
 
     // 验证 MIME 类型
     if !ALLOWED_MIME_TYPES.contains(&mime.as_str()) {

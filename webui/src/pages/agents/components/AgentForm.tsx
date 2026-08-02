@@ -36,6 +36,7 @@ async function resizeImage(file: File, maxSize = 256): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
+      URL.revokeObjectURL(img.src);
       const size = Math.min(img.width, img.height);
       const sx = (img.width - size) / 2;
       const sy = (img.height - size) / 2;
@@ -49,7 +50,10 @@ async function resizeImage(file: File, maxSize = 256): Promise<Blob> {
         else reject(new Error("Canvas toBlob failed"));
       }, "image/png");
     };
-    img.onerror = () => reject(new Error("Image load failed"));
+    img.onerror = () => {
+      URL.revokeObjectURL(img.src);
+      reject(new Error("Image load failed"));
+    };
     img.src = URL.createObjectURL(file);
   });
 }
@@ -136,7 +140,7 @@ export function AgentForm({ defaultValues, onSubmit }: Props) {
         <CardContent className="p-3 h-[130px] flex gap-3">
           {/* 左侧：正方形色块/图片 */}
           <div
-            className="w-[100px] shrink-0 rounded-xl overflow-hidden flex items-center justify-center"
+            className="aspect-square h-full shrink-0 rounded-xl overflow-hidden flex items-center justify-center"
             style={{
               background: isImageUrl(icon || "")
                 ? "transparent"

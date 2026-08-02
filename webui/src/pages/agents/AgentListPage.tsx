@@ -69,7 +69,7 @@ export function AgentListPage() {
                   <CardContent className="p-3 h-full flex gap-3">
                     {/* 左侧：正方形色块/图片 */}
                     <div
-                      className="w-[120px] shrink-0 rounded-xl overflow-hidden flex items-center justify-center"
+                      className="aspect-square h-full shrink-0 rounded-xl overflow-hidden flex items-center justify-center"
                       style={{ background: isImg ? "transparent" : leftBg }}
                     >
                       {isImg ? (
@@ -79,7 +79,7 @@ export function AgentListPage() {
                           className="h-full w-full object-cover"
                         />
                       ) : (
-                        <span className="text-5xl select-none">
+                        <span className="text-4xl select-none">
                           {a.icon || "🤖"}
                         </span>
                       )}
