@@ -1,18 +1,18 @@
-import { useEffect, useRef, useState } from 'react'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
-import { Badge } from '@/components/ui/badge'
-import { Switch } from '@/components/ui/switch'
+import { useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from '@/components/ui/select'
+} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -20,44 +20,56 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@/components/ui/dialog'
-import { LoadingSpinner } from '@/components/common/LoadingSpinner'
-import { EmptyState } from '@/components/common/EmptyState'
-import { getMcpConfig, saveMcpConfig, testMcpConnection } from '@/api/mcp'
-import type { McpServerConfig, TransportType } from '@/types/mcp'
-import { Plus, Save, Pencil, Trash2, RefreshCw, Plug, Terminal, Globe } from 'lucide-react'
-import { toast } from 'sonner'
-import axios from 'axios'
+} from "@/components/ui/dialog";
+import { LoadingSpinner } from "@/components/common/LoadingSpinner";
+import { EmptyState } from "@/components/common/EmptyState";
+import { getMcpConfig, saveMcpConfig, testMcpConnection } from "@/api/mcp";
+import type { McpServerConfig, TransportType } from "@/types/mcp";
+import {
+  Plus,
+  Save,
+  Pencil,
+  Trash2,
+  RefreshCw,
+  Plug,
+  Terminal,
+  Globe,
+} from "lucide-react";
+import { toast } from "sonner";
+import axios from "axios";
 
 interface ServerFormData extends McpServerConfig {
-  name: string
-  transport: TransportType
+  name: string;
+  transport: TransportType;
 }
 
 const emptyForm = (): ServerFormData => ({
-  name: '',
-  transport: 'stdio',
+  name: "",
+  transport: "stdio",
   enabled: true,
-  command: '',
+  command: "",
   args: [],
   env: {},
-  url: '',
+  url: "",
   headers: {},
   timeoutSecs: 30,
   maxRetries: 3,
-})
+});
 
 const TRANSPORT_LABELS: Record<TransportType, string> = {
-  stdio: 'stdio (本地进程)',
-  sse: 'sse (远程 SSE)',
-  streamable_http: 'streamable_http (远程 HTTP)',
-}
+  stdio: "stdio (本地进程)",
+  sse: "sse (远程 SSE)",
+  streamable_http: "streamable_http (远程 HTTP)",
+};
 
-const BADGE_VARIANT: Record<TransportType, 'secondary' | 'default' | 'outline'> = {
-  stdio: 'secondary',
-  sse: 'default',
-  streamable_http: 'outline',
-}
+const BADGE_VARIANT: Record<
+  TransportType,
+  "secondary" | "default" | "outline"
+> = {
+  stdio: "secondary",
+  sse: "default",
+  streamable_http: "outline",
+};
 
 /** Strip surrounding single or double quotes from a value. */
 function unquote(s: string): string {
@@ -65,107 +77,107 @@ function unquote(s: string): string {
     (s.startsWith('"') && s.endsWith('"')) ||
     (s.startsWith("'") && s.endsWith("'"))
   ) {
-    const inner = s.slice(1, -1)
+    const inner = s.slice(1, -1);
     // Only unquote when the quotes are matched and the inner content doesn't break
-    if (!inner.includes(s[0])) return inner
+    if (!inner.includes(s[0])) return inner;
   }
-  return s
+  return s;
 }
 
 function getApiErrorMessage(err: unknown): string | undefined {
   if (axios.isAxiosError(err)) {
-    if (err.response?.data?.message) return String(err.response.data.message)
-    if (err.message) return err.message
+    if (err.response?.data?.message) return String(err.response.data.message);
+    if (err.message) return err.message;
   }
-  if (err instanceof Error) return err.message
-  return undefined
+  if (err instanceof Error) return err.message;
+  return undefined;
 }
 
 function parseLines(text: string): string[] {
   return text
-    .split('\n')
+    .split("\n")
     .map((l) => l.trim())
-    .filter(Boolean)
+    .filter(Boolean);
 }
 
 function parseEnv(text: string): Record<string, string> {
-  const env: Record<string, string> = {}
+  const env: Record<string, string> = {};
   for (const line of parseLines(text)) {
-    const eq = line.indexOf('=')
+    const eq = line.indexOf("=");
     if (eq > 0) {
-      env[line.slice(0, eq).trim()] = unquote(line.slice(eq + 1).trim())
+      env[line.slice(0, eq).trim()] = unquote(line.slice(eq + 1).trim());
     }
   }
-  return env
+  return env;
 }
 
 function parseHeaders(text: string): Record<string, string> {
-  const headers: Record<string, string> = {}
+  const headers: Record<string, string> = {};
   for (const line of parseLines(text)) {
-    const col = line.indexOf(':')
+    const col = line.indexOf(":");
     if (col > 0) {
-      headers[line.slice(0, col).trim()] = unquote(line.slice(col + 1).trim())
+      headers[line.slice(0, col).trim()] = unquote(line.slice(col + 1).trim());
     }
   }
-  return headers
+  return headers;
 }
 
 function envToString(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
-    .join('\n')
+    .join("\n");
 }
 
 function headersToString(headers: Record<string, string>): string {
   return Object.entries(headers)
     .map(([k, v]) => `${k}: ${v}`)
-    .join('\n')
+    .join("\n");
 }
 
 // Form state uses string representations for args/env/headers (textarea-friendly)
 interface DialogFormState {
-  name: string
-  transport: TransportType
-  enabled: boolean
-  command: string
-  argsText: string
-  envText: string
-  url: string
-  headersText: string
-  timeoutSecs: number
-  maxRetries: number
+  name: string;
+  transport: TransportType;
+  enabled: boolean;
+  command: string;
+  argsText: string;
+  envText: string;
+  url: string;
+  headersText: string;
+  timeoutSecs: number;
+  maxRetries: number;
 }
 
 const dialogFormDefault = (): DialogFormState => ({
-  name: '',
-  transport: 'stdio',
+  name: "",
+  transport: "stdio",
   enabled: true,
-  command: '',
-  argsText: '',
-  envText: '',
-  url: '',
-  headersText: '',
+  command: "",
+  argsText: "",
+  envText: "",
+  url: "",
+  headersText: "",
   timeoutSecs: 30,
   maxRetries: 3,
-})
+});
 
 function configToDialogForm(name: string, s: McpServerConfig): DialogFormState {
   return {
     name,
     transport: s.transport,
     enabled: s.enabled !== false,
-    command: s.command || '',
-    argsText: (s.args || []).join('\n'),
-    envText: s.env ? envToString(s.env) : '',
-    url: s.url || '',
-    headersText: s.headers ? headersToString(s.headers) : '',
+    command: s.command || "",
+    argsText: (s.args || []).join("\n"),
+    envText: s.env ? envToString(s.env) : "",
+    url: s.url || "",
+    headersText: s.headers ? headersToString(s.headers) : "",
     timeoutSecs: s.timeoutSecs ?? 30,
     maxRetries: s.maxRetries ?? 3,
-  }
+  };
 }
 
 function dialogFormToConfig(f: DialogFormState): McpServerConfig {
-  const isStdio = f.transport === 'stdio'
+  const isStdio = f.transport === "stdio";
   return {
     transport: f.transport,
     enabled: f.enabled,
@@ -181,162 +193,163 @@ function dialogFormToConfig(f: DialogFormState): McpServerConfig {
         }),
     timeoutSecs: f.timeoutSecs,
     maxRetries: f.maxRetries,
-  }
+  };
 }
 
 export function McpConfigPage() {
-  const [config, setConfig] = useState<Record<string, McpServerConfig>>({})
-  const [initialJson, setInitialJson] = useState('{}')
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
+  const [config, setConfig] = useState<Record<string, McpServerConfig>>({});
+  const [initialJson, setInitialJson] = useState("{}");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   // Dialog state
-  const [dialogOpen, setDialogOpen] = useState(false)
-  const [editingName, setEditingName] = useState<string | null>(null)
-  const [dialogForm, setDialogForm] = useState<DialogFormState>(dialogFormDefault())
-  const [nameError, setNameError] = useState('')
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const [dialogForm, setDialogForm] =
+    useState<DialogFormState>(dialogFormDefault());
+  const [nameError, setNameError] = useState("");
 
   // Test connection state
-  const [testing, setTesting] = useState<string | null>(null)
+  const [testing, setTesting] = useState<string | null>(null);
 
   // Delete confirmation
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
-  const unmountedRef = useRef(false)
+  const unmountedRef = useRef(false);
   useEffect(() => {
-    unmountedRef.current = false
+    unmountedRef.current = false;
     getMcpConfig()
       .then((res) => {
-        if (unmountedRef.current) return
-        const servers = res.mcpServers || {}
-        setConfig(servers)
-        setInitialJson(JSON.stringify({ mcpServers: servers }))
+        if (unmountedRef.current) return;
+        const servers = res.mcpServers || {};
+        setConfig(servers);
+        setInitialJson(JSON.stringify({ mcpServers: servers }));
       })
       .catch(() => {
-        if (!unmountedRef.current) toast.error('加载 MCP 配置失败')
+        if (!unmountedRef.current) toast.error("加载 MCP 配置失败");
       })
       .finally(() => {
-        if (!unmountedRef.current) setLoading(false)
-      })
+        if (!unmountedRef.current) setLoading(false);
+      });
     return () => {
-      unmountedRef.current = true
-    }
-  }, [])
+      unmountedRef.current = true;
+    };
+  }, []);
 
-  const hasChanges = JSON.stringify({ mcpServers: config }) !== initialJson
+  const hasChanges = JSON.stringify({ mcpServers: config }) !== initialJson;
 
   // ── Dialog handlers ──────────────────────────────────────────────────────────
 
   const openAddDialog = () => {
-    setEditingName(null)
-    setDialogForm(dialogFormDefault())
-    setNameError('')
-    setDialogOpen(true)
-  }
+    setEditingName(null);
+    setDialogForm(dialogFormDefault());
+    setNameError("");
+    setDialogOpen(true);
+  };
 
   const openEditDialog = (name: string) => {
-    setEditingName(name)
-    const server = config[name]
-    setDialogForm(configToDialogForm(name, server))
-    setNameError('')
-    setDialogOpen(true)
-  }
+    setEditingName(name);
+    const server = config[name];
+    setDialogForm(configToDialogForm(name, server));
+    setNameError("");
+    setDialogOpen(true);
+  };
 
   const closeDialog = () => {
-    setDialogOpen(false)
-    setEditingName(null)
-    setNameError('')
-  }
+    setDialogOpen(false);
+    setEditingName(null);
+    setNameError("");
+  };
 
   const isDialogFormValid = () => {
-    if (!dialogForm.name.trim()) return false
-    if (dialogForm.transport === 'stdio') {
-      if (!dialogForm.command.trim()) return false
+    if (!dialogForm.name.trim()) return false;
+    if (dialogForm.transport === "stdio") {
+      if (!dialogForm.command.trim()) return false;
     } else {
-      if (!dialogForm.url.trim()) return false
+      if (!dialogForm.url.trim()) return false;
     }
-    return true
-  }
+    return true;
+  };
 
   const handleDialogSubmit = () => {
     // Validate name
-    const name = dialogForm.name.trim()
+    const name = dialogForm.name.trim();
     if (!name) {
-      setNameError('请输入服务器名称')
-      return
+      setNameError("请输入服务器名称");
+      return;
     }
 
     // Check for duplicate name on add
     if (!editingName && config[name]) {
-      setNameError('该名称已存在')
-      return
+      setNameError("该名称已存在");
+      return;
     }
 
-    setNameError('')
-    const serverConfig = dialogFormToConfig(dialogForm)
-    setConfig((prev) => ({ ...prev, [name]: serverConfig }))
-    closeDialog()
-  }
+    setNameError("");
+    const serverConfig = dialogFormToConfig(dialogForm);
+    setConfig((prev) => ({ ...prev, [name]: serverConfig }));
+    closeDialog();
+  };
 
   const handleTransportChange = (transport: TransportType) => {
     // Clear transport-specific fields when switching
     setDialogForm((prev) => ({
       ...prev,
       transport,
-      ...(transport === 'stdio'
-        ? { url: '', headersText: '' }
-        : { command: '', argsText: '', envText: '' }),
-    }))
-  }
+      ...(transport === "stdio"
+        ? { url: "", headersText: "" }
+        : { command: "", argsText: "", envText: "" }),
+    }));
+  };
 
   // ── Config actions ───────────────────────────────────────────────────────────
 
   const handleSave = async () => {
-    setSaving(true)
+    setSaving(true);
     try {
-      await saveMcpConfig({ mcpServers: config })
-      const newJson = JSON.stringify({ mcpServers: config })
-      setInitialJson(newJson)
-      toast.success('配置已保存')
+      await saveMcpConfig({ mcpServers: config });
+      const newJson = JSON.stringify({ mcpServers: config });
+      setInitialJson(newJson);
+      toast.success("配置已保存");
     } catch (err) {
-      toast.error(getApiErrorMessage(err) || '保存失败')
+      toast.error(getApiErrorMessage(err) || "保存失败");
     } finally {
-      setSaving(false)
+      setSaving(false);
     }
-  }
+  };
 
   const confirmDelete = (name: string) => {
-    setDeleteTarget(name)
-  }
+    setDeleteTarget(name);
+  };
 
   const handleDelete = () => {
-    if (!deleteTarget) return
-    const name = deleteTarget
+    if (!deleteTarget) return;
+    const name = deleteTarget;
     setConfig((prev) => {
-      const next = { ...prev }
-      delete next[name]
-      return next
-    })
-    setDeleteTarget(null)
-  }
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
+    setDeleteTarget(null);
+  };
 
   const handleTest = async (name: string) => {
-    setTesting(name)
+    setTesting(name);
     try {
-      const result = await testMcpConnection(name)
-      toast.success(result.message || `连接 ${name} 测试成功`)
+      const result = await testMcpConnection(name);
+      toast.success(result.message || `连接 ${name} 测试成功`);
     } catch (err) {
-      toast.error(getApiErrorMessage(err) || `连接 ${name} 测试失败`)
+      toast.error(getApiErrorMessage(err) || `连接 ${name} 测试失败`);
     } finally {
-      setTesting(null)
+      setTesting(null);
     }
-  }
+  };
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
-  const servers = Object.entries(config)
+  const servers = Object.entries(config);
 
-  if (loading) return <LoadingSpinner />
+  if (loading) return <LoadingSpinner />;
 
   return (
     <div className="max-w-4xl mx-auto space-y-4">
@@ -348,9 +361,13 @@ export function McpConfigPage() {
             <Plus className="mr-2 h-4 w-4" />
             添加服务器
           </Button>
-          <Button variant={hasChanges ? 'default' : 'outline'} onClick={handleSave} disabled={saving}>
+          <Button
+            variant={hasChanges ? "default" : "outline"}
+            onClick={handleSave}
+            disabled={saving}
+          >
             <Save className="mr-2 h-4 w-4" />
-            {saving ? '保存中...' : '保存配置'}
+            {saving ? "保存中..." : "保存配置"}
           </Button>
         </div>
       </div>
@@ -365,21 +382,29 @@ export function McpConfigPage() {
       ) : (
         <div className="grid gap-3 md:grid-cols-2">
           {servers.map(([name, server]) => {
-            const isStdio = server.transport === 'stdio'
-            const isTesting = testing === name
+            const isStdio = server.transport === "stdio";
+            const isTesting = testing === name;
             return (
-              <Card key={name} className="group hover:border-primary/50 transition-colors">
+              <Card
+                key={name}
+                className="group hover:border-primary/50 transition-colors"
+              >
                 <CardContent className="p-4 space-y-3">
                   {/* Row 1: status + name + transport badge + actions */}
                   <div className="flex items-center gap-2.5">
                     {/* Status dot */}
                     <span
                       className={`h-2.5 w-2.5 shrink-0 rounded-full ${
-                        server.enabled !== false ? 'bg-green-500' : 'bg-gray-400'
+                        server.enabled !== false
+                          ? "bg-green-500"
+                          : "bg-gray-400"
                       }`}
                     />
                     <span className="font-medium truncate flex-1">{name}</span>
-                    <Badge variant={BADGE_VARIANT[server.transport]} className="shrink-0">
+                    <Badge
+                      variant={BADGE_VARIANT[server.transport]}
+                      className="shrink-0"
+                    >
                       {server.transport}
                     </Badge>
 
@@ -400,7 +425,9 @@ export function McpConfigPage() {
                         disabled={isTesting}
                         title="测试连接"
                       >
-                        <RefreshCw className={`h-4 w-4 ${isTesting ? 'animate-spin' : ''}`} />
+                        <RefreshCw
+                          className={`h-4 w-4 ${isTesting ? "animate-spin" : ""}`}
+                        />
                       </Button>
                       <Button
                         variant="ghost"
@@ -418,7 +445,9 @@ export function McpConfigPage() {
                     {isStdio ? (
                       <>
                         <Terminal className="h-3.5 w-3.5 shrink-0" />
-                        <span className="truncate font-mono">{server.command || '?'}</span>
+                        <span className="truncate font-mono">
+                          {server.command || "?"}
+                        </span>
                         {(server.args || []).length > 0 && (
                           <span className="shrink-0">
                             · {(server.args || []).length} 个参数
@@ -428,16 +457,19 @@ export function McpConfigPage() {
                     ) : (
                       <>
                         <Globe className="h-3.5 w-3.5 shrink-0" />
-                        <span className="truncate font-mono">{server.url || '?'}</span>
+                        <span className="truncate font-mono">
+                          {server.url || "?"}
+                        </span>
                       </>
                     )}
                     <span className="shrink-0">
-                      · {server.timeoutSecs ?? 30}s · 重试 {server.maxRetries ?? 3} 次
+                      · {server.timeoutSecs ?? 30}s · 重试{" "}
+                      {server.maxRetries ?? 3} 次
                     </span>
                   </div>
                 </CardContent>
               </Card>
-            )
+            );
           })}
         </div>
       )}
@@ -448,7 +480,9 @@ export function McpConfigPage() {
           <DialogHeader>
             <DialogTitle>确认删除</DialogTitle>
             <DialogDescription>
-              确定要删除 MCP 服务器 <span className="font-semibold">{deleteTarget}</span> 吗？此操作不可撤销。
+              确定要删除 MCP 服务器{" "}
+              <span className="font-semibold">{deleteTarget}</span>{" "}
+              吗？此操作不可撤销。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -466,7 +500,9 @@ export function McpConfigPage() {
       <Dialog open={dialogOpen} onOpenChange={(open) => !open && closeDialog()}>
         <DialogContent className="sm:max-w-lg max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>{editingName ? `编辑 ${editingName}` : '添加 MCP 服务器'}</DialogTitle>
+            <DialogTitle>
+              {editingName ? `编辑 ${editingName}` : "添加 MCP 服务器"}
+            </DialogTitle>
             <DialogDescription>配置 MCP 服务器连接参数</DialogDescription>
           </DialogHeader>
 
@@ -479,12 +515,14 @@ export function McpConfigPage() {
                 placeholder="my-mcp-server"
                 value={dialogForm.name}
                 onChange={(e) => {
-                  setDialogForm((p) => ({ ...p, name: e.target.value }))
-                  if (nameError) setNameError('')
+                  setDialogForm((p) => ({ ...p, name: e.target.value }));
+                  if (nameError) setNameError("");
                 }}
                 disabled={!!editingName}
               />
-              {nameError && <p className="text-sm text-destructive mt-1">{nameError}</p>}
+              {nameError && (
+                <p className="text-sm text-destructive mt-1">{nameError}</p>
+              )}
             </div>
 
             {/* Transport */}
@@ -498,7 +536,9 @@ export function McpConfigPage() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="stdio">{TRANSPORT_LABELS.stdio}</SelectItem>
+                  <SelectItem value="stdio">
+                    {TRANSPORT_LABELS.stdio}
+                  </SelectItem>
                   <SelectItem value="sse">{TRANSPORT_LABELS.sse}</SelectItem>
                   <SelectItem value="streamable_http">
                     {TRANSPORT_LABELS.streamable_http}
@@ -512,13 +552,15 @@ export function McpConfigPage() {
               <Switch
                 id="mcp-enabled"
                 checked={dialogForm.enabled}
-                onCheckedChange={(v) => setDialogForm((p) => ({ ...p, enabled: v }))}
+                onCheckedChange={(v) =>
+                  setDialogForm((p) => ({ ...p, enabled: v }))
+                }
               />
               <Label htmlFor="mcp-enabled">启用</Label>
             </div>
 
             {/* ── stdio fields ─────────────────────────────────────────── */}
-            {dialogForm.transport === 'stdio' && (
+            {dialogForm.transport === "stdio" && (
               <>
                 <div className="space-y-1.5">
                   <Label htmlFor="mcp-command">命令 *</Label>
@@ -526,7 +568,9 @@ export function McpConfigPage() {
                     id="mcp-command"
                     placeholder="npx 或可执行文件路径"
                     value={dialogForm.command}
-                    onChange={(e) => setDialogForm((p) => ({ ...p, command: e.target.value }))}
+                    onChange={(e) =>
+                      setDialogForm((p) => ({ ...p, command: e.target.value }))
+                    }
                   />
                 </div>
                 <div className="space-y-1.5">
@@ -536,24 +580,31 @@ export function McpConfigPage() {
                     rows={3}
                     placeholder="-y\n@scope/server\n--port=8080"
                     value={dialogForm.argsText}
-                    onChange={(e) => setDialogForm((p) => ({ ...p, argsText: e.target.value }))}
+                    onChange={(e) =>
+                      setDialogForm((p) => ({ ...p, argsText: e.target.value }))
+                    }
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="mcp-env">环境变量（KEY=VALUE，每行一个）</Label>
+                  <Label htmlFor="mcp-env">
+                    环境变量（KEY=VALUE，每行一个）
+                  </Label>
                   <Textarea
                     id="mcp-env"
                     rows={3}
                     placeholder="NODE_ENV=production\nDEBUG=true"
                     value={dialogForm.envText}
-                    onChange={(e) => setDialogForm((p) => ({ ...p, envText: e.target.value }))}
+                    onChange={(e) =>
+                      setDialogForm((p) => ({ ...p, envText: e.target.value }))
+                    }
                   />
                 </div>
               </>
             )}
 
             {/* ── sse / streamable_http fields ─────────────────────────── */}
-            {(dialogForm.transport === 'sse' || dialogForm.transport === 'streamable_http') && (
+            {(dialogForm.transport === "sse" ||
+              dialogForm.transport === "streamable_http") && (
               <>
                 <div className="space-y-1.5">
                   <Label htmlFor="mcp-url">URL *</Label>
@@ -561,18 +612,25 @@ export function McpConfigPage() {
                     id="mcp-url"
                     placeholder="http://localhost:8000/mcp"
                     value={dialogForm.url}
-                    onChange={(e) => setDialogForm((p) => ({ ...p, url: e.target.value }))}
+                    onChange={(e) =>
+                      setDialogForm((p) => ({ ...p, url: e.target.value }))
+                    }
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <Label htmlFor="mcp-headers">Headers（KEY: VALUE，每行一个）</Label>
+                  <Label htmlFor="mcp-headers">
+                    Headers（KEY: VALUE，每行一个）
+                  </Label>
                   <Textarea
                     id="mcp-headers"
                     rows={3}
                     placeholder="Authorization: Bearer token\nX-API-Key: abc123"
                     value={dialogForm.headersText}
                     onChange={(e) =>
-                      setDialogForm((p) => ({ ...p, headersText: e.target.value }))
+                      setDialogForm((p) => ({
+                        ...p,
+                        headersText: e.target.value,
+                      }))
                     }
                   />
                 </div>
@@ -590,7 +648,10 @@ export function McpConfigPage() {
                   max={300}
                   value={dialogForm.timeoutSecs}
                   onChange={(e) =>
-                    setDialogForm((p) => ({ ...p, timeoutSecs: Number(e.target.value) || 30 }))
+                    setDialogForm((p) => ({
+                      ...p,
+                      timeoutSecs: Number(e.target.value) || 30,
+                    }))
                   }
                 />
               </div>
@@ -603,7 +664,10 @@ export function McpConfigPage() {
                   max={10}
                   value={dialogForm.maxRetries}
                   onChange={(e) =>
-                    setDialogForm((p) => ({ ...p, maxRetries: Number(e.target.value) || 3 }))
+                    setDialogForm((p) => ({
+                      ...p,
+                      maxRetries: Number(e.target.value) || 3,
+                    }))
                   }
                 />
               </div>
@@ -614,12 +678,15 @@ export function McpConfigPage() {
             <Button variant="outline" onClick={closeDialog}>
               取消
             </Button>
-            <Button onClick={handleDialogSubmit} disabled={!isDialogFormValid()}>
-              {editingName ? '保存修改' : '添加'}
+            <Button
+              onClick={handleDialogSubmit}
+              disabled={!isDialogFormValid()}
+            >
+              {editingName ? "保存修改" : "添加"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
-  )
+  );
 }

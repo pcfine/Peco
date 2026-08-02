@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::routing::post;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -32,6 +34,7 @@ pub mod session_store;
 pub mod skill;
 pub mod state;
 pub mod task;
+pub mod upload;
 pub mod usage;
 pub mod workspace;
 
@@ -48,8 +51,12 @@ pub fn build_router(state: Arc<state::AppState>) -> Router {
 pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: bool) -> Router {
     let secret = state.jwt_secret.clone();
 
+    // 静态文件服务：上传的图片等资源
+    let uploads_dir = state.data_dir.join("uploads");
+
     // 受保护的路由组（需要认证 + 限流）
     let protected_routes = Router::new()
+        .route("/api/upload", post(upload::upload))
         .nest("/api/peco", peco::handler::router())
         .nest("/api/chat", chat::router())
         .nest("/api/providers", provider::router())
@@ -71,6 +78,7 @@ pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: 
     Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
         .nest("/api/auth", auth::router()) // 公开路由，不限流
+        .nest_service("/uploads", ServeDir::new(uploads_dir))
         .merge(protected_routes)
         .with_state(state)
         .layer(CorsLayer::permissive())

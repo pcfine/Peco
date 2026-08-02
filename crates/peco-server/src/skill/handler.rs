@@ -150,4 +150,3 @@ pub async fn import_skill(
         message: Some(format!("Skill '{name}' imported")),
     }))
 }
-

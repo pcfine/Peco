@@ -1,15 +1,15 @@
-import { useState } from 'react'
-import { Sidebar } from './Sidebar'
-import { Header } from './Header'
-import { Outlet } from 'react-router-dom'
-import { Sheet, SheetContent } from '@/components/ui/sheet'
-import { Menu } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { useSidebarStore } from '@/stores/sidebarStore'
+import { useState } from "react";
+import { Sidebar } from "./Sidebar";
+import { Header } from "./Header";
+import { Outlet } from "react-router-dom";
+import { Sheet, SheetContent } from "@/components/ui/sheet";
+import { Menu } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useSidebarStore } from "@/stores/sidebarStore";
 
 export function AppLayout() {
-  const [mobileOpen, setMobileOpen] = useState(false)
-  const collapsed = useSidebarStore((s) => s.collapsed)
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const collapsed = useSidebarStore((s) => s.collapsed);
 
   return (
     <div className="flex h-full overflow-hidden bg-background">
@@ -44,5 +44,5 @@ export function AppLayout() {
         </main>
       </div>
     </div>
-  )
+  );
 }

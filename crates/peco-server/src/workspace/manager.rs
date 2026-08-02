@@ -75,10 +75,7 @@ impl WorkspaceManager {
         let ws = Arc::new(ws);
 
         // Start file watcher for this workspace
-        let watcher = FileWatcher::start(
-            self.workspace_dir(user_id),
-            Arc::downgrade(&ws),
-        );
+        let watcher = FileWatcher::start(self.workspace_dir(user_id), Arc::downgrade(&ws));
 
         if watcher.is_none() {
             tracing::warn!(user_id = %user_id, "File watcher failed to start for workspace");

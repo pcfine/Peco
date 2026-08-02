@@ -147,9 +147,7 @@ fn classify_event(workspace_root: &Path, event: &Event) -> Vec<ReloadAction> {
     let is_remove = matches!(event.kind, EventKind::Remove(_));
     let is_relevant = matches!(
         event.kind,
-        EventKind::Create(_)
-            | EventKind::Modify(_)
-            | EventKind::Remove(_)
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     );
     if !is_relevant {
         return vec![];

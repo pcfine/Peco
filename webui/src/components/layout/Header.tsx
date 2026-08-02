@@ -1,38 +1,39 @@
-import { useLocation } from 'react-router-dom'
-import { useAuthStore } from '@/stores/authStore'
-import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { useLocation } from "react-router-dom";
+import { useAuthStore } from "@/stores/authStore";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { LogOut, User } from 'lucide-react'
+} from "@/components/ui/dropdown-menu";
+import { LogOut, User } from "lucide-react";
 
 const PAGE_TITLES: Record<string, string> = {
-  '/peco': 'Peco',
-  '/chat': '对话',
-  '/manage/providers': 'Provider',
-  '/manage/agents': 'Agent 管理',
-  '/manage/skills': 'Skill',
-  '/manage/mcp': 'MCP',
-  '/manage/knowledge': '知识库',
-  '/tasks': '定时任务',
-  '/settings': '设置',
-}
+  "/peco": "Peco",
+  "/chat": "对话",
+  "/manage/providers": "Provider",
+  "/manage/agents": "Agent 管理",
+  "/manage/skills": "Skill",
+  "/manage/mcp": "MCP",
+  "/manage/knowledge": "知识库",
+  "/tasks": "定时任务",
+  "/settings": "设置",
+};
 
 interface HeaderProps {
-  children?: React.ReactNode
+  children?: React.ReactNode;
 }
 
 export function Header({ children }: HeaderProps) {
-  const location = useLocation()
-  const { user, logout } = useAuthStore()
+  const location = useLocation();
+  const { user, logout } = useAuthStore();
 
-  const title = Object.entries(PAGE_TITLES).find(([path]) =>
-    location.pathname.startsWith(path),
-  )?.[1] ?? 'Peco'
+  const title =
+    Object.entries(PAGE_TITLES).find(([path]) =>
+      location.pathname.startsWith(path),
+    )?.[1] ?? "Peco";
 
   return (
     <header className="flex h-14 items-center justify-between border-b px-4 md:px-6 bg-background">
@@ -66,5 +67,5 @@ export function Header({ children }: HeaderProps) {
         </DropdownMenu>
       )}
     </header>
-  )
+  );
 }

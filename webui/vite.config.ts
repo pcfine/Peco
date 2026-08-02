@@ -17,6 +17,10 @@ export default defineConfig({
         target: 'http://localhost:9227',
         changeOrigin: true,
       },
+      '/uploads': {
+        target: 'http://localhost:9227',
+        changeOrigin: true,
+      },
     },
   },
   // @ts-expect-error — vitest not yet installed; install vitest + jsdom and remove this directive

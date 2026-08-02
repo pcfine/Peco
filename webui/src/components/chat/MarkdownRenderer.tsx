@@ -1,16 +1,17 @@
 // MarkdownRenderer — renders AI-generated markdown with GFM + syntax highlighting
 
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import rehypeHighlight from 'rehype-highlight'
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 
 interface MarkdownRendererProps {
-  content: string
+  content: string;
 }
 
 export function MarkdownRenderer({ content }: MarkdownRendererProps) {
   return (
-    <div className="max-w-none break-words text-sm leading-relaxed space-y-2
+    <div
+      className="max-w-none break-words text-sm leading-relaxed space-y-2
       [&_h1]:text-xl [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2
       [&_h2]:text-lg [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-2
       [&_h3]:text-base [&_h3]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1
@@ -30,7 +31,8 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
       [&_blockquote]:border-l-4 [&_blockquote]:border-l-muted-foreground/30 [&_blockquote]:pl-3 [&_blockquote]:text-muted-foreground [&_blockquote]:my-2
       [&_a]:text-primary [&_a]:underline [&_a]:break-all
       [&_img]:rounded-md [&_img]:max-w-full [&_img]:my-2
-    ">
+    "
+    >
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
@@ -38,5 +40,5 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
         {content}
       </ReactMarkdown>
     </div>
-  )
+  );
 }

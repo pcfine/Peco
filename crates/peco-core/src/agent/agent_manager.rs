@@ -322,9 +322,8 @@ impl AgentManager {
         // 使用与 parse_meta 相同的 serde_yaml 解析做验证，
         // 确保写盘的内容一定能被后续缓存识别。
         // split_frontmatter 仅检查 --- 分隔符，不验证 YAML 结构。
-        let (_profile, _body) =
-            crate::agent::agent_config::parse_agent_md(content)
-                .map_err(|e| WorkspaceError::InvalidAgentFormat(e.to_string()))?;
+        let (_profile, _body) = crate::agent::agent_config::parse_agent_md(content)
+            .map_err(|e| WorkspaceError::InvalidAgentFormat(e.to_string()))?;
 
         let dir = self.agents_dir.join(name);
         std::fs::create_dir_all(&dir)?;
@@ -332,10 +331,10 @@ impl AgentManager {
         self.invalidate(name);
 
         // 刷新 Tier-1 元数据（已验证过 YAML 合法，此处不会失败）
-        if let Ok(mut metas) = self.metas.write() {
-            if let Ok(meta) = Self::parse_meta(&dir.join("agent.md")) {
-                metas.insert(name.to_string(), meta);
-            }
+        if let Ok(mut metas) = self.metas.write()
+            && let Ok(meta) = Self::parse_meta(&dir.join("agent.md"))
+        {
+            metas.insert(name.to_string(), meta);
         }
 
         info!(agent = %name, "Agent file saved");

@@ -208,9 +208,7 @@ impl WorkSpace {
     /// 重新加载知识库管理器（拆毁并重建底层 KnowledgeBaseManager）。
     ///
     /// 适用于 kb_config.json 变更后需要重新发现知识库的场景。
-    pub async fn reload_knowledge(
-        &self,
-    ) -> Result<(), crate::knowledge::KnowledgeModuleError> {
+    pub async fn reload_knowledge(&self) -> Result<(), crate::knowledge::KnowledgeModuleError> {
         self.knowledge_manager.reload().await
     }
 

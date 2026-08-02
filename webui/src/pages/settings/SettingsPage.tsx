@@ -1,17 +1,17 @@
-import { useAuthStore } from '@/stores/authStore'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { useNavigate } from 'react-router-dom'
+import { useAuthStore } from "@/stores/authStore";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { useNavigate } from "react-router-dom";
 
 export function SettingsPage() {
-  const { user, logout } = useAuthStore()
-  const navigate = useNavigate()
+  const { user, logout } = useAuthStore();
+  const navigate = useNavigate();
 
   const handleLogout = () => {
-    logout()
-    navigate('/login')
-  }
+    logout();
+    navigate("/login");
+  };
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
@@ -30,12 +30,19 @@ export function SettingsPage() {
             <div>
               <p className="text-lg font-semibold">{user?.username}</p>
               <p className="text-sm text-muted-foreground">{user?.email}</p>
-              <p className="text-xs text-muted-foreground">注册时间: {user?.created_at ? new Date(user.created_at).toLocaleDateString('zh-CN') : '-'}</p>
+              <p className="text-xs text-muted-foreground">
+                注册时间:{" "}
+                {user?.created_at
+                  ? new Date(user.created_at).toLocaleDateString("zh-CN")
+                  : "-"}
+              </p>
             </div>
           </div>
-          <Button variant="destructive" onClick={handleLogout}>退出登录</Button>
+          <Button variant="destructive" onClick={handleLogout}>
+            退出登录
+          </Button>
         </CardContent>
       </Card>
     </div>
-  )
+  );
 }

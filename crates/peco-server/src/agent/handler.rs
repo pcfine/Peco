@@ -37,6 +37,8 @@ pub struct CreateAgentRequest {
     #[serde(default = "default_color")]
     pub color: String,
     #[serde(default)]
+    pub background_color: Option<String>,
+    #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<String>,
@@ -73,6 +75,7 @@ pub struct UpdateAgentRequest {
     pub provider: Option<Option<String>>,
     pub icon: Option<String>,
     pub color: Option<String>,
+    pub background_color: Option<String>,
     pub tools: Option<Vec<String>>,
     pub mcp_servers: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
@@ -94,6 +97,7 @@ pub struct AgentListItem {
     pub provider: Option<String>,
     pub icon: String,
     pub color: String,
+    pub background_color: String,
     pub status: String,
     pub tools: Vec<String>,
     pub knowledge_bases: Vec<String>,
@@ -111,6 +115,7 @@ pub struct AgentDetail {
     pub provider: Option<String>,         // agent.md llm.provider（可能未指定）
     pub icon: String,                     // DB only
     pub color: String,                    // DB only
+    pub background_color: String,         // DB only
     pub status: String,                   // DB only
     pub tools: Vec<String>,               // agent.md tools
     pub mcp_servers: Vec<String>,         // agent.md mcp
@@ -150,6 +155,7 @@ fn agent_detail_from_profile(
         provider: llm.and_then(|l| l.provider.clone()),
         icon: db_row.icon.clone(),
         color: db_row.color.clone(),
+        background_color: db_row.background_color.clone(),
         status: db_row.status.clone(),
         tools: profile.tools.clone(),
         mcp_servers: profile.mcp.clone(),
@@ -283,6 +289,7 @@ pub async fn list(
                     description: meta.description.clone(),
                     icon: "🤖".to_string(),
                     color: "#6366f1".to_string(),
+                    background_color: String::new(),
                 };
                 if let Err(e) = agents::insert(&state.db, &params).await {
                     tracing::warn!(
@@ -305,7 +312,8 @@ pub async fn list(
     let mut items: Vec<AgentListItem> = Vec::with_capacity(rows.len());
     for r in &rows {
         // 尝试从 agent.md 读取 tools/model/provider/knowledge_bases（失败则使用空默认值）
-        let (tools, model, provider, knowledge_bases) = read_agent_md_light(ws.agent_manager(), &r.name);
+        let (tools, model, provider, knowledge_bases) =
+            read_agent_md_light(ws.agent_manager(), &r.name);
         items.push(AgentListItem {
             id: r.id.clone(),
             name: r.name.clone(),
@@ -314,6 +322,7 @@ pub async fn list(
             provider,
             icon: r.icon.clone(),
             color: r.color.clone(),
+            background_color: r.background_color.clone(),
             status: r.status.clone(),
             tools,
             knowledge_bases,
@@ -395,6 +404,7 @@ pub async fn create(
         description: req.description.trim().to_string(),
         icon: req.icon.clone(),
         color: req.color.clone(),
+        background_color: req.background_color.clone().unwrap_or_default(),
     };
     agents::insert(&state.db, &db_params).await?;
 
@@ -422,6 +432,7 @@ pub async fn create(
             description: String::new(),
             icon: req.icon.clone(),
             color: req.color.clone(),
+            background_color: req.background_color.clone().unwrap_or_default(),
             status: "idle".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -444,6 +455,7 @@ pub async fn create(
         },
         icon: req.icon,
         color: req.color,
+        background_color: db_row.background_color,
         status: db_row.status,
         tools: assemble_params.tools,
         mcp_servers: assemble_params.mcp_servers,
@@ -497,6 +509,7 @@ pub async fn get(
                 description: Some(profile.agent.description.clone()),
                 icon: None,
                 color: None,
+                background_color: None,
             },
         )
         .await;
@@ -577,6 +590,7 @@ pub async fn update(
             description: Some(merged.description.clone()),
             icon: req.icon.clone(),
             color: req.color.clone(),
+            background_color: req.background_color.clone(),
         },
     )
     .await?;
@@ -615,6 +629,7 @@ pub async fn update(
         },
         icon: updated_row.icon,
         color: updated_row.color,
+        background_color: updated_row.background_color,
         status: updated_row.status,
         tools: merged.tools,
         mcp_servers: merged.mcp_servers,

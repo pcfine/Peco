@@ -3,23 +3,23 @@
 //   timeout_secs → timeoutSecs, max_retries → maxRetries (explicit #[serde(rename)])
 //   all other fields use snake_case, TransportType uses snake_case
 
-export type TransportType = 'stdio' | 'sse' | 'streamable_http'
+export type TransportType = "stdio" | "sse" | "streamable_http";
 
 export interface McpServerConfig {
-  transport: TransportType
-  enabled?: boolean
+  transport: TransportType;
+  enabled?: boolean;
   // stdio fields
-  command?: string
-  args?: string[]
-  env?: Record<string, string>
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
   // sse / streamable_http fields
-  url?: string
-  headers?: Record<string, string>
+  url?: string;
+  headers?: Record<string, string>;
   // general
-  timeoutSecs?: number
-  maxRetries?: number
+  timeoutSecs?: number;
+  maxRetries?: number;
 }
 
 export interface McpConfigResponse {
-  mcpServers: Record<string, McpServerConfig>
+  mcpServers: Record<string, McpServerConfig>;
 }
