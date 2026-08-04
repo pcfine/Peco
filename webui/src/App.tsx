@@ -5,11 +5,13 @@ import { Toaster } from "sonner";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { ChatLayout } from "@/components/layout/ChatLayout";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { LoginPage } from "@/pages/auth/LoginPage";
 import { RegisterPage } from "@/pages/auth/RegisterPage";
 import { PecoChatPage } from "@/pages/peco/PecoChatPage";
 import { AgentChatPage } from "@/pages/chat/AgentChatPage";
+import { StartChatPage } from "@/pages/chat/StartChatPage";
 import { AgentListPage } from "@/pages/agents/AgentListPage";
 import { AgentCreatePage } from "@/pages/agents/AgentCreatePage";
 import { AgentEditPage } from "@/pages/agents/AgentEditPage";
@@ -21,11 +23,6 @@ import { TaskLogsPage } from "@/pages/tasks/TaskLogsPage";
 import { SettingsPage } from "@/pages/settings/SettingsPage";
 
 // Lazy-loaded management pages (new in v2)
-const ProviderListPage = lazy(() =>
-  import("@/pages/manage/ProviderListPage").then((m) => ({
-    default: m.ProviderListPage,
-  })),
-);
 const SkillListPage = lazy(() =>
   import("@/pages/manage/SkillListPage").then((m) => ({
     default: m.SkillListPage,
@@ -58,35 +55,30 @@ export default function App() {
                   {/* Peco 永续聊天 */}
                   <Route path="/peco" element={<PecoChatPage />} />
 
-                  {/* Agent 对话 */}
-                  <Route path="/chat/:agentId" element={<AgentChatPage />} />
+                  {/* 空间 */}
                   <Route
-                    path="/chat/:agentId/:conversationId"
-                    element={<AgentChatPage />}
+                    path="/workspace/agents"
+                    element={<AgentListPage />}
                   />
-
-                  {/* 管理 */}
                   <Route
-                    path="/manage/providers"
-                    element={<ProviderListPage />}
-                  />
-                  <Route path="/manage/agents" element={<AgentListPage />} />
-                  <Route
-                    path="/manage/agents/new"
+                    path="/workspace/agents/new"
                     element={<AgentCreatePage />}
                   />
                   <Route
-                    path="/manage/agents/:agentId/edit"
+                    path="/workspace/agents/:agentId/edit"
                     element={<AgentEditPage />}
                   />
-                  <Route path="/manage/skills" element={<SkillListPage />} />
-                  <Route path="/manage/mcp" element={<McpConfigPage />} />
                   <Route
-                    path="/manage/knowledge"
+                    path="/workspace/skills"
+                    element={<SkillListPage />}
+                  />
+                  <Route path="/workspace/mcp" element={<McpConfigPage />} />
+                  <Route
+                    path="/workspace/knowledge"
                     element={<KnowledgeListPage />}
                   />
                   <Route
-                    path="/manage/knowledge/:kbId"
+                    path="/workspace/knowledge/:kbId"
                     element={<KnowledgeDetailPage />}
                   />
 
@@ -100,6 +92,18 @@ export default function App() {
 
                   {/* 设置 */}
                   <Route path="/settings" element={<SettingsPage />} />
+                </Route>
+
+                {/* Chat 路由 — 独立 ChatLayout（无 AppLayout 依赖） */}
+                <Route element={<ChatLayout />}>
+                  <Route
+                    path="/chat/:agentId"
+                    element={<StartChatPage />}
+                  />
+                  <Route
+                    path="/chat/:agentId/:conversationId"
+                    element={<AgentChatPage />}
+                  />
                 </Route>
               </Route>
             </Routes>

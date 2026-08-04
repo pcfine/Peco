@@ -10,7 +10,7 @@ export interface AgentListItem {
   background_color: string;
   status: string;
   tools?: string[];
-  knowledge_bases?: string[];
+  knowledge_bases: string[];
   created_at: string;
 }
 
@@ -20,6 +20,8 @@ export interface AgentDetail extends AgentListItem {
   skills: string[];
   temperature?: number;
   max_tokens?: number;
+  reasoning_effort?: string;
+  max_turns: number;
   updated_at: string;
 }
 
@@ -35,8 +37,11 @@ export interface CreateAgentRequest {
   tools?: string[];
   mcp_servers?: string[];
   skills?: string[];
+  knowledge_bases?: string[];
   temperature?: number;
   max_tokens?: number;
+  reasoning_effort?: string;
+  max_turns?: number;
 }
 
 export interface UpdateAgentRequest {
@@ -51,8 +56,11 @@ export interface UpdateAgentRequest {
   tools?: string[];
   mcp_servers?: string[];
   skills?: string[];
+  knowledge_bases?: string[];
   temperature?: number;
   max_tokens?: number;
+  reasoning_effort?: string;
+  max_turns?: number;
 }
 
 export interface SuccessResponse {

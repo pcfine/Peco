@@ -20,8 +20,14 @@ export const agentSchema = z.object({
   icon: z.string().optional().default("🤖"),
   color: z.string().optional().default("#6366f1"),
   background_color: z.string().optional().default(""),
+  tools: z.array(z.string()).optional().default([]),
+  skills: z.array(z.string()).optional().default([]),
+  knowledge_bases: z.array(z.string()).optional().default([]),
+  mcp_servers: z.array(z.string()).optional().default([]),
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().positive().optional(),
+  reasoning_effort: z.string().optional(),
+  max_turns: z.number().positive().optional(),
 });
 
 export const knowledgeBaseSchema = z.object({

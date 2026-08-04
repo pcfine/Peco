@@ -23,7 +23,7 @@ export function AgentEditPage() {
     try {
       await updateAgent(agentId, data);
       toast.success("Agent 已更新");
-      navigate("/manage/agents");
+      navigate("/workspace/agents");
     } catch {
       toast.error("更新失败");
     }

@@ -13,11 +13,10 @@ import { LogOut, User } from "lucide-react";
 const PAGE_TITLES: Record<string, string> = {
   "/peco": "Peco",
   "/chat": "对话",
-  "/manage/providers": "Provider",
-  "/manage/agents": "Agent 管理",
-  "/manage/skills": "Skill",
-  "/manage/mcp": "MCP",
-  "/manage/knowledge": "知识库",
+  "/workspace/agents": "Agent 管理",
+  "/workspace/skills": "Skill",
+  "/workspace/mcp": "MCP",
+  "/workspace/knowledge": "知识库",
   "/tasks": "定时任务",
   "/settings": "设置",
 };

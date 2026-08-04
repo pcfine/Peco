@@ -2,6 +2,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { ProviderSection } from "@/components/settings/ProviderSection";
 import { useNavigate } from "react-router-dom";
 
 export function SettingsPage() {
@@ -16,6 +17,7 @@ export function SettingsPage() {
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <h2 className="text-2xl font-bold">设置</h2>
+
       <Card>
         <CardHeader>
           <CardTitle>用户信息</CardTitle>
@@ -41,6 +43,15 @@ export function SettingsPage() {
           <Button variant="destructive" onClick={handleLogout}>
             退出登录
           </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Provider 配置</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <ProviderSection />
         </CardContent>
       </Card>
     </div>

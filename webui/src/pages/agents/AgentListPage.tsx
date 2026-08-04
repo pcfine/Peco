@@ -1,22 +1,29 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { listAgents, deleteAgent } from "@/api/agents";
 import type { AgentListItem } from "@/types/agent";
-import { Plus, Trash2, Bot, Wrench, Database, Cpu } from "lucide-react";
+import { Plus, Trash2, Bot, Wrench, Database, Cpu, MessageSquare, AlertCircle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 export function AgentListPage() {
+  const navigate = useNavigate();
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const load = () => {
+    setError(null);
+    setLoading(true);
     listAgents()
       .then(setAgents)
-      .catch(() => toast.error("加载 Agent 列表失败"))
+      .catch(() => {
+        setError("加载 Agent 列表失败，请检查网络连接后重试");
+        toast.error("加载 Agent 列表失败");
+      })
       .finally(() => setLoading(false));
   };
 
@@ -36,11 +43,26 @@ export function AgentListPage() {
 
   if (loading) return <LoadingSpinner />;
 
+  if (error) {
+    return (
+      <div className="max-w-4xl mx-auto">
+        <div className="flex flex-col items-center justify-center gap-4 py-20">
+          <AlertCircle className="h-10 w-10 text-destructive" />
+          <p className="text-muted-foreground text-sm">{error}</p>
+          <Button variant="outline" onClick={load}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            重试
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-4xl mx-auto space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold">Agent 管理</h2>
-        <Link to="/manage/agents/new">
+        <Link to="/workspace/agents/new">
           <Button>
             <Plus className="mr-2 h-4 w-4" />
             创建 Agent
@@ -62,7 +84,7 @@ export function AgentListPage() {
             return (
               <Link
                 key={a.id}
-                to={`/manage/agents/${a.id}/edit`}
+                to={`/workspace/agents/${a.id}/edit`}
                 className="block"
               >
                 <Card className="group h-[170px] hover:border-primary/50 transition-colors cursor-pointer overflow-hidden">
@@ -93,6 +115,19 @@ export function AgentListPage() {
                           {a.name}
                         </p>
                         <div className="flex gap-1 opacity-0 group-hover:opacity-100 shrink-0">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            title="对话"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              navigate(`/chat/${encodeURIComponent(a.name)}`);
+                            }}
+                          >
+                            <MessageSquare className="h-3.5 w-3.5" />
+                          </Button>
                           <Button
                             variant="ghost"
                             size="icon"

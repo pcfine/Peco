@@ -35,11 +35,21 @@ export interface ChatViewProps {
   /** 头部右侧操作区（如清除对话按钮、归档按钮） */
   headerActions?: React.ReactNode;
   /** 头部标题 */
-  headerTitle?: string;
+  headerTitle?: React.ReactNode;
   /** 消息列表为空时显示的欢迎内容 */
   welcomeMessage?: React.ReactNode;
   /** 提交反馈回调 */
   onFeedback?: (messageId: string, rating: "up" | "down") => Promise<void>;
+  /** 当前是否为可见对话。false 时隐藏 DOM 但保持挂载和 SSE */
+  visible?: boolean;
+  /** 挂载后自动发送的首条消息（仅在 snapshot 就绪后传入） */
+  initialQuery?: string;
+  /** 不可见时收到新消息的回调，用于 ConversationList 未读标记 */
+  onUnread?: (unreadCount: number) => void;
+  /** initialQuery 被发送后回调，用于父组件清理状态，防止重新挂载时重复发送 */
+  onInitialQuerySent?: () => void;
+  /** 附加到根元素的 CSS class（用于覆盖高度等布局属性） */
+  className?: string;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
@@ -50,6 +60,11 @@ export function ChatView({
   headerActions,
   headerTitle = "对话",
   welcomeMessage,
+  visible = true,
+  initialQuery,
+  onUnread,
+  onInitialQuerySent,
+  className,
 }: ChatViewProps) {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
@@ -57,34 +72,40 @@ export function ChatView({
   const abortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const token = useAuthStore((s) => s.token);
+  const unreadCountRef = useRef(0);
+  const unreadDebounceRef = useRef<ReturnType<typeof setTimeout>>();
 
-  // Update messages when initialMessages change (e.g. navigation between conversations)
-  useEffect(() => {
-    setMessages(initialMessages);
-  }, [initialMessages]);
-
-  // Refs for stable closure access
+  // Refs for stable closure access — avoids effect re-trigger from prop/state changes
   const inputRef = useRef(input);
   inputRef.current = input;
   const streamingRef = useRef(streaming);
   streamingRef.current = streaming;
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
 
-  // Auto-scroll
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  // Refs for callback props — eliminate dependency churn
+  const streamUrlRef = useRef(streamUrl);
+  streamUrlRef.current = streamUrl;
+  const onUnreadRef = useRef(onUnread);
+  onUnreadRef.current = onUnread;
+  const onInitialQuerySentRef = useRef(onInitialQuerySent);
+  onInitialQuerySentRef.current = onInitialQuerySent;
+  // token from Zustand is stable after login, but capture in ref for safety
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
 
-  const handleSend = useCallback(async () => {
-    const currentInput = inputRef.current;
-    if (!currentInput.trim() || !token || streamingRef.current) return;
+  // ── Core send logic — stable identity (empty deps, reads everything from refs) ─
+
+  const sendMessage = useCallback(async (text: string) => {
+    const tok = tokenRef.current;
+    if (!text.trim() || !tok || streamingRef.current) return;
 
     const userMsg: ChatMessage = {
       role: "user",
-      content: currentInput,
+      content: text,
       turnIndex: 0,
     };
     setMessages((prev) => [...prev, userMsg]);
-    setInput("");
     setStreaming(true);
 
     const assistantMsg: ChatMessage = {
@@ -98,9 +119,9 @@ export function ChatView({
     abortRef.current = controller;
 
     try {
-      const url = streamUrl(currentInput);
+      const url = streamUrlRef.current(text);
       const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${tok}` },
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -121,7 +142,23 @@ export function ChatView({
 
         for (const parsed of events) {
           const event = toChatSseEvent(parsed);
-          if (event) handleSSEEvent(event, setMessages, setStreaming);
+          if (event) {
+            handleSSEEvent(event, setMessages, setStreaming, () => {
+              if (!visibleRef.current && onUnreadRef.current) {
+                unreadCountRef.current += 1;
+                // Debounce: each text_delta fires this callback, which can be
+                // hundreds of times per message. Throttle to one
+                // notification per 150ms to avoid flooding the parent with
+                // Map rebuilds and re-renders.
+                if (unreadDebounceRef.current) {
+                  clearTimeout(unreadDebounceRef.current);
+                }
+                unreadDebounceRef.current = setTimeout(() => {
+                  onUnreadRef.current?.(unreadCountRef.current);
+                }, 150);
+              }
+            });
+          }
         }
       }
     } catch (err: unknown) {
@@ -131,7 +168,87 @@ export function ChatView({
       setStreaming(false);
       abortRef.current = null;
     }
-  }, [token, streamUrl]);
+  }, []);
+
+  // ── Sync messages when initialMessages changes (pool keep-alive) ─────────
+
+  const prevInitialMessagesRef = useRef(initialMessages);
+  useEffect(() => {
+    // Only sync if the reference actually changed (not just re-render).
+    // Skip reset while an SSE stream is active — parent re-renders (e.g. from
+    // onInitialQuerySent) can cause the `?? []` fallback to produce a new
+    // reference, which would otherwise wipe out in-flight messages.
+    if (
+      prevInitialMessagesRef.current !== initialMessages &&
+      !streamingRef.current
+    ) {
+      prevInitialMessagesRef.current = initialMessages;
+      setMessages(initialMessages);
+    }
+  }, [initialMessages]);
+
+  // ── handleSend: reads from input → clears input → delegates to sendMessage ─
+
+  const handleSend = useCallback(async () => {
+    const currentInput = inputRef.current;
+    const tok = tokenRef.current;
+    if (!currentInput.trim() || !tok || streamingRef.current) return;
+    setInput("");
+    await sendMessage(currentInput);
+  }, [sendMessage]);
+
+  // ── initialQuery auto-send ──────────────────────────────────────────────
+
+  const hasSentInitialRef = useRef(false);
+  useEffect(() => {
+    const tok = tokenRef.current;
+    if (initialQuery && !hasSentInitialRef.current && tok) {
+      hasSentInitialRef.current = true;
+      sendMessage(initialQuery);
+      // Defer onInitialQuerySent to the next microtask so that sendMessage's
+      // synchronous state updates (setMessages, setStreaming) are committed
+      // before the parent clears initialQuery.  This prevents a parent
+      // re-render in the same batch from resetting in-flight messages.
+      Promise.resolve().then(() => {
+        onInitialQuerySentRef.current?.();
+      });
+    }
+  }, [initialQuery]);
+
+  // ── Reset unread when becoming visible ──────────────────────────────────
+
+  useEffect(() => {
+    if (visible) {
+      unreadCountRef.current = 0;
+      // Notify parent so it clears unreadCounts map for this convId.
+      // Without this, switching away from a conversation that previously
+      // had unread messages causes the blue dot to incorrectly reappear.
+      onUnreadRef.current?.(0);
+    }
+  }, [visible]);
+
+  // ── Auto-scroll (paused when hidden) ────────────────────────────────────
+
+  useEffect(() => {
+    if (visible) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, visible]);
+
+  // ── Cleanup on unmount ─────────────────────────────────────────────────
+
+  // React 18 silently drops state updates on unmounted components, so we
+  // intentionally do NOT abort the SSE stream here.  Aborting in the cleanup
+  // would interact poorly with React StrictMode (which fires cleanups between
+  // the two effect passes), killing the initialQuery auto-send.  The browser
+  // will GC the ReadableStream when the component unmounts.
+  useEffect(() => {
+    return () => {
+      // no-op: React 18 drops state updates after unmount
+    };
+  }, []);
+
+  // ── Handlers ────────────────────────────────────────────────────────────
 
   const handleStop = () => {
     abortRef.current?.abort();
@@ -145,8 +262,12 @@ export function ChatView({
     }
   };
 
+  const isInputDisabled = streaming || !visible;
+
+  // ── Render ──────────────────────────────────────────────────────────────
+
   return (
-    <div className="flex flex-col h-[calc(100vh-7rem)] max-w-4xl mx-auto">
+    <div className={`flex flex-col max-w-4xl mx-auto ${className || "h-[calc(100vh-7rem)]"}`}>
       {/* Header */}
       <div className="flex items-center gap-3 py-3 border-b mb-4">
         <h2 className="font-semibold flex-1">{headerTitle}</h2>
@@ -170,18 +291,18 @@ export function ChatView({
       <div className="flex gap-2 pt-4 border-t mt-4">
         <input
           className="flex-1 rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary bg-background"
-          placeholder="输入消息..."
+          placeholder={isInputDisabled ? "加载中…" : "输入消息..."}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          disabled={streaming}
+          disabled={isInputDisabled}
         />
         {streaming ? (
           <Button variant="destructive" onClick={handleStop}>
             <Square className="h-4 w-4" />
           </Button>
         ) : (
-          <Button onClick={handleSend} disabled={!input.trim()}>
+          <Button onClick={handleSend} disabled={!input.trim() || !visible}>
             <Send className="h-4 w-4" />
           </Button>
         )}
@@ -265,9 +386,11 @@ function handleSSEEvent(
   event: ChatSseEvent,
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
   setStreaming: React.Dispatch<React.SetStateAction<boolean>>,
+  onTextDelta?: () => void,
 ) {
   switch (event.event) {
     case "text_delta":
+      onTextDelta?.();
       setMessages((prev) => {
         const last = prev[prev.length - 1];
         if (last?.role === "assistant") {
