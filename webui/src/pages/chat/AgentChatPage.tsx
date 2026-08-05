@@ -9,12 +9,14 @@ import {
   listConversations,
   updateConversation,
   deleteConversation as deleteConversationApi,
+  createConversation,
 } from "@/api/conversations";
 import { getAgent, listAgents } from "@/api/agents";
 import type { AgentDetail } from "@/types/agent";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, ArrowLeft, Send } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatMessage } from "@/components/chat/ChatView";
 import type { Conversation } from "@/types/chat";
@@ -78,6 +80,10 @@ export function AgentChatPage() {
   // Mobile
   const [mobilePanelOpen, setMobilePanelOpen] = useState(false);
 
+  // New conversation input
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+
   // Track which convId came from StartChatPage (for initialQuery targeting)
   const newFromStartRef = useRef<string | null>(null);
 
@@ -95,9 +101,7 @@ export function AgentChatPage() {
         "",
       );
     }
-    // Only run once on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [conversationId, location.state]);
 
   // ── Load agent detail ──────────────────────────────────────────────────
 
@@ -168,7 +172,26 @@ export function AgentChatPage() {
   const initialMountRef = useRef(true);
 
   useEffect(() => {
-    if (!agentId || !conversationId) return;
+    if (!agentId) return;
+
+    // No conversation selected — clear pool, show StartChatPage content
+    if (!conversationId) {
+      if (initialMountRef.current) {
+        setLoading(false);
+        initialMountRef.current = false;
+      }
+      setVisibleConvId(null);
+      setChatPool((prev) => {
+        if (prev.size === 0) return prev;
+        return new Map();
+      });
+      setSnapshots((prev) => {
+        if (prev.size === 0) return prev;
+        return new Map();
+      });
+      setSnapshotReady(true);
+      return;
+    }
 
     // Only show full-page spinner on initial mount, not on conversation switches
     if (initialMountRef.current) {
@@ -385,6 +408,40 @@ export function AgentChatPage() {
     }
   }, [agentId, archivedExpanded]);
 
+  // Resolved agent ID: prefer UUID from state, fallback to URL param (agent name)
+  const resolvedAgentId = agentId || "";
+
+  // ── Send (new conversation) handler ──────────────────────────────────
+
+  const handleSend = useCallback(async () => {
+    const query = input.trim();
+    if (!query || !resolvedAgentId || sending) return;
+    setSending(true);
+    try {
+      const conv = await createConversation(resolvedAgentId, query.slice(0, 15));
+      setConversations((prev) => [conv, ...prev]);
+      setInput("");
+      setSending(false);
+      navigate(`/chat/${encodeURIComponent(resolvedAgentId)}/${conv.id}`, {
+        state: { initialQuery: query },
+        replace: true,
+      });
+    } catch {
+      toast.error("创建对话失败，请重试");
+      setSending(false);
+    }
+  }, [input, resolvedAgentId, sending, navigate]);
+
+  const handleInputKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
+    },
+    [handleSend],
+  );
+
   // ── Unread handler ─────────────────────────────────────────────────────
 
   const handleUnread = useCallback(
@@ -397,9 +454,6 @@ export function AgentChatPage() {
     },
     [],
   );
-
-  // Resolved agent ID: prefer UUID from state, fallback to URL param (agent name)
-  const resolvedAgentId = agentId || "";
 
   if (loading) return <LoadingSpinner />;
 
@@ -436,39 +490,100 @@ export function AgentChatPage() {
         </Button>
       </div>
 
-      {/* Left panel: ConversationList */}
+      {/* Left panel — minimal: back + agent icon + conversation list */}
       <div
         className={`${
           mobilePanelOpen ? "block" : "hidden"
-        } md:block w-[280px] lg:w-[280px] md:w-[220px] shrink-0`}
+        } md:flex md:flex-col w-[280px] lg:w-[280px] md:w-[220px] shrink-0 border-r bg-muted`}
       >
-        <ConversationList
-          conversations={conversations}
-          activeConvId={visibleConvId}
-          unreadCounts={unreadCounts}
-          loading={convListLoading}
-          error={convListError}
-          onSelectConversation={(convId) => {
-            handleSelectConversation(convId);
-            setMobilePanelOpen(false);
-          }}
-          onNewConversation={handleNewConversation}
-          onRename={handleRename}
-          onArchive={handleArchive}
-          onDelete={handleDelete}
-          onRetry={handleRetryConversations}
-          archivedConversations={archivedConversations}
-          archivedLoading={archivedLoading}
-          archivedExpanded={archivedExpanded}
-          onToggleArchived={handleToggleArchived}
-        />
+        {/* Header: back button left, icon + name centered */}
+        <div className="relative flex items-center justify-center gap-2 px-3 py-2 border-b">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="absolute left-1 h-7 w-7 shrink-0"
+            onClick={() => navigate("/workspace/agents")}
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </Button>
+          <div
+            className="w-6 h-6 rounded-full flex items-center justify-center text-xs shrink-0"
+            style={{
+              backgroundColor: agent?.background_color || "#6366f1",
+            }}
+          >
+            {agent?.icon || "🤖"}
+          </div>
+          <span className="font-semibold text-sm truncate">
+            {agent?.name || agentId || ""}
+          </span>
+        </div>
+
+        {/* Conversation list */}
+        <div className="flex-1 min-h-0">
+          <ConversationList
+            conversations={conversations}
+            activeConvId={visibleConvId}
+            unreadCounts={unreadCounts}
+            loading={convListLoading}
+            error={convListError}
+            onSelectConversation={(convId) => {
+              handleSelectConversation(convId);
+              setMobilePanelOpen(false);
+            }}
+            onNewConversation={handleNewConversation}
+            onRename={handleRename}
+            onArchive={handleArchive}
+            onDelete={handleDelete}
+            onRetry={handleRetryConversations}
+            archivedConversations={archivedConversations}
+            archivedLoading={archivedLoading}
+            archivedExpanded={archivedExpanded}
+            onToggleArchived={handleToggleArchived}
+          />
+        </div>
       </div>
 
-      {/* Right panel: ChatView pool */}
+      {/* Right panel */}
       <div className="flex-1 relative">
+        {/* No conversation selected — StartChatPage style */}
         {showPool.length === 0 && (
           <div className="flex items-center justify-center h-full">
-            <p className="text-muted-foreground">选择或开始一个对话</p>
+            <div className="flex flex-col items-center gap-4 w-full max-w-xl px-4">
+              <div
+                className="w-16 h-16 rounded-full flex items-center justify-center text-2xl shrink-0"
+                style={{ backgroundColor: agent?.background_color || "#6366f1" }}
+              >
+                {agent?.icon || "🤖"}
+              </div>
+              <h1 className="text-xl font-semibold">{agent?.name}</h1>
+              {agent?.description && (
+                <p className="text-sm text-muted-foreground text-center max-w-md">
+                  {agent.description}
+                </p>
+              )}
+              <div className="flex gap-2 w-full mt-4">
+                <Input
+                  className="flex-1"
+                  placeholder="输入你的问题…"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleInputKeyDown}
+                  disabled={sending}
+                  autoFocus
+                />
+                <Button onClick={handleSend} disabled={!input.trim() || sending}>
+                  {sending ? (
+                    "创建中…"
+                  ) : (
+                    <>
+                      <Send className="h-4 w-4 mr-1" />
+                      发送
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
           </div>
         )}
         {showPool.map((convId) => (

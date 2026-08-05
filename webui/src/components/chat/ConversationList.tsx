@@ -6,14 +6,6 @@ import {
 } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { Plus, Archive, ChevronDown, ChevronRight, Pencil, Trash2, Box } from "lucide-react";
@@ -74,8 +66,7 @@ export function ConversationList({
 }: ConversationListProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
-  const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
-  const [deleting, setDeleting] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [olderExpanded, setOlderExpanded] = useState(false);
 
   // Show at most RECENT_LIMIT conversations directly; the rest are folded
@@ -103,14 +94,12 @@ export function ConversationList({
 
   // ── Delete handlers ─────────────────────────────────────────────────────
 
-  const handleDeleteConfirm = async () => {
-    if (!deleteTarget) return;
-    setDeleting(true);
+  const handleDelete = async (convId: string) => {
+    setDeletingId(convId);
     try {
-      await onDelete(deleteTarget.id);
+      await onDelete(convId);
     } finally {
-      setDeleting(false);
-      setDeleteTarget(null);
+      setDeletingId(null);
     }
   };
 
@@ -143,7 +132,7 @@ export function ConversationList({
         {/* Title / Inline edit */}
         {editingId === conv.id ? (
           <Input
-            className="h-6 flex-1 text-xs"
+            className="h-6 flex-1 min-w-0 text-xs"
             value={editTitle}
             onChange={(e) => setEditTitle(e.target.value)}
             onKeyDown={(e) => {
@@ -155,46 +144,68 @@ export function ConversationList({
             onClick={(e) => e.stopPropagation()}
           />
         ) : (
-          <span className="flex-1 truncate">
-            {conv.title || "新对话"}
+          <span
+            className={cn(
+              "flex-1 min-w-0 truncate max-w-[14ch]",
+              isActive && "font-semibold",
+            )}
+          >
+            {conv.title
+              ? conv.title.length > 7
+                ? conv.title.slice(0, 7) + "…"
+                : conv.title
+              : "新对话"}
           </span>
         )}
 
-        {/* Time */}
-        <span className="shrink-0 text-[10px] text-muted-foreground hidden group-hover:hidden sm:inline">
-          {relativeTime(conv.updated_at)}
-        </span>
-
-        {/* Actions (hover) */}
-        <div className="hidden group-hover:flex shrink-0 items-center gap-0.5">
-          {!isArchived && (
-            <>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-5 w-5"
-                onClick={(e) => { e.stopPropagation(); startRename(conv); }}
-              >
-                <Pencil className="h-3 w-3" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-5 w-5"
-                onClick={(e) => { e.stopPropagation(); onArchive(conv.id); }}
-              >
-                <Archive className="h-3 w-3" />
-              </Button>
-            </>
-          )}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-5 w-5 text-destructive hover:text-destructive"
-            onClick={(e) => { e.stopPropagation(); setDeleteTarget(conv); }}
+        {/* Time + Actions slot — stable width, actions overlay time */}
+        <div className="shrink-0 relative flex items-center">
+          {/* Time — always in layout flow, invisible when actions shown */}
+          <span
+            className={cn(
+              "text-[10px] text-muted-foreground whitespace-nowrap group-hover:invisible",
+              isActive && "invisible",
+            )}
           >
-            <Trash2 className="h-3 w-3" />
-          </Button>
+            {relativeTime(conv.updated_at)}
+          </span>
+          {/* Actions — absolutely positioned over time slot */}
+          <div
+            className={cn(
+              "absolute inset-0 items-center gap-0.5",
+              isActive ? "flex" : "hidden group-hover:flex",
+            )}
+          >
+            {!isArchived && (
+              <>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-5 w-5"
+                  onClick={(e) => { e.stopPropagation(); startRename(conv); }}
+                >
+                  <Pencil className="h-3 w-3" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-5 w-5"
+                  onClick={(e) => { e.stopPropagation(); onArchive(conv.id); }}
+                >
+                  <Archive className="h-3 w-3" />
+                </Button>
+              </>
+            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-5 w-5 text-destructive hover:text-destructive"
+              disabled={deletingId === conv.id}
+              onClick={(e) => { e.stopPropagation(); handleDelete(conv.id); }}
+            >
+              <Trash2 className="h-3 w-3" />
+            </Button>
+          </div>
         </div>
       </div>
     );
@@ -203,7 +214,7 @@ export function ConversationList({
   // ── Render ──────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex flex-col h-full border-r">
+    <div className="flex flex-col h-full">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b">
         <span className="text-sm font-medium">历史对话</span>
@@ -309,25 +320,6 @@ export function ConversationList({
         </div>
       </ScrollArea>
 
-      {/* Delete confirmation dialog */}
-      <Dialog open={!!deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>删除对话</DialogTitle>
-            <DialogDescription>
-              确定要删除「{deleteTarget?.title}」吗？此操作不可撤销。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={deleting}>
-              取消
-            </Button>
-            <Button variant="destructive" onClick={handleDeleteConfirm} disabled={deleting}>
-              {deleting ? "删除中…" : "删除"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

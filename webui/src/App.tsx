@@ -5,13 +5,11 @@ import { Toaster } from "sonner";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { AppLayout } from "@/components/layout/AppLayout";
-import { ChatLayout } from "@/components/layout/ChatLayout";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { LoginPage } from "@/pages/auth/LoginPage";
 import { RegisterPage } from "@/pages/auth/RegisterPage";
 import { PecoChatPage } from "@/pages/peco/PecoChatPage";
 import { AgentChatPage } from "@/pages/chat/AgentChatPage";
-import { StartChatPage } from "@/pages/chat/StartChatPage";
 import { AgentListPage } from "@/pages/agents/AgentListPage";
 import { AgentCreatePage } from "@/pages/agents/AgentCreatePage";
 import { AgentEditPage } from "@/pages/agents/AgentEditPage";
@@ -94,17 +92,15 @@ export default function App() {
                   <Route path="/settings" element={<SettingsPage />} />
                 </Route>
 
-                {/* Chat 路由 — 独立 ChatLayout（无 AppLayout 依赖） */}
-                <Route element={<ChatLayout />}>
-                  <Route
-                    path="/chat/:agentId"
-                    element={<StartChatPage />}
-                  />
-                  <Route
-                    path="/chat/:agentId/:conversationId"
-                    element={<AgentChatPage />}
-                  />
-                </Route>
+                {/* Chat 路由 — 统一双栏布局，无顶部页眉 */}
+                <Route
+                  path="/chat/:agentId"
+                  element={<AgentChatPage />}
+                />
+                <Route
+                  path="/chat/:agentId/:conversationId"
+                  element={<AgentChatPage />}
+                />
               </Route>
             </Routes>
           </BrowserRouter>
