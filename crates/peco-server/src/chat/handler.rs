@@ -332,11 +332,12 @@ pub async fn stream_chat(
 
     // ── 3. 加载或创建 Session ────────────────────────────────────────────
     let persister = SqliteSessionPersister::new(state.db.clone());
-    let session: Box<Session> = match persister.load(&conv_id).await {
+    let (session, is_first_turn): (Box<Session>, bool) = match persister.load(&conv_id).await {
         Ok(Some((snapshot, _meta))) => {
+            let existing_turns = snapshot.committed_turns.len();
             tracing::info!(
                 conversation_id = %conv_id,
-                turns = snapshot.committed_turns.len(),
+                turns = existing_turns,
                 "Session restored from snapshot"
             );
             let created_at = snapshot
@@ -350,16 +351,20 @@ pub async fn stream_chat(
                         .map(|d| d.as_secs())
                         .unwrap_or(0)
                 });
-            Box::new(Session::from_snapshot(
-                conv_id.clone(),
-                conv.title.clone(),
-                created_at,
-                snapshot,
-            ))
+            let is_first = existing_turns == 0;
+            (
+                Box::new(Session::from_snapshot(
+                    conv_id.clone(),
+                    conv.title.clone(),
+                    created_at,
+                    snapshot,
+                )),
+                is_first,
+            )
         }
         _ => {
             tracing::info!(conversation_id = %conv_id, "Creating new session");
-            Box::new(Session::new(conv_id.clone(), conv.title.clone()))
+            (Box::new(Session::new(conv_id.clone(), conv.title.clone())), true)
         }
     };
 
@@ -412,7 +417,9 @@ pub async fn stream_chat(
 
         let mut assistant_text = String::new();
         let mut sub_agent_registry: HashMap<String, Vec<SubAgentInfo>> = HashMap::new();
-        let mut is_first_turn = true;
+        // is_first_turn is captured from the outer scope — based on session
+        // snapshot committed_turns, NOT reset per SSE connection.
+        let mut is_first_turn = is_first_turn;
 
         let resolve_agent_id = |agent_name: &str| -> String {
             tokio::task::block_in_place(|| {
@@ -538,10 +545,11 @@ pub async fn stream_chat(
                         )
                         .await;
 
-                        // 仅首轮对话时根据 assistant 回复自动生成标题
+                        // 仅首轮对话时根据用户第一条消息自动生成标题
                         if is_first_turn {
-                            let short: String = assistant_text.chars().take(50).collect();
-                            let new_title = if short.len() >= assistant_text.len() {
+                            let short: String =
+                                message_for_bg.chars().take(50).collect();
+                            let new_title = if short.len() >= message_for_bg.len() {
                                 short
                             } else {
                                 format!("{short}...")
