@@ -16,6 +16,7 @@ import type { AgentDetail } from "@/types/agent";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
+import { AgentIcon } from "@/components/common/AgentIcon";
 import { AlertCircle, ArrowLeft, Send } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatMessage } from "@/components/chat/ChatView";
@@ -506,14 +507,11 @@ export function AgentChatPage() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div
-            className="w-6 h-6 rounded-full flex items-center justify-center text-xs shrink-0"
-            style={{
-              backgroundColor: agent?.background_color || "#6366f1",
-            }}
-          >
-            {agent?.icon || "🤖"}
-          </div>
+          <AgentIcon
+            icon={agent?.icon || "🤖"}
+            backgroundColor={agent?.background_color}
+            size="sm"
+          />
           <span className="font-semibold text-sm truncate">
             {agent?.name || agentId || ""}
           </span>
@@ -550,12 +548,11 @@ export function AgentChatPage() {
         {showPool.length === 0 && (
           <div className="flex items-center justify-center h-full">
             <div className="flex flex-col items-center gap-4 w-full max-w-xl px-4">
-              <div
-                className="w-16 h-16 rounded-full flex items-center justify-center text-2xl shrink-0"
-                style={{ backgroundColor: agent?.background_color || "#6366f1" }}
-              >
-                {agent?.icon || "🤖"}
-              </div>
+              <AgentIcon
+                icon={agent?.icon || "🤖"}
+                backgroundColor={agent?.background_color}
+                size="lg"
+              />
               <h1 className="text-xl font-semibold">{agent?.name}</h1>
               {agent?.description && (
                 <p className="text-sm text-muted-foreground text-center max-w-md">
@@ -614,14 +611,11 @@ export function AgentChatPage() {
               headerTitle={
                 agent ? (
                   <div className="flex items-center gap-2">
-                    <div
-                      className="w-6 h-6 rounded-full flex items-center justify-center text-xs shrink-0"
-                      style={{
-                        backgroundColor: agent.background_color || "#6366f1",
-                      }}
-                    >
-                      {agent.icon || "🤖"}
-                    </div>
+                    <AgentIcon
+                      icon={agent.icon || "🤖"}
+                      backgroundColor={agent.background_color}
+                      size="sm"
+                    />
                     <span className="font-semibold">{agent.name}</span>
                   </div>
                 ) : (

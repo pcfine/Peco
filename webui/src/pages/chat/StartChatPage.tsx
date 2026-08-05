@@ -13,6 +13,7 @@ import {
   deleteConversation as deleteConversationApi,
 } from "@/api/conversations";
 import { Send, ArrowLeft } from "lucide-react";
+import { AgentIcon } from "@/components/common/AgentIcon";
 import { toast } from "sonner";
 import type { AgentDetail } from "@/types/agent";
 import type { Conversation } from "@/types/chat";
@@ -322,12 +323,11 @@ export function StartChatPage() {
       <div className="flex-1 flex items-center justify-center">
         <div className="flex flex-col items-center gap-4 w-full max-w-xl px-4">
           {/* Agent info */}
-          <div
-            className="w-16 h-16 rounded-full flex items-center justify-center text-2xl shrink-0"
-            style={{ backgroundColor: agent?.background_color || "#6366f1" }}
-          >
-            {agent?.icon || "🤖"}
-          </div>
+          <AgentIcon
+            icon={agent?.icon || "🤖"}
+            backgroundColor={agent?.background_color}
+            size="lg"
+          />
           <h1 className="text-xl font-semibold">{agent?.name}</h1>
           {agent?.description && (
             <p className="text-sm text-muted-foreground text-center max-w-md">
