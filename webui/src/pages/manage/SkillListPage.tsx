@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -16,13 +17,11 @@ import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import {
   listSkills,
-  getSkill,
-  upsertSkill,
   deleteSkill,
   importSkill,
   exportSkill,
 } from "@/api/skills";
-import type { SkillListItem, SkillDetail } from "@/types/skill";
+import type { SkillListItem } from "@/types/skill";
 import { Upload, Download, Trash2, Puzzle } from "lucide-react";
 import { toast } from "sonner";
 import axios from "axios";
@@ -37,6 +36,7 @@ function getApiErrorMessage(err: unknown): string | undefined {
 }
 
 export function SkillListPage() {
+  const navigate = useNavigate();
   const [skills, setSkills] = useState<SkillListItem[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -44,13 +44,6 @@ export function SkillListPage() {
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [importForm, setImportForm] = useState({ name: "", content: "" });
   const [importing, setImporting] = useState(false);
-
-  // Edit dialog
-  const [editDialogOpen, setEditDialogOpen] = useState(false);
-  const [editingSkill, setEditingSkill] = useState<SkillDetail | null>(null);
-  const [editContent, setEditContent] = useState("");
-  const [editLoading, setEditLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<SkillListItem | null>(null);
@@ -106,44 +99,6 @@ export function SkillListPage() {
     }
   };
 
-  // ── Edit ─────────────────────────────────────────────────────────────────────
-
-  const openEdit = async (name: string) => {
-    if (editDialogOpen || editLoading) return; // prevent double-click opening multiple dialogs
-    setEditLoading(true);
-    try {
-      const detail = await getSkill(name);
-      setEditingSkill(detail);
-      setEditContent(detail.content);
-      setEditDialogOpen(true);
-    } catch (err) {
-      toast.error(getApiErrorMessage(err) || "加载 Skill 详情失败");
-    } finally {
-      setEditLoading(false);
-    }
-  };
-
-  const closeEdit = () => {
-    setEditDialogOpen(false);
-    setEditingSkill(null);
-    setEditContent("");
-  };
-
-  const handleSaveEdit = async () => {
-    if (!editingSkill || !editContent.trim()) return;
-    setSaving(true);
-    try {
-      await upsertSkill(editingSkill.name, editContent);
-      toast.success("保存成功");
-      closeEdit();
-      load();
-    } catch (err) {
-      toast.error(getApiErrorMessage(err) || "保存失败");
-    } finally {
-      setSaving(false);
-    }
-  };
-
   // ── Delete ───────────────────────────────────────────────────────────────────
 
   const confirmDelete = (skill: SkillListItem) => {
@@ -157,10 +112,6 @@ export function SkillListPage() {
       await deleteSkill(name);
       setSkills((prev) => prev.filter((s) => s.name !== name));
       toast.success("已删除");
-      // If editing the deleted skill, close the edit dialog
-      if (editingSkill?.name === name) {
-        closeEdit();
-      }
     } catch (err) {
       toast.error(getApiErrorMessage(err) || "删除失败");
     } finally {
@@ -212,8 +163,8 @@ export function SkillListPage() {
           {skills.map((skill) => (
             <Card
               key={skill.name}
-              className={`group hover:border-primary/50 transition-colors cursor-pointer ${editLoading ? "pointer-events-none opacity-60" : ""}`}
-              onClick={() => openEdit(skill.name)}
+              className="group hover:border-primary/50 transition-colors cursor-pointer"
+              onClick={() => navigate(`/workspace/skills/${encodeURIComponent(skill.name)}/edit`)}
             >
               <CardContent className="p-4 flex items-start gap-3">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-accent">
@@ -335,43 +286,6 @@ export function SkillListPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Edit Dialog */}
-      <Dialog
-        open={editDialogOpen}
-        onOpenChange={(open) => !open && closeEdit()}
-      >
-        <DialogContent className="sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>{editingSkill?.name} — 编辑</DialogTitle>
-            <DialogDescription>编辑 SKILL.md 内容</DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="skill-edit-content">内容</Label>
-              <Textarea
-                id="skill-edit-content"
-                rows={22}
-                className="font-mono text-sm"
-                value={editContent}
-                onChange={(e) => setEditContent(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={closeEdit}>
-              取消
-            </Button>
-            <Button
-              onClick={handleSaveEdit}
-              disabled={!editContent.trim() || saving}
-            >
-              {saving ? "保存中..." : "保存"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

@@ -26,6 +26,11 @@ const SkillListPage = lazy(() =>
     default: m.SkillListPage,
   })),
 );
+const SkillEditPage = lazy(() =>
+  import("@/pages/manage/SkillEditPage").then((m) => ({
+    default: m.SkillEditPage,
+  })),
+);
 const McpConfigPage = lazy(() =>
   import("@/pages/manage/McpConfigPage").then((m) => ({
     default: m.McpConfigPage,
@@ -69,6 +74,10 @@ export default function App() {
                   <Route
                     path="/workspace/skills"
                     element={<SkillListPage />}
+                  />
+                  <Route
+                    path="/workspace/skills/:skillName/edit"
+                    element={<SkillEditPage />}
                   />
                   <Route path="/workspace/mcp" element={<McpConfigPage />} />
                   <Route
