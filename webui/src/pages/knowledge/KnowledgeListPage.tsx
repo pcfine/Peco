@@ -83,14 +83,14 @@ export function KnowledgeListPage() {
               <DialogTitle>新建知识库</DialogTitle>
             </DialogHeader>
             <div className="space-y-4">
-              <div>
+              <div className="space-y-2">
                 <Label>名称</Label>
                 <Input
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                 />
               </div>
-              <div>
+              <div className="space-y-2">
                 <Label>描述</Label>
                 <Textarea
                   value={form.description}

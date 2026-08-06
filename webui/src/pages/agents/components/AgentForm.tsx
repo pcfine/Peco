@@ -212,11 +212,12 @@ function CheckboxSection({
 interface Props {
   defaultValues?: AgentDetail;
   onSubmit: (data: CreateAgentRequest) => Promise<void>;
+  onCancel?: () => void;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────
 
-export function AgentForm({ defaultValues, onSubmit }: Props) {
+export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
 
   // ── Form ──────────────────────────────────────────────────────────────
@@ -690,9 +691,16 @@ export function AgentForm({ defaultValues, onSubmit }: Props) {
         </div>
       </div>
 
-      <Button type="submit" className="w-full">
-        {defaultValues ? "保存修改" : "创建 Agent"}
-      </Button>
+      <div className="flex gap-3 pt-4 border-t">
+        {onCancel && (
+          <Button type="button" variant="outline" className="flex-1" onClick={onCancel}>
+            取消
+          </Button>
+        )}
+        <Button type="submit" className="flex-1">
+          {defaultValues ? "保存修改" : "创建 Agent"}
+        </Button>
+      </div>
     </form>
   );
 }
