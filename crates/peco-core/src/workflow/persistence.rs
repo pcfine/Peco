@@ -44,10 +44,14 @@ pub struct WorkflowSnapshot {
     pub workflow_name: String,
     pub definition: WorkflowDefinition,
     pub state: WorkflowSnapshotState,
+    /// 外部输入参数 JSON（创建执行时传入，用于恢复/审计）。
+    pub inputs_json: Option<String>,
     /// 已完成步骤的结果（用于重建 TemplateContext）
     pub step_results: HashMap<String, StepResult>,
     /// 当前执行到的层级索引（0-based）
     pub current_level: usize,
+    /// 总步骤数（独立于 definition.steps.len()，避免 load-then-save 时因 definition 空壳而清零）。
+    pub total_steps: usize,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -71,8 +75,8 @@ pub trait WorkflowPersister: Send + Sync {
     /// 删除 Workflow 执行记录。
     async fn delete(&self, run_id: &str) -> Result<(), WorkflowError>;
 
-    /// 列出用户的所有 Workflow 执行记录。
-    async fn list(&self, user_id: &str) -> Result<Vec<WorkflowSnapshot>, WorkflowError>;
+    /// 列出所有 Workflow 执行记录（由 persister 内部持有用户上下文过滤）。
+    async fn list(&self) -> Result<Vec<WorkflowSnapshot>, WorkflowError>;
 }
 
 // ============================================================================
@@ -98,7 +102,7 @@ impl WorkflowPersister for NullWorkflowPersister {
         Ok(())
     }
 
-    async fn list(&self, _user_id: &str) -> Result<Vec<WorkflowSnapshot>, WorkflowError> {
+    async fn list(&self) -> Result<Vec<WorkflowSnapshot>, WorkflowError> {
         Ok(Vec::new())
     }
 }
@@ -150,8 +154,10 @@ mod tests {
                 body: None,
             },
             state: WorkflowSnapshotState::Completed,
+            inputs_json: None,
             step_results,
             current_level: 1,
+            total_steps: 1,
             started_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -213,7 +219,7 @@ mod tests {
     #[tokio::test]
     async fn test_null_persister_list_empty() {
         let persister = NullWorkflowPersister;
-        let result = persister.list("user-1").await.unwrap();
+        let result = persister.list().await.unwrap();
         assert!(result.is_empty());
     }
 }

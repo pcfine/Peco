@@ -1,14 +1,20 @@
 // ConversationList — Agent 左侧对话历史列表面板
 
 import { useState } from "react";
-import {
-  ScrollArea,
-} from "@/components/ui/scroll-area";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { Plus, Archive, ChevronDown, ChevronRight, Pencil, Trash2, Box } from "lucide-react";
+import {
+  Plus,
+  Archive,
+  ChevronDown,
+  ChevronRight,
+  Pencil,
+  Trash2,
+  Box,
+} from "lucide-react";
 import type { Conversation } from "@/types/chat";
 
 // ── Relative time formatter ────────────────────────────────────────────────
@@ -122,7 +128,9 @@ export function ConversationList({
       >
         {/* Icon */}
         <span className="shrink-0 text-xs">
-          {isArchived ? <Box className="h-3.5 w-3.5" /> : hasUnread ? (
+          {isArchived ? (
+            <Box className="h-3.5 w-3.5" />
+          ) : hasUnread ? (
             <span className="inline-block w-2 h-2 rounded-full bg-blue-500" />
           ) : (
             <span className="inline-block w-2 h-2" />
@@ -182,7 +190,10 @@ export function ConversationList({
                   variant="ghost"
                   size="icon"
                   className="h-5 w-5"
-                  onClick={(e) => { e.stopPropagation(); startRename(conv); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    startRename(conv);
+                  }}
                 >
                   <Pencil className="h-3 w-3" />
                 </Button>
@@ -190,7 +201,10 @@ export function ConversationList({
                   variant="ghost"
                   size="icon"
                   className="h-5 w-5"
-                  onClick={(e) => { e.stopPropagation(); onArchive(conv.id); }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onArchive(conv.id);
+                  }}
                 >
                   <Archive className="h-3 w-3" />
                 </Button>
@@ -201,7 +215,10 @@ export function ConversationList({
               size="icon"
               className="h-5 w-5 text-destructive hover:text-destructive"
               disabled={deletingId === conv.id}
-              onClick={(e) => { e.stopPropagation(); handleDelete(conv.id); }}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDelete(conv.id);
+              }}
             >
               <Trash2 className="h-3 w-3" />
             </Button>
@@ -218,7 +235,12 @@ export function ConversationList({
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b">
         <span className="text-sm font-medium">历史对话</span>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={onNewConversation}>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          onClick={onNewConversation}
+        >
           <Plus className="h-4 w-4" />
         </Button>
       </div>
@@ -255,7 +277,9 @@ export function ConversationList({
           )}
 
           {/* Active conversations — recent 10 */}
-          {!loading && !error && recentConversations.map((c) => renderConversationItem(c))}
+          {!loading &&
+            !error &&
+            recentConversations.map((c) => renderConversationItem(c))}
 
           {/* Older conversations fold */}
           {!loading && !error && olderConversations.length > 0 && (
@@ -303,23 +327,22 @@ export function ConversationList({
               </button>
               {archivedExpanded && (
                 <div className="mt-1">
-                  {archivedLoading && (
-                    <Skeleton className="h-6 w-full mx-2" />
-                  )}
+                  {archivedLoading && <Skeleton className="h-6 w-full mx-2" />}
                   {!archivedLoading && archivedConversations.length === 0 && (
                     <p className="text-[10px] text-muted-foreground px-2 py-1">
                       暂无归档对话
                     </p>
                   )}
                   {!archivedLoading &&
-                    archivedConversations.map((c) => renderConversationItem(c, true))}
+                    archivedConversations.map((c) =>
+                      renderConversationItem(c, true),
+                    )}
                 </div>
               )}
             </div>
           )}
         </div>
       </ScrollArea>
-
     </div>
   );
 }

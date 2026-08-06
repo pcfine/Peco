@@ -40,4 +40,12 @@ pub enum WorkflowError {
     /// IO 错误
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Workflow 名称不合法
+    #[error("invalid workflow name: {0}")]
+    InvalidName(String),
+
+    /// Workflow 已存在（创建时同名冲突）
+    #[error("workflow already exists: {0}")]
+    AlreadyExists(String),
 }

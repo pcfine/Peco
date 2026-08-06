@@ -31,6 +31,8 @@ pub struct WorkflowMeta {
     pub name: String,
     pub description: String,
     pub version: String,
+    /// 步骤数量（从 steps 数组长度获取，0 表示定义中无 steps）。
+    pub step_count: usize,
 }
 
 // ── WorkflowManager ───────────────────────────────────────────────────────
@@ -42,25 +44,26 @@ pub struct WorkflowMeta {
 /// - Tier 2：`definitions` — 完整加载的 WorkflowDefinition 实例
 ///
 /// **不追踪活跃执行**：调用方自行管理 `WorkflowHandle` 生命周期。
+///
+/// **不再持有 persister**：persister 由调用方在 `execute()` 时按用户传入。
 pub struct WorkflowManager {
     workflows_dir: PathBuf,
     /// Tier-1 元数据缓存（name → WorkflowMeta）
     metas: RwLock<HashMap<String, WorkflowMeta>>,
     /// Tier-2 完整定义缓存（name → WorkflowDefinition）
     definitions: RwLock<HashMap<String, WorkflowDefinition>>,
-    persister: Arc<dyn WorkflowPersister>,
 }
 
 impl WorkflowManager {
     /// 创建新的 WorkflowManager。
     ///
     /// 创建后应调用 [`init`](Self::init) 扫描目录并缓存元数据。
-    pub fn new(workflows_dir: PathBuf, persister: Arc<dyn WorkflowPersister>) -> Self {
+    /// persister 不再通过构造注入，改为在 [`execute`](Self::execute) 时按用户传入。
+    pub fn new(workflows_dir: PathBuf) -> Self {
         Self {
             workflows_dir,
             metas: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
-            persister,
         }
     }
 
@@ -105,13 +108,13 @@ impl WorkflowManager {
         Ok(metas.len())
     }
 
-    /// 解析单个 workflow.md 的 frontmatter，提取 name + description + version。
+    /// 解析单个 workflow.md 的 frontmatter，提取 name + description + version + step_count。
     fn parse_meta(md_path: &Path) -> Result<WorkflowMeta, WorkflowError> {
         let raw = std::fs::read_to_string(md_path)?;
         let (frontmatter_str, _) = crate::agent::split_frontmatter(&raw)
             .map_err(|e| WorkflowError::Parse(format!("invalid frontmatter: {e}")))?;
 
-        // 解析 workflow 包装格式：workflow: { name, description, version }
+        // 解析 workflow 包装格式：workflow: { name, description, version, steps }
         #[derive(serde::Deserialize)]
         struct WorkflowFileMeta {
             workflow: WorkflowMetaRaw,
@@ -122,6 +125,8 @@ impl WorkflowManager {
             description: String,
             #[serde(default)]
             version: String,
+            #[serde(default)]
+            steps: Vec<serde_yaml::Value>,
         }
 
         let parsed: WorkflowFileMeta = serde_yaml::from_str(frontmatter_str)
@@ -131,6 +136,7 @@ impl WorkflowManager {
             name: parsed.workflow.name,
             description: parsed.workflow.description,
             version: parsed.workflow.version,
+            step_count: parsed.workflow.steps.len(),
         })
     }
 
@@ -222,10 +228,14 @@ impl WorkflowManager {
     ///
     /// Thin wrapper：加载定义 → 验证输入 → spawn 引擎 → 返回 handle。
     /// 调用方通过 `WorkflowHandle` 消费事件和管理生命周期。
+    ///
+    /// `persister` 由调用方（peco-server handler 层）按用户创建并传入，
+    /// 引擎通过该 persister 自动持久化快照，无需感知用户上下文。
     pub fn execute(
         &self,
         name: &str,
         agent_access: Arc<dyn AgentAccess>,
+        persister: Arc<dyn WorkflowPersister>,
         config: WorkflowConfig,
         inputs: HashMap<String, serde_json::Value>,
     ) -> Result<WorkflowHandle, WorkflowError> {
@@ -234,10 +244,183 @@ impl WorkflowManager {
         Ok(WorkflowEngine::spawn(
             definition,
             agent_access,
-            self.persister.clone(),
+            persister,
             config,
             inputs,
         ))
+    }
+
+    // ── 写操作 ──────────────────────────────────────────────────────
+    ///
+    /// 所有写操作遵循「先 I/O 后缓存」原则：
+    /// 文件系统操作在锁外完成，仅在更新内存缓存时持锁，
+    /// 避免 std::sync::RwLock 持锁期间阻塞 async runtime 工作线程。
+
+    /// 校验 Workflow 名称格式。
+    ///
+    /// 规则：1-128 字符，仅允许 ASCII 字母、数字、下划线和连字符。
+    /// 禁止目录遍历字符（`.` 和 `..`）。
+    fn validate_workflow_name(name: &str) -> Result<(), WorkflowError> {
+        if name.is_empty() || name.len() > 128 {
+            return Err(WorkflowError::InvalidName(
+                "name must be 1-128 characters".into(),
+            ));
+        }
+        if name == "." || name == ".." {
+            return Err(WorkflowError::InvalidName(
+                "name must not be '.' or '..'".into(),
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(WorkflowError::InvalidName(
+                "name must contain only ASCII letters, digits, underscores, and hyphens".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 创建新 Workflow。
+    ///
+    /// 流程：校验名称 → 检查目录不存在 → 原子写入 workflow.md →
+    /// 解析定义 → 持锁更新 metas 缓存。
+    /// 所有文件 I/O 在持锁之前完成。
+    pub fn create(
+        &self,
+        name: &str,
+        yaml_content: &str,
+    ) -> Result<WorkflowDefinition, WorkflowError> {
+        Self::validate_workflow_name(name)?;
+        let dir = self.workflows_dir.join(name);
+
+        // 1. 文件 I/O（锁外完成）
+        if dir.exists() {
+            return Err(WorkflowError::AlreadyExists(format!(
+                "workflow '{name}' already exists"
+            )));
+        }
+        std::fs::create_dir_all(&dir)?;
+
+        let tmp_path = dir.join(".workflow.md.tmp");
+        let final_path = dir.join("workflow.md");
+        std::fs::write(&tmp_path, yaml_content)?;
+        std::fs::rename(&tmp_path, &final_path)?;
+
+        // 2. 解析定义（纯 CPU）
+        let definition = WorkflowDefinition::from_file(&final_path)?;
+
+        // 3. 更新缓存（持锁）
+        {
+            let mut metas = self
+                .metas
+                .write()
+                .map_err(|e| WorkflowError::Persist(format!("metas lock poisoned: {e}")))?;
+            metas.insert(
+                name.to_string(),
+                WorkflowMeta {
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
+                    version: definition.version.clone(),
+                    step_count: definition.steps.len(),
+                },
+            );
+        }
+
+        debug!(workflow = %name, "Workflow created");
+        Ok(definition)
+    }
+
+    /// 更新已有 Workflow。
+    ///
+    /// 流程：检查目录存在 → 原子覆盖 workflow.md → 解析定义 →
+    /// 持锁更新 metas + 淘汰 definitions 缓存。
+    pub fn update(
+        &self,
+        name: &str,
+        yaml_content: &str,
+    ) -> Result<WorkflowDefinition, WorkflowError> {
+        let dir = self.workflows_dir.join(name);
+        let final_path = dir.join("workflow.md");
+
+        if !final_path.exists() {
+            return Err(WorkflowError::Parse(format!(
+                "workflow '{name}' not found at {}",
+                final_path.display()
+            )));
+        }
+
+        // 1. 文件 I/O（锁外完成）
+        let tmp_path = dir.join(".workflow.md.tmp");
+        std::fs::write(&tmp_path, yaml_content)?;
+        std::fs::rename(&tmp_path, &final_path)?;
+
+        // 2. 解析定义（纯 CPU）
+        let definition = WorkflowDefinition::from_file(&final_path)?;
+
+        // 3. 更新缓存（持锁）
+        {
+            // 淘汰 Tier-2
+            let mut defs = self
+                .definitions
+                .write()
+                .map_err(|e| WorkflowError::Persist(format!("definitions lock poisoned: {e}")))?;
+            defs.remove(name);
+
+            // 更新 Tier-1
+            let mut metas = self
+                .metas
+                .write()
+                .map_err(|e| WorkflowError::Persist(format!("metas lock poisoned: {e}")))?;
+            metas.insert(
+                name.to_string(),
+                WorkflowMeta {
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
+                    version: definition.version.clone(),
+                    step_count: definition.steps.len(),
+                },
+            );
+        }
+
+        debug!(workflow = %name, "Workflow updated");
+        Ok(definition)
+    }
+
+    /// 删除 Workflow。
+    ///
+    /// 流程：检查目录存在 → 删除目录 → 持锁清理 metas + definitions 缓存。
+    pub fn delete(&self, name: &str) -> Result<(), WorkflowError> {
+        let dir = self.workflows_dir.join(name);
+
+        if !dir.exists() {
+            return Err(WorkflowError::Parse(format!(
+                "workflow '{name}' not found at {}",
+                dir.display()
+            )));
+        }
+
+        // 1. 文件 I/O（锁外完成）
+        std::fs::remove_dir_all(&dir)?;
+
+        // 2. 清理缓存（持锁）
+        {
+            let mut defs = self
+                .definitions
+                .write()
+                .map_err(|e| WorkflowError::Persist(format!("definitions lock poisoned: {e}")))?;
+            defs.remove(name);
+
+            let mut metas = self
+                .metas
+                .write()
+                .map_err(|e| WorkflowError::Persist(format!("metas lock poisoned: {e}")))?;
+            metas.remove(name);
+        }
+
+        debug!(workflow = %name, "Workflow deleted");
+        Ok(())
     }
 
     // ── 路径 ────────────────────────────────────────────────────────
@@ -252,8 +435,6 @@ impl WorkflowManager {
 mod tests {
     use super::*;
     use crate::workflow::definition::StepConfig;
-    use crate::workflow::persistence::NullWorkflowPersister;
-    use std::sync::Arc;
 
     fn setup_test_dir() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -277,7 +458,7 @@ mod tests {
         create_workflow_file(&wf_dir, "test-wf", "A test workflow", "1.0");
         create_workflow_file(&wf_dir, "another-wf", "Another one", "2.0");
 
-        let manager = WorkflowManager::new(wf_dir, Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir);
         let count = manager.init().unwrap();
         assert_eq!(count, 2);
     }
@@ -285,17 +466,14 @@ mod tests {
     #[test]
     fn test_init_empty_dir() {
         let (_tmp, wf_dir) = setup_test_dir();
-        let manager = WorkflowManager::new(wf_dir, Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir);
         let count = manager.init().unwrap();
         assert_eq!(count, 0);
     }
 
     #[test]
     fn test_init_nonexistent_dir() {
-        let manager = WorkflowManager::new(
-            PathBuf::from("/tmp/nonexistent-workflow-dir-12345"),
-            Arc::new(NullWorkflowPersister),
-        );
+        let manager = WorkflowManager::new(PathBuf::from("/tmp/nonexistent-workflow-dir-12345"));
         let count = manager.init().unwrap();
         assert_eq!(count, 0);
     }
@@ -307,7 +485,7 @@ mod tests {
         create_workflow_file(&wf_dir, "alpha", "A", "1.0");
         create_workflow_file(&wf_dir, "mike", "M", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir, Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir);
         manager.init().unwrap();
         let names = manager.list_names();
         assert_eq!(names, vec!["alpha", "mike", "zulu"]);
@@ -318,7 +496,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "test-wf", "A test workflow", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir, Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir);
         manager.init().unwrap();
 
         let def1 = manager.load("test-wf").unwrap();
@@ -331,7 +509,7 @@ mod tests {
     #[test]
     fn test_load_missing() {
         let (_tmp, wf_dir) = setup_test_dir();
-        let manager = WorkflowManager::new(wf_dir, Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir);
         manager.init().unwrap();
 
         let err = manager.load("nonexistent").unwrap_err();
@@ -344,7 +522,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "test-wf", "Original", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir.clone(), Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir.clone());
         manager.init().unwrap();
 
         let def1 = manager.load("test-wf").unwrap();
@@ -367,7 +545,7 @@ mod tests {
         let content = "---\nworkflow:\n  name: \"echo-wf\"\n  description: \"Echo test\"\n  version: \"1.0\"\n  steps:\n    - id: \"A\"\n      name: \"Echo\"\n      type: shell\n      config:\n        command: \"echo hello\"\n---\n";
         std::fs::write(wf_dir_inner.join("workflow.md"), content).unwrap();
 
-        let manager = WorkflowManager::new(wf_dir, Arc::new(NullWorkflowPersister));
+        let manager = WorkflowManager::new(wf_dir);
         manager.init().unwrap();
 
         // Verify the definition loads and has correct step config

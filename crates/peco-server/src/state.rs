@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use peco_core::config::SystemConfig;
+use peco_core::workflow::WorkflowManager;
 use sqlx::SqlitePool;
 
 use crate::config::ServerConfig;
-use crate::task::CronScheduler;
+use crate::workflow::persister::SqliteWorkflowPersister;
+use crate::workflow::scheduler::CronScheduler;
 use crate::workspace::WorkspaceManager;
 
 /// 应用全局状态，所有 handler 通过 `State<Arc<AppState>>` 访问。
@@ -20,10 +22,14 @@ pub struct AppState {
     pub jwt_secret: String,
     /// 数据存储根目录。
     pub data_dir: PathBuf,
-    /// 工作空间管理器（替代 agent_registry + web_knowledge_manager）。
+    /// 工作空间管理器。
     pub workspace_manager: Arc<WorkspaceManager>,
-    /// 定时任务调度器。
-    pub task_scheduler: Arc<CronScheduler>,
+
+    // ── Workflow 子系统 ──────────────────────────────────────────────
+    /// 定时调度器。
+    pub cron_scheduler: Arc<CronScheduler>,
+    /// Workflow 生命周期管理器（CRUD + 执行）。
+    pub workflow_manager: Arc<WorkflowManager>,
 }
 
 impl AppState {
@@ -31,7 +37,7 @@ impl AppState {
     pub async fn new(
         config: &ServerConfig,
         db: SqlitePool,
-        task_scheduler: Arc<CronScheduler>,
+        cron_scheduler: Arc<CronScheduler>,
     ) -> Self {
         if let Err(e) = tokio::fs::create_dir_all(&config.data_dir).await {
             tracing::warn!(
@@ -59,6 +65,12 @@ impl AppState {
             tracing::warn!(error = %e, dir = %knowledge_dir.display(), "Failed to create knowledge directory");
         }
 
+        // 确保 workflows 子目录存在
+        let workflows_dir = config.data_dir.join("workflows");
+        if let Err(e) = tokio::fs::create_dir_all(&workflows_dir).await {
+            tracing::warn!(error = %e, dir = %workflows_dir.display(), "Failed to create workflows directory");
+        }
+
         // 加载系统级配置
         let system_config = Arc::new(SystemConfig::load());
 
@@ -69,12 +81,25 @@ impl AppState {
             128,
         ));
 
+        // 创建 WorkflowManager
+        let workflow_manager = Arc::new(WorkflowManager::new(workflows_dir));
+        match workflow_manager.init() {
+            Ok(count) => tracing::info!(count = count, "WorkflowManager initialized"),
+            Err(e) => tracing::warn!(error = %e, "Failed to scan workflow metadata"),
+        }
+
         Self {
             db,
             jwt_secret: config.jwt_secret.clone(),
             data_dir: config.data_dir.clone(),
             workspace_manager,
-            task_scheduler,
+            cron_scheduler,
+            workflow_manager,
         }
+    }
+
+    /// 为指定用户创建 workflow 持久化实例（per-user pattern）。
+    pub fn workflow_persister_for(&self, user_id: &str) -> SqliteWorkflowPersister {
+        SqliteWorkflowPersister::new(self.db.clone(), user_id.to_string())
     }
 }

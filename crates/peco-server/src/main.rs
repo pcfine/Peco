@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 use peco_server::config::ServerConfig;
 use peco_server::db;
 use peco_server::state::AppState;
-use peco_server::task::CronScheduler;
+use peco_server::workflow::scheduler::CronScheduler;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +26,6 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     // ── 3. 加载初步配置（获取 database_url 和 data_dir）─────────────────
-    //    此时还不依赖 DB，JWT 先用环境变量或随机值
     let config_prelim = ServerConfig::from_env()?;
     tracing::info!(
         host = %config_prelim.host,
@@ -44,7 +43,6 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).await?;
 
     // ── 6. 重新加载完整配置（含 DB 持久化的 JWT 密钥）───────────────────
-    //    DB 已就绪，JWT 密钥支持三层降级：环境变量 → DB → 随机生成+持久化
     let config = ServerConfig::from_env_with_db(&pool).await?;
     tracing::info!(
         host = %config.host,
@@ -53,29 +51,38 @@ async fn main() -> anyhow::Result<()> {
         "Full configuration loaded (with JWT persistence)"
     );
 
-    // ── 7. 创建 CronScheduler ───────────────────────────────────────────────
+    // ── 7. 清理僵尸 Workflow 执行记录 ───────────────────────────────────
+    match db::workflow_executions::mark_zombies_failed(&pool).await {
+        Ok(count) if count > 0 => tracing::info!(
+            zombie_count = count,
+            "Marked zombie workflow executions as failed"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "Failed to mark zombie workflow executions"),
+    }
+
+    // ── 8. 创建 CronScheduler ───────────────────────────────────────────────
     let cron_scheduler = Arc::new(
         CronScheduler::new()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create CronScheduler: {e}"))?,
     );
 
-    // ── 8. 创建 AppState ───────────────────────────────────────────────────
+    // ── 9. 创建 AppState ───────────────────────────────────────────────────
     let state = Arc::new(AppState::new(&config, pool, cron_scheduler.clone()).await);
 
-    // ── 9. 从 DB 加载已启用的 Task 并注册到调度器 ─────────────────────────
-    match db::tasks::list_all_enabled(&state.db).await {
-        Ok(enabled_tasks) => {
-            let count = enabled_tasks.len();
-            for task in &enabled_tasks {
+    // ── 10. 从 DB 加载已启用的 Workflow 调度并注册 ────────────────────────
+    match db::workflow_schedules::list_all_enabled(&state.db).await {
+        Ok(schedules) => {
+            let count = schedules.len();
+            for schedule in &schedules {
                 match state
-                    .task_scheduler
-                    .add_task(
-                        task.id.clone(),
-                        task.cron_expr.clone(),
-                        task.agent_id.clone(),
-                        task.user_id.clone(),
-                        task.prompt.clone(),
+                    .cron_scheduler
+                    .add_workflow(
+                        schedule.workflow_name.clone(),
+                        schedule.cron_expr.clone(),
+                        schedule.timezone.clone(),
+                        schedule.user_id.clone(),
                         state.db.clone(),
                         Arc::clone(&state),
                     )
@@ -83,30 +90,30 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Ok(uuid) => {
                         tracing::info!(
-                            task_id = %task.id,
-                            task_name = %task.name,
+                            workflow = %schedule.workflow_name,
+                            user_id = %schedule.user_id,
                             job_uuid = %uuid,
-                            "Loaded scheduled task"
+                            "Loaded scheduled workflow"
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
-                            task_id = %task.id,
-                            task_name = %task.name,
+                            workflow = %schedule.workflow_name,
+                            user_id = %schedule.user_id,
                             error = %e,
-                            "Failed to register scheduled task on startup"
+                            "Failed to register scheduled workflow on startup"
                         );
                     }
                 }
             }
-            tracing::info!(count = count, "Scheduled tasks loaded from database");
+            tracing::info!(count = count, "Scheduled workflows loaded from database");
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to load scheduled tasks from database");
+            tracing::warn!(error = %e, "Failed to load scheduled workflows from database");
         }
     }
 
-    // ── 10. 启动调度器 ──────────────────────────────────────────────────────
+    // ── 11. 启动调度器 ──────────────────────────────────────────────────────
     cron_scheduler
         .start()
         .await
@@ -116,10 +123,10 @@ async fn main() -> anyhow::Result<()> {
         "CronScheduler started"
     );
 
-    // ── 11. 构建 Router（启用 API 限流）───────────────────────────────────
+    // ── 12. 构建 Router（启用 API 限流）───────────────────────────────────
     let app = peco_server::build_router_with_limits(state, true);
 
-    // ── 12. 绑定端口并启动 ──────────────────────────────────────────────────
+    // ── 13. 绑定端口并启动 ──────────────────────────────────────────────────
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     tracing::info!("Server starting on http://{}", addr);
 

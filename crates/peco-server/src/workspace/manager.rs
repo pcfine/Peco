@@ -410,5 +410,4 @@ impl WorkspaceManager {
             }
         }
     }
-
 }

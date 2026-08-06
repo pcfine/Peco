@@ -8,7 +8,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   Sparkles,
   Settings2,
-  Clock,
+  Workflow,
   Settings,
   ChevronLeft,
   ChevronDown,
@@ -43,7 +43,7 @@ const NAV_ITEMS: NavItem[] = [
       { to: "/workspace/knowledge", label: "KnowledgeBase", icon: BookOpen },
     ],
   },
-  { to: "/tasks", label: "任务", icon: Clock },
+  { to: "/workflows", label: "工作流", icon: Workflow },
   { to: "/settings", label: "设置", icon: Settings },
 ];
 
@@ -121,11 +121,11 @@ export function Sidebar({ forceExpanded }: SidebarProps) {
                 {!collapsed && (
                   <>
                     <span className="flex-1">{item.label}</span>
-                    {(isWorkspaceSection) && (
+                    {isWorkspaceSection && (
                       <ChevronDown
                         className={cn(
                           "h-3 w-3 transition-transform",
-                          (isWorkspaceSection && expandedManage)
+                          isWorkspaceSection && expandedManage
                             ? ""
                             : "-rotate-90",
                         )}

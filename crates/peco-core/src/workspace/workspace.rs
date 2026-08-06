@@ -10,7 +10,6 @@ use crate::config::{McpConfig, SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::mcp::McpConfigStore;
 use crate::skills::SkillRegister;
-use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::{WorkflowAccess, WorkflowManager};
 
 use super::error::WorkspaceError;
@@ -106,10 +105,7 @@ impl WorkSpace {
         }
 
         let workflows_dir = root.join("workflows");
-        let workflow_manager = Arc::new(WorkflowManager::new(
-            workflows_dir,
-            Arc::new(NullWorkflowPersister),
-        ));
+        let workflow_manager = Arc::new(WorkflowManager::new(workflows_dir));
         if let Err(e) = workflow_manager.init() {
             tracing::warn!(error = %e, "Failed to scan workflow metadata");
         }

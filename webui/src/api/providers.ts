@@ -29,7 +29,9 @@ export async function listProviders(): Promise<ProviderInfo[]> {
 }
 
 export async function getProvider(name: string): Promise<ProviderInfo> {
-  const res = await api.get<ProviderInfo>(`/providers/${encodeURIComponent(name)}`);
+  const res = await api.get<ProviderInfo>(
+    `/providers/${encodeURIComponent(name)}`,
+  );
   return res.data;
 }
 

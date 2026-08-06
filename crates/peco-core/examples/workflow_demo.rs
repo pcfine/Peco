@@ -30,7 +30,7 @@ use peco_core::tools::ToolDyn;
 use peco_core::workflow::{
     ApprovalDecision, ApprovalResponse, NullWorkflowPersister, StepConfig, StepType,
     WorkflowConfig, WorkflowDefinition, WorkflowEngine, WorkflowEvent, WorkflowManager,
-    WorkflowStep,
+    WorkflowPersister, WorkflowStep,
 };
 use peco_core::workflow::{ExecuteWorkflow, OnFailure, WorkflowAccess};
 
@@ -306,10 +306,7 @@ workflow:
     std::fs::write(wf_dir.join("workflow.md"), workflow_yaml).unwrap();
 
     // Step 2: 通过 WorkflowManager 加载
-    let manager = WorkflowManager::new(
-        tmp.path().join("workflows"),
-        Arc::new(NullWorkflowPersister),
-    );
+    let manager = WorkflowManager::new(tmp.path().join("workflows"));
     manager.init().unwrap();
 
     let names = manager.list_names();
@@ -325,10 +322,12 @@ workflow:
 
     // Step 3: 执行
     let agent_access: Arc<dyn AgentAccess> = Arc::new(NoopAgentAccess);
+    let persister: Arc<dyn WorkflowPersister> = Arc::new(NullWorkflowPersister);
     let mut handle = manager
         .execute(
             "data-pipeline",
             agent_access,
+            persister,
             WorkflowConfig::default(),
             HashMap::new(),
         )

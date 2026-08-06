@@ -57,9 +57,9 @@ pub struct AgentProfile {
     pub max_turns: usize,
 }
 
-/// `max_turns` 的默认值：20 轮对话。
+/// `max_turns` 的默认值：50 轮对话。
 pub fn default_max_turns() -> usize {
-    20
+    50
 }
 
 /// Agent 身份信息。
@@ -590,7 +590,7 @@ mod tests {
         assert!(profile.tools.is_empty());
         assert!(profile.mcp.is_empty());
         assert!(profile.skills.is_empty());
-        assert_eq!(profile.max_turns, 20);
+        assert_eq!(profile.max_turns, 50);
         assert_eq!(body, "Be helpful.");
     }
 

@@ -8,8 +8,8 @@ pub mod documents;
 pub mod knowledge_bases;
 pub mod messages;
 pub mod sync;
-pub mod task_logs;
-pub mod tasks;
+pub mod workflow_executions;
+pub mod workflow_schedules;
 pub mod workspace_hashes;
 
 use sqlx::sqlite::SqlitePool;
@@ -140,6 +140,43 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::info!("Migration 003 completed");
     } else {
         tracing::debug!("Migration 003 skipped: agent_name column already exists");
+    }
+
+    // ── Migration 005: Workflow 管理模块 ──────────────────────────────────
+    let has_workflow_executions = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='workflow_executions'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    // 检查是否还有旧 task 表需要清理（首次迁移时处理）
+    let has_old_tasks = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tasks'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_workflow_executions || has_old_tasks {
+        tracing::info!("Running migration 005: workflow management module");
+        let migration_sql = include_str!("migrations/005_workflow_executions.sql");
+        for statement in migration_sql.split(';') {
+            let trimmed = statement.trim();
+            if trimmed.is_empty()
+                || trimmed
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+            {
+                continue;
+            }
+            sqlx::raw_sql(trimmed).execute(pool).await?;
+        }
+        tracing::info!("Migration 005 completed: task tables dropped, workflow tables created");
+    } else {
+        tracing::debug!(
+            "Migration 005 skipped: workflow_executions table already exists and no old tasks table"
+        );
     }
 
     Ok(())

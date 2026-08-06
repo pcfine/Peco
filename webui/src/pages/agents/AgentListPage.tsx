@@ -6,7 +6,17 @@ import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { listAgents, deleteAgent } from "@/api/agents";
 import type { AgentListItem } from "@/types/agent";
-import { Plus, Trash2, Bot, Wrench, Database, Cpu, MessageSquare, AlertCircle, RefreshCw } from "lucide-react";
+import {
+  Plus,
+  Trash2,
+  Bot,
+  Wrench,
+  Database,
+  Cpu,
+  MessageSquare,
+  AlertCircle,
+  RefreshCw,
+} from "lucide-react";
 import { toast } from "sonner";
 
 export function AgentListPage() {

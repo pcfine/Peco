@@ -364,7 +364,10 @@ pub async fn stream_chat(
         }
         _ => {
             tracing::info!(conversation_id = %conv_id, "Creating new session");
-            (Box::new(Session::new(conv_id.clone(), conv.title.clone())), true)
+            (
+                Box::new(Session::new(conv_id.clone(), conv.title.clone())),
+                true,
+            )
         }
     };
 
@@ -547,8 +550,7 @@ pub async fn stream_chat(
 
                         // 仅首轮对话时根据用户第一条消息自动生成标题
                         if is_first_turn {
-                            let short: String =
-                                message_for_bg.chars().take(50).collect();
+                            let short: String = message_for_bg.chars().take(50).collect();
                             let new_title = if short.len() >= message_for_bg.len() {
                                 short
                             } else {

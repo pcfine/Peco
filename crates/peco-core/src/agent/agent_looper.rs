@@ -1077,9 +1077,7 @@ impl AgentLooper {
                 match user_listener.recv().await {
                     Some(UserMsg::Query(text)) => {
                         // 暂停期间收到的输入放入 pending 队列
-                        info!(
-                            "Message queued (looper paused). Will process after resume."
-                        );
+                        info!("Message queued (looper paused). Will process after resume.");
                         self.session.enqueue_pending(text);
                     }
                     Some(UserMsg::Shutdown) => break,

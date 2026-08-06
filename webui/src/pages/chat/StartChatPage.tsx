@@ -45,7 +45,9 @@ export function StartChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convListLoading, setConvListLoading] = useState(true);
   const [convListError, setConvListError] = useState<string | null>(null);
-  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
+  const [archivedConversations, setArchivedConversations] = useState<
+    Conversation[]
+  >([]);
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [archivedLoading, setArchivedLoading] = useState(false);
 
@@ -262,12 +264,21 @@ export function StartChatPage() {
         <div className="flex flex-col items-center gap-4 text-center max-w-md">
           <p className="text-lg text-muted-foreground">{agentError}</p>
           {agentError === "Agent 未找到" ? (
-            <Button variant="outline" onClick={() => navigate("/workspace/agents")}>
+            <Button
+              variant="outline"
+              onClick={() => navigate("/workspace/agents")}
+            >
               <ArrowLeft className="h-4 w-4 mr-2" />
               返回 Agent 列表
             </Button>
           ) : (
-            <Button variant="outline" onClick={() => { setAgentLoading(true); setAgentError(null); }}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAgentLoading(true);
+                setAgentError(null);
+              }}
+            >
               重试
             </Button>
           )}

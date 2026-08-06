@@ -33,9 +33,9 @@ pub mod provider;
 pub mod session_store;
 pub mod skill;
 pub mod state;
-pub mod task;
 pub mod upload;
 pub mod usage;
+pub mod workflow;
 pub mod workspace;
 
 /// 构建完整的 Axum Router（不含限流层，供集成测试使用）。
@@ -64,7 +64,8 @@ pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: 
         .nest("/api/skills", skill::router())
         .nest("/api/mcp", mcp_config::router())
         .nest("/api/knowledge", knowledge::router())
-        .nest("/api/tasks", task::router())
+        .nest("/api/workflows", workflow::workflow_router())
+        .nest("/api/schedules", workflow::schedule_router())
         .nest("/api/usage", usage::router())
         // DEPRECATED since 0.2.0: use /api/chat/:agentId/conversations instead
         .nest("/api/conversations", chat::conversation_router());

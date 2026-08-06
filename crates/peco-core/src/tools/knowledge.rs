@@ -392,7 +392,12 @@ impl ToolDyn for SyncKnowledgeBase {
                         lines.push(format!("  '{}': {err}", name));
                     }
                 }
-                info!(kb_count = self.allowed_kbs.len(), synced = reports.len(), failed = errors.len(), "All KBs synced via tool");
+                info!(
+                    kb_count = self.allowed_kbs.len(),
+                    synced = reports.len(),
+                    failed = errors.len(),
+                    "All KBs synced via tool"
+                );
                 Ok(format!("知识库同步完成:\n{}", lines.join("\n")))
             }
         })

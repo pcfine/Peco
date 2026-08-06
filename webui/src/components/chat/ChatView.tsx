@@ -280,7 +280,9 @@ export function ChatView({
   // ── Render ──────────────────────────────────────────────────────────────
 
   return (
-    <div className={`flex flex-col max-w-4xl mx-auto ${className || "h-[calc(100vh-7rem)]"}`}>
+    <div
+      className={`flex flex-col max-w-4xl mx-auto ${className || "h-[calc(100vh-7rem)]"}`}
+    >
       {/* Header */}
       <div className="flex items-center gap-3 py-3 border-b mb-4">
         <h2 className="font-semibold flex-1">{headerTitle}</h2>

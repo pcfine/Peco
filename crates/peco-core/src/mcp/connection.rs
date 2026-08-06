@@ -107,9 +107,7 @@ pub(crate) fn make_http_transport(
     let transport_config = StreamableHttpClientTransportConfig::with_uri(resolved_url.clone())
         .custom_headers(custom_headers);
 
-    let transport = rmcp::transport::StreamableHttpClientTransport::from_config(
-        transport_config,
-    );
+    let transport = rmcp::transport::StreamableHttpClientTransport::from_config(transport_config);
     info!(server = name, transport = "http", url = %resolved_url, "MCP transport created");
     Ok(transport)
 }

@@ -59,9 +59,15 @@ export function AgentChatPage() {
     }
     return map;
   });
-  const [visibleConvId, setVisibleConvId] = useState<string | null>(conversationId ?? null);
-  const [unreadCounts, setUnreadCounts] = useState<Map<string, number>>(new Map());
-  const [snapshots, setSnapshots] = useState<Map<string, ChatMessage[]>>(new Map());
+  const [visibleConvId, setVisibleConvId] = useState<string | null>(
+    conversationId ?? null,
+  );
+  const [unreadCounts, setUnreadCounts] = useState<Map<string, number>>(
+    new Map(),
+  );
+  const [snapshots, setSnapshots] = useState<Map<string, ChatMessage[]>>(
+    new Map(),
+  );
   const [snapshotReady, setSnapshotReady] = useState(false);
   const [initialQuery, setInitialQuery] = useState<string | undefined>();
   const [invalidConv, setInvalidConv] = useState(false);
@@ -71,7 +77,9 @@ export function AgentChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [convListLoading, setConvListLoading] = useState(true);
   const [convListError, setConvListError] = useState<string | null>(null);
-  const [archivedConversations, setArchivedConversations] = useState<Conversation[]>([]);
+  const [archivedConversations, setArchivedConversations] = useState<
+    Conversation[]
+  >([]);
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [archivedLoading, setArchivedLoading] = useState(false);
 
@@ -159,7 +167,11 @@ export function AgentChatPage() {
     setConvListLoading(true);
     setConvListError(null);
     try {
-      const active = await listConversations(agentId, "active", controller.signal);
+      const active = await listConversations(
+        agentId,
+        "active",
+        controller.signal,
+      );
       setConversations(active);
     } catch {
       // Ignore cancelled requests (unmount or superseded by a new call)
@@ -397,7 +409,14 @@ export function AgentChatPage() {
         toast.error("删除失败");
       }
     },
-    [agentId, visibleConvId, conversations, chatPool, handleSelectConversation, navigate],
+    [
+      agentId,
+      visibleConvId,
+      conversations,
+      chatPool,
+      handleSelectConversation,
+      navigate,
+    ],
   );
 
   const handleRetryConversations = useCallback(() => {
@@ -432,7 +451,10 @@ export function AgentChatPage() {
     if (!query || !resolvedAgentId || sending) return;
     setSending(true);
     try {
-      const conv = await createConversation(resolvedAgentId, query.slice(0, 15));
+      const conv = await createConversation(
+        resolvedAgentId,
+        query.slice(0, 15),
+      );
       setConversations((prev) => [conv, ...prev]);
       setInput("");
       setSending(false);
@@ -458,16 +480,13 @@ export function AgentChatPage() {
 
   // ── Unread handler ─────────────────────────────────────────────────────
 
-  const handleUnread = useCallback(
-    (convId: string, count: number) => {
-      setUnreadCounts((prev) => {
-        const next = new Map(prev);
-        next.set(convId, count);
-        return next;
-      });
-    },
-    [],
-  );
+  const handleUnread = useCallback((convId: string, count: number) => {
+    setUnreadCounts((prev) => {
+      const next = new Map(prev);
+      next.set(convId, count);
+      return next;
+    });
+  }, []);
 
   if (loading) return <LoadingSpinner />;
 
@@ -479,7 +498,10 @@ export function AgentChatPage() {
         <div className="flex flex-col items-center gap-4 text-center">
           <AlertCircle className="h-10 w-10 text-muted-foreground" />
           <p className="text-lg text-muted-foreground">对话不存在或已被删除</p>
-          <Button variant="outline" onClick={() => navigate(`/chat/${resolvedAgentId}`)}>
+          <Button
+            variant="outline"
+            onClick={() => navigate(`/chat/${resolvedAgentId}`)}
+          >
             返回开始页
           </Button>
         </div>
@@ -582,7 +604,10 @@ export function AgentChatPage() {
                   disabled={sending}
                   autoFocus
                 />
-                <Button onClick={handleSend} disabled={!input.trim() || sending}>
+                <Button
+                  onClick={handleSend}
+                  disabled={!input.trim() || sending}
+                >
                   {sending ? (
                     "创建中…"
                   ) : (
@@ -632,7 +657,7 @@ export function AgentChatPage() {
                     <span className="font-semibold">{agent.name}</span>
                   </div>
                 ) : (
-                  agentId ?? "对话"
+                  (agentId ?? "对话")
                 )
               }
             />

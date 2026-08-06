@@ -15,9 +15,11 @@ import { AgentCreatePage } from "@/pages/agents/AgentCreatePage";
 import { AgentEditPage } from "@/pages/agents/AgentEditPage";
 import { KnowledgeListPage } from "@/pages/knowledge/KnowledgeListPage";
 import { KnowledgeDetailPage } from "@/pages/knowledge/KnowledgeDetailPage";
-import { TaskListPage } from "@/pages/tasks/TaskListPage";
-import { TaskCreatePage } from "@/pages/tasks/TaskCreatePage";
-import { TaskLogsPage } from "@/pages/tasks/TaskLogsPage";
+import { WorkflowListPage } from "@/pages/workflows/WorkflowListPage";
+import { WorkflowEditorPage } from "@/pages/workflows/WorkflowEditorPage";
+import { WorkflowDetailPage } from "@/pages/workflows/WorkflowDetailPage";
+import { WorkflowRunDetailPage } from "@/pages/workflows/WorkflowRunDetailPage";
+import { ScheduleManagePage } from "@/pages/workflows/ScheduleManagePage";
 import { SettingsPage } from "@/pages/settings/SettingsPage";
 
 // Lazy-loaded management pages (new in v2)
@@ -59,10 +61,7 @@ export default function App() {
                   <Route path="/peco" element={<PecoChatPage />} />
 
                   {/* 空间 */}
-                  <Route
-                    path="/workspace/agents"
-                    element={<AgentListPage />}
-                  />
+                  <Route path="/workspace/agents" element={<AgentListPage />} />
                   <Route
                     path="/workspace/agents/new"
                     element={<AgentCreatePage />}
@@ -71,10 +70,7 @@ export default function App() {
                     path="/workspace/agents/:agentId/edit"
                     element={<AgentEditPage />}
                   />
-                  <Route
-                    path="/workspace/skills"
-                    element={<SkillListPage />}
-                  />
+                  <Route path="/workspace/skills" element={<SkillListPage />} />
                   <Route
                     path="/workspace/skills/:skillName/edit"
                     element={<SkillEditPage />}
@@ -89,12 +85,34 @@ export default function App() {
                     element={<KnowledgeDetailPage />}
                   />
 
-                  {/* 任务 */}
-                  <Route path="/tasks" element={<TaskListPage />} />
-                  <Route path="/tasks/new" element={<TaskCreatePage />} />
+                  {/* 工作流 */}
+                  <Route path="/workflows" element={<WorkflowListPage />} />
                   <Route
-                    path="/tasks/:taskId/logs"
-                    element={<TaskLogsPage />}
+                    path="/workflows/new"
+                    element={<WorkflowEditorPage />}
+                  />
+                  <Route
+                    path="/workflows/:name"
+                    element={<WorkflowDetailPage />}
+                  />
+                  <Route
+                    path="/workflows/:name/edit"
+                    element={<WorkflowEditorPage />}
+                  />
+                  <Route
+                    path="/workflows/executions/:runId"
+                    element={<WorkflowRunDetailPage />}
+                  />
+                  <Route path="/schedules" element={<ScheduleManagePage />} />
+
+                  {/* 旧路由重定向 */}
+                  <Route
+                    path="/tasks"
+                    element={<Navigate to="/workflows" replace />}
+                  />
+                  <Route
+                    path="/tasks/*"
+                    element={<Navigate to="/workflows" replace />}
                   />
 
                   {/* 设置 */}
@@ -102,10 +120,7 @@ export default function App() {
                 </Route>
 
                 {/* Chat 路由 — 统一双栏布局，无顶部页眉 */}
-                <Route
-                  path="/chat/:agentId"
-                  element={<AgentChatPage />}
-                />
+                <Route path="/chat/:agentId" element={<AgentChatPage />} />
                 <Route
                   path="/chat/:agentId/:conversationId"
                   element={<AgentChatPage />}

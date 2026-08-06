@@ -259,7 +259,10 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
   // UseController for array fields (tools, skills, etc.)
   const { field: toolsField } = useController({ name: "tools", control });
   const { field: skillsField } = useController({ name: "skills", control });
-  const { field: kbField } = useController({ name: "knowledge_bases", control });
+  const { field: kbField } = useController({
+    name: "knowledge_bases",
+    control,
+  });
   const { field: mcpField } = useController({ name: "mcp_servers", control });
 
   // ── Dynamic option loading ─────────────────────────────────────────────
@@ -693,7 +696,12 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
 
       <div className="flex gap-3 pt-4 border-t">
         {onCancel && (
-          <Button type="button" variant="outline" className="flex-1" onClick={onCancel}>
+          <Button
+            type="button"
+            variant="outline"
+            className="flex-1"
+            onClick={onCancel}
+          >
             取消
           </Button>
         )}

@@ -269,9 +269,7 @@ export function ProviderSection() {
                 disabled={!!editing}
               />
               {editing && (
-                <p className="text-xs text-muted-foreground">
-                  名称不可修改
-                </p>
+                <p className="text-xs text-muted-foreground">名称不可修改</p>
               )}
             </div>
             <div className="space-y-2">
@@ -345,7 +343,11 @@ export function ProviderSection() {
             >
               取消
             </Button>
-            <Button variant="destructive" onClick={handleDelete} disabled={deleting}>
+            <Button
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={deleting}
+            >
               {deleting ? "删除中…" : "删除"}
             </Button>
           </DialogFooter>

@@ -164,7 +164,11 @@ export function SkillListPage() {
             <Card
               key={skill.name}
               className="group hover:border-primary/50 transition-colors cursor-pointer"
-              onClick={() => navigate(`/workspace/skills/${encodeURIComponent(skill.name)}/edit`)}
+              onClick={() =>
+                navigate(
+                  `/workspace/skills/${encodeURIComponent(skill.name)}/edit`,
+                )
+              }
             >
               <CardContent className="p-4 flex items-start gap-3">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-accent">
@@ -285,7 +289,6 @@ export function SkillListPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
     </div>
   );
 }

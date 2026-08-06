@@ -77,32 +77,6 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- 定时任务表
-CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    cron_expr TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    last_run_at TEXT,
-    next_run_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- 任务执行日志表
-CREATE TABLE IF NOT EXISTS task_logs (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    status TEXT NOT NULL,
-    output TEXT,
-    error TEXT,
-    started_at TEXT NOT NULL,
-    finished_at TEXT
-);
-
 -- 会话快照表（Session 持久化）
 CREATE TABLE IF NOT EXISTS session_snapshots (
     conversation_id TEXT PRIMARY KEY,
@@ -150,4 +124,40 @@ CREATE INDEX IF NOT EXISTS idx_conversations_user_agent_active ON conversations(
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_bases_user_id ON knowledge_bases(user_id);
 CREATE INDEX IF NOT EXISTS idx_documents_kb_id ON documents(kb_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id);
+-- Workflow 调度配置表
+CREATE TABLE IF NOT EXISTS workflow_schedules (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    workflow_name TEXT NOT NULL,
+    cron_expr TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    timezone TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, workflow_name)
+);
+CREATE INDEX IF NOT EXISTS idx_ws_user ON workflow_schedules(user_id);
+CREATE INDEX IF NOT EXISTS idx_ws_enabled ON workflow_schedules(enabled);
+
+-- Workflow 执行记录表
+CREATE TABLE IF NOT EXISTS workflow_executions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    workflow_name TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    inputs_json TEXT,
+    total_steps INTEGER NOT NULL,
+    steps_completed INTEGER NOT NULL DEFAULT 0,
+    steps_failed INTEGER NOT NULL DEFAULT 0,
+    steps_skipped INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms INTEGER,
+    error TEXT,
+    snapshot_json TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_we_user_status ON workflow_executions(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_we_user_name ON workflow_executions(user_id, workflow_name);
+CREATE INDEX IF NOT EXISTS idx_we_user_started ON workflow_executions(user_id, started_at DESC);

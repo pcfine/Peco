@@ -124,14 +124,17 @@ impl WorkflowEngine {
         step_results: &HashMap<String, super::definition::StepResult>,
         current_level: usize,
         started_at: chrono::DateTime<chrono::Utc>,
+        inputs_json: Option<String>,
     ) -> WorkflowSnapshot {
         WorkflowSnapshot {
             run_id: self.run_id.clone(),
             workflow_name: self.definition.name.clone(),
             definition: self.definition.clone(),
             state,
+            inputs_json,
             step_results: step_results.clone(),
             current_level,
+            total_steps: self.definition.steps.len(),
             started_at,
             updated_at: chrono::Utc::now(),
         }
@@ -153,6 +156,7 @@ impl WorkflowEngine {
         let validated_inputs = match self.definition.validate_inputs(&inputs) {
             Ok(v) => v,
             Err(e) => {
+                let inputs_json = serde_json::to_string(&inputs).ok();
                 let _ = self
                     .persister
                     .save(&WorkflowSnapshot {
@@ -160,8 +164,10 @@ impl WorkflowEngine {
                         workflow_name: self.definition.name.clone(),
                         definition: self.definition.clone(),
                         state: WorkflowSnapshotState::Failed,
+                        inputs_json,
                         step_results: HashMap::new(),
                         current_level: 0,
+                        total_steps: self.definition.steps.len(),
                         started_at: chrono::Utc::now(),
                         updated_at: chrono::Utc::now(),
                     })
@@ -180,6 +186,7 @@ impl WorkflowEngine {
         let dag = match DagGraph::build(&self.definition.steps) {
             Ok(dag) => dag,
             Err(e) => {
+                let inputs_json = serde_json::to_string(&inputs).ok();
                 let _ = self
                     .persister
                     .save(&WorkflowSnapshot {
@@ -187,8 +194,10 @@ impl WorkflowEngine {
                         workflow_name: self.definition.name.clone(),
                         definition: self.definition.clone(),
                         state: WorkflowSnapshotState::Failed,
+                        inputs_json,
                         step_results: HashMap::new(),
                         current_level: 0,
+                        total_steps: self.definition.steps.len(),
                         started_at: chrono::Utc::now(),
                         updated_at: chrono::Utc::now(),
                     })
@@ -202,6 +211,9 @@ impl WorkflowEngine {
                 return;
             }
         };
+
+        // 1b. 序列化输入参数（供快照持久化）
+        let inputs_json = serde_json::to_string(&validated_inputs).ok();
 
         // 2. 初始化模板上下文（注入外部输入参数）
         let mut tpl_ctx = TemplateContext::new(Some(&validated_inputs));
@@ -373,6 +385,7 @@ impl WorkflowEngine {
                                 &step_results,
                                 level_idx,
                                 started_at,
+                                inputs_json.clone(),
                             );
                             let _ = self.persister.save(&snapshot).await;
                             // 阻塞等待审批决策
@@ -431,6 +444,7 @@ impl WorkflowEngine {
                     &step_results,
                     level_idx,
                     started_at,
+                    inputs_json.clone(),
                 );
                 let _ = self.persister.save(&snapshot).await;
                 // 确保所有剩余 handle 都被清理
@@ -446,6 +460,7 @@ impl WorkflowEngine {
                 &step_results,
                 level_idx + 1,
                 started_at,
+                inputs_json.clone(),
             );
             let _ = self.persister.save(&snapshot).await;
         }
@@ -456,6 +471,7 @@ impl WorkflowEngine {
             &step_results,
             levels.len(),
             started_at,
+            inputs_json.clone(),
         );
         let _ = self.persister.save(&snapshot).await;
 

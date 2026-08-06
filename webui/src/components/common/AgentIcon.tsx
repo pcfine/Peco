@@ -21,8 +21,7 @@ export function AgentIcon({
   className = "",
   size = "sm",
 }: AgentIconProps) {
-  const sizeClasses =
-    size === "lg" ? "w-16 h-16 text-2xl" : "w-6 h-6 text-xs";
+  const sizeClasses = size === "lg" ? "w-16 h-16 text-2xl" : "w-6 h-6 text-xs";
   const isImg = isImageUrl(icon);
 
   return (
@@ -31,11 +30,7 @@ export function AgentIcon({
       style={{ backgroundColor: isImg ? "transparent" : backgroundColor }}
     >
       {isImg ? (
-        <img
-          src={icon}
-          alt=""
-          className="h-full w-full object-cover"
-        />
+        <img src={icon} alt="" className="h-full w-full object-cover" />
       ) : (
         icon || "🤖"
       )}
