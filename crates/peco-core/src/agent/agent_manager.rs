@@ -48,7 +48,7 @@ pub struct AgentManager {
     user_id: String,
     user_config: UserConfig,
     /// MCP 配置的共享持有者（与 `user_config.mcp` 解耦，支持独立热重载）。
-    mcp_config: McpConfigStore,
+    mcp_config: Arc<McpConfigStore>,
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
     /// Tier-1 元数据缓存（name → AgentMeta）
@@ -73,7 +73,7 @@ impl AgentManager {
             agents_dir,
             user_id,
             user_config,
-            mcp_config,
+            mcp_config: Arc::new(mcp_config),
             skill_registry,
             knowledge_manager,
             metas: RwLock::new(HashMap::new()),
@@ -216,6 +216,8 @@ impl AgentManager {
             knowledge_access: self.clone() as Arc<dyn KnowledgeAccess>,
             allowed_kbs: Vec::new(),
             workflow_access: None,
+            mcp_access: None,
+            workflow_persister: None,
         }
     }
 
@@ -245,6 +247,8 @@ impl AgentManager {
             }),
             allowed_kbs: Vec::new(),
             workflow_access: None,
+            mcp_access: None,
+            workflow_persister: None,
         }
     }
 
@@ -318,6 +322,11 @@ impl AgentManager {
         }
     }
 
+    /// 返回 MCP 配置存储的共享引用。
+    pub fn mcp_config_store(&self) -> &Arc<McpConfigStore> {
+        &self.mcp_config
+    }
+
     // ── 文件 CRUD ───────────────────────────────────────────────────
 
     /// 保存 Agent 的 `agent.md` 文件并刷新缓存。
@@ -380,11 +389,32 @@ impl AgentAccess for AgentManager {
     fn save_agent(&self, name: &str, content: &str) -> Result<(), String> {
         self.save(name, content).map_err(|e| e.to_string())
     }
+
+    fn read_agent(&self, name: &str) -> Result<String, String> {
+        let path = self.md_path(name);
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read agent '{name}': {e}"))
+    }
+
+    fn delete_agent(&self, name: &str) -> Result<(), String> {
+        self.delete(name).map_err(|e| e.to_string())
+    }
 }
 
 impl SkillProvider for AgentManager {
     fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
+    }
+
+    fn save_skill(&self, name: &str, content: &str) -> Result<(), String> {
+        self.skill_registry
+            .save_skill(name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete_skill(&self, name: &str) -> Result<(), String> {
+        self.skill_registry
+            .delete_skill(name)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -447,6 +477,8 @@ impl AgentAccess for AmAgentAccess {
             }),
             allowed_kbs: Vec::new(),
             workflow_access: None,
+            mcp_access: None,
+            workflow_persister: None,
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;
@@ -482,6 +514,20 @@ impl AgentAccess for AmAgentAccess {
 
         Ok(())
     }
+
+    fn read_agent(&self, name: &str) -> Result<String, String> {
+        let path = self.agents_dir.join(name).join("agent.md");
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read agent '{name}': {e}"))
+    }
+
+    fn delete_agent(&self, name: &str) -> Result<(), String> {
+        let dir = self.agents_dir.join(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|e| format!("Failed to delete agent '{name}': {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 struct AmSkillProvider {
@@ -491,6 +537,16 @@ struct AmSkillProvider {
 impl SkillProvider for AmSkillProvider {
     fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.registry
+    }
+
+    fn save_skill(&self, name: &str, content: &str) -> Result<(), String> {
+        self.registry
+            .save_skill(name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete_skill(&self, name: &str) -> Result<(), String> {
+        self.registry.delete_skill(name).map_err(|e| e.to_string())
     }
 }
 

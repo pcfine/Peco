@@ -61,36 +61,37 @@ fn db_json_to_snapshot(
     started_at: &str,
     finished_at: Option<&str>,
 ) -> Result<WorkflowSnapshot, WorkflowError> {
-    let (step_results, current_level, inputs_json, total_steps) = if let Some(json_str) = snapshot_json {
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_str).map_err(|e| WorkflowError::Persist(e.to_string()))?;
-        let results: std::collections::HashMap<String, peco_core::workflow::StepResult> =
-            serde_json::from_value(
-                parsed
-                    .get("step_results")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({})),
-            )
-            .map_err(|e| WorkflowError::Persist(format!("step_results deserialize: {e}")))?;
-        let level: usize = parsed
-            .get("current_level")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let inputs: Option<String> = parsed.get("inputs_json").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                Some(v.to_string())
-            }
-        });
-        let ts: usize = parsed
-            .get("total_steps")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        (results, level, inputs, ts)
-    } else {
-        (Default::default(), 0, None, 0)
-    };
+    let (step_results, current_level, inputs_json, total_steps) =
+        if let Some(json_str) = snapshot_json {
+            let parsed: serde_json::Value = serde_json::from_str(json_str)
+                .map_err(|e| WorkflowError::Persist(e.to_string()))?;
+            let results: std::collections::HashMap<String, peco_core::workflow::StepResult> =
+                serde_json::from_value(
+                    parsed
+                        .get("step_results")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({})),
+                )
+                .map_err(|e| WorkflowError::Persist(format!("step_results deserialize: {e}")))?;
+            let level: usize = parsed
+                .get("current_level")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let inputs: Option<String> = parsed.get("inputs_json").and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            });
+            let ts: usize = parsed
+                .get("total_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            (results, level, inputs, ts)
+        } else {
+            (Default::default(), 0, None, 0)
+        };
 
     let snapshot_state = match state {
         "running" => WorkflowSnapshotState::Running,

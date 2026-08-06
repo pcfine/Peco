@@ -187,11 +187,31 @@ mod tests {
             self.definitions.keys().cloned().collect()
         }
 
+        fn list_workflow_meta(&self) -> Vec<crate::workflow::WorkflowMeta> {
+            self.definitions
+                .iter()
+                .map(|(name, def)| crate::workflow::WorkflowMeta {
+                    name: name.clone(),
+                    description: def.description.clone(),
+                    version: def.version.clone(),
+                    step_count: def.steps.len(),
+                })
+                .collect()
+        }
+
         fn reload_workflow(
             &self,
             name: &str,
         ) -> Result<WorkflowDefinition, crate::workflow::WorkflowError> {
             self.load_workflow(name)
+        }
+
+        fn save_workflow(&self, _name: &str, _content: &str) -> Result<(), String> {
+            Err("save_workflow not supported in stub".to_string())
+        }
+
+        fn delete_workflow(&self, _name: &str) -> Result<(), String> {
+            Err("delete_workflow not supported in stub".to_string())
         }
     }
 
@@ -210,6 +230,12 @@ mod tests {
         }
         fn save_agent(&self, _name: &str, _content: &str) -> Result<(), String> {
             Ok(())
+        }
+        fn read_agent(&self, _name: &str) -> Result<String, String> {
+            Err("not supported".into())
+        }
+        fn delete_agent(&self, _name: &str) -> Result<(), String> {
+            Err("not supported".into())
         }
     }
 

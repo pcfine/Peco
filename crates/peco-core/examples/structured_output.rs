@@ -39,6 +39,12 @@ impl AgentAccess for NoopAgentAccess {
     fn save_agent(&self, _name: &str, _content: &str) -> Result<(), String> {
         Err("noop agent writer".into())
     }
+    fn read_agent(&self, _name: &str) -> Result<String, String> {
+        Err("noop agent reader".into())
+    }
+    fn delete_agent(&self, _name: &str) -> Result<(), String> {
+        Err("noop agent deleter".into())
+    }
 }
 
 struct NoopSkillProvider {
@@ -47,6 +53,12 @@ struct NoopSkillProvider {
 impl SkillProvider for NoopSkillProvider {
     fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.registry
+    }
+    fn save_skill(&self, _name: &str, _content: &str) -> Result<(), String> {
+        Err("noop skill writer".into())
+    }
+    fn delete_skill(&self, _name: &str) -> Result<(), String> {
+        Err("noop skill deleter".into())
     }
 }
 
@@ -80,6 +92,8 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
         knowledge_access: Arc::new(NoopKnowledgeAccess),
         allowed_kbs: Vec::new(),
         workflow_access: None,
+        mcp_access: None,
+        workflow_persister: None,
     };
 
     let agent_md = agent_dir.join("agent.md");

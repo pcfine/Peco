@@ -41,12 +41,15 @@ impl ToolDyn for SaveAgent {
                   agent.description: what this agent does\n\
                 \n\
                 Optional fields: llm (provider, model, temperature, max_tokens, stream, \
-                reasoning_effort), tools, mcp, skills, knowledge_bases, max_turns (default 20).\n\
+                reasoning_effort), tools, mcp, skills, knowledge_bases, max_turns (default 50).\n\
                 \n\
-                Available tool names: shell, fetch, read_skill, delegate_sub_agent, \
-                run_parallel_sub_agents, save_agent, search_knowledge, list_knowledge_bases, \
-                add_to_knowledge_base, sync_knowledge_base, get_knowledge_base_docs, \
-                add_facts_to_knowledge_base, query_entity_facts.\n\
+                Available tool names: shell, fetch, show_workspace, read_agent, read_skill, \
+                list_skills, list_workflows, list_mcp_servers, list_knowledge_bases, \
+                search_knowledge, get_knowledge_base_docs, query_entity_facts, \
+                save_agent, delete_agent, save_skill, delete_skill, save_workflow, \
+                delete_workflow, save_mcp_server, delete_mcp_server, \
+                add_to_knowledge_base, add_facts_to_knowledge_base, sync_knowledge_base, \
+                delegate_sub_agent, run_parallel_sub_agents, execute_workflow.\n\
                 \n\
                 Example:\n\
                 ---\n\
@@ -104,6 +107,14 @@ impl ToolDyn for SaveAgent {
             if parsed.content.trim().is_empty() {
                 return Err(ToolError::ToolCallError(Box::new(StringError(
                     "agent content is required and cannot be empty".into(),
+                ))));
+            }
+
+            // 安全边界：不能覆盖 @assistant 自身
+            if name == "@assistant" {
+                return Err(ToolError::ToolCallError(Box::new(StringError(
+                    "Cannot overwrite @assistant — it is the meta-agent managing this workspace."
+                        .into(),
                 ))));
             }
 

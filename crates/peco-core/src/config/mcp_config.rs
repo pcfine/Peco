@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::error::ConfigError;
 
@@ -46,7 +46,7 @@ fn default_max_retries() -> u32 {
 // ── Transport type ────────────────────────────────────────────────────────────
 
 /// Transport method for connecting to an MCP server.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportType {
     /// Standard input/output — spawn a local child process.
@@ -70,7 +70,7 @@ pub enum TransportType {
 /// |---|---|---|
 /// | `command`, `args`, `env` | `stdio` | Child process invocation |
 /// | `url`, `headers` | `sse`, `streamable_http` | Remote server connection |
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
     /// Transport method for this server.
     pub transport: TransportType,
@@ -118,7 +118,7 @@ pub struct McpServerConfig {
 /// Root structure of the MCP configuration JSON file.
 ///
 /// Maps server names (the keys in `mcpServers`) to their configurations.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
     /// Named MCP server configurations.
     #[serde(rename = "mcpServers")]

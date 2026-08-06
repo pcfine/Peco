@@ -2,28 +2,38 @@
 // tools — peco-core's tool abstraction + concrete implementations
 // ============================================================================
 
+mod delete_agent;
 mod deps;
 mod fetch;
 mod knowledge;
+mod mcp_config_tools;
+mod read_agent;
 mod save_agent;
 mod shell;
 mod skill;
 mod sub_agent;
 mod tool_factory;
 mod tool_register;
+mod workspace_info;
 
-pub use deps::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
+pub use delete_agent::DeleteAgent;
+pub use deps::{
+    AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, SkillProvider, ToolDependencies,
+};
 pub use fetch::Fetch;
 pub use knowledge::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
+pub use mcp_config_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer};
+pub use read_agent::ReadAgent;
 pub use save_agent::SaveAgent;
 pub use shell::ShellExec;
-pub use skill::ReadSkill;
+pub use skill::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
 pub use tool_factory::{DefaultToolsExecutor, StringError};
 pub use tool_register::ToolRegister;
+pub use workspace_info::ShowWorkspace;
 
 use async_trait::async_trait;
 use std::future::Future;

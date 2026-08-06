@@ -2,12 +2,15 @@
 // 窄 Trait 接口 — 替代 Arc<WorkSpace> 注入
 // ============================================================================
 
+use serde::Serialize;
 use std::sync::Arc;
 
 use crate::agent::{Agent, AgentError};
+use crate::config::{McpServerConfig, TransportType};
 use crate::knowledge::KnowledgeManager;
 use crate::skills::SkillRegister;
 use crate::workflow::WorkflowAccess;
+use crate::workflow::persistence::WorkflowPersister;
 
 // ============================================================================
 // AgentAccess — 所有 Agent 相关工具需要（加载、创建、列表）
@@ -19,6 +22,10 @@ pub trait AgentAccess: Send + Sync {
     /// 保存 agent.md 文件。若 agent 已存在则覆盖。
     /// `content` 必须是完整的 agent.md 内容（YAML frontmatter + Markdown body）。
     fn save_agent(&self, name: &str, content: &str) -> Result<(), String>;
+    /// 读取 agent.md 原始内容（YAML frontmatter + Markdown body）。
+    fn read_agent(&self, name: &str) -> Result<String, String>;
+    /// 删除 Agent 目录（不可逆操作）。
+    fn delete_agent(&self, name: &str) -> Result<(), String>;
 }
 
 // ============================================================================
@@ -27,6 +34,11 @@ pub trait AgentAccess: Send + Sync {
 
 pub trait SkillProvider: Send + Sync {
     fn skill_registry(&self) -> &Arc<SkillRegister>;
+    /// 创建或更新 SKILL.md 文件。
+    /// `content` 必须是完整的 SKILL.md 内容（YAML frontmatter + Markdown body）。
+    fn save_skill(&self, name: &str, content: &str) -> Result<(), String>;
+    /// 删除 Skill 目录（不可逆操作）。
+    fn delete_skill(&self, name: &str) -> Result<(), String>;
 }
 
 // ============================================================================
@@ -36,6 +48,33 @@ pub trait SkillProvider: Send + Sync {
 pub trait KnowledgeAccess: Send + Sync {
     fn user_id(&self) -> &str;
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager>;
+}
+
+// ============================================================================
+// McpServerInfo — MCP Server 摘要信息
+// ============================================================================
+
+/// MCP Server 摘要信息（供 list_mcp_servers 返回）。
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    pub transport: TransportType,
+    pub enabled: bool,
+    pub url: Option<String>,
+    pub command: Option<String>,
+}
+
+// ============================================================================
+// McpAccess — MCP 配置管理接口
+// ============================================================================
+
+pub trait McpAccess: Send + Sync {
+    /// 列出所有已配置的 MCP Server（摘要信息）。
+    fn list_mcp_servers(&self) -> Vec<McpServerInfo>;
+    /// 添加或更新一个 MCP Server 配置（单 server 粒度合并）。
+    fn add_mcp_server(&self, name: &str, config: McpServerConfig) -> Result<(), String>;
+    /// 从配置中移除指定的 MCP Server（不可逆）。
+    fn remove_mcp_server(&self, name: &str) -> Result<(), String>;
 }
 
 // ============================================================================
@@ -50,6 +89,10 @@ pub struct ToolDependencies {
     pub allowed_kbs: Vec<String>,
     /// Workflow 支持（Phase 2 新增）。Optional 以保持向后兼容性。
     pub workflow_access: Option<Arc<dyn WorkflowAccess>>,
+    /// MCP 配置管理支持。Optional 以保持向后兼容性。
+    pub mcp_access: Option<Arc<dyn McpAccess>>,
+    /// Workflow 持久化支持。Optional — None 时使用 NullWorkflowPersister。
+    pub workflow_persister: Option<Arc<dyn WorkflowPersister>>,
 }
 
 impl Clone for ToolDependencies {
@@ -60,6 +103,8 @@ impl Clone for ToolDependencies {
             knowledge_access: self.knowledge_access.clone(),
             allowed_kbs: self.allowed_kbs.clone(),
             workflow_access: self.workflow_access.clone(),
+            mcp_access: self.mcp_access.clone(),
+            workflow_persister: self.workflow_persister.clone(),
         }
     }
 }

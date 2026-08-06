@@ -13,7 +13,10 @@ use crate::skills::SkillRegister;
 use crate::workflow::{WorkflowAccess, WorkflowManager};
 
 use super::error::WorkspaceError;
-use crate::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolExecutor, ToolRegister};
+use crate::tools::{
+    AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, SkillProvider, ToolExecutor,
+    ToolRegister,
+};
 
 // ============================================================================
 // TemplateInitReport
@@ -221,6 +224,8 @@ impl WorkSpace {
     pub fn build_tool_executor(self: &Arc<Self>, tool_names: &[String]) -> Arc<dyn ToolExecutor> {
         let mut deps = self.agent_manager.build_deps();
         deps.workflow_access = Some(self.clone() as Arc<dyn WorkflowAccess>);
+        deps.mcp_access = Some(self.clone() as Arc<dyn McpAccess>);
+        // workflow_persister 由 peco-server 层注入；此处保持 None
         ToolRegister::build(tool_names, &deps)
     }
 
@@ -394,11 +399,38 @@ impl AgentAccess for WorkSpace {
             .save(name, content)
             .map_err(|e| e.to_string())
     }
+
+    fn read_agent(&self, name: &str) -> Result<String, String> {
+        let path = self.agent_manager.md_path(name);
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read agent '{name}': {e}"))
+    }
+
+    fn delete_agent(&self, name: &str) -> Result<(), String> {
+        if name == "@assistant" {
+            return Err(
+                "Cannot delete @assistant — it is the meta-agent managing this workspace."
+                    .to_string(),
+            );
+        }
+        self.agent_manager.delete(name).map_err(|e| e.to_string())
+    }
 }
 
 impl SkillProvider for WorkSpace {
     fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
+    }
+
+    fn save_skill(&self, name: &str, content: &str) -> Result<(), String> {
+        self.skill_registry
+            .save_skill(name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete_skill(&self, name: &str) -> Result<(), String> {
+        self.skill_registry
+            .delete_skill(name)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -421,10 +453,73 @@ impl WorkflowAccess for WorkSpace {
     fn list_workflow_names(&self) -> Vec<String> {
         self.workflow_manager.list_names()
     }
+    fn list_workflow_meta(&self) -> Vec<crate::workflow::WorkflowMeta> {
+        self.workflow_manager.list_meta()
+    }
     fn reload_workflow(
         &self,
         name: &str,
     ) -> Result<crate::workflow::WorkflowDefinition, crate::workflow::WorkflowError> {
         self.workflow_manager.reload(name)
+    }
+    fn save_workflow(&self, name: &str, content: &str) -> Result<(), String> {
+        match self.workflow_manager.create(name, content) {
+            Ok(_) => Ok(()),
+            Err(crate::workflow::WorkflowError::AlreadyExists(_)) => self
+                .workflow_manager
+                .update(name, content)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    fn delete_workflow(&self, name: &str) -> Result<(), String> {
+        self.workflow_manager
+            .delete(name)
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl McpAccess for WorkSpace {
+    fn list_mcp_servers(&self) -> Vec<McpServerInfo> {
+        let config = self.agent_manager.mcp_config_store().get();
+        config
+            .mcp_servers
+            .iter()
+            .map(|(name, srv)| McpServerInfo {
+                name: name.clone(),
+                transport: srv.transport.clone(),
+                enabled: srv.enabled,
+                url: srv.url.clone(),
+                command: srv.command.clone(),
+            })
+            .collect()
+    }
+
+    fn add_mcp_server(
+        &self,
+        name: &str,
+        server_config: crate::config::McpServerConfig,
+    ) -> Result<(), String> {
+        let name = name.to_string();
+        self.agent_manager
+            .mcp_config_store()
+            .atomic_update(&self.root, |config| {
+                config.mcp_servers.insert(name.clone(), server_config);
+                Ok(())
+            })
+            .map_err(|e| format!("Failed to save MCP server '{name}': {e}"))
+    }
+
+    fn remove_mcp_server(&self, name: &str) -> Result<(), String> {
+        let name = name.to_string();
+        self.agent_manager
+            .mcp_config_store()
+            .atomic_update(&self.root, |config| {
+                if config.mcp_servers.remove(&name).is_none() {
+                    return Err(format!("MCP server '{name}' not found"));
+                }
+                Ok(())
+            })
     }
 }

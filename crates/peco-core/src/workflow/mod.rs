@@ -33,4 +33,4 @@ pub use persistence::{
     NullWorkflowPersister, WorkflowPersister, WorkflowSnapshot, WorkflowSnapshotState,
 };
 pub use template::TemplateContext;
-pub use tools::ExecuteWorkflow;
+pub use tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};

@@ -505,6 +505,12 @@ mod tests {
         fn save_agent(&self, _name: &str, _content: &str) -> Result<(), String> {
             Err("not supported".into())
         }
+        fn read_agent(&self, _name: &str) -> Result<String, String> {
+            Err("not supported".into())
+        }
+        fn delete_agent(&self, _name: &str) -> Result<(), String> {
+            Err("not supported".into())
+        }
     }
 
     fn make_shell_step(id: &str, name: &str, command: &str, deps: Vec<&str>) -> WorkflowStep {

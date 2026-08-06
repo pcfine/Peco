@@ -351,6 +351,94 @@ impl SkillRegister {
         inner.activated.remove(name);
         debug!(name = %name, "Skill 已从缓存中移除");
     }
+
+    // ── 写操作 ─────────────────────────────────────────────────────────
+
+    /// 创建或更新一个 Skill，写入 SKILL.md 文件并刷新缓存。
+    ///
+    /// `content` 必须是完整的 SKILL.md 内容（YAML frontmatter + Markdown body）。
+    /// 内部流程：校验名称 → 解析 YAML → 校验一致性 → 原子写入 → 刷新缓存。
+    pub fn save_skill(&self, name: &str, content: &str) -> Result<(), SkillError> {
+        use super::config::{
+            parse_frontmatter, split_frontmatter, validate_description, validate_name,
+        };
+
+        // 1. 校验名称格式
+        validate_name(name).map_err(|reason| SkillError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+
+        // 2. 解析 frontmatter 并校验
+        let (frontmatter_str, _body) =
+            split_frontmatter(content).map_err(|reason| SkillError::InvalidFrontmatter {
+                path: PathBuf::from(name),
+                reason,
+            })?;
+        let fm = parse_frontmatter(frontmatter_str).map_err(|reason| {
+            SkillError::InvalidFrontmatter {
+                path: PathBuf::from(name),
+                reason,
+            }
+        })?;
+
+        // 3. 名称一致性检查
+        if fm.name != name {
+            return Err(SkillError::NameMismatch {
+                dir: name.to_string(),
+                name: fm.name,
+            });
+        }
+
+        // 4. 描述字段校验
+        validate_description(&fm.description).map_err(|reason| SkillError::InvalidFrontmatter {
+            path: PathBuf::from(name),
+            reason,
+        })?;
+
+        // 5. 原子写入文件（先写临时文件再重命名）
+        let skills_root = {
+            let inner = self.inner.read().expect("RwLock poisoned");
+            inner.loader.skills_root.clone()
+        };
+        let dir = skills_root.join(name);
+        std::fs::create_dir_all(&dir).map_err(|source| SkillError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let md_path = dir.join(super::config::SKILL_MD_FILENAME);
+        let tmp_path = dir.join(format!(".{}.tmp", super::config::SKILL_MD_FILENAME));
+        std::fs::write(&tmp_path, content).map_err(|source| SkillError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp_path, &md_path).map_err(|source| SkillError::Io {
+            path: md_path.clone(),
+            source,
+        })?;
+
+        // 6. 刷新缓存
+        self.refresh_one(name);
+
+        info!(name = %name, "Skill 已保存");
+        Ok(())
+    }
+
+    /// 删除 Skill 目录并清除缓存（不可逆操作）。
+    pub fn delete_skill(&self, name: &str) -> Result<(), SkillError> {
+        let skills_root = {
+            let inner = self.inner.read().expect("RwLock poisoned");
+            inner.loader.skills_root.clone()
+        };
+        let dir = skills_root.join(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|source| SkillError::Io { path: dir, source })?;
+        }
+
+        self.remove_one(name);
+        info!(name = %name, "Skill 已删除");
+        Ok(())
+    }
 }
 
 // ── Integration tests ────────────────────────────────────────────────────────

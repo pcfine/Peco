@@ -58,6 +58,41 @@ impl McpConfigStore {
             .clone()
     }
 
+    /// 原子更新 MCP 配置。
+    ///
+    /// 获取写锁，调用 `f` 修改配置、校验结果、通过临时文件重命名原子写入磁盘，
+    /// 然后直接更新内存中的配置。整个操作在写锁保护下完成，消除 TOCTOU 竞态。
+    ///
+    /// 与先 `get()` 克隆、再修改、再 `write()` + `reload()` 的分步方式不同，
+    /// 此方法保证原子性且不需要回退配置。写入失败时内存状态保持不变。
+    pub fn atomic_update<F>(&self, workspace_root: &Path, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut McpConfig) -> Result<(), String>,
+    {
+        let mut guard = self.config.write().expect("McpConfigStore RwLock poisoned");
+
+        // 1. 应用变更
+        f(&mut guard)?;
+
+        // 2. 校验完整配置
+        guard
+            .validate()
+            .map_err(|e| format!("Invalid MCP config: {e}"))?;
+
+        // 3. 原子写入磁盘（先写临时文件再重命名）
+        let path = workspace_root.join("mcpconfig.json");
+        let tmp_path = workspace_root.join(".mcpconfig.json.tmp");
+        let json = serde_json::to_string_pretty(&*guard)
+            .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
+        std::fs::write(&tmp_path, &json).map_err(|e| format!("Failed to write MCP config: {e}"))?;
+        std::fs::rename(&tmp_path, &path)
+            .map_err(|e| format!("Failed to commit MCP config: {e}"))?;
+
+        let count = guard.mcp_servers.len();
+        info!(servers = count, "MCP 配置已原子更新");
+        Ok(())
+    }
+
     /// 从工作空间根目录重新加载 MCP 配置。
     ///
     /// 读取 `{workspace_root}/mcpconfig.json`。若用户级文件不存在或解析失败，

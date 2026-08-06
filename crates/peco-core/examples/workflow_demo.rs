@@ -448,11 +448,28 @@ async fn demo_execute_workflow_tool() {
         fn list_workflow_names(&self) -> Vec<String> {
             self.defs.keys().cloned().collect()
         }
+        fn list_workflow_meta(&self) -> Vec<peco_core::workflow::WorkflowMeta> {
+            self.defs
+                .iter()
+                .map(|(name, def)| peco_core::workflow::WorkflowMeta {
+                    name: name.clone(),
+                    description: def.description.clone(),
+                    version: def.version.clone(),
+                    step_count: def.steps.len(),
+                })
+                .collect()
+        }
         fn reload_workflow(
             &self,
             name: &str,
         ) -> Result<WorkflowDefinition, peco_core::workflow::WorkflowError> {
             self.load_workflow(name)
+        }
+        fn save_workflow(&self, _name: &str, _content: &str) -> Result<(), String> {
+            Err("save_workflow not supported in stub".to_string())
+        }
+        fn delete_workflow(&self, _name: &str) -> Result<(), String> {
+            Err("delete_workflow not supported in stub".to_string())
         }
     }
 
@@ -680,7 +697,13 @@ impl AgentAccess for NoopAgentAccess {
         vec![]
     }
     fn save_agent(&self, _name: &str, _content: &str) -> Result<(), String> {
-        Ok(())
+        Err("noop".into())
+    }
+    fn read_agent(&self, _name: &str) -> Result<String, String> {
+        Err("noop".into())
+    }
+    fn delete_agent(&self, _name: &str) -> Result<(), String> {
+        Err("noop".into())
     }
 }
 
