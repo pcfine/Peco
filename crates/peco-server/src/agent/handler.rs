@@ -17,6 +17,7 @@ use crate::auth::AuthUser;
 use crate::db::agents::{self, AgentRow, CreateAgentParams, UpdateAgentParams};
 use crate::error::ApiError;
 use crate::state::AppState;
+use tracing::{info, warn};
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
 
@@ -296,6 +297,7 @@ pub async fn list(
             created_at: r.created_at.clone(),
         });
     }
+    info!(user_id = %user_id, count = items.len(), "Agents listed");
     Ok(Json(items))
 }
 
@@ -390,7 +392,7 @@ pub async fn create(
     let _ =
         crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "agents", &agents_hash).await;
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         agent_id = %agent_id,
         agent_name = %name,
@@ -478,9 +480,9 @@ pub async fn get(
     let (profile, body) = agent_config::parse_agent_md(&content)
         .map_err(|e| ApiError::Internal(format!("agent.md parse error: {e}")))?;
 
-    Ok(Json(agent_detail_from_profile(
-        &agent_id, &db_row, &profile, &body,
-    )))
+    let detail = agent_detail_from_profile(&agent_id, &db_row, &profile, &body);
+    info!(user_id = %user_id, agent_id = %agent_id, name = %db_row.name, "Agent fetched");
+    Ok(Json(detail))
 }
 
 /// `PATCH /api/agents/:id`
@@ -578,7 +580,7 @@ pub async fn update(
     let _ =
         crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "agents", &agents_hash).await;
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         agent_id = %agent_id,
         old_name = %existing.name,
@@ -653,7 +655,7 @@ pub async fn delete(
         .get_synced(&user_id, &state.db)
         .await?;
     if let Err(e) = ws.agent_manager().delete(&existing.name) {
-        tracing::warn!(error = %e, agent = %existing.name, "Failed to delete agent files");
+        warn!(error = %e, agent = %existing.name, "Failed to delete agent files");
     }
 
     // 更新 agents 模块哈希
@@ -666,7 +668,7 @@ pub async fn delete(
         crate::upload::cleanup_uploaded_file(&state.data_dir, &existing.icon);
     }
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         agent_id = %agent_id,
         agent_name = %existing.name,

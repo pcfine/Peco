@@ -16,6 +16,7 @@ use serde_json::json;
 use super::deps::KnowledgeAccess;
 
 use super::{StringError, ToolDyn, ToolError};
+use tracing::{info, warn};
 
 fn string_err(msg: impl ToString) -> ToolError {
     ToolError::ToolCallError(Box::new(StringError(msg.to_string())))
@@ -291,6 +292,7 @@ impl ToolDyn for AddToKnowledgeBase {
                 .await
                 .map_err(string_err)?;
 
+            info!(kb = %parsed.kb_name, title = %parsed.title, doc_id = %doc.id, "Document added via tool");
             Ok(format!("已添加文档: {} (id: {})", doc.title, doc.id))
         })
     }
@@ -351,6 +353,7 @@ impl ToolDyn for SyncKnowledgeBase {
             if let Some(name) = parsed.kb_name {
                 check_kb_access(&self.allowed_kbs, &name)?;
                 let report = km.sync_kb(&name).await.map_err(string_err)?;
+                info!(kb = %name, added = report.added, updated = report.updated, removed = report.removed, "KB synced via tool");
                 Ok(format!(
                     "知识库 '{}' 同步完成:\n- 新增: {} 个文件\n- 更新: {} 个文件\n- 删除: {} 个文件\n- 跳过: {} 个文件\n- 耗时: {}ms",
                     report.kb_name,
@@ -368,7 +371,7 @@ impl ToolDyn for SyncKnowledgeBase {
                     match km.sync_kb(kb_name).await {
                         Ok(report) => reports.push((kb_name.clone(), report)),
                         Err(e) => {
-                            tracing::warn!(kb = %kb_name, error = %e, "同步失败");
+                            warn!(kb = %kb_name, error = %e, "同步失败");
                             errors.push((kb_name.clone(), e.to_string()));
                         }
                     }
@@ -389,6 +392,7 @@ impl ToolDyn for SyncKnowledgeBase {
                         lines.push(format!("  '{}': {err}", name));
                     }
                 }
+                info!(kb_count = self.allowed_kbs.len(), synced = reports.len(), failed = errors.len(), "All KBs synced via tool");
                 Ok(format!("知识库同步完成:\n{}", lines.join("\n")))
             }
         })
@@ -589,6 +593,7 @@ impl ToolDyn for AddFactsToKnowledgeBase {
                 .await
                 .map_err(string_err)?;
 
+            info!(kb = %parsed.kb_name, fact_count = stored.len(), "Facts added via tool");
             Ok(format!("已添加 {} 条事实到知识库", stored.len()))
         })
     }

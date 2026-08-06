@@ -18,6 +18,7 @@ use crate::auth::AuthUser;
 use crate::db::{documents, knowledge_bases};
 use crate::error::ApiError;
 use crate::state::AppState;
+use tracing::{error, info, warn};
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
 
@@ -213,6 +214,7 @@ pub async fn list_knowledge_bases(
         });
     }
 
+    info!(user_id = %user_id, count = responses.len(), "Knowledge bases listed");
     Ok(Json(responses))
 }
 
@@ -286,7 +288,7 @@ pub async fn create_knowledge_base(
         updated_at: String::new(),
     };
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         kb_id = %response.id,
         name = %response.name,
@@ -320,6 +322,7 @@ pub async fn get_knowledge_base(
         Err(_) => (0, 0),
     };
 
+    info!(user_id = %user_id, kb_id = %kb_id, name = %row.name, "Knowledge base fetched");
     Ok(Json(KnowledgeBaseResponse {
         id: row.id,
         name: row.name,
@@ -361,14 +364,14 @@ pub async fn delete_knowledge_base(
     if let Ok(km) = get_user_km(&state, &user_id)
         && let Err(e) = km.delete_kb(&kb_name).await
     {
-        tracing::warn!(
+        warn!(
             kb_name = %kb_name,
             error = %e,
             "KnowledgeBaseManager failed to delete KB data (may already be removed)"
         );
     }
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         kb_id = %kb_id,
         kb_name = %kb_name,
@@ -415,6 +418,7 @@ pub async fn list_documents(
         })
         .collect();
 
+    info!(user_id = %user_id, kb_id = %kb_id, count = responses.len(), "Documents listed");
     Ok(Json(responses))
 }
 
@@ -514,7 +518,7 @@ pub async fn upload_document(
                 Ok(_report) => {
                     let _ =
                         documents::update_status(&db_for_bg, &doc_id_for_bg, "ready", None).await;
-                    tracing::info!(
+                    info!(
                         doc_id = %doc_id_for_bg,
                         kb = %kb_name_for_bg,
                         "Document processed successfully"
@@ -528,7 +532,7 @@ pub async fn upload_document(
                         Some(&e.to_string()),
                     )
                     .await;
-                    tracing::error!(
+                    error!(
                         doc_id = %doc_id_for_bg,
                         kb = %kb_name_for_bg,
                         error = %e,
@@ -583,6 +587,7 @@ pub async fn sync_knowledge_base(
     // 更新 KB 时间戳
     let _ = knowledge_bases::touch(&state.db, &kb_id).await;
 
+    info!(user_id = %user_id, kb_id = %kb_id, name = %row.name, added = report.added, updated = report.updated, "Knowledge base synced");
     Ok(Json(SyncResponse {
         kb_name: report.kb_name,
         added: report.added,
@@ -627,7 +632,7 @@ pub async fn delete_document(
     // 从 SQLite 删除
     documents::delete(&state.db, &doc_id).await?;
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         kb_id = %kb_id,
         doc_id = %doc_id,

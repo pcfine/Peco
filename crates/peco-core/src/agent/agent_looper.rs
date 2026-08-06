@@ -29,6 +29,7 @@ use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
 use crate::session::{AnnotatedMessage, MessageSource, Session, SessionState};
 use crate::utils::intercom::{Listener, Speaker, make_async_intercom_pair};
+use tracing::{debug, error, info, warn};
 
 // ============================================================================
 // 纯标记状态枚举（不携带数据）
@@ -384,7 +385,7 @@ impl Drop for OwnedTask {
             // 设置取消标志作为安全网：若 looper 仍在运行，会在下个循环迭代中正常退出。
             // looper 可能已通过 shutdown()/wait() 正常结束，此时 cancel_flag 无实际作用。
             self.cancel_flag.store(true, Ordering::Release);
-            tracing::debug!(
+            debug!(
                 "LooperHandle dropped (last reference). \
                  Cancel flag set as safety net for any still-running looper."
             );
@@ -805,6 +806,15 @@ impl AgentLooper {
             persister,
         );
 
+        let agent_name = looper.agent.config().agent.name.clone();
+        let session_id = looper.session.id().to_owned();
+
+        debug!(
+            agent = %agent_name,
+            session_id = %session_id,
+            "AgentLooper spawned"
+        );
+
         let handle = tokio::spawn(async move { looper.run(user_listener).await });
 
         let task_handle = OwnedTask::new(handle, cancel_flag.clone());
@@ -1017,6 +1027,13 @@ impl AgentLooper {
         &mut self,
         mut user_listener: Listener<UserMsg>,
     ) -> Result<ModelResponse, AgentError> {
+        info!(
+            agent = %self.agent.config().agent.name,
+            session_id = %self.session.id(),
+            max_turns = self.max_turns,
+            "AgentLooper::run() started"
+        );
+
         // Ensure deferred MCP connections are established before first tool use.
         self.agent.mcp_manager().ensure_connected().await;
 
@@ -1060,7 +1077,7 @@ impl AgentLooper {
                 match user_listener.recv().await {
                     Some(UserMsg::Query(text)) => {
                         // 暂停期间收到的输入放入 pending 队列
-                        tracing::info!(
+                        info!(
                             "Message queued (looper paused). Will process after resume."
                         );
                         self.session.enqueue_pending(text);
@@ -1131,6 +1148,16 @@ impl AgentLooper {
             .as_ref()
             .map(|r| format!("{:?}", r))
             .unwrap_or_else(|| "done".to_string());
+
+        info!(
+            agent = %self.agent.config().agent.name,
+            session_id = %self.session.id(),
+            reason = %shutdown_reason,
+            total_turns = turns,
+            total_tokens = usage.total_tokens,
+            "AgentLooper::run() finished"
+        );
+
         Self::emit_event_guaranteed(
             &self.event_speaker,
             LooperEvent::Shutdown {
@@ -1179,7 +1206,7 @@ impl AgentLooper {
             }
             SessionState::Active => {
                 // InnerLoop 进行中 — 放入 pending 队列
-                tracing::info!("Message queued. Will process after current turn.");
+                info!("Message queued. Will process after current turn.");
                 self.session.enqueue_pending(text);
             }
             _ => {
@@ -1242,7 +1269,7 @@ impl AgentLooper {
                 let _token = match self.session.commit_turn() {
                     Ok(token) => token,
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to commit turn");
+                        error!(error = %e, "Failed to commit turn");
                         self.react_state = ReActState::Failed;
                         return;
                     }
@@ -1283,7 +1310,7 @@ impl AgentLooper {
                     )
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to persist session after turn commit");
+                    error!(error = %e, "Failed to persist session after turn commit");
                 }
 
                 // 检查是否有 pending 输入自动续接
@@ -1307,7 +1334,7 @@ impl AgentLooper {
                         .await;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to dequeue pending input");
+                        error!(error = %e, "Failed to dequeue pending input");
                         self.react_state = ReActState::Failed;
                     }
                 }
@@ -1325,7 +1352,7 @@ impl AgentLooper {
 
                 // 回滚当前 turn
                 if let Err(e) = self.session.rollback_turn(false) {
-                    tracing::error!(error = %e, "Failed to rollback turn");
+                    error!(error = %e, "Failed to rollback turn");
                 }
 
                 // Emit TurnComplete + hook
@@ -1369,14 +1396,14 @@ impl AgentLooper {
                         .await;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to dequeue pending input");
+                        error!(error = %e, "Failed to dequeue pending input");
                         self.react_state = ReActState::Failed;
                     }
                 }
             }
 
             ReActState::AwaitingModel => {
-                tracing::warn!("Unexpected AwaitingModel state in react_step");
+                warn!("Unexpected AwaitingModel state in react_step");
                 self.react_state = ReActState::Failed;
             }
         }
@@ -1481,7 +1508,7 @@ impl AgentLooper {
                     self.react_state = ReActState::Streaming;
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "Streaming chat request failed");
+                    error!(error = %e, "Streaming chat request failed");
                     self.failure_reason = Some(TurnFailureReason::Other(format!(
                         "Streaming request failed: {e}"
                     )));
@@ -1496,7 +1523,7 @@ impl AgentLooper {
                     self.react_state = ReActState::ResolvingResponse;
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "Batch chat request failed");
+                    error!(error = %e, "Batch chat request failed");
                     self.failure_reason = Some(TurnFailureReason::Other(format!(
                         "Chat request failed: {e}"
                     )));
@@ -1513,7 +1540,7 @@ impl AgentLooper {
         let response = match self.react_ctx.batch_response.take() {
             Some(r) => r,
             None => {
-                tracing::error!("No batch_response in ResolvingResponse state");
+                error!("No batch_response in ResolvingResponse state");
                 self.react_state = ReActState::Failed;
                 return;
             }
@@ -1540,7 +1567,7 @@ impl AgentLooper {
                 reasoning_content.clone().unwrap_or_default(),
             ),
             _ => {
-                tracing::warn!("Expected Assistant message, got something else");
+                warn!("Expected Assistant message, got something else");
                 (String::new(), None, String::new())
             }
         };
@@ -1588,7 +1615,7 @@ impl AgentLooper {
         let stream = match &mut self.active_stream {
             Some(s) => s,
             None => {
-                tracing::error!("No active stream in Streaming state");
+                error!("No active stream in Streaming state");
                 self.react_state = ReActState::Failed;
                 return;
             }
@@ -1717,7 +1744,7 @@ impl AgentLooper {
             }
 
             Some(Err(e)) => {
-                tracing::error!(error = %e, "Stream error");
+                error!(error = %e, "Stream error");
                 self.failure_reason = Some(TurnFailureReason::Other(format!("Stream error: {e}")));
                 self.react_state = ReActState::Failed;
             }
@@ -1944,7 +1971,7 @@ impl AgentLooper {
                             .await;
                         }
                         Some(Err(join_error)) => {
-                            tracing::error!(
+                            error!(
                                 error = %join_error,
                                 "Tool execution task panicked; continuing with remaining tools"
                             );
@@ -1966,7 +1993,7 @@ impl AgentLooper {
 
             // Task panic
             Ok(Some(Err(join_error))) => {
-                tracing::error!(
+                error!(
                     error = %join_error,
                     "Tool execution task panicked; continuing with remaining tools"
                 );

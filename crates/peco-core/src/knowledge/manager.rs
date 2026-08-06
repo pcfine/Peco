@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::config::KnowledgeConfig;
 use super::error::KnowledgeModuleError;
@@ -87,7 +87,9 @@ impl KnowledgeManager {
         drop(guard);
         // 允许重新触发 auto_sync
         self.auto_sync_done.store(false, Ordering::SeqCst);
-        self.ensure_loaded().await
+        self.ensure_loaded().await?;
+        info!("KnowledgeManager reloaded");
+        Ok(())
     }
 
     /// 如配置了 `auto_sync_on_start`，执行一次自动同步（仅首次调用生效）。
@@ -110,7 +112,7 @@ impl KnowledgeManager {
         for name in &names {
             match self.sync_kb_impl(name).await {
                 Ok(report) => total_changes += report.total_changes(),
-                Err(e) => tracing::warn!(kb = %name, error = %e, "auto_sync 失败"),
+                Err(e) => warn!(kb = %name, error = %e, "auto_sync 失败"),
             }
         }
 
@@ -267,7 +269,9 @@ impl KnowledgeManager {
             .await
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
-        Ok(kb.add_text(title, content, source).await?)
+        let doc = kb.add_text(title, content, source).await?;
+        info!(kb = %kb_name, title = %title, doc_id = %doc.id, "Text added to knowledge base");
+        Ok(doc)
     }
 
     /// 按指定存储模式添加文本到知识库。
@@ -289,7 +293,9 @@ impl KnowledgeManager {
             .await
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
-        Ok(kb.add_text_with_mode(title, content, source, mode).await?)
+        let doc = kb.add_text_with_mode(title, content, source, mode).await?;
+        info!(kb = %kb_name, title = %title, doc_id = %doc.id, mode = ?mode, "Text added to knowledge base (with mode)");
+        Ok(doc)
     }
 
     // ── 图谱操作 ────────────────────────────────────────────────────────────
@@ -311,7 +317,9 @@ impl KnowledgeManager {
             .await
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
-        Ok(kb.add_facts(facts, index_text).await?)
+        let result = kb.add_facts(facts, index_text).await?;
+        info!(kb = %kb_name, fact_count = facts.len(), index_text, "Facts added to knowledge base");
+        Ok(result)
     }
 
     /// 添加实体到知识图谱。
@@ -330,7 +338,9 @@ impl KnowledgeManager {
             .await
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
-        Ok(kb.add_entities(entities).await?)
+        kb.add_entities(entities).await?;
+        info!(kb = %kb_name, entity_count = entities.len(), "Entities added to knowledge base");
+        Ok(())
     }
 
     /// 查询实体相关事实。
@@ -485,7 +495,7 @@ impl KnowledgeManager {
         for name in names {
             match self.sync_kb_impl(&name).await {
                 Ok(report) => results.push((name, report)),
-                Err(e) => tracing::warn!(kb = %name, error = %e, "同步失败，跳过"),
+                Err(e) => warn!(kb = %name, error = %e, "同步失败，跳过"),
             }
         }
 
@@ -521,7 +531,7 @@ impl KnowledgeManager {
                 );
                 // 删除旧数据（失败不阻塞，记录警告）
                 if let Err(e) = kb.remove_document(&entry.doc_id).await {
-                    tracing::warn!(
+                    warn!(
                         kb = %kb_name,
                         doc_id = %entry.doc_id,
                         error = %e,

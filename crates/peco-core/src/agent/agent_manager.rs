@@ -141,7 +141,10 @@ impl AgentManager {
     /// 不清除 Tier-2 缓存 — 已加载的 Agent 实例（含 MCP 连接）不受影响。
     /// 返回重新发现的 Agent 数量。
     pub fn rescan(&self) -> Result<usize, AgentError> {
-        self.init()
+        info!("AgentManager rescanning for agents");
+        let count = self.init()?;
+        info!(count, "AgentManager rescan complete");
+        Ok(count)
     }
 
     // ── Agent 加载 ───────────────────────────────────────────────────

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
+use tracing::info;
 
 #[derive(Debug, Serialize)]
 pub struct SkillInfo {
@@ -44,6 +45,7 @@ pub async fn list(
             description: m.description,
         })
         .collect();
+    info!(user_id = %user_id, count = skills.len(), "Skills listed");
     Ok(Json(skills))
 }
 
@@ -62,6 +64,7 @@ pub async fn get(
     }
     let content = std::fs::read_to_string(&skill_md)
         .map_err(|e| ApiError::Internal(format!("failed to read SKILL.md: {e}")))?;
+    info!(user_id = %user_id, name = %name, "Skill fetched");
     Ok(Json(
         serde_json::json!({ "name": name, "content": content }),
     ))
@@ -91,6 +94,7 @@ pub async fn upsert(
     let _ =
         crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "skills", &skills_hash).await;
 
+    info!(user_id = %user_id, name = %name, "Skill created/updated");
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' saved")),
@@ -120,6 +124,7 @@ pub async fn delete_skill(
     let _ =
         crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "skills", &skills_hash).await;
 
+    info!(user_id = %user_id, name = %name, "Skill deleted");
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' deleted")),
@@ -142,6 +147,7 @@ pub async fn export_skill(
     // Simple: return SKILL.md content as download
     let content = std::fs::read_to_string(skill_dir.join("SKILL.md"))
         .map_err(|e| ApiError::Internal(format!("failed to read SKILL.md: {e}")))?;
+    info!(user_id = %user_id, name = %name, "Skill exported");
     Ok(content.into_bytes())
 }
 
@@ -170,6 +176,7 @@ pub async fn import_skill(
     let _ =
         crate::db::workspace_hashes::upsert_hash(&state.db, &user_id, "skills", &skills_hash).await;
 
+    info!(user_id = %user_id, name = %name, "Skill imported");
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' imported")),

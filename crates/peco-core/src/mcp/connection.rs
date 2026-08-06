@@ -21,6 +21,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use tokio::process::Command;
 
 use crate::config::resolve_env_vars;
+use tracing::info;
 
 // ── Transport factories ────────────────────────────────────────────────────────
 
@@ -58,6 +59,9 @@ pub(crate) fn make_stdio_transport(
 
     TokioChildProcess::new(cmd)
         .with_context(|| format!("Failed to create stdio transport for MCP server '{name}'"))
+        .inspect(|_| {
+            info!(server = name, transport = "stdio", "MCP transport created");
+        })
 }
 
 /// Build a [`StreamableHttpClientTransport`] for an HTTP/SSE MCP server.
@@ -93,7 +97,7 @@ pub(crate) fn make_http_transport(
     }
 
     if !custom_headers.is_empty() {
-        tracing::info!(
+        info!(
             server = name,
             header_count = custom_headers.len(),
             "Configuring custom headers for MCP HTTP transport"
@@ -103,9 +107,11 @@ pub(crate) fn make_http_transport(
     let transport_config = StreamableHttpClientTransportConfig::with_uri(resolved_url.clone())
         .custom_headers(custom_headers);
 
-    Ok(rmcp::transport::StreamableHttpClientTransport::from_config(
+    let transport = rmcp::transport::StreamableHttpClientTransport::from_config(
         transport_config,
-    ))
+    );
+    info!(server = name, transport = "http", url = %resolved_url, "MCP transport created");
+    Ok(transport)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
