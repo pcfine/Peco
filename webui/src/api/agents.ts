@@ -7,8 +7,10 @@ import type {
 } from "@/types/agent";
 import type { SuccessResponse } from "@/types/common";
 
-export async function listAgents(): Promise<AgentListItem[]> {
-  const res = await api.get<AgentListItem[]>("/agents");
+export async function listAgents(
+  signal?: AbortSignal,
+): Promise<AgentListItem[]> {
+  const res = await api.get<AgentListItem[]>("/agents", { signal });
   return res.data;
 }
 

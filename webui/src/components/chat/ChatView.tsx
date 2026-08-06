@@ -83,6 +83,10 @@ export function ChatView({
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
 
+  // StrictMode-safe unmount timer: setTimeout in cleanup is cleared on remount,
+  // so abort only fires for genuine unmounts, not StrictMode double-invocation.
+  const unmountTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
   // Refs for callback props — eliminate dependency churn
   const streamUrlRef = useRef(streamUrl);
   streamUrlRef.current = streamUrl;
@@ -231,20 +235,29 @@ export function ChatView({
 
   useEffect(() => {
     if (visible) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      messagesEndRef.current?.scrollIntoView({ behavior: "instant" });
     }
   }, [messages, visible]);
 
   // ── Cleanup on unmount ─────────────────────────────────────────────────
 
-  // React 18 silently drops state updates on unmounted components, so we
-  // intentionally do NOT abort the SSE stream here.  Aborting in the cleanup
-  // would interact poorly with React StrictMode (which fires cleanups between
-  // the two effect passes), killing the initialQuery auto-send.  The browser
-  // will GC the ReadableStream when the component unmounts.
+  // When the component unmounts, abort the SSE stream so the browser releases
+  // the TCP connection and the server-side AgentLooper is cancelled.
+  //
+  // We delay abort via setTimeout(0) so React StrictMode double-invocation
+  // (mount → unmount → remount, synchronous in dev) can cancel it: the remount
+  // effect clears the timer before the macrotask fires. For a genuine unmount
+  // there is no follow-up remount, so the timer fires and the stream is killed.
   useEffect(() => {
+    // Mount: cancel any pending abort from a StrictMode unmount cycle
+    if (unmountTimerRef.current) {
+      clearTimeout(unmountTimerRef.current);
+      unmountTimerRef.current = undefined;
+    }
     return () => {
-      // no-op: React 18 drops state updates after unmount
+      unmountTimerRef.current = setTimeout(() => {
+        abortRef.current?.abort();
+      }, 0);
     };
   }, []);
 

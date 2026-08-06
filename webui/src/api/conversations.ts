@@ -16,9 +16,13 @@ function chatBase(agentId: string) {
 export async function listConversations(
   agentId: string,
   status?: string,
+  signal?: AbortSignal,
 ): Promise<Conversation[]> {
   const params = status ? { status } : {};
-  const res = await api.get<Conversation[]>(chatBase(agentId), { params });
+  const res = await api.get<Conversation[]>(chatBase(agentId), {
+    params,
+    signal,
+  });
   return res.data;
 }
 

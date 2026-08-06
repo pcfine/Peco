@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -14,13 +14,21 @@ export function AgentListPage() {
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const load = () => {
+    // Cancel any previous in-flight request
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setError(null);
     setLoading(true);
-    listAgents()
+    listAgents(controller.signal)
       .then(setAgents)
       .catch(() => {
+        // Ignore cancelled requests (unmount or superseded)
+        if (controller.signal.aborted) return;
         setError("加载 Agent 列表失败，请检查网络连接后重试");
         toast.error("加载 Agent 列表失败");
       })
@@ -29,6 +37,9 @@ export function AgentListPage() {
 
   useEffect(() => {
     load();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, []);
 
   const handleDelete = async (id: string) => {

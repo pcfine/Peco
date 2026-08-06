@@ -88,6 +88,9 @@ export function AgentChatPage() {
   // Track which convId came from StartChatPage (for initialQuery targeting)
   const newFromStartRef = useRef<string | null>(null);
 
+  // AbortController for conversation list loading — cancelled on unmount
+  const convListAbortRef = useRef<AbortController | null>(null);
+
   // ── Read initialQuery from navigation state ────────────────────────────
 
   useEffect(() => {
@@ -148,12 +151,19 @@ export function AgentChatPage() {
 
   const loadConversations = useCallback(async () => {
     if (!agentId) return;
+    // Cancel any previous in-flight request before starting a new one
+    convListAbortRef.current?.abort();
+    const controller = new AbortController();
+    convListAbortRef.current = controller;
+
     setConvListLoading(true);
     setConvListError(null);
     try {
-      const active = await listConversations(agentId, "active");
+      const active = await listConversations(agentId, "active", controller.signal);
       setConversations(active);
     } catch {
+      // Ignore cancelled requests (unmount or superseded by a new call)
+      if (controller.signal.aborted) return;
       setConvListError("加载对话列表失败");
     } finally {
       setConvListLoading(false);
@@ -162,6 +172,9 @@ export function AgentChatPage() {
 
   useEffect(() => {
     loadConversations();
+    return () => {
+      convListAbortRef.current?.abort();
+    };
   }, [loadConversations]);
 
   // ── Load initial snapshot and setup pool ───────────────────────────────
