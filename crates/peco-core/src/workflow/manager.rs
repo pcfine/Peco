@@ -206,10 +206,46 @@ impl WorkflowManager {
         Ok(def)
     }
 
-    /// 强制从磁盘重新加载指定 Workflow（缓存失效）。
+    /// 强制从磁盘重新加载指定 Workflow（Tier-1 元数据更新 + Tier-2 缓存失效）。
     pub fn reload(&self, name: &str) -> Result<WorkflowDefinition, WorkflowError> {
-        self.invalidate(name);
+        self.refresh_one(name);
         self.load(name)
+    }
+
+    /// 刷新单个 Workflow 的缓存（Tier-2 失效 + Tier-1 元数据更新）。
+    ///
+    /// 从磁盘重新解析 workflow.md 的 frontmatter 并更新 Tier-1 元数据。
+    /// 同时使 Tier-2 缓存失效，确保下次 [`load`](Self::load) 从磁盘重新读取完整定义。
+    ///
+    /// 如果 workflow.md 文件在磁盘上已不存在（如被外部删除），
+    /// 则从 Tier-1 和 Tier-2 两级缓存中移除该 Workflow。
+    ///
+    /// 若解析失败（YAML 损坏），保留过时的 Tier-1 元数据并记录 warning —
+    /// 与 `crate::agent::agent_manager::AgentManager::refresh_one` 行为一致.
+    pub fn refresh_one(&self, name: &str) {
+        self.invalidate(name);
+
+        let md_path = self.workflows_dir.join(name).join("workflow.md");
+        if md_path.exists() {
+            match Self::parse_meta(&md_path) {
+                Ok(meta) => {
+                    if let Ok(mut metas) = self.metas.write() {
+                        metas.insert(name.to_string(), meta);
+                    }
+                    debug!(workflow = %name, "Workflow metadata refreshed from disk");
+                }
+                Err(e) => {
+                    warn!(workflow = %name, error = %e,
+                        "Failed to parse workflow metadata, keeping stale cache");
+                }
+            }
+        } else {
+            // workflow.md 已被外部删除 — 从两级缓存中清理
+            if let Ok(mut metas) = self.metas.write() {
+                metas.remove(name);
+            }
+            debug!(workflow = %name, "Workflow removed from caches (file gone)");
+        }
     }
 
     // ── 缓存管理 ────────────────────────────────────────────────────
@@ -524,41 +560,122 @@ mod tests {
     }
 
     #[test]
-    fn test_reload_invalidates_cache() {
+    fn test_load_workflow_with_steps() {
         let (_tmp, wf_dir) = setup_test_dir();
-        create_workflow_file(&wf_dir, "test-wf", "Original", "1.0");
-
-        let manager = WorkflowManager::new(wf_dir.clone());
-        manager.init().unwrap();
-
-        let def1 = manager.load("test-wf").unwrap();
-        assert_eq!(def1.description, "Original");
-
-        // Modify the file on disk
-        create_workflow_file(&wf_dir, "test-wf", "Updated", "2.0");
-
-        // Reload should pick up the change
-        let def2 = manager.reload("test-wf").unwrap();
-        assert_eq!(def2.description, "Updated");
-    }
-
-    #[tokio::test]
-    async fn test_execute_loads_and_spawns() {
-        let (_tmp, wf_dir) = setup_test_dir();
-        // Create a simple shell workflow
-        let wf_dir_inner = wf_dir.join("echo-wf");
+        let wf_dir_inner = wf_dir.join("multi-step-wf");
         std::fs::create_dir_all(&wf_dir_inner).unwrap();
-        let content = "---\nworkflow:\n  name: \"echo-wf\"\n  description: \"Echo test\"\n  version: \"1.0\"\n  steps:\n    - id: \"A\"\n      name: \"Echo\"\n      type: shell\n      config:\n        command: \"echo hello\"\n---\n";
+        let content = "---\nworkflow:\n  name: \"multi-step-wf\"\n  description: \"Multi-step\"\n  version: \"1.0\"\n  steps:\n    - id: \"lint\"\n      name: \"Lint\"\n      type: shell\n      config:\n        command: \"cargo clippy\"\n    - id: \"review\"\n      name: \"Review\"\n      type: agent\n      config:\n        agent: \"@reviewer\"\n        prompt: \"review code\"\n---\n";
         std::fs::write(wf_dir_inner.join("workflow.md"), content).unwrap();
 
         let manager = WorkflowManager::new(wf_dir);
         manager.init().unwrap();
 
-        // Verify the definition loads and has correct step config
-        let def = manager.load("echo-wf").unwrap();
-        assert_eq!(def.name, "echo-wf");
-        assert_eq!(def.steps.len(), 1);
-        assert_eq!(def.steps[0].id, "A");
+        let def = manager.load("multi-step-wf").unwrap();
+        assert_eq!(def.name, "multi-step-wf");
+        assert_eq!(def.description, "Multi-step");
+        assert_eq!(def.steps.len(), 2);
+        assert_eq!(def.steps[0].id, "lint");
         assert!(matches!(def.steps[0].config, StepConfig::Shell { .. }));
+        assert_eq!(def.steps[1].id, "review");
+        assert!(matches!(def.steps[1].config, StepConfig::Agent { .. }));
+    }
+
+    // ── refresh_one / reload Tier-1 同步测试 ─────────────────────────
+
+    #[test]
+    fn test_refresh_one_new_file_adds_tier1_meta() {
+        let (_tmp, wf_dir) = setup_test_dir();
+        let manager = WorkflowManager::new(wf_dir.clone());
+        manager.init().unwrap();
+        assert_eq!(manager.list_names().len(), 0);
+
+        // 在磁盘上直接创建新的 workflow.md（不走 create()）
+        create_workflow_file(&wf_dir, "new-wf", "New workflow", "1.0");
+
+        // refresh_one 应该发现新文件并添加到 Tier-1
+        manager.refresh_one("new-wf");
+        let names = manager.list_names();
+        assert!(names.contains(&"new-wf".to_string()));
+
+        // Tier-1 meta 也应正确
+        let metas = manager.list_meta();
+        let meta = metas.iter().find(|m| m.name == "new-wf").unwrap();
+        assert_eq!(meta.description, "New workflow");
+        assert_eq!(meta.version, "1.0");
+    }
+
+    #[test]
+    fn test_refresh_one_updates_tier1_meta() {
+        let (_tmp, wf_dir) = setup_test_dir();
+        create_workflow_file(&wf_dir, "test-wf", "Original", "1.0");
+
+        let manager = WorkflowManager::new(wf_dir.clone());
+        manager.init().unwrap();
+        assert_eq!(manager.list_meta()[0].description, "Original");
+
+        // 修改磁盘上的文件（description 和 version 都变了）
+        create_workflow_file(&wf_dir, "test-wf", "Updated description", "2.0");
+
+        // refresh_one 应该更新 Tier-1 meta
+        manager.refresh_one("test-wf");
+        let meta = &manager.list_meta()[0];
+        assert_eq!(meta.description, "Updated description");
+        assert_eq!(meta.version, "2.0");
+    }
+
+    #[test]
+    fn test_refresh_one_deleted_file_removes_tier1_meta() {
+        let (_tmp, wf_dir) = setup_test_dir();
+        create_workflow_file(&wf_dir, "temp-wf", "Will be deleted", "1.0");
+
+        let manager = WorkflowManager::new(wf_dir.clone());
+        manager.init().unwrap();
+        assert_eq!(manager.list_names().len(), 1);
+
+        // 删除 workflow 目录
+        std::fs::remove_dir_all(wf_dir.join("temp-wf")).unwrap();
+
+        // refresh_one 应该从 Tier-1 中移除
+        manager.refresh_one("temp-wf");
+        assert_eq!(manager.list_names().len(), 0);
+    }
+
+    #[test]
+    fn test_refresh_one_corrupted_yaml_preserves_stale_meta() {
+        let (_tmp, wf_dir) = setup_test_dir();
+        create_workflow_file(&wf_dir, "corrupt-wf", "Original meta", "1.0");
+
+        let manager = WorkflowManager::new(wf_dir.clone());
+        manager.init().unwrap();
+        assert_eq!(manager.list_meta()[0].description, "Original meta");
+
+        // 写入损坏的 YAML
+        let md_path = wf_dir.join("corrupt-wf").join("workflow.md");
+        std::fs::write(&md_path, "this is not valid yaml {{{").unwrap();
+
+        // refresh_one 应该保留旧 meta
+        manager.refresh_one("corrupt-wf");
+        let metas = manager.list_meta();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].description, "Original meta");
+    }
+
+    #[test]
+    fn test_reload_deleted_workflow_returns_error_and_cleans_meta() {
+        let (_tmp, wf_dir) = setup_test_dir();
+        create_workflow_file(&wf_dir, "temp-wf", "Will be deleted", "1.0");
+
+        let manager = WorkflowManager::new(wf_dir.clone());
+        manager.init().unwrap();
+        assert_eq!(manager.list_names().len(), 1);
+
+        // 删除 workflow 目录
+        std::fs::remove_dir_all(wf_dir.join("temp-wf")).unwrap();
+
+        // reload 应该返回 error 且清理 meta
+        let err = manager.reload("temp-wf").unwrap_err();
+        assert!(matches!(err, WorkflowError::Parse(_)));
+        assert!(err.to_string().contains("not found"));
+        assert_eq!(manager.list_names().len(), 0);
     }
 }
