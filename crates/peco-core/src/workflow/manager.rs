@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::tools::AgentAccess;
 
-use super::definition::WorkflowDefinition;
+use super::definition::{WorkflowDefinition, pre_validate_workflow_yaml};
 use super::engine::{WorkflowConfig, WorkflowEngine};
 use super::error::WorkflowError;
 use super::handle::WorkflowHandle;
@@ -284,8 +284,8 @@ impl WorkflowManager {
 
     /// 创建新 Workflow。
     ///
-    /// 流程：校验名称 → 检查目录不存在 → 原子写入 workflow.md →
-    /// 解析定义 → 持锁更新 metas 缓存。
+    /// 流程：校验名称 → 检查目录不存在 → 解析定义（先验证后写入）→
+    /// 原子写入 workflow.md → 持锁更新 metas 缓存。
     /// 所有文件 I/O 在持锁之前完成。
     pub fn create(
         &self,
@@ -295,23 +295,26 @@ impl WorkflowManager {
         Self::validate_workflow_name(name)?;
         let dir = self.workflows_dir.join(name);
 
-        // 1. 文件 I/O（锁外完成）
         if dir.exists() {
             return Err(WorkflowError::AlreadyExists(format!(
                 "workflow '{name}' already exists"
             )));
         }
-        std::fs::create_dir_all(&dir)?;
 
+        // 1. 预校验：在 serde 严格解析前检查 YAML 结构，给出可操作的错误信息
+        pre_validate_workflow_yaml(yaml_content)?;
+
+        // 2. 解析并验证定义（纯 CPU，先于任何文件 I/O，确保只写入合法定义）
+        let definition = WorkflowDefinition::from_yaml(yaml_content)?;
+
+        // 3. 文件 I/O（锁外完成，原子写入）
+        std::fs::create_dir_all(&dir)?;
         let tmp_path = dir.join(".workflow.md.tmp");
         let final_path = dir.join("workflow.md");
         std::fs::write(&tmp_path, yaml_content)?;
         std::fs::rename(&tmp_path, &final_path)?;
 
-        // 2. 解析定义（纯 CPU）
-        let definition = WorkflowDefinition::from_file(&final_path)?;
-
-        // 3. 更新缓存（持锁）
+        // 4. 更新缓存（持锁）
         {
             let mut metas = self
                 .metas
@@ -334,8 +337,8 @@ impl WorkflowManager {
 
     /// 更新已有 Workflow。
     ///
-    /// 流程：检查目录存在 → 原子覆盖 workflow.md → 解析定义 →
-    /// 持锁更新 metas + 淘汰 definitions 缓存。
+    /// 流程：检查目录存在 → 解析定义（先验证后写入）→
+    /// 原子覆盖 workflow.md → 持锁更新 metas + 淘汰 definitions 缓存。
     pub fn update(
         &self,
         name: &str,
@@ -351,13 +354,16 @@ impl WorkflowManager {
             )));
         }
 
-        // 1. 文件 I/O（锁外完成）
+        // 1. 预校验：在 serde 严格解析前检查 YAML 结构，给出可操作的错误信息
+        pre_validate_workflow_yaml(yaml_content)?;
+
+        // 2. 解析并验证定义（纯 CPU，先于文件 I/O，防止写入无效内容覆盖合法文件）
+        let definition = WorkflowDefinition::from_yaml(yaml_content)?;
+
+        // 3. 文件 I/O（锁外完成，原子覆盖）
         let tmp_path = dir.join(".workflow.md.tmp");
         std::fs::write(&tmp_path, yaml_content)?;
         std::fs::rename(&tmp_path, &final_path)?;
-
-        // 2. 解析定义（纯 CPU）
-        let definition = WorkflowDefinition::from_file(&final_path)?;
 
         // 3. 更新缓存（持锁）
         {

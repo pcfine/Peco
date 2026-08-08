@@ -138,6 +138,19 @@ impl WorkSpace {
     pub fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
     }
+
+    // ── 依赖注入 ────────────────────────────────────────────────────
+
+    /// 将 WorkSpace 自身注入 AgentManager，使其构建的 ToolDependencies
+    /// 包含 workflow_access 和 mcp_access。
+    ///
+    /// 必须在 WorkSpace 被包装为 `Arc` 后调用。
+    pub fn inject_deps(self: &Arc<Self>) {
+        self.agent_manager
+            .set_workflow_access(self.clone() as Arc<dyn WorkflowAccess>);
+        self.agent_manager
+            .set_mcp_access(self.clone() as Arc<dyn McpAccess>);
+    }
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
     }

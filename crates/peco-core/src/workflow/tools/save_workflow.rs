@@ -34,7 +34,7 @@ impl ToolDyn for SaveWorkflow {
             description: "Create or update a workflow by writing its workflow.md file. \
                 If the workflow already exists, it is updated in place. \
                 The content must be a complete workflow.md file with YAML frontmatter \
-                (workflow.name, workflow.description, steps) followed by optional Markdown body.\n\
+                (workflow.name, workflow.description, workflow.steps) followed by optional Markdown body.\n\
                 \n\
                 Required frontmatter:\n\
                   workflow.name: unique workflow identifier\n\
@@ -42,6 +42,20 @@ impl ToolDyn for SaveWorkflow {
                   workflow.steps: array of step definitions\n\
                 \n\
                 Each step requires: id, name, type (shell/agent), config.\n\
+                \n\
+                Step config by type:\n\
+                  shell: { command: \"shell command to run\" }\n\
+                  agent: { agent: \"@agent-name\", prompt: \"what the agent should do\" }\n\
+                    Optional: max_turns (integer, max ReAct loop iterations)\n\
+                \n\
+                Example:\n\
+                  steps:\n\
+                    - id: \"step1\"\n\
+                      name: \"Run analysis\"\n\
+                      type: agent\n\
+                      config:\n\
+                        agent: \"@analyst\"\n\
+                        prompt: \"Analyze the data\"\n\
                 \n\
                 The workflow becomes immediately available for execute_workflow after creation."
                 .to_string(),

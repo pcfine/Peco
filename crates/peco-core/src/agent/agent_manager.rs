@@ -20,6 +20,8 @@ use crate::config::{McpConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::mcp::McpConfigStore;
 use crate::skills::SkillRegister;
+use crate::tools::McpAccess;
+use crate::workflow::WorkflowAccess;
 use crate::workspace::{
     AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, WorkspaceError,
 };
@@ -55,6 +57,10 @@ pub struct AgentManager {
     metas: RwLock<HashMap<String, AgentMeta>>,
     /// Tier-2 完整 Agent 实例缓存（name → Arc<Agent>）
     cache: RwLock<HashMap<String, Arc<Agent>>>,
+    /// Workflow 依赖注入（由 WorkSpace 在初始化时设置）。
+    workflow_access: RwLock<Option<Arc<dyn WorkflowAccess>>>,
+    /// MCP 依赖注入（由 WorkSpace 在初始化时设置）。
+    mcp_access: RwLock<Option<Arc<dyn McpAccess>>>,
 }
 
 impl AgentManager {
@@ -78,7 +84,21 @@ impl AgentManager {
             knowledge_manager,
             metas: RwLock::new(HashMap::new()),
             cache: RwLock::new(HashMap::new()),
+            workflow_access: RwLock::new(None),
+            mcp_access: RwLock::new(None),
         }
+    }
+
+    // ── 依赖注入 ────────────────────────────────────────────────────
+
+    /// 注入 Workflow 依赖（由 WorkSpace 在初始化时调用）。
+    pub fn set_workflow_access(&self, wa: Arc<dyn WorkflowAccess>) {
+        *self.workflow_access.write().unwrap() = Some(wa);
+    }
+
+    /// 注入 MCP 管理依赖（由 WorkSpace 在初始化时调用）。
+    pub fn set_mcp_access(&self, ma: Arc<dyn McpAccess>) {
+        *self.mcp_access.write().unwrap() = Some(ma);
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
@@ -215,8 +235,8 @@ impl AgentManager {
             skill_provider: self.clone() as Arc<dyn SkillProvider>,
             knowledge_access: self.clone() as Arc<dyn KnowledgeAccess>,
             allowed_kbs: Vec::new(),
-            workflow_access: None,
-            mcp_access: None,
+            workflow_access: self.workflow_access.read().unwrap().clone(),
+            mcp_access: self.mcp_access.read().unwrap().clone(),
             workflow_persister: None,
         }
     }
@@ -230,6 +250,8 @@ impl AgentManager {
     fn build_deps_direct(&self) -> ToolDependencies {
         let mut config = self.user_config.clone();
         config.mcp = self.mcp_config.get();
+        let workflow_access = self.workflow_access.read().unwrap().clone();
+        let mcp_access = self.mcp_access.read().unwrap().clone();
         ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
@@ -237,6 +259,8 @@ impl AgentManager {
                 user_config: config,
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
+                workflow_access: workflow_access.clone(),
+                mcp_access: mcp_access.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -246,8 +270,8 @@ impl AgentManager {
                 km: self.knowledge_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
-            workflow_access: None,
-            mcp_access: None,
+            workflow_access,
+            mcp_access,
             workflow_persister: None,
         }
     }
@@ -448,6 +472,8 @@ struct AmAgentAccess {
     user_config: UserConfig,
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
+    workflow_access: Option<Arc<dyn WorkflowAccess>>,
+    mcp_access: Option<Arc<dyn McpAccess>>,
 }
 
 impl AgentAccess for AmAgentAccess {
@@ -467,6 +493,8 @@ impl AgentAccess for AmAgentAccess {
                 user_config: self.user_config.clone(),
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
+                workflow_access: self.workflow_access.clone(),
+                mcp_access: self.mcp_access.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -476,8 +504,8 @@ impl AgentAccess for AmAgentAccess {
                 km: self.knowledge_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
-            workflow_access: None,
-            mcp_access: None,
+            workflow_access: self.workflow_access.clone(),
+            mcp_access: self.mcp_access.clone(),
             workflow_persister: None,
         };
 

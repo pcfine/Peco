@@ -302,6 +302,188 @@ impl StepOutcome {
 }
 
 // ============================================================================
+// Pre-validation — 在 serde 严格解析前检查 YAML 结构，给出可操作的错误信息
+// ============================================================================
+
+/// 在严格解析之前预校验 workflow YAML 结构。
+///
+/// 解析为通用 `serde_json::Value`，逐步骤检查 config 是否包含
+/// 该类型所需的必填字段。返回针对 LLM 自修正优化的可操作错误消息。
+pub fn pre_validate_workflow_yaml(yaml: &str) -> Result<(), WorkflowError> {
+    // 提取 frontmatter
+    let frontmatter = if yaml.trim_start().starts_with("---") {
+        match crate::agent::split_frontmatter(yaml) {
+            Ok((fm, _)) => fm,
+            Err(_) => yaml,
+        }
+    } else {
+        yaml
+    };
+
+    // 解析为通用 JSON value（宽松模式，不要求所有字段类型匹配）
+    let parsed: serde_json::Value = serde_yaml::from_str(frontmatter).map_err(|e| {
+        WorkflowError::Parse(format!(
+            "YAML syntax error: {e}\n\
+             Expected format:\n\
+             ---\n\
+             workflow:\n\
+               name: \"my-workflow\"\n\
+               description: \"what it does\"\n\
+               version: \"1.0\"\n\
+               steps:\n\
+                 - id: \"step1\"\n\
+                   name: \"Step Name\"\n\
+                   type: agent  # or shell\n\
+                   config:\n\
+                     agent: \"@agent-name\"\n\
+                     prompt: \"instructions\"\n\
+             ---"
+        ))
+    })?;
+
+    let workflow = parsed.get("workflow").ok_or_else(|| {
+        WorkflowError::Parse(
+            "Missing top-level 'workflow:' key.\n\
+             Expected format:\n\
+             ---\n\
+             workflow:\n\
+               name: \"my-workflow\"\n\
+               ...\n\
+             ---"
+            .into(),
+        )
+    })?;
+
+    let steps = match workflow.get("steps") {
+        Some(serde_json::Value::Array(arr)) => arr,
+        Some(_) => {
+            return Err(WorkflowError::Parse(
+                "'workflow.steps' must be an array".into(),
+            ));
+        }
+        None => {
+            return Err(WorkflowError::Parse(
+                "Missing 'workflow.steps' field. A workflow must have at least one step.".into(),
+            ));
+        }
+    };
+
+    if steps.is_empty() {
+        return Err(WorkflowError::Parse(
+            "'workflow.steps' is empty. A workflow must have at least one step.".into(),
+        ));
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, step) in steps.iter().enumerate() {
+        let step_num = i + 1;
+        let step_id = step
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(missing id)");
+        let step_type = step
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(missing type)");
+        let config = step.get("config");
+
+        match config {
+            None => {
+                errors.push(format!(
+                    "Step {step_num} (id=\"{step_id}\", type=\"{step_type}\"): \
+                     missing 'config' field. Every step must have a config block."
+                ));
+                continue;
+            }
+            Some(serde_json::Value::Object(config_map)) => match step_type {
+                "agent" => {
+                    let mut missing = Vec::new();
+                    if !config_map.contains_key("agent") {
+                        missing.push("agent (which agent to invoke, e.g. \"@assistant\")");
+                    }
+                    if !config_map.contains_key("prompt") {
+                        missing.push("prompt (instructions for the agent)");
+                    }
+                    if !missing.is_empty() {
+                        errors.push(format!(
+                            "Step {step_num} (id=\"{step_id}\", type=\"agent\"): \
+                                 config is missing required fields:\n  - {}\n\n\
+                                 Expected format for agent steps:\n\
+                                 config:\n  \
+                                   agent: \"<agent-name>\"     # required\n  \
+                                   prompt: \"<instructions>\"  # required\n  \
+                                   max_turns: <number>        # optional\n\n\
+                                 Received:\n  {}",
+                            missing.join("\n  - "),
+                            serde_yaml::to_string(&config_map)
+                                .unwrap_or_else(|_| format!("{config_map:?}"))
+                                .lines()
+                                .collect::<Vec<_>>()
+                                .join("\n  ")
+                        ));
+                    }
+                }
+                "shell" => {
+                    if !config_map.contains_key("command") {
+                        errors.push(format!(
+                            "Step {step_num} (id=\"{step_id}\", type=\"shell\"): \
+                                 config is missing required field 'command'.\n\n\
+                                 Expected format for shell steps:\n\
+                                 config:\n  \
+                                   command: \"<shell command>\"  # required\n\n\
+                                 Received:\n  {}",
+                            serde_yaml::to_string(&config_map)
+                                .unwrap_or_else(|_| format!("{config_map:?}"))
+                                .lines()
+                                .collect::<Vec<_>>()
+                                .join("\n  ")
+                        ));
+                    }
+                }
+                "llm" | "tool" => {
+                    errors.push(format!(
+                        "Step {step_num} (id=\"{step_id}\"): \
+                             step type \"{step_type}\" is not yet supported. \
+                             Supported types: shell, agent"
+                    ));
+                }
+                other => {
+                    errors.push(format!(
+                        "Step {step_num} (id=\"{step_id}\"): \
+                             unknown step type \"{other}\". \
+                             Supported types: shell, agent"
+                    ));
+                }
+            },
+            Some(_) => {
+                errors.push(format!(
+                    "Step {step_num} (id=\"{step_id}\"): \
+                     'config' must be a mapping/dictionary, got a scalar value."
+                ));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        let header = format!(
+            "Workflow validation failed with {} error(s):\n\n",
+            errors.len()
+        );
+        let body = errors
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("── Error {} ──\n{e}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let footer = "\n\n──\nPlease fix the errors above and try again.";
+        return Err(WorkflowError::Parse(format!("{header}{body}{footer}")));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // WorkflowDefinition — parsing methods
 // ============================================================================
 
@@ -454,5 +636,127 @@ impl WorkflowDefinition {
             "object" => value.is_object(),
             _ => true, // 未知类型不做校验
         }
+    }
+}
+
+#[cfg(test)]
+mod pre_validate_tests {
+    use super::*;
+
+    fn wrap(wf_yaml: &str) -> String {
+        format!(
+            "---\nworkflow:\n  name: \"test\"\n  description: \"test\"\n  version: \"1.0\"\n{}\n---",
+            wf_yaml
+        )
+    }
+
+    #[test]
+    fn test_valid_agent_step() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: agent\n      config:\n        agent: \"@test\"\n        prompt: \"do it\"",
+        );
+        assert!(pre_validate_workflow_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn test_valid_shell_step() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: shell\n      config:\n        command: \"echo hi\"",
+        );
+        assert!(pre_validate_workflow_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn test_agent_missing_agent_field() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: agent\n      config:\n        prompt: \"do it\"",
+        );
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("agent"), "should mention 'agent': {msg}");
+        assert!(
+            msg.contains("missing required fields"),
+            "should say missing: {msg}"
+        );
+        assert!(
+            msg.contains("Expected format for agent steps"),
+            "should show expected format: {msg}"
+        );
+        assert!(msg.contains("Received:"), "should show received: {msg}");
+    }
+
+    #[test]
+    fn test_agent_missing_prompt_field() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: agent\n      config:\n        agent: \"@test\"",
+        );
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prompt"), "should mention 'prompt': {msg}");
+    }
+
+    #[test]
+    fn test_shell_missing_command_field() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: shell\n      config:\n        something: \"else\"",
+        );
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("command"), "should mention 'command': {msg}");
+        assert!(
+            msg.contains("Expected format for shell steps"),
+            "should show expected format: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_missing_steps() {
+        let yaml =
+            "---\nworkflow:\n  name: \"test\"\n  description: \"test\"\n  version: \"1.0\"\n---";
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        assert!(err.to_string().contains("Missing 'workflow.steps'"));
+    }
+
+    #[test]
+    fn test_empty_steps() {
+        let yaml = wrap("  steps: []");
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_missing_workflow_key() {
+        let yaml = "---\nname: \"test\"\n---";
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        assert!(err.to_string().contains("Missing top-level 'workflow:'"));
+    }
+
+    #[test]
+    fn test_multiple_errors_reported() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: agent\n      config:\n        prompt: \"do it\"\n    - id: \"s2\"\n      name: \"Step 2\"\n      type: shell\n      config:\n        something: \"else\"",
+        );
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Error 1"), "should have Error 1: {msg}");
+        assert!(msg.contains("Error 2"), "should have Error 2: {msg}");
+        assert!(msg.contains("agent"), "should mention agent: {msg}");
+        assert!(msg.contains("command"), "should mention command: {msg}");
+    }
+
+    #[test]
+    fn test_unknown_step_type() {
+        let yaml = wrap(
+            "  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: unknown_type\n      config:\n        foo: bar",
+        );
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        assert!(err.to_string().contains("unknown step type"));
+    }
+
+    #[test]
+    fn test_missing_config() {
+        let yaml = wrap("  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: agent");
+        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        assert!(err.to_string().contains("missing 'config' field"));
     }
 }

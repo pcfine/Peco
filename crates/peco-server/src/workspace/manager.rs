@@ -143,6 +143,7 @@ impl WorkspaceManager {
         let root = self.workspace_dir(user_id);
         let ws = self.open_workspace(user_id, &root)?;
         let ws = Arc::new(ws);
+        ws.inject_deps();
         let watcher_state = Arc::new(WatcherState::new());
 
         let entry = CacheEntry {
@@ -208,6 +209,7 @@ impl WorkspaceManager {
         // 4. 打开 WorkSpace（总会初始化内存缓存）
         let ws = self.open_workspace(user_id, &root)?;
         let ws = Arc::new(ws);
+        ws.inject_deps();
 
         // 5. 对变更的模块执行双向同步
         if !changed_modules.is_empty() {

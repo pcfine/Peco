@@ -92,6 +92,7 @@ async fn init_template_workspace(config: &CliConfig, template_name: &str) -> any
         WorkSpace::open(config.workspace_root.clone(), user_id, &system_config)
             .map_err(|e| anyhow::anyhow!("WorkSpace 创建失败: {e}"))?,
     );
+    workspace.inject_deps();
 
     let report = workspace
         .init_from_template(tmp.path())

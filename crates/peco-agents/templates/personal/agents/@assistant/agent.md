@@ -41,7 +41,7 @@ tools:
   - execute_workflow
 mcp: []
 skills: []
-knowledge_bases: [@private_memory]
+knowledge_bases: ["@private_memory"]
 max_turns: 50
 ---
 
