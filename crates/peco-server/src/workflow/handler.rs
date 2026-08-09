@@ -52,15 +52,16 @@ pub async fn list_workflows(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<WorkflowListItem>>, ApiError> {
-    let metas = state.workflow_manager.list_meta();
+    let ws = state.workspace_manager.get(&user_id)?;
+    let metas = ws.workflow_manager().list_meta();
 
     let schedules = super::helper::get_user_schedules(&state.db, &user_id).await;
     let recent_executions = super::helper::get_recent_executions(&state.db, &user_id).await;
 
     let mut items = Vec::with_capacity(metas.len());
     for meta in &metas {
-        let path = state
-            .workflow_manager
+        let path = ws
+            .workflow_manager()
             .workflows_dir()
             .join(&meta.name)
             .join("workflow.md");
@@ -103,9 +104,11 @@ pub async fn create_workflow(
         .and_then(|n| n.as_str())
         .ok_or_else(|| ApiError::BadRequest("YAML must contain 'workflow.name'".into()))?;
 
+    let ws = state.workspace_manager.get(&user_id)?;
+
     // 创建
-    let definition = state
-        .workflow_manager
+    let definition = ws
+        .workflow_manager()
         .create(name, &body.yaml)
         .map_err(|e| match e {
             peco_core::workflow::WorkflowError::AlreadyExists(_) => {
@@ -127,15 +130,16 @@ pub async fn get_workflow(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<WorkflowDetailResponse>, ApiError> {
-    let definition = state
-        .workflow_manager
+    let ws = state.workspace_manager.get(&user_id)?;
+    let definition = ws
+        .workflow_manager()
         .load(&name)
         .map_err(|e| ApiError::NotFound(format!("workflow '{name}' not found: {e}")))?;
 
     // 读取原始 workflow.md 内容，保留用户格式、注释和字段顺序。
     // 避免 serde_yaml 往返序列化产生的格式变化。
-    let yaml_path = state
-        .workflow_manager
+    let yaml_path = ws
+        .workflow_manager()
         .workflows_dir()
         .join(&name)
         .join("workflow.md");
@@ -154,8 +158,9 @@ pub async fn update_workflow(
     Path(name): Path<String>,
     Json(body): Json<UpdateWorkflowRequest>,
 ) -> Result<Json<WorkflowDetailResponse>, ApiError> {
-    let definition = state
-        .workflow_manager
+    let ws = state.workspace_manager.get(&user_id)?;
+    let definition = ws
+        .workflow_manager()
         .update(&name, &body.yaml)
         .map_err(|e| ApiError::BadRequest(format!("update workflow: {e}")))?;
 
@@ -199,8 +204,8 @@ pub async fn delete_workflow(
     let _ = crate::db::workflow_schedules::delete(&state.db, &user_id, &name).await;
 
     // 删除 workflow 定义文件
-    state
-        .workflow_manager
+    let ws = state.workspace_manager.get(&user_id)?;
+    ws.workflow_manager()
         .delete(&name)
         .map_err(|e| ApiError::NotFound(format!("workflow '{name}' not found: {e}")))?;
 
@@ -216,8 +221,13 @@ pub async fn execute_workflow(
     Path(name): Path<String>,
     Json(body): Json<ExecuteWorkflowRequest>,
 ) -> Result<(StatusCode, Json<ExecuteResponse>), ApiError> {
-    let definition = state
-        .workflow_manager
+    let ws = state
+        .workspace_manager
+        .get(&user_id)
+        .map_err(|e| ApiError::Internal(format!("get workspace: {e}")))?;
+
+    let definition = ws
+        .workflow_manager()
         .load(&name)
         .map_err(|e| ApiError::NotFound(format!("workflow '{name}' not found: {e}")))?;
 
@@ -247,17 +257,11 @@ pub async fn execute_workflow(
     .await
     .map_err(|e| ApiError::Internal(format!("insert execution: {e}")))?;
 
-    // 获取 AgentAccess
-    let agent_access: Arc<dyn peco_core::tools::AgentAccess> = state
-        .workspace_manager
-        .get(&user_id)
-        .map_err(|e| ApiError::Internal(format!("get workspace: {e}")))?;
-
-    // 启动引擎（后台任务）
+    // 启动引擎（后台任务）。ws 自身实现 AgentAccess，直接传入。
     let config = WorkflowConfig::default();
-    let handle = state
-        .workflow_manager
-        .execute(&name, agent_access, persister.clone(), config, inputs)
+    let handle = ws
+        .workflow_manager()
+        .execute(&name, ws.clone(), persister.clone(), config, inputs)
         .map_err(|e| ApiError::Internal(format!("execute workflow: {e}")))?;
 
     // 注册到活跃执行表
@@ -434,8 +438,8 @@ pub async fn get_statistics(
     }
 
     // 验证 Workflow 存在
-    state
-        .workflow_manager
+    let ws = state.workspace_manager.get(&user_id)?;
+    ws.workflow_manager()
         .load(&name)
         .map_err(|_| ApiError::NotFound(format!("workflow '{name}' not found")))?;
 

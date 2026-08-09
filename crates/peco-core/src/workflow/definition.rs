@@ -246,6 +246,18 @@ pub enum OnFailure {
     Pause,
 }
 
+impl OnFailure {
+    /// 返回 snake_case 的字符串表示，与 serde 序列化格式和 SSE 协议一致。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OnFailure::Continue => "continue",
+            OnFailure::Abort => "abort",
+            OnFailure::Retry => "retry",
+            OnFailure::Pause => "pause",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
     pub max_attempts: usize,

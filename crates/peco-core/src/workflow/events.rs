@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Workflow 执行期间产生的事件。
 ///
 /// 通过 Speaker/Listener 通道传输，与 LooperEvent 模式一致。
-/// 每个事件都携带 `run_id` 字段（除 StepStarted/StepDelta/StepCompleted/
-/// StepSkipped/StepFailed/StepRetrying 外，它们通过 step_id 追踪）。
+/// 所有事件变体均自包含 `run_id`，前端/SSE 消费者无需外部上下文注入。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkflowEvent {
     /// Workflow 开始执行
@@ -20,16 +19,22 @@ pub enum WorkflowEvent {
 
     /// 步骤开始执行
     StepStarted {
+        run_id: String,
         step_id: String,
         step_name: String,
         step_type: String, // "shell" | "agent"
     },
 
     /// 步骤执行中的增量输出（Phase 4 预留）
-    StepDelta { step_id: String, text: String },
+    StepDelta {
+        run_id: String,
+        step_id: String,
+        text: String,
+    },
 
     /// 步骤执行成功
     StepCompleted {
+        run_id: String,
         step_id: String,
         step_name: String,
         output: String,
@@ -39,6 +44,7 @@ pub enum WorkflowEvent {
 
     /// 步骤被跳过（条件不满足）
     StepSkipped {
+        run_id: String,
         step_id: String,
         step_name: String,
         reason: String,
@@ -46,6 +52,7 @@ pub enum WorkflowEvent {
 
     /// 步骤执行失败
     StepFailed {
+        run_id: String,
         step_id: String,
         step_name: String,
         error: String,
@@ -56,6 +63,7 @@ pub enum WorkflowEvent {
 
     /// 等待重试（Phase 4 预留）
     StepRetrying {
+        run_id: String,
         step_id: String,
         attempt: usize,
         max_attempts: usize,

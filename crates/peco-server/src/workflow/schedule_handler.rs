@@ -47,8 +47,8 @@ pub async fn create_schedule(
     Json(body): Json<CreateScheduleRequest>,
 ) -> Result<(StatusCode, Json<ScheduleResponse>), ApiError> {
     // 验证 Workflow 存在
-    state
-        .workflow_manager
+    let ws = state.workspace_manager.get(&user_id)?;
+    ws.workflow_manager()
         .load(&body.workflow_name)
         .map_err(|_| ApiError::NotFound(format!("workflow '{}' not found", body.workflow_name)))?;
 

@@ -51,6 +51,7 @@ impl Default for WorkflowConfig {
 /// loop {
 ///     match handle.recv_event().await {
 ///         Some(WorkflowEvent::StepCompleted { .. }) => { /* 记录 */ }
+        // run_id 可通过 event 直接获取，无需外部注入
 ///         Some(WorkflowEvent::Completed { .. }) => break,
 ///         Some(WorkflowEvent::Failed { .. }) => break,
 ///         Some(WorkflowEvent::Paused { .. }) => {
@@ -256,6 +257,7 @@ impl WorkflowEngine {
                         .clone()
                         .unwrap_or_else(|| "condition evaluated to false".into());
                     let _ = event_tx.try_send(WorkflowEvent::StepSkipped {
+                        run_id: run_id.clone(),
                         step_id: step.id.clone(),
                         step_name: step.name.clone(),
                         reason: reason.clone(),
@@ -278,6 +280,7 @@ impl WorkflowEngine {
 
                 // 发射 StepStarted
                 let _ = event_tx.try_send(WorkflowEvent::StepStarted {
+                    run_id: run_id.clone(),
                     step_id: step.id.clone(),
                     step_name: step.name.clone(),
                     step_type: step.step_type.to_string(),
@@ -328,6 +331,7 @@ impl WorkflowEngine {
                     StepOutcome::Success(_) => {
                         steps_completed += 1;
                         WorkflowEvent::StepCompleted {
+                            run_id: run_id.clone(),
                             step_id: result.step.id.clone(),
                             step_name: result.step.name.clone(),
                             output: result.output.clone().unwrap_or_default(),
@@ -338,6 +342,7 @@ impl WorkflowEngine {
                     StepOutcome::Skipped(reason) => {
                         steps_skipped += 1;
                         WorkflowEvent::StepSkipped {
+                            run_id: run_id.clone(),
                             step_id: result.step.id.clone(),
                             step_name: result.step.name.clone(),
                             reason: reason.clone(),
@@ -346,12 +351,13 @@ impl WorkflowEngine {
                     StepOutcome::Failed(err) => {
                         steps_failed += 1;
                         WorkflowEvent::StepFailed {
+                            run_id: run_id.clone(),
                             step_id: result.step.id.clone(),
                             step_name: result.step.name.clone(),
                             error: err.clone(),
                             duration_ms: result.duration.as_millis() as u64,
                             attempt: result.attempt,
-                            failure_policy: format!("{:?}", result.step.on_failure),
+                            failure_policy: result.step.on_failure.as_str().to_string(),
                         }
                     }
                 };

@@ -211,8 +211,21 @@ async fn execute_scheduled_workflow(
         "Scheduled workflow triggered"
     );
 
-    // 1. 加载 Workflow 定义
-    let definition = match state.workflow_manager.load(&workflow_name) {
+    // 1. 获取用户 WorkSpace
+    let ws = match state.workspace_manager.get(&user_id) {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "Failed to get workspace for scheduled workflow execution"
+            );
+            return;
+        }
+    };
+
+    // 2. 加载 Workflow 定义
+    let definition = match ws.workflow_manager().load(&workflow_name) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(workflow = %workflow_name, error = %e, "Failed to load workflow");
@@ -220,14 +233,14 @@ async fn execute_scheduled_workflow(
         }
     };
 
-    // 2. 验证输入（定时触发无外部输入）
+    // 3. 验证输入（定时触发无外部输入）
     let inputs = std::collections::HashMap::new();
     if let Err(e) = definition.validate_inputs(&inputs) {
         tracing::error!(workflow = %workflow_name, error = %e, "Input validation failed");
         return;
     }
 
-    // 3. 创建 per-user persister + 写入初始记录
+    // 4. 创建 per-user persister + 写入初始记录
     let persister = Arc::new(crate::workflow::persister::SqliteWorkflowPersister::new(
         pool.clone(),
         user_id.clone(),
@@ -250,25 +263,11 @@ async fn execute_scheduled_workflow(
         return;
     }
 
-    // 4. 获取 AgentAccess（通过 WorkspaceManager 为用户获取 workspace）
-    let agent_access: Arc<dyn peco_core::tools::AgentAccess> =
-        match state.workspace_manager.get(&user_id) {
-            Ok(ws) => ws,
-            Err(e) => {
-                tracing::error!(
-                    user_id = %user_id,
-                    error = %e,
-                    "Failed to get workspace for scheduled workflow execution"
-                );
-                return;
-            }
-        };
-
-    // 5. 启动引擎
+    // 5. 启动引擎。ws 自身实现 AgentAccess，直接传入。
     let config = peco_core::workflow::WorkflowConfig::default();
-    let handle = match state.workflow_manager.execute(
+    let handle = match ws.workflow_manager().execute(
         &workflow_name,
-        agent_access,
+        ws.clone(),
         persister.clone(),
         config,
         inputs,

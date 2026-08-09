@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use peco_core::config::SystemConfig;
-use peco_core::workflow::WorkflowManager;
 use sqlx::SqlitePool;
 
 use crate::config::ServerConfig;
@@ -28,8 +27,6 @@ pub struct AppState {
     // ── Workflow 子系统 ──────────────────────────────────────────────
     /// 定时调度器。
     pub cron_scheduler: Arc<CronScheduler>,
-    /// Workflow 生命周期管理器（CRUD + 执行）。
-    pub workflow_manager: Arc<WorkflowManager>,
 }
 
 impl AppState {
@@ -65,12 +62,6 @@ impl AppState {
             tracing::warn!(error = %e, dir = %knowledge_dir.display(), "Failed to create knowledge directory");
         }
 
-        // 确保 workflows 子目录存在
-        let workflows_dir = config.data_dir.join("workflows");
-        if let Err(e) = tokio::fs::create_dir_all(&workflows_dir).await {
-            tracing::warn!(error = %e, dir = %workflows_dir.display(), "Failed to create workflows directory");
-        }
-
         // 加载系统级配置
         let system_config = Arc::new(SystemConfig::load());
 
@@ -81,20 +72,12 @@ impl AppState {
             128,
         ));
 
-        // 创建 WorkflowManager
-        let workflow_manager = Arc::new(WorkflowManager::new(workflows_dir));
-        match workflow_manager.init() {
-            Ok(count) => tracing::info!(count = count, "WorkflowManager initialized"),
-            Err(e) => tracing::warn!(error = %e, "Failed to scan workflow metadata"),
-        }
-
         Self {
             db,
             jwt_secret: config.jwt_secret.clone(),
             data_dir: config.data_dir.clone(),
             workspace_manager,
             cron_scheduler,
-            workflow_manager,
         }
     }
 
