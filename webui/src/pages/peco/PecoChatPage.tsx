@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { ChatView } from "@/components/chat/ChatView";
 import { pecoStreamUrl } from "@/api/peco";
 import { usePecoChatStore } from "@/stores/pecoChatStore";
+import { useAuthStore } from "@/stores/authStore";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { Button } from "@/components/ui/button";
 import { Trash2 } from "lucide-react";
@@ -12,12 +13,26 @@ export function PecoChatPage() {
   const loading = usePecoChatStore((s) => s.loading);
   const loaded = usePecoChatStore((s) => s.loaded);
   const sessionKey = usePecoChatStore((s) => s.sessionKey);
+  const isStreaming = usePecoChatStore((s) => s.isStreaming);
   const load = usePecoChatStore((s) => s.load);
   const clear = usePecoChatStore((s) => s.clear);
+  const sendMessage = usePecoChatStore((s) => s.sendMessage);
+  const abortStream = usePecoChatStore((s) => s.abortStream);
+  const error = usePecoChatStore((s) => s.error);
+  const clearError = usePecoChatStore((s) => s.clearError);
+  const token = useAuthStore((s) => s.token);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Surface streaming errors via toast.
+  useEffect(() => {
+    if (error) {
+      toast.error(error);
+      clearError();
+    }
+  }, [error, clearError]);
 
   const handleClear = async () => {
     try {
@@ -34,8 +49,14 @@ export function PecoChatPage() {
   return (
     <ChatView
       key={sessionKey}
+      mode="external"
       streamUrl={pecoStreamUrl}
       initialMessages={messages}
+      onExternalSend={(text) => {
+        sendMessage(text, token ?? "");
+      }}
+      onExternalStop={abortStream}
+      externalIsStreaming={isStreaming}
       headerTitle="Peco"
       headerActions={
         <Button variant="ghost" size="sm" onClick={handleClear}>

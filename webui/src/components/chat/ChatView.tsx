@@ -50,6 +50,16 @@ export interface ChatViewProps {
   onInitialQuerySent?: () => void;
   /** 附加到根元素的 CSS class（用于覆盖高度等布局属性） */
   className?: string;
+  /** 运行模式。`"external"` 时 ChatView 不管理自己的 SSE 连接 —
+   * 消息从 initialMessages prop 读取，发送/停止委托给外部。
+   * @default "internal" */
+  mode?: "internal" | "external";
+  /** [mode="external" 必需] 外部发送回调 */
+  onExternalSend?: (text: string) => void;
+  /** [mode="external" 必需] 外部停止回调 */
+  onExternalStop?: () => void;
+  /** [mode="external" 必需] 外部流式状态 */
+  externalIsStreaming?: boolean;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
@@ -65,7 +75,17 @@ export function ChatView({
   onUnread,
   onInitialQuerySent,
   className,
+  mode = "internal",
+  onExternalSend,
+  onExternalStop,
+  externalIsStreaming,
 }: ChatViewProps) {
+  const isExternalMode = mode === "external";
+  if (isExternalMode && import.meta.env.DEV) {
+    if (!onExternalSend) console.warn("ChatView mode=external: onExternalSend is required");
+    if (!onExternalStop) console.warn("ChatView mode=external: onExternalStop is required");
+    if (externalIsStreaming === undefined) console.warn("ChatView mode=external: externalIsStreaming is required");
+  }
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -97,6 +117,18 @@ export function ChatView({
   // token from Zustand is stable after login, but capture in ref for safety
   const tokenRef = useRef(token);
   tokenRef.current = token;
+
+  // External-mode refs — stable across renders for use in callbacks / effects.
+  const onExternalSendRef = useRef(onExternalSend);
+  onExternalSendRef.current = onExternalSend;
+  const onExternalStopRef = useRef(onExternalStop);
+  onExternalStopRef.current = onExternalStop;
+  const externalIsStreamingRef = useRef(externalIsStreaming);
+  externalIsStreamingRef.current = externalIsStreaming;
+
+  // In external mode messages are driven by the store via initialMessages;
+  // in local mode they are managed by our own useState + SSE handlers.
+  const displayMessages = isExternalMode ? initialMessages : messages;
 
   // ── Core send logic — stable identity (empty deps, reads everything from refs) ─
 
@@ -178,6 +210,9 @@ export function ChatView({
 
   const prevInitialMessagesRef = useRef(initialMessages);
   useEffect(() => {
+    // In external mode messages are rendered directly from initialMessages
+    // so there is no need to sync to local state.
+    if (isExternalMode) return;
     // Only sync if the reference actually changed (not just re-render).
     // Skip reset while an SSE stream is active — parent re-renders (e.g. from
     // onInitialQuerySent) can cause the `?? []` fallback to produce a new
@@ -189,16 +224,21 @@ export function ChatView({
       prevInitialMessagesRef.current = initialMessages;
       setMessages(initialMessages);
     }
-  }, [initialMessages]);
+  }, [initialMessages, isExternalMode]);
 
   // ── handleSend: reads from input → clears input → delegates to sendMessage ─
 
   const handleSend = useCallback(async () => {
     const currentInput = inputRef.current;
     const tok = tokenRef.current;
-    if (!currentInput.trim() || !tok || streamingRef.current) return;
+    const streaming = externalIsStreamingRef.current ?? streamingRef.current;
+    if (!currentInput.trim() || !tok || streaming) return;
     setInput("");
-    await sendMessage(currentInput);
+    if (onExternalSendRef.current) {
+      onExternalSendRef.current(currentInput);
+    } else {
+      await sendMessage(currentInput);
+    }
   }, [sendMessage]);
 
   // ── initialQuery auto-send ──────────────────────────────────────────────
@@ -208,7 +248,11 @@ export function ChatView({
     const tok = tokenRef.current;
     if (initialQuery && !hasSentInitialRef.current && tok) {
       hasSentInitialRef.current = true;
-      sendMessage(initialQuery);
+      if (onExternalSendRef.current) {
+        onExternalSendRef.current(initialQuery);
+      } else {
+        sendMessage(initialQuery);
+      }
       // Defer onInitialQuerySent to the next microtask so that sendMessage's
       // synchronous state updates (setMessages, setStreaming) are committed
       // before the parent clears initialQuery.  This prevents a parent
@@ -237,7 +281,7 @@ export function ChatView({
     if (visible) {
       messagesEndRef.current?.scrollIntoView({ behavior: "instant" });
     }
-  }, [messages, visible]);
+  }, [displayMessages, visible]);
 
   // ── Cleanup on unmount ─────────────────────────────────────────────────
 
@@ -255,17 +299,24 @@ export function ChatView({
       unmountTimerRef.current = undefined;
     }
     return () => {
+      // In external mode the SSE lifecycle is managed by the store —
+      // do NOT abort on unmount so streaming continues in the background.
+      if (isExternalMode) return;
       unmountTimerRef.current = setTimeout(() => {
         abortRef.current?.abort();
       }, 0);
     };
-  }, []);
+  }, [isExternalMode]);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
   const handleStop = () => {
-    abortRef.current?.abort();
-    setStreaming(false);
+    if (onExternalStopRef.current) {
+      onExternalStopRef.current();
+    } else {
+      abortRef.current?.abort();
+      setStreaming(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -275,7 +326,7 @@ export function ChatView({
     }
   };
 
-  const isInputDisabled = streaming || !visible;
+  const isInputDisabled = (externalIsStreaming ?? streaming) || !visible;
 
   // ── Render ──────────────────────────────────────────────────────────────
 
@@ -291,12 +342,12 @@ export function ChatView({
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto space-y-4 pr-2">
-        {messages.length === 0 && welcomeMessage && (
+        {displayMessages.length === 0 && welcomeMessage && (
           <div className="text-center text-muted-foreground mt-20">
             {welcomeMessage}
           </div>
         )}
-        {messages.map((msg, i) => (
+        {displayMessages.map((msg, i) => (
           <ChatBubble key={i} message={msg} />
         ))}
         <div ref={messagesEndRef} />
@@ -312,7 +363,7 @@ export function ChatView({
           onKeyDown={handleKeyDown}
           disabled={isInputDisabled}
         />
-        {streaming ? (
+        {(externalIsStreaming ?? streaming) ? (
           <Button variant="destructive" onClick={handleStop}>
             <Square className="h-4 w-4" />
           </Button>
@@ -395,72 +446,66 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   );
 }
 
-// ── SSE Event Handler ──────────────────────────────────────────────────────
+// ── Shared SSE Event Reducer ─────────────────────────────────────────────────
+//
+// Pure functions: take current messages + an SSE event, return new messages.
+// Exported so pecoChatStore can reuse them — keep the two copies in sync by
+// making this the single source of truth for message transformation logic.
 
-function handleSSEEvent(
+/** Apply a single SSE event to a messages array (pure — no side effects). */
+export function reduceStreamEvent(
   event: ChatSseEvent,
-  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
-  setStreaming: React.Dispatch<React.SetStateAction<boolean>>,
-  onTextDelta?: () => void,
-) {
+  messages: ChatMessage[],
+): ChatMessage[] {
   switch (event.event) {
-    case "text_delta":
-      onTextDelta?.();
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant") {
-          return [
-            ...prev.slice(0, -1),
-            { ...last, content: last.content + event.data.content },
-          ];
-        }
-        return prev;
-      });
-      break;
-    case "reasoning_delta":
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant") {
-          return [
-            ...prev.slice(0, -1),
-            { ...last, reasoning: (last.reasoning ?? "") + event.data.content },
-          ];
-        }
-        return prev;
-      });
-      break;
-    case "tool_call_start":
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant") {
-          const tc = {
-            id: event.data.id,
-            name: event.data.name,
-            arguments: event.data.arguments,
-          };
-          return [
-            ...prev.slice(0, -1),
-            { ...last, toolCalls: [...(last.toolCalls ?? []), tc] },
-          ];
-        }
-        return prev;
-      });
-      break;
-    case "tool_result":
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant" && last.toolCalls) {
-          const updated = last.toolCalls.map((tc) =>
-            tc.id === event.data.id ? { ...tc, result: event.data.result } : tc,
-          );
-          return [...prev.slice(0, -1), { ...last, toolCalls: updated }];
-        }
-        return prev;
-      });
-      break;
+    case "text_delta": {
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant") {
+        return [
+          ...messages.slice(0, -1),
+          { ...last, content: last.content + event.data.content },
+        ];
+      }
+      return messages;
+    }
+    case "reasoning_delta": {
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant") {
+        return [
+          ...messages.slice(0, -1),
+          { ...last, reasoning: (last.reasoning ?? "") + event.data.content },
+        ];
+      }
+      return messages;
+    }
+    case "tool_call_start": {
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant") {
+        const tc = {
+          id: event.data.id,
+          name: event.data.name,
+          arguments: event.data.arguments,
+        };
+        return [
+          ...messages.slice(0, -1),
+          { ...last, toolCalls: [...(last.toolCalls ?? []), tc] },
+        ];
+      }
+      return messages;
+    }
+    case "tool_result": {
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant" && last.toolCalls) {
+        const updated = last.toolCalls.map((tc) =>
+          tc.id === event.data.id ? { ...tc, result: event.data.result } : tc,
+        );
+        return [...messages.slice(0, -1), { ...last, toolCalls: updated }];
+      }
+      return messages;
+    }
     case "agent_call_start":
-      setMessages((prev) => [
-        ...prev,
+      return [
+        ...messages,
         {
           role: "agent-call" as const,
           content: "",
@@ -469,24 +514,51 @@ function handleSSEEvent(
           agentTask: event.data.task,
           callId: event.data.call_id,
         },
-      ]);
-      break;
+      ];
     case "agent_call_end":
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.callId === event.data.call_id
-            ? { ...m, content: event.data.result || "(完成)" }
-            : m,
-        ),
+      return messages.map((m) =>
+        m.callId === event.data.call_id
+          ? { ...m, content: event.data.result || "(完成)" }
+          : m,
       );
-      break;
     case "turn_complete":
     case "done":
-      setStreaming(false);
-      break;
     case "error":
-      setStreaming(false);
-      break;
+      return messages;
+  }
+}
+
+/** Whether this SSE event signals the end of streaming (UI should show stop→send). */
+export function isStreamTerminalEvent(event: ChatSseEvent): boolean {
+  switch (event.event) {
+    case "turn_complete":
+    case "done":
+    case "error":
+      return true;
+    default:
+      return false;
+  }
+}
+
+// ── Internal SSE handler (wires reduceStreamEvent into React state) ──────────
+
+function handleSSEEvent(
+  event: ChatSseEvent,
+  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
+  setStreaming: React.Dispatch<React.SetStateAction<boolean>>,
+  onTextDelta?: () => void,
+) {
+  if (event.event === "text_delta") {
+    onTextDelta?.();
+  }
+
+  setMessages((prev) => reduceStreamEvent(event, prev));
+
+  // Eagerly update streaming flag for responsive UI.
+  // The AbortController / finally block in sendMessage is the safety net
+  // that guarantees streaming is cleaned up even if these events never arrive.
+  if (isStreamTerminalEvent(event)) {
+    setStreaming(false);
   }
 }
 
