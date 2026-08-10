@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Markdown | ✅ | 内置 |
 | HTML | ✅ | 内置 |
 | TXT / 代码 | ✅ | 内置 |
-| DOCX | 🚧 | 后续版本 |
+| DOCX | ✅ | 内置 |
 
 ### 智能分块
 
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `OverlappingWindow` | 800 字符, 200 重叠 | 滑动窗口 + 句子边界对齐（推荐） |
 | `FixedSize` | 固定大小 | 简单等长切分 |
 | `SentenceBased` | 按最大字符数 | 按句子边界切分 |
-| `MarkdownHeading` | — | 按标题层级切分（规划中） |
+| `MarkdownHeading` | 按最大字符数 | 按标题层级切分 |
 
 ### 嵌入模型
 

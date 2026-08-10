@@ -8,10 +8,10 @@ AI Agent 核心框架 — 提供 Agent 组装、会话管理、知识库、MCP �
 WorkSpace（用户隔离核心）
 ├── SystemConfig          ← 系统级配置（providers.toml + mcpconfig.json）
 ├── UserConfig            ← 用户级配置（Merge 深递归合并）
-├── ToolFactory           ← 内置工具注册表（13 个工具）
+├── ToolRegister          ← 内置工具注册表（26 个工具）
 ├── SkillRegister          ← Skill 发现与生命周期管理
 ├── KnowledgeManager      ← 知识库管理（增量同步 + 混合检索）
-├── PersonalMemoryStore   ← PPA 个人记忆存储（三层记忆模型）
+├── WorkflowManager       ← Workflow 定义管理（加载/缓存/执行）
 └── [create_agent()]      ← 从 agent.md 组装完整 Agent 实例
 ```
 
@@ -38,13 +38,12 @@ WorkSpace（用户隔离核心）
 | [`executor`](src/executor/mod.rs) | AgentExecutor 外观层：SingleTurn / MultiTurn / agent-as-tool |
 | [`config`](src/config/mod.rs) | 配置系统：SystemConfig + UserConfig + Merge 深递归合并，providers.toml + MCP 注册表 |
 | [`workspace`](src/workspace/mod.rs) | 用户隔离核心：WorkSpace、WorkspaceError、模板初始化 |
-| [`personal_memory`](src/personal_memory/mod.rs) | PPA 个人记忆：PersonalMemoryStore、MemoryFact/UserProfile/TurnContext 类型与配置 |
-| [`knowledge`](src/knowledge/mod.rs) | 知识库管理：文件哈希追踪、增量同步（工具移至 `tools/knowledge.rs`） |
-| [`mcp`](src/mcp/mod.rs) | MCP 客户端：连接管理、工具自动同步、热重载 |
-| [`persistence`](src/persistence/mod.rs) | 会话持久化：`SessionPersister` trait + 文件持久化实现 |
+| [`workflow`](src/workflow/mod.rs) | Workflow 编排引擎：DAG 定义、拓扑执行、条件门控、模板变量、失败策略 |
+| [`mcp`](src/mcp/mod.rs) | MCP 客户端：连接管理、工具自动同步、热重载（Stdio/SSE/StreamableHTTP） |
+| [`persistence`](src/persistence/mod.rs) | 会话持久化：`SessionPersister` trait + FileSessionPersister + NullSessionPersister |
 | [`session`](src/session/mod.rs) | 多轮对话状态管理：Session、消息缓冲、Snapshot |
 | [`skills`](src/skills/mod.rs) | Skill 系统：三层渐进式加载、YAML frontmatter 解析 |
-| [`tools`](src/tools/mod.rs) | 工具抽象层：`Tool`/`ToolDyn` trait、`ToolFactory`、13 个内置工具（含 PPA 记忆工具） |
+| [`tools`](src/tools/mod.rs) | 工具抽象层：`Tool`/`ToolDyn` trait、`ToolRegister`、26 个内置工具（shell/fetch + Agent/Skill/Workflow/MCP/KB 完整 CRUD） |
 
 ## 快速开始
 

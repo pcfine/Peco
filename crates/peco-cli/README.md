@@ -65,15 +65,13 @@ cargo run -p peco-cli
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|---------|--------|------|
-| `-a`, `--agent` | `PECO_AGENT_PATH` | `@assistant` | Agent 名称（从 workspace 的 `agents/` 目录加载）或 `agent.md` 文件路径 |
+| `-t`, `--init-template` | `PECO_INIT_TEMPLATE` | — | 从内置模板初始化 workspace（personal / minimal / developer） |
 | `-w`, `--workspace` | `PECO_WORKSPACE` | `./` | WorkSpace 根目录 |
-| `-s`, `--session` | — | — | 恢复指定 ID 的会话 |
-| `--no-persist` | — | false | 禁用会话持久化 |
-| `--list-sessions` | — | — | 列出已保存的会话并退出 |
-| `--sessions-dir` | `PC_AGENT_SESSIONS_DIR` | — | 会话存储目录 |
 | `--no-color` | `NO_COLOR` | false | 禁用彩色输出 |
 | `--show-reasoning` | — | true | 显示模型推理过程 |
 | `--show-tools` | — | true | 显示工具调用详情 |
+
+启动时通过终端交互菜单选择 Agent 和 Session，无需通过命令行指定。
 
 ## Agent 定义
 
@@ -108,39 +106,33 @@ max_turns: 30
 
 ### 工具列表
 
-| 工具名 | 说明 |
-|--------|------|
-| `shell` | 执行终端命令 |
-| `fetch` | 获取网页内容 |
-| `read_skill` | 读取已注册的 Skill 内容 |
-| `delegate_sub_agent` | 委派子 Agent 串行执行 |
-| `run_parallel_sub_agents` | 启动多个子 Agent 并行执行 |
-| `search_knowledge` | 搜索知识库 |
-| `list_knowledge_bases` | 列出知识库 |
-| `add_to_knowledge_base` | 向知识库添加文档 |
-| `sync_knowledge_base` | 同步知识库 |
-| `get_knowledge_base_docs` | 获取知识库文档列表 |
+CLI 中 Agent 可用的工具由 workspace 中 agent.md 的 `tools` 字段声明。完整工具列表参见 peco-core 的 `ToolRegister`（26 个工具）：
+
+| 分类 | 工具 |
+|------|------|
+| 通用 | `shell`, `fetch`, `show_workspace` |
+| Agent | `delegate_sub_agent`, `run_parallel_sub_agents`, `save_agent`, `read_agent`, `delete_agent` |
+| Skill | `read_skill`, `list_skills`, `save_skill`, `delete_skill` |
+| Workflow | `execute_workflow`, `list_workflows`, `save_workflow`, `delete_workflow` |
+| MCP | `list_mcp_servers`, `save_mcp_server`, `delete_mcp_server` |
+| 知识库 | `search_knowledge`, `list_knowledge_bases`, `add_to_knowledge_base`, `sync_knowledge_base`, `get_knowledge_base_docs`, `add_facts_to_knowledge_base`, `query_entity_facts` |
 
 ## 使用示例
 
 ```bash
-# 使用默认 workspace（./）和默认 Agent（@assistant）
+# 初始化 workspace（从内置模板，首次使用推荐）
+peco -t personal       # 个人助手
+peco -t developer      # 开发辅助
+peco -t minimal        # 最轻量对话
+
+# 使用默认 workspace（./）启动交互式对话
 peco
 
-# 使用指定的 Agent 名称（从 workspace 的 agents/ 目录加载）
-peco --agent code-reviewer
-
-# 直接指定 agent.md 文件路径（向后兼容）
-peco --agent /path/to/my-agent.md
-
 # 指定 workspace 目录
-peco --workspace ~/my-peco-workspace --agent @assistant
+peco --workspace ~/my-peco-workspace
 
-# 恢复之前的会话
-peco --session <session-id>
-
-# 列出已保存的会话
-peco --list-sessions
+# 禁用彩色输出和工具显示
+peco --no-color --show-tools=false
 ```
 
 ## 终端快捷键
