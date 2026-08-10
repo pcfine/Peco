@@ -93,6 +93,8 @@ export interface StepResultResponse {
   stepName: string;
   stepType: string;
   outcome: string;
+  error?: string;
+  reason?: string;
   output?: string;
   durationMs: number;
   attempt: number;

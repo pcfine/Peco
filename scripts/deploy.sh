@@ -163,7 +163,7 @@ PECO_SERVER_HOST=$SERVER_HOST
 PECO_SERVER_PORT=$SERVER_PORT
 PECO_DATA_DIR=$DATA_DIR
 PECO_DATABASE_URL=sqlite:$DATA_DIR/server.db?mode=rwc
-RUST_LOG=peco_server=info,tower_http=warn
+RUST_LOG=peco=info,tower_http=warn
 EOF
 chmod 600 /etc/peco-server/env
 

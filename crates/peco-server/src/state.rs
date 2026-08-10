@@ -8,7 +8,11 @@ use std::sync::Arc;
 use peco_core::config::SystemConfig;
 use sqlx::SqlitePool;
 
+use peco_core::workflow::WorkflowEvent;
+use tokio::sync::broadcast;
+
 use crate::config::ServerConfig;
+use crate::workflow::WorkflowEventSource;
 use crate::workflow::persister::SqliteWorkflowPersister;
 use crate::workflow::scheduler::CronScheduler;
 use crate::workspace::WorkspaceManager;
@@ -84,5 +88,11 @@ impl AppState {
     /// 为指定用户创建 workflow 持久化实例（per-user pattern）。
     pub fn workflow_persister_for(&self, user_id: &str) -> SqliteWorkflowPersister {
         SqliteWorkflowPersister::new(self.db.clone(), user_id.to_string())
+    }
+}
+
+impl WorkflowEventSource for AppState {
+    fn subscribe_events(&self, run_id: &str) -> Option<broadcast::Receiver<WorkflowEvent>> {
+        crate::workflow::active::subscribe_events(run_id)
     }
 }

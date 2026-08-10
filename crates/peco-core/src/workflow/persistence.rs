@@ -44,6 +44,9 @@ pub struct WorkflowSnapshot {
     pub workflow_name: String,
     pub definition: WorkflowDefinition,
     pub state: WorkflowSnapshotState,
+    /// Workflow 级错误信息（Paused 时存暂停原因，Failed 时存失败原因）。
+    /// 引擎在 snapshot 构建时从失败的 step_result 或顶层错误中填充。
+    pub error: Option<String>,
     /// 外部输入参数 JSON（创建执行时传入，用于恢复/审计）。
     pub inputs_json: Option<String>,
     /// 已完成步骤的结果（用于重建 TemplateContext）
@@ -154,6 +157,7 @@ mod tests {
                 body: None,
             },
             state: WorkflowSnapshotState::Completed,
+            error: None,
             inputs_json: None,
             step_results,
             current_level: 1,
@@ -171,6 +175,7 @@ mod tests {
         assert_eq!(restored.run_id, snapshot.run_id);
         assert_eq!(restored.workflow_name, snapshot.workflow_name);
         assert_eq!(restored.state, snapshot.state);
+        assert_eq!(restored.error, snapshot.error);
         assert_eq!(restored.current_level, snapshot.current_level);
         assert_eq!(restored.step_results.len(), 1);
         assert!(restored.step_results.contains_key("A"));

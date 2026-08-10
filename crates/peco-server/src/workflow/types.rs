@@ -108,7 +108,6 @@ pub struct ExecutionListResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionDetailResponse {
-    #[serde(flatten)]
     pub summary: ExecutionSummary,
     pub inputs: Option<Value>,
     pub error: Option<String>,
@@ -122,7 +121,14 @@ pub struct StepResultResponse {
     pub step_id: String,
     pub step_name: String,
     pub step_type: String,
+    /// "success" | "failed" | "skipped" — 精确匹配，不用 Debug 格式化
     pub outcome: String,
+    /// 失败时的错误信息（仅 outcome = "failed" 时有值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 跳过原因（仅 outcome = "skipped" 时有值，如 "condition false"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub output: Option<String>,
     pub duration_ms: u64,
     pub attempt: usize,

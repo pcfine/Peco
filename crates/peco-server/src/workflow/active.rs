@@ -66,7 +66,6 @@ pub async fn approve_run(run_id: &str, decision: ApprovalDecision, note: Option<
 /// 返回 broadcast Receiver，调用方可通过 `recv().await` 消费事件。
 /// 若执行不存在或已完成，返回 None。
 /// Phase 3 由 SSE endpoint 调用。
-#[allow(dead_code)]
 pub fn subscribe_events(run_id: &str) -> Option<broadcast::Receiver<WorkflowEvent>> {
     let map = ACTIVE.lock().unwrap();
     map.get(run_id).map(|entry| entry.event_tx.subscribe())

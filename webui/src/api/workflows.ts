@@ -262,7 +262,7 @@ function hydrateFromSnapshot(
           runId: detail.summary.runId,
           stepId: step.stepId,
           stepName: step.stepName,
-          error: step.output ?? "Unknown error",
+          error: step.error ?? step.output ?? "Unknown error",
           durationMs: step.durationMs,
           attempt: step.attempt,
           failurePolicy: "abort",
@@ -274,7 +274,7 @@ function hydrateFromSnapshot(
           runId: detail.summary.runId,
           stepId: step.stepId,
           stepName: step.stepName,
-          reason: "Condition not met",
+          reason: step.reason ?? step.error ?? "Condition not met",
         });
         break;
     }

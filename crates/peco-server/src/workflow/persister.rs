@@ -35,6 +35,7 @@ fn snapshot_to_db_json(snapshot: &WorkflowSnapshot) -> serde_json::Value {
         "run_id": snapshot.run_id,
         "workflow_name": snapshot.workflow_name,
         "state": snapshot.state,
+        "error": snapshot.error,
         "inputs_json": snapshot.inputs_json,
         "step_results": snapshot.step_results,
         "current_level": snapshot.current_level,
@@ -61,7 +62,7 @@ fn db_json_to_snapshot(
     started_at: &str,
     finished_at: Option<&str>,
 ) -> Result<WorkflowSnapshot, WorkflowError> {
-    let (step_results, current_level, inputs_json, total_steps) =
+    let (step_results, current_level, inputs_json, total_steps, snapshot_error) =
         if let Some(json_str) = snapshot_json {
             let parsed: serde_json::Value = serde_json::from_str(json_str)
                 .map_err(|e| WorkflowError::Persist(e.to_string()))?;
@@ -88,9 +89,13 @@ fn db_json_to_snapshot(
                 .get("total_steps")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
-            (results, level, inputs, ts)
+            let err: Option<String> = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (results, level, inputs, ts, err)
         } else {
-            (Default::default(), 0, None, 0)
+            (Default::default(), 0, None, 0, None)
         };
 
     let snapshot_state = match state {
@@ -124,6 +129,7 @@ fn db_json_to_snapshot(
         workflow_name: workflow_name.to_string(),
         definition,
         state: snapshot_state,
+        error: snapshot_error,
         inputs_json,
         step_results,
         current_level,
@@ -171,13 +177,15 @@ impl WorkflowPersister for SqliteWorkflowPersister {
         };
 
         // UPSERT 模式：先尝试 UPDATE，无行影响则 INSERT
+        let error_str = snapshot.error.as_deref();
         let rows = sqlx::query(
-            "UPDATE workflow_executions SET status = ?, steps_completed = ?, \
+            "UPDATE workflow_executions SET status = ?, error = ?, steps_completed = ?, \
              steps_failed = ?, steps_skipped = ?, snapshot_json = ?, \
              total_steps = ?, finished_at = ? \
              WHERE id = ? AND user_id = ?",
         )
         .bind(status)
+        .bind(error_str)
         .bind(steps_completed)
         .bind(steps_failed)
         .bind(steps_skipped)
@@ -203,15 +211,16 @@ impl WorkflowPersister for SqliteWorkflowPersister {
 
             sqlx::query(
                 "INSERT INTO workflow_executions (id, user_id, workflow_name, trigger_type, \
-                 status, inputs_json, total_steps, steps_completed, steps_failed, \
+                 status, error, inputs_json, total_steps, steps_completed, steps_failed, \
                  steps_skipped, snapshot_json, started_at, finished_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&snapshot.run_id)
             .bind(&self.user_id)
             .bind(&snapshot.workflow_name)
             .bind(trigger_type)
             .bind(status)
+            .bind(error_str)
             .bind(&snapshot.inputs_json)
             .bind(total_steps)
             .bind(steps_completed)

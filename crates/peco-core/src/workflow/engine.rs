@@ -51,7 +51,7 @@ impl Default for WorkflowConfig {
 /// loop {
 ///     match handle.recv_event().await {
 ///         Some(WorkflowEvent::StepCompleted { .. }) => { /* 记录 */ }
-        // run_id 可通过 event 直接获取，无需外部注入
+// run_id 可通过 event 直接获取，无需外部注入
 ///         Some(WorkflowEvent::Completed { .. }) => break,
 ///         Some(WorkflowEvent::Failed { .. }) => break,
 ///         Some(WorkflowEvent::Paused { .. }) => {
@@ -122,6 +122,7 @@ impl WorkflowEngine {
     fn build_snapshot(
         &self,
         state: WorkflowSnapshotState,
+        error: Option<String>,
         step_results: &HashMap<String, super::definition::StepResult>,
         current_level: usize,
         started_at: chrono::DateTime<chrono::Utc>,
@@ -132,6 +133,7 @@ impl WorkflowEngine {
             workflow_name: self.definition.name.clone(),
             definition: self.definition.clone(),
             state,
+            error,
             inputs_json,
             step_results: step_results.clone(),
             current_level,
@@ -157,6 +159,7 @@ impl WorkflowEngine {
         let validated_inputs = match self.definition.validate_inputs(&inputs) {
             Ok(v) => v,
             Err(e) => {
+                let error_msg = e.to_string();
                 let inputs_json = serde_json::to_string(&inputs).ok();
                 let _ = self
                     .persister
@@ -165,6 +168,7 @@ impl WorkflowEngine {
                         workflow_name: self.definition.name.clone(),
                         definition: self.definition.clone(),
                         state: WorkflowSnapshotState::Failed,
+                        error: Some(error_msg.clone()),
                         inputs_json,
                         step_results: HashMap::new(),
                         current_level: 0,
@@ -175,7 +179,7 @@ impl WorkflowEngine {
                     .await;
                 let _ = event_tx.try_send(WorkflowEvent::Failed {
                     run_id,
-                    error: e.to_string(),
+                    error: error_msg,
                     failed_at_step: None,
                     total_duration_ms: 0,
                 });
@@ -187,6 +191,7 @@ impl WorkflowEngine {
         let dag = match DagGraph::build(&self.definition.steps) {
             Ok(dag) => dag,
             Err(e) => {
+                let error_msg = e.to_string();
                 let inputs_json = serde_json::to_string(&inputs).ok();
                 let _ = self
                     .persister
@@ -195,6 +200,7 @@ impl WorkflowEngine {
                         workflow_name: self.definition.name.clone(),
                         definition: self.definition.clone(),
                         state: WorkflowSnapshotState::Failed,
+                        error: Some(error_msg.clone()),
                         inputs_json,
                         step_results: HashMap::new(),
                         current_level: 0,
@@ -205,7 +211,7 @@ impl WorkflowEngine {
                     .await;
                 let _ = event_tx.try_send(WorkflowEvent::Failed {
                     run_id,
-                    error: e.to_string(),
+                    error: error_msg,
                     failed_at_step: None,
                     total_duration_ms: 0,
                 });
@@ -305,6 +311,7 @@ impl WorkflowEngine {
                 tokio::task::JoinHandle<super::definition::StepResult>,
             )> = VecDeque::from(handles);
             let mut aborted = false;
+            let mut abort_error: Option<String> = None;
 
             while let Some((step_id, handle)) = remaining.pop_front() {
                 // 如果已触发 abort，显式 abort 所有剩余 handle
@@ -364,30 +371,36 @@ impl WorkflowEngine {
                 let _ = event_tx.try_send(event);
 
                 // 检查失败策略
-                if result.outcome.is_failed() {
+                if let StepOutcome::Failed(step_error) = &result.outcome {
+                    let step_error = step_error.clone();
                     match result.step.on_failure {
                         OnFailure::Abort => {
+                            let workflow_err =
+                                format!("Step '{}' failed: {}", result.step.id, step_error);
                             let _ = event_tx.try_send(WorkflowEvent::Failed {
                                 run_id: run_id.clone(),
-                                error: format!("Step '{}' failed", result.step.id,),
+                                error: workflow_err.clone(),
                                 failed_at_step: Some(result.step.id.clone()),
                                 total_duration_ms: start.elapsed().as_millis() as u64,
                             });
                             aborted = true;
+                            abort_error = Some(workflow_err);
                             // 不清空 remaining — while 循环顶部会 abort 所有剩余项
                         }
                         OnFailure::Pause => {
+                            let pause_reason = format!(
+                                "Step '{}' failed: {step_error}, waiting for approval",
+                                result.step.id,
+                            );
                             let _ = event_tx.try_send(WorkflowEvent::Paused {
                                 run_id: run_id.clone(),
-                                reason: format!(
-                                    "Step '{}' failed, waiting for approval",
-                                    result.step.id
-                                ),
+                                reason: pause_reason.clone(),
                                 paused_at_step: Some(result.step.id.clone()),
                             });
                             // 持久化暂停快照
                             let snapshot = self.build_snapshot(
                                 WorkflowSnapshotState::Paused,
+                                Some(pause_reason),
                                 &step_results,
                                 level_idx,
                                 started_at,
@@ -401,9 +414,13 @@ impl WorkflowEngine {
                                     ..
                                 })
                                 | None => {
+                                    let abort_reason = format!(
+                                        "User aborted after step '{}' failed: {step_error}",
+                                        result.step.id,
+                                    );
                                     let _ = event_tx.try_send(WorkflowEvent::Failed {
                                         run_id,
-                                        error: "User aborted after pause".into(),
+                                        error: abort_reason,
                                         failed_at_step: Some(result.step.id.clone()),
                                         total_duration_ms: start.elapsed().as_millis() as u64,
                                     });
@@ -447,6 +464,7 @@ impl WorkflowEngine {
                 // 持久化失败快照
                 let snapshot = self.build_snapshot(
                     WorkflowSnapshotState::Failed,
+                    abort_error,
                     &step_results,
                     level_idx,
                     started_at,
@@ -463,6 +481,7 @@ impl WorkflowEngine {
             // 层级完成：持久化 Running 快照
             let snapshot = self.build_snapshot(
                 WorkflowSnapshotState::Running,
+                None,
                 &step_results,
                 level_idx + 1,
                 started_at,
@@ -474,6 +493,7 @@ impl WorkflowEngine {
         // 5. 完成 — 持久化最终快照
         let snapshot = self.build_snapshot(
             WorkflowSnapshotState::Completed,
+            None,
             &step_results,
             levels.len(),
             started_at,

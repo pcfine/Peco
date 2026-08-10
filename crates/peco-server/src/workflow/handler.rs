@@ -9,7 +9,7 @@ use std::time::Instant;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use peco_core::workflow::WorkflowConfig;
+use peco_core::workflow::{StepOutcome, WorkflowConfig};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -335,35 +335,54 @@ pub async fn get_execution(
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
 
-    // 从 snapshot_json 提取 step_results
-    let step_results = row
+    // 从 snapshot_json 提取 step_results 和 workflow-level error
+    let (step_results, snapshot_error) = row
         .snapshot_json
         .as_deref()
         .and_then(|s| {
             let parsed: serde_json::Value = serde_json::from_str(s).ok()?;
             let results: HashMap<String, peco_core::workflow::StepResult> =
                 serde_json::from_value(parsed.get("step_results")?.clone()).ok()?;
-            Some(
-                results
-                    .into_iter()
-                    .map(|(id, r)| StepResultResponse {
+            let snap_err: Option<String> = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let step_results = results
+                .into_iter()
+                .map(|(id, r)| {
+                    let (outcome, error, reason) = match &r.outcome {
+                        StepOutcome::Success(_) => ("success".to_string(), None, None),
+                        StepOutcome::Skipped(reason) => {
+                            ("skipped".to_string(), None, Some(reason.clone()))
+                        }
+                        StepOutcome::Failed(err) => {
+                            ("failed".to_string(), Some(err.clone()), None)
+                        }
+                    };
+                    StepResultResponse {
                         step_id: id,
                         step_name: r.step.name.clone(),
                         step_type: format!("{:?}", r.step.step_type).to_lowercase(),
-                        outcome: format!("{:?}", r.outcome).to_lowercase(),
+                        outcome,
+                        error,
+                        reason,
                         output: r.output,
                         duration_ms: r.duration.as_millis() as u64,
                         attempt: r.attempt,
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                    }
+                })
+                .collect::<Vec<_>>();
+            Some((step_results, snap_err))
         })
         .unwrap_or_default();
+
+    // Prefer snapshot-level error (from engine), fall back to DB row error
+    let execution_error = snapshot_error.or(row.error);
 
     Ok(Json(ExecutionDetailResponse {
         summary,
         inputs,
-        error: row.error,
+        error: execution_error,
         step_results,
     }))
 }
