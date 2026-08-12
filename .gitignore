@@ -8,3 +8,4 @@ dist/
 **/knowledge/**/__manifest/
 **/knowledge/**/*.lance/
 **/knowledge/**/file_hashes.json
+docs/

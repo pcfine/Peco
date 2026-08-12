@@ -355,9 +355,7 @@ pub async fn get_execution(
                         StepOutcome::Skipped(reason) => {
                             ("skipped".to_string(), None, Some(reason.clone()))
                         }
-                        StepOutcome::Failed(err) => {
-                            ("failed".to_string(), Some(err.clone()), None)
-                        }
+                        StepOutcome::Failed(err) => ("failed".to_string(), Some(err.clone()), None),
                     };
                     StepResultResponse {
                         step_id: id,
