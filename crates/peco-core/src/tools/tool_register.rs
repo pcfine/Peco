@@ -9,7 +9,7 @@ use crate::tools::{
     DeleteAgent, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs, ListKnowledgeBases,
     ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill, RunParallelSubAgents,
     SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellExec, ShowWorkspace,
-    SyncKnowledgeBase, ToolDyn, ToolExecutor,
+    SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolExecutor,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -114,6 +114,12 @@ impl ToolRegister {
                             "delete_mcp_server tool requires mcp_access in ToolDependencies",
                         );
                         Some(Box::new(DeleteMcpServer::new(ma)))
+                    }
+                    "test_mcp_connection" => {
+                        let ma = deps.mcp_access.clone().expect(
+                            "test_mcp_connection tool requires mcp_access in ToolDependencies",
+                        );
+                        Some(Box::new(TestMcpConnection::new(ma)))
                     }
 
                     // ── Knowledge 依赖 ──────────────────────

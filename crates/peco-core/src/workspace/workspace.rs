@@ -171,6 +171,19 @@ impl WorkSpace {
         self.agent_manager.reload_mcp_config(&self.root, system_mcp)
     }
 
+    /// 原子替换整个 MCP 配置（校验 → 写盘 → 更新内存，在一次锁内完成）。
+    ///
+    /// 相比先写文件再 `reload_mcp_config()` 的两步模式，此方法保证磁盘与内存一致，
+    /// 且写入失败时内存状态保持不变。
+    pub fn replace_mcp_config(&self, new_config: McpConfig) -> Result<(), String> {
+        self.agent_manager
+            .mcp_config_store()
+            .atomic_update(&self.root, |config| {
+                *config = new_config;
+                Ok(())
+            })
+    }
+
     /// 重新加载单个 Agent 的缓存（Tier-2 失效 + Tier-1 刷新）。
     ///
     /// 适用于 agent.md 文件被外部修改（如 IDE 编辑）后的场景。
@@ -534,5 +547,10 @@ impl McpAccess for WorkSpace {
                 }
                 Ok(())
             })
+    }
+
+    fn get_mcp_server_config(&self, name: &str) -> Option<crate::config::McpServerConfig> {
+        let config = self.agent_manager.mcp_config_store().get();
+        config.mcp_servers.get(name).cloned()
     }
 }

@@ -1,5 +1,5 @@
 import api from "./client";
-import type { McpConfigResponse } from "@/types/mcp";
+import type { McpConfigResponse, McpTestResult } from "@/types/mcp";
 
 export async function getMcpConfig(): Promise<McpConfigResponse> {
   const res = await api.get<McpConfigResponse>("/mcp");
@@ -16,10 +16,8 @@ export async function saveMcpConfig(
   return res.data;
 }
 
-export async function testMcpConnection(
-  name: string,
-): Promise<{ success: boolean; message?: string }> {
-  const res = await api.post<{ success: boolean; message?: string }>(
+export async function testMcpConnection(name: string): Promise<McpTestResult> {
+  const res = await api.post<McpTestResult>(
     `/mcp/${encodeURIComponent(name)}/test`,
   );
   return res.data;

@@ -75,6 +75,9 @@ pub trait McpAccess: Send + Sync {
     fn add_mcp_server(&self, name: &str, config: McpServerConfig) -> Result<(), String>;
     /// 从配置中移除指定的 MCP Server（不可逆）。
     fn remove_mcp_server(&self, name: &str) -> Result<(), String>;
+    /// 获取指定 MCP Server 的完整配置。
+    /// 返回 None 表示该 Server 未在配置中注册。
+    fn get_mcp_server_config(&self, name: &str) -> Option<McpServerConfig>;
 }
 
 // ============================================================================

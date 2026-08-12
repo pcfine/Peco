@@ -7,6 +7,7 @@ mod deps;
 mod fetch;
 mod knowledge;
 mod mcp_config_tools;
+mod mcp_test_tool;
 mod read_agent;
 mod save_agent;
 mod shell;
@@ -26,6 +27,7 @@ pub use knowledge::{
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use mcp_config_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer};
+pub use mcp_test_tool::TestMcpConnection;
 pub use read_agent::ReadAgent;
 pub use save_agent::SaveAgent;
 pub use shell::ShellExec;

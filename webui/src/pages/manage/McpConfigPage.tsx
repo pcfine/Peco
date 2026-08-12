@@ -24,7 +24,12 @@ import {
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { getMcpConfig, saveMcpConfig, testMcpConnection } from "@/api/mcp";
-import type { McpServerConfig, TransportType } from "@/types/mcp";
+import type {
+  McpServerConfig,
+  McpTestErrorType,
+  McpTestResult,
+  TransportType,
+} from "@/types/mcp";
 import {
   Plus,
   Save,
@@ -86,6 +91,8 @@ function unquote(s: string): string {
 
 function getApiErrorMessage(err: unknown): string | undefined {
   if (axios.isAxiosError(err)) {
+    // 后端 ApiError 序列化为 { "error": "...", "details": "..." }
+    if (err.response?.data?.details) return String(err.response.data.details);
     if (err.response?.data?.message) return String(err.response.data.message);
     if (err.message) return err.message;
   }
@@ -271,7 +278,7 @@ export function McpConfigPage() {
     return true;
   };
 
-  const handleDialogSubmit = () => {
+  const handleDialogSubmit = async () => {
     // Validate name
     const name = dialogForm.name.trim();
     if (!name) {
@@ -287,8 +294,21 @@ export function McpConfigPage() {
 
     setNameError("");
     const serverConfig = dialogFormToConfig(dialogForm);
-    setConfig((prev) => ({ ...prev, [name]: serverConfig }));
-    closeDialog();
+    const nextConfig = { ...config, [name]: serverConfig };
+
+    // 立即持久化到后端，避免"保存修改"仅更新前端 state 导致文件未更新
+    setSaving(true);
+    try {
+      await saveMcpConfig({ mcpServers: nextConfig });
+      setConfig(nextConfig);
+      setInitialJson(JSON.stringify({ mcpServers: nextConfig }));
+      closeDialog();
+      toast.success("配置已保存");
+    } catch (err) {
+      toast.error(getApiErrorMessage(err) || "保存失败");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleTransportChange = (transport: TransportType) => {
@@ -322,22 +342,56 @@ export function McpConfigPage() {
     setDeleteTarget(name);
   };
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
     if (!deleteTarget) return;
     const name = deleteTarget;
-    setConfig((prev) => {
-      const next = { ...prev };
-      delete next[name];
-      return next;
-    });
-    setDeleteTarget(null);
+    const nextConfig = { ...config };
+    delete nextConfig[name];
+
+    // 立即持久化到后端
+    setSaving(true);
+    try {
+      await saveMcpConfig({ mcpServers: nextConfig });
+      setConfig(nextConfig);
+      setInitialJson(JSON.stringify({ mcpServers: nextConfig }));
+      setDeleteTarget(null);
+      toast.success("配置已删除");
+    } catch (err) {
+      toast.error(getApiErrorMessage(err) || "删除失败");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleTest = async (name: string) => {
     setTesting(name);
     try {
-      const result = await testMcpConnection(name);
-      toast.success(result.message || `连接 ${name} 测试成功`);
+      const result: McpTestResult = await testMcpConnection(name);
+      if (result.success) {
+        toast.success(
+          `${name} 连接成功 — 发现 ${result.tool_count} 个工具：${result.tools.join(", ")}（耗时 ${result.duration_ms}ms）`,
+        );
+      } else {
+        // 根据 error_type 给出差异化提示
+        const hints: Record<McpTestErrorType, string> = {
+          config_not_found: "请检查 MCP 配置是否已保存",
+          invalid_config: "请检查必填字段（command 或 url）是否填写正确",
+          connection_refused: "请确认 MCP Server 已启动且端口可访问",
+          connection_timeout: "请检查网络连接或增加超时时间",
+          handshake_failed:
+            "MCP 协议握手失败，请确认 Server 实现了正确的 MCP 协议",
+          transport_error: "传输层错误，请检查 DNS、TLS 证书或代理配置",
+          tool_list_failed:
+            "连接成功但获取工具列表失败，请检查 Server 端工具注册逻辑",
+        };
+        const hint = result.error_type ? hints[result.error_type] : "";
+        toast.error(
+          `测试 ${name} 失败：${result.message}（耗时 ${result.duration_ms}ms）`,
+          {
+            description: hint || result.error_type,
+          },
+        );
+      }
     } catch (err) {
       toast.error(getApiErrorMessage(err) || `连接 ${name} 测试失败`);
     } finally {
@@ -422,8 +476,8 @@ export function McpConfigPage() {
                         variant="ghost"
                         size="icon"
                         onClick={() => handleTest(name)}
-                        disabled={isTesting}
-                        title="测试连接"
+                        disabled={testing !== null}
+                        title={testing !== null ? "正在测试中..." : "测试连接"}
                       >
                         <RefreshCw
                           className={`h-4 w-4 ${isTesting ? "animate-spin" : ""}`}
@@ -489,7 +543,11 @@ export function McpConfigPage() {
             <Button variant="outline" onClick={() => setDeleteTarget(null)}>
               取消
             </Button>
-            <Button variant="destructive" onClick={handleDelete}>
+            <Button
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={saving}
+            >
               删除
             </Button>
           </DialogFooter>
@@ -680,7 +738,7 @@ export function McpConfigPage() {
             </Button>
             <Button
               onClick={handleDialogSubmit}
-              disabled={!isDialogFormValid()}
+              disabled={!isDialogFormValid() || saving}
             >
               {editingName ? "保存修改" : "添加"}
             </Button>

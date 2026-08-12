@@ -71,34 +71,39 @@ impl McpConfigStore {
     {
         let mut guard = self.config.write().expect("McpConfigStore RwLock poisoned");
 
-        // 1. 应用变更
-        f(&mut guard)?;
+        // 在副本上应用变更，避免失败时污染内存（写盘成功后才写回）
+        let mut new_config = guard.clone();
+
+        // 1. 在副本上应用变更
+        f(&mut new_config)?;
 
         // 2. 校验完整配置
-        guard
+        new_config
             .validate()
             .map_err(|e| format!("Invalid MCP config: {e}"))?;
 
         // 3. 原子写入磁盘（先写临时文件再重命名）
         let path = workspace_root.join("mcpconfig.json");
         let tmp_path = workspace_root.join(".mcpconfig.json.tmp");
-        let json = serde_json::to_string_pretty(&*guard)
+        let json = serde_json::to_string_pretty(&new_config)
             .map_err(|e| format!("Failed to serialize MCP config: {e}"))?;
         std::fs::write(&tmp_path, &json).map_err(|e| format!("Failed to write MCP config: {e}"))?;
         std::fs::rename(&tmp_path, &path)
             .map_err(|e| format!("Failed to commit MCP config: {e}"))?;
 
-        let count = guard.mcp_servers.len();
+        // 4. 写盘成功后，才更新内存
+        let count = new_config.mcp_servers.len();
+        *guard = new_config;
         info!(servers = count, "MCP 配置已原子更新");
         Ok(())
     }
 
     /// 从工作空间根目录重新加载 MCP 配置。
     ///
-    /// 读取 `{workspace_root}/mcpconfig.json`。若用户级文件不存在或解析失败，
-    /// 回退到 `system_mcp`。解析时会执行校验（如 stdio 传输必须有 command 字段）。
+    /// 读取 `{workspace_root}/mcpconfig.json`。若文件不存在，回退到 `system_mcp`。
+    /// **若文件存在但解析或校验失败，保留当前内存配置不变**（而非覆盖为回退配置）。
     ///
-    /// 返回新配置中 MCP 服务器的数量。
+    /// 返回新配置中 MCP 服务器的数量。失败时返回当前内存中的服务器数量。
     pub fn reload(&self, workspace_root: &Path, system_mcp: &McpConfig) -> usize {
         let user_mcp_path = workspace_root.join("mcpconfig.json");
 
@@ -110,18 +115,28 @@ impl McpConfigStore {
                         tracing::warn!(
                             error = %e,
                             path = %user_mcp_path.display(),
-                            "解析用户 mcpconfig.json 失败，使用系统回退配置"
+                            "解析用户 mcpconfig.json 失败，保留当前内存配置"
                         );
-                        system_mcp.clone()
+                        return self
+                            .config
+                            .read()
+                            .expect("McpConfigStore RwLock poisoned")
+                            .mcp_servers
+                            .len();
                     }
                 },
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         path = %user_mcp_path.display(),
-                        "读取用户 mcpconfig.json 失败，使用系统回退配置"
+                        "读取用户 mcpconfig.json 失败，保留当前内存配置"
                     );
-                    system_mcp.clone()
+                    return self
+                        .config
+                        .read()
+                        .expect("McpConfigStore RwLock poisoned")
+                        .mcp_servers
+                        .len();
                 }
             }
         } else {
@@ -170,28 +185,69 @@ mod tests {
     }
 
     #[test]
-    fn reload_invalid_json_uses_fallback() {
+    fn reload_invalid_json_preserves_current_config() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("mcpconfig.json"), "not json").unwrap();
 
-        let store = McpConfigStore::new(McpConfig::empty());
+        // 先在 store 中放入一个有效配置（模拟已有配置）
+        let valid_json =
+            r#"{"mcpServers": {"existing": {"transport": "stdio", "command": "echo"}}}"#;
+        let existing = McpConfig::from_json_str(valid_json).unwrap();
+        let store = McpConfigStore::new(existing);
         let fallback = McpConfig::empty();
         let count = store.reload(tmp.path(), &fallback);
-        // 回退到系统配置（空）
-        assert_eq!(count, 0);
+        // 解析失败 → 保留当前内存配置（1 个 server），不覆盖为空
+        assert_eq!(count, 1);
+        assert!(store.get().mcp_servers.contains_key("existing"));
     }
 
     #[test]
-    fn reload_invalid_config_uses_fallback() {
+    fn reload_invalid_config_preserves_current_config() {
         let tmp = tempfile::tempdir().unwrap();
         // stdio 传输缺少 command 字段 — 校验应失败
         let json = r#"{"mcpServers": {"bad-srv": {"transport": "stdio"}}}"#;
         std::fs::write(tmp.path().join("mcpconfig.json"), json).unwrap();
 
-        let store = McpConfigStore::new(McpConfig::empty());
+        // 先在 store 中放入一个有效配置
+        let valid_json =
+            r#"{"mcpServers": {"existing": {"transport": "stdio", "command": "echo"}}}"#;
+        let existing = McpConfig::from_json_str(valid_json).unwrap();
+        let store = McpConfigStore::new(existing);
         let fallback = McpConfig::empty();
         let count = store.reload(tmp.path(), &fallback);
-        // 校验失败，回退到系统配置
-        assert_eq!(count, 0);
+        // 校验失败 → 保留当前内存配置（1 个 server），不覆盖为空
+        assert_eq!(count, 1);
+        assert!(store.get().mcp_servers.contains_key("existing"));
+    }
+
+    #[test]
+    fn atomic_update_validation_failure_preserves_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 先原子写入一个有效配置
+        let store = McpConfigStore::new(McpConfig::empty());
+        store
+            .atomic_update(tmp.path(), |config| {
+                *config = McpConfig::from_json_str(
+                    r#"{"mcpServers": {"existing": {"transport": "stdio", "command": "echo"}}}"#,
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        // 尝试原子写入一个无效配置：stdio 缺 command
+        // 用 serde_json::from_str（不校验）构造，让它在 atomic_update 的 validate() 阶段失败
+        let result = store.atomic_update(tmp.path(), |config| {
+            *config =
+                serde_json::from_str(r#"{"mcpServers": {"bad": {"transport": "stdio"}}}"#).unwrap();
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        // 内存应保留 existing，不被 "bad" 污染
+        let config = store.get();
+        assert!(config.mcp_servers.contains_key("existing"));
+        assert!(!config.mcp_servers.contains_key("bad"));
     }
 }

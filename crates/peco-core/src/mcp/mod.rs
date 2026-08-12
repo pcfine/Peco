@@ -69,6 +69,7 @@ pub mod error;
 pub mod mcp_client_handler;
 pub mod mcp_config_store;
 pub mod mcp_manager;
+pub mod test_connection;
 pub mod tool;
 
 // Re-export config types for convenience
@@ -77,4 +78,6 @@ pub use error::{McpClientError, McpError};
 pub use mcp_client_handler::McpClientHandler;
 pub use mcp_config_store::McpConfigStore;
 pub use mcp_manager::McpManager;
+pub(crate) use test_connection::fail_result_config_not_found;
+pub use test_connection::{McpTestErrorType, McpTestResult, test_mcp_connection};
 pub use tool::McpTool;
