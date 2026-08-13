@@ -45,23 +45,14 @@ fn snapshot_to_db_json(snapshot: &WorkflowSnapshot) -> serde_json::Value {
     })
 }
 
-/// 将 DB 中的快照 JSON 还原为 WorkflowSnapshot。
+/// 将 DB 行还原为 WorkflowSnapshot。
 ///
 /// `workflow_name` 和 `run_id` 从 DB 列中获取（非 JSON 内）。
 /// `definition` 需要调用方从文件系统补全。
 fn db_json_to_snapshot(
-    run_id: &str,
-    workflow_name: &str,
-    state: &str,
-    snapshot_json: Option<&str>,
-    _steps_completed: i64,
-    _steps_failed: i64,
-    _steps_skipped: i64,
-    _total_duration_ms: Option<i64>,
-    _error: Option<&str>,
-    started_at: &str,
-    finished_at: Option<&str>,
+    row: &crate::db::workflow_executions::WorkflowExecutionRow,
 ) -> Result<WorkflowSnapshot, WorkflowError> {
+    let snapshot_json = row.snapshot_json.as_deref();
     let (step_results, current_level, inputs_json, total_steps, snapshot_error) =
         if let Some(json_str) = snapshot_json {
             let parsed: serde_json::Value = serde_json::from_str(json_str)
@@ -98,7 +89,7 @@ fn db_json_to_snapshot(
             (Default::default(), 0, None, 0, None)
         };
 
-    let snapshot_state = match state {
+    let snapshot_state = match row.status.as_str() {
         "running" => WorkflowSnapshotState::Running,
         "paused" => WorkflowSnapshotState::Paused,
         "completed" => WorkflowSnapshotState::Completed,
@@ -106,16 +97,21 @@ fn db_json_to_snapshot(
         _ => WorkflowSnapshotState::Failed,
     };
 
-    let started = started_at
+    let started = row
+        .started_at
         .parse::<chrono::DateTime<chrono::Utc>>()
-        .map_err(|e| WorkflowError::Persist(format!("invalid started_at '{started_at}': {e}")))?;
-    let updated = finished_at
+        .map_err(|e| {
+            WorkflowError::Persist(format!("invalid started_at '{}': {e}", row.started_at))
+        })?;
+    let updated = row
+        .finished_at
+        .as_deref()
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
         .unwrap_or(started);
 
     // definition 留空 — 调用方在 load() 中从文件补全
     let definition = WorkflowDefinition {
-        name: workflow_name.to_string(),
+        name: row.workflow_name.clone(),
         description: String::new(),
         version: String::new(),
         timeout_seconds: None,
@@ -125,8 +121,8 @@ fn db_json_to_snapshot(
     };
 
     Ok(WorkflowSnapshot {
-        run_id: run_id.to_string(),
-        workflow_name: workflow_name.to_string(),
+        run_id: row.id.clone(),
+        workflow_name: row.workflow_name.clone(),
         definition,
         state: snapshot_state,
         error: snapshot_error,
@@ -249,19 +245,7 @@ impl WorkflowPersister for SqliteWorkflowPersister {
 
         match row {
             Some(r) => {
-                let snapshot = db_json_to_snapshot(
-                    &r.id,
-                    &r.workflow_name,
-                    &r.status,
-                    r.snapshot_json.as_deref(),
-                    r.steps_completed,
-                    r.steps_failed,
-                    r.steps_skipped,
-                    r.total_duration_ms,
-                    r.error.as_deref(),
-                    &r.started_at,
-                    r.finished_at.as_deref(),
-                )?;
+                let snapshot = db_json_to_snapshot(&r)?;
                 Ok(Some(snapshot))
             }
             None => Ok(None),
@@ -285,19 +269,7 @@ impl WorkflowPersister for SqliteWorkflowPersister {
 
         let mut snapshots = Vec::with_capacity(rows.len());
         for r in &rows {
-            let snapshot = db_json_to_snapshot(
-                &r.id,
-                &r.workflow_name,
-                &r.status,
-                r.snapshot_json.as_deref(),
-                r.steps_completed,
-                r.steps_failed,
-                r.steps_skipped,
-                r.total_duration_ms,
-                r.error.as_deref(),
-                &r.started_at,
-                r.finished_at.as_deref(),
-            )?;
+            let snapshot = db_json_to_snapshot(r)?;
             snapshots.push(snapshot);
         }
 

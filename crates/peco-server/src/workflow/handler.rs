@@ -429,11 +429,14 @@ pub async fn approve_execution(
 
 // ── 统计 ────────────────────────────────────────────────────────────────────
 
+/// 统计缓存 Key: (user_id, workflow_name, days) — user_id 确保跨用户隔离。
+type StatsCacheKey = (String, String, u32);
+/// 统计缓存条目: (写入时间, 统计结果)。
+type StatsCacheEntry = (Instant, StatisticsResponse);
+
 /// 统计缓存（60 秒 TTL）。
-/// Key: (user_id, workflow_name, days) — user_id 确保跨用户隔离。
-static STATS_CACHE: std::sync::LazyLock<
-    Mutex<HashMap<(String, String, u32), (Instant, StatisticsResponse)>>,
-> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static STATS_CACHE: std::sync::LazyLock<Mutex<HashMap<StatsCacheKey, StatsCacheEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// `GET /api/workflows/:name/statistics` — 获取 Workflow 统计。
 pub async fn get_statistics(
@@ -447,10 +450,10 @@ pub async fn get_statistics(
     // 检查缓存
     {
         let cache = STATS_CACHE.lock().unwrap();
-        if let Some((ts, stats)) = cache.get(&(user_id.clone(), name.clone(), days)) {
-            if ts.elapsed().as_secs() < 60 {
-                return Ok(Json(stats.clone()));
-            }
+        if let Some((ts, stats)) = cache.get(&(user_id.clone(), name.clone(), days))
+            && ts.elapsed().as_secs() < 60
+        {
+            return Ok(Json(stats.clone()));
         }
     }
 
