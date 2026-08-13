@@ -103,7 +103,9 @@ impl SkillRegister {
                 "Tier1 loaded: {} — {}",
                 meta.name,
                 if meta.description.len() > 80 {
-                    format!("{}...", &meta.description[..77])
+                    // 按字符边界截断，避免在多字节 UTF-8 字符中间切分导致 panic。
+                    let truncated: String = meta.description.chars().take(77).collect();
+                    format!("{truncated}...")
                 } else {
                     meta.description.clone()
                 }
