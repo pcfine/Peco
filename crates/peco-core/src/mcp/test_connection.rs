@@ -269,12 +269,14 @@ pub async fn test_mcp_connection(name: &str, config: &McpServerConfig) -> McpTes
             let transport = match crate::mcp::connection::make_stdio_transport(name, config) {
                 Ok(t) => t,
                 Err(e) => {
+                    // command 已通过 validate_config 校验为非空，此处失败属于
+                    // 进程启动/传输层问题（如二进制不存在），而非配置不合法。
                     return fail_result(
                         name,
                         config,
                         start,
-                        McpTestErrorType::InvalidConfig,
-                        format!("Failed to create stdio transport: {e}"),
+                        McpTestErrorType::TransportError,
+                        format!("Failed to start stdio transport: {e}"),
                     );
                 }
             };
@@ -341,6 +343,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             timeout_secs: 30,
             max_retries: 3,
+            extra: std::collections::HashMap::new(),
         }
     }
 
@@ -380,6 +383,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             timeout_secs: 30,
             max_retries: 3,
+            extra: std::collections::HashMap::new(),
         }
     }
 

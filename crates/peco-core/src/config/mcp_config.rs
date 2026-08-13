@@ -111,6 +111,11 @@ pub struct McpServerConfig {
     /// Maximum retry attempts on connection failure.
     #[serde(default = "default_max_retries", rename = "maxRetries")]
     pub max_retries: u32,
+
+    /// 未识别的额外字段（原样保留，避免配置往返时丢失）。
+    #[serde(flatten)]
+    #[serde(default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 // ── Root config ───────────────────────────────────────────────────────────────
@@ -123,6 +128,11 @@ pub struct McpConfig {
     /// Named MCP server configurations.
     #[serde(rename = "mcpServers")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    /// 顶层未识别的额外字段（原样保留，避免配置往返时丢失）。
+    #[serde(flatten)]
+    #[serde(default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl McpConfig {
@@ -156,6 +166,7 @@ impl McpConfig {
     pub fn empty() -> Self {
         McpConfig {
             mcp_servers: HashMap::new(),
+            extra: HashMap::new(),
         }
     }
 
@@ -190,25 +201,32 @@ impl McpConfig {
 
     /// Validate the configuration for all servers.
     ///
-    /// Ensures each server has the required fields for its transport type.
+    /// Ensures each server has the required fields for its transport type
+    /// (non-empty command for stdio, non-empty url for sse/http), and a
+    /// positive connection timeout.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (name, server) in &self.mcp_servers {
             match server.transport {
                 TransportType::Stdio => {
-                    if server.command.is_none() {
+                    if server.command.as_ref().is_none_or(|c| c.trim().is_empty()) {
                         return Err(ConfigError::Validation(format!(
                             "MCP server '{name}' uses stdio transport but missing 'command' field"
                         )));
                     }
                 }
                 TransportType::Sse | TransportType::StreamableHttp => {
-                    if server.url.is_none() {
+                    if server.url.as_ref().is_none_or(|u| u.trim().is_empty()) {
                         return Err(ConfigError::Validation(format!(
                             "MCP server '{name}' uses {:?} transport but missing 'url' field",
                             server.transport
                         )));
                     }
                 }
+            }
+            if server.timeout_secs == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "MCP server '{name}' has invalid timeout_secs (must be greater than 0)"
+                )));
             }
         }
         Ok(())
@@ -449,6 +467,51 @@ mod tests {
         }"#;
         let result = McpConfig::from_json_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_stdio_empty_command() {
+        let json = r#"{
+            "mcpServers": {
+                "bad": { "transport": "stdio", "command": "   " }
+            }
+        }"#;
+        assert!(McpConfig::from_json_str(json).is_err());
+    }
+
+    #[test]
+    fn validate_http_empty_url() {
+        let json = r#"{
+            "mcpServers": {
+                "bad": { "transport": "streamable_http", "url": "  " }
+            }
+        }"#;
+        assert!(McpConfig::from_json_str(json).is_err());
+    }
+
+    #[test]
+    fn validate_timeout_zero() {
+        let json = r#"{
+            "mcpServers": {
+                "bad": { "transport": "stdio", "command": "echo", "timeoutSecs": 0 }
+            }
+        }"#;
+        let err = McpConfig::from_json_str(json).unwrap_err().to_string();
+        assert!(err.contains("timeout_secs"));
+    }
+
+    #[test]
+    fn unknown_fields_round_trip() {
+        let json = r#"{
+            "mcpServers": {
+                "srv": { "transport": "stdio", "command": "echo", "customNote": "hello" }
+            },
+            "customTopLevel": "world"
+        }"#;
+        let config = McpConfig::from_json_str(json).unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("customNote"));
+        assert!(serialized.contains("customTopLevel"));
     }
 
     // ── TransportType serde ──────────────────────────────────────────────

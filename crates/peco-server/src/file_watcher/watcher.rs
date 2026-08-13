@@ -264,6 +264,7 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
             debug!("File watcher: reloading MCP config");
             let fallback = peco_core::config::McpConfig {
                 mcp_servers: std::collections::HashMap::new(),
+                extra: std::collections::HashMap::new(),
             };
             let count = ws.reload_mcp_config(&fallback);
             debug!(count, "File watcher: MCP config reloaded");

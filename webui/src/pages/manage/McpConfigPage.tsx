@@ -32,7 +32,6 @@ import type {
 } from "@/types/mcp";
 import {
   Plus,
-  Save,
   Pencil,
   Trash2,
   RefreshCw,
@@ -205,7 +204,6 @@ function dialogFormToConfig(f: DialogFormState): McpServerConfig {
 
 export function McpConfigPage() {
   const [config, setConfig] = useState<Record<string, McpServerConfig>>({});
-  const [initialJson, setInitialJson] = useState("{}");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -230,7 +228,6 @@ export function McpConfigPage() {
         if (unmountedRef.current) return;
         const servers = res.mcpServers || {};
         setConfig(servers);
-        setInitialJson(JSON.stringify({ mcpServers: servers }));
       })
       .catch(() => {
         if (!unmountedRef.current) toast.error("加载 MCP 配置失败");
@@ -242,8 +239,6 @@ export function McpConfigPage() {
       unmountedRef.current = true;
     };
   }, []);
-
-  const hasChanges = JSON.stringify({ mcpServers: config }) !== initialJson;
 
   // ── Dialog handlers ──────────────────────────────────────────────────────────
 
@@ -301,7 +296,6 @@ export function McpConfigPage() {
     try {
       await saveMcpConfig({ mcpServers: nextConfig });
       setConfig(nextConfig);
-      setInitialJson(JSON.stringify({ mcpServers: nextConfig }));
       closeDialog();
       toast.success("配置已保存");
     } catch (err) {
@@ -324,20 +318,6 @@ export function McpConfigPage() {
 
   // ── Config actions ───────────────────────────────────────────────────────────
 
-  const handleSave = async () => {
-    setSaving(true);
-    try {
-      await saveMcpConfig({ mcpServers: config });
-      const newJson = JSON.stringify({ mcpServers: config });
-      setInitialJson(newJson);
-      toast.success("配置已保存");
-    } catch (err) {
-      toast.error(getApiErrorMessage(err) || "保存失败");
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const confirmDelete = (name: string) => {
     setDeleteTarget(name);
   };
@@ -353,7 +333,6 @@ export function McpConfigPage() {
     try {
       await saveMcpConfig({ mcpServers: nextConfig });
       setConfig(nextConfig);
-      setInitialJson(JSON.stringify({ mcpServers: nextConfig }));
       setDeleteTarget(null);
       toast.success("配置已删除");
     } catch (err) {
@@ -380,7 +359,7 @@ export function McpConfigPage() {
           connection_timeout: "请检查网络连接或增加超时时间",
           handshake_failed:
             "MCP 协议握手失败，请确认 Server 实现了正确的 MCP 协议",
-          transport_error: "传输层错误，请检查 DNS、TLS 证书或代理配置",
+          transport_error: "传输层错误，请检查连接参数或进程路径",
           tool_list_failed:
             "连接成功但获取工具列表失败，请检查 Server 端工具注册逻辑",
         };
@@ -414,14 +393,6 @@ export function McpConfigPage() {
           <Button onClick={openAddDialog}>
             <Plus className="mr-2 h-4 w-4" />
             添加服务器
-          </Button>
-          <Button
-            variant={hasChanges ? "default" : "outline"}
-            onClick={handleSave}
-            disabled={saving}
-          >
-            <Save className="mr-2 h-4 w-4" />
-            {saving ? "保存中..." : "保存配置"}
           </Button>
         </div>
       </div>
