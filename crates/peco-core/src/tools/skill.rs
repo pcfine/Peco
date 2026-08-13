@@ -33,7 +33,9 @@ impl ToolDyn for ReadSkill {
             name: "read_skill".to_string(),
             description: "Read the full description and instructions for a skill by its name. \
                 Use this to get detailed information about what a skill does, what tools it is \
-                allowed to use, and the complete procedure to follow."
+                allowed to use, and the complete procedure to follow. The response also includes \
+                the skill's absolute directory path and a listing of its bundled resources \
+                (scripts/, references/, assets/) so they can be run or read by path."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -72,6 +74,11 @@ impl ToolDyn for ReadSkill {
                 ToolError::ToolCallError(format!("failed to read skill '{name}': {e}").into())
             })?;
 
+            // Resolve an absolute directory so the agent can pass it as `cwd`
+            // to the `shell` tool and run bundled scripts via relative paths.
+            let root_dir =
+                std::fs::canonicalize(&skill.root_dir).unwrap_or_else(|_| skill.root_dir.clone());
+
             let mut output = String::new();
             output.push_str(&format!("# Skill: {}\n\n", skill.frontmatter.name));
             output.push_str(&format!(
@@ -88,6 +95,30 @@ impl ToolDyn for ReadSkill {
             if let Some(ref compat) = skill.frontmatter.compatibility {
                 output.push_str(&format!("**Compatibility**: {compat}\n"));
             }
+            output.push_str(&format!("\n**Directory**: {}\n", root_dir.display()));
+
+            let scripts = skill.list_scripts();
+            let references = skill.list_references();
+            let assets = skill.list_assets();
+            if !scripts.is_empty() {
+                output.push_str("\n**Scripts**:\n");
+                for path in &scripts {
+                    output.push_str(&format!("  - {}\n", path.display()));
+                }
+            }
+            if !references.is_empty() {
+                output.push_str("\n**References**:\n");
+                for path in &references {
+                    output.push_str(&format!("  - {}\n", path.display()));
+                }
+            }
+            if !assets.is_empty() {
+                output.push_str("\n**Assets**:\n");
+                for path in &assets {
+                    output.push_str(&format!("  - {}\n", path.display()));
+                }
+            }
+
             output.push_str("\n---\n\n");
             output.push_str(&skill.body);
 
