@@ -74,3 +74,19 @@ pub async fn fetch(
         Ok(format!("HTTP {status}\n\n{text}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tools::{Fetch, Tool};
+
+    #[test]
+    fn fetch_schema_marks_only_url_as_required() {
+        // Option<T> 参数不应出现在 JSON Schema 的 required 数组里。
+        let def = Fetch.definition();
+        let required = def.parameters["required"]
+            .as_array()
+            .expect("required should be an array");
+        let required: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(required, vec!["url"]);
+    }
+}

@@ -303,6 +303,7 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
 
     // ── Collect parameter names, types, and descriptions ──────────────────
     let mut param_names: Vec<Ident> = Vec::new();
+    let mut optional_params: Vec<bool> = Vec::new();
     let mut field_tokens: Vec<proc_macro2::TokenStream> = Vec::new();
 
     for arg in input_fn.sig.inputs.iter() {
@@ -323,8 +324,9 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                 quote! { #[schemars(description = #default_desc)] }
             };
 
-            // Option<T> → #[serde(default)]
-            let serde_default = if is_option_type(ty) {
+            // Option<T> → #[serde(default)]，并记入可选参数集合
+            let is_optional = is_option_type(ty);
+            let serde_default = if is_optional {
                 quote! { #[serde(default)] }
             } else {
                 quote! {}
@@ -336,13 +338,20 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                 #vis #param_name: #ty
             });
             param_names.push(param_name.clone());
+            optional_params.push(is_optional);
         }
     }
 
-    // ── Required list: explicit > all params ──────────────────────────────
-    let required_args: Vec<String> = args
-        .required
-        .unwrap_or_else(|| param_names.iter().map(|n| n.to_string()).collect());
+    // ── Required list: explicit > 非 Option 参数 ─────────────────────────
+    // Option<T> 参数默认不进 required 数组（可选参数不应被强制要求）。
+    let required_args: Vec<String> = args.required.unwrap_or_else(|| {
+        param_names
+            .iter()
+            .zip(optional_params.iter())
+            .filter(|(_, is_optional)| !**is_optional)
+            .map(|(n, _)| n.to_string())
+            .collect()
+    });
 
     // ── call() implementation ─────────────────────────────────────────────
     let call_impl = if is_async {
