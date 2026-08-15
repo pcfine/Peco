@@ -136,9 +136,22 @@ impl ToolDyn for RunParallelSubAgents {
                 "type": "object",
                 "properties": {
                     "tasks": {
-                        "type": "string",
-                        "description": "JSON array of task objects, each with 'agent_name' and 'prompt'. \
-                            Example: [{\"agent_name\": \"reviewer\", \"prompt\": \"Review auth.rs\"}]"
+                        "type": "array",
+                        "description": "List of sub-agent tasks to run in parallel.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent_name": {
+                                    "type": "string",
+                                    "description": "Name of the sub-agent to delegate to. Must match an existing agent name exactly."
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "The task description to send to the sub-agent."
+                                }
+                            },
+                            "required": ["agent_name", "prompt"]
+                        }
                     }
                 },
                 "required": ["tasks"]
@@ -153,18 +166,12 @@ impl ToolDyn for RunParallelSubAgents {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct TasksWrapper {
-                tasks: String,
+                tasks: Vec<ParallelTaskDef>,
             }
 
             let wrapper: TasksWrapper =
                 serde_json::from_str(&args).map_err(ToolError::JsonError)?;
-
-            let task_defs: Vec<ParallelTaskDef> =
-                serde_json::from_str(&wrapper.tasks).map_err(|e| {
-                    ToolError::ToolCallError(Box::new(StringError(format!(
-                        "Failed to parse tasks JSON: {e}"
-                    ))))
-                })?;
+            let task_defs = wrapper.tasks;
 
             if task_defs.is_empty() {
                 return Err(ToolError::ToolCallError(Box::new(StringError(

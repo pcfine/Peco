@@ -171,10 +171,9 @@ pub fn parse_sub_agent_infos(
 
     if tool_name == "run_parallel_sub_agents" {
         if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
-            && let Some(tasks) = args["tasks"].as_str()
-            && let Ok(task_list) = serde_json::from_str::<Vec<serde_json::Value>>(tasks)
+            && let Some(tasks) = args["tasks"].as_array()
         {
-            return task_list
+            return tasks
                 .iter()
                 .enumerate()
                 .map(|(index, task)| {
