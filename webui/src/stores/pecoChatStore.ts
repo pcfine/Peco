@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { getPecoSession, clearPecoSession, pecoStreamUrl } from "@/api/peco";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
+import { useAuthStore } from "@/stores/authStore";
 import {
   snapshotToMessages,
   reduceStreamEvent,
@@ -108,8 +109,26 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       });
 
       if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(errText || `HTTP ${response.status}`);
+        // Expired/invalid token — log out so ProtectedRoute redirects to
+        // /login, rather than showing the raw JSON error in the chat box.
+        if (response.status === 401) {
+          useAuthStore.getState().logout();
+          throw new Error("登录已过期，请重新登录");
+        }
+
+        // Surface a human-readable message from the API error body
+        // ({ error, details }) instead of a raw JSON blob.
+        let message = `HTTP ${response.status}`;
+        try {
+          const body = (await response.json()) as {
+            details?: string;
+            error?: string;
+          };
+          message = body.details || body.error || message;
+        } catch {
+          // Non-JSON body — fall back to the status code.
+        }
+        throw new Error(message);
       }
 
       const reader = response.body!.getReader();
@@ -134,8 +153,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") return;
       // Surface network / server errors so the UI can display a toast.
-      const message =
-        err instanceof Error ? err.message : "连接中断，请重试";
+      const message = err instanceof Error ? err.message : "连接中断，请重试";
       set({ error: message });
     } finally {
       set({ isStreaming: false });
