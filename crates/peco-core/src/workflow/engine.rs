@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 use crate::tools::AgentAccess;
 
@@ -152,32 +153,61 @@ impl WorkflowEngine {
         inputs: HashMap<String, serde_json::Value>,
     ) {
         let run_id = self.run_id.clone();
+        let workflow_name = self.definition.name.clone();
+        let total_steps = self.definition.steps.len();
 
-        tracing::debug!(%run_id, "WorkflowEngine::run() started");
+        // 事件发送辅助：非阻塞发送。当事件 channel 已满（消费端过慢）或已关闭
+        // （handle 被 drop）时事件会被静默丢弃 — 至少记录一条日志，否则终态事件
+        // 丢失后消费端会把 None 误判为「意外结束」。
+        let send_event = {
+            let run_id_log = run_id.clone();
+            move |event: WorkflowEvent| {
+                if let Err(e) = event_tx.try_send(event) {
+                    warn!(
+                        run_id = %run_id_log,
+                        error = %e,
+                        "failed to send workflow event (channel full or closed); event dropped"
+                    );
+                }
+            }
+        };
+
+        info!(
+            %run_id,
+            workflow = %workflow_name,
+            total_steps,
+            "WorkflowEngine::run() started"
+        );
 
         // 0. 验证输入参数
         let validated_inputs = match self.definition.validate_inputs(&inputs) {
             Ok(v) => v,
             Err(e) => {
                 let error_msg = e.to_string();
+                warn!(
+                    %run_id,
+                    workflow = %workflow_name,
+                    error = %e,
+                    "input validation failed, failing workflow"
+                );
                 let inputs_json = serde_json::to_string(&inputs).ok();
-                let _ = self
-                    .persister
-                    .save(&WorkflowSnapshot {
-                        run_id: run_id.clone(),
-                        workflow_name: self.definition.name.clone(),
-                        definition: self.definition.clone(),
-                        state: WorkflowSnapshotState::Failed,
-                        error: Some(error_msg.clone()),
-                        inputs_json,
-                        step_results: HashMap::new(),
-                        current_level: 0,
-                        total_steps: self.definition.steps.len(),
-                        started_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                    })
-                    .await;
-                let _ = event_tx.try_send(WorkflowEvent::Failed {
+                let snapshot = WorkflowSnapshot {
+                    run_id: run_id.clone(),
+                    workflow_name: workflow_name.clone(),
+                    definition: self.definition.clone(),
+                    state: WorkflowSnapshotState::Failed,
+                    error: Some(error_msg.clone()),
+                    inputs_json,
+                    step_results: HashMap::new(),
+                    current_level: 0,
+                    total_steps,
+                    started_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = self.persister.save(&snapshot).await {
+                    error!(%run_id, error = %e, "failed to persist Failed snapshot");
+                }
+                send_event(WorkflowEvent::Failed {
                     run_id,
                     error: error_msg,
                     failed_at_step: None,
@@ -192,24 +222,30 @@ impl WorkflowEngine {
             Ok(dag) => dag,
             Err(e) => {
                 let error_msg = e.to_string();
+                warn!(
+                    %run_id,
+                    workflow = %workflow_name,
+                    error = %e,
+                    "DAG construction failed, failing workflow"
+                );
                 let inputs_json = serde_json::to_string(&inputs).ok();
-                let _ = self
-                    .persister
-                    .save(&WorkflowSnapshot {
-                        run_id: run_id.clone(),
-                        workflow_name: self.definition.name.clone(),
-                        definition: self.definition.clone(),
-                        state: WorkflowSnapshotState::Failed,
-                        error: Some(error_msg.clone()),
-                        inputs_json,
-                        step_results: HashMap::new(),
-                        current_level: 0,
-                        total_steps: self.definition.steps.len(),
-                        started_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                    })
-                    .await;
-                let _ = event_tx.try_send(WorkflowEvent::Failed {
+                let snapshot = WorkflowSnapshot {
+                    run_id: run_id.clone(),
+                    workflow_name: workflow_name.clone(),
+                    definition: self.definition.clone(),
+                    state: WorkflowSnapshotState::Failed,
+                    error: Some(error_msg.clone()),
+                    inputs_json,
+                    step_results: HashMap::new(),
+                    current_level: 0,
+                    total_steps,
+                    started_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = self.persister.save(&snapshot).await {
+                    error!(%run_id, error = %e, "failed to persist Failed snapshot");
+                }
+                send_event(WorkflowEvent::Failed {
                     run_id,
                     error: error_msg,
                     failed_at_step: None,
@@ -226,10 +262,10 @@ impl WorkflowEngine {
         let mut tpl_ctx = TemplateContext::new(Some(&validated_inputs));
 
         // 3. 发送 Started 事件
-        let _ = event_tx.try_send(WorkflowEvent::Started {
+        send_event(WorkflowEvent::Started {
             run_id: run_id.clone(),
-            workflow_name: self.definition.name.clone(),
-            total_steps: self.definition.steps.len(),
+            workflow_name: workflow_name.clone(),
+            total_steps,
         });
 
         // 4. 按拓扑层级迭代执行
@@ -241,14 +277,29 @@ impl WorkflowEngine {
         let mut steps_skipped = 0usize;
 
         let levels = dag.topological_levels().to_vec();
+        debug!(
+            %run_id,
+            workflow = %workflow_name,
+            level_count = levels.len(),
+            "DAG resolved into levels"
+        );
+
         for (level_idx, level) in levels.iter().enumerate() {
             // 4a. 层级开始前检查取消
             if cancel_flag.load(Ordering::Acquire) {
-                let _ = event_tx.try_send(WorkflowEvent::Cancelled {
+                info!(%run_id, level = level_idx, "cancelled before level start");
+                send_event(WorkflowEvent::Cancelled {
                     run_id: run_id.clone(),
                 });
                 return;
             }
+
+            debug!(
+                %run_id,
+                level = level_idx,
+                level_steps = level.len(),
+                "starting level"
+            );
 
             // 4b. 发射 StepStarted + 启动同一层级的所有步骤（并行执行）
             let mut handles: Vec<(
@@ -262,7 +313,13 @@ impl WorkflowEngine {
                         .condition
                         .clone()
                         .unwrap_or_else(|| "condition evaluated to false".into());
-                    let _ = event_tx.try_send(WorkflowEvent::StepSkipped {
+                    debug!(
+                        %run_id,
+                        step_id = %step.id,
+                        reason = %reason,
+                        "step condition false, skipping"
+                    );
+                    send_event(WorkflowEvent::StepSkipped {
                         run_id: run_id.clone(),
                         step_id: step.id.clone(),
                         step_name: step.name.clone(),
@@ -284,8 +341,15 @@ impl WorkflowEngine {
                     continue;
                 }
 
+                debug!(
+                    %run_id,
+                    step_id = %step.id,
+                    step_type = %step.step_type,
+                    "starting step"
+                );
+
                 // 发射 StepStarted
-                let _ = event_tx.try_send(WorkflowEvent::StepStarted {
+                send_event(WorkflowEvent::StepStarted {
                     run_id: run_id.clone(),
                     step_id: step.id.clone(),
                     step_name: step.name.clone(),
@@ -316,6 +380,7 @@ impl WorkflowEngine {
             while let Some((step_id, handle)) = remaining.pop_front() {
                 // 如果已触发 abort，显式 abort 所有剩余 handle
                 if aborted || cancel_flag.load(Ordering::Acquire) {
+                    debug!(%run_id, step_id = %step_id, aborted, "aborting pending step");
                     handle.abort();
                     continue;
                 }
@@ -324,7 +389,7 @@ impl WorkflowEngine {
                 let result = match handle.await {
                     Ok(r) => r,
                     Err(join_err) => {
-                        tracing::error!(
+                        error!(
                             step_id = %step_id,
                             error = %join_err,
                             "Step task panicked or was cancelled"
@@ -337,6 +402,13 @@ impl WorkflowEngine {
                 let event = match &result.outcome {
                     StepOutcome::Success(_) => {
                         steps_completed += 1;
+                        debug!(
+                            %run_id,
+                            step_id = %result.step.id,
+                            duration_ms = result.duration.as_millis() as u64,
+                            attempt = result.attempt,
+                            "step completed"
+                        );
                         WorkflowEvent::StepCompleted {
                             run_id: run_id.clone(),
                             step_id: result.step.id.clone(),
@@ -348,6 +420,12 @@ impl WorkflowEngine {
                     }
                     StepOutcome::Skipped(reason) => {
                         steps_skipped += 1;
+                        debug!(
+                            %run_id,
+                            step_id = %result.step.id,
+                            reason = %reason,
+                            "step skipped (post-execution)"
+                        );
                         WorkflowEvent::StepSkipped {
                             run_id: run_id.clone(),
                             step_id: result.step.id.clone(),
@@ -357,6 +435,15 @@ impl WorkflowEngine {
                     }
                     StepOutcome::Failed(err) => {
                         steps_failed += 1;
+                        warn!(
+                            %run_id,
+                            step_id = %result.step.id,
+                            error = %err,
+                            duration_ms = result.duration.as_millis() as u64,
+                            attempt = result.attempt,
+                            failure_policy = %result.step.on_failure.as_str(),
+                            "step failed"
+                        );
                         WorkflowEvent::StepFailed {
                             run_id: run_id.clone(),
                             step_id: result.step.id.clone(),
@@ -368,7 +455,7 @@ impl WorkflowEngine {
                         }
                     }
                 };
-                let _ = event_tx.try_send(event);
+                send_event(event);
 
                 // 检查失败策略
                 if let StepOutcome::Failed(step_error) = &result.outcome {
@@ -377,7 +464,12 @@ impl WorkflowEngine {
                         OnFailure::Abort => {
                             let workflow_err =
                                 format!("Step '{}' failed: {}", result.step.id, step_error);
-                            let _ = event_tx.try_send(WorkflowEvent::Failed {
+                            info!(
+                                %run_id,
+                                step_id = %result.step.id,
+                                "failure policy=abort, failing workflow"
+                            );
+                            send_event(WorkflowEvent::Failed {
                                 run_id: run_id.clone(),
                                 error: workflow_err.clone(),
                                 failed_at_step: Some(result.step.id.clone()),
@@ -392,7 +484,12 @@ impl WorkflowEngine {
                                 "Step '{}' failed: {step_error}, waiting for approval",
                                 result.step.id,
                             );
-                            let _ = event_tx.try_send(WorkflowEvent::Paused {
+                            info!(
+                                %run_id,
+                                step_id = %result.step.id,
+                                "failure policy=pause, waiting for approval"
+                            );
+                            send_event(WorkflowEvent::Paused {
                                 run_id: run_id.clone(),
                                 reason: pause_reason.clone(),
                                 paused_at_step: Some(result.step.id.clone()),
@@ -406,7 +503,13 @@ impl WorkflowEngine {
                                 started_at,
                                 inputs_json.clone(),
                             );
-                            let _ = self.persister.save(&snapshot).await;
+                            if let Err(e) = self.persister.save(&snapshot).await {
+                                error!(
+                                    %run_id,
+                                    error = %e,
+                                    "failed to persist Paused snapshot"
+                                );
+                            }
                             // 阻塞等待审批决策
                             match approval_rx.recv().await {
                                 Some(ApprovalResponse {
@@ -418,7 +521,12 @@ impl WorkflowEngine {
                                         "User aborted after step '{}' failed: {step_error}",
                                         result.step.id,
                                     );
-                                    let _ = event_tx.try_send(WorkflowEvent::Failed {
+                                    info!(
+                                        %run_id,
+                                        step_id = %result.step.id,
+                                        "approval decision=abort (or channel closed), failing workflow"
+                                    );
+                                    send_event(WorkflowEvent::Failed {
                                         run_id,
                                         error: abort_reason,
                                         failed_at_step: Some(result.step.id.clone()),
@@ -434,7 +542,8 @@ impl WorkflowEngine {
                                     decision: ApprovalDecision::Proceed,
                                     ..
                                 }) => {
-                                    let _ = event_tx.try_send(WorkflowEvent::Resumed {
+                                    info!(%run_id, "approval decision=proceed, resuming");
+                                    send_event(WorkflowEvent::Resumed {
                                         run_id: run_id.clone(),
                                     });
                                     // 继续当前层级剩余步骤
@@ -443,10 +552,15 @@ impl WorkflowEngine {
                         }
                         OnFailure::Continue => {
                             // 继续执行，不中止
+                            debug!(
+                                %run_id,
+                                step_id = %result.step.id,
+                                "failure policy=continue"
+                            );
                         }
                         OnFailure::Retry => {
                             // Phase 4: 重试逻辑（此处退化为 Continue）
-                            tracing::debug!(
+                            debug!(
                                 step_id = %result.step.id,
                                 "Retry not supported in Phase 1, continuing"
                             );
@@ -470,7 +584,9 @@ impl WorkflowEngine {
                     started_at,
                     inputs_json.clone(),
                 );
-                let _ = self.persister.save(&snapshot).await;
+                if let Err(e) = self.persister.save(&snapshot).await {
+                    error!(%run_id, error = %e, "failed to persist Failed snapshot");
+                }
                 // 确保所有剩余 handle 都被清理
                 for (_, h) in remaining.drain(..) {
                     h.abort();
@@ -487,7 +603,10 @@ impl WorkflowEngine {
                 started_at,
                 inputs_json.clone(),
             );
-            let _ = self.persister.save(&snapshot).await;
+            if let Err(e) = self.persister.save(&snapshot).await {
+                error!(%run_id, error = %e, "failed to persist Running snapshot");
+            }
+            debug!(%run_id, level = level_idx, "level complete");
         }
 
         // 5. 完成 — 持久化最终快照
@@ -499,11 +618,23 @@ impl WorkflowEngine {
             started_at,
             inputs_json.clone(),
         );
-        let _ = self.persister.save(&snapshot).await;
+        if let Err(e) = self.persister.save(&snapshot).await {
+            error!(%run_id, error = %e, "failed to persist Completed snapshot");
+        }
 
-        let _ = event_tx.try_send(WorkflowEvent::Completed {
+        let total_duration_ms = start.elapsed().as_millis() as u64;
+        info!(
+            %run_id,
+            workflow = %workflow_name,
+            total_duration_ms,
+            steps_completed,
+            steps_failed,
+            steps_skipped,
+            "workflow completed"
+        );
+        send_event(WorkflowEvent::Completed {
             run_id,
-            total_duration_ms: start.elapsed().as_millis() as u64,
+            total_duration_ms,
             steps_completed,
             steps_failed,
             steps_skipped,
