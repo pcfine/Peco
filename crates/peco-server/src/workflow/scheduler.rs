@@ -2,6 +2,11 @@
 // CronScheduler — tokio-cron-scheduler 封装（Workflow 专用）
 // ============================================================================
 //
+// 触发层（Trigger layer）角色：本模块是「定时执行」这一**外部触发策略**的入口。
+// Workflow 定义本身（workflow.md / WorkflowDefinition）不感知调度 —— 调度触发走
+// 同一 `WorkflowManager::execute() → WorkflowEngine::spawn()` 路径，仅在落库时写入
+// `workflow_executions.trigger_type = 'scheduled'`（区别于 handler 的 'manual'）。
+//
 // 内部使用 tokio::sync::Mutex<JobScheduler> 而非直接持有 JobScheduler：
 // - JobScheduler::shutdown() 需要 &mut self
 // - CronScheduler 通过 Arc<CronScheduler> 共享，Arc 无法提供 &mut

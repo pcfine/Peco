@@ -71,7 +71,7 @@ export interface ExecutionSummary {
   runId: string;
   workflowName: string;
   triggerType: "manual" | "scheduled";
-  status: "running" | "paused" | "completed" | "failed" | "cancelled";
+  status: "running" | "paused" | "completed" | "failed" | "cancelled" | "timed_out";
   totalSteps: number;
   stepsCompleted: number;
   stepsFailed: number;
@@ -123,6 +123,7 @@ export interface StatisticsResponse {
   successCount: number;
   failureCount: number;
   cancelledCount: number;
+  timedOutCount: number;
   successRate: number;
   avgDurationMs: number;
   minDurationMs: number;
@@ -250,6 +251,13 @@ export type WorkflowSSEEvent =
   | {
       type: "workflow_cancelled";
       runId: string;
+    }
+  | {
+      type: "workflow_timed_out";
+      runId: string;
+      error: string;
+      failedAtStep?: string;
+      totalDurationMs: number;
     }
   | { type: "done"; runId: string };
 

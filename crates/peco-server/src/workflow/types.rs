@@ -188,6 +188,7 @@ pub struct StatisticsResponse {
     pub success_count: i64,
     pub failure_count: i64,
     pub cancelled_count: i64,
+    pub timed_out_count: i64,
     pub success_rate: f64,
     pub avg_duration_ms: f64,
     pub min_duration_ms: i64,

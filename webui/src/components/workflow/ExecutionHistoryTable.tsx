@@ -8,7 +8,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import type { ExecutionSummary } from "@/types/workflow";
-import { CheckCircle2, XCircle, Clock, Ban, Pause } from "lucide-react";
+import { CheckCircle2, XCircle, Clock, Ban, Pause, Timer } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface ExecutionHistoryTableProps {
@@ -45,6 +45,11 @@ const STATUS_CONFIG: Record<
     icon: <Pause className="h-3.5 w-3.5" />,
     label: "已暂停",
     className: "text-amber-600",
+  },
+  timed_out: {
+    icon: <Timer className="h-3.5 w-3.5" />,
+    label: "超时",
+    className: "text-orange-600",
   },
 };
 

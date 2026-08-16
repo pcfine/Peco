@@ -138,6 +138,17 @@ pub enum WorkflowSseEvent {
         #[serde(rename = "runId")]
         run_id: String,
     },
+    #[serde(rename = "workflow_timed_out")]
+    TimedOut {
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "error")]
+        error: String,
+        #[serde(rename = "failedAtStep")]
+        failed_at_step: Option<String>,
+        #[serde(rename = "totalDurationMs")]
+        total_duration_ms: u64,
+    },
     /// 流终止信号 — 无对应 WorkflowEvent，由 handler 在终端事件后发送
     #[serde(rename = "done")]
     Done {
@@ -166,7 +177,7 @@ impl WorkflowSseEvent {
 ///   （见 events.rs 头部注释），无需外部注入
 /// - **返回 Option**：`StepDelta` / `StepRetrying`（Phase 4 预留）返回 `None`，
 ///   调用方跳过该事件，不 panic
-/// - **不写 `_` 通配符**：显式匹配全部 12 个变体，编译器在新增变体时产生
+/// - **不写 `_` 通配符**：显式匹配全部 13 个变体，编译器在新增变体时产生
 ///   non-exhaustive match 错误，开发者必须显式决定处理方式
 pub fn map_event(event: &WorkflowEvent) -> Option<WorkflowSseEvent> {
     match event {
@@ -287,6 +298,17 @@ pub fn map_event(event: &WorkflowEvent) -> Option<WorkflowSseEvent> {
         }),
         WorkflowEvent::Cancelled { run_id } => Some(WorkflowSseEvent::Cancelled {
             run_id: run_id.clone(),
+        }),
+        WorkflowEvent::TimedOut {
+            run_id,
+            error,
+            failed_at_step,
+            total_duration_ms,
+        } => Some(WorkflowSseEvent::TimedOut {
+            run_id: run_id.clone(),
+            error: error.clone(),
+            failed_at_step: failed_at_step.clone(),
+            total_duration_ms: *total_duration_ms,
         }),
     }
 }
@@ -499,6 +521,26 @@ mod tests {
         };
         let sse = map_event(&ev).unwrap();
         assert!(matches!(sse, WorkflowSseEvent::Cancelled { .. }));
+
+        // TimedOut
+        let ev = WorkflowEvent::TimedOut {
+            run_id: rid.clone(),
+            error: "timed out".into(),
+            failed_at_step: None,
+            total_duration_ms: 123,
+        };
+        let sse = map_event(&ev).unwrap();
+        match sse {
+            WorkflowSseEvent::TimedOut {
+                run_id,
+                total_duration_ms,
+                ..
+            } => {
+                assert_eq!(run_id, rid);
+                assert_eq!(total_duration_ms, 123);
+            }
+            _ => panic!("expected TimedOut"),
+        }
     }
 
     #[test]

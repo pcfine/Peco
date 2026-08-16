@@ -75,7 +75,7 @@ export function StatisticsPanel({
   return (
     <div className={cn("space-y-6", className)}>
       {/* Top-level stat cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <StatCard label="总运行次数" value={String(stats.totalRuns)} />
         <StatCard
           label="成功率"
@@ -87,6 +87,7 @@ export function StatisticsPanel({
           value={formatDuration(stats.avgDurationMs)}
         />
         <StatCard label="已取消" value={String(stats.cancelledCount)} />
+        <StatCard label="超时" value={String(stats.timedOutCount)} />
       </div>
 
       {/* 30-day run history — simple bar chart */}

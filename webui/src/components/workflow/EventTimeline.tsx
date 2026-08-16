@@ -8,6 +8,7 @@ import {
   Pause,
   Flag,
   Loader2,
+  Timer,
 } from "lucide-react";
 
 interface EventTimelineProps {
@@ -41,6 +42,8 @@ function eventIcon(eventType: string) {
       return <XCircle className={cls} style={{ color: "#ef4444" }} />;
     case "workflow_cancelled":
       return <Flag className={cls} style={{ color: "#6b7280" }} />;
+    case "workflow_timed_out":
+      return <Timer className={cls} style={{ color: "#f97316" }} />;
     default:
       return <div className={cn(cls, "rounded-full bg-muted-foreground/30")} />;
   }
@@ -69,6 +72,8 @@ function eventLabel(entry: TimelineEntry): string {
       return `Workflow 失败: ${event.error}${event.failedAtStep ? ` (步骤: ${event.failedAtStep})` : ""}`;
     case "workflow_cancelled":
       return "Workflow 已取消";
+    case "workflow_timed_out":
+      return `Workflow 超时: ${event.error} (${event.totalDurationMs}ms)`;
     case "done":
       return "SSE 流结束";
     default:

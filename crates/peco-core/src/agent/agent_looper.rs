@@ -850,9 +850,17 @@ impl AgentLooper {
         let _ = speaker.send(event).await;
     }
 
-    /// 发送 ReactStateChange 事件。
+    /// 发送 ReactStateChange 事件，并记录调试日志。
     fn emit_react_state_change(&self, from: ReActState, to: ReActState, turn_index: usize) {
         if from != to {
+            debug!(
+                agent = %self.agent.config().agent.name,
+                session_id = %self.session.id(),
+                turn = turn_index,
+                from = ?from,
+                to = ?to,
+                "ReAct state changed"
+            );
             self.emit_event(LooperEvent::ReactStateChange {
                 turn_index,
                 from,
@@ -861,9 +869,16 @@ impl AgentLooper {
         }
     }
 
-    /// 发送 OuterStateChange 事件。
+    /// 发送 OuterStateChange 事件，并记录调试日志。
     fn emit_outer_state_change(&self, from: OuterState, to: OuterState) {
         if from != to {
+            debug!(
+                agent = %self.agent.config().agent.name,
+                session_id = %self.session.id(),
+                from = ?from,
+                to = ?to,
+                "Outer state changed"
+            );
             self.emit_event(LooperEvent::OuterStateChange { from, to });
         }
     }

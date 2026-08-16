@@ -150,6 +150,8 @@ export function WorkflowCard({
               <CheckCircle2 className="h-3 w-3 text-green-500" />
             ) : lastExec.status === "failed" ? (
               <XCircle className="h-3 w-3 text-red-500" />
+            ) : lastExec.status === "timed_out" ? (
+              <Timer className="h-3 w-3 text-orange-500" />
             ) : (
               <Timer className="h-3 w-3" />
             )}

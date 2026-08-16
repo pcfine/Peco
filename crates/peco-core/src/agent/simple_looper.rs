@@ -89,10 +89,12 @@ impl SimpleAgentLooper {
         };
 
         let join_handle = tokio::spawn(async move { looper.run(prompt).await });
+        let abort_handle = join_handle.abort_handle();
 
         SimpleLooperHandle {
             cancel_flag,
             join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+            abort_handle,
         }
     }
 
@@ -119,10 +121,12 @@ impl SimpleAgentLooper {
         };
 
         let join_handle = tokio::spawn(async move { looper.run(prompt).await });
+        let abort_handle = join_handle.abort_handle();
 
         SimpleLooperHandle {
             cancel_flag,
             join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+            abort_handle,
         }
     }
 
@@ -273,15 +277,15 @@ impl SimpleAgentLooper {
 /// ```text
 /// let handle = SimpleAgentLooper::spawn(agent, "do X".into(), None);
 ///
-/// // Option A: wait for result (consumes the handle)
+/// // Option A: wait for result
 /// let output = handle.wait().await?;
 ///
 /// // Option B: cancel early and discard
 /// handle.cancel();
 /// drop(handle); // cancel flag was already set
 ///
-/// // Option C: just drop — auto-cancels if last reference
-/// drop(handle); // sets cancel flag, task exits gracefully
+/// // Option C: just drop — auto-cancels + aborts if last reference
+/// drop(handle); // sets cancel flag and aborts the underlying task
 /// ```
 ///
 /// # Clone
@@ -292,6 +296,9 @@ impl SimpleAgentLooper {
 pub struct SimpleLooperHandle {
     cancel_flag: Arc<AtomicBool>,
     join_handle: SharedSimpleTask,
+    /// 独立于 `join_handle` 的中止句柄（`AbortHandle` 可 clone），
+    /// 允许在 `wait()` 已 consume `JoinHandle` 后仍能真正中止底层 task。
+    abort_handle: tokio::task::AbortHandle,
 }
 
 impl SimpleLooperHandle {
@@ -323,10 +330,24 @@ impl SimpleLooperHandle {
             .ok_or_else(|| AgentError::AgentProtocol("task already consumed".into()))?;
         match handle.await {
             Ok(result) => result,
+            Err(join_err) if join_err.is_cancelled() => {
+                Err(AgentError::AgentProtocol("cancelled".into()))
+            }
             Err(join_err) => Err(AgentError::AgentProtocol(format!(
                 "looper task panicked: {join_err}"
             ))),
         }
+    }
+
+    /// Abort the underlying task immediately.
+    ///
+    /// Unlike [`cancel`](SimpleLooperHandle::cancel) (which is cooperative —
+    /// the looper exits at its next loop boundary), this cancels the in-flight
+    /// work (LLM request, tool execution) at the next await point. Safe to call
+    /// after the task has already completed.
+    pub fn abort(&self) {
+        self.cancel_flag.store(true, Ordering::Release);
+        self.abort_handle.abort();
     }
 
     /// Returns `true` if the background task is still executing.
@@ -348,6 +369,7 @@ impl Clone for SimpleLooperHandle {
         Self {
             cancel_flag: Arc::clone(&self.cancel_flag),
             join_handle: Arc::clone(&self.join_handle),
+            abort_handle: self.abort_handle.clone(),
         }
     }
 }
@@ -359,6 +381,10 @@ impl Drop for SimpleLooperHandle {
             // 设置取消标志作为安全网：若 looper 仍在运行，会在下个循环迭代中正常退出。
             // looper 可能已通过 wait() 正常结束，此时 cancel_flag 无实际作用。
             self.cancel_flag.store(true, Ordering::Release);
+            // 同时 abort 底层 task，使在途的 LLM 请求/工具执行被真正取消，
+            // 而非在后台继续消耗 token / 产生副作用。AbortHandle 独立于
+            // JoinHandle，即使 wait() 已 consume 后者仍能生效。
+            self.abort_handle.abort();
             tracing::debug!(
                 "SimpleLooperHandle dropped (last reference). \
                  Cancel flag set as safety net for any still-running looper."
@@ -375,8 +401,18 @@ impl Drop for SimpleLooperHandle {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_handle_clone() {
+    /// Spawn a no-op task purely to obtain an `AbortHandle` for tests that
+    /// build a `SimpleLooperHandle` without a real running looper. The task is
+    /// aborted immediately so it never executes.
+    fn dummy_abort_handle() -> tokio::task::AbortHandle {
+        let handle = tokio::spawn(async {});
+        let abort = handle.abort_handle();
+        handle.abort();
+        abort
+    }
+
+    #[tokio::test]
+    async fn test_handle_clone() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = Arc::new(tokio::sync::Mutex::new(
             None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
@@ -384,6 +420,7 @@ mod tests {
         let h1 = SimpleLooperHandle {
             cancel_flag: cancel_flag.clone(),
             join_handle: join_handle.clone(),
+            abort_handle: dummy_abort_handle(),
         };
         let h2 = h1.clone();
         assert!(!h1.is_cancelled());
@@ -393,8 +430,8 @@ mod tests {
         assert!(h2.is_cancelled());
     }
 
-    #[test]
-    fn test_handle_is_running_no_task() {
+    #[tokio::test]
+    async fn test_handle_is_running_no_task() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = Arc::new(tokio::sync::Mutex::new(
             None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
@@ -402,13 +439,13 @@ mod tests {
         let h = SimpleLooperHandle {
             cancel_flag,
             join_handle,
+            abort_handle: dummy_abort_handle(),
         };
         assert!(!h.is_running());
     }
 
-    #[test]
-    fn test_handle_wait_already_consumed() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+    #[tokio::test]
+    async fn test_handle_wait_already_consumed() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = Arc::new(tokio::sync::Mutex::new(
             None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
@@ -416,8 +453,9 @@ mod tests {
         let h = SimpleLooperHandle {
             cancel_flag,
             join_handle,
+            abort_handle: dummy_abort_handle(),
         };
-        let result = rt.block_on(h.wait());
+        let result = h.wait().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already consumed"));
     }
@@ -426,9 +464,11 @@ mod tests {
     async fn test_handle_wait_returns_result() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = tokio::spawn(async { Ok("hello".to_string()) });
+        let abort_handle = join_handle.abort_handle();
         let handle = SimpleLooperHandle {
             cancel_flag,
             join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+            abort_handle,
         };
         let result = handle.wait().await.unwrap();
         assert_eq!(result, "hello");
@@ -440,9 +480,11 @@ mod tests {
         let join_handle = tokio::spawn(async {
             Err::<String, AgentError>(AgentError::MaxTurns { max_turns: 1 })
         });
+        let abort_handle = join_handle.abort_handle();
         let handle = SimpleLooperHandle {
             cancel_flag,
             join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
+            abort_handle,
         };
         let result = handle.wait().await;
         assert!(result.is_err());

@@ -146,6 +146,11 @@ impl ToolDyn for ExecuteWorkflow {
                             "Workflow cancelled.".to_string(),
                         ))));
                     }
+                    Some(WorkflowEvent::TimedOut { error, .. }) => {
+                        return Err(ToolError::ToolCallError(Box::new(StringError(format!(
+                            "Workflow timed out: {error}"
+                        )))));
+                    }
                     None => {
                         return Err(ToolError::ToolCallError(Box::new(StringError(
                             "Workflow ended unexpectedly.".to_string(),

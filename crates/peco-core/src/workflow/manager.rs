@@ -262,8 +262,12 @@ impl WorkflowManager {
 
     /// 启动 Workflow 执行。
     ///
-    /// Thin wrapper：加载定义 → 验证输入 → spawn 引擎 → 返回 handle。
+    /// Thin wrapper：加载定义 → spawn 引擎 → 返回 handle。
     /// 调用方通过 `WorkflowHandle` 消费事件和管理生命周期。
+    ///
+    /// 输入校验不在此处进行 —— [`WorkflowEngine::run`] 是唯一校验边界，
+    /// 校验失败会以 `WorkflowEvent::Failed` 事件 + `WorkflowSnapshotState::Failed`
+    /// 快照的形式反馈，而非在此抛错。
     ///
     /// `persister` 由调用方（peco-server handler 层）按用户创建并传入，
     /// 引擎通过该 persister 自动持久化快照，无需感知用户上下文。
@@ -276,7 +280,6 @@ impl WorkflowManager {
         inputs: HashMap<String, serde_json::Value>,
     ) -> Result<WorkflowHandle, WorkflowError> {
         let definition = self.load(name)?;
-        let _validated = definition.validate_inputs(&inputs)?;
         Ok(WorkflowEngine::spawn(
             definition,
             agent_access,

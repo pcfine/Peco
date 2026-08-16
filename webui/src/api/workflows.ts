@@ -229,8 +229,12 @@ async function connectStream(
 /**
  * Hydrate store state from a GET /executions/:runId snapshot.
  * Replays step results as synthetic SSE events so the UI state is rebuilt.
+ *
+ * Exported so the run-detail page can reuse the exact same terminal-state
+ * mapping (keeping reload and reconnect in sync) instead of maintaining a
+ * second, divergent copy.
  */
-function hydrateFromSnapshot(
+export function hydrateFromSnapshot(
   detail: ExecutionDetailResponse,
   onEvent: (e: WorkflowSSEEvent) => void,
 ): void {
@@ -304,6 +308,14 @@ function hydrateFromSnapshot(
       onEvent({
         type: "workflow_cancelled",
         runId: detail.summary.runId,
+      });
+      break;
+    case "timed_out":
+      onEvent({
+        type: "workflow_timed_out",
+        runId: detail.summary.runId,
+        error: detail.error ?? "Workflow timed out",
+        totalDurationMs: detail.summary.totalDurationMs ?? 0,
       });
       break;
     case "paused":

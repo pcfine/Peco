@@ -60,6 +60,7 @@ pub async fn stream_execution(
                             WorkflowEvent::Completed { .. }
                                 | WorkflowEvent::Failed { .. }
                                 | WorkflowEvent::Cancelled { .. }
+                                | WorkflowEvent::TimedOut { .. }
                         );
 
                         if let Ok(data) = sse_ev.to_sse_event()
@@ -125,6 +126,12 @@ pub async fn stream_execution(
                     }),
                     "cancelled" => Some(WorkflowSseEvent::Cancelled {
                         run_id: rid.clone(),
+                    }),
+                    "timed_out" => Some(WorkflowSseEvent::TimedOut {
+                        run_id: rid.clone(),
+                        error: row.error.unwrap_or_else(|| "Workflow timed out".into()),
+                        failed_at_step: None,
+                        total_duration_ms: row.total_duration_ms.unwrap_or(0) as u64,
                     }),
                     _ => {
                         // running/paused — 不应出现（active 注册表已清理）

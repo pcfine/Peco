@@ -117,7 +117,8 @@ pub async fn insert_run(run_id: &str, mut handle: WorkflowHandle) {
                         }
                         WorkflowEvent::Completed { .. }
                         | WorkflowEvent::Failed { .. }
-                        | WorkflowEvent::Cancelled { .. } => {
+                        | WorkflowEvent::Cancelled { .. }
+                        | WorkflowEvent::TimedOut { .. } => {
                             break;
                         }
                         _ => {}

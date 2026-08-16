@@ -94,6 +94,7 @@ fn db_json_to_snapshot(
         "paused" => WorkflowSnapshotState::Paused,
         "completed" => WorkflowSnapshotState::Completed,
         "failed" => WorkflowSnapshotState::Failed,
+        "timed_out" => WorkflowSnapshotState::TimedOut,
         _ => WorkflowSnapshotState::Failed,
     };
 
@@ -147,6 +148,7 @@ impl WorkflowPersister for SqliteWorkflowPersister {
             WorkflowSnapshotState::Paused => "paused",
             WorkflowSnapshotState::Completed => "completed",
             WorkflowSnapshotState::Failed => "failed",
+            WorkflowSnapshotState::TimedOut => "timed_out",
         };
 
         let total_steps = snapshot.total_steps as i64;
@@ -163,11 +165,27 @@ impl WorkflowPersister for SqliteWorkflowPersister {
         let steps_skipped = snapshot.step_results.len() as i64 - steps_completed - steps_failed;
 
         let started_str = snapshot.started_at.to_rfc3339();
-        let finished_str = if matches!(
+        let is_terminal = matches!(
             snapshot.state,
-            WorkflowSnapshotState::Completed | WorkflowSnapshotState::Failed
-        ) {
+            WorkflowSnapshotState::Completed
+                | WorkflowSnapshotState::Failed
+                | WorkflowSnapshotState::TimedOut
+        );
+        let finished_str = if is_terminal {
             Some(snapshot.updated_at.to_rfc3339())
+        } else {
+            None
+        };
+        // 总耗时（毫秒）：仅终端状态写入，running/paused 保持 NULL，
+        // 避免「进行中已耗时」污染统计面板的 AVG/MIN/MAX 平均耗时。
+        let total_duration_ms = if is_terminal {
+            Some(
+                snapshot
+                    .updated_at
+                    .signed_duration_since(snapshot.started_at)
+                    .num_milliseconds()
+                    .max(0),
+            )
         } else {
             None
         };
@@ -175,13 +193,14 @@ impl WorkflowPersister for SqliteWorkflowPersister {
         // UPSERT 模式：先尝试 UPDATE，无行影响则 INSERT
         let error_str = snapshot.error.as_deref();
         let rows = sqlx::query(
-            "UPDATE workflow_executions SET status = ?, error = ?, steps_completed = ?, \
-             steps_failed = ?, steps_skipped = ?, snapshot_json = ?, \
+            "UPDATE workflow_executions SET status = ?, error = ?, total_duration_ms = ?, \
+             steps_completed = ?, steps_failed = ?, steps_skipped = ?, snapshot_json = ?, \
              total_steps = ?, finished_at = ? \
              WHERE id = ? AND user_id = ?",
         )
         .bind(status)
         .bind(error_str)
+        .bind(total_duration_ms)
         .bind(steps_completed)
         .bind(steps_failed)
         .bind(steps_skipped)
@@ -207,9 +226,9 @@ impl WorkflowPersister for SqliteWorkflowPersister {
 
             sqlx::query(
                 "INSERT INTO workflow_executions (id, user_id, workflow_name, trigger_type, \
-                 status, error, inputs_json, total_steps, steps_completed, steps_failed, \
-                 steps_skipped, snapshot_json, started_at, finished_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 status, error, total_duration_ms, inputs_json, total_steps, steps_completed, \
+                 steps_failed, steps_skipped, snapshot_json, started_at, finished_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&snapshot.run_id)
             .bind(&self.user_id)
@@ -217,6 +236,7 @@ impl WorkflowPersister for SqliteWorkflowPersister {
             .bind(trigger_type)
             .bind(status)
             .bind(error_str)
+            .bind(total_duration_ms)
             .bind(&snapshot.inputs_json)
             .bind(total_steps)
             .bind(steps_completed)

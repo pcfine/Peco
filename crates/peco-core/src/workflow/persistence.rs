@@ -28,6 +28,8 @@ pub enum WorkflowSnapshotState {
     Completed,
     /// 已失败
     Failed,
+    /// 已超时（全局超时终态，不可恢复）
+    TimedOut,
 }
 
 // ============================================================================
@@ -51,7 +53,11 @@ pub struct WorkflowSnapshot {
     pub inputs_json: Option<String>,
     /// 已完成步骤的结果（用于重建 TemplateContext）
     pub step_results: HashMap<String, StepResult>,
-    /// 当前执行到的层级索引（0-based）
+    /// 已完整执行完毕的层级数（0-based 语义：值 = 完成层级数，不含进行中的层级）。
+    ///
+    /// 引擎写入时机：Pause 时传当前层索引 `level_idx`（此时 0..level_idx 层已完整跑完，
+    /// 第 level_idx 层进行中）；Completed 时传 `levels.len()`（全部层级完整跑完）。
+    /// 用于恢复时定位重启点。
     pub current_level: usize,
     /// 总步骤数（独立于 definition.steps.len()，避免 load-then-save 时因 definition 空壳而清零）。
     pub total_steps: usize,
@@ -188,6 +194,7 @@ mod tests {
             (WorkflowSnapshotState::Paused, "paused"),
             (WorkflowSnapshotState::Completed, "completed"),
             (WorkflowSnapshotState::Failed, "failed"),
+            (WorkflowSnapshotState::TimedOut, "timed_out"),
         ];
 
         for (state, expected_str) in states {

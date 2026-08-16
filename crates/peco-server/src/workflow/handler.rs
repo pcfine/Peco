@@ -215,6 +215,11 @@ pub async fn delete_workflow(
 // ── 执行操作 ────────────────────────────────────────────────────────────────
 
 /// `POST /api/workflows/:name/execute` — 手动触发执行。
+///
+/// 触发层（Trigger layer）角色：本入口是「手动立即执行」这一**外部触发策略**。
+/// Workflow 定义本身不感知触发方式，此处仅在落库时写入
+/// `workflow_executions.trigger_type = 'manual'`（区别于 scheduler 的 'scheduled'），
+/// 随后与定时触发共享同一 `WorkflowManager::execute() → WorkflowEngine::spawn()` 路径。
 pub async fn execute_workflow(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -536,6 +541,7 @@ async fn compute_statistics(
          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as success, \
          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failure, \
          SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled, \
+         SUM(CASE WHEN status = 'timed_out' THEN 1 ELSE 0 END) as timed_out, \
          AVG(total_duration_ms) as avg_dur, \
          MIN(total_duration_ms) as min_dur, \
          MAX(total_duration_ms) as max_dur \
@@ -553,9 +559,10 @@ async fn compute_statistics(
     let success: i64 = stats_row.get(1);
     let failure: i64 = stats_row.get(2);
     let cancelled: i64 = stats_row.get(3);
-    let avg_dur: Option<f64> = stats_row.get(4);
-    let min_dur: Option<i64> = stats_row.get(5);
-    let max_dur: Option<i64> = stats_row.get(6);
+    let timed_out: i64 = stats_row.get(4);
+    let avg_dur: Option<f64> = stats_row.get(5);
+    let min_dur: Option<i64> = stats_row.get(6);
+    let max_dur: Option<i64> = stats_row.get(7);
 
     let success_rate = if total > 0 {
         success as f64 / total as f64
@@ -608,6 +615,7 @@ async fn compute_statistics(
         success_count: success,
         failure_count: failure,
         cancelled_count: cancelled,
+        timed_out_count: timed_out,
         success_rate,
         avg_duration_ms: avg_dur.unwrap_or(0.0),
         min_duration_ms: min_dur.unwrap_or(0),

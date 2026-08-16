@@ -15,6 +15,14 @@ use super::error::WorkflowError;
 // ============================================================================
 
 /// 从 workflow.md 解析的完整工作流定义。
+///
+/// # 设计不变式
+///
+/// `WorkflowDefinition` 是**纯执行描述**（DAG + 步骤 + 失败策略 + 资源上限），
+/// **永不新增** `schedule` / `trigger` / `run_mode` 等触发相关字段。
+/// 「手动触发」「定时执行」是外部触发策略，由 peco-server 的触发层管理，仅体现为
+/// `workflow_executions.trigger_type` 的不同取值，不进入本类型。
+/// 违反此不变式会让引擎（`WorkflowEngine`）与传输层耦合，破坏触发层可扩展性。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowDefinition {
     pub name: String,

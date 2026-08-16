@@ -15,6 +15,7 @@ use crate::tools::AgentAccess;
 use super::condition::evaluate_condition;
 use super::dag::DagGraph;
 use super::definition::{OnFailure, StepOutcome, WorkflowDefinition};
+use super::error::WorkflowError;
 use super::events::{ApprovalDecision, ApprovalResponse, WorkflowEvent};
 use super::handle::WorkflowHandle;
 use super::persistence::{WorkflowPersister, WorkflowSnapshot, WorkflowSnapshotState};
@@ -29,16 +30,11 @@ pub type SharedWorkflowTask = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
 pub struct WorkflowConfig {
     /// 事件通道 buffer 大小（默认 64）
     pub event_buffer: usize,
-    /// Phase 2: 步骤间最小延迟（防止模型速率限制）
-    pub step_delay: Option<Duration>,
 }
 
 impl Default for WorkflowConfig {
     fn default() -> Self {
-        Self {
-            event_buffer: 64,
-            step_delay: None,
-        }
+        Self { event_buffer: 64 }
     }
 }
 
@@ -73,6 +69,17 @@ pub struct WorkflowEngine {
     persister: Arc<dyn WorkflowPersister>,
     #[allow(dead_code)]
     config: WorkflowConfig,
+}
+
+/// 生命周期/终态事件必须保证投递（背压 `send().await`），不能像步骤级流式事件那样
+/// `try_send` 静默丢弃——`Started`/`Paused`/`Resumed`/`Completed`/`Failed`/`Cancelled`/
+/// `TimedOut` 若丢失会让消费端状态错乱（把 `None` 误判为「意外结束」、或漏掉暂停/恢复）。
+///
+/// 消费端已 drop 时 `send` 返回 `Err`，此时引擎已无后续工作，仅记录日志即可。
+async fn send_event_await(tx: &tokio::sync::mpsc::Sender<WorkflowEvent>, ev: WorkflowEvent) {
+    if let Err(e) = tx.send(ev).await {
+        warn!(error = %e, "lifecycle event receiver closed; event dropped");
+    }
 }
 
 impl WorkflowEngine {
@@ -120,6 +127,9 @@ impl WorkflowEngine {
     }
 
     /// 构建当前引擎状态的快照（供 persister.save() 使用）。
+    ///
+    /// `current_level` 语义统一为「已完整执行层级数」（不含进行中的层级）：
+    /// Pause 传 `level_idx`（0..level_idx 已完整跑完），Completed 传 `levels.len()`。
     fn build_snapshot(
         &self,
         state: WorkflowSnapshotState,
@@ -144,6 +154,50 @@ impl WorkflowEngine {
         }
     }
 
+    /// 全局超时终止路径（层边界与收集循环共用）。
+    ///
+    /// 持久化 `TimedOut` 快照并发射 `TimedOut` 终态事件。调用方负责在调用前
+    /// abort 所有在途 handle。全局超时对应层内并行的执行窗口，无唯一「当前步」，
+    /// 故 `failed_at_step` 取 `None`。
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_timeout(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<WorkflowEvent>,
+        start: Instant,
+        step_results: &HashMap<String, super::definition::StepResult>,
+        current_level: usize,
+        started_at: chrono::DateTime<chrono::Utc>,
+        inputs_json: Option<String>,
+    ) {
+        let error_msg = WorkflowError::Timeout {
+            elapsed_seconds: start.elapsed().as_secs(),
+        }
+        .to_string();
+
+        let snapshot = self.build_snapshot(
+            WorkflowSnapshotState::TimedOut,
+            Some(error_msg.clone()),
+            step_results,
+            current_level,
+            started_at,
+            inputs_json,
+        );
+        if let Err(e) = self.persister.save(&snapshot).await {
+            error!(run_id = %self.run_id, error = %e, "failed to persist TimedOut snapshot");
+        }
+
+        send_event_await(
+            event_tx,
+            WorkflowEvent::TimedOut {
+                run_id: self.run_id.clone(),
+                error: error_msg,
+                failed_at_step: None,
+                total_duration_ms: start.elapsed().as_millis() as u64,
+            },
+        )
+        .await;
+    }
+
     /// 核心执行循环（在 tokio::spawn 中运行）。
     async fn run(
         self,
@@ -156,9 +210,14 @@ impl WorkflowEngine {
         let workflow_name = self.definition.name.clone();
         let total_steps = self.definition.steps.len();
 
+        // 生命周期/终态事件需要背压投递（send().await），clone 一个 sender 供
+        // send_event_await 使用；原 event_tx 被下面的 send_event 闭包 move 走
+        // （try_send 非阻塞路径，仅用于步骤级流式事件）。
+        let lifecycle_tx = event_tx.clone();
+
         // 事件发送辅助：非阻塞发送。当事件 channel 已满（消费端过慢）或已关闭
-        // （handle 被 drop）时事件会被静默丢弃 — 至少记录一条日志，否则终态事件
-        // 丢失后消费端会把 None 误判为「意外结束」。
+        // （handle 被 drop）时事件会被静默丢弃 — 至少记录一条日志，否则步骤级
+        // 流式事件丢失仅影响观测，不影响引擎终态。
         let send_event = {
             let run_id_log = run_id.clone();
             move |event: WorkflowEvent| {
@@ -207,12 +266,16 @@ impl WorkflowEngine {
                 if let Err(e) = self.persister.save(&snapshot).await {
                     error!(%run_id, error = %e, "failed to persist Failed snapshot");
                 }
-                send_event(WorkflowEvent::Failed {
-                    run_id,
-                    error: error_msg,
-                    failed_at_step: None,
-                    total_duration_ms: 0,
-                });
+                send_event_await(
+                    &lifecycle_tx,
+                    WorkflowEvent::Failed {
+                        run_id,
+                        error: error_msg,
+                        failed_at_step: None,
+                        total_duration_ms: 0,
+                    },
+                )
+                .await;
                 return;
             }
         };
@@ -245,12 +308,16 @@ impl WorkflowEngine {
                 if let Err(e) = self.persister.save(&snapshot).await {
                     error!(%run_id, error = %e, "failed to persist Failed snapshot");
                 }
-                send_event(WorkflowEvent::Failed {
-                    run_id,
-                    error: error_msg,
-                    failed_at_step: None,
-                    total_duration_ms: 0,
-                });
+                send_event_await(
+                    &lifecycle_tx,
+                    WorkflowEvent::Failed {
+                        run_id,
+                        error: error_msg,
+                        failed_at_step: None,
+                        total_duration_ms: 0,
+                    },
+                )
+                .await;
                 return;
             }
         };
@@ -262,15 +329,25 @@ impl WorkflowEngine {
         let mut tpl_ctx = TemplateContext::new(Some(&validated_inputs));
 
         // 3. 发送 Started 事件
-        send_event(WorkflowEvent::Started {
-            run_id: run_id.clone(),
-            workflow_name: workflow_name.clone(),
-            total_steps,
-        });
+        send_event_await(
+            &lifecycle_tx,
+            WorkflowEvent::Started {
+                run_id: run_id.clone(),
+                workflow_name: workflow_name.clone(),
+                total_steps,
+            },
+        )
+        .await;
 
         // 4. 按拓扑层级迭代执行
         let start = Instant::now();
         let started_at = chrono::Utc::now();
+
+        // 全局超时 deadline（净执行时长）。Pause 等待审批不计入预算，恢复时顺延。
+        let mut deadline: Option<Instant> = self
+            .definition
+            .timeout_seconds
+            .map(|s| Instant::now() + Duration::from_secs(s));
         let mut step_results: HashMap<String, super::definition::StepResult> = HashMap::new();
         let mut steps_completed = 0usize;
         let mut steps_failed = 0usize;
@@ -288,9 +365,28 @@ impl WorkflowEngine {
             // 4a. 层级开始前检查取消
             if cancel_flag.load(Ordering::Acquire) {
                 info!(%run_id, level = level_idx, "cancelled before level start");
-                send_event(WorkflowEvent::Cancelled {
-                    run_id: run_id.clone(),
-                });
+                send_event_await(
+                    &lifecycle_tx,
+                    WorkflowEvent::Cancelled {
+                        run_id: run_id.clone(),
+                    },
+                )
+                .await;
+                return;
+            }
+
+            // 层级开始前检查全局超时
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                info!(%run_id, level = level_idx, "global timeout reached before level start");
+                self.fail_timeout(
+                    &lifecycle_tx,
+                    start,
+                    &step_results,
+                    level_idx,
+                    started_at,
+                    inputs_json.clone(),
+                )
+                .await;
                 return;
             }
 
@@ -358,13 +454,12 @@ impl WorkflowEngine {
 
                 let step_id = step.id.clone();
                 let step_data = step.clone();
-                let prev = step_results.clone();
                 let ctx = tpl_ctx.clone();
                 let cancel = cancel_flag.clone();
                 let agent_access = self.agent_access.clone();
 
                 let handle = tokio::spawn(async move {
-                    execute_step_static(&step_data, &prev, &ctx, &cancel, &agent_access).await
+                    execute_step_static(&step_data, &ctx, &cancel, &agent_access).await
                 });
                 handles.push((step_id, handle));
             }
@@ -385,10 +480,42 @@ impl WorkflowEngine {
                     continue;
                 }
 
-                // 等待当前步骤完成
-                let result = match handle.await {
-                    Ok(r) => r,
-                    Err(join_err) => {
+                // 等待当前步骤完成；若设定了全局超时，则 race deadline —— 超时立即
+                // 终止在途步骤（而非仅在步骤间检查，避免单步超过全局预算时悬挂）。
+                let mut handle = handle;
+                enum StepWait {
+                    Done(Result<Box<super::definition::StepResult>, tokio::task::JoinError>),
+                    TimedOut,
+                }
+                let wait = if let Some(d) = deadline {
+                    tokio::select! {
+                        r = &mut handle => StepWait::Done(r.map(Box::new)),
+                        _ = tokio::time::sleep_until(d.into()) => StepWait::TimedOut,
+                    }
+                } else {
+                    StepWait::Done((&mut handle).await.map(Box::new))
+                };
+
+                let result = match wait {
+                    StepWait::TimedOut => {
+                        info!(%run_id, step_id = %step_id, "global timeout reached during step execution");
+                        handle.abort();
+                        for (_, h) in remaining.drain(..) {
+                            h.abort();
+                        }
+                        self.fail_timeout(
+                            &lifecycle_tx,
+                            start,
+                            &step_results,
+                            level_idx,
+                            started_at,
+                            inputs_json.clone(),
+                        )
+                        .await;
+                        return;
+                    }
+                    StepWait::Done(Ok(r)) => *r,
+                    StepWait::Done(Err(join_err)) => {
                         error!(
                             step_id = %step_id,
                             error = %join_err,
@@ -418,20 +545,13 @@ impl WorkflowEngine {
                             attempt: result.attempt,
                         }
                     }
-                    StepOutcome::Skipped(reason) => {
-                        steps_skipped += 1;
-                        debug!(
-                            %run_id,
-                            step_id = %result.step.id,
-                            reason = %reason,
-                            "step skipped (post-execution)"
-                        );
-                        WorkflowEvent::StepSkipped {
-                            run_id: run_id.clone(),
-                            step_id: result.step.id.clone(),
-                            step_name: result.step.name.clone(),
-                            reason: reason.clone(),
-                        }
+                    // 不可达：条件不满足的步骤在 spawn 前（`for step in level` 循环）
+                    // 已直接插入 `step_results` 并 `continue`，从不进入 handles 收集循环。
+                    // `execute_step_static` 也只返回 `Success`/`Failed`，永不返回 `Skipped`。
+                    StepOutcome::Skipped(_) => {
+                        unreachable!(
+                            "skipped steps are filtered before spawning and never collected"
+                        )
                     }
                     StepOutcome::Failed(err) => {
                         steps_failed += 1;
@@ -469,12 +589,16 @@ impl WorkflowEngine {
                                 step_id = %result.step.id,
                                 "failure policy=abort, failing workflow"
                             );
-                            send_event(WorkflowEvent::Failed {
-                                run_id: run_id.clone(),
-                                error: workflow_err.clone(),
-                                failed_at_step: Some(result.step.id.clone()),
-                                total_duration_ms: start.elapsed().as_millis() as u64,
-                            });
+                            send_event_await(
+                                &lifecycle_tx,
+                                WorkflowEvent::Failed {
+                                    run_id: run_id.clone(),
+                                    error: workflow_err.clone(),
+                                    failed_at_step: Some(result.step.id.clone()),
+                                    total_duration_ms: start.elapsed().as_millis() as u64,
+                                },
+                            )
+                            .await;
                             aborted = true;
                             abort_error = Some(workflow_err);
                             // 不清空 remaining — while 循环顶部会 abort 所有剩余项
@@ -489,12 +613,17 @@ impl WorkflowEngine {
                                 step_id = %result.step.id,
                                 "failure policy=pause, waiting for approval"
                             );
-                            send_event(WorkflowEvent::Paused {
-                                run_id: run_id.clone(),
-                                reason: pause_reason.clone(),
-                                paused_at_step: Some(result.step.id.clone()),
-                            });
-                            // 持久化暂停快照
+                            send_event_await(
+                                &lifecycle_tx,
+                                WorkflowEvent::Paused {
+                                    run_id: run_id.clone(),
+                                    reason: pause_reason.clone(),
+                                    paused_at_step: Some(result.step.id.clone()),
+                                },
+                            )
+                            .await;
+                            // 持久化暂停快照（失败则升级为 Failed，避免引擎在无法
+                            // 恢复的暂停状态上等待审批）
                             let snapshot = self.build_snapshot(
                                 WorkflowSnapshotState::Paused,
                                 Some(pause_reason),
@@ -504,13 +633,28 @@ impl WorkflowEngine {
                                 inputs_json.clone(),
                             );
                             if let Err(e) = self.persister.save(&snapshot).await {
-                                error!(
-                                    %run_id,
-                                    error = %e,
-                                    "failed to persist Paused snapshot"
+                                let fail_reason = format!(
+                                    "Step '{}' failed: {step_error}, and persisting Paused snapshot failed: {e}",
+                                    result.step.id,
                                 );
+                                error!(%run_id, error = %e, "failed to persist Paused snapshot");
+                                send_event_await(
+                                    &lifecycle_tx,
+                                    WorkflowEvent::Failed {
+                                        run_id: run_id.clone(),
+                                        error: fail_reason,
+                                        failed_at_step: Some(result.step.id.clone()),
+                                        total_duration_ms: start.elapsed().as_millis() as u64,
+                                    },
+                                )
+                                .await;
+                                for (_, h) in remaining.drain(..) {
+                                    h.abort();
+                                }
+                                return;
                             }
-                            // 阻塞等待审批决策
+                            // 阻塞等待审批决策（Pause 等待不计入全局超时预算）
+                            let pause_started = Instant::now();
                             match approval_rx.recv().await {
                                 Some(ApprovalResponse {
                                     decision: ApprovalDecision::Abort,
@@ -526,12 +670,16 @@ impl WorkflowEngine {
                                         step_id = %result.step.id,
                                         "approval decision=abort (or channel closed), failing workflow"
                                     );
-                                    send_event(WorkflowEvent::Failed {
-                                        run_id,
-                                        error: abort_reason,
-                                        failed_at_step: Some(result.step.id.clone()),
-                                        total_duration_ms: start.elapsed().as_millis() as u64,
-                                    });
+                                    send_event_await(
+                                        &lifecycle_tx,
+                                        WorkflowEvent::Failed {
+                                            run_id,
+                                            error: abort_reason,
+                                            failed_at_step: Some(result.step.id.clone()),
+                                            total_duration_ms: start.elapsed().as_millis() as u64,
+                                        },
+                                    )
+                                    .await;
                                     // 取消剩余 handles
                                     for (_, h) in remaining.drain(..) {
                                         h.abort();
@@ -543,9 +691,17 @@ impl WorkflowEngine {
                                     ..
                                 }) => {
                                     info!(%run_id, "approval decision=proceed, resuming");
-                                    send_event(WorkflowEvent::Resumed {
-                                        run_id: run_id.clone(),
-                                    });
+                                    // 恢复：把暂停期间耗时从全局超时预算中剔除（deadline 顺延）
+                                    if let Some(d) = deadline {
+                                        deadline = Some(d + (Instant::now() - pause_started));
+                                    }
+                                    send_event_await(
+                                        &lifecycle_tx,
+                                        WorkflowEvent::Resumed {
+                                            run_id: run_id.clone(),
+                                        },
+                                    )
+                                    .await;
                                     // 继续当前层级剩余步骤
                                 }
                             }
@@ -632,13 +788,17 @@ impl WorkflowEngine {
             steps_skipped,
             "workflow completed"
         );
-        send_event(WorkflowEvent::Completed {
-            run_id,
-            total_duration_ms,
-            steps_completed,
-            steps_failed,
-            steps_skipped,
-        });
+        send_event_await(
+            &lifecycle_tx,
+            WorkflowEvent::Completed {
+                run_id,
+                total_duration_ms,
+                steps_completed,
+                steps_failed,
+                steps_skipped,
+            },
+        )
+        .await;
     }
 }
 
@@ -1022,6 +1182,117 @@ mod tests {
             }
         }
         // The cancelled flag was set — we got either Cancelled or Failed
+    }
+
+    #[tokio::test]
+    async fn test_execute_global_timeout() {
+        // 单步 sleep 5s，但全局超时 1s — 必须中断在途步骤并返回 TimedOut 终态。
+        let steps = vec![make_shell_step(
+            "A",
+            "Sleep",
+            "sleep 5 && echo 'done'",
+            vec![],
+        )];
+        let def = WorkflowDefinition {
+            name: "global-timeout".into(),
+            description: "test".into(),
+            version: "1.0".into(),
+            timeout_seconds: Some(1),
+            inputs: HashMap::new(),
+            steps,
+            body: None,
+        };
+        let agent_access: Arc<dyn AgentAccess> = Arc::new(NullAgentAccess);
+        let start = Instant::now();
+        let mut handle = WorkflowEngine::spawn(
+            def,
+            agent_access,
+            Arc::new(NullWorkflowPersister),
+            WorkflowConfig::default(),
+            HashMap::new(),
+        );
+
+        let mut timed_out = false;
+        while let Some(event) = handle.recv_event().await {
+            match event {
+                WorkflowEvent::TimedOut { error, .. } => {
+                    assert!(
+                        error.contains("timed out"),
+                        "TimedOut error should mention timeout, got: {error}"
+                    );
+                    timed_out = true;
+                    break;
+                }
+                WorkflowEvent::Failed { .. } | WorkflowEvent::Cancelled { .. } => break,
+                _ => {}
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(timed_out, "expected TimedOut terminal event");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "global timeout should interrupt in-flight step promptly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_step_timeout() {
+        // 步骤级超时 1s，shell 命令 sleep 5s — 步骤应失败（error 含 "timed out"），
+        // 随后按 on_failure=abort 触发 workflow Failed。
+        let steps = vec![WorkflowStep {
+            id: "slow".into(),
+            name: "Slow Step".into(),
+            step_type: StepType::Shell,
+            config: StepConfig::Shell {
+                command: "sleep 5 && echo 'done'".into(),
+            },
+            depends_on: vec![],
+            condition: None,
+            timeout_seconds: Some(1),
+            on_failure: OnFailure::Abort,
+            retry_policy: None,
+            output_schema: None,
+        }];
+        let def = WorkflowDefinition {
+            name: "step-timeout".into(),
+            description: "test".into(),
+            version: "1.0".into(),
+            timeout_seconds: None,
+            inputs: HashMap::new(),
+            steps,
+            body: None,
+        };
+        let agent_access: Arc<dyn AgentAccess> = Arc::new(NullAgentAccess);
+        let mut handle = WorkflowEngine::spawn(
+            def,
+            agent_access,
+            Arc::new(NullWorkflowPersister),
+            WorkflowConfig::default(),
+            HashMap::new(),
+        );
+
+        let mut step_failed_timeout = false;
+        let mut workflow_failed = false;
+        while let Some(event) = handle.recv_event().await {
+            match event {
+                WorkflowEvent::StepFailed { error, .. } => {
+                    if error.contains("timed out") {
+                        step_failed_timeout = true;
+                    }
+                }
+                WorkflowEvent::Failed { .. } => {
+                    workflow_failed = true;
+                    break;
+                }
+                WorkflowEvent::Cancelled { .. } | WorkflowEvent::TimedOut { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(step_failed_timeout, "expected step-level timeout failure");
+        assert!(
+            workflow_failed,
+            "expected workflow Failed after step timeout"
+        );
     }
 
     #[tokio::test]

@@ -99,6 +99,17 @@ pub enum WorkflowEvent {
 
     /// Workflow 被取消
     Cancelled { run_id: String },
+
+    /// Workflow 因全局超时被终止（净执行时长超过 `timeout_seconds`）。
+    ///
+    /// 独立于 `Failed` — 超时是可观测的独立终态，前端单独渲染「超时」徽章。
+    /// `failed_at_step` 始终为 `None`：全局超时对应层内并行的执行窗口，无唯一「当前步」。
+    TimedOut {
+        run_id: String,
+        error: String,
+        failed_at_step: Option<String>,
+        total_duration_ms: u64,
+    },
 }
 
 /// 审批决策枚举。

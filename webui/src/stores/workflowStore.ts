@@ -15,7 +15,13 @@ export interface TimelineEntry {
 }
 
 export type RunStatus =
-  "idle" | "running" | "paused" | "completed" | "failed" | "cancelled";
+  | "idle"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
 
 export interface WorkflowRunState {
   runId: string | null;
@@ -168,6 +174,12 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
 
         case "workflow_cancelled":
           run.status = "cancelled";
+          break;
+
+        case "workflow_timed_out":
+          run.status = "timed_out";
+          run.error = event.error;
+          run.totalDurationMs = event.totalDurationMs;
           break;
 
         case "done":

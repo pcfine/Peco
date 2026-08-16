@@ -8,7 +8,7 @@ import {
   useWorkflowStore,
   connectWorkflowStream,
 } from "@/stores/workflowStore";
-import { getExecution } from "@/api/workflows";
+import { getExecution, hydrateFromSnapshot } from "@/api/workflows";
 import {
   ArrowLeft,
   RefreshCw,
@@ -55,26 +55,20 @@ export function WorkflowRunDetailPage() {
 
         store.setDagTopology(nodes, []);
 
-        // If already terminal, just show snapshot
+        // If already terminal, hydrate the full snapshot (step results + terminal
+        // state) via the shared mapper, so step counts and status stay correct.
         if (
           detail.summary.status === "completed" ||
           detail.summary.status === "failed" ||
-          detail.summary.status === "cancelled"
+          detail.summary.status === "cancelled" ||
+          detail.summary.status === "timed_out"
         ) {
           store.startRun(
             runId,
             detail.summary.workflowName,
             detail.summary.totalSteps,
           );
-          // Update with terminal state
-          store.handleSSEEvent({
-            type: "workflow_completed",
-            runId: detail.summary.runId,
-            totalDurationMs: detail.summary.totalDurationMs ?? 0,
-            stepsCompleted: detail.summary.stepsCompleted,
-            stepsFailed: detail.summary.stepsFailed,
-            stepsSkipped: detail.summary.stepsSkipped,
-          });
+          hydrateFromSnapshot(detail, store.handleSSEEvent);
           return;
         }
 
@@ -112,7 +106,8 @@ export function WorkflowRunDetailPage() {
   const isTerminal =
     currentRun.status === "completed" ||
     currentRun.status === "failed" ||
-    currentRun.status === "cancelled";
+    currentRun.status === "cancelled" ||
+    currentRun.status === "timed_out";
 
   const statusLabel = {
     idle: "空闲",
@@ -121,6 +116,7 @@ export function WorkflowRunDetailPage() {
     completed: "已完成",
     failed: "失败",
     cancelled: "已取消",
+    timed_out: "超时",
   }[currentRun.status];
 
   const statusColor = {
@@ -130,6 +126,7 @@ export function WorkflowRunDetailPage() {
     completed: "text-green-600",
     failed: "text-red-600",
     cancelled: "text-gray-500",
+    timed_out: "text-orange-600",
   }[currentRun.status];
 
   if (!runId) {
