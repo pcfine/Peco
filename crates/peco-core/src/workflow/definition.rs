@@ -609,8 +609,8 @@ impl WorkflowDefinition {
 
     /// 验证外部输入参数是否满足 inputs schema。
     ///
-    /// - 检查 required 参数是否存在
-    /// - 为缺失的 optional 参数填充 default 值
+    /// - 检查 required 参数是否存在（required 但带 default 的字段缺省时填充 default）
+    /// - 为缺失的参数填充 default 值
     /// - 检查参数类型是否匹配声明的 type
     pub fn validate_inputs(
         &self,
@@ -621,10 +621,16 @@ impl WorkflowDefinition {
         for (name, input_def) in &self.inputs {
             match (provided.get(name), input_def.required) {
                 (None, true) => {
-                    return Err(WorkflowError::InputValidation(format!(
-                        "required input '{}' is missing",
-                        name
-                    )));
+                    // required 但带 default 的字段：缺省时填充默认值，而非报错。
+                    // 无 default 的 required 字段才视为真正缺失。
+                    if let Some(default) = &input_def.default {
+                        validated.insert(name.clone(), default.clone());
+                    } else {
+                        return Err(WorkflowError::InputValidation(format!(
+                            "required input '{}' is missing",
+                            name
+                        )));
+                    }
                 }
                 (None, false) => {
                     // 填充默认值
@@ -778,5 +784,59 @@ mod pre_validate_tests {
         let yaml = wrap("  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: agent");
         let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
         assert!(err.to_string().contains("missing 'config' field"));
+    }
+}
+
+#[cfg(test)]
+mod validate_inputs_tests {
+    use super::*;
+
+    /// 构造一个带单个 shell 步骤 + 给定 inputs 定义的合法 WorkflowDefinition。
+    fn definition_with_inputs(inputs_yaml: &str) -> WorkflowDefinition {
+        let yaml = format!(
+            "---\nworkflow:\n  name: \"test\"\n  description: \"test\"\n  version: \"1.0\"\n  inputs:\n{}\n  steps:\n    - id: \"s1\"\n      name: \"Step 1\"\n      type: shell\n      config:\n        command: \"echo hi\"\n---",
+            inputs_yaml
+        );
+        WorkflowDefinition::from_yaml(&yaml).unwrap()
+    }
+
+    #[test]
+    fn test_required_with_default_is_filled() {
+        let def = definition_with_inputs(
+            "    topic_area:\n      type: \"string\"\n      required: true\n      default: \"AI工具\"\n",
+        );
+        let validated = def.validate_inputs(&HashMap::new()).unwrap();
+        assert_eq!(
+            validated.get("topic_area").and_then(|v| v.as_str()),
+            Some("AI工具")
+        );
+    }
+
+    #[test]
+    fn test_required_without_default_errors() {
+        let def = definition_with_inputs(
+            "    image_dir:\n      type: \"string\"\n      required: true\n",
+        );
+        let err = def.validate_inputs(&HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("image_dir"));
+        assert!(err.to_string().contains("is missing"));
+    }
+
+    #[test]
+    fn test_optional_without_default_is_absent() {
+        let def =
+            definition_with_inputs("    style:\n      type: \"string\"\n      required: false\n");
+        let validated = def.validate_inputs(&HashMap::new()).unwrap();
+        assert!(!validated.contains_key("style"));
+    }
+
+    #[test]
+    fn test_type_mismatch_errors() {
+        let def =
+            definition_with_inputs("    count:\n      type: \"number\"\n      required: true\n");
+        let mut provided = HashMap::new();
+        provided.insert("count".to_string(), serde_json::json!("not-a-number"));
+        let err = def.validate_inputs(&provided).unwrap_err();
+        assert!(err.to_string().contains("expected type 'number'"));
     }
 }

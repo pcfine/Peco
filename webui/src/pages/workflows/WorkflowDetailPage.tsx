@@ -50,6 +50,8 @@ import axios from "axios";
 
 function getApiErrorMessage(err: unknown): string | undefined {
   if (axios.isAxiosError(err)) {
+    // 后端 ApiError 序列化为 { "error": "...", "details": "..." }
+    if (err.response?.data?.details) return String(err.response.data.details);
     if (err.response?.data?.message) return String(err.response.data.message);
     if (err.message) return err.message;
   }
