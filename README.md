@@ -77,6 +77,20 @@
 - **限流保护**：GCRA 算法（`governor`），per-user 速率限制（默认 20 req/s，burst 100；SSE 端点 1 req/s，burst 3）
 - **优雅关闭**：SIGTERM 信号处理，调度器安全停止
 
+## Web UI
+
+基于 **React 19 + TypeScript + Vite** 的现代化前端，提供完整的 Agent 管理与对话体验。
+
+**对话界面**（`pecochat`）—— SSE 实时流式对话，支持推理过程折叠展示、工具调用卡片、子 Agent 委托可视化追踪、Markdown 渲染与代码高亮：
+
+![Peco 对话界面](assets/pecochat.png)
+
+**Workflow 界面**（`workflow`）—— 声明式 DAG 工作流可视化编辑与执行追踪，SSE 实时流式显示步骤执行状态与审批流程：
+
+![Peco Workflow 界面](assets/workflow.png)
+
+前端页面包括 `chat`（对话）、`agents`（Agent 管理）、`knowledge`（知识库）、`tasks`（定时任务）、`auth`（登录/注册）、`settings`（设置），通过 Zustand 管理状态，使用 shadcn/ui + Tailwind CSS v4 构建 UI。
+
 ## 快速开始
 
 ### 前提条件
@@ -382,6 +396,20 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 - **Skill System**: 3-tier progressive loading (name+desc → full body → scripts/references/assets), `SKILL.md` format, automatic directory discovery
 - **Web UI**: SSE streaming chat with 9 event types, Agent CRUD, knowledge base management, workflow DAG editor with real-time execution tracking, cron task scheduling, JWT HS256 authentication (7-day expiry)
 - **Operations**: One-command deploy via `deploy.sh`, Swagger API docs, GCRA rate limiting (20 req/s default, 1 req/s for SSE), graceful shutdown
+
+### Web UI
+
+A modern frontend built on **React 19 + TypeScript + Vite**, offering a complete Agent management and chat experience.
+
+**Chat interface** — real-time SSE streaming with collapsible reasoning, tool-call cards, sub-agent delegation tracking, Markdown rendering and code highlighting:
+
+![Peco Chat Interface](assets/pecochat.png)
+
+**Workflow interface** — visual declarative DAG editor with SSE live execution tracking and approval flows:
+
+![Peco Workflow Interface](assets/workflow.png)
+
+Pages include `chat`, `agents`, `knowledge`, `tasks`, `auth`, and `settings` — state managed with Zustand, UI built with shadcn/ui + Tailwind CSS v4.
 
 ### Quick Start
 
