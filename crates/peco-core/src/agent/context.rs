@@ -24,9 +24,9 @@ use crate::session::AnnotatedMessage;
 pub enum ContextStrategy {
     /// 滑动窗口：保留最近 N 轮完整 turn
     SlidingWindow { max_turns: usize },
-    /// Token 预算：保留不超过 max_tokens 的消息
+    /// Token 预算：保留不超过 max_context_tokens 的消息
     TokenBudget {
-        max_tokens: usize,
+        max_context_tokens: usize,
         /// 超出预算时是否用摘要替代早期 turn（Phase 4 实现）
         summarize_overflow: bool,
     },
@@ -44,11 +44,11 @@ impl std::fmt::Debug for ContextStrategy {
                 .field("max_turns", max_turns)
                 .finish(),
             Self::TokenBudget {
-                max_tokens,
+                max_context_tokens,
                 summarize_overflow,
             } => f
                 .debug_struct("TokenBudget")
-                .field("max_tokens", max_tokens)
+                .field("max_context_tokens", max_context_tokens)
                 .field("summarize_overflow", summarize_overflow)
                 .finish(),
             Self::FullHistory => write!(f, "FullHistory"),
@@ -111,9 +111,14 @@ pub fn build_context(
             build_sliding_window(messages, system_prompt, *max_turns)
         }
         ContextStrategy::TokenBudget {
-            max_tokens,
+            max_context_tokens,
             summarize_overflow,
-        } => build_token_budget(messages, system_prompt, *max_tokens, *summarize_overflow),
+        } => build_token_budget(
+            messages,
+            system_prompt,
+            *max_context_tokens,
+            *summarize_overflow,
+        ),
         ContextStrategy::FullHistory => build_full_history(messages, system_prompt),
         ContextStrategy::Custom(filter) => filter.apply(messages, system_prompt),
     }
@@ -210,13 +215,13 @@ fn build_sliding_window(
 
 /// 构建 Token 预算上下文。
 ///
-/// 从最新 turn 向前累积消息，直到超出 `max_tokens` 预算。
+/// 从最新 turn 向前累积消息，直到超出 `max_context_tokens` 预算。
 /// 始终保留 system prompt（若提供）和 at least 1 个完整 turn。
 /// 当 `summarize_overflow` 为 true 时，被截断的早期 turn 用占位摘要替代。
 fn build_token_budget(
     messages: &[&AnnotatedMessage],
     system_prompt: Option<&str>,
-    max_tokens: usize,
+    max_context_tokens: usize,
     summarize_overflow: bool,
 ) -> ContextResult {
     if messages.is_empty() {
@@ -245,7 +250,7 @@ fn build_token_budget(
     let system_tokens: usize = system_prompt
         .map(|s| (s.len() as f64 * 0.3) as usize)
         .unwrap_or(0);
-    let mut budget_remaining = max_tokens.saturating_sub(system_tokens);
+    let mut budget_remaining = max_context_tokens.saturating_sub(system_tokens);
 
     // 从后往前扫描，按 turn 分组累积
     // 找到每轮 turn 的起止索引
@@ -496,7 +501,7 @@ mod tests {
             &refs,
             None,
             &ContextStrategy::TokenBudget {
-                max_tokens: 1,
+                max_context_tokens: 1,
                 summarize_overflow: false,
             },
         );
@@ -522,7 +527,7 @@ mod tests {
             &refs,
             None,
             &ContextStrategy::TokenBudget {
-                max_tokens: 5,
+                max_context_tokens: 5,
                 summarize_overflow: false,
             },
         );
@@ -551,7 +556,7 @@ mod tests {
             &refs,
             None,
             &ContextStrategy::TokenBudget {
-                max_tokens: 5,
+                max_context_tokens: 5,
                 summarize_overflow: true,
             },
         );

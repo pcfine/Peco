@@ -49,7 +49,7 @@ impl SystemConfig {
                     default: Some(LlmApiParams {
                         model: "deepseek-v4-flash".to_string(),
                         temperature: Some(0.7),
-                        max_tokens: Some(4096),
+                        max_tokens: None,
                         stream: Some(true),
                         reasoning_effort: None,
                     }),

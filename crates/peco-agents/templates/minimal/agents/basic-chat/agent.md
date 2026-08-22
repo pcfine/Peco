@@ -6,7 +6,6 @@ llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
   temperature: 0.7
-  max_tokens: 4096
   stream: true
 tools:
   - shell

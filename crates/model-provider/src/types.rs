@@ -191,7 +191,7 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     /// 可选的生成 token 最大数量。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<u32>,
     /// 推理力度 `"low"`, `"high"`, `"max"`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,

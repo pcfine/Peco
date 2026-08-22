@@ -48,7 +48,7 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -81,7 +81,7 @@ pub struct UpdateAgentRequest {
     pub mcp_servers: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub temperature: Option<Option<f64>>,
-    pub max_tokens: Option<Option<u64>>,
+    pub max_tokens: Option<Option<u32>>,
     pub stream: Option<Option<bool>>,
     pub reasoning_effort: Option<Option<String>>,
     pub max_turns: Option<usize>,
@@ -123,7 +123,7 @@ pub struct AgentDetail {
     pub skills: Vec<String>,              // agent.md skills
     pub knowledge_bases: Vec<String>,     // agent.md knowledge_bases
     pub temperature: Option<f64>,         // agent.md llm.temperature
-    pub max_tokens: Option<u64>,          // agent.md llm.max_tokens
+    pub max_tokens: Option<u32>,          // agent.md llm.max_tokens
     pub stream: Option<bool>,             // agent.md llm.stream
     pub reasoning_effort: Option<String>, // agent.md llm.reasoning_effort
     pub max_turns: usize,                 // agent.md max_turns

@@ -91,7 +91,7 @@ pub struct LlmConfig {
 
     /// 最大输出 token 数（可选）。
     #[serde(default)]
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<u32>,
 
     /// 是否启用流式输出（可选）。
     #[serde(default)]
@@ -113,7 +113,7 @@ pub struct ModelConfig {
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
     pub temperature: Option<f32>,
-    pub max_tokens: Option<usize>,
+    pub max_tokens: Option<u32>,
     pub stream: Option<bool>,
     pub reasoning_effort: Option<String>,
 }
@@ -133,7 +133,7 @@ impl ModelConfig {
                 .clone()
                 .or_else(|| Some(defaults.model.clone())),
             temperature: self.temperature.or(defaults.temperature.map(|t| t as f32)),
-            max_tokens: self.max_tokens.or(defaults.max_tokens.map(|t| t as usize)),
+            max_tokens: self.max_tokens.or(defaults.max_tokens),
             stream: self.stream.or(defaults.stream),
             reasoning_effort: self
                 .reasoning_effort
@@ -160,7 +160,7 @@ pub struct ModelConfigBuilder {
     provider_name: Option<String>,
     model_name: Option<String>,
     temperature: Option<f32>,
-    max_tokens: Option<usize>,
+    max_tokens: Option<u32>,
     stream: Option<bool>,
     reasoning_effort: Option<String>,
 }
@@ -197,7 +197,7 @@ impl ModelConfigBuilder {
     }
 
     /// 设置最大输出 token 数。
-    pub fn max_tokens(mut self, tokens: usize) -> Self {
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
         self
     }
@@ -247,7 +247,7 @@ pub struct AssembleAgentMdParams {
     pub provider: String,
     pub model: String,
     pub temperature: Option<f64>,
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<u32>,
     pub stream: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub tools: Vec<String>,

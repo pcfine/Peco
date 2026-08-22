@@ -76,7 +76,7 @@ pub struct LlmApiParams {
 
     /// 默认最大输出 token 数（可选）。
     #[serde(default)]
-    pub max_tokens: Option<u64>,
+    pub max_tokens: Option<u32>,
 
     /// 是否默认启用流式输出（可选）。
     #[serde(default)]

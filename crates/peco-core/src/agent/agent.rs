@@ -303,7 +303,7 @@ impl Agent {
             messages,
             tools,
             temperature: self.model_config.temperature.map(|t| t as f64),
-            max_tokens: self.model_config.max_tokens.map(|t| t as u64),
+            max_tokens: self.model_config.max_tokens,
             reasoning_effort: self.model_config.reasoning_effort.clone(),
             additional_params: None,
         }
@@ -369,7 +369,7 @@ pub fn build_model_config_with_user(
             builder = builder.temperature(t as f32);
         }
         if let Some(m) = llm.max_tokens {
-            builder = builder.max_tokens(m as usize);
+            builder = builder.max_tokens(m);
         }
         if let Some(s) = llm.stream {
             builder = builder.stream(s);

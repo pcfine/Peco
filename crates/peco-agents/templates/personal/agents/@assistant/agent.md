@@ -6,7 +6,6 @@ llm:
   provider: "deepseek"
   model: "deepseek-v4-pro"
   temperature: 0.3
-  max_tokens: 8192
   stream: true
   reasoning_effort: "high"
 tools:
