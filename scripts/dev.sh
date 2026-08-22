@@ -65,6 +65,11 @@ if $BACKEND; then
     log_info "API  : http://localhost:9227"
     log_info "Docs : http://localhost:9227/docs"
 
+    # 启用 debug 日志：tracing_subscriber 通过 RUST_LOG 读取过滤级别。
+    # 默认打开本项目 crate 的 debug 日志（含 AgentLooper 状态变化），依赖保持 info。
+    export RUST_LOG="${RUST_LOG:-peco_core=debug,peco_server=debug,tower_http=info}"
+    log_info "RUST_LOG=$RUST_LOG"
+
     cargo run -p peco-server &
     BACKEND_PID=$!
     sleep 2
