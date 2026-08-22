@@ -18,7 +18,6 @@ pub struct AgentRow {
     pub name: String,             // 对应 agents/{name}/ 目录名
     pub description: String,      // 缓存副本，来自 agent.md YAML（列表加速）
     pub icon: String,             // 纯 UI
-    pub color: String,            // 纯 UI
     pub background_color: String, // 纯 UI — 卡片背景色
     pub status: String,           // 运行时状态
     pub created_at: String,
@@ -32,7 +31,6 @@ pub struct CreateAgentParams {
     pub name: String,
     pub description: String,
     pub icon: String,
-    pub color: String,
     pub background_color: String,
 }
 
@@ -41,7 +39,6 @@ pub struct UpdateAgentParams {
     pub name: Option<String>,
     pub description: Option<String>,
     pub icon: Option<String>,
-    pub color: Option<String>,
     pub background_color: Option<String>,
 }
 
@@ -53,7 +50,7 @@ pub async fn list_index_by_user(
     user_id: &str,
 ) -> Result<Vec<AgentRow>, sqlx::Error> {
     sqlx::query_as::<_, AgentRow>(
-        "SELECT id, user_id, name, description, icon, color, background_color, status, created_at, updated_at \
+        "SELECT id, user_id, name, description, icon, background_color, status, created_at, updated_at \
          FROM agents WHERE user_id = ? ORDER BY created_at DESC",
     )
     .bind(user_id)
@@ -79,7 +76,7 @@ pub async fn find_index_by_id_and_user(
     user_id: &str,
 ) -> Result<Option<AgentRow>, sqlx::Error> {
     sqlx::query_as::<_, AgentRow>(
-        "SELECT id, user_id, name, description, icon, color, background_color, status, created_at, updated_at \
+        "SELECT id, user_id, name, description, icon, background_color, status, created_at, updated_at \
          FROM agents WHERE id = ? AND user_id = ?",
     )
     .bind(agent_id)
@@ -106,15 +103,14 @@ pub async fn find_id_by_name_and_user(
 /// 插入新 Agent（仅索引列）。
 pub async fn insert(pool: &SqlitePool, params: &CreateAgentParams) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO agents (id, user_id, name, description, icon, color, background_color) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agents (id, user_id, name, description, icon, background_color) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&params.id)
     .bind(&params.user_id)
     .bind(&params.name)
     .bind(&params.description)
     .bind(&params.icon)
-    .bind(&params.color)
     .bind(&params.background_color)
     .execute(pool)
     .await?;
@@ -143,10 +139,6 @@ pub async fn update(
     if let Some(ref icon) = params.icon {
         sets.push(format!("icon = ?{}", binds.len() + 1));
         binds.push(icon.clone());
-    }
-    if let Some(ref color) = params.color {
-        sets.push(format!("color = ?{}", binds.len() + 1));
-        binds.push(color.clone());
     }
     if let Some(ref bg_color) = params.background_color {
         sets.push(format!("background_color = ?{}", binds.len() + 1));

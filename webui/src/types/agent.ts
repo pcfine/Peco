@@ -6,7 +6,6 @@ export interface AgentListItem {
   model?: string;
   provider?: string;
   icon: string;
-  color: string;
   background_color: string;
   status: string;
   tools?: string[];
@@ -32,7 +31,6 @@ export interface CreateAgentRequest {
   model?: string;
   provider?: string;
   icon?: string;
-  color?: string;
   background_color?: string;
   tools?: string[];
   mcp_servers?: string[];
@@ -51,7 +49,6 @@ export interface UpdateAgentRequest {
   model?: string;
   provider?: string;
   icon?: string;
-  color?: string;
   background_color?: string;
   tools?: string[];
   mcp_servers?: string[];

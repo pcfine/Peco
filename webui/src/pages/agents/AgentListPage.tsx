@@ -100,7 +100,7 @@ export function AgentListPage() {
       ) : (
         <div className="grid gap-3 md:grid-cols-2">
           {agents.map((a) => {
-            const leftBg = a.background_color || a.color + "18";
+            const leftBg = a.background_color || "#6366f118";
             const isImg = a.icon.startsWith("/uploads/");
             return (
               <Link

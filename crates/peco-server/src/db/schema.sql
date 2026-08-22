@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS agents (
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     icon TEXT NOT NULL DEFAULT '🤖',
-    color TEXT NOT NULL DEFAULT '#6366f1',
     background_color TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'idle',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),

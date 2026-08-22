@@ -39,7 +39,6 @@ pub async fn sync_agents_with_db(user_id: &str, db: &SqlitePool, ws: &WorkSpace)
                 name: meta.name.clone(),
                 description: meta.description.clone(),
                 icon: "🤖".to_string(),
-                color: "#6366f1".to_string(),
                 background_color: String::new(),
             };
             match agents::insert(db, &params).await {
@@ -98,7 +97,6 @@ pub async fn sync_agents_with_db(user_id: &str, db: &SqlitePool, ws: &WorkSpace)
                     name: None,
                     description: Some(disk_desc.to_string()),
                     icon: None,
-                    color: None,
                     background_color: None,
                 },
             )

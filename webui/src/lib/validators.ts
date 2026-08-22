@@ -18,7 +18,6 @@ export const agentSchema = z.object({
   model: z.string().optional().default("deepseek-v4-flash"),
   provider: z.string().optional().default("deepseek"),
   icon: z.string().optional().default("🤖"),
-  color: z.string().optional().default("#6366f1"),
   background_color: z.string().optional().default(""),
   tools: z.array(z.string()).optional().default([]),
   skills: z.array(z.string()).optional().default([]),

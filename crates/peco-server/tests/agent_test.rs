@@ -21,8 +21,7 @@ async fn test_create_agent() {
             "system_prompt": "你是一位资深代码审查专家",
             "model": "deepseek-v4-flash",
             "tools": ["shell_exec", "fetch"],
-            "icon": "🔍",
-            "color": "#22c55e"
+            "icon": "🔍"
         }))
         .send()
         .await
@@ -393,8 +392,7 @@ async fn test_create_agent_with_all_new_fields() {
             "mcp_servers": ["filesystem"],
             "skills": ["code-review"],
             "max_turns": 30,
-            "icon": "🧪",
-            "color": "#ff6600"
+            "icon": "🧪"
         }))
         .send()
         .await
@@ -413,7 +411,6 @@ async fn test_create_agent_with_all_new_fields() {
     assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["max_turns"], 30);
     assert_eq!(body["icon"], "🧪");
-    assert_eq!(body["color"], "#ff6600");
 
     let tools: Vec<&str> = body["tools"]
         .as_array()

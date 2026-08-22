@@ -179,6 +179,33 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         );
     }
 
+    // ── Migration 006: drop agents.color (unused theme color) ────────────
+    let has_color = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'color'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if has_color {
+        tracing::info!("Running migration 006: drop agents.color");
+        let migration_sql = include_str!("migrations/006_drop_agent_color.sql");
+        for statement in migration_sql.split(';') {
+            let trimmed = statement.trim();
+            if trimmed.is_empty()
+                || trimmed
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+            {
+                continue;
+            }
+            sqlx::raw_sql(trimmed).execute(pool).await?;
+        }
+        tracing::info!("Migration 006 completed");
+    } else {
+        tracing::debug!("Migration 006 skipped: color column already absent");
+    }
+
     Ok(())
 }
 

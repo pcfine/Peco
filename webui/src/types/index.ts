@@ -22,7 +22,6 @@ export interface Agent {
   systemPrompt: string;
   model: string;
   icon: string;
-  color: string;
   status: "idle" | "running" | "error";
   createdAt: string;
 }

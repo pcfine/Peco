@@ -35,8 +35,6 @@ pub struct CreateAgentRequest {
     pub provider: Option<String>,
     #[serde(default = "default_icon")]
     pub icon: String,
-    #[serde(default = "default_color")]
-    pub color: String,
     #[serde(default)]
     pub background_color: Option<String>,
     #[serde(default)]
@@ -62,9 +60,6 @@ pub struct CreateAgentRequest {
 fn default_icon() -> String {
     "🤖".into()
 }
-fn default_color() -> String {
-    "#6366f1".into()
-}
 
 /// 更新 Agent 的请求体（全部字段可选）。
 #[derive(Debug, Deserialize)]
@@ -75,7 +70,6 @@ pub struct UpdateAgentRequest {
     pub model: Option<Option<String>>, // Option<Option<T>>: None=不更新, Some(None)=清空
     pub provider: Option<Option<String>>,
     pub icon: Option<String>,
-    pub color: Option<String>,
     pub background_color: Option<String>,
     pub tools: Option<Vec<String>>,
     pub mcp_servers: Option<Vec<String>>,
@@ -97,7 +91,6 @@ pub struct AgentListItem {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub icon: String,
-    pub color: String,
     pub background_color: String,
     pub status: String,
     pub tools: Vec<String>,
@@ -115,7 +108,6 @@ pub struct AgentDetail {
     pub model: Option<String>,            // agent.md llm.model（可能未指定）
     pub provider: Option<String>,         // agent.md llm.provider（可能未指定）
     pub icon: String,                     // DB only
-    pub color: String,                    // DB only
     pub background_color: String,         // DB only
     pub status: String,                   // DB only
     pub tools: Vec<String>,               // agent.md tools
@@ -155,7 +147,6 @@ fn agent_detail_from_profile(
         model: llm.and_then(|l| l.model.clone()),
         provider: llm.and_then(|l| l.provider.clone()),
         icon: db_row.icon.clone(),
-        color: db_row.color.clone(),
         background_color: db_row.background_color.clone(),
         status: db_row.status.clone(),
         tools: profile.tools.clone(),
@@ -190,7 +181,7 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
         mcp_servers: req.mcp_servers.clone(),
         skills: req.skills.clone(),
         knowledge_bases: req.knowledge_bases.clone().unwrap_or_default(),
-        max_turns: req.max_turns.unwrap_or(20),
+        max_turns: req.max_turns.unwrap_or(agent_config::default_max_turns()),
         system_prompt: req.system_prompt.trim().to_string(),
     }
 }
@@ -289,7 +280,6 @@ pub async fn list(
             model,
             provider,
             icon: r.icon.clone(),
-            color: r.color.clone(),
             background_color: r.background_color.clone(),
             status: r.status.clone(),
             tools,
@@ -375,7 +365,6 @@ pub async fn create(
         name: name.to_string(),
         description: req.description.trim().to_string(),
         icon: req.icon.clone(),
-        color: req.color.clone(),
         background_color: req.background_color.clone().unwrap_or_default(),
     };
     agents::insert(&state.db, &db_params).await?;
@@ -408,7 +397,6 @@ pub async fn create(
             name: name.to_string(),
             description: String::new(),
             icon: req.icon.clone(),
-            color: req.color.clone(),
             background_color: req.background_color.clone().unwrap_or_default(),
             status: "idle".to_string(),
             created_at: String::new(),
@@ -431,7 +419,6 @@ pub async fn create(
             Some(assemble_params.provider)
         },
         icon: req.icon,
-        color: req.color,
         background_color: db_row.background_color,
         status: db_row.status,
         tools: assemble_params.tools,
@@ -557,7 +544,6 @@ pub async fn update(
             },
             description: Some(merged.description.clone()),
             icon: req.icon.clone(),
-            color: req.color.clone(),
             background_color: req.background_color.clone(),
         },
     )
@@ -609,7 +595,6 @@ pub async fn update(
             Some(merged.provider)
         },
         icon: updated_row.icon,
-        color: updated_row.color,
         background_color: updated_row.background_color,
         status: updated_row.status,
         tools: merged.tools,
