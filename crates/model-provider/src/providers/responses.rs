@@ -35,7 +35,6 @@ pub struct DeepSeekResponsesAdapter {
     http_client: reqwest::Client,
     api_key: String,
     base_url: String,
-    strict_feature_validation: bool,
 }
 
 impl DeepSeekResponsesAdapter {
@@ -50,7 +49,6 @@ impl DeepSeekResponsesAdapter {
             http_client,
             api_key: api_key.into(),
             base_url: DEEPSEEK_API_BASE_URL.to_string(),
-            strict_feature_validation: false,
         })
     }
 
@@ -64,12 +62,6 @@ impl DeepSeekResponsesAdapter {
     /// 设置自定义基础 URL。
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        self
-    }
-
-    /// 设置严格特性校验开关（默认 `false`）。
-    pub fn strict_feature_validation(mut self, strict: bool) -> Self {
-        self.strict_feature_validation = strict;
         self
     }
 
@@ -119,6 +111,18 @@ fn function_call_item(call_id: &str, name: &str, arguments: &str) -> Value {
     })
 }
 
+/// 构建单个 Responses `input[]` reasoning 元素（thinking 模式回传思考内容）。
+///
+/// DeepSeek 在 thinking 模式下要求把上一轮产生的 `reasoning_text` 原样回传，
+/// 否则工具调用后的后续请求会返回 400。输入侧仅支持明文 `content`，
+/// `summary` / `encrypted_content` 不作为输入。
+fn reasoning_item(content: &str) -> Value {
+    serde_json::json!({
+        "type": "reasoning",
+        "content": [{ "type": "reasoning_text", "text": content }]
+    })
+}
+
 /// 构建单个 Responses `input[]` function_call_output 元素。
 fn function_call_output_item(call_id: &str, output: &str) -> Value {
     serde_json::json!({
@@ -132,14 +136,14 @@ fn function_call_output_item(call_id: &str, output: &str) -> Value {
 ///
 /// 与 chat 适配器的 `input_items_to_wire_messages` 对称：
 /// - 合并相邻的 assistant 文本（避免同一轮被拆成多个 message 元素）；
-/// - `Reasoning` 在 input 中无法承载（Responses 的 reasoning 是输出专用），回放时丢弃；
 /// - 保证 `function_call` 与其 `function_call_output` 相邻配对（按 `call_id` 匹配，
 ///   可容忍并发工具输出乱序；若调用后紧跟文本则把文本后置到输出之后）。
 ///
-/// 返回 `(input 元素列表, 是否丢弃了 Reasoning 输入项)`。
-fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> (Vec<Value>, bool) {
+/// `Reasoning` 是否回传由 `carry_reasoning` 决定。判据是「请求是否携带 tools 且 reasoning
+/// 已启用」，而非「某轮是否真的调用了工具」——只要携带 tools 且 reasoning 启用，即使某轮
+/// 没调工具其 reasoning 也必须保留；reasoning 显式关闭时不回传，避免与关闭态自相矛盾。
+fn input_items_to_responses_values(items: &[Arc<InputItem>], carry_reasoning: bool) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    let mut dropped_reasoning = false;
 
     // 尚未收到对应 output 的 function_call（按出现顺序，值用于最终成对输出）。
     let mut open_calls: Vec<(String, Value)> = Vec::new();
@@ -156,8 +160,14 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> (Vec<Value>, boo
 
     for item in items {
         match &**item {
-            InputItem::Reasoning { .. } => {
-                dropped_reasoning = true;
+            InputItem::Reasoning { content } => {
+                // 仅当请求携带 tools 时才回传；不带 tools 的 span 其 reasoning
+                // 会被 API 忽略，直接丢弃以省上下文。
+                if carry_reasoning {
+                    // 先冲刷暂存的 assistant 文本，保持与输入一致的时间顺序。
+                    flush_text(&mut out, &mut pending_text);
+                    out.push(reasoning_item(content));
+                }
             }
             InputItem::Message { role, content } => match role {
                 Role::System | Role::Developer | Role::User => {
@@ -206,7 +216,7 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> (Vec<Value>, boo
     }
     flush_text(&mut out, &mut pending_text);
 
-    (out, dropped_reasoning)
+    out
 }
 
 fn reasoning_config_to_value(reasoning: Option<&ReasoningConfig>) -> Option<Value> {
@@ -247,12 +257,17 @@ fn tool_choice_to_value(choice: &ToolChoice) -> Value {
     }
 }
 
-/// 构建 Responses 请求体。返回 `(字节, 是否存在被丢弃的 Reasoning 输入项)`。
+/// 构建 Responses 请求体。
 fn build_responses_request_body(
     request: &GenerateRequest,
     stream: bool,
-) -> Result<(Vec<u8>, bool), ProviderError> {
-    let (input, dropped_reasoning) = input_items_to_responses_values(&request.input);
+) -> Result<Vec<u8>, ProviderError> {
+    // reasoning 是否启用：未显式配置（None）按 provider 默认启用；否则看 enabled。
+    let reasoning_enabled = request.reasoning.as_ref().is_none_or(|r| r.enabled);
+    let input = input_items_to_responses_values(
+        &request.input,
+        !request.tools.is_empty() && reasoning_enabled,
+    );
 
     let mut body = serde_json::Map::new();
     body.insert("model".into(), serde_json::json!(request.model));
@@ -312,7 +327,7 @@ fn build_responses_request_body(
 
     let bytes = serde_json::to_vec(&Value::Object(body))
         .map_err(|e| ProviderError::Request(format!("序列化 responses 请求失败: {e}")))?;
-    Ok((bytes, dropped_reasoning))
+    Ok(bytes)
 }
 
 // ============================================================================
@@ -759,9 +774,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
     }
 
     async fn generate(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
-        self.validate_generate_request(request)?;
-
-        let (body, _) = build_responses_request_body(request, false)?;
+        let body = build_responses_request_body(request, false)?;
         let endpoint = self.responses_endpoint();
 
         let response = self
@@ -828,9 +841,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateStream, ProviderError> {
-        self.validate_generate_request(request)?;
-
-        let (body, _) = build_responses_request_body(request, true)?;
+        let body = build_responses_request_body(request, true)?;
         let endpoint = self.responses_endpoint();
         let model = request.model.clone();
 
@@ -849,28 +860,6 @@ impl ModelProvider for DeepSeekResponsesAdapter {
             endpoint,
             model,
         ))
-    }
-}
-
-impl DeepSeekResponsesAdapter {
-    /// Responses 支持完整中立特性；仅 `Reasoning` 输入项在 input 中无法承载。
-    fn validate_generate_request(&self, request: &GenerateRequest) -> Result<(), ProviderError> {
-        let has_reasoning_input = request
-            .input
-            .iter()
-            .any(|i| matches!(&**i, InputItem::Reasoning { .. }));
-        if self.strict_feature_validation && has_reasoning_input {
-            return Err(ProviderError::Request(
-                "responses 适配器不支持在 input 中回放 Reasoning".to_string(),
-            ));
-        }
-        if has_reasoning_input {
-            tracing::debug!(
-                target: "model_provider::responses",
-                "input 中的 Reasoning 项无法承载，回放时丢弃"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -906,8 +895,7 @@ mod tests {
     #[test]
     fn test_build_request_body_basic() {
         let request = make_request();
-        let (body, dropped) = build_responses_request_body(&request, false).unwrap();
-        assert!(!dropped);
+        let body = build_responses_request_body(&request, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["model"], "deepseek-v4-pro");
         assert_eq!(json["instructions"], "你是一个助手");
@@ -927,7 +915,7 @@ mod tests {
             parameters: serde_json::json!({ "type": "object" }),
         }];
         request.tool_choice = Some(ToolChoice::None);
-        let (body, _) = build_responses_request_body(&request, true).unwrap();
+        let body = build_responses_request_body(&request, true).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["name"], "get_weather");
@@ -939,7 +927,34 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_body_drops_reasoning_input() {
+    fn test_build_request_body_preserves_reasoning_when_tools_present() {
+        let mut request = make_request();
+        request.tools = vec![crate::ToolDefinition {
+            name: "get_weather".to_string(),
+            description: "获取天气".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        request.input = Arc::from([
+            Arc::new(InputItem::Message {
+                role: Role::User,
+                content: "hi".to_string(),
+            }),
+            Arc::new(InputItem::Reasoning {
+                content: "思考".to_string(),
+            }),
+        ]);
+        let body = build_responses_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let input = json["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        // 携带 tools 时，reasoning 项以 thinking 模式要求的 reasoning_text 形式回传。
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(input[1]["content"][0]["text"], "思考");
+    }
+
+    #[test]
+    fn test_build_request_body_drops_reasoning_when_no_tools() {
         let mut request = make_request();
         request.input = Arc::from([
             Arc::new(InputItem::Message {
@@ -950,9 +965,9 @@ mod tests {
                 content: "思考".to_string(),
             }),
         ]);
-        let (body, dropped) = build_responses_request_body(&request, false).unwrap();
-        assert!(dropped);
+        let body = build_responses_request_body(&request, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
+        // 未携带 tools 时，reasoning 会被 API 忽略，序列化时直接丢弃。
         assert_eq!(json["input"].as_array().unwrap().len(), 1);
     }
 
@@ -1098,21 +1113,21 @@ mod tests {
                 content: "今天晴天".to_string(),
             }),
         ];
-        let (values, dropped) = input_items_to_responses_values(&items);
-        assert!(dropped);
+        let values = input_items_to_responses_values(&items, true);
         let types: Vec<&str> = values.iter().map(|v| v["type"].as_str().unwrap()).collect();
         assert_eq!(
             types,
             vec![
                 "message",
                 "message",
+                "reasoning",
                 "function_call",
                 "function_call_output",
                 "message",
             ]
         );
-        assert_eq!(values[2]["call_id"], "c1");
         assert_eq!(values[3]["call_id"], "c1");
+        assert_eq!(values[4]["call_id"], "c1");
     }
 
     #[test]
@@ -1133,7 +1148,7 @@ mod tests {
                 output: "72F".to_string(),
             }),
         ];
-        let (values, _) = input_items_to_responses_values(&items);
+        let values = input_items_to_responses_values(&items, true);
         let types: Vec<&str> = values.iter().map(|v| v["type"].as_str().unwrap()).collect();
         assert_eq!(
             types,

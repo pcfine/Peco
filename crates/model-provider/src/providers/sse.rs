@@ -207,6 +207,10 @@ pub enum SseEvent {
 type ResponseFuture =
     Pin<Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Send>>;
 
+/// 校验 SSE 响应（含读取错误体）的装箱 future。
+type CheckResponseFuture =
+    Pin<Box<dyn Future<Output = Result<reqwest::Response, ProviderError>> + Send>>;
+
 /// 解析后的 SSE 事件的装箱流。
 type SseByteStream = Pin<
     Box<
@@ -224,15 +228,17 @@ fn into_event_stream(response: reqwest::Response) -> SseByteStream {
 }
 
 /// 验证响应是否为正确的 SSE 连接。
-fn check_sse_response(
+async fn check_sse_response(
     response: reqwest::Response,
     allow_missing_content_type: bool,
 ) -> Result<reqwest::Response, ProviderError> {
     let status = response.status();
     if status != StatusCode::OK {
+        // 读取错误响应体（通常为 JSON 错误详情），截断以避免异常大的响应体。
+        let body = read_error_body(response).await;
         return Err(ProviderError::Api {
             status: status.as_u16(),
-            body: String::new(),
+            body,
         });
     }
 
@@ -254,6 +260,39 @@ fn check_sse_response(
             "SSE 的内容类型无效：期望 text/event-stream".into(),
         ))
     }
+}
+
+/// 读取非 200 响应的错误体，最多读入 `MAX_BODY_BYTES` 字节以便日志诊断。
+async fn read_error_body(response: reqwest::Response) -> String {
+    const MAX_BODY_BYTES: usize = 8192;
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return format!("<failed to read error body: {e}>"),
+        };
+        let remaining = MAX_BODY_BYTES - bytes.len();
+        if chunk.len() >= remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let mut text = String::from_utf8_lossy(&bytes).to_string();
+    if text.len() > MAX_BODY_BYTES {
+        // `from_utf8_lossy` 可能把末尾不完整的多字节序列替换为 U+FFFD，使字节数略增；
+        // 截断前退回到最近的字符边界，避免在字符中间 panic。
+        text.truncate(text.floor_char_boundary(MAX_BODY_BYTES));
+    }
+    if truncated {
+        text.push_str("…(truncated)");
+    }
+    text
 }
 
 // ============================================================================
@@ -278,6 +317,11 @@ pin_project! {
             #[pin]
             retry_delay: futures_timer::Delay,
             current_retry: (usize, Duration),
+        },
+        /// 校验已收到的响应（含读取非 200 错误体）后进入 Open 或失败。
+        ValidatingResponse {
+            #[pin]
+            check_future: CheckResponseFuture,
         },
         /// 在传输错误后重新连接。
         Reconnecting {
@@ -437,17 +481,12 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                     match response_future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(response)) => {
-                            match check_sse_response(response, *this.allow_missing_content_type) {
-                                Ok(response) => {
-                                    let event_stream = into_event_stream(response);
-                                    this.state.set(SseState::Open { event_stream });
-                                    return Poll::Ready(Some(Ok(SseEvent::Open)));
-                                }
-                                Err(err) => {
-                                    this.state.set(SseState::Closed);
-                                    return Poll::Ready(Some(Err(err)));
-                                }
-                            }
+                            let check_future =
+                                check_sse_response(response, *this.allow_missing_content_type);
+                            this.state.set(SseState::ValidatingResponse {
+                                check_future: Box::pin(check_future),
+                            });
+                            continue;
                         }
                         Poll::Ready(Err(err)) => {
                             let provider_err = ProviderError::from(err);
@@ -473,17 +512,12 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                     match response_future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(response)) => {
-                            match check_sse_response(response, *this.allow_missing_content_type) {
-                                Ok(response) => {
-                                    let event_stream = into_event_stream(response);
-                                    this.state.set(SseState::Open { event_stream });
-                                    return Poll::Ready(Some(Ok(SseEvent::Open)));
-                                }
-                                Err(err) => {
-                                    this.state.set(SseState::Closed);
-                                    return Poll::Ready(Some(Err(err)));
-                                }
-                            }
+                            let check_future =
+                                check_sse_response(response, *this.allow_missing_content_type);
+                            this.state.set(SseState::ValidatingResponse {
+                                check_future: Box::pin(check_future),
+                            });
+                            continue;
                         }
                         Poll::Ready(Err(err)) => {
                             let provider_err = ProviderError::from(err);
@@ -498,6 +532,22 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                             } else {
                                 this.state.set(SseState::Closed);
                             }
+                        }
+                    }
+                }
+
+                // ---- 校验响应（含读取非 200 错误体）----
+                SseStateProjection::ValidatingResponse { check_future } => {
+                    match check_future.poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(response)) => {
+                            let event_stream = into_event_stream(response);
+                            this.state.set(SseState::Open { event_stream });
+                            return Poll::Ready(Some(Ok(SseEvent::Open)));
+                        }
+                        Poll::Ready(Err(err)) => {
+                            this.state.set(SseState::Closed);
+                            return Poll::Ready(Some(Err(err)));
                         }
                     }
                 }
