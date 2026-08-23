@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use model_provider::{Message, Usage};
+use model_provider::{InputItem, Role, Usage};
 use peco_core::agent::TurnFailureReason;
 use peco_core::agent::hooks::{HookAction, LooperHook, ToolHookAction};
 use peco_core::session::Session;
@@ -57,7 +57,10 @@ impl PpaMemoryHook {
         let last_turn = session.committed_turns().last()?;
 
         let user_text = match last_turn.first()?.message.as_ref() {
-            Message::User { content } => content.clone(),
+            InputItem::Message {
+                role: Role::User,
+                content,
+            } => content.clone(),
             _ => return None,
         };
 
@@ -66,7 +69,10 @@ impl PpaMemoryHook {
             .iter()
             .skip(1) // 跳过 User 自身
             .filter_map(|am| match am.message.as_ref() {
-                Message::Assistant { content, .. } => content.clone(),
+                InputItem::Message {
+                    role: Role::Assistant,
+                    content,
+                } => Some(content.clone()),
                 _ => None,
             })
             .collect();
@@ -185,7 +191,7 @@ impl LooperHook for PpaMemoryHook {
     async fn on_before_request(
         &self,
         _turn_index: usize,
-        _messages: &mut Vec<Arc<Message>>,
+        _messages: &mut Vec<Arc<InputItem>>,
     ) -> HookAction {
         HookAction::Continue
     }

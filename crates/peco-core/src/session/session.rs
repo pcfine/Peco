@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use model_provider::{Message, Usage};
+use model_provider::{InputItem, Role, Usage};
 
 use super::buffer::{CommittedBuffer, StagingBuffer};
 use super::error::SessionError;
@@ -220,7 +220,10 @@ impl Session {
         let am = AnnotatedMessage {
             id,
             turn_index: self.turn_index,
-            message: Arc::new(Message::user(user_text)),
+            message: Arc::new(InputItem::Message {
+                role: Role::User,
+                content: user_text,
+            }),
             timestamp_ms: unix_timestamp_ms(),
             estimated_tokens: None,
             source: MessageSource::UserInput,
@@ -232,16 +235,16 @@ impl Session {
         Ok(())
     }
 
-    /// 向 staging 追加消息（仅 Active 状态）。
-    pub fn stage_message(
+    /// 向 staging 追加一个中立 item（仅 Active 状态）。
+    pub fn stage_item(
         &mut self,
         source: MessageSource,
-        msg: Message,
+        item: InputItem,
     ) -> Result<MessageId, SessionError> {
         if !self.state.can_stage_message() {
             return Err(SessionError::InvalidStateTransition {
                 current_state: self.state,
-                action: "stage_message".to_string(),
+                action: "stage_item".to_string(),
             });
         }
 
@@ -249,7 +252,7 @@ impl Session {
         let am = AnnotatedMessage {
             id,
             turn_index: self.turn_index,
-            message: Arc::new(msg),
+            message: Arc::new(item),
             timestamp_ms: unix_timestamp_ms(),
             estimated_tokens: None,
             source,
@@ -292,7 +295,10 @@ impl Session {
     pub fn rollback_turn(&mut self, requeue: bool) -> Result<TurnBoundaryToken, SessionError> {
         if requeue && let Some(ui) = self.staging.take_user_input() {
             let text = match ui.message.as_ref() {
-                Message::User { content } => content.clone(),
+                InputItem::Message {
+                    role: Role::User,
+                    content,
+                } => content.clone(),
                 _ => String::new(),
             };
             if !text.is_empty() {
@@ -452,7 +458,33 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::Message;
+    use model_provider::{InputItem, Role};
+
+    fn user(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::User,
+            content: text.into(),
+        }
+    }
+    fn assistant(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::Assistant,
+            content: text.into(),
+        }
+    }
+    fn tool(call_id: impl Into<String>, content: impl Into<String>) -> InputItem {
+        InputItem::FunctionCallOutput {
+            call_id: call_id.into(),
+            output: content.into(),
+        }
+    }
+    fn function_call(call_id: impl Into<String>, name: impl Into<String>) -> InputItem {
+        InputItem::FunctionCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: "{}".to_string(),
+        }
+    }
 
     fn make_session() -> Session {
         Session::new("test-id".to_string(), "test session".to_string())
@@ -493,7 +525,7 @@ mod tests {
     #[test]
     fn test_stage_message_when_idle_fails() {
         let mut s = make_session();
-        let result = s.stage_message(MessageSource::ModelGeneration, Message::assistant("hi"));
+        let result = s.stage_item(MessageSource::ModelGeneration, assistant("hi"));
         assert!(result.is_err());
     }
 
@@ -501,11 +533,8 @@ mod tests {
     fn test_stage_and_commit_turn() {
         let mut s = make_session();
         s.start_turn("hello".to_string()).unwrap();
-        s.stage_message(
-            MessageSource::ModelGeneration,
-            Message::assistant("hi there"),
-        )
-        .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("hi there"))
+            .unwrap();
 
         let token = s.commit_turn().unwrap();
         assert_eq!(s.state(), SessionState::Idle);
@@ -542,13 +571,13 @@ mod tests {
 
         // Turn 0
         s.start_turn("q1".to_string()).unwrap();
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("a1"))
+        s.stage_item(MessageSource::ModelGeneration, assistant("a1"))
             .unwrap();
         let _token = s.commit_turn().unwrap();
 
         // Turn 1 (staging, not committed)
         s.start_turn("q2".to_string()).unwrap();
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("a2"))
+        s.stage_item(MessageSource::ModelGeneration, assistant("a2"))
             .unwrap();
 
         let refs: Vec<&AnnotatedMessage> = s.all_message_refs().collect();
@@ -559,11 +588,8 @@ mod tests {
     fn test_rollback_turn() {
         let mut s = make_session();
         s.start_turn("hello".to_string()).unwrap();
-        s.stage_message(
-            MessageSource::ModelGeneration,
-            Message::assistant("partial"),
-        )
-        .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("partial"))
+            .unwrap();
 
         let _token = s.rollback_turn(false).unwrap();
         assert_eq!(s.state(), SessionState::Idle);
@@ -596,7 +622,7 @@ mod tests {
         assert!(s.has_pending());
 
         // Complete current turn
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("a1"))
+        s.stage_item(MessageSource::ModelGeneration, assistant("a1"))
             .unwrap();
         let _token = s.commit_turn().unwrap();
 
@@ -621,11 +647,8 @@ mod tests {
         // Create 3 turns
         for i in 0..3 {
             s.start_turn(format!("q{i}")).unwrap();
-            s.stage_message(
-                MessageSource::ModelGeneration,
-                Message::assistant(format!("a{i}")),
-            )
-            .unwrap();
+            s.stage_item(MessageSource::ModelGeneration, assistant(format!("a{i}")))
+                .unwrap();
             let _ = s.commit_turn().unwrap();
         }
         assert_eq!(s.turn_index(), 3);
@@ -661,39 +684,59 @@ mod tests {
     fn test_display_message_refs_filters_correctly() {
         let mut s = make_session();
 
-        // Turn with tool calls
+        // Turn with tool calls. In the neutral model the assistant's text preamble,
+        // function call, and final answer are all separate items.
         s.start_turn("weather?".to_string()).unwrap();
-        // Assistant with tool call — should NOT be displayable
-        use model_provider::ToolCall;
-        let tc = ToolCall::new("call_1", "get_weather", r#"{"city":"BJ"}"#);
-        let assistant_tool = Message::Assistant {
-            content: Some("Let me check...".to_string()),
-            tool_calls: Some(vec![tc]),
-            reasoning_content: None,
-        };
-        s.stage_message(MessageSource::ModelGeneration, assistant_tool)
+        // Assistant preamble text — a real text item, IS displayable
+        s.stage_item(MessageSource::ModelGeneration, assistant("Let me check..."))
             .unwrap();
-        // Tool result — should NOT be displayable
-        s.stage_message(
+        // Function call — NOT displayable
+        s.stage_item(
+            MessageSource::ModelGeneration,
+            function_call("call_1", "get_weather"),
+        )
+        .unwrap();
+        // Tool result — NOT displayable
+        s.stage_item(
             MessageSource::ToolExecution {
                 tool_name: "get_weather".to_string(),
             },
-            Message::tool("call_1", "Sunny, 25C"),
+            tool("call_1", "Sunny, 25C"),
         )
         .unwrap();
-        // Final assistant — should BE displayable
-        s.stage_message(
+        // Final assistant — IS displayable
+        s.stage_item(
             MessageSource::ModelGeneration,
-            Message::assistant("Beijing is sunny, 25C"),
+            assistant("Beijing is sunny, 25C"),
         )
         .unwrap();
         let _token = s.commit_turn().unwrap();
 
         let display: Vec<_> = s.display_message_refs().collect();
-        // Only 2: user query + final assistant reply
-        assert_eq!(display.len(), 2);
-        assert!(display[0].is_displayable()); // User
-        assert!(display[1].is_displayable()); // Final assistant
+        // 3 displayable: user query + assistant preamble + final assistant reply.
+        // FunctionCall / FunctionCallOutput / Reasoning are filtered out.
+        assert_eq!(display.len(), 3);
+        assert!(matches!(
+            display[0].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
+        assert!(matches!(
+            display[1].message.as_ref(),
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        ));
+        assert!(matches!(
+            display[2].message.as_ref(),
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -722,7 +765,7 @@ mod tests {
         // Create a snapshot with some data
         let mut s = make_session();
         s.start_turn("q".to_string()).unwrap();
-        s.stage_message(MessageSource::ModelGeneration, Message::assistant("a"))
+        s.stage_item(MessageSource::ModelGeneration, assistant("a"))
             .unwrap();
         let token = s.commit_turn().unwrap();
         let snap = s.snapshot(&token);
@@ -765,7 +808,7 @@ mod tests {
         assert!(result);
         // The user input in staging should be the interrupt
         let ui = s.staging_user_input().unwrap();
-        assert_eq!(ui.message.as_ref(), &Message::user("interrupt"));
+        assert_eq!(ui.message.as_ref(), &user("interrupt"));
 
         // Commit
         let _ = s.commit_turn().unwrap();
@@ -774,6 +817,6 @@ mod tests {
         let result = s.dequeue_and_start_turn().unwrap();
         assert!(result);
         let ui = s.staging_user_input().unwrap();
-        assert_eq!(ui.message.as_ref(), &Message::user("normal"));
+        assert_eq!(ui.message.as_ref(), &user("normal"));
     }
 }

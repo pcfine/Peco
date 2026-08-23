@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use model_provider::Message;
+use model_provider::{InputItem, Role};
 use peco_core::persistence::{FileSessionPersister, PersistError, PersistResult, SessionPersister};
 use peco_core::session::{SessionMeta, SessionSnapshot};
 use tokio::sync::RwLock;
@@ -162,7 +162,10 @@ fn extract_first_query(snapshot: &SessionSnapshot) -> Option<&str> {
         .first()?
         .first()
         .and_then(|am| match am.message.as_ref() {
-            Message::User { content } => Some(content.as_str()),
+            InputItem::Message {
+                role: Role::User,
+                content,
+            } => Some(content.as_str()),
             _ => None,
         })
 }

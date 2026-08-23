@@ -14,6 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use futures::stream::Stream;
+use model_provider::InputItem;
 use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::db::{agents, conversations, messages};
 use crate::error::ApiError;
+use crate::session_dto::group_input_items;
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
@@ -362,7 +364,18 @@ pub async fn stream_chat(
                 is_first,
             )
         }
-        _ => {
+        Err(e) => {
+            tracing::warn!(
+                conversation_id = %conv_id,
+                error = %e,
+                "会话快照加载失败，创建新会话（历史会话丢失）"
+            );
+            (
+                Box::new(Session::new(conv_id.clone(), conv.title.clone())),
+                true,
+            )
+        }
+        Ok(None) => {
             tracing::info!(conversation_id = %conv_id, "Creating new session");
             (
                 Box::new(Session::new(conv_id.clone(), conv.title.clone())),
@@ -672,30 +685,35 @@ pub async fn get_session_snapshot(
                 .enumerate()
                 .map(|(i, msgs): (usize, &Vec<_>)| TurnData {
                     turn_index: i,
-                    messages: msgs
-                        .iter()
-                        .map(|am| {
-                            let msg = &*am.message;
-                            MessageData {
-                                role: msg.role_name().to_string(),
-                                content: msg.content().map(|s: &str| s.to_string()),
-                                tool_calls: msg.tool_calls().map(|tcs: &Vec<_>| {
-                                    tcs.iter()
-                                        .map(|tc| ToolCallData {
-                                            id: tc.id.clone(),
-                                            name: tc.function.name.clone(),
-                                            arguments: tc.function.arguments.clone(),
-                                        })
-                                        .collect()
-                                }),
-                                reasoning_content: msg
-                                    .reasoning_content()
-                                    .map(|s: &str| s.to_string()),
-                                tool_call_id: msg.tool_call_id().map(|s: &str| s.to_string()),
-                                timestamp_ms: am.timestamp_ms,
-                            }
-                        })
-                        .collect(),
+                    messages: {
+                        let items: Vec<InputItem> =
+                            msgs.iter().map(|am| (*am.message).clone()).collect();
+                        let timestamps: Vec<u64> = msgs.iter().map(|am| am.timestamp_ms).collect();
+                        group_input_items(&items, &timestamps)
+                            .into_iter()
+                            .map(|msg| MessageData {
+                                role: msg.role.to_string(),
+                                content: msg.content,
+                                tool_calls: if msg.tool_calls.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        msg.tool_calls
+                                            .into_iter()
+                                            .map(|tc| ToolCallData {
+                                                id: tc.id,
+                                                name: tc.function.name,
+                                                arguments: tc.function.arguments,
+                                            })
+                                            .collect(),
+                                    )
+                                },
+                                reasoning_content: msg.reasoning_content,
+                                tool_call_id: msg.tool_call_id,
+                                timestamp_ms: msg.timestamp_ms,
+                            })
+                            .collect()
+                    },
                 })
                 .collect();
 
@@ -786,33 +804,32 @@ pub(crate) fn snapshot_to_markdown(
     let mut md = format!("# 对话记录 — {conv_id}\n\n");
     if let Some((snap, _meta)) = snapshot_opt {
         for turn in &snap.committed_turns {
-            for am in turn {
-                let msg = &*am.message;
-                match msg.role_name() {
+            let items: Vec<InputItem> = turn.iter().map(|am| (*am.message).clone()).collect();
+            let timestamps: Vec<u64> = turn.iter().map(|am| am.timestamp_ms).collect();
+            for msg in group_input_items(&items, &timestamps) {
+                match msg.role {
                     "user" => {
-                        if let Some(content) = msg.content() {
+                        if let Some(content) = msg.content {
                             md.push_str(&format!("\n## 用户\n{content}\n"));
                         }
                     }
                     "assistant" => {
-                        if let Some(reasoning) = msg.reasoning_content() {
+                        if let Some(reasoning) = msg.reasoning_content {
                             md.push_str(&format!("\n> 推理：{reasoning}\n"));
                         }
-                        if let Some(tool_calls) = msg.tool_calls() {
-                            for tc in tool_calls {
-                                md.push_str(&format!(
-                                    "\n> 🔧 {}: `{}`\n",
-                                    tc.function.name,
-                                    tc.function.arguments.chars().take(200).collect::<String>()
-                                ));
-                            }
+                        for tc in &msg.tool_calls {
+                            md.push_str(&format!(
+                                "\n> 🔧 {}: `{}`\n",
+                                tc.function.name,
+                                tc.function.arguments.chars().take(200).collect::<String>()
+                            ));
                         }
-                        if let Some(content) = msg.content() {
+                        if let Some(content) = msg.content {
                             md.push_str(&format!("\n## 助手\n{content}\n"));
                         }
                     }
                     "tool" => {
-                        if let Some(content) = msg.content() {
+                        if let Some(content) = msg.content {
                             let preview: String = content.chars().take(300).collect();
                             md.push_str(&format!("\n> 工具输出：\n> ```\n> {preview}\n> ```\n"));
                         }

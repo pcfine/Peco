@@ -109,6 +109,7 @@ mod tests {
                 provider_type: "deepseek".into(),
                 api_key: Some("sk-123".into()),
                 base_url: None,
+                api: None,
                 default: None,
             },
         );
@@ -118,6 +119,7 @@ mod tests {
                 provider_type: "openai".into(),
                 api_key: Some("sk-456".into()),
                 base_url: None,
+                api: None,
                 default: None,
             },
         );

@@ -1,5 +1,5 @@
 // ============================================================================
-// v3 磁盘格式定义
+// v4 磁盘格式定义
 // ============================================================================
 
 use model_provider::Usage;
@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{AnnotatedMessage, PendingInput, SessionMeta};
 
-/// 磁盘上存储的会话文件结构（v3）。
+/// 磁盘上存储的会话文件结构（v4）。
 ///
 /// 仅在 turn 完成后落盘。不再包含 state（恒 Idle）和 staging（恒空）。
+/// v4 将消息内容从 `Message` 迁移为中立 `InputItem`（外部标记 serde）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionFile {
-    /// 格式版本号（3 = 本设计）
+    /// 格式版本号（4 = 本设计）
     pub format_version: u32,
     /// 会话元数据（动态字段由 Persister 在写入时计算）
     pub meta: SessionMeta,

@@ -25,6 +25,9 @@ pub struct UpsertProviderRequest {
     pub provider_type: String,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// 使用的 API 风格：`"responses"` | `"chat"`（可选，默认 `"responses"`）。
+    #[serde(default)]
+    pub api: Option<String>,
     #[allow(dead_code)]
     pub models: Option<Vec<String>>,
 }
@@ -139,6 +142,7 @@ pub async fn upsert(
             provider_type: req.provider_type,
             api_key: req.api_key,
             base_url: req.base_url,
+            api: req.api,
             default: None,
         },
     );

@@ -91,7 +91,16 @@ impl SessionPersister for SqliteSessionPersister {
         match row {
             Some(r) => {
                 let snapshot: SessionSnapshot =
-                    serde_json::from_str(&r.snapshot_json).map_err(PersistError::Serialization)?;
+                    serde_json::from_str(&r.snapshot_json).map_err(|e| {
+                        // 历史快照可能是旧格式（Message → InputItem 迁移前的 blob），
+                        // 反序列化失败即判定为不兼容，此处记录清晰日志供排查。
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "会话快照反序列化失败（可能是旧格式/损坏数据），无法恢复历史会话"
+                        );
+                        PersistError::Serialization(e)
+                    })?;
 
                 // 从 snapshot 计算动态字段
                 let tokens_used =

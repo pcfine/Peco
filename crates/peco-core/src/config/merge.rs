@@ -68,6 +68,7 @@ fn merge_provider_entry(system: &ProviderEntry, user: &ProviderEntry) -> Provide
 
     let api_key = user.api_key.clone().or_else(|| system.api_key.clone());
     let base_url = user.base_url.clone().or_else(|| system.base_url.clone());
+    let api = user.api.clone().or_else(|| system.api.clone());
 
     let default = match (&system.default, &user.default) {
         (Some(sys_default), Some(user_default)) => {
@@ -82,6 +83,7 @@ fn merge_provider_entry(system: &ProviderEntry, user: &ProviderEntry) -> Provide
         provider_type,
         api_key,
         base_url,
+        api,
         default,
     }
 }
@@ -119,6 +121,7 @@ mod tests {
                 provider_type: "deepseek".to_string(),
                 api_key: None,
                 base_url: Some("https://api.deepseek.com".to_string()),
+                api: None,
                 default: Some(LlmApiParams {
                     model: "deepseek-v4-flash".to_string(),
                     temperature: Some(0.7),
@@ -142,6 +145,7 @@ mod tests {
                 provider_type: "deepseek".to_string(),
                 api_key: Some("sk-xxx".to_string()),
                 base_url: None,
+                api: None,
                 default: Some(LlmApiParams {
                     model: "deepseek-v4-pro".to_string(),
                     temperature: None,
@@ -198,6 +202,7 @@ mod tests {
                 provider_type: "openai".to_string(),
                 api_key: Some("sk-openai".to_string()),
                 base_url: None,
+                api: None,
                 default: None,
             },
         );

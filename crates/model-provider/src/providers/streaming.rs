@@ -5,13 +5,14 @@
 //! 集中到一个与提供商无关的 [`StreamingProfile`] trait 背后。
 //! 各个提供商只需要实现数据块规范化即可。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_stream::stream;
 use futures::StreamExt;
 
 use crate::providers::sse::{SseEvent, StreamingEventSource};
-use crate::{ChatStream, ProviderError, StreamEvent, ToolCall, Usage};
+use crate::response::{BlockType, ContentBlock, FinishReason, StreamChunk};
+use crate::{GenerateStream, ProviderError, ToolCall, Usage};
 
 // ============================================================================
 // 中间表示类型
@@ -230,54 +231,80 @@ pub(crate) fn into_tool_call(pending: &PendingToolCall) -> Option<ToolCall> {
 }
 
 // ============================================================================
-// 共享流式管线
+// 中立 StreamChunk 流式管线（chat 适配器 stream_generate 用）
 // ============================================================================
 
-/// 通过提供商无关的管线处理 SSE 事件源。
+/// 文本块的固定 index（chat 适配器流式合成）。
+const TEXT_BLOCK_INDEX: usize = 0;
+/// 推理块的固定 index。
+const REASONING_BLOCK_INDEX: usize = 1;
+/// 工具调用块的 index 基（工具调用块 index = `TOOL_BLOCK_INDEX_BASE + wire index`）。
+const TOOL_BLOCK_INDEX_BASE: usize = 2;
+
+/// 将已完成的待处理工具调用转换为 [`ContentBlock::ToolCall`]。
 ///
-/// 此函数封装了所有通用的流式处理逻辑：
-/// - SSE 事件分发（Open / Message / Error）
-/// - [DONE] 哨兵值和空数据跳过
-/// - SSE 载荷中的 API 错误检测
-/// - 文本 / 推理增量产出
-/// - 工具调用的累积、淘汰和最终化
-/// - 用量跟踪
-/// - 正常的流结束清理
+/// 复用 [`into_tool_call`] 的规范化逻辑（丢弃缺 id/name、空参数归一化为 `"{}"`），
+/// 仅在其成功产出时返回块。
+fn pending_to_content_block(pending: &PendingToolCall) -> Option<ContentBlock> {
+    into_tool_call(pending).map(|tc| ContentBlock::ToolCall {
+        call_id: tc.id,
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+    })
+}
+
+/// 将 chat 协议的 `finish_reason` 映射为中立 [`FinishReason`]。
+fn finish_reason_to_finish(reason: Option<&str>) -> FinishReason {
+    match reason {
+        Some("stop") => FinishReason::Stop,
+        Some("tool_calls") => FinishReason::ToolCalls,
+        Some("length") => FinishReason::MaxTokens,
+        Some("content_filter") => FinishReason::Error,
+        None => FinishReason::Stop,
+        Some(_) => FinishReason::Error,
+    }
+}
+
+/// 以中立 [`StreamChunk`] 为出口的 chat 适配器流式管线
+/// （供 `stream_generate` 使用）。
 ///
-/// 提供商标定的数据块解析委托给 `profile`。
-pub(crate) fn process_normalized_sse_stream<P: StreamingProfile + 'static>(
+/// 关键差异：
+/// - 文本/推理增量在流结束时合成为完整的 `BlockEnd`（适配器生成的单调 index）。
+/// - 工具调用在 `BlockStart` 首次出现 name 时、`BlockEnd` 在完成时发出，
+///   与 wire 的 `tool_calls[].index` 偏移 [`TOOL_BLOCK_INDEX_BASE`] 避免碰撞。
+/// - 结束时发出 `Usage` + `Finish`，由 [`crate::BlockAssembler`] 折叠。
+pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static>(
     event_source: StreamingEventSource,
     profile: P,
     span: tracing::Span,
     endpoint: String,
     model: String,
-) -> ChatStream {
+) -> GenerateStream {
     let stream = stream! {
         let _guard = span.enter();
 
         tracing::debug!(
             target: "model_provider::streaming",
-            "开始 SSE 流式处理 (端点={}, 模型={})",
+            "开始 SSE 流式处理（中立 chunk）(端点={}, 模型={})",
             endpoint,
             model
         );
 
         let mut pending_tool_calls: HashMap<usize, PendingToolCall> = HashMap::new();
+        let mut started_tool_calls: HashSet<usize> = HashSet::new();
         let mut accumulated_usage: Option<NormalizedUsage> = None;
+        let mut text_buffer = String::new();
+        let mut reasoning_buffer = String::new();
+        let mut text_started = false;
+        let mut reasoning_started = false;
+        let mut finish_reason: Option<String> = None;
         let mut terminated_with_error = false;
 
         futures::pin_mut!(event_source);
 
         while let Some(event_result) = event_source.next().await {
-            // ── SSE 事件分发 ──
             let data = match event_result {
-                Ok(SseEvent::Open) => {
-                    tracing::debug!(
-                        target: "model_provider::streaming",
-                        "SSE 连接已打开"
-                    );
-                    continue;
-                }
+                Ok(SseEvent::Open) => continue,
                 Ok(SseEvent::Message(msg_event)) => msg_event.data,
                 Err(provider_err) => {
                     terminated_with_error = true;
@@ -286,19 +313,16 @@ pub(crate) fn process_normalized_sse_stream<P: StreamingProfile + 'static>(
                 }
             };
 
-            // ── 哨兵值 / 空数据跳过 ──
             if data.trim().is_empty() || data.trim() == "[DONE]" {
                 continue;
             }
 
-            // ── API 错误检测 ──
             if let Some(error) = provider_error_from_sse_data(&data) {
                 terminated_with_error = true;
                 yield Err(error);
                 break;
             }
 
-            // ── 提供商标定的数据块规范化 ──
             let chunk: NormalizedChunk = match profile.normalize_chunk(&data) {
                 Ok(Some(c)) => c,
                 Ok(None) => continue,
@@ -309,120 +333,183 @@ pub(crate) fn process_normalized_sse_stream<P: StreamingProfile + 'static>(
                 }
             };
 
-            // ── 用量跟踪 ──
             if let Some(usage) = chunk.usage {
                 accumulated_usage = Some(usage);
+            }
+            if let Some(ref reason) = chunk.finish_reason {
+                finish_reason = Some(reason.clone());
             }
 
             // ── 文本增量 ──
             if let Some(ref text) = chunk.text
                 && !text.is_empty()
             {
-                yield Ok(StreamEvent::TextDelta(text.clone()));
+                if !text_started {
+                    yield Ok(StreamChunk::BlockStart {
+                        index: TEXT_BLOCK_INDEX,
+                        block_type: BlockType::Text,
+                    });
+                    text_started = true;
+                }
+                yield Ok(StreamChunk::TextDelta {
+                    index: TEXT_BLOCK_INDEX,
+                    delta: text.clone(),
+                });
+                text_buffer.push_str(text);
             }
 
             // ── 推理增量 ──
             if let Some(ref reasoning) = chunk.reasoning
                 && !reasoning.is_empty()
             {
-                yield Ok(StreamEvent::ReasoningDelta(reasoning.clone()));
+                if !reasoning_started {
+                    yield Ok(StreamChunk::BlockStart {
+                        index: REASONING_BLOCK_INDEX,
+                        block_type: BlockType::Reasoning,
+                    });
+                    reasoning_started = true;
+                }
+                yield Ok(StreamChunk::ReasoningDelta {
+                    index: REASONING_BLOCK_INDEX,
+                    delta: reasoning.clone(),
+                });
+                reasoning_buffer.push_str(reasoning);
             }
 
             // ── 工具调用处理 ──
             for tc in &chunk.tool_calls {
+                let stream_idx = TOOL_BLOCK_INDEX_BASE + tc.index;
+
                 // ---- 淘汰检查 ----
                 if profile.uses_distinct_tool_call_eviction()
                     && let Some(existing) = pending_tool_calls.get(&tc.index)
                     && should_evict_tool_call(existing, tc)
                 {
-                    if let Some(tc) = into_tool_call(existing) {
-                        yield Ok(StreamEvent::ToolCallComplete(tc));
+                    if let Some(block) = pending_to_content_block(existing) {
+                        yield Ok(StreamChunk::BlockEnd {
+                            index: stream_idx,
+                            block,
+                        });
                     }
                     pending_tool_calls.remove(&tc.index);
+                    started_tool_calls.remove(&tc.index);
                 }
 
                 // ---- 单数据块完整工具调用 ----
                 if profile.emits_complete_single_chunk_tool_calls()
                     && is_complete_single_chunk(tc)
                 {
-                    if let Some(ref id) = tc.id
-                        && let Some(ref name) = tc.name
-                        && let Some(ref args_str) = tc.arguments
-                    {
-                        // 产出完整组装的工具调用 — agent
-                        // 会在没有前置增量时
-                        // 据此生成显示事件（Name + Arguments）。
-                        yield Ok(StreamEvent::ToolCallComplete(ToolCall::new(
-                            id.clone(),
-                            name.clone(),
-                            args_str.clone(),
-                        )));
+                    let pending = PendingToolCall {
+                        id: tc.id.clone().unwrap_or_default(),
+                        name: tc.name.clone().unwrap_or_default(),
+                        arguments: tc.arguments.clone().unwrap_or_default(),
+                    };
+                    if let Some(block) = pending_to_content_block(&pending) {
+                        if started_tool_calls.insert(tc.index) {
+                            yield Ok(StreamChunk::BlockStart {
+                                index: stream_idx,
+                                block_type: BlockType::ToolCall,
+                            });
+                        }
+                        yield Ok(StreamChunk::ToolCallDelta {
+                            index: stream_idx,
+                            call_id: pending.id.clone(),
+                            name: Some(pending.name.clone()),
+                            arguments: serde_json::Value::String(String::new()),
+                        });
+                        yield Ok(StreamChunk::ToolCallDelta {
+                            index: stream_idx,
+                            call_id: pending.id.clone(),
+                            name: None,
+                            arguments: serde_json::Value::String(pending.arguments.clone()),
+                        });
+                        yield Ok(StreamChunk::BlockEnd {
+                            index: stream_idx,
+                            block,
+                        });
                     }
                     pending_tool_calls.remove(&tc.index);
+                    started_tool_calls.remove(&tc.index);
                     continue;
                 }
 
                 // ---- 增量累积 ----
-                let entry = pending_tool_calls
-                    .entry(tc.index)
-                    .or_insert_with(|| PendingToolCall {
-                        id: String::new(),
-                        name: String::new(),
-                        arguments: String::new(),
-                    });
+                let entry = pending_tool_calls.entry(tc.index).or_insert_with(|| PendingToolCall {
+                    id: String::new(),
+                    name: String::new(),
+                    arguments: String::new(),
+                });
 
-                // ID 更新 — 如果发生变化，刷新旧调用并重新开始
+                // ID 更新
                 if let Some(ref id) = tc.id {
                     if !entry.id.is_empty() && entry.id != *id {
-                        if let Some(tc) = into_tool_call(entry) {
-                            yield Ok(StreamEvent::ToolCallComplete(tc));
+                        if let Some(block) = pending_to_content_block(entry) {
+                            yield Ok(StreamChunk::BlockEnd {
+                                index: stream_idx,
+                                block,
+                            });
                         }
                         entry.arguments.clear();
+                        started_tool_calls.remove(&tc.index);
                     }
                     entry.id = id.clone();
                 }
 
-                // 名称更新 — 增量产出
+                // 名称更新
                 if let Some(ref name) = tc.name {
                     if !entry.name.is_empty() && entry.name != *name {
-                        if let Some(tc) = into_tool_call(entry) {
-                            yield Ok(StreamEvent::ToolCallComplete(tc));
+                        if let Some(block) = pending_to_content_block(entry) {
+                            yield Ok(StreamChunk::BlockEnd {
+                                index: stream_idx,
+                                block,
+                            });
                         }
                         entry.arguments.clear();
+                        started_tool_calls.remove(&tc.index);
                     }
                     entry.name = name.clone();
 
-                    yield Ok(StreamEvent::ToolCallDelta {
-                        id: entry.id.clone(),
+                    if started_tool_calls.insert(tc.index) {
+                        yield Ok(StreamChunk::BlockStart {
+                            index: stream_idx,
+                            block_type: BlockType::ToolCall,
+                        });
+                    }
+                    yield Ok(StreamChunk::ToolCallDelta {
+                        index: stream_idx,
+                        call_id: entry.id.clone(),
                         name: Some(name.clone()),
                         arguments: serde_json::Value::String(String::new()),
                     });
                 }
 
-                // 参数更新 — 增量产出
+                // 参数更新
                 if let Some(ref args) = tc.arguments {
                     normalize_tool_call_arguments(&mut entry.arguments, args);
-                    yield Ok(StreamEvent::ToolCallDelta {
-                        id: entry.id.clone(),
+                    yield Ok(StreamChunk::ToolCallDelta {
+                        index: stream_idx,
+                        call_id: entry.id.clone(),
                         name: None,
                         arguments: serde_json::Value::String(args.clone()),
                     });
                 }
             }
 
-            // ── 结束原因刷新 ──
-            // 内联处理：在 stream! 宏中 yield 不能跨闭包边界。
+            // ── 结束原因刷新（tool_calls）──
             if let Some(ref reason) = chunk.finish_reason
                 && profile.is_tool_calls_finish_reason(reason)
             {
-                let mut indices: Vec<usize> =
-                    pending_tool_calls.keys().copied().collect();
+                let mut indices: Vec<usize> = pending_tool_calls.keys().copied().collect();
                 indices.sort();
                 for idx in indices {
-                    if let Some(pending) = pending_tool_calls.remove(&idx)
-                        && let Some(tc) = into_tool_call(&pending)
-                    {
-                        yield Ok(StreamEvent::ToolCallComplete(tc));
+                    if let Some(pending) = pending_tool_calls.remove(&idx) {
+                        if let Some(block) = pending_to_content_block(&pending) {
+                            yield Ok(StreamChunk::BlockEnd {
+                                index: TOOL_BLOCK_INDEX_BASE + idx,
+                                block,
+                            });
+                        }
+                        started_tool_calls.remove(&idx);
                     }
                 }
             }
@@ -433,24 +520,53 @@ pub(crate) fn process_normalized_sse_stream<P: StreamingProfile + 'static>(
             return;
         }
 
-        // 刷新剩余的待处理工具调用（按索引排序以
-        // 确保确定性的顺序）。
-        let mut indices: Vec<usize> =
-            pending_tool_calls.keys().copied().collect();
-        indices.sort();
-        for idx in indices {
-            if let Some(pending) = pending_tool_calls.remove(&idx)
-                && let Some(tc) = into_tool_call(&pending)
-            {
-                yield Ok(StreamEvent::ToolCallComplete(tc));
+        // 刷新剩余的待处理工具调用（按 index 排序）。
+        // MaxTokens（"length"）截断时，未闭合的 tool call 不得 flush 成完整 BlockEnd：
+        // 留给 [`crate::BlockAssembler`] 的 `Finish{MaxTokens}` 隐式丢弃，避免把畸形
+        // FunctionCall 临时 staging 后又在 rollback 时产生半成品工具调用。
+        let truncated = matches!(finish_reason.as_deref(), Some("length"));
+        if !truncated {
+            let mut indices: Vec<usize> = pending_tool_calls.keys().copied().collect();
+            indices.sort();
+            for idx in indices {
+                if let Some(pending) = pending_tool_calls.remove(&idx) {
+                    if let Some(block) = pending_to_content_block(&pending) {
+                        yield Ok(StreamChunk::BlockEnd {
+                            index: TOOL_BLOCK_INDEX_BASE + idx,
+                            block,
+                        });
+                    }
+                    started_tool_calls.remove(&idx);
+                }
             }
+        }
+
+        // 合成文本 / 推理完整块。
+        if text_started && !text_buffer.is_empty() {
+            yield Ok(StreamChunk::BlockEnd {
+                index: TEXT_BLOCK_INDEX,
+                block: ContentBlock::Text {
+                    text: std::mem::take(&mut text_buffer),
+                },
+            });
+        }
+        if reasoning_started && !reasoning_buffer.is_empty() {
+            yield Ok(StreamChunk::BlockEnd {
+                index: REASONING_BLOCK_INDEX,
+                block: ContentBlock::Reasoning {
+                    text: std::mem::take(&mut reasoning_buffer),
+                },
+            });
         }
 
         let usage = accumulated_usage
             .map(|u| profile.convert_usage(u))
             .unwrap_or_default();
-        yield Ok(StreamEvent::End { usage });
+        yield Ok(StreamChunk::Usage { usage });
+        yield Ok(StreamChunk::Finish {
+            reason: finish_reason_to_finish(finish_reason.as_deref()),
+        });
     };
 
-    ChatStream::new(Box::pin(stream))
+    GenerateStream::new(Box::pin(stream))
 }

@@ -190,7 +190,27 @@ impl StagingBuffer {
 mod tests {
     use super::*;
     use crate::session::types::{MessageId, MessageSource};
-    use model_provider::Message;
+    use model_provider::{InputItem, Role};
+
+    fn user(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::User,
+            content: text.into(),
+        }
+    }
+    fn assistant(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::Assistant,
+            content: text.into(),
+        }
+    }
+    fn function_call(call_id: impl Into<String>, name: impl Into<String>) -> InputItem {
+        InputItem::FunctionCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: "{}".to_string(),
+        }
+    }
 
     // ── CommittedBuffer tests ──────────────────────────────────────────
 
@@ -205,12 +225,7 @@ mod tests {
     #[test]
     fn test_committed_push_and_iter() {
         let mut cb = CommittedBuffer::new();
-        let am = AnnotatedMessage::new(
-            MessageId(0),
-            0,
-            Message::user("hello"),
-            MessageSource::UserInput,
-        );
+        let am = AnnotatedMessage::new(MessageId(0), 0, user("hello"), MessageSource::UserInput);
         cb.push_turn(vec![am.clone()]);
         assert_eq!(cb.len(), 1);
         assert_eq!(cb.message_count(), 1);
@@ -222,18 +237,8 @@ mod tests {
     #[test]
     fn test_committed_iter_from() {
         let mut cb = CommittedBuffer::new();
-        let am0 = AnnotatedMessage::new(
-            MessageId(0),
-            0,
-            Message::user("q0"),
-            MessageSource::UserInput,
-        );
-        let am1 = AnnotatedMessage::new(
-            MessageId(1),
-            1,
-            Message::user("q1"),
-            MessageSource::UserInput,
-        );
+        let am0 = AnnotatedMessage::new(MessageId(0), 0, user("q0"), MessageSource::UserInput);
+        let am1 = AnnotatedMessage::new(MessageId(1), 1, user("q1"), MessageSource::UserInput);
         cb.push_turn(vec![am0]);
         cb.push_turn(vec![am1]);
         assert_eq!(cb.iter_from(0).count(), 2);
@@ -248,7 +253,7 @@ mod tests {
             let am = AnnotatedMessage::new(
                 MessageId(i),
                 i as usize,
-                Message::user(&format!("q{i}")),
+                user(&format!("q{i}")),
                 MessageSource::UserInput,
             );
             cb.push_turn(vec![am]);
@@ -262,12 +267,7 @@ mod tests {
     #[test]
     fn test_committed_get_turn() {
         let mut cb = CommittedBuffer::new();
-        let am = AnnotatedMessage::new(
-            MessageId(0),
-            0,
-            Message::user("q0"),
-            MessageSource::UserInput,
-        );
+        let am = AnnotatedMessage::new(MessageId(0), 0, user("q0"), MessageSource::UserInput);
         cb.push_turn(vec![am]);
         assert!(cb.get_turn(0).is_some());
         assert!(cb.get_turn(1).is_none());
@@ -278,7 +278,7 @@ mod tests {
         let turns = vec![vec![AnnotatedMessage::new(
             MessageId(0),
             0,
-            Message::user("q0"),
+            user("q0"),
             MessageSource::UserInput,
         )]];
         let cb = CommittedBuffer::from_turns(turns);
@@ -299,17 +299,12 @@ mod tests {
     #[test]
     fn test_staging_set_and_iter() {
         let mut sb = StagingBuffer::new();
-        let ui = AnnotatedMessage::new(
-            MessageId(0),
-            0,
-            Message::user("hi"),
-            MessageSource::UserInput,
-        );
+        let ui = AnnotatedMessage::new(MessageId(0), 0, user("hi"), MessageSource::UserInput);
         sb.set_user_input(ui);
         let msg = AnnotatedMessage::new(
             MessageId(1),
             0,
-            Message::assistant("hello"),
+            assistant("hello"),
             MessageSource::ModelGeneration,
         );
         sb.push(msg);
@@ -320,8 +315,20 @@ mod tests {
         let all: Vec<_> = sb.iter_all().collect();
         assert_eq!(all.len(), 2);
         // user_input comes first
-        assert!(matches!(all[0].message.as_ref(), Message::User { .. }));
-        assert!(matches!(all[1].message.as_ref(), Message::Assistant { .. }));
+        assert!(matches!(
+            all[0].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
+        assert!(matches!(
+            all[1].message.as_ref(),
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -330,13 +337,13 @@ mod tests {
         sb.set_user_input(AnnotatedMessage::new(
             MessageId(0),
             0,
-            Message::user("q"),
+            user("q"),
             MessageSource::UserInput,
         ));
         sb.push(AnnotatedMessage::new(
             MessageId(1),
             0,
-            Message::assistant("a"),
+            assistant("a"),
             MessageSource::ModelGeneration,
         ));
 
@@ -351,7 +358,7 @@ mod tests {
         sb.set_user_input(AnnotatedMessage::new(
             MessageId(0),
             0,
-            Message::user("q"),
+            user("q"),
             MessageSource::UserInput,
         ));
         let ui = sb.take_user_input();
@@ -365,13 +372,13 @@ mod tests {
         sb.set_user_input(AnnotatedMessage::new(
             MessageId(0),
             0,
-            Message::user("q"),
+            user("q"),
             MessageSource::UserInput,
         ));
         sb.push(AnnotatedMessage::new(
             MessageId(1),
             0,
-            Message::assistant("a"),
+            assistant("a"),
             MessageSource::ModelGeneration,
         ));
         sb.clear();
@@ -384,27 +391,36 @@ mod tests {
         // Not complete initially
         assert!(!sb.is_complete());
 
-        // Assistant with tool_calls — not a final response
-        use model_provider::ToolCall;
-        let tc = ToolCall::new("c1", "tool", "{}");
-        let assist_with_tool = AnnotatedMessage::new(
+        // Function call — not a final response
+        let fc = AnnotatedMessage::new(
             MessageId(1),
             0,
-            Message::Assistant {
-                content: Some("calling...".to_string()),
-                tool_calls: Some(vec![tc]),
-                reasoning_content: None,
-            },
+            function_call("c1", "tool"),
             MessageSource::ModelGeneration,
         );
-        sb.push(assist_with_tool);
+        sb.push(fc);
         assert!(!sb.is_complete());
 
-        // Assistant without tool_calls — final response
-        let final_assist = AnnotatedMessage::new(
+        // Tool result — not a final response
+        let tr = AnnotatedMessage::new(
             MessageId(2),
             0,
-            Message::assistant("done"),
+            InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: "result".to_string(),
+            },
+            MessageSource::ToolExecution {
+                tool_name: "tool".to_string(),
+            },
+        );
+        sb.push(tr);
+        assert!(!sb.is_complete());
+
+        // Assistant text — final response
+        let final_assist = AnnotatedMessage::new(
+            MessageId(3),
+            0,
+            assistant("done"),
             MessageSource::ModelGeneration,
         );
         sb.push(final_assist);

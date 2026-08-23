@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use model_provider::Message;
+use model_provider::{InputItem, Role};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -50,11 +50,11 @@ impl std::fmt::Display for MessageId {
 /// 而非消息的协议格式（role）。用于审计日志、调试追踪和持久化元数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageSource {
-    /// 用户直接输入（对应 `Message::User`）
+    /// 用户直接输入（对应 `InputItem::Message { role: User }`）
     UserInput,
-    /// 模型生成的回复（对应 `Message::Assistant`）
+    /// 模型生成的回复（对应 `InputItem::Message { role: Assistant }` / `FunctionCall` / `Reasoning`）
     ModelGeneration,
-    /// Tool 执行结果（对应 `Message::Tool`）
+    /// Tool 执行结果（对应 `InputItem::FunctionCallOutput`）
     ToolExecution {
         /// 被执行的工具名称
         tool_name: String,
@@ -82,8 +82,8 @@ pub struct AnnotatedMessage {
     /// 所属 turn 编号（从 0 开始）
     pub turn_index: usize,
 
-    /// 消息内容（LLM 协议格式，Arc 共享所有权，避免上下文构建时深度克隆）
-    pub message: Arc<Message>,
+    /// 消息内容（中立 InputItem，Arc 共享所有权，避免上下文构建时深度克隆）
+    pub message: Arc<InputItem>,
 
     /// 消息写入时间（Unix 毫秒）
     pub timestamp_ms: u64,
@@ -101,7 +101,12 @@ pub struct AnnotatedMessage {
 
 impl AnnotatedMessage {
     /// 创建新的带注释消息。
-    pub fn new(id: MessageId, turn_index: usize, message: Message, source: MessageSource) -> Self {
+    pub fn new(
+        id: MessageId,
+        turn_index: usize,
+        message: InputItem,
+        source: MessageSource,
+    ) -> Self {
         Self {
             id,
             turn_index,
@@ -115,46 +120,37 @@ impl AnnotatedMessage {
     /// 判断此消息是否应在对话 UI 中展示。
     ///
     /// 展示规则：
-    /// - `Message::User`：总是展示
-    /// - `Message::Assistant`：仅当有文本内容且无 tool_calls（即最终回复）时展示
-    /// - `Message::Tool` / `Message::System`：不展示
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// let displayable: Vec<_> = session.display_message_refs().collect();
-    /// // 只包含用户提问和模型最终回复，不含中间 tool 调用过程
-    /// ```
+    /// - `InputItem::Message { role: User }`：总是展示
+    /// - `InputItem::Message { role: Assistant }`：仅当有文本内容（即最终回复）时展示
+    ///   （tool 调用已拆为独立的 `FunctionCall` item，不再附于 assistant 消息）
+    /// - `FunctionCall` / `FunctionCallOutput` / `Reasoning` / `Message{System}`：不展示
     pub fn is_displayable(&self) -> bool {
         match self.message.as_ref() {
-            Message::User { .. } => true,
-            Message::Assistant {
+            InputItem::Message {
+                role: Role::User, ..
+            } => true,
+            InputItem::Message {
+                role: Role::Assistant,
                 content,
-                tool_calls,
-                ..
-            } => {
-                content.as_ref().is_some_and(|c| !c.is_empty())
-                    && tool_calls.as_ref().is_none_or(|t| t.is_empty())
-            }
+            } => !content.is_empty(),
             _ => false,
         }
     }
 
-    /// 是否为模型最终回复（turn 终止点的 Assistant 消息）。
+    /// 是否为模型最终回复（turn 终止点的 Assistant 文本消息）。
     pub fn is_final_response(&self) -> bool {
-        matches!(self.message.as_ref(),
-            Message::Assistant { content, tool_calls, .. }
-            if content.as_ref().is_some_and(|c| !c.is_empty())
-                && tool_calls.as_ref().is_none_or(|t| t.is_empty())
+        matches!(
+            self.message.as_ref(),
+            InputItem::Message {
+                role: Role::Assistant,
+                content
+            } if !content.is_empty()
         )
     }
 
-    /// 是否为带 tool_calls 的中间推理步骤。
+    /// 是否为工具调用（`InputItem::FunctionCall`）。
     pub fn is_tool_invocation(&self) -> bool {
-        matches!(self.message.as_ref(),
-            Message::Assistant { tool_calls, .. }
-            if tool_calls.as_ref().is_some_and(|t| !t.is_empty())
-        )
+        matches!(self.message.as_ref(), InputItem::FunctionCall { .. })
     }
 }
 

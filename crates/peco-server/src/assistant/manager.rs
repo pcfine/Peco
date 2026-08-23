@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use axum::response::sse::{KeepAlive, Sse};
 use futures::stream::Stream;
-use model_provider::Message;
+use model_provider::{InputItem, Role};
 use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent, MessageFilter};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::{AnnotatedMessage, Session};
@@ -151,7 +151,15 @@ impl PersonalAssistantManager {
                     snapshot,
                 ))
             }
-            _ => {
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %self.user_id,
+                    error = %e,
+                    "个人助理会话快照加载失败，创建新会话（历史会话丢失）"
+                );
+                Box::new(Session::new(conv_id.clone(), "个人助理".to_string()))
+            }
+            Ok(None) => {
                 tracing::info!(
                     user_id = %self.user_id,
                     "Creating new personal assistant session"
@@ -328,10 +336,13 @@ impl MessageFilter for PersonalAssistantMessageFilter {
         let filtered_history: Vec<_> = history
             .into_iter()
             .filter(|m| match m.message.as_ref() {
-                Message::User { .. } => true,
-                // 保留有文本内容的 Assistant 消息
-                Message::Assistant { content, .. } => content.is_some(),
-                // Tool / 其他 → 丢弃（历史的 tool 过程已被最终回复总结）
+                InputItem::Message { role, content } => match role {
+                    Role::User => true,
+                    // 保留有文本内容的 Assistant 消息
+                    Role::Assistant => !content.is_empty(),
+                    _ => false,
+                },
+                // FunctionCall / FunctionCallOutput / Reasoning → 丢弃（历史的 tool 过程已被最终回复总结）
                 _ => false,
             })
             .collect();
@@ -360,45 +371,37 @@ impl MessageFilter for PersonalAssistantMessageFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::{Message, ToolCall, ToolCallFunction};
 
-    fn make_annotated(turn: usize, msg: Message) -> AnnotatedMessage {
+    fn make_annotated(turn: usize, msg: InputItem) -> AnnotatedMessage {
         AnnotatedMessage::new(MessageId(0), turn, msg, MessageSource::UserInput)
     }
 
-    fn make_user(content: &str) -> Message {
-        Message::User {
+    fn make_user(content: &str) -> InputItem {
+        InputItem::Message {
+            role: Role::User,
             content: content.to_string(),
         }
     }
 
-    fn make_assistant_text(content: &str) -> Message {
-        Message::Assistant {
-            content: Some(content.to_string()),
-            tool_calls: None,
-            reasoning_content: None,
-        }
-    }
-
-    fn make_assistant_tool_call(id: &str, name: &str, args: &str) -> Message {
-        Message::Assistant {
-            content: Some("Let me run a command.".to_string()),
-            tool_calls: Some(vec![ToolCall {
-                id: id.to_string(),
-                call_type: "function".to_string(),
-                function: ToolCallFunction {
-                    name: name.to_string(),
-                    arguments: args.to_string(),
-                },
-            }]),
-            reasoning_content: None,
-        }
-    }
-
-    fn make_tool(tool_call_id: &str, content: &str) -> Message {
-        Message::Tool {
-            tool_call_id: tool_call_id.to_string(),
+    fn make_assistant_text(content: &str) -> InputItem {
+        InputItem::Message {
+            role: Role::Assistant,
             content: content.to_string(),
+        }
+    }
+
+    fn make_function_call(id: &str, name: &str, args: &str) -> InputItem {
+        InputItem::FunctionCall {
+            call_id: id.to_string(),
+            name: name.to_string(),
+            arguments: args.to_string(),
+        }
+    }
+
+    fn make_function_call_output(id: &str, content: &str) -> InputItem {
+        InputItem::FunctionCallOutput {
+            call_id: id.to_string(),
+            output: content.to_string(),
         }
     }
 
@@ -421,18 +424,42 @@ mod tests {
         // 历史 10 条 → 滑动窗口保留最近 4 条（问题3,回答3,问题4,回答4）
         // + 当前轮 User(1) = 5。无 System 消息。
         assert_eq!(result.len(), 5);
-        assert!(matches!(result[0].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[0].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
         assert!(matches!(
             result[1].message.as_ref(),
-            Message::Assistant { .. }
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
         ));
-        assert!(matches!(result[2].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[2].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
         assert!(matches!(
             result[3].message.as_ref(),
-            Message::Assistant { .. }
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
         ));
         // 当前轮
-        assert!(matches!(result[4].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[4].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -460,22 +487,8 @@ mod tests {
         let msgs = vec![
             // turn 0: history
             make_annotated(0, make_user("历史问题")),
-            make_annotated(
-                0,
-                Message::Assistant {
-                    content: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "t1".to_string(),
-                        call_type: "function".to_string(),
-                        function: ToolCallFunction {
-                            name: "shell_exec".to_string(),
-                            arguments: "ls".to_string(),
-                        },
-                    }]),
-                    reasoning_content: None,
-                },
-            ),
-            make_annotated(0, make_tool("t1", "output")),
+            make_annotated(0, make_function_call("t1", "shell_exec", "ls")),
+            make_annotated(0, make_function_call_output("t1", "output")),
             make_annotated(0, make_assistant_text("历史回答")),
             // turn 1: current
             make_annotated(1, make_user("当前问题")),
@@ -485,14 +498,29 @@ mod tests {
         let result = filter.filter(&refs);
 
         // Expected: 历史User + 历史纯文本Assistant + 当前User
-        // Assistant(content=None, tool_calls=Some) and its Tool are dropped
+        // FunctionCall and its FunctionCallOutput are dropped in history
         assert_eq!(result.len(), 3);
-        assert!(matches!(result[0].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[0].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
         assert!(matches!(
             result[1].message.as_ref(),
-            Message::Assistant { .. }
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
         ));
-        assert!(matches!(result[2].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[2].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -503,49 +531,83 @@ mod tests {
         let msgs = vec![
             // Turn 0 (history): User + tool-call Assistant(content+tool_calls) + Tool + text Assistant
             make_annotated(0, make_user("问题1")),
-            make_annotated(
-                0,
-                make_assistant_tool_call("c1", "shell_exec", "cargo build"),
-            ),
-            make_annotated(0, make_tool("c1", "compilation error...")),
+            make_annotated(0, make_assistant_text("运行命令")),
+            make_annotated(0, make_function_call("c1", "shell_exec", "cargo build")),
+            make_annotated(0, make_function_call_output("c1", "compilation error...")),
             make_annotated(0, make_assistant_text("修复完成")),
             // Turn 1 (history): User + text-only Assistant
             make_annotated(1, make_user("问题2")),
             make_annotated(1, make_assistant_text("回答2")),
             // Turn 2 (current): User + tool-call Assistant + Tool
             make_annotated(2, make_user("当前问题")),
-            make_annotated(
-                2,
-                make_assistant_tool_call("c2", "shell_exec", "cargo test"),
-            ),
-            make_annotated(2, make_tool("c2", "tests passed")),
+            make_annotated(2, make_assistant_text("运行测试")),
+            make_annotated(2, make_function_call("c2", "shell_exec", "cargo test")),
+            make_annotated(2, make_function_call_output("c2", "tests passed")),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
 
         let result = filter.filter(&refs);
 
-        // 10 input messages, 1 history Tool dropped → 9 output messages
-        // [User"问题1"][Asst(tool)][Asst"修复完成"][User"问题2"][Asst"回答2"][User"当前"][Asst(tool)][Tool]
-        assert_eq!(result.len(), 8);
-        assert!(matches!(result[0].message.as_ref(), Message::User { .. }));
+        // History (turn 0-1): User"问题1" + Asst"运行命令" + Asst"修复完成" + User"问题2" + Asst"回答2" = 5
+        //   (FunctionCall c1 + FunctionCallOutput c1 dropped)
+        // Current (turn 2): User"当前" + Asst"运行测试" + FunctionCall c2 + FunctionCallOutput c2 = 4
+        assert_eq!(result.len(), 9);
+        assert!(matches!(
+            result[0].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
         assert!(matches!(
             result[1].message.as_ref(),
-            Message::Assistant { .. }
-        )); // tool_call with content
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        ));
         assert!(matches!(
             result[2].message.as_ref(),
-            Message::Assistant { .. }
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        )); // "修复完成"
+        assert!(matches!(
+            result[3].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
         ));
-        assert!(matches!(result[3].message.as_ref(), Message::User { .. }));
         assert!(matches!(
             result[4].message.as_ref(),
-            Message::Assistant { .. }
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
         )); // "回答2"
-        assert!(matches!(result[5].message.as_ref(), Message::User { .. }));
+        assert!(matches!(
+            result[5].message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ));
         assert!(matches!(
             result[6].message.as_ref(),
-            Message::Assistant { .. }
-        )); // current tool_call
-        assert!(matches!(result[7].message.as_ref(), Message::Tool { .. }));
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        )); // current "运行测试"
+        assert!(matches!(
+            result[7].message.as_ref(),
+            InputItem::FunctionCall { .. }
+        ));
+        assert!(matches!(
+            result[8].message.as_ref(),
+            InputItem::FunctionCallOutput { .. }
+        ));
     }
 }

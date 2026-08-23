@@ -17,7 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use model_provider::{ChatResponse, ChatStream, Message, StreamEvent, ToolCall, Usage};
+use model_provider::{
+    BlockAssembler, ContentBlock, GenerateResult, GenerateStream, InputItem, ResponseStatus, Role,
+    StreamChunk, ToolCall, Usage,
+};
 
 type ModelTaskHandle = tokio::task::JoinHandle<Result<ModelResponse, AgentError>>;
 type SharedModelTask = Arc<tokio::sync::Mutex<Option<ModelTaskHandle>>>;
@@ -53,17 +56,17 @@ pub enum OuterState {
 /// batch 和 streaming 分别有独立的状态路径，但共享 ExecutingTools / Done / Failed。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReActState {
-    /// 构建 ChatRequest，决定走 batch 还是 streaming 分支
+    /// 构建 GenerateRequest，决定走 batch 还是 streaming 分支
     PreparingRequest,
 
     // ── batch 分支 ──
-    /// 已发送非流式请求，等待完整 ChatResponse
+    /// 已发送非流式请求，等待完整 GenerateResult
     AwaitingModel,
-    /// 收到完整 ChatResponse，分析结果（有无 tool_calls）
+    /// 收到完整 GenerateResult，分析结果（有无 tool_calls）
     ResolvingResponse,
 
     // ── streaming 分支 ──
-    /// 消费 ChatStream，逐 chunk 处理直到流关闭
+    /// 消费 GenerateStream，逐 chunk 处理直到流关闭
     Streaming,
 
     // ── 共享后续状态 ──
@@ -83,7 +86,7 @@ pub enum ReActState {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReActContext {
     /// batch 模式的完整响应
-    batch_response: Option<ChatResponse>,
+    batch_response: Option<GenerateResult>,
     /// 待执行的 tool calls，每个携带自身执行状态
     pending_tool_calls: Vec<PendingToolCall>,
     /// 当前轮 assistant 文本内容
@@ -558,85 +561,6 @@ impl Clone for LooperHandle {
 }
 
 // ============================================================================
-// StreamAssembler — Streaming 增量组装器
-// ============================================================================
-
-/// Streaming 模式的增量组装器。
-///
-/// 累积 text delta、reasoning delta，并从增量 `ToolCallDelta` 事件中组装完整的 tool calls。
-///
-/// Tool call builders 以 `HashMap` 按 `id` 索引，`apply_delta` 和 `complete_tool_call`
-/// 均为 O(1) 平均查找。
-#[derive(Debug, Clone)]
-struct StreamAssembler {
-    /// 收集的文本 delta
-    text_buffer: String,
-    /// 收集的推理 delta
-    reasoning_buffer: String,
-    /// 正在组装的 tool calls（key = tool call id）
-    tool_call_builders: std::collections::HashMap<String, ToolCallBuilder>,
-}
-
-impl StreamAssembler {
-    fn new() -> Self {
-        Self {
-            text_buffer: String::new(),
-            reasoning_buffer: String::new(),
-            tool_call_builders: std::collections::HashMap::new(),
-        }
-    }
-
-    /// 应用一个 tool call delta（增量构建）。O(1) 平均。
-    fn apply_delta(&mut self, id: String, name: Option<String>, arguments: String) {
-        self.tool_call_builders
-            .entry(id)
-            .and_modify(|b| {
-                if let Some(n) = &name {
-                    b.name = Some(n.clone());
-                }
-                b.arguments.push_str(&arguments);
-            })
-            .or_insert_with(|| ToolCallBuilder { name, arguments });
-    }
-
-    /// 标记一个 tool call 为完整（从 ToolCallComplete 事件）。O(1) 平均。
-    fn complete_tool_call(&mut self, tc: ToolCall) {
-        self.tool_call_builders
-            .entry(tc.id.clone())
-            .and_modify(|b| {
-                b.name = Some(tc.function.name.clone());
-                b.arguments = tc.function.arguments.clone();
-            })
-            .or_insert_with(|| ToolCallBuilder {
-                name: Some(tc.function.name),
-                arguments: tc.function.arguments,
-            });
-    }
-
-    /// 从 builder 映射中构建最终的 `Vec<ToolCall>`。
-    ///
-    /// Tool call 的 `id` 来自 HashMap key，保持与 provider 分配一致。
-    fn build_tool_calls(&self) -> Vec<ToolCall> {
-        self.tool_call_builders
-            .iter()
-            .filter_map(|(id, b)| {
-                let name = b.name.clone()?;
-                Some(ToolCall::new(id.clone(), name, b.arguments.clone()))
-            })
-            .collect()
-    }
-}
-
-/// Streaming 模式中单个 tool call 的增量构建器。
-///
-/// `id` 不再存储在此结构中 — 改为 `StreamAssembler` 的 `HashMap` key。
-#[derive(Debug, Clone)]
-struct ToolCallBuilder {
-    name: Option<String>,
-    arguments: String,
-}
-
-// ============================================================================
 // AgentLooper 主结构
 // ============================================================================
 
@@ -721,10 +645,10 @@ pub struct AgentLooper {
     persister: Arc<dyn crate::persistence::SessionPersister>,
 
     // ── 纯运行时状态（不可持久化）──
-    /// streaming 模式：活跃的 ChatStream
-    active_stream: Option<ChatStream>,
-    /// streaming 模式：增量组装器（跨 chunk 持久）
-    stream_assembler: StreamAssembler,
+    /// streaming 模式：活跃的 [`GenerateStream`]
+    active_stream: Option<GenerateStream>,
+    /// streaming 模式：中立块组装器（跨 chunk 持久）
+    stream_assembler: BlockAssembler,
     /// 活跃的 tool 执行任务集（增量执行模式：Spawn → Poll → 完成）
     active_tool_tasks: Option<tokio::task::JoinSet<(usize, ToolCallResult)>>,
 }
@@ -774,7 +698,7 @@ impl AgentLooper {
             pause_flag,
             persister,
             active_stream: None,
-            stream_assembler: StreamAssembler::new(),
+            stream_assembler: BlockAssembler::new(),
             active_tool_tasks: None,
         }
     }
@@ -886,13 +810,13 @@ impl AgentLooper {
     // ── Hook 调用辅助函数 ──────────────────────────────────────────────────
     //
     // NOTE: 这些是关联函数（非方法），直接接收 hooks 切片，避免 `&self` 跨越 await point。
-    // 由于 AgentLooper 不是 Sync（含 non-Sync 的 ChatStream），
+    // 由于 AgentLooper 不是 Sync（含 non-Sync 的 GenerateStream），
     // `&self` 不能在 tokio::spawn 的 future 中跨 await 持有。
 
     async fn invoke_on_before_request(
         hooks: &[Arc<dyn LooperHook>],
         turn: usize,
-        messages: &mut Vec<Arc<Message>>,
+        messages: &mut Vec<Arc<InputItem>>,
     ) -> HookAction {
         for hook in hooks {
             match hook.on_before_request(turn, messages).await {
@@ -906,7 +830,7 @@ impl AgentLooper {
     async fn invoke_on_after_response(
         hooks: &[Arc<dyn LooperHook>],
         turn: usize,
-        response: &ChatResponse,
+        response: &GenerateResult,
     ) -> HookAction {
         for hook in hooks {
             match hook.on_after_response(turn, response).await {
@@ -1471,21 +1395,32 @@ impl AgentLooper {
         // 否则（tool 结果返回后的 ReAct 迭代）复用已缓存的上下文。
         let last_is_user = refs
             .last()
-            .map(|am| matches!(am.message.as_ref(), Message::User { .. }))
+            .map(|am| {
+                matches!(
+                    am.message.as_ref(),
+                    InputItem::Message {
+                        role: Role::User,
+                        ..
+                    }
+                )
+            })
             .unwrap_or(false);
 
         if last_is_user && let Some(dc) = &self.config.dynamic_context {
             let query_text = refs
                 .last()
                 .and_then(|am| match am.message.as_ref() {
-                    Message::User { content } => Some(content.as_str()),
+                    InputItem::Message {
+                        role: Role::User,
+                        content,
+                    } => Some(content.as_str()),
                     _ => None,
                 })
                 .unwrap_or("");
             self.dynamic_context = dc.query(query_text).await;
         }
 
-        // ── 合并 system prompt ─────────────────────────────────────────
+        // ── 合并 system prompt → instructions ──────────────────────────
         let effective_prompt = match &self.dynamic_context {
             Some(dyn_ctx) => {
                 format!("{}\n\n[Dynamic Context]\n{}", self.system_prompt, dyn_ctx)
@@ -1514,14 +1449,18 @@ impl AgentLooper {
 
         if use_stream {
             // ── Streaming 路径 ──
-            match self.agent.stream_chat(session_messages).await {
+            match self
+                .agent
+                .stream_generate(session_messages, Some(effective_prompt))
+                .await
+            {
                 Ok(stream) => {
                     self.active_stream = Some(stream);
-                    self.stream_assembler = StreamAssembler::new();
+                    self.stream_assembler = BlockAssembler::new();
                     self.react_state = ReActState::Streaming;
                 }
                 Err(e) => {
-                    error!(error = %e, "Streaming chat request failed");
+                    error!(error = %e, "Streaming generate request failed");
                     self.failure_reason = Some(TurnFailureReason::Other(format!(
                         "Streaming request failed: {e}"
                     )));
@@ -1530,15 +1469,20 @@ impl AgentLooper {
             }
         } else {
             // ── Batch 路径 ──
-            match self.agent.chat(session_messages).await {
+            let tools = self.agent.tool_executor().definitions();
+            match self
+                .agent
+                .generate_with_tools(session_messages, Some(effective_prompt), tools)
+                .await
+            {
                 Ok(response) => {
                     self.react_ctx.batch_response = Some(response);
                     self.react_state = ReActState::ResolvingResponse;
                 }
                 Err(e) => {
-                    error!(error = %e, "Batch chat request failed");
+                    error!(error = %e, "Batch generate request failed");
                     self.failure_reason = Some(TurnFailureReason::Other(format!(
-                        "Chat request failed: {e}"
+                        "Generate request failed: {e}"
                     )));
                     self.react_state = ReActState::Failed;
                 }
@@ -1568,26 +1512,6 @@ impl AgentLooper {
             return;
         }
 
-        // 提取 assistant 内容
-        let (text, tool_calls, reasoning) = match &response.message {
-            Message::Assistant {
-                content,
-                tool_calls,
-                reasoning_content,
-            } => (
-                content.clone().unwrap_or_default(),
-                tool_calls.clone(),
-                reasoning_content.clone().unwrap_or_default(),
-            ),
-            _ => {
-                warn!("Expected Assistant message, got something else");
-                (String::new(), None, String::new())
-            }
-        };
-
-        self.react_ctx.assistant_text = text;
-        self.react_ctx.assistant_reasoning = reasoning;
-
         // 聚合 usage
         self.session.add_usage(response.usage.clone());
 
@@ -1597,14 +1521,47 @@ impl AgentLooper {
             usage: response.usage.clone(),
         });
 
-        // 写入 assistant 消息到 session staging
-        let _ = self
-            .session
-            .stage_message(MessageSource::ModelGeneration, response.message);
+        // 写入 assistant 内容到 session staging（分块回填 InputItem，
+        // 同时更新 assistant_text / assistant_reasoning）。
+        self.stage_output_blocks(&response.output);
+
+        // 状态收敛：Failed 与 Incomplete 都视为异常终止（partial_text 已回填）
+        if response.status != ResponseStatus::Completed {
+            let msg = response
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| match response.status {
+                    ResponseStatus::Incomplete => {
+                        "model response was truncated (incomplete)".to_string()
+                    }
+                    _ => "model response failed".to_string(),
+                });
+            self.failure_reason = Some(TurnFailureReason::Other(msg));
+            self.react_state = ReActState::Failed;
+            return;
+        }
+
+        // 提取 tool calls（转 ToolCall）用于决定下一步
+        let tool_calls: Vec<ToolCall> = response
+            .output
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => Some(ToolCall::new(
+                    call_id.clone(),
+                    name.clone(),
+                    arguments.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
 
         // 判断下一步
-        if let Some(tcs) = tool_calls.filter(|t| !t.is_empty()) {
-            self.react_ctx.pending_tool_calls = tcs
+        if !tool_calls.is_empty() {
+            self.react_ctx.pending_tool_calls = tool_calls
                 .into_iter()
                 .map(|tc| PendingToolCall {
                     call: Arc::new(tc),
@@ -1634,163 +1591,201 @@ impl AgentLooper {
             }
         };
 
-        match stream.next_event().await {
-            Some(Ok(StreamEvent::TextDelta(delta))) => {
-                // ★ Hook: on_text_delta — 可中止流式响应
-                if let HookAction::Abort(reason) = Self::invoke_on_text_delta(
-                    &self.config.hooks,
-                    turn,
-                    &delta,
-                    &self.stream_assembler.text_buffer,
-                )
-                .await
-                {
-                    self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
-                    self.react_state = ReActState::Failed;
-                    self.active_stream = None;
-                    return;
-                }
+        match stream.next_chunk().await {
+            Some(Ok(chunk)) => {
+                // 双轨：delta 原样转发前端，BlockEnd 交由 assembler 折叠。
+                self.stream_assembler.push(chunk.clone());
 
-                self.emit_event(LooperEvent::TextDelta {
-                    delta: delta.clone(),
-                });
-                self.stream_assembler.text_buffer.push_str(&delta);
-            }
+                match chunk {
+                    StreamChunk::BlockStart { .. } => {}
 
-            Some(Ok(StreamEvent::ReasoningDelta(delta))) => {
-                self.emit_event(LooperEvent::ReasoningDelta {
-                    delta: delta.clone(),
-                });
-                self.stream_assembler.reasoning_buffer.push_str(&delta);
-            }
+                    StreamChunk::TextDelta { delta, .. } => {
+                        // ★ Hook: on_text_delta — 可中止流式响应
+                        if let HookAction::Abort(reason) = Self::invoke_on_text_delta(
+                            &self.config.hooks,
+                            turn,
+                            &delta,
+                            &self.react_ctx.assistant_text,
+                        )
+                        .await
+                        {
+                            self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
+                            self.react_state = ReActState::Failed;
+                            self.active_stream = None;
+                            return;
+                        }
 
-            Some(Ok(StreamEvent::ToolCallDelta {
-                id,
-                name,
-                arguments,
-            })) => {
-                // Normalize arguments to String at the boundary
-                let args_str = match &arguments {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => serde_json::to_string(other).unwrap_or_default(),
-                };
-                self.emit_event(LooperEvent::ToolCallDelta {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: args_str.clone(),
-                });
-                self.stream_assembler.apply_delta(id, name, args_str);
-            }
-
-            Some(Ok(StreamEvent::ToolCallComplete(tc))) => {
-                self.emit_event(LooperEvent::ToolCallStart {
-                    id: tc.id.clone(),
-                    name: tc.function.name.clone(),
-                    arguments: tc.function.arguments.clone(),
-                });
-                self.stream_assembler.complete_tool_call(tc.clone());
-                // 将完整 tool call 加入待执行列表
-                self.react_ctx.pending_tool_calls.push(PendingToolCall {
-                    call: Arc::new(tc),
-                    result: None,
-                });
-            }
-
-            Some(Ok(StreamEvent::End { usage })) => {
-                self.emit_event(LooperEvent::ModelUsage {
-                    call_index: turn,
-                    usage: usage.clone(),
-                });
-
-                self.session.add_usage(usage);
-
-                // Transfer accumulated text from assembler to react_ctx (single O(n) copy)
-                self.react_ctx.assistant_text =
-                    std::mem::take(&mut self.stream_assembler.text_buffer);
-                self.react_ctx.assistant_reasoning =
-                    std::mem::take(&mut self.stream_assembler.reasoning_buffer);
-
-                // 构建 assistant 消息并写入 session staging
-                let tool_calls = self.stream_assembler.build_tool_calls();
-
-                let reasoning = std::mem::take(&mut self.react_ctx.assistant_reasoning);
-                let message = if tool_calls.is_empty() {
-                    Message::Assistant {
-                        content: Some(std::mem::take(&mut self.react_ctx.assistant_text)),
-                        tool_calls: None,
-                        reasoning_content: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning)
-                        },
+                        self.emit_event(LooperEvent::TextDelta {
+                            delta: delta.clone(),
+                        });
+                        self.react_ctx.assistant_text.push_str(&delta);
                     }
-                } else {
-                    Message::Assistant {
-                        content: Some(std::mem::take(&mut self.react_ctx.assistant_text)),
-                        tool_calls: Some(tool_calls.clone()),
-                        reasoning_content: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning)
-                        },
+
+                    StreamChunk::ReasoningDelta { delta, .. } => {
+                        self.emit_event(LooperEvent::ReasoningDelta {
+                            delta: delta.clone(),
+                        });
+                        self.react_ctx.assistant_reasoning.push_str(&delta);
                     }
-                };
-                let _ = self
-                    .session
-                    .stage_message(MessageSource::ModelGeneration, message);
 
-                self.active_stream = None;
+                    StreamChunk::ToolCallDelta {
+                        call_id,
+                        name,
+                        arguments,
+                        ..
+                    } => {
+                        // Normalize arguments to String at the boundary
+                        let args_str = match &arguments {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        };
+                        self.emit_event(LooperEvent::ToolCallDelta {
+                            id: call_id,
+                            name,
+                            arguments: args_str,
+                        });
+                    }
 
-                if tool_calls.is_empty() {
-                    self.react_state = ReActState::Done;
-                } else {
-                    // 将 assembler 构建的 tool calls 同步到 pending_tool_calls
-                    self.react_ctx.pending_tool_calls = tool_calls
-                        .into_iter()
-                        .map(|tc| PendingToolCall {
-                            call: Arc::new(tc),
-                            result: None,
-                        })
-                        .collect();
-                    self.react_state = ReActState::ExecutingTools;
+                    StreamChunk::BlockEnd { .. } => {
+                        // 块已由 assembler 折叠；ToolCallStart 统一在 execute_tools_step
+                        // 的 spawn 阶段发出，避免流式路径下重复发送 ToolCallStart。
+                    }
+
+                    StreamChunk::Usage { usage } => {
+                        self.emit_event(LooperEvent::ModelUsage {
+                            call_index: turn,
+                            usage: usage.clone(),
+                        });
+                        self.session.add_usage(usage);
+                    }
+
+                    StreamChunk::Finish { .. } => {
+                        self.finish_stream().await;
+                    }
                 }
             }
 
             Some(Err(e)) => {
                 error!(error = %e, "Stream error");
                 self.failure_reason = Some(TurnFailureReason::Other(format!("Stream error: {e}")));
+                self.active_stream = None;
                 self.react_state = ReActState::Failed;
             }
 
             None => {
-                // Stream ended without End event — treat as successful completion
-                // Transfer accumulated text from assembler (single O(n) copy)
-                self.react_ctx.assistant_text =
-                    std::mem::take(&mut self.stream_assembler.text_buffer);
-                self.react_ctx.assistant_reasoning =
-                    std::mem::take(&mut self.stream_assembler.reasoning_buffer);
-
-                if self.react_ctx.pending_tool_calls.is_empty() {
-                    let reasoning = std::mem::take(&mut self.react_ctx.assistant_reasoning);
-                    let message = Message::Assistant {
-                        content: Some(std::mem::take(&mut self.react_ctx.assistant_text)),
-                        tool_calls: None,
-                        reasoning_content: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning)
-                        },
-                    };
-                    let _ = self
-                        .session
-                        .stage_message(MessageSource::ModelGeneration, message);
-                    self.active_stream = None;
-                    self.react_state = ReActState::Done;
-                } else {
-                    self.active_stream = None;
-                    self.react_state = ReActState::ExecutingTools;
-                }
+                // Stream ended without Finish event — 收敛 assembler，按成功处理。
+                self.finish_stream().await;
             }
+        }
+    }
+
+    /// 流结束（收到 `Finish` 或流自然关闭）后的收尾。
+    ///
+    /// 从 [`BlockAssembler`] 收敛有序块，回填 `InputItem` 到 session staging，
+    /// 并决定 `Done` / `ExecutingTools` / `Failed`。
+    async fn finish_stream(&mut self) {
+        self.active_stream = None;
+        let assembler = std::mem::take(&mut self.stream_assembler);
+        let (blocks, _usage, status, error) = assembler.finish();
+
+        // 回填 InputItem 到 session staging，并更新 assistant_text / assistant_reasoning
+        // （失败分支也先回填，使 Failed 结果携带 partial_text）。
+        self.stage_output_blocks(&blocks);
+
+        // 状态收敛：Failed（Aborted / Error）与 Incomplete（截断 / 过滤）都视为异常终止
+        if status != ResponseStatus::Completed {
+            let msg = error.map(|e| e.message).unwrap_or_else(|| match status {
+                ResponseStatus::Incomplete => {
+                    "model response was truncated (incomplete)".to_string()
+                }
+                _ => "model response failed".to_string(),
+            });
+            self.failure_reason = Some(TurnFailureReason::Other(msg));
+            self.react_state = ReActState::Failed;
+            return;
+        }
+
+        // 提取 tool calls（转 ToolCall）
+        let tool_calls: Vec<ToolCall> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => Some(ToolCall::new(
+                    call_id.clone(),
+                    name.clone(),
+                    arguments.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        if tool_calls.is_empty() {
+            self.react_state = ReActState::Done;
+        } else {
+            self.react_ctx.pending_tool_calls = tool_calls
+                .into_iter()
+                .map(|tc| PendingToolCall {
+                    call: Arc::new(tc),
+                    result: None,
+                })
+                .collect();
+            self.react_state = ReActState::ExecutingTools;
+        }
+    }
+
+    /// 将有序 output 块回填到 session staging：`Text→Message{Assistant}`、
+    /// `Reasoning→Reasoning`、`ToolCall→FunctionCall`；并更新本轮
+    /// `assistant_text` / `assistant_reasoning`。
+    fn stage_output_blocks(&mut self, blocks: &[ContentBlock]) {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        for block in blocks {
+            match block {
+                ContentBlock::Text { text: t } => {
+                    text.push_str(t);
+                    let _ = self.session.stage_item(
+                        MessageSource::ModelGeneration,
+                        InputItem::Message {
+                            role: Role::Assistant,
+                            content: t.clone(),
+                        },
+                    );
+                }
+                ContentBlock::Reasoning { text: t } => {
+                    reasoning.push_str(t);
+                    let _ = self.session.stage_item(
+                        MessageSource::ModelGeneration,
+                        InputItem::Reasoning { content: t.clone() },
+                    );
+                }
+                ContentBlock::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let _ = self.session.stage_item(
+                        MessageSource::ModelGeneration,
+                        InputItem::FunctionCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+        // 流式路径下 assistant_text / assistant_reasoning 已由 delta 累积；
+        // 仅在传入文本非空（或当前为空）时覆盖，避免截断（Incomplete）时把已累积的
+        // partial text 抹掉。
+        if !text.is_empty() || self.react_ctx.assistant_text.is_empty() {
+            self.react_ctx.assistant_text = text;
+        }
+        if !reasoning.is_empty() || self.react_ctx.assistant_reasoning.is_empty() {
+            self.react_ctx.assistant_reasoning = reasoning;
         }
     }
 
@@ -2027,11 +2022,14 @@ impl AgentLooper {
     async fn finalize_tool_execution(&mut self) {
         for ptc in &self.react_ctx.pending_tool_calls {
             if let Some(ref result) = ptc.result {
-                let _ = self.session.stage_message(
+                let _ = self.session.stage_item(
                     MessageSource::ToolExecution {
                         tool_name: ptc.call.function.name.clone(),
                     },
-                    Message::tool(&ptc.call.id, &result.result),
+                    InputItem::FunctionCallOutput {
+                        call_id: ptc.call.id.clone(),
+                        output: result.result.clone(),
+                    },
                 );
             }
         }
@@ -2063,67 +2061,6 @@ impl AgentLooper {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── StreamAssembler tests ────────────────────────────────────────────
-
-    #[test]
-    fn test_stream_assembler_new() {
-        let a = StreamAssembler::new();
-        assert!(a.text_buffer.is_empty());
-        assert!(a.reasoning_buffer.is_empty());
-        assert!(a.tool_call_builders.is_empty());
-    }
-
-    #[test]
-    fn test_stream_assembler_build_tool_calls_empty() {
-        let a = StreamAssembler::new();
-        let calls = a.build_tool_calls();
-        assert!(calls.is_empty());
-    }
-
-    #[test]
-    fn test_stream_assembler_complete_tool_call() {
-        let mut a = StreamAssembler::new();
-        let tc = ToolCall::new("call_1", "get_weather", r#"{"city":"SF"}"#);
-        a.complete_tool_call(tc);
-        let calls = a.build_tool_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].function.name, "get_weather");
-    }
-
-    #[test]
-    fn test_stream_assembler_apply_delta_name() {
-        let mut a = StreamAssembler::new();
-        a.apply_delta(
-            "call_1".to_string(),
-            Some("get_weather".to_string()),
-            String::new(),
-        );
-        a.apply_delta("call_1".to_string(), None, r#"{"city":"SF"}"#.to_string());
-        let calls = a.build_tool_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].function.name, "get_weather");
-        assert_eq!(calls[0].function.arguments, r#"{"city":"SF"}"#);
-    }
-
-    #[test]
-    fn test_stream_assembler_multiple_tool_calls() {
-        let mut a = StreamAssembler::new();
-        a.apply_delta(
-            "call_1".to_string(),
-            Some("tool_a".to_string()),
-            r#"{"x":1}"#.to_string(),
-        );
-        a.apply_delta(
-            "call_2".to_string(),
-            Some("tool_b".to_string()),
-            r#"{"y":2}"#.to_string(),
-        );
-        let calls = a.build_tool_calls();
-        assert_eq!(calls.len(), 2);
-    }
 
     // ── LooperConfig tests ────────────────────────────────────────────
 

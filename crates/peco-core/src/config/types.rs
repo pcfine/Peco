@@ -56,6 +56,12 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub base_url: Option<String>,
 
+    /// 使用的 API 风格：`"responses"` | `"chat"`（可选，默认 `"responses"`）。
+    ///
+    /// `None` 时由 merge 继承 system / 分发时回退 `"responses"`（见 `build_provider_with_user`）。
+    #[serde(default)]
+    pub api: Option<String>,
+
     /// 该 provider 的默认模型和参数。
     #[serde(default)]
     pub default: Option<LlmApiParams>,

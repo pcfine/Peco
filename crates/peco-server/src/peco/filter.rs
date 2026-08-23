@@ -7,7 +7,7 @@
 //   - 历史轮：仅保留 User + 纯文本 Assistant（丢弃 tool 过程消息）
 //   - 滑动窗口：历史轮最近 N 条（默认 10）
 
-use model_provider::Message;
+use model_provider::{InputItem, Role};
 use peco_core::agent::MessageFilter;
 use peco_core::session::AnnotatedMessage;
 
@@ -60,16 +60,13 @@ impl MessageFilter for PecoMessageFilter {
             .partition(|m| m.turn_index < current_turn);
 
         // ── 3. 过滤历史轮 ────────────────────────────────────────
-        // 保留 User 消息和纯文本 Assistant (content 有值, tool_calls 无值)
+        // 保留 User / Assistant 纯文本项，丢弃 FunctionCall / FunctionCallOutput / Reasoning。
         let filtered_history: Vec<_> = history
             .into_iter()
             .filter(|m| match m.message.as_ref() {
-                Message::User { .. } => true,
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => content.is_some() && tool_calls.is_none(),
+                InputItem::Message { role, .. } => {
+                    matches!(role, Role::User | Role::Assistant)
+                }
                 _ => false,
             })
             .collect();
@@ -94,10 +91,35 @@ impl MessageFilter for PecoMessageFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::{ToolCall, ToolCallFunction};
     use peco_core::session::{MessageId, MessageSource};
 
-    fn make_annotated(turn: usize, msg: Message) -> AnnotatedMessage {
+    fn user(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::User,
+            content: text.into(),
+        }
+    }
+    fn assistant(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::Assistant,
+            content: text.into(),
+        }
+    }
+    fn function_call(call_id: &str, name: &str) -> InputItem {
+        InputItem::FunctionCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: "ls".into(),
+        }
+    }
+    fn function_call_output(call_id: &str) -> InputItem {
+        InputItem::FunctionCallOutput {
+            call_id: call_id.into(),
+            output: "out".into(),
+        }
+    }
+
+    fn make_annotated(turn: usize, msg: InputItem) -> AnnotatedMessage {
         AnnotatedMessage::new(MessageId(0), turn, msg, MessageSource::UserInput)
     }
 
@@ -113,60 +135,17 @@ mod tests {
     fn test_current_turn_keeps_full_tool_context() {
         let filter = PecoMessageFilter::new(10);
         let msgs = vec![
-            make_annotated(
-                0,
-                Message::User {
-                    content: "旧问题".into(),
-                },
-            ),
-            make_annotated(
-                0,
-                Message::Assistant {
-                    content: Some("旧回答".into()),
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-            ),
-            make_annotated(
-                1,
-                Message::User {
-                    content: "新问题".into(),
-                },
-            ),
-            make_annotated(
-                1,
-                Message::Assistant {
-                    content: Some("run".into()),
-                    tool_calls: Some(vec![ToolCall {
-                        id: "c1".into(),
-                        call_type: "function".into(),
-                        function: ToolCallFunction {
-                            name: "shell".into(),
-                            arguments: "ls".into(),
-                        },
-                    }]),
-                    reasoning_content: None,
-                },
-            ),
-            make_annotated(
-                1,
-                Message::Tool {
-                    tool_call_id: "c1".into(),
-                    content: "out".into(),
-                },
-            ),
-            make_annotated(
-                1,
-                Message::Assistant {
-                    content: Some("done".into()),
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-            ),
+            make_annotated(0, user("旧问题")),
+            make_annotated(0, assistant("旧回答")),
+            make_annotated(1, user("新问题")),
+            make_annotated(1, assistant("run")),
+            make_annotated(1, function_call("c1", "shell")),
+            make_annotated(1, function_call_output("c1")),
+            make_annotated(1, assistant("done")),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
         let result = filter.filter(&refs);
-        // 历史: User + Asst(text) = 2, 当前: 4
-        assert_eq!(result.len(), 6);
+        // 历史: User + Asst(text) = 2, 当前: 5
+        assert_eq!(result.len(), 7);
     }
 }

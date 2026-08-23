@@ -43,9 +43,10 @@ impl SystemConfig {
             providers.insert(
                 "deepseek".to_string(),
                 ProviderEntry {
-                    provider_type: "openai_compatible".to_string(),
+                    provider_type: "deepseek".to_string(),
                     api_key: None,
-                    base_url: Some("https://api.deepseek.com/v1".to_string()),
+                    base_url: Some("https://api.deepseek.com".to_string()),
+                    api: None,
                     default: Some(LlmApiParams {
                         model: "deepseek-v4-flash".to_string(),
                         temperature: Some(0.7),

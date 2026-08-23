@@ -23,6 +23,7 @@ use axum::extract::{Query, State};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::routing::get;
 use futures::stream::Stream;
+use model_provider::InputItem;
 use peco_core::agent::{AgentLooper, LooperConfig};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
@@ -32,6 +33,7 @@ use tokio::sync::mpsc;
 use crate::auth::AuthUser;
 use crate::chat::sse::{ChatSseEvent, UsageData, map_looper_event};
 use crate::error::ApiError;
+use crate::session_dto::group_input_items;
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
@@ -146,7 +148,15 @@ pub async fn stream_chat(
                 snapshot,
             ))
         }
-        _ => {
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "个人 Agent 会话快照加载失败，创建新会话（历史会话丢失）"
+            );
+            Box::new(Session::new(session_id.clone(), SESSION_TITLE.to_string()))
+        }
+        Ok(None) => {
             tracing::info!(user_id = %user_id, "Creating new personal agent session");
             Box::new(Session::new(session_id.clone(), SESSION_TITLE.to_string()))
         }
@@ -256,30 +266,35 @@ pub async fn get_session_snapshot(
                 .enumerate()
                 .map(|(i, msgs): (usize, &Vec<_>)| TurnData {
                     turn_index: i,
-                    messages: msgs
-                        .iter()
-                        .map(|am| {
-                            let msg = &*am.message;
-                            MessageData {
-                                role: msg.role_name().to_string(),
-                                content: msg.content().map(|s: &str| s.to_string()),
-                                tool_calls: msg.tool_calls().map(|tcs: &Vec<_>| {
-                                    tcs.iter()
-                                        .map(|tc| ToolCallData {
-                                            id: tc.id.clone(),
-                                            name: tc.function.name.clone(),
-                                            arguments: tc.function.arguments.clone(),
-                                        })
-                                        .collect()
-                                }),
-                                reasoning_content: msg
-                                    .reasoning_content()
-                                    .map(|s: &str| s.to_string()),
-                                tool_call_id: msg.tool_call_id().map(|s: &str| s.to_string()),
-                                timestamp_ms: am.timestamp_ms,
-                            }
-                        })
-                        .collect(),
+                    messages: {
+                        let items: Vec<InputItem> =
+                            msgs.iter().map(|am| (*am.message).clone()).collect();
+                        let timestamps: Vec<u64> = msgs.iter().map(|am| am.timestamp_ms).collect();
+                        group_input_items(&items, &timestamps)
+                            .into_iter()
+                            .map(|msg| MessageData {
+                                role: msg.role.to_string(),
+                                content: msg.content,
+                                tool_calls: if msg.tool_calls.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        msg.tool_calls
+                                            .into_iter()
+                                            .map(|tc| ToolCallData {
+                                                id: tc.id,
+                                                name: tc.function.name,
+                                                arguments: tc.function.arguments,
+                                            })
+                                            .collect(),
+                                    )
+                                },
+                                reasoning_content: msg.reasoning_content,
+                                tool_call_id: msg.tool_call_id,
+                                timestamp_ms: msg.timestamp_ms,
+                            })
+                            .collect()
+                    },
                 })
                 .collect();
 

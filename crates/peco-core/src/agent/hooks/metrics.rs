@@ -6,7 +6,7 @@
 // 通过 mpsc channel 发送给 consumer（在 peco-server handler 中消费写入 DB）。
 
 use async_trait::async_trait;
-use model_provider::ChatResponse;
+use model_provider::GenerateResult;
 use tokio::sync::mpsc;
 
 use super::{HookAction, LooperHook};
@@ -42,7 +42,7 @@ impl MetricsCollector {
 
 #[async_trait]
 impl LooperHook for MetricsCollector {
-    async fn on_after_response(&self, turn_index: usize, response: &ChatResponse) -> HookAction {
+    async fn on_after_response(&self, turn_index: usize, response: &GenerateResult) -> HookAction {
         if response.usage.total_tokens > 0 {
             let record = UsageRecord {
                 input_tokens: response.usage.input_tokens,

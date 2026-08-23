@@ -3,6 +3,7 @@
 //! 提供 [`DeepSeek`]，为 [DeepSeek API](https://api.deepseek.com) 实现
 //! [`ModelProvider`]，使用与 OpenAI 兼容的聊天补全协议。
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,12 +13,13 @@ use serde_json::Value;
 use crate::providers::sse::StreamingEventSource;
 use crate::providers::streaming::{
     NormalizedChunk, NormalizedToolCall, NormalizedUsage, StreamingProfile,
-    process_normalized_sse_stream,
+    process_normalized_sse_stream_chunks,
 };
-use crate::{
-    ChatRequest, ChatResponse, ChatStream, Message, ModelProvider, ProviderError, ToolCall,
-    ToolDefinition, Usage,
+use crate::response::{
+    ContentBlock, GenerateRequest, GenerateResult, InputItem, ReasoningConfig, ReasoningEffort,
+    ResponseError, ResponseStatus, Role, TextFormat,
 };
+use crate::{GenerateStream, ModelProvider, ProviderError, ToolCall, ToolDefinition, Usage};
 
 // ============================================================================
 // DeepSeek 客户端
@@ -39,7 +41,13 @@ pub struct DeepSeek {
     http_client: reqwest::Client,
     api_key: String,
     base_url: String,
+    /// 严格特性校验：`false` 时静默丢弃（`debug!`）chat 适配器无法承载的特性
+    /// （`text.format=json_schema`、`Role::Developer`），`true` 时返回 [`ProviderError::Request`]。
+    strict_feature_validation: bool,
 }
+
+/// chat completions 适配器的语义别名（保留 `DeepSeek` 名以避免涟漪）。
+pub type DeepSeekChatCompletionsAdapter = DeepSeek;
 
 impl DeepSeek {
     /// 使用给定的 API 密钥创建新的 DeepSeek 客户端。
@@ -55,6 +63,7 @@ impl DeepSeek {
             http_client,
             api_key: api_key.into(),
             base_url: DEEPSEEK_API_BASE_URL.to_string(),
+            strict_feature_validation: false,
         })
     }
 
@@ -72,6 +81,12 @@ impl DeepSeek {
     /// 适用于代理或自部署的 DeepSeek 兼容端点。
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// 设置严格特性校验开关（默认 `false`）。
+    pub fn strict_feature_validation(mut self, strict: bool) -> Self {
+        self.strict_feature_validation = strict;
         self
     }
 
@@ -102,7 +117,7 @@ struct ApiToolDef<'a> {
 #[derive(Serialize)]
 struct DeepSeekRequest<'a> {
     model: &'a str,
-    messages: &'a [Arc<Message>],
+    messages: &'a [WireMessage<'a>],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiToolDef<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,12 +130,12 @@ struct DeepSeekRequest<'a> {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
-    /// DeepSeek thinking 配置，由 provider 从 ChatRequest::reasoning_effort 构建。
+    /// DeepSeek thinking 配置，由 provider 从 `GenerateRequest::reasoning` 构建。
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Value>,
-    /// 将额外参数扁平化合并到请求体中（透传 ChatRequest::additional_params）。
+    /// 将额外参数扁平化合并到请求体中（透传 `GenerateRequest::additional_params`）。
     #[serde(flatten)]
-    extra: Option<Value>,
+    extra: Option<&'a Value>,
 }
 
 #[derive(Serialize)]
@@ -131,6 +146,8 @@ struct StreamOptions {
 /// DeepSeek API 非流式响应。
 #[derive(Deserialize)]
 struct DeepSeekResponse {
+    #[serde(default)]
+    id: String,
     choices: Vec<DeepSeekChoice>,
     usage: Option<DeepSeekApiUsage>,
 }
@@ -165,7 +182,7 @@ struct DeepSeekApiUsage {
 
 /// DeepSeek 流式 API 中的单个 SSE 数据块。
 #[derive(Deserialize)]
-struct StreamChunk {
+struct ChatSseChunk {
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<DeepSeekApiUsage>,
@@ -209,13 +226,158 @@ struct StreamToolFunctionDelta {
 // 辅助函数
 // ============================================================================
 
-/// 将 DeepSeek API 消息转换为我们的公共 Message 类型。
-fn convert_api_message(api_msg: DeepSeekApiMessage) -> Message {
-    Message::Assistant {
-        content: api_msg.content,
-        tool_calls: api_msg.tool_calls,
-        reasoning_content: api_msg.reasoning_content,
+/// chat completions 传输层消息（仅用于请求体序列化，私有）。
+///
+/// 承载 chat 协议需要的形状：`system` / `user` / `assistant` / `tool`。
+///
+/// 所有文本字段借用自 [`GenerateRequest`]（`'a` 即请求的借用期），序列化前不复制字符串；
+/// 唯一例外是 `reasoning_content` — 多个 `Reasoning` 项需要拼接，故用 [`Cow`]：
+/// 单项时借用，需拼接时才转为 owned。
+#[derive(Debug, Serialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+enum WireMessage<'a> {
+    System {
+        content: &'a str,
+    },
+    User {
+        content: &'a str,
+    },
+    Assistant {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_calls: Option<Vec<WireToolCall<'a>>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<Cow<'a, str>>,
+    },
+    #[serde(rename = "tool")]
+    Tool {
+        tool_call_id: &'a str,
+        content: &'a str,
+    },
+}
+
+/// [`ToolCall`] 的借用版本，与其序列化形状逐字段一致（`id` / `type` / `function`）。
+#[derive(Debug, Serialize)]
+struct WireToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: WireToolCallFunction<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireToolCallFunction<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+/// 合并累加器中「当前 assistant 消息」的构建状态。
+#[derive(Default)]
+struct WireAssistantBuilder<'a> {
+    content: Option<&'a str>,
+    tool_calls: Vec<WireToolCall<'a>>,
+    reasoning_content: Option<Cow<'a, str>>,
+}
+
+impl<'a> WireAssistantBuilder<'a> {
+    fn into_message(self) -> Option<WireMessage<'a>> {
+        // 空字符串 content 视同缺失，避免序列化出 `"content": ""`（部分网关拒绝空 content）。
+        let content = self.content.filter(|c| !c.is_empty());
+        if content.is_none() && self.tool_calls.is_empty() && self.reasoning_content.is_none() {
+            return None;
+        }
+        Some(WireMessage::Assistant {
+            content,
+            tool_calls: if self.tool_calls.is_empty() {
+                None
+            } else {
+                Some(self.tool_calls)
+            },
+            reasoning_content: self.reasoning_content,
+        })
     }
+}
+
+/// 将有序 [`InputItem`] 列表合并为 chat completions 传输层消息列表。
+///
+/// 用「合并累加器」维护当前 assistant 消息指针：`FunctionCall` / `Reasoning` 追加到
+/// 该指针，遇 `Message{role: Assistant}` 时若当前组尚无文本则合并、否则刷新开启新组。
+fn input_items_to_wire_messages<'a>(items: &'a [Arc<InputItem>]) -> Vec<WireMessage<'a>> {
+    let mut messages: Vec<WireMessage<'a>> = Vec::new();
+    let mut current: Option<WireAssistantBuilder<'a>> = None;
+
+    // 刷新当前 assistant 消息（如有）。
+    fn flush<'a>(
+        messages: &mut Vec<WireMessage<'a>>,
+        current: &mut Option<WireAssistantBuilder<'a>>,
+    ) {
+        if let Some(builder) = current.take()
+            && let Some(msg) = builder.into_message()
+        {
+            messages.push(msg);
+        }
+    }
+
+    for item in items {
+        match &**item {
+            InputItem::Message { role, content } => match role {
+                // chat 无法承载 Developer，宽松模式下降级为 system。
+                Role::System | Role::Developer => {
+                    flush(&mut messages, &mut current);
+                    messages.push(WireMessage::System { content });
+                }
+                Role::User => {
+                    flush(&mut messages, &mut current);
+                    messages.push(WireMessage::User { content });
+                }
+                Role::Assistant => match current.as_mut() {
+                    Some(builder) if builder.content.is_none() => {
+                        builder.content = Some(content);
+                    }
+                    _ => {
+                        flush(&mut messages, &mut current);
+                        current = Some(WireAssistantBuilder {
+                            content: Some(content),
+                            ..Default::default()
+                        });
+                    }
+                },
+            },
+            InputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                current
+                    .get_or_insert_with(WireAssistantBuilder::default)
+                    .tool_calls
+                    .push(WireToolCall {
+                        id: call_id,
+                        call_type: "function",
+                        function: WireToolCallFunction { name, arguments },
+                    });
+            }
+            InputItem::Reasoning { content } => {
+                let builder = current.get_or_insert_with(WireAssistantBuilder::default);
+                match &mut builder.reasoning_content {
+                    // 拼接才付出一次 owned 代价；单条 Reasoning 仍是借用。
+                    Some(existing) => existing.to_mut().push_str(content),
+                    None => builder.reasoning_content = Some(Cow::Borrowed(content)),
+                }
+            }
+            InputItem::FunctionCallOutput { call_id, output } => {
+                flush(&mut messages, &mut current);
+                messages.push(WireMessage::Tool {
+                    tool_call_id: call_id,
+                    content: output,
+                });
+            }
+        }
+    }
+    flush(&mut messages, &mut current);
+
+    messages
 }
 
 /// 将 DeepSeek API 用量转换为我们的 Usage 类型。
@@ -228,7 +390,18 @@ fn convert_usage(api_usage: DeepSeekApiUsage) -> Usage {
 }
 
 /// 构建请求体并序列化为 JSON 字节。
-fn build_request_body(request: &ChatRequest, stream: bool) -> Result<Vec<u8>, serde_json::Error> {
+fn build_request_body(
+    request: &GenerateRequest,
+    stream: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut messages: Vec<WireMessage> = Vec::new();
+    if let Some(instructions) = &request.instructions {
+        messages.push(WireMessage::System {
+            content: instructions,
+        });
+    }
+    messages.extend(input_items_to_wire_messages(&request.input));
+
     let tools: Vec<ApiToolDef> = request
         .tools
         .iter()
@@ -249,7 +422,8 @@ fn build_request_body(request: &ChatRequest, stream: bool) -> Result<Vec<u8>, se
     // - "disabled" / "none" → 显式禁用 thinking
     // - 其它等级：low, high, max
     // - 未配置 → 默认启用 thinking（rely on DeepSeek 默认行为）
-    let thinking = match &request.reasoning_effort {
+    let reasoning_effort = reasoning_config_to_effort(request.reasoning.as_ref());
+    let thinking = match reasoning_effort {
         Some(effort) if !effort.is_empty() => {
             let effort_lower = effort.to_lowercase();
             if effort_lower == "disabled" || effort_lower == "none" {
@@ -266,18 +440,95 @@ fn build_request_body(request: &ChatRequest, stream: bool) -> Result<Vec<u8>, se
 
     let api_request = DeepSeekRequest {
         model: &request.model,
-        messages: &request.messages,
+        messages: &messages,
         tools,
         temperature: request.temperature,
-        max_tokens: request.max_tokens,
+        max_tokens: request.max_output_tokens,
         stream: if stream { Some(true) } else { None },
         stream_options,
         tool_choice: None,
         thinking,
-        extra: request.additional_params.clone(),
+        extra: request.additional_params.as_ref(),
     };
 
     serde_json::to_vec(&api_request)
+}
+
+/// 将中立 [`ReasoningConfig`] 映射为 chat 协议的 `reasoning_effort` 字符串。
+fn reasoning_config_to_effort(reasoning: Option<&ReasoningConfig>) -> Option<String> {
+    let config = reasoning?;
+    if !config.enabled {
+        return Some("disabled".to_string());
+    }
+    config
+        .effort
+        .map(|e| match e {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
+        })
+        .map(str::to_string)
+}
+
+/// 将 chat 协议的 `finish_reason` 映射为中立 [`ResponseStatus`]。
+fn finish_reason_to_status(reason: Option<&str>) -> ResponseStatus {
+    match reason {
+        Some("stop") | Some("tool_calls") | None => ResponseStatus::Completed,
+        Some("length") => ResponseStatus::Incomplete,
+        _ => ResponseStatus::Failed,
+    }
+}
+
+/// 将 DeepSeek chat 响应转换为中立 [`GenerateResult`]。
+///
+/// 块顺序（与流式合成一致）：`content`→`Text`、`reasoning_content`→`Reasoning`、
+/// `tool_calls`→`ToolCall`。
+fn chat_response_to_generate_result(
+    api_response: DeepSeekResponse,
+) -> Result<GenerateResult, ProviderError> {
+    let choice = api_response
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ProviderError::Response("响应中不包含任何选项".to_string()))?;
+
+    let finish_reason = choice.finish_reason;
+    let status = finish_reason_to_status(finish_reason.as_deref());
+
+    let mut output = Vec::new();
+    if let Some(content) = choice.message.content {
+        output.push(ContentBlock::Text { text: content });
+    }
+    if let Some(reasoning) = choice.message.reasoning_content {
+        output.push(ContentBlock::Reasoning { text: reasoning });
+    }
+    if let Some(tool_calls) = choice.message.tool_calls {
+        for tc in tool_calls {
+            output.push(ContentBlock::ToolCall {
+                call_id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            });
+        }
+    }
+
+    let error = if status == ResponseStatus::Failed {
+        Some(ResponseError {
+            code: None,
+            message: finish_reason.unwrap_or_else(|| "unknown".to_string()),
+        })
+    } else {
+        None
+    };
+
+    Ok(GenerateResult {
+        id: api_response.id,
+        output,
+        usage: api_response.usage.map(convert_usage).unwrap_or_default(),
+        status,
+        error,
+    })
 }
 
 // ============================================================================
@@ -290,13 +541,15 @@ impl ModelProvider for DeepSeek {
         "deepseek"
     }
 
-    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+    async fn generate(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
+        self.validate_generate_request(request)?;
+
         let body = build_request_body(request, false)?;
 
         let endpoint = self.chat_endpoint();
         tracing::debug!(
             target: "model_provider::deepseek",
-            "发送聊天请求到 {} (模型={})",
+            "发送中立生成请求到 {} (模型={})",
             endpoint,
             request.model
         );
@@ -328,31 +581,22 @@ impl ModelProvider for DeepSeek {
         }
 
         let api_response: DeepSeekResponse = serde_json::from_slice(&response_body)?;
-
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| ProviderError::Response("响应中不包含任何选项".to_string()))?;
-
-        let message = convert_api_message(choice.message);
-        let usage = api_response.usage.map(convert_usage).unwrap_or_default();
-
-        Ok(ChatResponse {
-            message,
-            usage,
-            finish_reason: choice.finish_reason,
-        })
+        chat_response_to_generate_result(api_response)
     }
 
-    async fn stream_chat(&self, request: &ChatRequest) -> Result<ChatStream, ProviderError> {
+    async fn stream_generate(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateStream, ProviderError> {
+        self.validate_generate_request(request)?;
+
         let body = build_request_body(request, true)?;
 
         let endpoint = self.chat_endpoint();
         let model = request.model.clone();
 
         let span = tracing::info_span!(
-            "deepseek_stream_chat",
+            "deepseek_stream_generate",
             model = %model,
         );
 
@@ -363,13 +607,62 @@ impl ModelProvider for DeepSeek {
             self.auth_header(),
         );
 
-        Ok(process_normalized_sse_stream(
+        Ok(process_normalized_sse_stream_chunks(
             event_source,
             DeepSeekStreamingProfile,
             span,
             endpoint,
             model,
         ))
+    }
+}
+
+impl DeepSeek {
+    /// 校验 chat 适配器无法承载的中立特性。
+    ///
+    /// 宽松模式（默认）`debug!` + 静默丢弃；严格模式返回 [`ProviderError::Request`]。
+    fn validate_generate_request(&self, request: &GenerateRequest) -> Result<(), ProviderError> {
+        let has_json_schema = request
+            .text
+            .as_ref()
+            .and_then(|t| t.format.as_ref())
+            .is_some_and(|f| matches!(f, TextFormat::JsonSchema { .. }));
+        let has_developer = request.input.iter().any(|i| {
+            matches!(
+                &**i,
+                InputItem::Message {
+                    role: Role::Developer,
+                    ..
+                }
+            )
+        });
+
+        if self.strict_feature_validation {
+            if has_json_schema {
+                return Err(ProviderError::Request(
+                    "chat 适配器不支持 text.format=json_schema".to_string(),
+                ));
+            }
+            if has_developer {
+                return Err(ProviderError::Request(
+                    "chat 适配器不支持 Developer role".to_string(),
+                ));
+            }
+        } else {
+            if has_json_schema {
+                tracing::debug!(
+                    target: "model_provider::deepseek",
+                    "chat 适配器不支持 text.format=json_schema，忽略"
+                );
+            }
+            if has_developer {
+                tracing::debug!(
+                    target: "model_provider::deepseek",
+                    "chat 适配器不支持 Developer role，降级为 system"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -382,7 +675,7 @@ struct DeepSeekStreamingProfile;
 
 impl StreamingProfile for DeepSeekStreamingProfile {
     fn normalize_chunk(&self, data: &str) -> Result<Option<NormalizedChunk>, ProviderError> {
-        let chunk: StreamChunk = serde_json::from_str(data)
+        let chunk: ChatSseChunk = serde_json::from_str(data)
             .map_err(|e| ProviderError::Stream(format!("解析 SSE 数据块失败: {e}")))?;
 
         // 提取第一个选项（聊天补全的标准做法）
@@ -500,53 +793,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_message_serde_roundtrip() {
-        // 序列化 → 反序列化往返测试覆盖所有 Message 变体
-        let cases = vec![
-            Message::system("你是一个助手。"),
-            Message::user("你好"),
-            Message::assistant("你好！"),
-            Message::assistant_with_tools(
-                "",
-                vec![ToolCall::new(
-                    "call_123",
-                    "get_weather",
-                    r#"{"location":"NYC"}"#,
-                )],
-            ),
-            Message::tool("call_123", "72°F，晴天"),
-        ];
-
-        for msg in &cases {
-            let json = serde_json::to_string(msg).unwrap();
-            let roundtripped: Message = serde_json::from_str(&json).unwrap();
-            assert_eq!(&roundtripped, msg, "往返失败: {json}");
-        }
-    }
-
-    #[test]
-    fn test_chat_request_serialization() {
-        let request = ChatRequest {
-            model: "deepseek-v4-pro".to_string(),
-            messages: vec![
-                Arc::new(Message::system("You are helpful.")),
-                Arc::new(Message::user("Hi")),
-            ],
-            tools: vec![],
-            temperature: Some(0.7),
-            max_tokens: Some(1024),
-            reasoning_effort: None,
-            additional_params: None,
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        let parsed: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["model"], "deepseek-v4-pro");
-        assert_eq!(parsed["temperature"], 0.7);
-        assert_eq!(parsed["max_tokens"], 1024);
-        assert_eq!(parsed["messages"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
     fn test_deepseek_response_deserialization() {
         let json = r#"{
             "choices": [{
@@ -584,7 +830,7 @@ mod tests {
                 "finish_reason": null
             }]
         }"#;
-        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let chunk: ChatSseChunk = serde_json::from_str(json).unwrap();
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
         assert_eq!(chunk.choices[0].delta.reasoning_content, None);
     }
@@ -605,7 +851,7 @@ mod tests {
                 "total_tokens": 22
             }
         }"#;
-        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let chunk: ChatSseChunk = serde_json::from_str(json).unwrap();
         assert!(chunk.usage.is_some());
         let usage = chunk.usage.unwrap();
         assert_eq!(usage.total_tokens, 22);
@@ -630,7 +876,7 @@ mod tests {
                 }
             }]
         }"#;
-        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        let chunk: ChatSseChunk = serde_json::from_str(json).unwrap();
         let tool_calls = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id.as_deref(), Some("call_abc"));
@@ -654,16 +900,21 @@ mod tests {
     #[test]
     fn test_build_request_body() {
         // 非流式请求
-        let request = ChatRequest {
+        let request = GenerateRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![
-                Arc::new(Message::system("You are helpful.")),
-                Arc::new(Message::user("Hello")),
-            ],
+            instructions: Some("You are helpful.".to_string()),
+            input: vec![Arc::new(InputItem::Message {
+                role: Role::User,
+                content: "Hello".to_string(),
+            })]
+            .into(),
             tools: vec![],
+            tool_choice: None,
             temperature: Some(0.7),
-            max_tokens: None,
-            reasoning_effort: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning: None,
+            text: None,
             additional_params: None,
         };
         let body = build_request_body(&request, false).unwrap();
@@ -671,6 +922,7 @@ mod tests {
         assert_eq!(json["model"], "deepseek-v4-pro");
         assert_eq!(json["temperature"], 0.7);
         assert!(json.get("stream").is_none());
+        assert_eq!(json["messages"].as_array().unwrap().len(), 2);
 
         // 流式请求
         let body = build_request_body(&request, true).unwrap();
@@ -686,13 +938,21 @@ mod tests {
             description: "获取天气信息".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         };
-        let request = ChatRequest {
+        let request = GenerateRequest {
             model: "deepseek-v4-pro".to_string(),
-            messages: vec![Arc::new(Message::user("天气怎么样？"))],
+            instructions: None,
+            input: vec![Arc::new(InputItem::Message {
+                role: Role::User,
+                content: "天气怎么样？".to_string(),
+            })]
+            .into(),
             tools: vec![tool],
+            tool_choice: None,
             temperature: None,
-            max_tokens: None,
-            reasoning_effort: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning: None,
+            text: None,
             additional_params: None,
         };
         let body = build_request_body(&request, false).unwrap();
@@ -701,5 +961,95 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
+
+    /// 借用版 `WireToolCall` 的 JSON 形状必须与 owned [`ToolCall`] 逐字段一致。
+    #[test]
+    fn test_wire_tool_call_serialization_shape() {
+        let request = GenerateRequest {
+            model: "deepseek-v4-pro".to_string(),
+            instructions: None,
+            input: vec![
+                Arc::new(InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city":"SF"}"#.to_string(),
+                }),
+                Arc::new(InputItem::FunctionCallOutput {
+                    call_id: "c1".to_string(),
+                    output: "72F".to_string(),
+                }),
+            ]
+            .into(),
+            tools: vec![],
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            reasoning: None,
+            text: None,
+            additional_params: Some(serde_json::json!({"top_k": 5})),
+        };
+        let body = build_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let assistant = &json["messages"][0];
+        assert_eq!(assistant["role"], "assistant");
+        let tc = &assistant["tool_calls"][0];
+        assert_eq!(
+            *tc,
+            serde_json::to_value(ToolCall::new("c1", "get_weather", r#"{"city":"SF"}"#)).unwrap()
+        );
+        // assistant 无文本时不得序列化出 `content` 字段
+        assert!(assistant.get("content").is_none());
+
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "c1");
+        assert_eq!(json["messages"][1]["content"], "72F");
+        // additional_params 仍被扁平化透传
+        assert_eq!(json["top_k"], 5);
+    }
+
+    #[test]
+    fn test_input_items_to_wire_messages_merge() {
+        let items = vec![
+            Arc::new(InputItem::Message {
+                role: Role::User,
+                content: "hi".to_string(),
+            }),
+            Arc::new(InputItem::Reasoning {
+                content: "step 1".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: r#"{"city":"SF"}"#.to_string(),
+            }),
+            Arc::new(InputItem::Message {
+                role: Role::Assistant,
+                content: "done".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: "72F".to_string(),
+            }),
+        ];
+        let msgs = input_items_to_wire_messages(&items);
+        // user + assistant（reasoning+tool_call+text 合并）+ tool = 3 条
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[0], WireMessage::User { .. }));
+        match &msgs[1] {
+            WireMessage::Assistant {
+                content,
+                tool_calls,
+                reasoning_content,
+            } => {
+                assert_eq!(content.as_deref(), Some("done"));
+                assert_eq!(reasoning_content.as_deref(), Some("step 1"));
+                assert_eq!(tool_calls.as_ref().map(|t| t.len()), Some(1));
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+        assert!(matches!(msgs[2], WireMessage::Tool { .. }));
     }
 }

@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // 每个会话存储为 `{base_dir}/{session_id}.json` 下的独立 JSON 文件。
-// 使用 v3 格式（仅 committed turns + 计数器 + pending，不含 state/staging）。
+// 使用 v4 格式（仅 committed turns + 计数器 + pending，不含 state/staging）。
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +16,7 @@ use crate::session::{AnnotatedMessage, SessionMeta, SessionSnapshot};
 
 /// 基于 JSON 文件的 [`SessionPersister`] 实现。
 ///
-/// # 文件格式 (v3)
+/// # 文件格式 (v4)
 ///
 /// ```text
 /// {base_dir}/
@@ -127,7 +127,7 @@ impl SessionPersister for FileSessionPersister {
         };
 
         let file = SessionFile {
-            format_version: 3,
+            format_version: 4,
             meta,
             committed_turns,
             turn_index: snapshot.turn_index,
@@ -180,7 +180,7 @@ impl SessionPersister for FileSessionPersister {
             if path.extension().is_some_and(|ext| ext == "json")
                 && let Ok(content) = tokio::fs::read_to_string(&path).await
                 && let Ok(file) = serde_json::from_str::<SessionFile>(&content)
-                && file.format_version == 3
+                && file.format_version == 4
             {
                 metas.push(file.meta);
             }
@@ -196,7 +196,7 @@ impl SessionPersister for FileSessionPersister {
 // 辅助函数
 // ============================================================================
 
-/// 从路径读取并解析 v3 SessionFile（无锁、无校验）。
+/// 从路径读取并解析 v4 SessionFile（无锁、无校验）。
 async fn read_session_file(
     path: &Path,
 ) -> Result<Option<(SessionSnapshot, SessionMeta)>, PersistError> {
@@ -208,7 +208,7 @@ async fn read_session_file(
 
     let file: SessionFile = serde_json::from_str(&raw).map_err(|_| PersistError::UnknownFormat)?;
 
-    if file.format_version != 3 {
+    if file.format_version != 4 {
         return Err(PersistError::UnsupportedFormatVersion(file.format_version));
     }
 
@@ -275,7 +275,14 @@ fn sanitize_session_id(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::session::{AnnotatedMessage, MessageId, MessageSource};
-    use model_provider::{Message, Usage};
+    use model_provider::{InputItem, Role, Usage};
+
+    fn user(text: impl Into<String>) -> InputItem {
+        InputItem::Message {
+            role: Role::User,
+            content: text.into(),
+        }
+    }
 
     fn temp_dir(test_name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -302,7 +309,7 @@ mod tests {
             committed_turns: vec![vec![crate::session::AnnotatedMessage::new(
                 crate::session::MessageId(0),
                 0,
-                model_provider::Message::user("hello"),
+                user("hello"),
                 crate::session::MessageSource::UserInput,
             )]],
             turn_index: 1,
@@ -399,7 +406,7 @@ mod tests {
             committed_turns: vec![vec![AnnotatedMessage::new(
                 MessageId(0),
                 0,
-                Message::user("turn0"),
+                user("turn0"),
                 MessageSource::UserInput,
             )]],
             turn_index: 1,
@@ -419,13 +426,13 @@ mod tests {
                 vec![AnnotatedMessage::new(
                     MessageId(0),
                     0,
-                    Message::user("turn0"),
+                    user("turn0"),
                     MessageSource::UserInput,
                 )],
                 vec![AnnotatedMessage::new(
                     MessageId(1),
                     1,
-                    Message::user("turn1"),
+                    user("turn1"),
                     MessageSource::UserInput,
                 )],
             ],

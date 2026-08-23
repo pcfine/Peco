@@ -83,8 +83,8 @@ pub async fn build_ppa_components(state: &AppState, user_id: &str) -> PpaCompone
         )));
 
     // 创建 MemoryAnalyzer（写路径）
-    // 使用独立模型分析对话，失败不影响主流程
-    let analyzer_model = match model_provider::DeepSeek::from_env() {
+    // 使用独立模型分析对话，失败不影响主流程；默认走 Responses API。
+    let analyzer_model = match model_provider::DeepSeekResponsesAdapter::from_env() {
         Ok(provider) => Arc::new(provider),
         Err(e) => {
             tracing::warn!(error = %e, "Failed to create PPA analyzer model provider, PPA write path disabled");

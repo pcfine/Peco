@@ -12,7 +12,9 @@
 
 use std::sync::Arc;
 
-use model_provider::{ChatRequest, ChatResponse, Message, ModelProvider};
+use model_provider::{
+    ContentBlock, GenerateRequest, GenerateResult, InputItem, ModelProvider, Role,
+};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -67,23 +69,28 @@ impl MemoryAnalyzer {
         let conversation_text = turn_context.format_for_analysis();
 
         // 构建请求
-        let request = ChatRequest {
+        let request = GenerateRequest {
             model: self.config.model.clone(),
-            messages: vec![
-                Message::system(build_analyzer_system_prompt()).into(),
-                Message::user(&conversation_text).into(),
-            ],
+            instructions: Some(build_analyzer_system_prompt()),
+            input: vec![Arc::new(InputItem::Message {
+                role: Role::User,
+                content: conversation_text,
+            })]
+            .into(),
             tools: vec![],
+            tool_choice: None,
             temperature: Some(0.1), // 低温度，追求一致性
-            max_tokens: Some(1024),
-            reasoning_effort: None,
+            top_p: None,
+            max_output_tokens: Some(1024),
+            reasoning: None,
+            text: None,
             additional_params: None,
         };
 
         // 调用模型
         let response = self
             .model
-            .chat(&request)
+            .generate(&request)
             .await
             .map_err(|e| format!("Memory analysis LLM call failed: {e}"))?;
 
@@ -104,10 +111,14 @@ impl MemoryAnalyzer {
     }
 
     /// 解析 LLM 响应，提取 MemoryFact 列表。
-    fn parse_response(&self, response: &ChatResponse) -> Result<Vec<MemoryFact>, String> {
+    fn parse_response(&self, response: &GenerateResult) -> Result<Vec<MemoryFact>, String> {
         let text = response
-            .message
-            .content()
+            .output
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
             .unwrap_or_default()
             .trim()
             .to_string();

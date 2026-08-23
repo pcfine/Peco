@@ -30,6 +30,7 @@ pub mod peco;
 pub mod personal_agent;
 pub mod personal_assistant;
 pub mod provider;
+pub mod session_dto;
 pub mod session_store;
 pub mod skill;
 pub mod state;

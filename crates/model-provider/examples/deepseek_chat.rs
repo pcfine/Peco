@@ -1,4 +1,4 @@
-//! 使用 `model-provider` 的 DeepSeek 聊天示例。
+//! 使用 `model-provider` 的 DeepSeek 中立生成示例（v2 `generate`）。
 //!
 //! ## 运行方式
 //!
@@ -10,9 +10,9 @@
 //! ## 示例演示内容
 //!
 //! 1. 从环境变量创建 `DeepSeek` 提供商
-//! 2. 构建包含系统消息和用户消息的 `ChatRequest`
-//! 3. 非流式 `chat()` 调用
-//! 4. 流式 `stream_chat()` 调用，逐条输出增量内容
+//! 2. 构建包含系统指令和用户输入项的 `GenerateRequest`
+//! 3. 非流式 `generate()` 调用
+//! 4. 流式 `stream_generate()` 调用，逐条输出增量内容
 //! 5. 将提供商作为 `Box<dyn ModelProvider>` 传递
 
 #![allow(unused_crate_dependencies)]
@@ -21,113 +21,118 @@ use std::sync::Arc;
 
 use model_provider::providers::deepseek::DEEPSEEK_V4_PRO;
 use model_provider::{
-    ChatRequest, ChatStream, DeepSeek, Message, ModelProvider, ProviderError, StreamEvent,
+    BlockAssembler, ContentBlock, DeepSeek, GenerateRequest, GenerateResult, GenerateStream,
+    InputItem, ModelProvider, ProviderError, Role, StreamChunk,
 };
 
-/// 辅助函数：打印用量信息。
-fn print_usage(response: &model_provider::ChatResponse) {
-    let content = match &response.message {
-        Message::Assistant { content, .. } => content.as_deref().unwrap_or("(empty)"),
-        _ => "(not an assistant message)",
-    };
-    println!("Response: {content}");
+/// 构造一条带系统指令与用户输入的请求。
+fn request(
+    user_content: &str,
+    instructions: &str,
+    tools: Vec<model_provider::ToolDefinition>,
+) -> GenerateRequest {
+    GenerateRequest {
+        model: DEEPSEEK_V4_PRO.to_string(),
+        instructions: Some(instructions.to_string()),
+        input: vec![Arc::new(InputItem::Message {
+            role: Role::User,
+            content: user_content.to_string(),
+        })]
+        .into(),
+        tools,
+        tool_choice: None,
+        temperature: Some(0.7),
+        top_p: None,
+        max_output_tokens: Some(256),
+        reasoning: None,
+        text: None,
+        additional_params: None,
+    }
+}
+
+/// 打印有序内容块。
+fn print_blocks(result: &GenerateResult) {
+    for block in &result.output {
+        match block {
+            ContentBlock::Text { text } => println!("[text] {text}"),
+            ContentBlock::Reasoning { text } => println!("[reasoning] {text}"),
+            ContentBlock::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => println!("[tool_call] {name} ({call_id}): {arguments}"),
+            _ => println!("[other block]"),
+        }
+    }
     println!(
-        "Usage: input={}, output={}, total={}",
-        response.usage.input_tokens, response.usage.output_tokens, response.usage.total_tokens
+        "Usage: input={}, output={}, total={}, status={:?}",
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.total_tokens,
+        result.status
     );
 }
 
-/// 非流式聊天示例。
-async fn run_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
-    println!("=== Non-Streaming Chat ===");
+/// 非流式生成示例。
+async fn run_generate(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
+    println!("=== Non-Streaming generate ===");
 
-    let request = ChatRequest {
-        model: DEEPSEEK_V4_PRO.to_string(),
-        messages: vec![
-            Arc::new(Message::system(
-                "You are a helpful assistant. Keep answers concise.",
-            )),
-            Arc::new(Message::user(
-                "What are the top 3 programming languages in 2026?",
-            )),
-        ],
-        tools: vec![],
-        temperature: Some(0.7),
-        max_tokens: Some(256),
-        reasoning_effort: None,
-        additional_params: None,
-    };
+    let request = request(
+        "What are the top 3 programming languages in 2026?",
+        "You are a helpful assistant. Keep answers concise.",
+        vec![],
+    );
 
-    let response = provider.chat(&request).await?;
-    print_usage(&response);
+    let result = provider.generate(&request).await?;
+    print_blocks(&result);
     println!();
     Ok(())
 }
 
-/// 流式聊天示例。
-async fn run_stream_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
-    println!("=== Streaming Chat ===");
+/// 流式生成示例。
+async fn run_stream_generate(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
+    println!("=== Streaming stream_generate ===");
 
-    let request = ChatRequest {
-        model: DEEPSEEK_V4_PRO.to_string(),
-        messages: vec![
-            Arc::new(Message::system(
-                "You are a helpful assistant. Keep answers concise.",
-            )),
-            Arc::new(Message::user("Write a haiku about Rust programming.")),
-        ],
-        tools: vec![],
-        temperature: Some(0.9),
-        max_tokens: Some(128),
-        reasoning_effort: None,
-        additional_params: None,
-    };
+    let request = request(
+        "Write a haiku about Rust programming.",
+        "You are a helpful assistant. Keep answers concise.",
+        vec![],
+    );
 
-    let mut stream: ChatStream = provider.stream_chat(&request).await?;
+    let mut stream: GenerateStream = provider.stream_generate(&request).await?;
+    let mut assembler = BlockAssembler::new();
     print!("Streaming: ");
 
-    while let Some(event) = futures::StreamExt::next(&mut stream).await {
-        match event? {
-            StreamEvent::TextDelta(text) => {
-                print!("{text}");
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let chunk = chunk?;
+        match &chunk {
+            StreamChunk::TextDelta { delta, .. } => print!("{delta}"),
+            StreamChunk::ReasoningDelta { delta, .. } => print!("\n[reasoning: {delta}]\n"),
+            StreamChunk::ToolCallDelta { call_id, name, .. } => {
+                print!("\n[tool_call {call_id}] {name:?}");
             }
-            StreamEvent::ReasoningDelta(reasoning) => {
-                print!("\n[reasoning: {reasoning}]\n");
-            }
-            StreamEvent::ToolCallDelta {
-                id,
-                name,
-                arguments,
-            } => match &arguments {
-                serde_json::Value::String(s) => {
-                    println!("\n[ToolCall {id}]: {name:?} (fragment: {s})");
-                }
-                other => {
-                    println!("\n[ToolCall {id}]: {name:?} ({other})");
-                }
-            },
-            StreamEvent::End { usage } => {
-                println!();
-                println!(
-                    "Stream finished. Usage: input={}, output={}, total={}",
-                    usage.input_tokens, usage.output_tokens, usage.total_tokens
-                );
-            }
-            StreamEvent::ToolCallComplete(tc) => {
-                println!(
-                    "\n[ToolCall assembled] {}: {} ({})",
-                    tc.id, tc.function.name, tc.function.arguments
-                );
-            }
+            _ => {}
+        }
+        assembler.push(chunk);
+    }
+    let (blocks, usage, status, _err) = assembler.finish();
+    println!();
+    for block in &blocks {
+        if let ContentBlock::Text { text } = block {
+            println!("[final text] {text}");
         }
     }
+    println!(
+        "Stream finished. Usage: input={}, output={}, total={}, status={:?}",
+        usage.input_tokens, usage.output_tokens, usage.total_tokens, status
+    );
     println!();
     Ok(())
 }
 
-/// 工具调用聊天示例。
-async fn run_tool_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
-    println!("=== Tool-Calling Chat ===");
+/// 工具调用生成示例。
+async fn run_tool_generate(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
+    println!("=== Tool-Calling generate ===");
 
     let weather_tool = model_provider::ToolDefinition {
         name: "get_weather".to_string(),
@@ -144,43 +149,14 @@ async fn run_tool_chat(provider: &dyn ModelProvider) -> Result<(), ProviderError
         }),
     };
 
-    let request = ChatRequest {
-        model: DEEPSEEK_V4_PRO.to_string(),
-        messages: vec![Arc::new(Message::user(
-            "What's the weather like in San Francisco?",
-        ))],
-        tools: vec![weather_tool],
-        temperature: Some(0.0),
-        max_tokens: Some(256),
-        reasoning_effort: None,
-        additional_params: None,
-    };
-
-    let response = provider.chat(&request).await?;
-    match &response.message {
-        Message::Assistant {
-            content,
-            tool_calls,
-            reasoning_content: _,
-        } => {
-            if let Some(text) = content {
-                println!("Assistant text: {text}");
-            }
-            if let Some(calls) = tool_calls {
-                for tc in calls {
-                    println!(
-                        "Tool call: id={}, function={}, arguments={}",
-                        tc.id, tc.function.name, tc.function.arguments
-                    );
-                }
-            }
-        }
-        _ => println!("Unexpected message type"),
-    }
-    println!(
-        "Usage: input={}, output={}, total={}",
-        response.usage.input_tokens, response.usage.output_tokens, response.usage.total_tokens
+    let request = request(
+        "What's the weather like in San Francisco?",
+        "You are a helpful assistant.",
+        vec![weather_tool],
     );
+
+    let result = provider.generate(&request).await?;
+    print_blocks(&result);
     println!();
     Ok(())
 }
@@ -196,9 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider: Box<dyn ModelProvider> = Box::new(deepseek);
 
     // 运行示例
-    run_chat(provider.as_ref()).await?;
-    run_stream_chat(provider.as_ref()).await?;
-    run_tool_chat(provider.as_ref()).await?;
+    run_generate(provider.as_ref()).await?;
+    run_stream_generate(provider.as_ref()).await?;
+    run_tool_generate(provider.as_ref()).await?;
 
     println!("所有示例执行完毕。");
     Ok(())

@@ -160,7 +160,7 @@ default_provider = "deepseek"
 [providers.deepseek]
 type = "deepseek"
 api_key = "${DEEPSEEK_API_KEY}"
-base_url = "https://api.deepseek.com/v1"
+base_url = "https://api.deepseek.com"
 
 [providers.deepseek.default]
 model = "deepseek-v4-flash"

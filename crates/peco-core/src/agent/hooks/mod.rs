@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use model_provider::{ChatResponse, Message, ToolCall, Usage};
+use model_provider::{GenerateResult, InputItem, ToolCall, Usage};
 
 use super::agent_looper::{OuterState, ReActState, TurnFailureReason};
 use crate::session::Session;
@@ -69,19 +69,23 @@ pub trait LooperHook: Send + Sync {
 
     /// 模型请求发送前调用。
     ///
-    /// - `messages`：即将发送给模型的完整消息列表（已包含动态 system prompt）。
-    ///   可在此处修改、注入、截断消息。
+    /// - `messages`：即将发送给模型的历史输入项（不含 system prompt，其由
+    ///   `GenerateRequest.instructions` 单独承载）。可在此处修改、注入、截断。
     /// - 返回 `HookAction::Abort(reason)` 中止本次请求。
     async fn on_before_request(
         &self,
         _turn_index: usize,
-        _messages: &mut Vec<Arc<Message>>,
+        _messages: &mut Vec<Arc<InputItem>>,
     ) -> HookAction {
         HookAction::Continue
     }
 
     /// 收到模型完整响应后调用（在写入 session staging 之前）。
-    async fn on_after_response(&self, _turn_index: usize, _response: &ChatResponse) -> HookAction {
+    async fn on_after_response(
+        &self,
+        _turn_index: usize,
+        _response: &GenerateResult,
+    ) -> HookAction {
         HookAction::Continue
     }
 
@@ -231,7 +235,7 @@ impl LooperHook for TokenBudgetHook {
     async fn on_before_request(
         &self,
         _turn_index: usize,
-        _messages: &mut Vec<Arc<Message>>,
+        _messages: &mut Vec<Arc<InputItem>>,
     ) -> HookAction {
         let acc = *self.accumulated.lock().await;
         if acc >= self.max_total_tokens {

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use model_provider::{Message, ToolCall};
+use model_provider::{ContentBlock, InputItem, Role, ToolCall};
 
 use super::agent::Agent;
 use super::error::AgentError;
@@ -44,9 +44,10 @@ pub struct SimpleAgentLooper {
 
     /// Accumulated message history.
     ///
-    /// System prompt is NOT stored here — [`Agent::chat`] injects it on each
-    /// call. This vec contains User, Assistant, and Tool messages only.
-    messages: Vec<Arc<Message>>,
+    /// System prompt is NOT stored here — [`Agent::generate`] injects it on each
+    /// call as `instructions`. This vec contains User / Assistant / FunctionCall /
+    /// FunctionCallOutput [`InputItem`]s only.
+    messages: Vec<Arc<InputItem>>,
 
     /// Model calls made so far in this run. Checked against `max_turns`.
     react_loop_iteration: usize,
@@ -138,7 +139,10 @@ impl SimpleAgentLooper {
         self.agent.mcp_manager().ensure_connected().await;
 
         // Build initial message list: [User(prompt)]
-        self.messages.push(Arc::new(Message::user(&prompt)));
+        self.messages.push(Arc::new(InputItem::Message {
+            role: Role::User,
+            content: prompt,
+        }));
 
         loop {
             // ── Check cancel ──────────────────────────────────────────────
@@ -155,38 +159,66 @@ impl SimpleAgentLooper {
             self.react_loop_iteration += 1;
 
             // ── Model call (batch, non-streaming) ─────────────────────────
-            // Build messages with system prompt prepended (system prompt is
-            // not stored in history — injected dynamically each call).
-            let mut chat_messages = Vec::with_capacity(self.messages.len() + 1);
-            chat_messages.push(Arc::new(Message::system(self.agent.system_prompt())));
-            chat_messages.extend(self.messages.iter().cloned());
+            // System prompt is not stored in history — injected as `instructions`
+            // on each call (via `Agent::generate` / `generate_with_tools`).
+            let instructions = Some(self.agent.system_prompt());
 
             // 如果有自定义执行器则使用它获取工具定义，否则用 agent 默认的
             let response = if let Some(ref executor) = self.tool_executor_override {
                 let tools = executor.definitions();
-                self.agent.chat_with_tools(chat_messages, tools).await?
+                self.agent
+                    .generate_with_tools(self.messages.clone(), instructions, tools)
+                    .await?
             } else {
-                self.agent.chat(chat_messages).await?
+                self.agent.generate(self.messages.clone()).await?
             };
 
-            // Extract content from response
-            let (text, tool_calls) = match &response.message {
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => (content.clone().unwrap_or_default(), tool_calls.clone()),
-                _ => (String::new(), None),
-            };
+            // Extract text + reasoning + tool calls from ordered output blocks.
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            for block in &response.output {
+                match block {
+                    ContentBlock::Text { text: t } => text.push_str(t),
+                    ContentBlock::Reasoning { text: r } => reasoning.push_str(r),
+                    ContentBlock::ToolCall {
+                        call_id,
+                        name,
+                        arguments,
+                    } => tool_calls.push(ToolCall::new(
+                        call_id.clone(),
+                        name.clone(),
+                        arguments.clone(),
+                    )),
+                    _ => {}
+                }
+            }
 
-            // Store assistant message in history
-            self.messages.push(Arc::new(response.message));
+            // Store assistant text + reasoning + function calls in history (as InputItems).
+            // Text must precede Reasoning/FunctionCall items so the chat adapter's reverse
+            // merge reassembles them into one assistant message.
+            if !text.is_empty() {
+                self.messages.push(Arc::new(InputItem::Message {
+                    role: Role::Assistant,
+                    content: text.clone(),
+                }));
+            }
+            if !reasoning.is_empty() {
+                self.messages
+                    .push(Arc::new(InputItem::Reasoning { content: reasoning }));
+            }
+            for tc in &tool_calls {
+                self.messages.push(Arc::new(InputItem::FunctionCall {
+                    call_id: tc.id.clone(),
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                }));
+            }
 
             // No tool calls → done, return final text
-            let tool_calls = match tool_calls {
-                Some(tcs) if !tcs.is_empty() => tcs,
-                _ => return Ok(text),
-            };
+            if tool_calls.is_empty() {
+                return Ok(text);
+            }
 
             // ── Execute tools ─────────────────────────────────────────────
             let tool_messages = self.execute_tools(&tool_calls).await?;
@@ -200,11 +232,11 @@ impl SimpleAgentLooper {
     ///
     /// Spawns one tokio task per tool call. Awaits them in order (preserving
     /// the model's `tool_calls` sequence) while checking cancel between each.
-    /// Returns `Vec<Message>` to be appended to the message history.
+    /// Returns `FunctionCallOutput` [`InputItem`]s to be appended to the history.
     async fn execute_tools(
         &self,
         tool_calls: &[ToolCall],
-    ) -> Result<Vec<Arc<Message>>, AgentError> {
+    ) -> Result<Vec<Arc<InputItem>>, AgentError> {
         // 有自定义执行器则用它，否则用 MCP 托管的执行器
         let executor = if let Some(ref ov) = self.tool_executor_override {
             ov.clone()
@@ -229,7 +261,7 @@ impl SimpleAgentLooper {
             .collect();
 
         // Await in order, checking cancel between each handle
-        let mut results: Vec<(usize, Arc<Message>)> = Vec::with_capacity(handles.len());
+        let mut results: Vec<(usize, Arc<InputItem>)> = Vec::with_capacity(handles.len());
         for (expected_idx, handle) in handles.into_iter().enumerate() {
             if self.cancel_flag.load(Ordering::Acquire) {
                 // Remaining handles will be dropped (tokio tasks continue but
@@ -242,17 +274,23 @@ impl SimpleAgentLooper {
                         Ok(r) => r,
                         Err(e) => e,
                     };
-                    results.push((idx, Arc::new(Message::tool(&tc.id, &content))));
+                    results.push((
+                        idx,
+                        Arc::new(InputItem::FunctionCallOutput {
+                            call_id: tc.id,
+                            output: content,
+                        }),
+                    ));
                 }
                 Err(join_err) => {
                     tracing::error!(error = %join_err, "Tool execution task panicked");
                     // Insert an error placeholder with estimated index
                     results.push((
                         expected_idx,
-                        Arc::new(Message::tool(
-                            "unknown",
-                            format!("tool panicked: {join_err}"),
-                        )),
+                        Arc::new(InputItem::FunctionCallOutput {
+                            call_id: "unknown".into(),
+                            output: format!("tool panicked: {join_err}"),
+                        }),
                     ));
                 }
             }

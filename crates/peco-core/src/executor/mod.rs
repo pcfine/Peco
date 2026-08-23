@@ -25,7 +25,7 @@ pub use tool::AgentExecutorTool;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use model_provider::{Message, Usage};
+use model_provider::{InputItem, Usage};
 
 use crate::agent::error::AgentError;
 
@@ -60,7 +60,7 @@ pub struct ExecutorInput {
     /// 用户 prompt 文本
     pub prompt: String,
     /// 注入到临时 Session 的上下文消息（不含 system prompt）
-    pub context: Vec<Arc<Message>>,
+    pub context: Vec<Arc<InputItem>>,
     /// 结构化输出 schema（StructuredOutputExecutor 使用，Phase 2）
     pub output_schema: Option<serde_json::Value>,
 }
@@ -76,7 +76,7 @@ impl ExecutorInput {
     }
 
     /// 创建带上下文消息的输入。
-    pub fn with_context(prompt: impl Into<String>, context: Vec<Arc<Message>>) -> Self {
+    pub fn with_context(prompt: impl Into<String>, context: Vec<Arc<InputItem>>) -> Self {
         Self {
             prompt: prompt.into(),
             context,

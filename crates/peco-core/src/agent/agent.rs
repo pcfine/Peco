@@ -9,7 +9,8 @@ use crate::agent::agent_config::{
 };
 use crate::agent::error::AgentError;
 use model_provider::{
-    ChatRequest, ChatResponse, ChatStream, DeepSeek, Message, ModelProvider, ToolDefinition, Usage,
+    DeepSeek, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult, GenerateStream, InputItem,
+    ModelProvider, ReasoningConfig, ReasoningEffort, ToolChoice, ToolDefinition, Usage,
 };
 
 use serde::{Deserialize, Serialize};
@@ -292,61 +293,100 @@ impl Agent {
 
     // ── 请求发送方法 ───────────────────────────────────────────────────────────
 
-    /// 构造 [`ChatRequest`]。
-    fn build_chat_request(
+    /// 构造中立 [`GenerateRequest`]。
+    ///
+    /// `instructions` 承载 system prompt（含动态上下文），`input` 为历史 [`InputItem`]。
+    fn build_generate_request(
         &self,
-        messages: Vec<Arc<Message>>,
+        input: Vec<Arc<InputItem>>,
+        instructions: Option<String>,
         tools: Vec<ToolDefinition>,
-    ) -> ChatRequest {
-        ChatRequest {
+    ) -> GenerateRequest {
+        GenerateRequest {
             model: self.model_config.model_name.clone().unwrap_or_default(),
-            messages,
+            instructions,
+            input: input.into(),
             tools,
+            tool_choice: Some(ToolChoice::Auto),
             temperature: self.model_config.temperature.map(|t| t as f64),
-            max_tokens: self.model_config.max_tokens,
-            reasoning_effort: self.model_config.reasoning_effort.clone(),
+            top_p: None,
+            max_output_tokens: self.model_config.max_tokens,
+            reasoning: reasoning_effort_to_config(self.model_config.reasoning_effort.as_deref()),
+            text: None,
             additional_params: None,
         }
     }
 
-    /// 发送非流式 chat 请求。
+    /// 发送非流式生成请求。
     ///
-    /// 调用方需自行构建完整的消息列表（含 system prompt）。
-    /// Agent 负责收集 tool 定义、构造 ChatRequest、调用 provider。
-    pub(crate) async fn chat(
+    /// 调用方提供历史 `input`（不含 system prompt）；system prompt 由
+    /// `self.system_prompt()` 承载为 `instructions`。
+    pub(crate) async fn generate(
         &self,
-        messages: Vec<Arc<Message>>,
-    ) -> Result<ChatResponse, AgentError> {
+        input: Vec<Arc<InputItem>>,
+    ) -> Result<GenerateResult, AgentError> {
         let tools = self.tool_executor.definitions();
-        let request = self.build_chat_request(messages, tools);
-        Ok(self.model.chat(&request).await?)
+        let instructions = Some(self.system_prompt());
+        let request = self.build_generate_request(input, instructions, tools);
+        Ok(self.model.generate(&request).await?)
     }
 
-    /// 发送流式 chat 请求。
-    ///
-    /// 调用方需自行构建完整的消息列表（含 system prompt）。
-    /// Agent 负责收集 tool 定义、构造 ChatRequest、调用 provider。
-    pub(crate) async fn stream_chat(
+    /// 发送流式生成请求。
+    pub(crate) async fn stream_generate(
         &self,
-        messages: Vec<Arc<Message>>,
-    ) -> Result<ChatStream, AgentError> {
+        input: Vec<Arc<InputItem>>,
+        instructions: Option<String>,
+    ) -> Result<GenerateStream, AgentError> {
         let tools = self.tool_executor.definitions();
-        let request = self.build_chat_request(messages, tools);
-        Ok(self.model.stream_chat(&request).await?)
+        let request = self.build_generate_request(input, instructions, tools);
+        Ok(self.model.stream_generate(&request).await?)
     }
 
-    /// 发送非流式 chat 请求，使用指定的 tool 定义。
+    /// 发送非流式生成请求，使用指定的 tool 定义。
     ///
     /// 由 `SimpleAgentLooper` 在 tool_executor_override 场景下使用，
     /// 允许调用方提供自定义 tool 列表（如包含 `__submit_output__`）。
-    pub(crate) async fn chat_with_tools(
+    pub(crate) async fn generate_with_tools(
         &self,
-        messages: Vec<Arc<Message>>,
+        input: Vec<Arc<InputItem>>,
+        instructions: Option<String>,
         tools: Vec<ToolDefinition>,
-    ) -> Result<ChatResponse, AgentError> {
-        let request = self.build_chat_request(messages, tools);
-        Ok(self.model.chat(&request).await?)
+    ) -> Result<GenerateResult, AgentError> {
+        let request = self.build_generate_request(input, instructions, tools);
+        Ok(self.model.generate(&request).await?)
     }
+}
+
+/// 将 agent.md 的 `reasoning_effort` 字符串（`Option<String>`）映射为中立 [`ReasoningConfig`]。
+///
+/// 规则对齐旧 chat 适配器的 `thinking` 映射：
+/// - `None` → 返回 `None`（适配器按 provider 默认启用 high）；
+/// - `"disabled"`/`"none"` → `enabled: false`；
+/// - `"low"`/`"medium"`/`"high"`/`"max"` → `enabled: true` + 对应 effort；
+/// - 其它（含空串/未知值）→ `enabled: true` + effort `None`（provider 默认）。
+fn reasoning_effort_to_config(effort: Option<&str>) -> Option<ReasoningConfig> {
+    let effort = effort?;
+    let lower = effort.to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if lower == "disabled" || lower == "none" {
+        return Some(ReasoningConfig {
+            enabled: false,
+            effort: None,
+        });
+    }
+    let effort = match lower.as_str() {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    };
+    Some(ReasoningConfig {
+        enabled: true,
+        effort,
+    })
 }
 
 // ── 辅助函数 ────────────────────────────────────────────────────────────────────
@@ -428,67 +468,43 @@ pub fn build_provider_with_user(
 
     match entry.provider_type.as_str() {
         "deepseek" => {
-            let mut provider = DeepSeek::new(api_key)?;
-            if let Some(ref url) = entry.base_url {
-                provider = provider.with_base_url(url.clone());
+            // 按 `api` 字段选择适配器：默认（含 None）→ 原生 /responses，
+            // `"chat"` → chat completions，`"responses"` → 原生 /responses，
+            // 其它值显式报错，避免拼写错误静默落到 responses 难排错。
+            let api_mode = entry
+                .api
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let use_responses = match api_mode {
+                Some(api) if api.eq_ignore_ascii_case("chat") => false,
+                Some(api) if api.eq_ignore_ascii_case("responses") => true,
+                None => true,
+                Some(other) => {
+                    return Err(AgentError::Config(format!(
+                        "unsupported api mode '{other}' for provider '{provider_name}'. \
+                         Expected 'chat' or 'responses'"
+                    )));
+                }
+            };
+
+            if use_responses {
+                let mut provider = DeepSeekResponsesAdapter::new(api_key)?;
+                if let Some(ref url) = entry.base_url {
+                    provider = provider.with_base_url(url.clone());
+                }
+                Ok(Arc::new(provider))
+            } else {
+                let mut provider = DeepSeek::new(api_key)?;
+                if let Some(ref url) = entry.base_url {
+                    provider = provider.with_base_url(url.clone());
+                }
+                Ok(Arc::new(provider))
             }
-            Ok(Arc::new(provider))
         }
         other => Err(AgentError::Config(format!(
             "unsupported provider type: '{other}'. Currently supported: deepseek"
         ))),
     }
-}
-
-// ── 日志辅助函数 ─────────────────────────────────────────────────────────────────
-
-/// 截断字符串用于日志输出，超出长度追加 `…(N more chars)`。
-#[allow(dead_code)]
-fn truncate_for_log(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len).collect();
-        format!("{truncated}…({} more chars)", s.len() - max_len)
-    }
-}
-
-/// 从 assistant 消息中提取日志摘要信息。
-///
-/// 返回 `(text_preview, reasoning_preview, tool_call_names)`。
-#[allow(dead_code)]
-fn extract_response_info(message: &Message) -> (String, String, String) {
-    let (content, tool_calls, reasoning) = match message {
-        Message::Assistant {
-            content,
-            tool_calls,
-            reasoning_content,
-        } => (content, tool_calls, reasoning_content),
-        _ => return (String::from("—"), String::from("—"), String::from("—")),
-    };
-
-    let text_preview = content
-        .as_deref()
-        .filter(|c| !c.is_empty())
-        .map(|c| truncate_for_log(c, 200))
-        .unwrap_or_else(|| String::from("(none)"));
-
-    let reasoning_preview = reasoning
-        .as_deref()
-        .filter(|r| !r.is_empty())
-        .map(|r| truncate_for_log(r, 200))
-        .unwrap_or_else(|| String::from("(none)"));
-
-    let tool_call_names = tool_calls
-        .as_ref()
-        .map(|tcs| {
-            tcs.iter()
-                .map(|tc| tc.function.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| String::from("(none)"));
-
-    (text_preview, reasoning_preview, tool_call_names)
 }
