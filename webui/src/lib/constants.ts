@@ -4,6 +4,20 @@ export const MODELS = [
   { value: "deepseek-v4", label: "DeepSeek V4" },
 ] as const;
 
+// 上下文窗口总量（token）— 每个模型的固定规格，按模型名维护。
+export const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+
+export const MODEL_CONTEXT_WINDOW: Record<string, number> = {
+  "deepseek-v4-flash": 1_000_000,
+  "deepseek-v4-pro": 1_000_000,
+  "deepseek-v4": 1_000_000,
+};
+
+/** 按模型名解析上下文窗口总量，未知模型回退默认值。 */
+export function contextWindowForModel(model?: string): number {
+  return (model && MODEL_CONTEXT_WINDOW[model]) || DEFAULT_CONTEXT_WINDOW;
+}
+
 export const PROVIDERS = [
   { value: "deepseek", label: "DeepSeek" },
   { value: "openai", label: "OpenAI" },

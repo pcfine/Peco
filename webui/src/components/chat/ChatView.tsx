@@ -2,12 +2,25 @@
 
 import { useEffect, useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useAuthStore } from "@/stores/authStore";
-import type { ChatSseEvent, MessageData, TurnData } from "@/types/chat";
-import { Send, Square } from "lucide-react";
+import type {
+  ChatSseEvent,
+  MessageData,
+  TurnData,
+  UsageData,
+} from "@/types/chat";
+import { Send, Square, Paperclip } from "lucide-react";
 import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
+import { TokenUsageRing } from "@/components/chat/TokenUsageRing";
+import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -50,6 +63,8 @@ export interface ChatViewProps {
   onInitialQuerySent?: () => void;
   /** 附加到根元素的 CSS class（用于覆盖高度等布局属性） */
   className?: string;
+  /** 上下文窗口总量（token），用于底部用量圆环的分母。默认 1M。 */
+  contextWindowTokens?: number;
   /** 运行模式。`"external"` 时 ChatView 不管理自己的 SSE 连接 —
    * 消息从 initialMessages prop 读取，发送/停止委托给外部。
    * @default "internal" */
@@ -60,6 +75,8 @@ export interface ChatViewProps {
   onExternalStop?: () => void;
   /** [mode="external" 必需] 外部流式状态 */
   externalIsStreaming?: boolean;
+  /** [mode="external"] 外部提供的当前 token 用量（驱动底部用量圆环）。 */
+  externalUsage?: UsageData | null;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
@@ -75,20 +92,26 @@ export function ChatView({
   onUnread,
   onInitialQuerySent,
   className,
+  contextWindowTokens = DEFAULT_CONTEXT_WINDOW,
   mode = "internal",
   onExternalSend,
   onExternalStop,
   externalIsStreaming,
+  externalUsage = null,
 }: ChatViewProps) {
   const isExternalMode = mode === "external";
   if (isExternalMode && import.meta.env.DEV) {
-    if (!onExternalSend) console.warn("ChatView mode=external: onExternalSend is required");
-    if (!onExternalStop) console.warn("ChatView mode=external: onExternalStop is required");
-    if (externalIsStreaming === undefined) console.warn("ChatView mode=external: externalIsStreaming is required");
+    if (!onExternalSend)
+      console.warn("ChatView mode=external: onExternalSend is required");
+    if (!onExternalStop)
+      console.warn("ChatView mode=external: onExternalStop is required");
+    if (externalIsStreaming === undefined)
+      console.warn("ChatView mode=external: externalIsStreaming is required");
   }
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [usage, setUsage] = useState<UsageData | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const token = useAuthStore((s) => s.token);
@@ -129,6 +152,10 @@ export function ChatView({
   // In external mode messages are driven by the store via initialMessages;
   // in local mode they are managed by our own useState + SSE handlers.
   const displayMessages = isExternalMode ? initialMessages : messages;
+
+  // Token usage for the context ring: internal mode reads from our own SSE
+  // `usage` state; external mode reads from the parent-provided prop.
+  const effectiveUsage = isExternalMode ? externalUsage : usage;
 
   // ── Core send logic — stable identity (empty deps, reads everything from refs) ─
 
@@ -179,6 +206,12 @@ export function ChatView({
         for (const parsed of events) {
           const event = toChatSseEvent(parsed);
           if (event) {
+            if (event.event === "usage") {
+              setUsage({
+                input_tokens: event.data.input_tokens,
+                output_tokens: event.data.output_tokens,
+              });
+            }
             handleSSEEvent(event, setMessages, setStreaming, () => {
               if (!visibleRef.current && onUnreadRef.current) {
                 unreadCountRef.current += 1;
@@ -319,7 +352,7 @@ export function ChatView({
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -354,24 +387,57 @@ export function ChatView({
       </div>
 
       {/* Input */}
-      <div className="flex gap-2 pt-4 border-t mt-4">
-        <input
-          className="flex-1 rounded-md border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary bg-background"
-          placeholder={isInputDisabled ? "加载中…" : "输入消息..."}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={isInputDisabled}
-        />
-        {(externalIsStreaming ?? streaming) ? (
-          <Button variant="destructive" onClick={handleStop}>
-            <Square className="h-4 w-4" />
-          </Button>
-        ) : (
-          <Button onClick={handleSend} disabled={!input.trim() || !visible}>
-            <Send className="h-4 w-4" />
-          </Button>
-        )}
+      <div className="pt-4 mt-4 border-t border-muted-foreground/15">
+        <div className="flex flex-col rounded-xl border bg-background focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/50">
+          <Textarea
+            className="min-h-10 max-h-40 resize-none border-0 px-3 pt-2.5 pb-0 shadow-none focus-visible:ring-0"
+            placeholder={isInputDisabled ? "加载中…" : "输入消息..."}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={isInputDisabled}
+            rows={1}
+          />
+
+          {/* 底部工具行：左侧预留扩展按钮，右侧用量圆环 + 发送/停止 */}
+          <div className="flex items-center justify-between gap-2 px-1.5 py-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled
+                  aria-label="文件上传（即将推出）"
+                >
+                  <Paperclip className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>文件上传（即将推出）</TooltipContent>
+            </Tooltip>
+
+            <div className="flex items-center gap-1">
+              {/* 用量圆环：external 模式（Peco）的 usage 由父组件传入。 */}
+              <TokenUsageRing
+                inputTokens={effectiveUsage?.input_tokens ?? 0}
+                outputTokens={effectiveUsage?.output_tokens}
+                contextWindow={contextWindowTokens}
+              />
+              {(externalIsStreaming ?? streaming) ? (
+                <Button variant="destructive" size="sm" onClick={handleStop}>
+                  <Square className="h-4 w-4" />
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  onClick={handleSend}
+                  disabled={!input.trim() || !visible}
+                >
+                  <Send className="h-4 w-4" />
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -523,6 +589,7 @@ export function reduceStreamEvent(
       );
     case "turn_complete":
     case "done":
+    case "usage":
     case "error":
       return messages;
   }

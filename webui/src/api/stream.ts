@@ -14,6 +14,7 @@ import type {
   AgentCallStartData,
   AgentCallEndData,
   DoneData,
+  UsageEventData,
   ErrorData,
 } from "@/types/chat";
 
@@ -79,6 +80,8 @@ export function toChatSseEvent(parsed: ParsedSSEEvent): ChatSseEvent | null {
       return { event, data: data as unknown as AgentCallEndData };
     case "done":
       return { event, data: data as unknown as DoneData };
+    case "usage":
+      return { event, data: data as unknown as UsageEventData };
     case "error":
       return { event, data: data as unknown as ErrorData };
     default:

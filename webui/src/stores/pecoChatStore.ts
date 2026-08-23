@@ -8,7 +8,7 @@ import {
   isStreamTerminalEvent,
 } from "@/components/chat/ChatView";
 import type { ChatMessage } from "@/components/chat/ChatView";
-import type { ChatSseEvent } from "@/types/chat";
+import type { ChatSseEvent, UsageData } from "@/types/chat";
 
 // Module-level AbortController so the SSE fetch survives component unmount.
 let currentAbort: AbortController | null = null;
@@ -24,6 +24,9 @@ interface PecoChatState {
 
   // Last error message from the streaming request (null when no error).
   error: string | null;
+
+  // Current token usage for the context ring (null until the first stream event).
+  usage: UsageData | null;
 
   load: () => Promise<void>;
   clear: () => Promise<void>;
@@ -46,6 +49,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   sessionKey: 0,
   isStreaming: false,
   error: null,
+  usage: null,
 
   load: async () => {
     if (get().loaded) return;
@@ -71,6 +75,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       messages: [],
       loaded: false,
       isStreaming: false,
+      usage: null,
       sessionKey: s.sessionKey + 1,
     }));
   },
@@ -187,12 +192,27 @@ function applyStreamEvent(
 ): void {
   const newMessages = reduceStreamEvent(event, get().messages);
 
+  // 捕获 ModelUsage 事件驱动用量圆环。仅 `usage` 事件携带「当前上下文
+  // 窗口用量」（input_tokens）；done/turn_complete 的 usage 是会话累计量，
+  // 不适合作为圆环分母。
+  let usage: UsageData | null | undefined;
+  if (event.event === "usage") {
+    usage = {
+      input_tokens: event.data.input_tokens,
+      output_tokens: event.data.output_tokens,
+    };
+  }
+
   // Eagerly clear isStreaming on terminal events so the UI flips from
   // stop→send button immediately.  The finally block in sendMessage is
   // the safety net — it guarantees cleanup even if these events never arrive.
   if (isStreamTerminalEvent(event)) {
-    set({ messages: newMessages, isStreaming: false });
+    set({
+      messages: newMessages,
+      isStreaming: false,
+      ...(usage ? { usage } : {}),
+    });
   } else {
-    set({ messages: newMessages });
+    set({ messages: newMessages, ...(usage ? { usage } : {}) });
   }
 }

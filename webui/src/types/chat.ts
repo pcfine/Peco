@@ -34,6 +34,7 @@ export type ChatSseEvent =
   | { event: "agent_call_start"; data: AgentCallStartData }
   | { event: "agent_call_end"; data: AgentCallEndData }
   | { event: "done"; data: DoneData }
+  | { event: "usage"; data: UsageEventData }
   | { event: "error"; data: ErrorData };
 
 export interface TextDeltaData {
@@ -84,6 +85,12 @@ export interface AgentCallEndData {
 
 export interface DoneData {
   usage: UsageData;
+  conversation_id: string;
+}
+
+export interface UsageEventData {
+  input_tokens: number;
+  output_tokens: number;
   conversation_id: string;
 }
 

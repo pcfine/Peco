@@ -14,6 +14,7 @@ export function PecoChatPage() {
   const loaded = usePecoChatStore((s) => s.loaded);
   const sessionKey = usePecoChatStore((s) => s.sessionKey);
   const isStreaming = usePecoChatStore((s) => s.isStreaming);
+  const usage = usePecoChatStore((s) => s.usage);
   const load = usePecoChatStore((s) => s.load);
   const clear = usePecoChatStore((s) => s.clear);
   const sendMessage = usePecoChatStore((s) => s.sendMessage);
@@ -57,6 +58,7 @@ export function PecoChatPage() {
       }}
       onExternalStop={abortStream}
       externalIsStreaming={isStreaming}
+      externalUsage={usage}
       headerTitle="Peco"
       headerActions={
         <Button variant="ghost" size="sm" onClick={handleClear}>

@@ -96,6 +96,17 @@ pub enum ChatSseEvent {
         usage: UsageData,
         conversation_id: String,
     },
+
+    /// 上下文用量快照（每次模型调用后发出）。
+    ///
+    /// `input_tokens` 为本次调用的 prompt 长度，即当前上下文占用，
+    /// 前端据此计算上下文窗口使用百分比。
+    #[serde(rename = "usage")]
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+        conversation_id: String,
+    },
 }
 
 /// Token 用量数据（精简版，供前端展示）。
@@ -128,6 +139,7 @@ impl ChatSseEvent {
             ChatSseEvent::AgentCallEnd { .. } => "agent_call_end",
             ChatSseEvent::Error { .. } => "error",
             ChatSseEvent::Done { .. } => "done",
+            ChatSseEvent::Usage { .. } => "usage",
         };
         Ok(Event::default().event(event_name).data(data))
     }
@@ -272,9 +284,14 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
+        LooperEvent::ModelUsage { usage, .. } => Some(ChatSseEvent::Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            conversation_id: cid,
+        }),
+
         // 以下事件不产生面向客户端的 SSE 事件
         LooperEvent::ToolCallDelta { .. }
-        | LooperEvent::ModelUsage { .. }
         | LooperEvent::ReactStateChange { .. }
         | LooperEvent::OuterStateChange { .. }
         | LooperEvent::TurnStart { .. }

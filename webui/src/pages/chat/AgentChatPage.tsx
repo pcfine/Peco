@@ -21,6 +21,7 @@ import { AlertCircle, ArrowLeft, Send } from "lucide-react";
 import { toast } from "sonner";
 import type { ChatMessage } from "@/components/chat/ChatView";
 import type { Conversation } from "@/types/chat";
+import { contextWindowForModel } from "@/lib/constants";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -632,6 +633,7 @@ export function AgentChatPage() {
             <ChatView
               visible={convId === visibleConvId}
               className="h-full"
+              contextWindowTokens={contextWindowForModel(agent?.model)}
               streamUrl={(msg) =>
                 `/api/chat/${encodeURIComponent(agentId ?? "")}/conversations/${convId}/stream?message=${encodeURIComponent(msg)}`
               }

@@ -130,7 +130,16 @@ describe("toChatSseEvent", () => {
     expect(result).toBeNull();
   });
 
-  it("maps all 9 known event types", () => {
+  it("maps usage to typed event", () => {
+    const result = toChatSseEvent({
+      event: "usage",
+      data: { input_tokens: 1000, output_tokens: 200, conversation_id: "1" },
+    });
+    expect(result).not.toBeNull();
+    expect(result!.event).toBe("usage");
+  });
+
+  it("maps all 10 known event types", () => {
     const events = [
       "text_delta",
       "reasoning_delta",
@@ -140,6 +149,7 @@ describe("toChatSseEvent", () => {
       "agent_call_start",
       "agent_call_end",
       "done",
+      "usage",
       "error",
     ];
     for (const evt of events) {
