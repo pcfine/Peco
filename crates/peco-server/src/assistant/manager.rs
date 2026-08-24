@@ -487,7 +487,7 @@ mod tests {
         let msgs = vec![
             // turn 0: history
             make_annotated(0, make_user("历史问题")),
-            make_annotated(0, make_function_call("t1", "shell_exec", "ls")),
+            make_annotated(0, make_function_call("t1", "shell", "ls")),
             make_annotated(0, make_function_call_output("t1", "output")),
             make_annotated(0, make_assistant_text("历史回答")),
             // turn 1: current
@@ -532,7 +532,7 @@ mod tests {
             // Turn 0 (history): User + tool-call Assistant(content+tool_calls) + Tool + text Assistant
             make_annotated(0, make_user("问题1")),
             make_annotated(0, make_assistant_text("运行命令")),
-            make_annotated(0, make_function_call("c1", "shell_exec", "cargo build")),
+            make_annotated(0, make_function_call("c1", "shell", "cargo build")),
             make_annotated(0, make_function_call_output("c1", "compilation error...")),
             make_annotated(0, make_assistant_text("修复完成")),
             // Turn 1 (history): User + text-only Assistant
@@ -541,7 +541,7 @@ mod tests {
             // Turn 2 (current): User + tool-call Assistant + Tool
             make_annotated(2, make_user("当前问题")),
             make_annotated(2, make_assistant_text("运行测试")),
-            make_annotated(2, make_function_call("c2", "shell_exec", "cargo test")),
+            make_annotated(2, make_function_call("c2", "shell", "cargo test")),
             make_annotated(2, make_function_call_output("c2", "tests passed")),
         ];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();

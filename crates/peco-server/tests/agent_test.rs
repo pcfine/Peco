@@ -20,7 +20,7 @@ async fn test_create_agent() {
             "description": "负责代码质量审查",
             "system_prompt": "你是一位资深代码审查专家",
             "model": "deepseek-v4-flash",
-            "tools": ["shell_exec", "fetch"],
+            "tools": ["shell", "fetch"],
             "icon": "🔍"
         }))
         .send()
@@ -37,7 +37,7 @@ async fn test_create_agent() {
     assert!(body["id"].as_str().is_some());
     // 验证 tools 被正确存储
     let tools = body["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|t| t == "shell_exec"));
+    assert!(tools.iter().any(|t| t == "shell"));
     assert!(tools.iter().any(|t| t == "fetch"));
 }
 

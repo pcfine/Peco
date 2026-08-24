@@ -24,7 +24,7 @@ export const PROVIDERS = [
 ] as const;
 
 export const TOOLS = [
-  { value: "shell_exec", label: "Shell 执行" },
+  { value: "shell", label: "Shell 执行" },
   { value: "fetch", label: "HTTP 请求" },
   { value: "search_knowledge", label: "知识搜索" },
   { value: "list_knowledge_bases", label: "知识库列表" },

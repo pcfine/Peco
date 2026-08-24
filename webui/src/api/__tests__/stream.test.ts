@@ -49,14 +49,14 @@ describe("parseSSELines", () => {
 
   it("handles tool_call_start event", () => {
     const chunk =
-      'event: tool_call_start\ndata: {"id":"call_1","name":"shell_exec","arguments":"{\\"cmd\\":\\"ls\\"}","conversation_id":"1"}\n\n';
+      'event: tool_call_start\ndata: {"id":"call_1","name":"shell","arguments":"{\\"cmd\\":\\"ls\\"}","conversation_id":"1"}\n\n';
 
     const { events } = parseSSELines(chunk, "");
 
     expect(events).toHaveLength(1);
     expect(events[0].event).toBe("tool_call_start");
     expect(events[0].data.id).toBe("call_1");
-    expect(events[0].data.name).toBe("shell_exec");
+    expect(events[0].data.name).toBe("shell");
   });
 
   it("handles agent_call_start with call_id", () => {
