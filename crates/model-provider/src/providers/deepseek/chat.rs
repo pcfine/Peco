@@ -10,15 +10,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::providers::sse::StreamingEventSource;
-use crate::providers::streaming::{
-    NormalizedChunk, NormalizedToolCall, NormalizedUsage, StreamingProfile,
-    process_normalized_sse_stream_chunks,
-};
 use crate::response::{
     ContentBlock, GenerateRequest, GenerateResult, InputItem, ReasoningConfig, ReasoningEffort,
     ResponseError, ResponseStatus, Role, TextFormat,
 };
+use crate::streaming::pipeline::{
+    NormalizedChunk, NormalizedToolCall, NormalizedUsage, StreamingProfile,
+    process_normalized_sse_stream_chunks,
+};
+use crate::streaming::sse::StreamingEventSource;
 use crate::{GenerateStream, ModelProvider, ProviderError, ToolCall, ToolDefinition, Usage};
 
 // ============================================================================

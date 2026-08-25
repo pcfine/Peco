@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use async_stream::stream;
 use futures::StreamExt;
 
-use crate::providers::sse::{SseEvent, StreamingEventSource};
 use crate::response::{BlockType, ContentBlock, FinishReason, StreamChunk};
+use crate::streaming::sse::{SseEvent, StreamingEventSource};
 use crate::{GenerateStream, ProviderError, ToolCall, Usage};
 
 // ============================================================================

@@ -13,13 +13,13 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::providers::sse::{SseEvent, StreamingEventSource};
-use crate::providers::streaming::normalize_tool_call_arguments;
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, TextConfig,
     TextFormat, ToolChoice,
 };
+use crate::streaming::pipeline::normalize_tool_call_arguments;
+use crate::streaming::sse::{SseEvent, StreamingEventSource};
 use crate::{GenerateStream, ModelProvider, ProviderError, Usage};
 
 const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";

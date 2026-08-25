@@ -367,7 +367,7 @@ pin_project! {
     /// ## 示例
     ///
     /// ```ignore
-    /// use model_provider::providers::sse::{StreamingEventSource, SseEvent};
+    /// use crate::streaming::sse::{StreamingEventSource, SseEvent};
     ///
     /// let mut source = StreamingEventSource::new(
     ///     client,

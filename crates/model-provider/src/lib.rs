@@ -41,22 +41,22 @@
 //! ```
 
 mod error;
+mod generate_stream;
 pub mod providers;
 mod response;
-mod stream;
+mod streaming;
 mod types;
 
 use async_trait::async_trait;
 
 pub use error::ProviderError;
-pub use providers::deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter};
-pub use providers::responses::DeepSeekResponsesAdapter;
+pub use generate_stream::GenerateStream;
+pub use providers::deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter};
 pub use response::{
     BlockAssembler, BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult,
     InputItem, ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk,
     TextConfig, TextFormat, ToolChoice,
 };
-pub use stream::GenerateStream;
 pub use types::{ToolCall, ToolCallFunction, ToolDefinition, Usage};
 
 /// 支持中立生成与流式传输的模型提供商。
