@@ -42,6 +42,7 @@
 
 mod error;
 mod generate_stream;
+mod logging;
 pub mod providers;
 mod response;
 mod streaming;
@@ -75,7 +76,10 @@ pub trait ModelProvider: Send + Sync {
     /// 发送中立非流式生成请求。
     ///
     /// 返回有序 [`ContentBlock`] 列表 + 状态 + 用量。
-    async fn generate_full(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError>;
+    async fn generate_full(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateResult, ProviderError>;
 
     /// 发送中立流式生成请求。
     ///

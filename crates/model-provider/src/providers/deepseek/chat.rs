@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Instrument;
 
+use crate::logging;
 use crate::response::{
     ContentBlock, GenerateRequest, GenerateResult, InputItem, ReasoningConfig, ReasoningEffort,
     ResponseError, ResponseStatus, Role, TextFormat,
@@ -541,47 +543,117 @@ impl ModelProvider for DeepSeek {
         "deepseek"
     }
 
-    async fn generate_full(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
-        self.validate_generate_request(request)?;
-
-        let body = build_request_body(request, false)?;
-
+    async fn generate_full(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateResult, ProviderError> {
+        let request_id = logging::next_request_id();
         let endpoint = self.chat_endpoint();
-        tracing::debug!(
-            target: "model_provider::deepseek",
-            "发送中立生成请求到 {} (模型={})",
-            endpoint,
-            request.model
+        let span = tracing::info_span!(
+            "deepseek_chat_generate_full",
+            provider = "deepseek",
+            endpoint = %endpoint,
+            model = %request.model,
+            request_id = %request_id,
         );
 
-        let response = self
-            .http_client
-            .post(&endpoint)
-            .header("Authorization", self.auth_header())
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await?;
+        async move {
+            self.validate_generate_request(request)?;
 
-        let status = response.status();
-        let response_body = response.bytes().await?;
+            let started = std::time::Instant::now();
+            let body = build_request_body(request, false)?;
+            let input = logging::summarize_input(&request.input);
 
-        if !status.is_success() {
-            let body_str = String::from_utf8_lossy(&response_body).to_string();
-            tracing::warn!(
+            tracing::debug!(
                 target: "model_provider::deepseek",
-                status = status.as_u16(),
-                body = %body_str,
-                "DeepSeek API 返回错误状态"
+                request_id = %request_id,
+                model = %request.model,
+                endpoint = %endpoint,
+                input_items = request.input.len(),
+                messages = input.messages,
+                function_calls = input.function_calls,
+                function_call_outputs = input.function_call_outputs,
+                reasoning_items = input.reasoning,
+                tools = request.tools.len(),
+                instructions_chars = request
+                    .instructions
+                    .as_deref()
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0),
+                body_bytes = body.len(),
+                stream = false,
+                "发送 chat 生成请求"
             );
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                body: body_str,
-            });
-        }
+            // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
+            tracing::trace!(
+                target: "model_provider::deepseek",
+                request_id = %request_id,
+                body = %String::from_utf8_lossy(&body),
+                "chat 请求体全文"
+            );
 
-        let api_response: DeepSeekResponse = serde_json::from_slice(&response_body)?;
-        chat_response_to_generate_result(api_response)
+            let response = self
+                .http_client
+                .post(&endpoint)
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await?;
+
+            let status = response.status();
+            // 必须在 `bytes()` 消费响应之前读头。
+            let provider_request_id = logging::request_id_header(&response);
+            let response_body = response.bytes().await?;
+            let latency_ms = started.elapsed().as_millis() as u64;
+
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&response_body).to_string();
+                tracing::warn!(
+                    target: "model_provider::deepseek",
+                    request_id = %request_id,
+                    provider_request_id = provider_request_id.as_deref().unwrap_or("-"),
+                    status = status.as_u16(),
+                    latency_ms,
+                    body = %body_str,
+                    "DeepSeek API 返回错误状态"
+                );
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    body: body_str,
+                });
+            }
+
+            tracing::trace!(
+                target: "model_provider::deepseek",
+                request_id = %request_id,
+                body = %String::from_utf8_lossy(&response_body),
+                "chat 响应体全文"
+            );
+
+            let api_response: DeepSeekResponse = serde_json::from_slice(&response_body)?;
+            let result = chat_response_to_generate_result(api_response)?;
+
+            let blocks = logging::summarize_blocks(&result.output);
+            tracing::debug!(
+                target: "model_provider::deepseek",
+                request_id = %request_id,
+                provider_request_id = provider_request_id.as_deref().unwrap_or("-"),
+                latency_ms,
+                status = ?result.status,
+                blocks = result.output.len(),
+                text_blocks = blocks.text,
+                reasoning_blocks = blocks.reasoning,
+                tool_call_blocks = blocks.tool_calls,
+                input_tokens = result.usage.input_tokens,
+                output_tokens = result.usage.output_tokens,
+                total_tokens = result.usage.total_tokens,
+                "chat 生成完成"
+            );
+            Ok(result)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn generate_stream(
@@ -594,10 +666,42 @@ impl ModelProvider for DeepSeek {
 
         let endpoint = self.chat_endpoint();
         let model = request.model.clone();
+        let request_id = logging::next_request_id();
+        let input = logging::summarize_input(&request.input);
+
+        tracing::debug!(
+            target: "model_provider::deepseek",
+            request_id = %request_id,
+            model = %model,
+            endpoint = %endpoint,
+            input_items = request.input.len(),
+            messages = input.messages,
+            function_calls = input.function_calls,
+            function_call_outputs = input.function_call_outputs,
+            reasoning_items = input.reasoning,
+            tools = request.tools.len(),
+            instructions_chars = request
+                .instructions
+                .as_deref()
+                .map(|s| s.chars().count())
+                .unwrap_or(0),
+            body_bytes = body.len(),
+            stream = true,
+            "发送 chat 流式生成请求"
+        );
+        tracing::trace!(
+            target: "model_provider::deepseek",
+            request_id = %request_id,
+            body = %String::from_utf8_lossy(&body),
+            "chat 流式请求体全文"
+        );
 
         let span = tracing::info_span!(
             "deepseek_stream_generate",
+            provider = "deepseek",
+            endpoint = %endpoint,
             model = %model,
+            request_id = %request_id,
         );
 
         let event_source = StreamingEventSource::new(
@@ -611,8 +715,8 @@ impl ModelProvider for DeepSeek {
             event_source,
             DeepSeekStreamingProfile,
             span,
-            endpoint,
             model,
+            request_id,
         ))
     }
 }

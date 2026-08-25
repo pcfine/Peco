@@ -391,6 +391,10 @@ pin_project! {
         retry_policy: R,
         last_event_id: Option<String>,
         allow_missing_content_type: bool,
+        // 被跳过的 SSE 解析 / UTF-8 错误计数。这些错误逐条可恢复（跳过该事件继续读流），
+        // 但逐条打日志会在畸形流上刷屏，因此只累加，在流终止（EOF / 重试放弃）时一次性汇报。
+        // 非零即说明上游发过畸形帧。
+        skipped_parse_errors: u64,
         #[pin]
         state: SseState,
     }
@@ -425,6 +429,7 @@ impl<R: RetryPolicy> StreamingEventSource<R> {
             retry_policy,
             last_event_id: None,
             allow_missing_content_type: false,
+            skipped_parse_errors: 0,
             state: SseState::Connecting { response_future },
         }
     }
@@ -508,14 +513,31 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                         }
                         Poll::Ready(Err(err)) => {
                             let provider_err = ProviderError::from(err);
-                            if let Some(delay) = this.retry_policy.retry(&provider_err, None) {
-                                let retry_delay = futures_timer::Delay::new(delay);
-                                this.state.set(SseState::WaitingToRetry {
-                                    retry_delay,
-                                    current_retry: (1, delay),
-                                });
-                            } else {
-                                this.state.set(SseState::Closed);
+                            match this.retry_policy.retry(&provider_err, None) {
+                                Some(delay) => {
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %provider_err,
+                                        attempt = 1,
+                                        delay_ms = delay.as_millis() as u64,
+                                        "SSE 连接失败，安排重试"
+                                    );
+                                    let retry_delay = futures_timer::Delay::new(delay);
+                                    this.state.set(SseState::WaitingToRetry {
+                                        retry_delay,
+                                        current_retry: (1, delay),
+                                    });
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %provider_err,
+                                        "SSE 连接失败，重试策略放弃，关闭事件源"
+                                    );
+                                    this.state.set(SseState::Closed);
+                                }
                             }
                         }
                     }
@@ -539,16 +561,32 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                         }
                         Poll::Ready(Err(err)) => {
                             let provider_err = ProviderError::from(err);
-                            if let Some(delay) =
-                                this.retry_policy.retry(&provider_err, Some(last_retry))
-                            {
-                                let retry_delay = futures_timer::Delay::new(delay);
-                                this.state.set(SseState::WaitingToRetry {
-                                    retry_delay,
-                                    current_retry: (last_retry.0 + 1, delay),
-                                });
-                            } else {
-                                this.state.set(SseState::Closed);
+                            match this.retry_policy.retry(&provider_err, Some(last_retry)) {
+                                Some(delay) => {
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %provider_err,
+                                        attempt = last_retry.0 + 1,
+                                        delay_ms = delay.as_millis() as u64,
+                                        "SSE 重连失败，继续重试"
+                                    );
+                                    let retry_delay = futures_timer::Delay::new(delay);
+                                    this.state.set(SseState::WaitingToRetry {
+                                        retry_delay,
+                                        current_retry: (last_retry.0 + 1, delay),
+                                    });
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %provider_err,
+                                        attempts = last_retry.0,
+                                        "SSE 重连失败，重试策略放弃，关闭事件源"
+                                    );
+                                    this.state.set(SseState::Closed);
+                                }
                             }
                         }
                     }
@@ -564,6 +602,14 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                             return Poll::Ready(Some(Ok(SseEvent::Open)));
                         }
                         Poll::Ready(Err(err)) => {
+                            // 非 200 与 content-type 不符都走这里。此前只作为 Err 返回，
+                            // 上层 pipeline 直接 yield 出去，没有任何一层记录过。
+                            tracing::warn!(
+                                target: "model_provider::streaming",
+                                url = %this.url,
+                                error = %err,
+                                "SSE 响应校验失败（非 200 或 content-type 不符），不重试"
+                            );
                             this.state.set(SseState::Closed);
                             return Poll::Ready(Some(Err(err)));
                         }
@@ -587,24 +633,51 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                         }
                         Poll::Ready(Some(Err(EventStreamError::Transport(err)))) => {
                             let provider_err = ProviderError::Stream(err.to_string());
-                            if let Some(delay) = this.retry_policy.retry(&provider_err, None) {
-                                let retry_delay = futures_timer::Delay::new(delay);
-                                this.state.set(SseState::WaitingToRetry {
-                                    retry_delay,
-                                    current_retry: (1, delay),
-                                });
-                            } else {
-                                this.state.set(SseState::Closed);
+                            match this.retry_policy.retry(&provider_err, None) {
+                                Some(delay) => {
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %provider_err,
+                                        delay_ms = delay.as_millis() as u64,
+                                        "已建立的 SSE 流传输中断，安排重连"
+                                    );
+                                    let retry_delay = futures_timer::Delay::new(delay);
+                                    this.state.set(SseState::WaitingToRetry {
+                                        retry_delay,
+                                        current_retry: (1, delay),
+                                    });
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %provider_err,
+                                        skipped_parse_errors = *this.skipped_parse_errors,
+                                        "SSE 流传输中断，重试策略放弃，关闭事件源"
+                                    );
+                                    this.state.set(SseState::Closed);
+                                }
                             }
                         }
                         // 解析器和 UTF-8 错误是可恢复的 — 跳过并继续处理流。
                         Poll::Ready(Some(Err(
                             EventStreamError::Parser(_) | EventStreamError::Utf8(_),
                         ))) => {
+                            // 逐条打会在畸形流上刷屏，只累加，流终止时统一汇报。
+                            *this.skipped_parse_errors += 1;
                             continue;
                         }
                         Poll::Ready(None) => {
-                            // 流正常结束
+                            // 流正常结束。此处不再逐流打「正常结束」日志 —— 上层终止摘要已覆盖。
+                            if *this.skipped_parse_errors > 0 {
+                                tracing::warn!(
+                                    target: "model_provider::streaming",
+                                    url = %this.url,
+                                    skipped_parse_errors = *this.skipped_parse_errors,
+                                    "SSE 流结束，但期间跳过了畸形事件"
+                                );
+                            }
                             this.state.set(SseState::Closed);
                             return Poll::Ready(None);
                         }
@@ -620,6 +693,13 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                     match retry_delay.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(()) => {
+                            tracing::debug!(
+                                target: "model_provider::streaming",
+                                url = %this.url,
+                                attempt = current_retry.0,
+                                last_event_id = this.last_event_id.as_deref().unwrap_or("-"),
+                                "开始 SSE 重连"
+                            );
                             let response_future = create_response_future(
                                 this.client,
                                 this.url,

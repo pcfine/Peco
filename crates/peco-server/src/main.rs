@@ -15,10 +15,15 @@ use peco_server::workflow::scheduler::CronScheduler;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ── 1. 初始化 tracing ──────────────────────────────────────────────────
+    // `model_provider` 必须显式列出：它不以 `peco` 开头，没有自己的 directive 时会落到
+    // EnvFilter 的 ERROR 默认级别，而该 crate 只发 warn/debug —— 于是 LLM 调用层的
+    // 所有异常（非 2xx、SSE 重连、丢弃工具调用）都会静默。
+    // 排查 LLM 问题：`RUST_LOG=model_provider=debug`，看完整请求体用 `=trace`。
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("peco=info,tower_http=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("peco=info,model_provider=info,tower_http=info")
+            }),
         )
         .init();
 

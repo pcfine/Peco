@@ -325,6 +325,14 @@ impl BlockAssembler {
     ) {
         let mut status = self.status;
         if !self.open.is_empty() && status == ResponseStatus::Completed {
+            // 「回答莫名截断」的直接证据：适配器发了 BlockStart 却没有对应的 BlockEnd。
+            tracing::warn!(
+                target: "model_provider::response",
+                open_indices = ?self.open.keys().collect::<Vec<_>>(),
+                open_types = ?self.open.values().collect::<Vec<_>>(),
+                blocks = self.blocks.len(),
+                "流结束时仍有未闭合的内容块，状态降级为 Incomplete"
+            );
             status = ResponseStatus::Incomplete;
         }
         (

@@ -277,19 +277,13 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
     event_source: StreamingEventSource,
     profile: P,
     span: tracing::Span,
-    endpoint: String,
     model: String,
+    request_id: String,
 ) -> GenerateStream {
+    // 「开始流式处理」不再单独打点：调用方（provider 的 `generate_stream`）刚打过一条
+    // 请求摘要，含相同的 request_id / model / endpoint 以及十几个更有用的字段，
+    // 这里再打一条是它的严格子集。流的另一端有终止摘要，起点由请求摘要覆盖。
     let stream = stream! {
-        let _guard = span.enter();
-
-        tracing::debug!(
-            target: "model_provider::streaming",
-            "开始 SSE 流式处理（中立 chunk）(端点={}, 模型={})",
-            endpoint,
-            model
-        );
-
         let mut pending_tool_calls: HashMap<usize, PendingToolCall> = HashMap::new();
         let mut started_tool_calls: HashSet<usize> = HashSet::new();
         let mut accumulated_usage: Option<NormalizedUsage> = None;
@@ -300,6 +294,16 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
         let mut finish_reason: Option<String> = None;
         let mut terminated_with_error = false;
 
+        // ── 诊断计数器 ──
+        // 每 chunk 都可能命中的分支不逐条打日志，累积后在流终止摘要里一次性汇报。
+        let started_at = std::time::Instant::now();
+        let mut first_chunk_at: Option<std::time::Instant> = None;
+        let mut event_count: u64 = 0;
+        let mut skipped_none_count: u64 = 0;
+        let mut text_bytes_total: usize = 0;
+        let mut reasoning_bytes_total: usize = 0;
+        let mut tool_call_count: u64 = 0;
+
         futures::pin_mut!(event_source);
 
         while let Some(event_result) = event_source.next().await {
@@ -308,10 +312,24 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                 Ok(SseEvent::Message(msg_event)) => msg_event.data,
                 Err(provider_err) => {
                     terminated_with_error = true;
+                    tracing::warn!(
+                        target: "model_provider::streaming",
+                        request_id = %request_id,
+                        model = %model,
+                        error = %provider_err,
+                        event_count,
+                        text_bytes = text_bytes_total,
+                        reasoning_bytes = reasoning_bytes_total,
+                        tool_call_count,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "SSE 流传输错误，中止"
+                    );
                     yield Err(provider_err);
                     break;
                 }
             };
+
+            event_count += 1;
 
             if data.trim().is_empty() || data.trim() == "[DONE]" {
                 continue;
@@ -319,15 +337,40 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
 
             if let Some(error) = provider_error_from_sse_data(&data) {
                 terminated_with_error = true;
+                tracing::warn!(
+                    target: "model_provider::streaming",
+                    request_id = %request_id,
+                    model = %model,
+                    error = %error,
+                    event_count,
+                    text_bytes = text_bytes_total,
+                    reasoning_bytes = reasoning_bytes_total,
+                    tool_call_count,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "SSE 流内错误载荷，中止"
+                );
                 yield Err(error);
                 break;
             }
 
             let chunk: NormalizedChunk = match profile.normalize_chunk(&data) {
                 Ok(Some(c)) => c,
-                Ok(None) => continue,
+                // 无法产出规范化 chunk（如 choices 为空）—— 静默跳过，仅计数。
+                Ok(None) => {
+                    skipped_none_count += 1;
+                    continue;
+                }
                 Err(err) => {
                     terminated_with_error = true;
+                    tracing::warn!(
+                        target: "model_provider::streaming",
+                        request_id = %request_id,
+                        model = %model,
+                        error = %err,
+                        event_count,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "SSE chunk 规范化失败，中止"
+                    );
                     yield Err(err);
                     break;
                 }
@@ -351,11 +394,13 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                     });
                     text_started = true;
                 }
+                first_chunk_at.get_or_insert_with(std::time::Instant::now);
                 yield Ok(StreamChunk::TextDelta {
                     index: TEXT_BLOCK_INDEX,
                     delta: text.clone(),
                 });
                 text_buffer.push_str(text);
+                text_bytes_total += text.len();
             }
 
             // ── 推理增量 ──
@@ -369,11 +414,13 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                     });
                     reasoning_started = true;
                 }
+                first_chunk_at.get_or_insert_with(std::time::Instant::now);
                 yield Ok(StreamChunk::ReasoningDelta {
                     index: REASONING_BLOCK_INDEX,
                     delta: reasoning.clone(),
                 });
                 reasoning_buffer.push_str(reasoning);
+                reasoning_bytes_total += reasoning.len();
             }
 
             // ── 工具调用处理 ──
@@ -385,6 +432,17 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                     && let Some(existing) = pending_tool_calls.get(&tc.index)
                     && should_evict_tool_call(existing, tc)
                 {
+                    // 同一 wire index 上开始了不同的工具调用 —— 上游行为异常的信号。
+                    tracing::debug!(
+                        target: "model_provider::streaming",
+                        request_id = %request_id,
+                        index = tc.index,
+                        old_id = %existing.id,
+                        old_name = %existing.name,
+                        new_id = tc.id.as_deref().unwrap_or("-"),
+                        new_name = tc.name.as_deref().unwrap_or("-"),
+                        "淘汰同索引上的旧工具调用"
+                    );
                     if let Some(block) = pending_to_content_block(existing) {
                         yield Ok(StreamChunk::BlockEnd {
                             index: stream_idx,
@@ -411,6 +469,8 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                                 block_type: BlockType::ToolCall,
                             });
                         }
+                        first_chunk_at.get_or_insert_with(std::time::Instant::now);
+                        tool_call_count += 1;
                         yield Ok(StreamChunk::ToolCallDelta {
                             index: stream_idx,
                             call_id: pending.id.clone(),
@@ -443,6 +503,14 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                 // ID 更新
                 if let Some(ref id) = tc.id {
                     if !entry.id.is_empty() && entry.id != *id {
+                        tracing::debug!(
+                            target: "model_provider::streaming",
+                            request_id = %request_id,
+                            index = tc.index,
+                            old_id = %entry.id,
+                            new_id = %id,
+                            "同索引工具调用 id 变更，清空已累积参数"
+                        );
                         if let Some(block) = pending_to_content_block(entry) {
                             yield Ok(StreamChunk::BlockEnd {
                                 index: stream_idx,
@@ -458,6 +526,14 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                 // 名称更新
                 if let Some(ref name) = tc.name {
                     if !entry.name.is_empty() && entry.name != *name {
+                        tracing::debug!(
+                            target: "model_provider::streaming",
+                            request_id = %request_id,
+                            index = tc.index,
+                            old_name = %entry.name,
+                            new_name = %name,
+                            "同索引工具调用 name 变更，清空已累积参数"
+                        );
                         if let Some(block) = pending_to_content_block(entry) {
                             yield Ok(StreamChunk::BlockEnd {
                                 index: stream_idx,
@@ -474,6 +550,8 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                             index: stream_idx,
                             block_type: BlockType::ToolCall,
                         });
+                        first_chunk_at.get_or_insert_with(std::time::Instant::now);
+                        tool_call_count += 1;
                     }
                     yield Ok(StreamChunk::ToolCallDelta {
                         index: stream_idx,
@@ -525,7 +603,19 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
         // 留给 [`crate::BlockAssembler`] 的 `Finish{MaxTokens}` 隐式丢弃，避免把畸形
         // FunctionCall 临时 staging 后又在 rollback 时产生半成品工具调用。
         let truncated = matches!(finish_reason.as_deref(), Some("length"));
-        if !truncated {
+        if truncated {
+            if !pending_tool_calls.is_empty() {
+                let mut dropped: Vec<usize> = pending_tool_calls.keys().copied().collect();
+                dropped.sort();
+                tracing::debug!(
+                    target: "model_provider::streaming",
+                    request_id = %request_id,
+                    indices = ?dropped,
+                    count = dropped.len(),
+                    "MaxTokens 截断，丢弃未闭合的工具调用"
+                );
+            }
+        } else {
             let mut indices: Vec<usize> = pending_tool_calls.keys().copied().collect();
             indices.sort();
             for idx in indices {
@@ -562,11 +652,32 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
         let usage = accumulated_usage
             .map(|u| profile.convert_usage(u))
             .unwrap_or_default();
+        let reason = finish_reason_to_finish(finish_reason.as_deref());
+
+        tracing::debug!(
+            target: "model_provider::streaming",
+            request_id = %request_id,
+            model = %model,
+            event_count,
+            text_bytes = text_bytes_total,
+            reasoning_bytes = reasoning_bytes_total,
+            tool_call_count,
+            finish_reason = %reason.as_str(),
+            wire_finish_reason = finish_reason.as_deref().unwrap_or("-"),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            total_tokens = usage.total_tokens,
+            skipped_none_count,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            ttfc_ms = first_chunk_at
+                .map(|t| t.duration_since(started_at).as_millis() as u64)
+                .unwrap_or(0),
+            "SSE 流式处理结束（中立 chunk）"
+        );
+
         yield Ok(StreamChunk::Usage { usage });
-        yield Ok(StreamChunk::Finish {
-            reason: finish_reason_to_finish(finish_reason.as_deref()),
-        });
+        yield Ok(StreamChunk::Finish { reason });
     };
 
-    GenerateStream::new(Box::pin(stream))
+    GenerateStream::new_instrumented(Box::pin(stream), span)
 }

@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::Instrument;
 
+use crate::logging;
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, TextConfig,
@@ -148,10 +150,31 @@ fn flush_call_group(
         outputs.clear();
         return;
     }
-    let matched: Vec<(String, Value)> = calls
-        .drain(..)
-        .filter(|(id, _)| outputs.iter().any(|(oid, _)| oid == id))
-        .collect();
+
+    // 一趟遍历同时分出配对与被丢弃的两组。被丢弃意味着模型确实发起过的工具调用被从
+    // 回放历史里抹掉 —— 只应出现在轮次被中断的异常历史里，故用 warn。
+    //
+    // 注意别为了拿 `dropped` 而在这之前单独再跑一遍同样的谓词：那是 O(n×m) 的重复扫描，
+    // 且正常路径上结果恒为空。`Vec::new()` 不分配，所以空集合这条路是零成本的。
+    let total_calls = calls.len();
+    let mut matched: Vec<(String, Value)> = Vec::with_capacity(total_calls);
+    let mut dropped: Vec<String> = Vec::new();
+    for (id, call_value) in calls.drain(..) {
+        if outputs.iter().any(|(oid, _)| oid == &id) {
+            matched.push((id, call_value));
+        } else {
+            dropped.push(id);
+        }
+    }
+    if !dropped.is_empty() {
+        tracing::warn!(
+            target: "model_provider::responses",
+            dropped_call_ids = ?dropped,
+            count = dropped.len(),
+            total_calls,
+            "丢弃无配对 output 的 function_call（工具调用被从回放历史中抹除）"
+        );
+    }
     let matched_ids: HashSet<&str> = matched.iter().map(|(id, _)| id.as_str()).collect();
 
     for (_, call_value) in &matched {
@@ -283,6 +306,16 @@ fn should_carry_reasoning(
             .any(|item| matches!(&**item, InputItem::FunctionCall { .. }))
 }
 
+/// reasoning 是否启用：未显式配置（`None`）按 provider 默认启用；否则看 `enabled`。
+///
+/// 与 [`reasoning_config_to_value`] 共用同一约定 —— 该函数在「启用但未指定 effort」时
+/// 同样省略 `reasoning` 字段、交由 provider 默认，即「省略 == 启用」。两处解读必须同步，
+/// 否则回传判定会与请求体实际声明的推理开关脱节。抽成函数是为了让请求摘要日志
+/// 复用同一判据，而不是在日志里重算一遍。
+fn reasoning_enabled(request: &GenerateRequest) -> bool {
+    request.reasoning.as_ref().is_none_or(|r| r.enabled)
+}
+
 fn reasoning_config_to_value(reasoning: Option<&ReasoningConfig>) -> Option<Value> {
     let config = reasoning?;
     if !config.enabled {
@@ -326,13 +359,11 @@ fn build_responses_request_body(
     request: &GenerateRequest,
     stream: bool,
 ) -> Result<Vec<u8>, ProviderError> {
-    // reasoning 是否启用：未显式配置（None）按 provider 默认启用；否则看 enabled。
-    // 与下方 `reasoning_config_to_value` 共用同一约定 —— 该函数在「启用但未指定 effort」时
-    // 同样省略 `reasoning` 字段、交由 provider 默认，即「省略 == 启用」。两处解读必须同步，
-    // 否则回传判定会与请求体实际声明的推理开关脱节。
-    let reasoning_enabled = request.reasoning.as_ref().is_none_or(|r| r.enabled);
-    let carry_reasoning =
-        should_carry_reasoning(&request.input, !request.tools.is_empty(), reasoning_enabled);
+    let carry_reasoning = should_carry_reasoning(
+        &request.input,
+        !request.tools.is_empty(),
+        reasoning_enabled(request),
+    );
     let input = input_items_to_responses_values(&request.input, carry_reasoning);
 
     let mut body = serde_json::Map::new();
@@ -563,17 +594,12 @@ struct PendingResponseToolCall {
 fn process_responses_sse_stream(
     event_source: StreamingEventSource,
     span: tracing::Span,
-    endpoint: String,
     model: String,
+    request_id: String,
 ) -> GenerateStream {
+    // 「开始流式处理」不再单独打点：调用方（`generate_stream`）刚打过一条请求摘要，
+    // 含相同的 request_id / model / endpoint 以及更多字段，这里再打是它的严格子集。
     let stream = stream! {
-        let _guard = span.enter();
-        tracing::debug!(
-            target: "model_provider::responses",
-            "开始 responses SSE 流式处理 (端点={}, 模型={})",
-            endpoint, model
-        );
-
         let mut text_buffers: HashMap<usize, String> = HashMap::new();
         let mut reasoning_buffers: HashMap<usize, String> = HashMap::new();
         let mut tool_calls: HashMap<usize, PendingResponseToolCall> = HashMap::new();
@@ -581,6 +607,23 @@ fn process_responses_sse_stream(
         let mut usage: Option<Usage> = None;
         let mut finish_reason: Option<FinishReason> = None;
         let mut terminated_with_error = false;
+
+        // ── 诊断计数器 ──
+        // 每 chunk 都可能命中的分支不逐条打日志，累积后在流终止摘要里一次性汇报；
+        // 「未知类型」额外收集去重集合，即使同一类型重复上万次，摘要行也保持有界。
+        let started_at = std::time::Instant::now();
+        let mut first_chunk_at: Option<std::time::Instant> = None;
+        let mut event_count: u64 = 0;
+        let mut text_bytes_total: usize = 0;
+        let mut reasoning_bytes_total: usize = 0;
+        let mut tool_call_count: u64 = 0;
+        let mut unknown_event_types: HashSet<String> = HashSet::new();
+        let mut unknown_event_count: u64 = 0;
+        let mut unknown_item_types: HashSet<String> = HashSet::new();
+        let mut unknown_item_count: u64 = 0;
+        // 缺 type / 缺 output_index / 缺 delta / 缺 item 都归为「上游发了畸形事件」，
+        // 恒为 0；分成四个计数器只会让每条终止摘要行都多三个恒 0 字段。
+        let mut malformed_event_count: u64 = 0;
 
         futures::pin_mut!(event_source);
 
@@ -590,10 +633,24 @@ fn process_responses_sse_stream(
                 Ok(SseEvent::Message(msg_event)) => msg_event.data,
                 Err(provider_err) => {
                     terminated_with_error = true;
+                    tracing::warn!(
+                        target: "model_provider::responses",
+                        request_id = %request_id,
+                        model = %model,
+                        error = %provider_err,
+                        event_count,
+                        text_bytes = text_bytes_total,
+                        reasoning_bytes = reasoning_bytes_total,
+                        tool_call_count,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "responses SSE 流传输错误，中止"
+                    );
                     yield Err(provider_err);
                     break;
                 }
             };
+
+            event_count += 1;
 
             if data.trim().is_empty() || data.trim() == "[DONE]" {
                 continue;
@@ -603,21 +660,38 @@ fn process_responses_sse_stream(
                 Ok(v) => v,
                 Err(e) => {
                     terminated_with_error = true;
+                    tracing::warn!(
+                        target: "model_provider::responses",
+                        request_id = %request_id,
+                        model = %model,
+                        error = %e,
+                        event_count,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "解析 responses SSE 事件失败，中止"
+                    );
                     yield Err(ProviderError::Stream(format!("解析 responses SSE 事件失败: {e}")));
                     break;
                 }
             };
             let Some(event_type) = event.get("type").and_then(Value::as_str).map(str::to_string) else {
+                malformed_event_count += 1;
                 continue;
             };
 
             match event_type.as_str() {
                 "response.output_item.added" => {
                     let Some(output_index) = event.get("output_index").and_then(Value::as_u64).map(|i| i as usize) else {
+                        malformed_event_count += 1;
                         continue;
                     };
-                    let Some(item) = event.get("item") else { continue; };
-                    let Some(item_type) = item.get("type").and_then(Value::as_str) else { continue; };
+                    let Some(item) = event.get("item") else {
+                        malformed_event_count += 1;
+                        continue;
+                    };
+                    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+                        malformed_event_count += 1;
+                        continue;
+                    };
 
                     match item_type {
                         "message" => {
@@ -647,6 +721,8 @@ fn process_responses_sse_stream(
                             }
                             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default().to_string();
                             let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                            tool_call_count += 1;
+                            first_chunk_at.get_or_insert_with(std::time::Instant::now);
                             tool_calls.insert(output_index, PendingResponseToolCall {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
@@ -659,34 +735,58 @@ fn process_responses_sse_stream(
                                 arguments: Value::String(String::new()),
                             });
                         }
-                        _ => {}
+                        // 未知 item 类型：整块内容会被静默丢弃 —— 累积后在终止摘要汇报。
+                        other => {
+                            unknown_item_count += 1;
+                            // 去重集合只存一份类型名；`contains` 先查一次，避免对
+                            // 每次重复出现的同类型反复分配 `String`。
+                            if !unknown_item_types.contains(other) {
+                                unknown_item_types.insert(other.to_string());
+                            }
+                        }
                     }
                 }
                 "response.output_text.delta" => {
                     let Some(output_index) = event.get("output_index").and_then(Value::as_u64).map(|i| i as usize) else {
+                        malformed_event_count += 1;
                         continue;
                     };
-                    let Some(delta) = event.get("delta").and_then(Value::as_str) else { continue; };
+                    let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                        malformed_event_count += 1;
+                        continue;
+                    };
                     if !delta.is_empty() {
+                        text_bytes_total += delta.len();
+                        first_chunk_at.get_or_insert_with(std::time::Instant::now);
                         text_buffers.entry(output_index).or_default().push_str(delta);
                         yield Ok(StreamChunk::TextDelta { index: output_index, delta: delta.to_string() });
                     }
                 }
                 "response.reasoning_text.delta" => {
                     let Some(output_index) = event.get("output_index").and_then(Value::as_u64).map(|i| i as usize) else {
+                        malformed_event_count += 1;
                         continue;
                     };
-                    let Some(delta) = event.get("delta").and_then(Value::as_str) else { continue; };
+                    let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                        malformed_event_count += 1;
+                        continue;
+                    };
                     if !delta.is_empty() {
+                        reasoning_bytes_total += delta.len();
+                        first_chunk_at.get_or_insert_with(std::time::Instant::now);
                         reasoning_buffers.entry(output_index).or_default().push_str(delta);
                         yield Ok(StreamChunk::ReasoningDelta { index: output_index, delta: delta.to_string() });
                     }
                 }
                 "response.function_call_arguments.delta" => {
                     let Some(output_index) = event.get("output_index").and_then(Value::as_u64).map(|i| i as usize) else {
+                        malformed_event_count += 1;
                         continue;
                     };
-                    let Some(delta) = event.get("delta").and_then(Value::as_str) else { continue; };
+                    let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                        malformed_event_count += 1;
+                        continue;
+                    };
                     if let Some(tc) = tool_calls.get_mut(&output_index) {
                         normalize_tool_call_arguments(&mut tc.arguments, delta);
                     }
@@ -700,6 +800,7 @@ fn process_responses_sse_stream(
                 }
                 "response.output_item.done" => {
                     let Some(output_index) = event.get("output_index").and_then(Value::as_u64).map(|i| i as usize) else {
+                        malformed_event_count += 1;
                         continue;
                     };
                     let item = event.get("item");
@@ -778,14 +879,38 @@ fn process_responses_sse_stream(
                         .to_string();
                     tracing::warn!(
                         target: "model_provider::responses",
+                        request_id = %request_id,
+                        model = %model,
                         %body,
+                        event_count,
+                        text_bytes = text_bytes_total,
+                        reasoning_bytes = reasoning_bytes_total,
+                        tool_call_count,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
                         "responses API 返回 failed"
                     );
                     terminated_with_error = true;
                     yield Err(ProviderError::Api { status: 500, body });
                     break;
                 }
-                _ => {}
+                // 协议规定的生命周期/心跳事件：不携带任何内容，正常流上每请求都会出现。
+                // 必须显式忽略 —— 否则它们落到 `other` 臂，`unknown_event_count` 在每条
+                // 健康流上都非零，「未知事件」这个告警就永远抓不到真正的异常了。
+                "response.created"
+                | "response.in_progress"
+                | "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.done"
+                | "response.reasoning_text.done"
+                | "response.function_call_arguments.done" => {}
+                // 未知事件类型：DeepSeek 新增/改名事件时，现象是「流跑完但没内容」而
+                // 日志毫无线索 —— 累积后在终止摘要汇报。
+                other => {
+                    unknown_event_count += 1;
+                    if !unknown_event_types.contains(other) {
+                        unknown_event_types.insert(other.to_string());
+                    }
+                }
             }
         }
 
@@ -817,11 +942,46 @@ fn process_responses_sse_stream(
             }
         }
 
-        yield Ok(StreamChunk::Usage { usage: usage.unwrap_or_default() });
-        yield Ok(StreamChunk::Finish { reason: finish_reason.unwrap_or(FinishReason::Stop) });
+        let usage = usage.unwrap_or_default();
+        let reason = finish_reason.unwrap_or(FinishReason::Stop);
+
+        tracing::debug!(
+            target: "model_provider::responses",
+            request_id = %request_id,
+            model = %model,
+            event_count,
+            text_bytes = text_bytes_total,
+            reasoning_bytes = reasoning_bytes_total,
+            tool_call_count,
+            finish_reason = %reason.as_str(),
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            total_tokens = usage.total_tokens,
+            unknown_event_count,
+            unknown_item_count,
+            malformed_event_count,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            ttfc_ms = first_chunk_at
+                .map(|t| t.duration_since(started_at).as_millis() as u64)
+                .unwrap_or(0),
+            "responses SSE 流式处理结束"
+        );
+        // 去重后的类型集合可能较长，只在 trace 输出。
+        if !unknown_event_types.is_empty() || !unknown_item_types.is_empty() {
+            tracing::trace!(
+                target: "model_provider::responses",
+                request_id = %request_id,
+                unknown_event_types = ?unknown_event_types,
+                unknown_item_types = ?unknown_item_types,
+                "responses 流中出现未处理的事件/item 类型"
+            );
+        }
+
+        yield Ok(StreamChunk::Usage { usage });
+        yield Ok(StreamChunk::Finish { reason });
     };
 
-    GenerateStream::new(Box::pin(stream))
+    GenerateStream::new_instrumented(Box::pin(stream), span)
 }
 
 // ============================================================================
@@ -834,68 +994,154 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         "deepseek-responses"
     }
 
-    async fn generate_full(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
-        let body = build_responses_request_body(request, false)?;
+    async fn generate_full(
+        &self,
+        request: &GenerateRequest,
+    ) -> Result<GenerateResult, ProviderError> {
+        let request_id = logging::next_request_id();
         let endpoint = self.responses_endpoint();
+        let span = tracing::info_span!(
+            "deepseek_responses_generate_full",
+            provider = "deepseek-responses",
+            endpoint = %endpoint,
+            model = %request.model,
+            request_id = %request_id,
+        );
 
-        let response = self
-            .http_client
-            .post(&endpoint)
-            .header("Authorization", self.auth_header())
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await?;
+        async move {
+            let started = std::time::Instant::now();
+            let body = build_responses_request_body(request, false)?;
+            let input = logging::summarize_input(&request.input);
 
-        let status = response.status();
-        let response_body = response.bytes().await?;
-
-        if !status.is_success() {
-            let body_str = String::from_utf8_lossy(&response_body).to_string();
-            tracing::warn!(
+            tracing::debug!(
                 target: "model_provider::responses",
-                status = status.as_u16(),
-                body = %body_str,
-                "DeepSeek responses API 返回错误状态"
+                request_id = %request_id,
+                model = %request.model,
+                endpoint = %endpoint,
+                input_items = request.input.len(),
+                messages = input.messages,
+                function_calls = input.function_calls,
+                function_call_outputs = input.function_call_outputs,
+                reasoning_items = input.reasoning,
+                carry_reasoning = should_carry_reasoning(
+                    &request.input,
+                    !request.tools.is_empty(),
+                    reasoning_enabled(request),
+                ),
+                tools = request.tools.len(),
+                instructions_chars = request
+                    .instructions
+                    .as_deref()
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0),
+                body_bytes = body.len(),
+                stream = false,
+                "发送 responses 生成请求"
             );
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                body: body_str,
-            });
-        }
+            // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
+            tracing::trace!(
+                target: "model_provider::responses",
+                request_id = %request_id,
+                body = %String::from_utf8_lossy(&body),
+                "responses 请求体全文"
+            );
 
-        let api_response: ResponsesResponse = serde_json::from_slice(&response_body)?;
-        let response_status = responses_status_to_response_status(api_response.status.as_deref());
-        let output: Vec<ContentBlock> = api_response
-            .output
-            .iter()
-            .filter_map(response_item_to_block)
-            .collect();
-        let error = if response_status == ResponseStatus::Failed {
-            api_response
-                .error
-                .as_ref()
-                .map(responses_error_to_response_error)
-                .or_else(|| {
-                    Some(ResponseError {
-                        code: None,
-                        message: "responses API failed".to_string(),
+            let response = self
+                .http_client
+                .post(&endpoint)
+                .header("Authorization", self.auth_header())
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await?;
+
+            let status = response.status();
+            // 必须在 `bytes()` 消费响应之前读头。
+            let provider_request_id = logging::request_id_header(&response);
+            let response_body = response.bytes().await?;
+            let latency_ms = started.elapsed().as_millis() as u64;
+
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&response_body).to_string();
+                tracing::warn!(
+                    target: "model_provider::responses",
+                    request_id = %request_id,
+                    provider_request_id = provider_request_id.as_deref().unwrap_or("-"),
+                    status = status.as_u16(),
+                    latency_ms,
+                    body = %body_str,
+                    "DeepSeek responses API 返回错误状态"
+                );
+                return Err(ProviderError::Api {
+                    status: status.as_u16(),
+                    body: body_str,
+                });
+            }
+
+            tracing::trace!(
+                target: "model_provider::responses",
+                request_id = %request_id,
+                body = %String::from_utf8_lossy(&response_body),
+                "responses 响应体全文"
+            );
+
+            let api_response: ResponsesResponse = serde_json::from_slice(&response_body)?;
+            let response_status =
+                responses_status_to_response_status(api_response.status.as_deref());
+            let output: Vec<ContentBlock> = api_response
+                .output
+                .iter()
+                .filter_map(response_item_to_block)
+                .collect();
+            let error = if response_status == ResponseStatus::Failed {
+                api_response
+                    .error
+                    .as_ref()
+                    .map(responses_error_to_response_error)
+                    .or_else(|| {
+                        Some(ResponseError {
+                            code: None,
+                            message: "responses API failed".to_string(),
+                        })
                     })
-                })
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
-        Ok(GenerateResult {
-            id: api_response.id,
-            output,
-            usage: api_response
+            let usage = api_response
                 .usage
                 .map(responses_usage_to_usage)
-                .unwrap_or_default(),
-            status: response_status,
-            error,
-        })
+                .unwrap_or_default();
+
+            let blocks = logging::summarize_blocks(&output);
+            tracing::debug!(
+                target: "model_provider::responses",
+                request_id = %request_id,
+                provider_request_id = provider_request_id.as_deref().unwrap_or("-"),
+                latency_ms,
+                status = ?response_status,
+                // 上游 output item 数与映射后的块数不一致，说明有 item 被 `response_item_to_block` 丢弃
+                raw_items = api_response.output.len(),
+                blocks = output.len(),
+                text_blocks = blocks.text,
+                reasoning_blocks = blocks.reasoning,
+                tool_call_blocks = blocks.tool_calls,
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                total_tokens = usage.total_tokens,
+                "responses 生成完成"
+            );
+
+            Ok(GenerateResult {
+                id: api_response.id,
+                output,
+                usage,
+                status: response_status,
+                error,
+            })
+        }
+        .instrument(span)
+        .await
     }
 
     async fn generate_stream(
@@ -905,8 +1151,48 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         let body = build_responses_request_body(request, true)?;
         let endpoint = self.responses_endpoint();
         let model = request.model.clone();
+        let request_id = logging::next_request_id();
+        let input = logging::summarize_input(&request.input);
 
-        let span = tracing::info_span!("deepseek_responses_stream", model = %model);
+        tracing::debug!(
+            target: "model_provider::responses",
+            request_id = %request_id,
+            model = %model,
+            endpoint = %endpoint,
+            input_items = request.input.len(),
+            messages = input.messages,
+            function_calls = input.function_calls,
+            function_call_outputs = input.function_call_outputs,
+            reasoning_items = input.reasoning,
+            carry_reasoning = should_carry_reasoning(
+                &request.input,
+                !request.tools.is_empty(),
+                reasoning_enabled(request),
+            ),
+            tools = request.tools.len(),
+            instructions_chars = request
+                .instructions
+                .as_deref()
+                .map(|s| s.chars().count())
+                .unwrap_or(0),
+            body_bytes = body.len(),
+            stream = true,
+            "发送 responses 流式生成请求"
+        );
+        tracing::trace!(
+            target: "model_provider::responses",
+            request_id = %request_id,
+            body = %String::from_utf8_lossy(&body),
+            "responses 流式请求体全文"
+        );
+
+        let span = tracing::info_span!(
+            "deepseek_responses_stream",
+            provider = "deepseek-responses",
+            endpoint = %endpoint,
+            model = %model,
+            request_id = %request_id,
+        );
 
         let event_source = StreamingEventSource::new(
             self.http_client.clone(),
@@ -918,8 +1204,8 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         Ok(process_responses_sse_stream(
             event_source,
             span,
-            endpoint,
             model,
+            request_id,
         ))
     }
 }
