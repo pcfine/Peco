@@ -231,7 +231,7 @@ pub(crate) fn into_tool_call(pending: &PendingToolCall) -> Option<ToolCall> {
 }
 
 // ============================================================================
-// 中立 StreamChunk 流式管线（chat 适配器 stream_generate 用）
+// 中立 StreamChunk 流式管线（chat 适配器 generate_stream 用）
 // ============================================================================
 
 /// 文本块的固定 index（chat 适配器流式合成）。
@@ -266,7 +266,7 @@ fn finish_reason_to_finish(reason: Option<&str>) -> FinishReason {
 }
 
 /// 以中立 [`StreamChunk`] 为出口的 chat 适配器流式管线
-/// （供 `stream_generate` 使用）。
+/// （供 `generate_stream` 使用）。
 ///
 /// 关键差异：
 /// - 文本/推理增量在流结束时合成为完整的 `BlockEnd`（适配器生成的单调 index）。

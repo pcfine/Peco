@@ -9,8 +9,8 @@
 //!
 //! ## 示例演示内容
 //!
-//! 1. `DeepSeekResponsesAdapter` 的非流式 `generate()` 与流式 `stream_generate()`
-//! 2. chat 适配器 `DeepSeek` 的 `generate()`（复用 chat/completions）
+//! 1. `DeepSeekResponsesAdapter` 的非流式 `generate_full()` 与流式 `generate_stream()`
+//! 2. chat 适配器 `DeepSeek` 的 `generate_full()`（复用 chat/completions）
 //! 3. 用 `BlockAssembler` 折叠流式 `StreamChunk` 为有序 `Vec<ContentBlock>`
 
 #![allow(unused_crate_dependencies)]
@@ -59,14 +59,14 @@ fn print_blocks(label: &str, blocks: &[ContentBlock]) {
     }
 }
 
-/// 非流式 `generate()`。
+/// 非流式 `generate_full()`。
 async fn run_generate(
     provider: &dyn ModelProvider,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Non-Streaming generate ===");
     let result = provider
-        .generate(&make_request(
+        .generate_full(&make_request(
             model,
             "What is 2 + 2? Answer in one sentence.",
         ))
@@ -76,14 +76,14 @@ async fn run_generate(
     Ok(())
 }
 
-/// 流式 `stream_generate()` + `BlockAssembler` 折叠。
+/// 流式 `generate_stream()` + `BlockAssembler` 折叠。
 async fn run_stream(
     provider: &dyn ModelProvider,
     model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Streaming generate ===");
     let mut stream = provider
-        .stream_generate(&make_request(model, "Count from 1 to 5."))
+        .generate_stream(&make_request(model, "Count from 1 to 5."))
         .await?;
 
     let mut assembler = BlockAssembler::new();

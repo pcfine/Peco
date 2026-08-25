@@ -541,7 +541,7 @@ impl ModelProvider for DeepSeek {
         "deepseek"
     }
 
-    async fn generate(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
+    async fn generate_full(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
         self.validate_generate_request(request)?;
 
         let body = build_request_body(request, false)?;
@@ -584,7 +584,7 @@ impl ModelProvider for DeepSeek {
         chat_response_to_generate_result(api_response)
     }
 
-    async fn stream_generate(
+    async fn generate_stream(
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateStream, ProviderError> {

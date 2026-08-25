@@ -1451,7 +1451,7 @@ impl AgentLooper {
             // ── Streaming 路径 ──
             match self
                 .agent
-                .stream_generate(session_messages, Some(effective_prompt))
+                .generate_stream(session_messages, Some(effective_prompt))
                 .await
             {
                 Ok(stream) => {

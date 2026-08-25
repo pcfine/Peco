@@ -1,4 +1,4 @@
-//! 使用 `model-provider` 的 DeepSeek 中立生成示例（v2 `generate`）。
+//! 使用 `model-provider` 的 DeepSeek 中立生成示例（v2 `generate_full`）。
 //!
 //! ## 运行方式
 //!
@@ -11,8 +11,8 @@
 //!
 //! 1. 从环境变量创建 `DeepSeek` 提供商
 //! 2. 构建包含系统指令和用户输入项的 `GenerateRequest`
-//! 3. 非流式 `generate()` 调用
-//! 4. 流式 `stream_generate()` 调用，逐条输出增量内容
+//! 3. 非流式 `generate_full()` 调用
+//! 4. 流式 `generate_stream()` 调用，逐条输出增量内容
 //! 5. 将提供商作为 `Box<dyn ModelProvider>` 传递
 
 #![allow(unused_crate_dependencies)]
@@ -83,15 +83,15 @@ async fn run_generate(provider: &dyn ModelProvider) -> Result<(), ProviderError>
         vec![],
     );
 
-    let result = provider.generate(&request).await?;
+    let result = provider.generate_full(&request).await?;
     print_blocks(&result);
     println!();
     Ok(())
 }
 
 /// 流式生成示例。
-async fn run_stream_generate(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
-    println!("=== Streaming stream_generate ===");
+async fn run_generate_stream(provider: &dyn ModelProvider) -> Result<(), ProviderError> {
+    println!("=== Streaming generate_stream ===");
 
     let request = request(
         "Write a haiku about Rust programming.",
@@ -99,7 +99,7 @@ async fn run_stream_generate(provider: &dyn ModelProvider) -> Result<(), Provide
         vec![],
     );
 
-    let mut stream: GenerateStream = provider.stream_generate(&request).await?;
+    let mut stream: GenerateStream = provider.generate_stream(&request).await?;
     let mut assembler = BlockAssembler::new();
     print!("Streaming: ");
 
@@ -155,7 +155,7 @@ async fn run_tool_generate(provider: &dyn ModelProvider) -> Result<(), ProviderE
         vec![weather_tool],
     );
 
-    let result = provider.generate(&request).await?;
+    let result = provider.generate_full(&request).await?;
     print_blocks(&result);
     println!();
     Ok(())
@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 运行示例
     run_generate(provider.as_ref()).await?;
-    run_stream_generate(provider.as_ref()).await?;
+    run_generate_stream(provider.as_ref()).await?;
     run_tool_generate(provider.as_ref()).await?;
 
     println!("所有示例执行完毕。");

@@ -90,7 +90,7 @@ impl MemoryAnalyzer {
         // 调用模型
         let response = self
             .model
-            .generate(&request)
+            .generate_full(&request)
             .await
             .map_err(|e| format!("Memory analysis LLM call failed: {e}"))?;
 

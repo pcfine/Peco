@@ -28,7 +28,7 @@ const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 // 客户端
 // ============================================================================
 
-/// DeepSeek Responses API 客户端，实现 [`ModelProvider`]（`generate`/`stream_generate`）。
+/// DeepSeek Responses API 客户端，实现 [`ModelProvider`]（`generate_full`/`generate_stream`）。
 ///
 /// 端点：`{base}/responses`。
 pub struct DeepSeekResponsesAdapter {
@@ -834,7 +834,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         "deepseek-responses"
     }
 
-    async fn generate(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
+    async fn generate_full(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError> {
         let body = build_responses_request_body(request, false)?;
         let endpoint = self.responses_endpoint();
 
@@ -898,7 +898,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         })
     }
 
-    async fn stream_generate(
+    async fn generate_stream(
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateStream, ProviderError> {

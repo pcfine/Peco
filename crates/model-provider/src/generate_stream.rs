@@ -13,7 +13,7 @@ pin_project! {
     /// 中立内容块流。
     ///
     /// 实现 [`futures::Stream`]，产出 [`StreamChunk`] 项。
-    /// 是 [`crate::ModelProvider::stream_generate`] 的返回类型，
+    /// 是 [`crate::ModelProvider::generate_stream`] 的返回类型，
     /// 引擎用 [`crate::BlockAssembler`] 折叠为 `Vec<ContentBlock>`。
     pub struct GenerateStream {
         #[pin]

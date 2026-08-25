@@ -34,7 +34,7 @@
 //!         additional_params: None,
 //!     };
 //!
-//!     let result = provider.generate(&request).await?;
+//!     let result = provider.generate_full(&request).await?;
 //!     println!("{:?}", result.status);
 //!     Ok(())
 //! }
@@ -65,7 +65,7 @@ pub use types::{ToolCall, ToolCallFunction, ToolDefinition, Usage};
 ///
 /// ```ignore
 /// let provider: Box<dyn ModelProvider> = Box::new(DeepSeek::from_env()?);
-/// let result = provider.generate(&request).await?;
+/// let result = provider.generate_full(&request).await?;
 /// ```
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
@@ -75,12 +75,12 @@ pub trait ModelProvider: Send + Sync {
     /// 发送中立非流式生成请求。
     ///
     /// 返回有序 [`ContentBlock`] 列表 + 状态 + 用量。
-    async fn generate(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError>;
+    async fn generate_full(&self, request: &GenerateRequest) -> Result<GenerateResult, ProviderError>;
 
     /// 发送中立流式生成请求。
     ///
     /// 返回一个 [`GenerateStream`]，产出 [`StreamChunk`]，由 [`BlockAssembler`] 折叠。
-    async fn stream_generate(
+    async fn generate_stream(
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateStream, ProviderError>;

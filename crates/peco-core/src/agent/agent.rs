@@ -321,25 +321,25 @@ impl Agent {
     ///
     /// 调用方提供历史 `input`（不含 system prompt）；system prompt 由
     /// `self.system_prompt()` 承载为 `instructions`。
-    pub(crate) async fn generate(
+    pub(crate) async fn generate_full(
         &self,
         input: Vec<Arc<InputItem>>,
     ) -> Result<GenerateResult, AgentError> {
         let tools = self.tool_executor.definitions();
         let instructions = Some(self.system_prompt());
         let request = self.build_generate_request(input, instructions, tools);
-        Ok(self.model.generate(&request).await?)
+        Ok(self.model.generate_full(&request).await?)
     }
 
     /// 发送流式生成请求。
-    pub(crate) async fn stream_generate(
+    pub(crate) async fn generate_stream(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
     ) -> Result<GenerateStream, AgentError> {
         let tools = self.tool_executor.definitions();
         let request = self.build_generate_request(input, instructions, tools);
-        Ok(self.model.stream_generate(&request).await?)
+        Ok(self.model.generate_stream(&request).await?)
     }
 
     /// 发送非流式生成请求，使用指定的 tool 定义。
@@ -353,7 +353,7 @@ impl Agent {
         tools: Vec<ToolDefinition>,
     ) -> Result<GenerateResult, AgentError> {
         let request = self.build_generate_request(input, instructions, tools);
-        Ok(self.model.generate(&request).await?)
+        Ok(self.model.generate_full(&request).await?)
     }
 }
 

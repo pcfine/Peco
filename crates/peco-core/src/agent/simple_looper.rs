@@ -170,7 +170,7 @@ impl SimpleAgentLooper {
                     .generate_with_tools(self.messages.clone(), instructions, tools)
                     .await?
             } else {
-                self.agent.generate(self.messages.clone()).await?
+                self.agent.generate_full(self.messages.clone()).await?
             };
 
             // Extract text + reasoning + tool calls from ordered output blocks.
