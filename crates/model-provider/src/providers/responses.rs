@@ -115,7 +115,8 @@ fn function_call_item(call_id: &str, name: &str, arguments: &str) -> Value {
 ///
 /// DeepSeek 在 thinking 模式下要求把上一轮产生的 `reasoning_text` 原样回传，
 /// 否则工具调用后的后续请求会返回 400。输入侧仅支持明文 `content`，
-/// `summary` / `encrypted_content` 不作为输入。
+/// `summary` / `encrypted_content` 不作为输入 —— 因此 [`response_item_to_block`]
+/// 只从输出的 `content` 取推理文本，保证这里拿到的一定是 `reasoning_text` 而非摘要。
 fn reasoning_item(content: &str) -> Value {
     serde_json::json!({
         "type": "reasoning",
@@ -132,91 +133,154 @@ fn function_call_output_item(call_id: &str, output: &str) -> Value {
     })
 }
 
+/// 冲刷一组工具调用：整组 `function_call` 连续输出，紧跟整组 `function_call_output`。
+///
+/// 组内**不得**插入任何其它元素（assistant 文本插在中间会被 API 判为
+/// “No tool output found”），组内 output 的顺序无所谓（可乱序）。
+/// 没有配对 output 的 call 必须丢弃 —— 留着会让整个请求以
+/// “No tool output found for tool call X” 失败，这类残缺组只出现在轮次被中断的异常历史里。
+fn flush_call_group(
+    out: &mut Vec<Value>,
+    calls: &mut Vec<(String, Value)>,
+    outputs: &mut Vec<(String, Value)>,
+) {
+    if calls.is_empty() {
+        outputs.clear();
+        return;
+    }
+    let matched: Vec<(String, Value)> = calls
+        .drain(..)
+        .filter(|(id, _)| outputs.iter().any(|(oid, _)| oid == id))
+        .collect();
+    let matched_ids: HashSet<&str> = matched.iter().map(|(id, _)| id.as_str()).collect();
+
+    for (_, call_value) in &matched {
+        out.push(call_value.clone());
+    }
+    for (id, output_value) in outputs.drain(..) {
+        if matched_ids.contains(id.as_str()) {
+            out.push(output_value);
+        }
+    }
+}
+
+/// 冲刷暂存的 assistant 文本。
+fn flush_text(out: &mut Vec<Value>, pending: &mut Option<String>) {
+    if let Some(text) = pending.take()
+        && !text.is_empty()
+    {
+        out.push(message_item(Role::Assistant, &text));
+    }
+}
+
 /// 将有序 [`InputItem`] 列表合并为 Responses `input[]` 元素。
 ///
-/// 与 chat 适配器的 `input_items_to_wire_messages` 对称：
-/// - 合并相邻的 assistant 文本（避免同一轮被拆成多个 message 元素）；
-/// - 保证 `function_call` 与其 `function_call_output` 相邻配对（按 `call_id` 匹配，
-///   可容忍并发工具输出乱序；若调用后紧跟文本则把文本后置到输出之后）。
+/// 与 chat 适配器的 `input_items_to_wire_messages` 对称，但排布必须额外满足 DeepSeek
+/// thinking 模式的回放约束（以下均为对 `/responses` 实测得出）：
 ///
-/// `Reasoning` 是否回传由 `carry_reasoning` 决定。判据是「请求是否携带 tools 且 reasoning
-/// 已启用」，而非「某轮是否真的调用了工具」——只要携带 tools 且 reasoning 启用，即使某轮
-/// 没调工具其 reasoning 也必须保留；reasoning 显式关闭时不回传，避免与关闭态自相矛盾。
+/// 1. **按迭代分组，不逐对配对**：模型一次迭代产出「reasoning →（可选文本）→ 若干
+///    function_call」，工具结果随后到达。回放必须保持这个分组 ——
+///    `call_a, out_a, call_b, out_b` 这种逐对交错会让 `call_b` 前面没有 reasoning，
+///    API 报 “The `reasoning_text` in the thinking mode must be passed back”。
+///    正确形状是 `reasoning, call_a, call_b, out_a, out_b`。
+/// 2. 组内 output 可乱序，但组内不能插入其它元素（见 [`flush_call_group`]）。
+/// 3. assistant 文本放在 reasoning 与 call 组**之间**是允许的；夹在 call 组和 output
+///    组之间则不允许 —— 所以组开启期间到达的文本一律推迟到整组冲刷之后。
+/// 4. **reasoning 必须是一段 assistant span 的第一个元素**（span = 一个 user 消息或一组
+///    output 之后、到下一个 user 消息之前的全部 assistant 产出）。assistant 文本排在
+///    reasoning 之前同样会触发 “reasoning_text … must be passed back”，即使该 reasoning
+///    确实在请求里。`SimpleAgentLooper` 为了迁就 chat 适配器的反向合并会把 Text 落在
+///    Reasoning 之前，而 `AgentLooper` 按模型输出顺序落库（Reasoning 在前）—— 本函数统一
+///    归位，因此对两种落库顺序都成立。
+///
+/// 相邻 assistant 文本会合并，避免同一轮被拆成多个 message 元素。
+/// `Reasoning` 是否回传由 `carry_reasoning` 决定，判据见 [`should_carry_reasoning`]。
 fn input_items_to_responses_values(items: &[Arc<InputItem>], carry_reasoning: bool) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
 
-    // 尚未收到对应 output 的 function_call（按出现顺序，值用于最终成对输出）。
-    let mut open_calls: Vec<(String, Value)> = Vec::new();
-    // 在存在未闭合 function_call 时暂存的 assistant 文本（后置到 output 之后）。
+    // 当前工具调用组：本次迭代的全部 function_call 及其 output（按出现顺序）。
+    let mut calls: Vec<(String, Value)> = Vec::new();
+    let mut outputs: Vec<(String, Value)> = Vec::new();
+    // 暂存的 assistant 文本；组开启期间到达的文本推迟到组冲刷之后再输出。
     let mut pending_text: Option<String> = None;
-
-    fn flush_text(out: &mut Vec<Value>, pending: &mut Option<String>) {
-        if let Some(text) = pending.take()
-            && !text.is_empty()
-        {
-            out.push(message_item(Role::Assistant, &text));
-        }
-    }
 
     for item in items {
         match &**item {
             InputItem::Reasoning { content } => {
-                // 仅当请求携带 tools 时才回传；不带 tools 的 span 其 reasoning
-                // 会被 API 忽略，直接丢弃以省上下文。
+                // 不回传时直接丢弃：这类 reasoning 会被 API 忽略，留着只占上下文。
                 if carry_reasoning {
-                    // 先冲刷暂存的 assistant 文本，保持与输入一致的时间顺序。
-                    flush_text(&mut out, &mut pending_text);
+                    // reasoning 标志着新一轮迭代开始，先收束上一组。
+                    flush_call_group(&mut out, &mut calls, &mut outputs);
+                    // reasoning 必须排在暂存文本**之前**（约束 4）：先 push reasoning
+                    // 再冲刷文本，把 assistant 文本归位到 reasoning 之后。
                     out.push(reasoning_item(content));
+                    flush_text(&mut out, &mut pending_text);
                 }
             }
             InputItem::Message { role, content } => match role {
                 Role::System | Role::Developer | Role::User => {
+                    flush_call_group(&mut out, &mut calls, &mut outputs);
                     flush_text(&mut out, &mut pending_text);
                     out.push(message_item(*role, content));
                 }
-                Role::Assistant => {
-                    // 有未闭合 function_call 时不立即输出，避免拆散 call→output 配对。
-                    if open_calls.is_empty() {
-                        flush_text(&mut out, &mut pending_text);
-                    }
-                    match &mut pending_text {
-                        Some(existing) => existing.push_str(content),
-                        None => pending_text = Some(content.clone()),
-                    }
-                }
+                // 仅累积，实际输出时机由下面各分支的 flush_text 决定（相邻文本自然合并）。
+                Role::Assistant => match &mut pending_text {
+                    Some(existing) => existing.push_str(content),
+                    None => pending_text = Some(content.clone()),
+                },
             },
             InputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
             } => {
-                flush_text(&mut out, &mut pending_text);
-                open_calls.push((
+                // 已经收到过 output 却又来新 call —— 说明上一组已结束，先收束。
+                if !outputs.is_empty() {
+                    flush_call_group(&mut out, &mut calls, &mut outputs);
+                }
+                // 组尚未开启时，先把文本放到组前面（约束 3 允许的位置）。
+                if calls.is_empty() {
+                    flush_text(&mut out, &mut pending_text);
+                }
+                calls.push((
                     call_id.clone(),
                     function_call_item(call_id, name, arguments),
                 ));
             }
             InputItem::FunctionCallOutput { call_id, output } => {
-                // 找到匹配的 function_call 并与之相邻输出。
-                if let Some(pos) = open_calls.iter().position(|(id, _)| id == call_id) {
-                    let (_, call_value) = open_calls.remove(pos);
-                    out.push(call_value);
-                }
-                out.push(function_call_output_item(call_id, output));
-                if open_calls.is_empty() {
-                    flush_text(&mut out, &mut pending_text);
-                }
+                outputs.push((call_id.clone(), function_call_output_item(call_id, output)));
             }
         }
     }
 
-    // 收尾：未配对 function_call（异常历史）与残留 assistant 文本。
-    for (_, call_value) in open_calls.drain(..) {
-        out.push(call_value);
-    }
+    flush_call_group(&mut out, &mut calls, &mut outputs);
     flush_text(&mut out, &mut pending_text);
 
     out
+}
+
+/// 判定历史中的 `Reasoning` 是否需要回传。
+///
+/// 不变式：**只要 `function_call` 被回放，其前置 `reasoning` 就必须一并回放** —— DeepSeek
+/// thinking 模式下二者缺一，下一轮会返回 400。而 [`input_items_to_responses_values`] 回放
+/// `function_call` 是无条件的（历史里有就写进 `input[]`），所以判据不能只看本次请求是否携带
+/// tools：无工具的后续轮、子 Agent、轮次之间改配置，都会让 `tools` 为空而历史仍含工具调用 ——
+/// 那恰好就是漏传 reasoning 的场景。
+///
+/// 因此：携带 tools（本轮可能产生新的工具调用）**或**历史含工具调用（需成对回放）时回传；
+/// reasoning 显式关闭时一律不回传，避免与关闭态自相矛盾。
+fn should_carry_reasoning(
+    items: &[Arc<InputItem>],
+    has_tools: bool,
+    reasoning_enabled: bool,
+) -> bool {
+    if !reasoning_enabled {
+        return false;
+    }
+    has_tools
+        || items
+            .iter()
+            .any(|item| matches!(&**item, InputItem::FunctionCall { .. }))
 }
 
 fn reasoning_config_to_value(reasoning: Option<&ReasoningConfig>) -> Option<Value> {
@@ -263,11 +327,13 @@ fn build_responses_request_body(
     stream: bool,
 ) -> Result<Vec<u8>, ProviderError> {
     // reasoning 是否启用：未显式配置（None）按 provider 默认启用；否则看 enabled。
+    // 与下方 `reasoning_config_to_value` 共用同一约定 —— 该函数在「启用但未指定 effort」时
+    // 同样省略 `reasoning` 字段、交由 provider 默认，即「省略 == 启用」。两处解读必须同步，
+    // 否则回传判定会与请求体实际声明的推理开关脱节。
     let reasoning_enabled = request.reasoning.as_ref().is_none_or(|r| r.enabled);
-    let input = input_items_to_responses_values(
-        &request.input,
-        !request.tools.is_empty() && reasoning_enabled,
-    );
+    let carry_reasoning =
+        should_carry_reasoning(&request.input, !request.tools.is_empty(), reasoning_enabled);
+    let input = input_items_to_responses_values(&request.input, carry_reasoning);
 
     let mut body = serde_json::Map::new();
     body.insert("model".into(), serde_json::json!(request.model));
@@ -420,22 +486,17 @@ fn response_item_to_block(item: &Value) -> Option<ContentBlock> {
             }
         }
         "reasoning" => {
-            // `content`（完整推理）与 `summary`（摘要）可能并存；取完整推理，
-            // 缺失时回退 summary，避免二者拼接导致重复计数。
-            let extract = |key: &str| -> String {
-                let mut text = String::new();
-                if let Some(parts) = item.get(key).and_then(Value::as_array) {
-                    for part in parts {
-                        if let Some(t) = part.get("text").and_then(Value::as_str) {
-                            text.push_str(t);
-                        }
+            // `content`（完整推理）与 `summary`（摘要）可能并存，这里只取 `content`：
+            // 输入侧没有 `summary_text` 的对应形式（见 [`reasoning_item`]），把 summary
+            // 也收进 `ContentBlock::Reasoning` 会让它在下一轮被当作 `reasoning_text` 回传。
+            // summary-only 的 item 视为「无可回传推理」直接丢弃。
+            let mut text = String::new();
+            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                for part in parts {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        text.push_str(t);
                     }
                 }
-                text
-            };
-            let mut text = extract("content");
-            if text.is_empty() {
-                text = extract("summary");
             }
             if text.is_empty() {
                 None
@@ -967,8 +1028,79 @@ mod tests {
         ]);
         let body = build_responses_request_body(&request, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        // 未携带 tools 时，reasoning 会被 API 忽略，序列化时直接丢弃。
+        // 未携带 tools 且历史无工具调用时，reasoning 会被 API 忽略，序列化时直接丢弃。
         assert_eq!(json["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_request_body_keeps_reasoning_for_replayed_calls_without_tools() {
+        // 历史含 function_call 时其回放是无条件的，即便本轮 tools 为空
+        // （无工具的后续轮 / 子 Agent / 轮次间改配置），前置 reasoning 也必须一并回传，
+        // 否则 DeepSeek thinking 模式会对这次请求返回 400。
+        let mut request = make_request();
+        request.input = Arc::from([
+            Arc::new(InputItem::Reasoning {
+                content: "思考".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: "72F".to_string(),
+            }),
+        ]);
+        assert!(request.tools.is_empty());
+
+        let body = build_responses_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let types: Vec<&str> = json["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["reasoning", "function_call", "function_call_output"]
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_drops_reasoning_when_disabled() {
+        // reasoning 显式关闭时不回传，避免与关闭态自相矛盾 —— 即使历史含工具调用。
+        let mut request = make_request();
+        request.reasoning = Some(ReasoningConfig {
+            enabled: false,
+            effort: None,
+        });
+        request.input = Arc::from([
+            Arc::new(InputItem::Reasoning {
+                content: "思考".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: "72F".to_string(),
+            }),
+        ]);
+
+        let body = build_responses_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let types: Vec<&str> = json["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["function_call", "function_call_output"]);
+        assert_eq!(json["reasoning"], serde_json::json!({ "effort": "none" }));
     }
 
     #[test]
@@ -976,7 +1108,7 @@ mod tests {
         let output = serde_json::json!([
             {
                 "type": "reasoning",
-                "summary": [{ "type": "summary_text", "text": "思考中" }]
+                "content": [{ "type": "reasoning_text", "text": "思考中" }]
             },
             {
                 "type": "function_call",
@@ -1000,6 +1132,28 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::Reasoning { .. }));
         assert!(matches!(blocks[1], ContentBlock::ToolCall { .. }));
         assert!(matches!(blocks[2], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn test_reasoning_summary_only_is_dropped() {
+        // 输入侧没有 summary_text 形式，summary-only 的推理无法合法回传；
+        // 若收进 ContentBlock 只会在下一轮被误标为 reasoning_text。
+        let summary_only = serde_json::json!({
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "摘要" }]
+        });
+        assert!(response_item_to_block(&summary_only).is_none());
+
+        // content 与 summary 并存时只取 content，不拼接。
+        let both = serde_json::json!({
+            "type": "reasoning",
+            "content": [{ "type": "reasoning_text", "text": "完整推理" }],
+            "summary": [{ "type": "summary_text", "text": "摘要" }]
+        });
+        match response_item_to_block(&both) {
+            Some(ContentBlock::Reasoning { text }) => assert_eq!(text, "完整推理"),
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1114,20 +1268,207 @@ mod tests {
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
-        let types: Vec<&str> = values.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        // assistant 文本被归位到 reasoning 之后（约束 4），call 组与 output 组各自成块。
         assert_eq!(
-            types,
+            types_of(&values),
             vec![
                 "message",
-                "message",
                 "reasoning",
+                "message",
                 "function_call",
                 "function_call_output",
                 "message",
             ]
         );
+        assert_eq!(values[2]["content"][0]["text"], "让我查一下");
         assert_eq!(values[3]["call_id"], "c1");
         assert_eq!(values[4]["call_id"], "c1");
+    }
+
+    /// 提取 `input[]` 的 type 序列，便于断言排布。
+    fn types_of(values: &[Value]) -> Vec<&str> {
+        values.iter().map(|v| v["type"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn test_parallel_calls_stay_grouped() {
+        // 回归：单轮并行工具调用曾被逐对配对成 call_a, out_a, call_b, out_b，
+        // 使 call_b 前面没有 reasoning，DeepSeek thinking 模式报
+        // "The `reasoning_text` in the thinking mode must be passed back to the API."
+        // 正确排布是整组 call 紧跟整组 output。
+        let items = vec![
+            Arc::new(InputItem::Reasoning {
+                content: "同时查两个城市".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "a".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "b".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            // 并发执行下 output 可能乱序到达 —— API 允许组内乱序。
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "b".to_string(),
+                output: "Tokyo 20C".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "a".to_string(),
+                output: "Paris 18C".to_string(),
+            }),
+        ];
+        let values = input_items_to_responses_values(&items, true);
+        assert_eq!(
+            types_of(&values),
+            vec![
+                "reasoning",
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+            ]
+        );
+        assert_eq!(values[1]["call_id"], "a");
+        assert_eq!(values[2]["call_id"], "b");
+    }
+
+    #[test]
+    fn test_multi_iteration_groups_keep_own_reasoning() {
+        // 多轮 ReAct：每一组 call 前都必须有自己的 reasoning，组间不能粘连。
+        let items = vec![
+            Arc::new(InputItem::Reasoning {
+                content: "r1".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: "o1".to_string(),
+            }),
+            Arc::new(InputItem::Reasoning {
+                content: "r2".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c2".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c2".to_string(),
+                output: "o2".to_string(),
+            }),
+        ];
+        let values = input_items_to_responses_values(&items, true);
+        assert_eq!(
+            types_of(&values),
+            vec![
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "reasoning",
+                "function_call",
+                "function_call_output",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unpaired_call_is_dropped() {
+        // 组内每个 call 都必须有配对 output，否则 API 报
+        // "No tool output found for tool call X" —— 轮次被中断的残缺组直接丢弃。
+        let items = vec![
+            Arc::new(InputItem::Reasoning {
+                content: "r".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "done".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "interrupted".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "done".to_string(),
+                output: "ok".to_string(),
+            }),
+        ];
+        let values = input_items_to_responses_values(&items, true);
+        assert_eq!(
+            types_of(&values),
+            vec!["reasoning", "function_call", "function_call_output"]
+        );
+        assert_eq!(values[1]["call_id"], "done");
+    }
+
+    #[test]
+    fn test_reasoning_normalized_before_assistant_text() {
+        // 回归：SimpleAgentLooper（workflow 的 agent 步骤）把 Text 落在 Reasoning 之前，
+        // 而 API 要求 reasoning 必须是 assistant span 的第一个元素，否则报
+        // "The `reasoning_text` in the thinking mode must be passed back to the API."
+        // 编码器需把文本归位到 reasoning 之后。
+        let items = vec![
+            Arc::new(InputItem::Message {
+                role: Role::User,
+                content: "查天气".to_string(),
+            }),
+            // ↓ SimpleAgentLooper 的落库顺序：Text 在 Reasoning 之前
+            Arc::new(InputItem::Message {
+                role: Role::Assistant,
+                content: "我查一下".to_string(),
+            }),
+            Arc::new(InputItem::Reasoning {
+                content: "需要调用工具".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: "18C".to_string(),
+            }),
+        ];
+        let values = input_items_to_responses_values(&items, true);
+        assert_eq!(
+            types_of(&values),
+            vec![
+                "message",
+                "reasoning",
+                "message",
+                "function_call",
+                "function_call_output",
+            ]
+        );
+        assert_eq!(values[0]["role"], "user");
+        assert_eq!(values[2]["role"], "assistant");
+        assert_eq!(values[2]["content"][0]["text"], "我查一下");
+    }
+
+    #[test]
+    fn test_adjacent_assistant_text_is_merged() {
+        let items = vec![
+            Arc::new(InputItem::Message {
+                role: Role::Assistant,
+                content: "前半".to_string(),
+            }),
+            Arc::new(InputItem::Message {
+                role: Role::Assistant,
+                content: "后半".to_string(),
+            }),
+        ];
+        let values = input_items_to_responses_values(&items, true);
+        assert_eq!(types_of(&values), vec!["message"]);
+        assert_eq!(values[0]["content"][0]["text"], "前半后半");
     }
 
     #[test]

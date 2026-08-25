@@ -7,16 +7,26 @@
 //!
 //! ## 架构
 //!
+//! 六状态机，转移如下（`重试 →` 表示由 [`RetryPolicy`] 决定：允许则 `WaitingToRetry`，
+//! 耗尽则 `Closed`）：
+//!
 //! ```text
-//! Connecting ──(200 + text/event-stream)──▶ Open ──(message)──▶ Open
-//!      │                                      │
-//!      └──(可重试错误)──▶ WaitingToRetry ◀──(传输错误)
-//!                                          │
-//!                                          └──(延迟结束)──▶ Reconnecting
-//!                                                                    │
-//!                                                    (成功)──────────┘
-//!                                                    (重试耗尽)─────▶ Closed
+//! Connecting          收到响应              → ValidatingResponse
+//!                     连接失败              → 重试 →
+//! Reconnecting        收到响应              → ValidatingResponse
+//!                     连接失败              → 重试 →
+//! ValidatingResponse  200 + event-stream    → Open（产出 SseEvent::Open）
+//!                     非 200 / 内容类型不符  → Closed（产出 ProviderError）
+//! Open                收到 message          → Open（产出 SseEvent::Message）
+//!                     解析 / UTF-8 错误      → Open（跳过该事件）
+//!                     传输错误              → 重试 →
+//!                     流正常结束            → Closed
+//! WaitingToRetry      延迟结束              → Reconnecting
+//! Closed              —                     → 终止，不再产出任何事件
 //! ```
+//!
+//! 注意非 200 响应**不重试**：`ValidatingResponse` 读取错误体后直接进入 `Closed` 并产出
+//! [`ProviderError::Api`]。重试只针对连接失败与已建立连接后的传输错误。
 
 use std::{
     future::Future,
@@ -274,8 +284,14 @@ async fn read_error_body(response: reqwest::Response) -> String {
             Ok(chunk) => chunk,
             Err(e) => return format!("<failed to read error body: {e}>"),
         };
+        // 上限已读满却还收到后续块 —— 此时才真的有内容被丢弃。恰好读满上限的响应体
+        // 会在这之前自然结束循环，不会被误标为截断。
+        if bytes.len() >= MAX_BODY_BYTES {
+            truncated = true;
+            break;
+        }
         let remaining = MAX_BODY_BYTES - bytes.len();
-        if chunk.len() >= remaining {
+        if chunk.len() > remaining {
             bytes.extend_from_slice(&chunk[..remaining]);
             truncated = true;
             break;
@@ -341,7 +357,9 @@ pin_project! {
 pin_project! {
     /// 一个 SSE 事件源，在传输错误时自动重连并使用指数退避策略。
     ///
-    /// 包装 `reqwest::Client` 和请求组件，通过五状态机驱动连接生命周期。
+    /// 包装 `reqwest::Client` 和请求组件，通过六状态机驱动连接生命周期
+    /// （`Connecting` / `ValidatingResponse` / `Open` / `WaitingToRetry` /
+    /// `Reconnecting` / `Closed`，见模块级文档的状态图）。
     /// 重试行为由 [`RetryPolicy`] 泛型参数控制（默认为 [`ExponentialBackoff`]）。
     ///
     /// URL、请求体和认证头分别存储，以便每次重试时可以从头构建请求。
