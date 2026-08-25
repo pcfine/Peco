@@ -2,36 +2,30 @@
 // tools — peco-core's tool abstraction + concrete implementations
 // ============================================================================
 
-mod delete_agent;
+mod agent_tools;
 mod deps;
 mod fetch;
-mod knowledge;
-mod mcp_config_tools;
-mod mcp_test_tool;
-mod read_agent;
-mod save_agent;
+mod knowledge_tools;
+mod mcp_tools;
 mod shell;
-mod skill;
+mod skill_tools;
 mod sub_agent;
 mod tool_factory;
 mod tool_register;
 mod workspace_info;
 
-pub use delete_agent::DeleteAgent;
+pub use agent_tools::{DeleteAgent, ReadAgent, SaveAgent};
 pub use deps::{
     AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, SkillProvider, ToolDependencies,
 };
 pub use fetch::Fetch;
-pub use knowledge::{
+pub use knowledge_tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
-pub use mcp_config_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer};
-pub use mcp_test_tool::TestMcpConnection;
-pub use read_agent::ReadAgent;
-pub use save_agent::SaveAgent;
+pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
 pub use shell::ShellExec;
-pub use skill::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
+pub use skill_tools::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
 pub use tool_factory::{DefaultToolsExecutor, StringError};
 pub use tool_register::ToolRegister;
