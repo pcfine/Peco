@@ -15,13 +15,18 @@ use peco_derive::peco_tool;
     required = ["command"]
 )]
 pub async fn shell_exec(command: String, cwd: Option<String>) -> Result<String, ToolError> {
-    let mut cmd = std::process::Command::new("sh");
+    // 必须使用 tokio::process — std::process::Command::output() 是同步阻塞调用，
+    // 会占住一个 tokio worker 线程直到子进程退出。子 Agent 扇出场景下
+    // （RunParallelSubAgents → N 个 SimpleAgentLooper → 各自并发 shell）
+    // 足以耗尽 worker 池，导致 SSE 流与其他请求全部停摆。
+    let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(&command);
     if let Some(dir) = cwd.as_deref().filter(|d| !d.is_empty()) {
         cmd.current_dir(dir);
     }
     let output = cmd
         .output()
+        .await
         .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
 
     let mut result = String::new();
