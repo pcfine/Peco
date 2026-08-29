@@ -269,6 +269,7 @@ Workflow 支持 Shell、Agent 两种步骤类型（Llm、Tool 为 Phase 4 规划
 | 变量 | 必需 | 说明 |
 |------|------|------|
 | `DEEPSEEK_API_KEY` | ✓ | DeepSeek API 密钥 |
+| `DASHSCOPE_API_KEY` | - | 阿里云百炼 API 密钥（使用 `type = "qwen"` provider 时必需） |
 | `PECO_SERVER_HOST` | - | 服务监听地址（默认 `0.0.0.0`） |
 | `PECO_SERVER_PORT` | - | 服务端口（默认 `9227`） |
 | `PECO_JWT_SECRET` | - | JWT 签名密钥（三层降级：环境变量 → DB → 随机生成+持久化） |
@@ -293,9 +294,27 @@ model = "deepseek-v4-flash"
 temperature = 0.7
 max_tokens = 4096
 stream = true
+
+[providers.qwen]
+type = "qwen"
+api_key = "${DASHSCOPE_API_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[providers.qwen.default]
+model = "qwen3.7-plus"
+temperature = 0.7
+max_tokens = 4096
+stream = true
 ```
 
-Provider 类型定义支持 `deepseek`、`openai`、`anthropic`、`ollama`、`groq`（当前仅 DeepSeek 有完整实现）。配置文件位于 workspace 根目录，支持 `${ENV_VAR}` 语法引用环境变量。
+Provider 类型定义支持 `deepseek`、`qwen`、`openai`、`anthropic`、`ollama`、`groq`（当前 `deepseek` 与 `qwen` 有完整实现）。配置文件位于 workspace 根目录，支持 `${ENV_VAR}` 语法引用环境变量。
+
+**Qwen（阿里云百炼 DashScope OpenAI 兼容模式）**：
+
+- `api` 字段仅接受 `chat`（或省略）—— Qwen 兼容模式没有 `/responses` 端点。
+- `base_url` 可省略，默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`；国际（新加坡）key 需改为 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。
+- **地域绑定**：API Key 与 endpoint 的地域必须一致，混用会返回 `401 invalid_api_key`。
+- 思考开关为请求体顶层 `enable_thinking`（不支持 effort 力度）；流式请求不携带 tools（Qwen 限制），工具调用走非流式路径。
 
 ### API 文档
 

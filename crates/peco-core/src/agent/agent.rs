@@ -10,7 +10,8 @@ use crate::agent::agent_config::{
 use crate::agent::error::AgentError;
 use model_provider::{
     DeepSeek, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult, GenerateStream, InputItem,
-    ModelProvider, ReasoningConfig, ReasoningEffort, ToolChoice, ToolDefinition, Usage,
+    ModelProvider, QwenChatCompletionsAdapter, ReasoningConfig, ReasoningEffort, ToolChoice,
+    ToolDefinition, Usage,
 };
 
 use serde::{Deserialize, Serialize};
@@ -503,8 +504,135 @@ pub fn build_provider_with_user(
                 Ok(Arc::new(provider))
             }
         }
+        "qwen" => {
+            // Qwen 仅提供 OpenAI 兼容的 chat completions 端点，没有原生 /responses。
+            let api_mode = entry
+                .api
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            match api_mode {
+                Some(api) if api.eq_ignore_ascii_case("chat") => {}
+                Some(api) if api.eq_ignore_ascii_case("responses") => {
+                    return Err(AgentError::Config(format!(
+                        "provider '{provider_name}' has no '/responses' endpoint: \
+                         Qwen only supports chat completions (api = 'chat')"
+                    )));
+                }
+                Some(other) => {
+                    return Err(AgentError::Config(format!(
+                        "unsupported api mode '{other}' for provider '{provider_name}'. \
+                         Expected 'chat'"
+                    )));
+                }
+                None => {}
+            }
+
+            let mut provider = QwenChatCompletionsAdapter::new(api_key)?;
+            if let Some(ref url) = entry.base_url {
+                provider = provider.with_base_url(url.clone());
+            }
+            Ok(Arc::new(provider))
+        }
         other => Err(AgentError::Config(format!(
-            "unsupported provider type: '{other}'. Currently supported: deepseek"
+            "unsupported provider type: '{other}'. Currently supported: deepseek, qwen"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{McpConfig, ProviderEntry, ProvidersConfig};
+    use std::collections::HashMap;
+
+    /// 构造一个仅含指定 provider 条目的最小 UserConfig。
+    fn user_config(name: &str, entry: ProviderEntry) -> UserConfig {
+        let mut providers = HashMap::new();
+        providers.insert(name.to_string(), entry);
+        UserConfig {
+            providers: ProvidersConfig {
+                default_provider: name.to_string(),
+                providers,
+            },
+            mcp: McpConfig::empty(),
+        }
+    }
+
+    fn model_config(provider_name: &str) -> ModelConfig {
+        ModelConfig {
+            provider_name: Some(provider_name.to_string()),
+            model_name: None,
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn qwen_entry() -> ProviderEntry {
+        ProviderEntry {
+            provider_type: "qwen".to_string(),
+            api_key: Some("sk-test-qwen".to_string()),
+            base_url: None,
+            api: None,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn test_qwen_branch_builds_chat_adapter() {
+        let entry = qwen_entry();
+        let config = user_config("qwen", entry);
+        let provider =
+            build_provider_with_user(&model_config("qwen"), &config).expect("qwen must build");
+        assert_eq!(provider.name(), "qwen");
+    }
+
+    #[test]
+    fn test_qwen_branch_applies_base_url() {
+        let entry = ProviderEntry {
+            base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+            ..qwen_entry()
+        };
+        let config = user_config("qwen", entry);
+        let provider =
+            build_provider_with_user(&model_config("qwen"), &config).expect("qwen must build");
+        assert_eq!(provider.name(), "qwen");
+    }
+
+    #[test]
+    fn test_qwen_branch_rejects_responses_api() {
+        let entry = ProviderEntry {
+            api: Some("responses".to_string()),
+            ..qwen_entry()
+        };
+        let config = user_config("qwen", entry);
+        let err = build_provider_with_user(&model_config("qwen"), &config)
+            .err()
+            .expect("api = 'responses' must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("no '/responses'"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn test_unknown_provider_type_lists_supported() {
+        let entry = ProviderEntry {
+            provider_type: "openai".to_string(),
+            api_key: Some("sk-test".to_string()),
+            base_url: None,
+            api: None,
+            default: None,
+        };
+        let config = user_config("openai", entry);
+        let err = build_provider_with_user(&model_config("openai"), &config)
+            .err()
+            .expect("unknown provider type must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Currently supported: deepseek, qwen"),
+            "unexpected message: {msg}"
+        );
     }
 }
