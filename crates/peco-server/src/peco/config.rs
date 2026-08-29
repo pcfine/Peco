@@ -63,8 +63,8 @@ impl Default for PecoConfig {
     fn default() -> Self {
         Self {
             event_buffer: 256,
-            per_turn_timeout_secs: 300,
-            total_timeout_secs: 1800,
+            per_turn_timeout_secs: 7200,
+            total_timeout_secs: 7200,
             history_token_budget: 128_000,
             compaction_trigger_tokens: 256_000,
             compaction_keep_recent_tokens: 96_000,

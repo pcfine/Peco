@@ -399,8 +399,8 @@ pub async fn stream_chat(
 
         let config = LooperConfig {
             event_buffer: 256,
-            per_turn_timeout: Some(Duration::from_secs(300)),
-            total_timeout: Some(Duration::from_secs(1800)),
+            per_turn_timeout: Some(Duration::from_secs(7200)),
+            total_timeout: Some(Duration::from_secs(7200)),
             persist_on_failure: true,
             ..LooperConfig::default()
         };
