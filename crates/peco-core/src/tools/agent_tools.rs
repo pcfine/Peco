@@ -45,7 +45,7 @@ impl ToolDyn for ReadAgent {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "The agent name to read (e.g., '@coding-assistant')."
+                        "description": "The agent name to read (e.g., 'coding-assistant')."
                     }
                 },
                 "required": ["name"]
@@ -106,6 +106,9 @@ impl ToolDyn for SaveAgent {
                 The content must start with YAML frontmatter between '---' delimiters, \
                 followed by the system prompt in Markdown.\n\
                 \n\
+                Naming convention: names starting with '@' are reserved for built-in system \
+                agents (e.g., '@assistant'). Do NOT prefix user-created agents with '@'.\n\
+                \n\
                 Required frontmatter fields:\n\
                   agent.name: unique agent identifier\n\
                   agent.description: what this agent does\n\
@@ -113,13 +116,10 @@ impl ToolDyn for SaveAgent {
                 Optional fields: llm (provider, model, temperature, max_tokens, stream, \
                 reasoning_effort), tools, mcp, skills, knowledge_bases, max_turns (default 50).\n\
                 \n\
-                Available tool names: shell, fetch, show_workspace, read_agent, read_skill, \
-                list_skills, list_workflows, list_mcp_servers, list_knowledge_bases, \
-                search_knowledge, get_knowledge_base_docs, query_entity_facts, \
-                save_agent, delete_agent, save_skill, delete_skill, save_workflow, \
-                delete_workflow, save_mcp_server, delete_mcp_server, \
-                add_to_knowledge_base, add_facts_to_knowledge_base, sync_knowledge_base, \
-                delegate_sub_agent, run_parallel_sub_agents, execute_workflow.\n\
+                Before choosing the tools field, call the list_tools tool (if available in your \
+                toolset) to discover the tools valid in this environment and their descriptions. \
+                MCP server tools are configured separately via the mcp field \
+                (see list_mcp_servers).\n\
                 \n\
                 Example:\n\
                 ---\n\
@@ -180,12 +180,12 @@ impl ToolDyn for SaveAgent {
                 ))));
             }
 
-            // 安全边界：不能覆盖 @assistant 自身
-            if name == "@assistant" {
-                return Err(ToolError::ToolCallError(Box::new(StringError(
-                    "Cannot overwrite @assistant — it is the meta-agent managing this workspace."
-                        .into(),
-                ))));
+            // 安全边界：'@' 前缀为系统内置 Agent 保留 — 禁止新建，
+            if name.starts_with('@') {
+                return Err(ToolError::ToolCallError(Box::new(StringError(format!(
+                        "Invalid agent name '{name}' — names starting with '@' are reserved \
+                         for built-in system agents. User-created agents must not use the '@' prefix."
+                    )))));
             }
 
             self.agent_access

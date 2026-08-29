@@ -13,6 +13,7 @@ tools:
   - shell
   - fetch
   - show_workspace
+  - list_tools
   - read_agent
   - read_skill
   - list_skills

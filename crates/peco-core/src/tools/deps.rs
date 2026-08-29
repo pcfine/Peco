@@ -91,9 +91,9 @@ pub struct ToolDependencies {
     pub knowledge_access: Arc<dyn KnowledgeAccess>,
     /// 来自 agent.md `knowledge_bases` 的 KB 白名单。空 = 无权访问任何 KB。
     pub allowed_kbs: Vec<String>,
-    /// Workflow 支持（Phase 2 新增）。Optional 以保持向后兼容性。
+    /// Workflow 支持，Optional 以保持向后兼容性。
     pub workflow_access: Option<Arc<dyn WorkflowAccess>>,
-    /// MCP 配置管理支持。Optional 以保持向后兼容性。
+    /// MCP 配置管理支持，Optional 以保持向后兼容性。
     pub mcp_access: Option<Arc<dyn McpAccess>>,
     /// Workflow 持久化支持。Optional — None 时使用 NullWorkflowPersister。
     pub workflow_persister: Option<Arc<dyn WorkflowPersister>>,

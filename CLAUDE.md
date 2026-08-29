@@ -107,8 +107,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, PPA 记忆�
 - blanket impl `impl<T: Tool> ToolDyn for T` 桥接二者。
 - `ToolExecutor` trait：运行时接口 — `execute(name, args) -> Result<String, String>` + `definitions() -> Vec<ToolDefinition>`。
 - **DI 契约**（`deps.rs`）：定义 5 个窄 trait — `AgentAccess`、`SkillProvider`、`KnowledgeAccess`、`WorkflowAccess`、`McpAccess` — 以及聚合结构体 `ToolDependencies`。工具只依赖这些 trait，不直接依赖 `WorkSpace`。
-- **工具组装**（`tool_register.rs`）：`ToolRegister::build()` 根据 tool_names 和 `ToolDependencies` 一次性构建包含所有工具的 `ToolExecutor`。
-- 内置工具（26 个）：`shell`、`fetch`、`show_workspace`、`read_skill`、`list_skills`、`save_skill`、`delete_skill`、`delegate_sub_agent`、`run_parallel_sub_agents`、`save_agent`、`read_agent`、`delete_agent`、`execute_workflow`、`list_workflows`、`save_workflow`、`delete_workflow`、`list_mcp_servers`、`save_mcp_server`、`delete_mcp_server`、`search_knowledge`、`list_knowledge_bases`、`add_to_knowledge_base`、`sync_knowledge_base`、`get_knowledge_base_docs`、`add_facts_to_knowledge_base`、`query_entity_facts`。
+- **工具组装**（`tool_register.rs`）：`ToolRegister::build()` 根据 tool_names 和 `ToolDependencies` 一次性构建包含所有工具的 `ToolExecutor`。权威工具名清单为 `BUILTIN_TOOL_NAMES` 常量（由防漂移测试保障与 match arms 一致）；可选依赖（`workflow_access`/`mcp_access`）缺失时对应工具 warn + skip，不 panic。
+- 内置工具（28 个）：`shell`、`fetch`、`show_workspace`、`list_tools`、`read_skill`、`list_skills`、`save_skill`、`delete_skill`、`delegate_sub_agent`、`run_parallel_sub_agents`、`save_agent`、`read_agent`、`delete_agent`、`execute_workflow`、`list_workflows`、`save_workflow`、`delete_workflow`、`list_mcp_servers`、`save_mcp_server`、`delete_mcp_server`、`test_mcp_connection`、`search_knowledge`、`list_knowledge_bases`、`add_to_knowledge_base`、`sync_knowledge_base`、`get_knowledge_base_docs`、`add_facts_to_knowledge_base`、`query_entity_facts`。
 - KB 工具通过 `check_kb_access()` 执行 Agent 级别访问控制（基于 agent.md `knowledge_bases` 白名单）。
 - `#[peco_tool]` 宏（来自 `peco-derive`）：标注一个 async fn，生成实现 `Tool` 的零大小结构体、带有 `#[derive(Deserialize, JsonSchema)]` 的类型化 `Parameters` 结构体，以及 `static TOOL_NAME` 常量。
 - `DefaultToolsExecutor` 是标准实现：持有 `HashMap<String, Box<dyn ToolDyn>>` 并按名称分发。
