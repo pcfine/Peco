@@ -259,9 +259,21 @@ fn finish_reason_to_finish(reason: Option<&str>) -> FinishReason {
         Some("stop") => FinishReason::Stop,
         Some("tool_calls") => FinishReason::ToolCalls,
         Some("length") => FinishReason::MaxTokens,
-        Some("content_filter") => FinishReason::Error,
+        Some("content_filter") => {
+            tracing::warn!(
+                wire_finish_reason = reason.unwrap(),
+                "Provider finished with content_filter, mapped to Error"
+            );
+            FinishReason::Error
+        }
         None => FinishReason::Stop,
-        Some(_) => FinishReason::Error,
+        Some(other) => {
+            tracing::warn!(
+                wire_finish_reason = other,
+                "Unknown finish_reason from provider, mapped to Error"
+            );
+            FinishReason::Error
+        }
     }
 }
 

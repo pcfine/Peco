@@ -1691,6 +1691,12 @@ impl AgentLooper {
                     }
                     _ => "model response failed".to_string(),
                 });
+            error!(
+                turn,
+                status = ?response.status,
+                message = %msg,
+                "Batch model response ended with non-completed status"
+            );
             self.failure_reason = Some(TurnFailureReason::Other(msg));
             self.react_state = ReActState::Failed;
             return;
@@ -1856,6 +1862,14 @@ impl AgentLooper {
                 }
                 _ => "model response failed".to_string(),
             });
+            error!(
+                turn = self.session.turn_index(),
+                ?status,
+                message = %msg,
+                blocks = blocks.len(),
+                text_len = self.react_ctx.assistant_text.len(),
+                "Model stream ended with non-completed status"
+            );
             self.failure_reason = Some(TurnFailureReason::Other(msg));
             self.react_state = ReActState::Failed;
             return;
