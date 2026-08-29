@@ -8,7 +8,7 @@ use crate::tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, DefaultToolsExecutor, DelegateSubAgent,
     DeleteAgent, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs, ListKnowledgeBases,
     ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill, RunParallelSubAgents,
-    SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellExec, ShowWorkspace,
+    SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellTool, ShowWorkspace,
     SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolExecutor,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
@@ -28,7 +28,9 @@ impl ToolRegister {
             let tool: Option<Box<dyn ToolDyn>> =
                 match name.as_str() {
                     // ── 零依赖工具 ──────────────────────────
-                    "shell" => Some(Box::new(ShellExec)),
+                    // ShellTool 包装 ShellExec，工作空间根目录作为默认 cwd
+                    // （workspace_root 为 None 时行为与旧 ShellExec 逐字节一致）
+                    "shell" => Some(Box::new(ShellTool::new(deps.workspace_root.clone()))),
                     "fetch" => Some(Box::new(Fetch)),
 
                     // ── Workspace 概览（聚合所有 trait）───
@@ -38,6 +40,7 @@ impl ToolRegister {
                         deps.knowledge_access.clone(),
                         deps.workflow_access.clone(),
                         deps.mcp_access.clone(),
+                        deps.workspace_root.clone(),
                     ))),
 
                     // ── Skill 依赖 ──────────────────────────

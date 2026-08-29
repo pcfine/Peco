@@ -134,6 +134,16 @@ pub struct LooperConfig {
     pub total_timeout: Option<Duration>,
     /// Hook 链（按注册顺序调用）。
     pub hooks: Vec<Arc<dyn LooperHook>>,
+    /// 环境上下文：会话级恒定的运行环境描述（用户身份、工作空间路径、日期等）。
+    ///
+    /// 契约（引擎与宿主层共同维护）：
+    /// - 宿主层（peco-server / peco-cli）在构造 looper 时求值一次并传入；
+    ///   引擎将其与 system prompt 拼接为稳定前缀，构造时缓存，此后不再读取。
+    /// - 内容必须会话级恒定。此字段位于稳定前缀内，若随轮次变化，
+    ///   将静默击穿 provider 的前缀缓存。该约束无法由类型系统表达，
+    ///   以此文档契约为准。
+    /// - 永不持久化：环境块只存在于发往 LLM 的请求中，不写入 Session 历史。
+    pub environment: Option<String>,
     /// 动态上下文提供者。
     pub dynamic_context: Option<Arc<dyn DynamicContext>>,
     /// 上下文构建策略。
@@ -158,6 +168,7 @@ impl Default for LooperConfig {
             per_turn_timeout: Some(Duration::from_secs(180)),
             total_timeout: None,
             hooks: Vec::new(),
+            environment: None,
             dynamic_context: None,
             context_strategy: super::context::ContextStrategy::FullHistory,
             persist_on_failure: false,
@@ -174,6 +185,34 @@ impl std::fmt::Debug for LooperConfig {
             .field("total_timeout", &self.total_timeout)
             .field("hooks", &format_args!("{} hooks", self.hooks.len()))
             .finish()
+    }
+}
+
+// ============================================================================
+// Prompt 组装纯函数 — 提取为模块级函数以便在无 Agent 的情况下单测
+// ============================================================================
+
+/// 拼接稳定前缀：system prompt + 环境上下文。
+///
+/// 环境块为空串时视为 `None`——否则会追加尾随 `"\n\n"`，
+/// 破坏 `environment: None` 路径与旧行为的字节一致。
+fn compose_stable_prefix(system_prompt: &str, environment: Option<&str>) -> String {
+    match environment.filter(|e| !e.is_empty()) {
+        Some(env) => format!("{system_prompt}\n\n{env}"),
+        None => system_prompt.to_string(),
+    }
+}
+
+/// 拼接最终 instructions：稳定前缀 + 动态上下文。
+///
+/// 动态上下文拼在稳定前缀之后属于**过渡形态**：
+/// 它位于消息序列首条，一旦每轮变化会使其后的全部历史
+/// 失去前缀缓存命中。终态方案（动态块前置到本轮 user 消息，
+/// 不写入 Session）见 docs/design/agent-environment-context.md §4.4。
+fn compose_effective_prompt(stable_prefix: &str, dynamic_context: Option<&str>) -> String {
+    match dynamic_context {
+        Some(dyn_ctx) => format!("{stable_prefix}\n\n[Dynamic Context]\n{dyn_ctx}"),
+        None => stable_prefix.to_string(),
     }
 }
 
@@ -594,8 +633,10 @@ pub struct AgentLooper {
     agent: Arc<Agent>,
     max_turns: usize,
     config: LooperConfig,
-    /// 缓存 `agent.system_prompt()`，避免每次 turn 重新计算。
-    system_prompt: String,
+    /// 稳定前缀：`agent.system_prompt()` + `config.environment`，
+    /// 构造时计算一次并缓存，避免每次 turn 重新拼接。
+    /// 此后每轮仅在此基础上追加 dynamic context。
+    stable_prefix: String,
 
     /// 当前 turn 缓存的动态上下文字符串。
     /// 在 [`prepare_and_send_request`] 检测到新 query 时更新，
@@ -676,13 +717,15 @@ impl AgentLooper {
         persister: Arc<dyn crate::persistence::SessionPersister>,
     ) -> Self {
         let max_turns = agent.max_turns();
-        let system_prompt = agent.system_prompt();
+        // 在 config 被 move 进结构体之前求值稳定前缀
+        let stable_prefix =
+            compose_stable_prefix(&agent.system_prompt(), config.environment.as_deref());
 
         AgentLooper {
             agent,
             max_turns,
             config,
-            system_prompt,
+            stable_prefix,
             dynamic_context: None,
             session,
             outer_state: OuterState::Idle,
@@ -1421,12 +1464,8 @@ impl AgentLooper {
         }
 
         // ── 合并 system prompt → instructions ──────────────────────────
-        let effective_prompt = match &self.dynamic_context {
-            Some(dyn_ctx) => {
-                format!("{}\n\n[Dynamic Context]\n{}", self.system_prompt, dyn_ctx)
-            }
-            None => self.system_prompt.clone(),
-        };
+        let effective_prompt =
+            compose_effective_prompt(&self.stable_prefix, self.dynamic_context.as_deref());
 
         let ctx = super::context::build_context(
             &refs,
@@ -2071,6 +2110,49 @@ mod tests {
         assert_eq!(config.per_turn_timeout, Some(Duration::from_secs(180)));
         assert!(config.total_timeout.is_none());
         assert!(config.hooks.is_empty());
+        assert!(config.environment.is_none());
+    }
+
+    // ── prompt 组装纯函数 tests ────────────────────────────────────────
+
+    #[test]
+    fn test_compose_stable_prefix_none() {
+        assert_eq!(compose_stable_prefix("SYS", None), "SYS");
+    }
+
+    #[test]
+    fn test_compose_stable_prefix_some() {
+        assert_eq!(
+            compose_stable_prefix("SYS", Some("<environment>x</environment>")),
+            "SYS\n\n<environment>x</environment>"
+        );
+    }
+
+    #[test]
+    fn test_compose_stable_prefix_empty_env() {
+        // 空串必须等同 None——否则追加尾随 "\n\n" 破坏字节一致
+        assert_eq!(compose_stable_prefix("SYS", Some("")), "SYS");
+    }
+
+    #[test]
+    fn test_compose_effective_prompt_none() {
+        assert_eq!(compose_effective_prompt("PREFIX", None), "PREFIX");
+    }
+
+    #[test]
+    fn test_compose_effective_prompt_some() {
+        assert_eq!(
+            compose_effective_prompt("PREFIX", Some("ctx")),
+            "PREFIX\n\n[Dynamic Context]\nctx"
+        );
+    }
+
+    #[test]
+    fn test_compose_roundtrip_compat() {
+        // 与旧行为字节等价的回归锚：无 environment、无 dynamic context 时
+        // effective prompt == agent.system_prompt()
+        let stable = compose_stable_prefix("SYS", None);
+        assert_eq!(compose_effective_prompt(&stable, None), "SYS");
     }
 
     // ── ReActContext tests ─────────────────────────────────────────────

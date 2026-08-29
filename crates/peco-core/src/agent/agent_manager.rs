@@ -47,6 +47,9 @@ pub struct AgentMeta {
 /// 可直接作为 [`ToolDependencies`] 的组成部分。
 pub struct AgentManager {
     agents_dir: PathBuf,
+    /// 工作空间根目录（agents_dir 的父目录）。
+    /// 用于 shell 默认 cwd 与 show_workspace root（经 ToolDependencies 注入）。
+    workspace_root: PathBuf,
     user_id: String,
     user_config: UserConfig,
     /// MCP 配置的共享持有者（与 `user_config.mcp` 解耦，支持独立热重载）。
@@ -66,6 +69,9 @@ pub struct AgentManager {
 impl AgentManager {
     /// 创建新的 AgentManager。
     ///
+    /// `workspace_root` 由 `agents_dir` 派生（其父目录），
+    /// 保证"shell 默认 cwd / show_workspace root 指向 agents 所在的工作空间"这一不变量。
+    ///
     /// 创建后应调用 [`init`](Self::init) 扫描目录并缓存元数据。
     pub fn new(
         agents_dir: PathBuf,
@@ -75,8 +81,13 @@ impl AgentManager {
         skill_registry: Arc<SkillRegister>,
         knowledge_manager: Arc<KnowledgeManager>,
     ) -> Self {
+        let workspace_root = agents_dir
+            .parent()
+            .expect("agents_dir must live under the workspace root")
+            .to_path_buf();
         Self {
             agents_dir,
+            workspace_root,
             user_id,
             user_config,
             mcp_config: Arc::new(mcp_config),
@@ -238,6 +249,7 @@ impl AgentManager {
             workflow_access: self.workflow_access.read().unwrap().clone(),
             mcp_access: self.mcp_access.read().unwrap().clone(),
             workflow_persister: None,
+            workspace_root: Some(self.workspace_root.clone()),
         }
     }
 
@@ -255,6 +267,7 @@ impl AgentManager {
         ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
+                workspace_root: self.workspace_root.clone(),
                 user_id: self.user_id.clone(),
                 user_config: config,
                 skill_registry: self.skill_registry.clone(),
@@ -273,6 +286,7 @@ impl AgentManager {
             workflow_access,
             mcp_access,
             workflow_persister: None,
+            workspace_root: Some(self.workspace_root.clone()),
         }
     }
 
@@ -310,8 +324,8 @@ impl AgentManager {
 
     /// 重新加载 MCP 配置。仅影响后续新加载的 Agent；
     /// 已缓存的 Agent 实例保持原有 MCP 连接。
-    pub fn reload_mcp_config(&self, workspace_root: &Path, system_mcp: &McpConfig) -> usize {
-        self.mcp_config.reload(workspace_root, system_mcp)
+    pub fn reload_mcp_config(&self, system_mcp: &McpConfig) -> usize {
+        self.mcp_config.reload(&self.workspace_root, system_mcp)
     }
 
     /// 刷新单个 Agent 的缓存（Tier-2 失效 + Tier-1 元数据更新）。
@@ -468,6 +482,7 @@ impl KnowledgeAccess for AgentManager {
 /// 不刷新 AgentManager 缓存（这些路径下 Agent 总是从磁盘加载）。
 struct AmAgentAccess {
     agents_dir: PathBuf,
+    workspace_root: PathBuf,
     user_id: String,
     user_config: UserConfig,
     skill_registry: Arc<SkillRegister>,
@@ -489,6 +504,7 @@ impl AgentAccess for AmAgentAccess {
         let deps = ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
+                workspace_root: self.workspace_root.clone(),
                 user_id: self.user_id.clone(),
                 user_config: self.user_config.clone(),
                 skill_registry: self.skill_registry.clone(),
@@ -507,6 +523,7 @@ impl AgentAccess for AmAgentAccess {
             workflow_access: self.workflow_access.clone(),
             mcp_access: self.mcp_access.clone(),
             workflow_persister: None,
+            workspace_root: Some(self.workspace_root.clone()),
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;

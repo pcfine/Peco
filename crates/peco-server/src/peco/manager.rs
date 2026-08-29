@@ -19,6 +19,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 use super::config::PecoConfig;
+use super::environment::EnvironmentInfo;
 
 /// Peco 永续对话管理器。
 ///
@@ -71,6 +72,25 @@ impl PecoManager {
 
         // ── 4. 加载 @assistant Agent（从 WorkSpace 目录，非 DB）─────────
         let agent = state.workspace_manager.get_agent(user_id, "@assistant")?;
+
+        // ── 5. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
+        //
+        // PecoManager 在每次流连接时新建（handler 每请求调用），
+        // 因此这里求值即保证日期新鲜度——每次续接都以当天日期重建环境块。
+        // 求值失败的兜底是 user_id，不阻断对话。
+        // username 查询经 WorkspaceManager 进程内缓存，每用户仅首次命中 DB。
+        let username = resolve_username(
+            state.workspace_manager.username(user_id, &state.db).await,
+            user_id,
+        );
+        let env_info = EnvironmentInfo::new(
+            user_id,
+            &username,
+            ws.root().to_path_buf(),
+            &agent.config().agent.name,
+        );
+        let mut config = config;
+        config.environment = Some(env_info.render());
 
         tracing::info!(
             user_id = %user_id,
@@ -128,5 +148,38 @@ impl PecoManager {
         }
 
         Ok(())
+    }
+}
+
+/// 解析用于环境块展示的用户名：查询缺失 / 空串 / 全空白 → 回退 `user_id`。
+fn resolve_username(raw: Option<String>, user_id: &str) -> String {
+    match raw {
+        Some(name) if !name.trim().is_empty() => name,
+        _ => user_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_username_valid() {
+        assert_eq!(resolve_username(Some("alice".into()), "uid-1"), "alice");
+    }
+
+    #[test]
+    fn test_resolve_username_none() {
+        assert_eq!(resolve_username(None, "uid-1"), "uid-1");
+    }
+
+    #[test]
+    fn test_resolve_username_empty() {
+        assert_eq!(resolve_username(Some(String::new()), "uid-1"), "uid-1");
+    }
+
+    #[test]
+    fn test_resolve_username_whitespace() {
+        assert_eq!(resolve_username(Some("   ".into()), "uid-1"), "uid-1");
     }
 }

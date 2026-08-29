@@ -25,6 +25,9 @@ pub struct PecoConfig {
     pub max_history_messages: usize,
 
     // ── 以下为 PPA / 可观测性钩子预留 ──────────────────────
+    /// 环境上下文（恒定前缀）：用户身份、工作空间路径、日期平台等。
+    /// 由 `PecoManager` 在构造时经 `EnvironmentInfo::render()` 求值一次填入。
+    pub environment: Option<String>,
     /// 动态上下文（读路径）：每次用户 query 前自动检索并注入。
     /// 后续接入 PPA 时设为 `Some(Arc::new(PpaDynamicContext::new(...)))`。
     pub dynamic_context: Option<Arc<dyn DynamicContext>>,
@@ -40,6 +43,7 @@ impl Default for PecoConfig {
             per_turn_timeout_secs: 300,
             total_timeout_secs: 1800,
             max_history_messages: 10,
+            environment: None,
             dynamic_context: None,
             hooks: Vec::new(),
         }
@@ -54,6 +58,7 @@ impl PecoConfig {
             per_turn_timeout: Some(Duration::from_secs(self.per_turn_timeout_secs)),
             total_timeout: Some(Duration::from_secs(self.total_timeout_secs)),
             persist_on_failure: true,
+            environment: self.environment.clone(),
             dynamic_context: self.dynamic_context.clone(),
             hooks: self.hooks.clone(),
             message_filter: Some(message_filter),

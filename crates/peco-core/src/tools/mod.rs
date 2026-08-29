@@ -24,7 +24,7 @@ pub use knowledge_tools::{
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
-pub use shell::ShellExec;
+pub use shell::{ShellExec, ShellTool};
 pub use skill_tools::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
 pub use tool_factory::{DefaultToolsExecutor, StringError};

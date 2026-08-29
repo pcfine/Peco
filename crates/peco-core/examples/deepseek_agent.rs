@@ -173,6 +173,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
         workflow_access: None,
         mcp_access: None,
         workflow_persister: None,
+        workspace_root: None,
     };
 
     let agent = Arc::new(Agent::from_file(&agent_md, &user_config, &tool_deps)?);

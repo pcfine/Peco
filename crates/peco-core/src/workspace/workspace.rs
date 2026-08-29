@@ -168,7 +168,7 @@ impl WorkSpace {
     /// 仅影响后续新加载的 Agent；已缓存的 Agent 保持原有 MCP 连接。
     /// 注意：此方法不更新 [`config()`](Self::config) 返回值中的 MCP 配置。
     pub fn reload_mcp_config(&self, system_mcp: &McpConfig) -> usize {
-        self.agent_manager.reload_mcp_config(&self.root, system_mcp)
+        self.agent_manager.reload_mcp_config(system_mcp)
     }
 
     /// 原子替换整个 MCP 配置（校验 → 写盘 → 更新内存，在一次锁内完成）。

@@ -6,6 +6,7 @@
 // 预留 PPA 钩子注入点（DynamicContext + LooperHook），后续不经 handler 改动即可接入。
 
 pub mod config;
+pub mod environment;
 pub mod filter;
 pub mod handler;
 pub mod manager;

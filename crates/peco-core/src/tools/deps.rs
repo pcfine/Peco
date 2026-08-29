@@ -3,6 +3,7 @@
 // ============================================================================
 
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent::{Agent, AgentError};
@@ -96,6 +97,9 @@ pub struct ToolDependencies {
     pub mcp_access: Option<Arc<dyn McpAccess>>,
     /// Workflow 持久化支持。Optional — None 时使用 NullWorkflowPersister。
     pub workflow_persister: Option<Arc<dyn WorkflowPersister>>,
+    /// 工作空间根目录。用于 shell 工具的默认 cwd 与 show_workspace 的 root 输出。
+    /// Optional — None 时行为与历史版本逐字节一致（examples / 非 WorkSpace 路径）。
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl Clone for ToolDependencies {
@@ -108,6 +112,7 @@ impl Clone for ToolDependencies {
             workflow_access: self.workflow_access.clone(),
             mcp_access: self.mcp_access.clone(),
             workflow_persister: self.workflow_persister.clone(),
+            workspace_root: self.workspace_root.clone(),
         }
     }
 }

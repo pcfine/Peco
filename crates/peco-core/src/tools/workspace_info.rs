@@ -2,6 +2,7 @@
 // ShowWorkspace — 统一工作空间概览
 // ============================================================================
 
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -19,6 +20,9 @@ pub struct ShowWorkspace {
     knowledge_access: Arc<dyn KnowledgeAccess>,
     workflow_access: Option<Arc<dyn WorkflowAccess>>,
     mcp_access: Option<Arc<dyn McpAccess>>,
+    /// 工作空间根目录。None 时不输出 root 字段（与非 WorkSpace 路径
+    /// 的历史行为保持一致）。
+    workspace_root: Option<PathBuf>,
 }
 
 impl ShowWorkspace {
@@ -28,6 +32,7 @@ impl ShowWorkspace {
         knowledge_access: Arc<dyn KnowledgeAccess>,
         workflow_access: Option<Arc<dyn WorkflowAccess>>,
         mcp_access: Option<Arc<dyn McpAccess>>,
+        workspace_root: Option<PathBuf>,
     ) -> Self {
         Self {
             agent_access,
@@ -35,6 +40,7 @@ impl ShowWorkspace {
             knowledge_access,
             workflow_access,
             mcp_access,
+            workspace_root,
         }
     }
 }
@@ -70,6 +76,11 @@ impl ToolDyn for ShowWorkspace {
             let mut output = json!({
                 "workspace": {}
             });
+
+            // ── Root ─────────────────────────────────────────────────
+            if let Some(root) = &self.workspace_root {
+                output["workspace"]["root"] = json!(root.display().to_string());
+            }
 
             // ── Agents ──────────────────────────────────────────────
             let agent_names = self.agent_access.list_agent_names();

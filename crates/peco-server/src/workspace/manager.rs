@@ -114,6 +114,10 @@ pub struct WorkspaceManager {
     system_config: Arc<SystemConfig>,
     /// LRU: user_id → CacheEntry (WorkSpace + WatcherState)
     cache: RwLock<LruCache<String, CacheEntry>>,
+    /// username 缓存（user_id → 原始查询结果，None = 用户无 username）。
+    /// username 仅在注册时写入、无更新端点，故可长期缓存；
+    /// 瞬时 DB 错误不缓存，下次请求重试。
+    usernames: RwLock<HashMap<String, Option<String>>>,
 }
 
 impl WorkspaceManager {
@@ -124,7 +128,36 @@ impl WorkspaceManager {
             data_dir,
             system_config,
             cache: RwLock::new(LruCache::new(cap)),
+            usernames: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// 查询 username（带进程内缓存，避免每请求一次 DB 往返）。
+    ///
+    /// 返回 None 表示用户不存在或查询失败（瞬时错误不缓存，下次重试）。
+    /// 空白 username 由调用方（如 `resolve_username`）决定回退值。
+    pub async fn username(&self, user_id: &str, db: &SqlitePool) -> Option<String> {
+        if let Ok(cache) = self.usernames.read()
+            && let Some(cached) = cache.get(user_id)
+        {
+            return cached.clone();
+        }
+        let fetched =
+            match sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = ?")
+                .bind(user_id)
+                .fetch_optional(db)
+                .await
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(%user_id, error = %e, "Failed to fetch username");
+                    return None;
+                }
+            };
+        if let Ok(mut cache) = self.usernames.write() {
+            cache.insert(user_id.to_string(), fetched.clone());
+        }
+        fetched
     }
 
     // ── 获取 WorkSpace ──────────────────────────────────────────────────
