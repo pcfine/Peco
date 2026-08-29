@@ -107,6 +107,28 @@ export interface ContextCompactedData {
   conversation_id: string;
 }
 
+/** 单条压缩记录（时间线） */
+export interface CompactionRecord {
+  at: string;
+  evicted_turns: number;
+  tokens_before: number;
+  tokens_after: number;
+  summary_chars: number;
+}
+
+/** 上下文指标（GET /api/peco/session） */
+export interface ContextMetrics {
+  /** 压缩触发口径：pinned 摘要 + 全部 committed 轮（含 tool/reasoning）估算 token */
+  estimated_total_tokens: number;
+  /** Verbatim 预算口径：历史轮 viewable（User/Assistant 文本）估算 token */
+  estimated_view_tokens: number;
+  pinned_summary_tokens: number;
+  history_token_budget: number;
+  compaction_trigger_tokens: number;
+  compaction_count: number;
+  compactions: CompactionRecord[];
+}
+
 // Session snapshot (GET /api/conversations/:id/session)
 export interface SessionSnapshotResponse {
   conversation_id: string;
@@ -114,6 +136,8 @@ export interface SessionSnapshotResponse {
   total_usage: UsageData;
   /** 钉扎的历史摘要（compaction 产物，无压缩历史时缺省） */
   pinned_summary?: string;
+  /** 上下文指标（会话不存在时缺省） */
+  context_metrics?: ContextMetrics;
 }
 
 export interface TurnData {

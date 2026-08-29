@@ -3,10 +3,12 @@
 // ============================================================================
 
 pub mod agents;
+pub mod compaction_log;
 pub mod conversations;
 pub mod documents;
 pub mod knowledge_bases;
 pub mod messages;
+pub mod session_archive;
 pub mod sync;
 pub mod workflow_executions;
 pub mod workflow_schedules;
@@ -206,6 +208,67 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 006 skipped: color column already absent");
     }
 
+    // ── Migration 007: Peco 压缩日志表 ────────────────────────────────────
+    let has_compaction_log = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peco_compaction_log'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_compaction_log {
+        run_migration(
+            pool,
+            "007",
+            include_str!("migrations/007_peco_compaction_log.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 007 completed");
+    } else {
+        tracing::debug!("Migration 007 skipped: peco_compaction_log table already exists");
+    }
+
+    // ── Migration 008: Peco 会话归档表 ────────────────────────────────────
+    let has_session_archives = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peco_session_archives'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_session_archives {
+        run_migration(
+            pool,
+            "008",
+            include_str!("migrations/008_peco_session_archives.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 008 completed");
+    } else {
+        tracing::debug!("Migration 008 skipped: peco_session_archives table already exists");
+    }
+
+    Ok(())
+}
+
+/// 执行一段幂等迁移 SQL（按 `;` 拆分逐条执行，跳过空语句与纯注释）。
+async fn run_migration(
+    pool: &SqlitePool,
+    name: &str,
+    migration_sql: &str,
+) -> Result<(), sqlx::Error> {
+    tracing::info!("Running migration {name}");
+    for statement in migration_sql.split(';') {
+        let trimmed = statement.trim();
+        if trimmed.is_empty()
+            || trimmed
+                .lines()
+                .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+        {
+            continue;
+        }
+        sqlx::raw_sql(trimmed).execute(pool).await?;
+    }
     Ok(())
 }
 

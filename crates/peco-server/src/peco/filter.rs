@@ -70,45 +70,67 @@ impl MessageFilter for PecoContextFilter {
         }
 
         // ── 2. 历史轮整轮选择：从最新往回，校准 token 预算 ──────────
-        // 严格预算：超预算的历史轮一律裁掉 — 旧信息由 pinned 摘要承载，
-        // 不做「至少保留一轮」的降级例外。
-        let mut selected: Vec<Vec<AnnotatedMessage>> = Vec::new();
-        let mut budget = self.history_token_budget;
-        for (_, turn_msgs) in history_turns.iter().rev() {
-            // 轮内 view：仅 User / Assistant 文本（丢弃 tool 过程与 reasoning）
-            let view_tokens: usize = turn_msgs
-                .iter()
-                .filter(|am| is_history_viewable(&am.message))
-                .map(|am| estimate_item_tokens(&am.message))
-                .sum();
-            if view_tokens > budget {
-                break;
-            }
-            budget = budget.saturating_sub(view_tokens);
-            selected.push(
-                turn_msgs
-                    .iter()
-                    .filter(|am| is_history_viewable(&am.message))
-                    .cloned()
-                    .collect(),
-            );
-        }
+        // 选择算法与可观测性指标共用（见 select_history_turns），
+        // 保证「指标显示的 Verbatim 占用 = 模型实际收到的上下文」。
+        let history_msgs: Vec<Vec<AnnotatedMessage>> =
+            history_turns.into_iter().map(|(_, msgs)| msgs).collect();
+        let (selected, _) = select_history_turns(&history_msgs, self.history_token_budget);
 
         // ── 3. 组装：pinned 摘要 + 历史（旧→新）+ 当前轮 ────────────
         let mut result = Vec::new();
         result.extend(pinned);
-        for turn_msgs in selected.into_iter().rev() {
-            result.extend(turn_msgs);
+        for i in selected {
+            // 轮内 view：仅 User / Assistant 文本（丢弃 tool 过程与 reasoning）
+            result.extend(
+                history_msgs[i]
+                    .iter()
+                    .filter(|am| is_history_viewable(&am.message))
+                    .cloned(),
+            );
         }
         result.extend(current);
         result
     }
 }
 
+/// Verbatim 层历史轮选择 — [`PecoContextFilter`] 与可观测性指标
+/// （[`super::metrics`]）共用的唯一实现，防两处口径漂移。
+///
+/// 从最新轮往回整轮计入 viewable token，严格预算：超预算的历史轮一律裁掉，
+/// 且更早轮不再尝试（连续窗口）— 旧信息由 pinned 摘要承载，
+/// 不做「至少保留一轮」的降级例外。
+///
+/// * `history_turns` — 历史轮（旧→新），每轮为该轮全部消息
+///
+/// 返回 `(选中轮下标（旧→新），选中轮 viewable token 总和)`。
+pub(crate) fn select_history_turns(
+    history_turns: &[Vec<AnnotatedMessage>],
+    budget: usize,
+) -> (Vec<usize>, usize) {
+    let mut selected: Vec<usize> = Vec::new();
+    let mut remaining = budget;
+    for (i, turn_msgs) in history_turns.iter().enumerate().rev() {
+        let view_tokens: usize = turn_msgs
+            .iter()
+            .filter(|am| is_history_viewable(&am.message))
+            .map(|am| estimate_item_tokens(&am.message))
+            .sum();
+        if view_tokens > remaining {
+            break;
+        }
+        remaining -= view_tokens;
+        selected.push(i);
+    }
+    selected.reverse();
+    (selected, budget - remaining)
+}
+
 /// 历史轮中可进入上下文的条目：User / Assistant 纯文本。
 ///
 /// pinned 摘要（SystemInjection）已在切分阶段归入 pinned，不在此列。
-fn is_history_viewable(item: &InputItem) -> bool {
+/// pub(crate)：可观测性指标（[`super::metrics`]）以同一谓词计算
+/// Verbatim 层口径，防两处漂移。
+pub(crate) fn is_history_viewable(item: &InputItem) -> bool {
     matches!(
         item,
         InputItem::Message {

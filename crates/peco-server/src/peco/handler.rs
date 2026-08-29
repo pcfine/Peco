@@ -92,6 +92,36 @@ pub struct TurnData {
     pub messages: Vec<MessageData>,
 }
 
+/// 单条压缩记录（时间线条目）。
+#[derive(Debug, Serialize)]
+pub struct CompactionRecord {
+    /// 发生时间（SQLite datetime 字符串，UTC）。
+    pub at: String,
+    pub evicted_turns: usize,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    /// 压缩后摘要正文字符数（观测摘要质量漂移的长度曲线）。
+    pub summary_chars: usize,
+}
+
+/// 上下文指标（压缩与 Verbatim 预算的占用情况）。
+#[derive(Debug, Serialize)]
+pub struct ContextMetrics {
+    /// 压缩触发口径：pinned 摘要 + 全部 committed 轮（含 tool 输出与 reasoning）
+    /// 的估算 token。与 `compaction_trigger_tokens` 同口径可直接比较。
+    pub estimated_total_tokens: usize,
+    /// Verbatim 预算口径：历史轮中 viewable（User/Assistant 文本）条目的估算 token，
+    /// 从最新轮往回整轮计入。与 `history_token_budget` 同口径可直接比较。
+    pub estimated_view_tokens: usize,
+    pub pinned_summary_tokens: usize,
+    pub history_token_budget: usize,
+    pub compaction_trigger_tokens: usize,
+    /// 累计压缩次数。
+    pub compaction_count: usize,
+    /// 压缩时间线（时间正序）。
+    pub compactions: Vec<CompactionRecord>,
+}
+
 /// 会话快照响应。
 #[derive(Debug, Serialize)]
 pub struct SessionSnapshotResponse {
@@ -101,6 +131,9 @@ pub struct SessionSnapshotResponse {
     /// 钉扎的历史摘要（compaction 产物）。无压缩历史时缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_summary: Option<String>,
+    /// 上下文指标。会话不存在时缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_metrics: Option<ContextMetrics>,
 }
 
 // ── WatcherGuard ──────────────────────────────────────────────────────────
@@ -287,13 +320,13 @@ pub async fn get_session_snapshot(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to load session: {e}")))?;
 
-    let (turns, usage, pinned_summary) = match snapshot_opt {
+    let (turns, usage, pinned_summary, context_metrics) = match snapshot_opt {
         Some((snap, _meta)) => {
             let pinned_summary: Option<String> =
                 snap.pinned_summary
                     .as_ref()
                     .and_then(|am| match am.message.as_ref() {
-                        // 剥离定界标签 — 下发给前端的是纯正文（P3 hover 展示用）
+                        // 剥离定界标签 — 下发给前端的是纯正文（归档分隔条 hover 展示用）
                         InputItem::Message { content, .. } => {
                             Some(strip_summary_wrapper(content).to_string())
                         }
@@ -341,7 +374,38 @@ pub async fn get_session_snapshot(
                 input_tokens: snap.total_usage.input_tokens,
                 output_tokens: snap.total_usage.output_tokens,
             };
-            (turns, usage, pinned_summary)
+
+            // ── 上下文指标 ──────────────────────────────────────────────
+            // 预算阈值取默认配置 — GET /session 不构建 PecoManager（无模板
+            // 安装等重副作用），阈值实际为常量，口径注释见 PecoConfig。
+            let peco_config = super::config::PecoConfig::default();
+            let est =
+                super::metrics::estimate_session_context(&snap, peco_config.history_token_budget);
+            let compactions =
+                crate::db::compaction_log::list_by_conversation(&state.db, &user_id, &session_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| CompactionRecord {
+                        at: row.created_at,
+                        evicted_turns: row.evicted_turns as usize,
+                        tokens_before: row.tokens_before as usize,
+                        tokens_after: row.tokens_after as usize,
+                        summary_chars: row.summary_chars as usize,
+                    })
+                    .collect::<Vec<_>>();
+            let compaction_count = compactions.len();
+            let context_metrics = ContextMetrics {
+                estimated_total_tokens: est.total_tokens,
+                estimated_view_tokens: est.view_tokens,
+                pinned_summary_tokens: est.pinned_tokens,
+                history_token_budget: peco_config.history_token_budget,
+                compaction_trigger_tokens: peco_config.compaction_trigger_tokens,
+                compaction_count,
+                compactions,
+            };
+
+            (turns, usage, pinned_summary, Some(context_metrics))
         }
         None => (
             Vec::new(),
@@ -349,6 +413,7 @@ pub async fn get_session_snapshot(
                 input_tokens: 0,
                 output_tokens: 0,
             },
+            None,
             None,
         ),
     };
@@ -365,22 +430,105 @@ pub async fn get_session_snapshot(
         turns,
         total_usage: usage,
         pinned_summary,
+        context_metrics,
     }))
 }
 
 // ── Handler: DELETE /api/peco/session ───────────────────────────────────
 
+/// `DELETE /api/peco/session?archive=true|false` 的查询参数。
+#[derive(Debug, Deserialize)]
+pub struct ClearQuery {
+    /// 归档式清空（默认 true）：清空前先将会话全文导出存入
+    /// `peco_session_archives` 表，避免误删即永久丢失。
+    /// 显式传 `false` 跳过归档（隐私场景硬删除）。
+    #[serde(default = "default_archive")]
+    pub archive: bool,
+}
+
+fn default_archive() -> bool {
+    true
+}
+
 /// 清除 Peco 永续会话（重置对话）。
 ///
-/// 删除 session_snapshots 表中的持久化记录。
+/// 归档式（默认）：先将会话全文（含 pinned 摘要与用量元数据）导出为
+/// Markdown 存入 `peco_session_archives` 表，再删除快照 — 归档失败时
+/// 中止删除，快照保持不动，保证信息不丢失。
+/// 快照损坏 / 旧格式无法 load 时跳过归档但仍执行删除，保留用户重置能力。
+/// 压缩日志（`peco_compaction_log`）随会话一并清理。
 /// 下次对话将创建全新的 Session。
 pub async fn clear_session(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
+    Query(params): Query<ClearQuery>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
     let session_id = private_session_id(&user_id);
     let persister = SqliteSessionPersister::new(state.db.clone());
 
+    // ── 1. 清理压缩日志（先于快照删除 — 失败时快照未动，可安全重试）──────
+    // conversation_id 清空重置后复用，日志必须随会话生命周期回收，
+    // 否则新会话的指标被旧会话污染。
+    crate::db::compaction_log::delete_by_conversation(&state.db, &user_id, &session_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to clear compaction log: {e}")))?;
+
+    // ── 2. 加载快照（尽力而为）────────────────────────────────────────
+    // 损坏 / 旧格式快照不阻断清空 — 跳过归档、删除照常执行，保留用户重置能力
+    //（archive=false 的隐私硬删除尤其不能因 load 失败而失效）。
+    let mut load_failed = false;
+    let snapshot_opt = match persister.load(&session_id).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id,
+                session_id = %session_id,
+                error = %e,
+                "Peco session snapshot load failed; skipping archive but clearing anyway"
+            );
+            load_failed = true;
+            None
+        }
+    };
+
+    // ── 3. 归档（默认开启；失败则中止删除）────────────────────────────
+    if params.archive && !load_failed {
+        let snapshot = match snapshot_opt {
+            Some(ref snap) => snap,
+            None => {
+                tracing::info!(
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    "Peco session clear: nothing to archive or clear"
+                );
+                return Ok(Json(SuccessResponse {
+                    success: true,
+                    message: Some("Session already empty".to_string()),
+                }));
+            }
+        };
+
+        let md = crate::chat::handler::archive_markdown(
+            &snapshot_opt,
+            &session_id,
+            &chrono::Utc::now().to_rfc3339(),
+        );
+
+        crate::db::session_archive::insert(
+            &state.db,
+            &uuid::Uuid::new_v4().to_string(),
+            &user_id,
+            &session_id,
+            snapshot.0.committed_turns.len(),
+            snapshot.0.total_usage.input_tokens as u64,
+            snapshot.0.total_usage.output_tokens as u64,
+            &md,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to archive session before clear: {e}")))?;
+    }
+
+    // ── 2. 删除快照 ─────────────────────────────────────────────────────
     persister
         .delete(&session_id)
         .await
@@ -389,13 +537,78 @@ pub async fn clear_session(
     tracing::info!(
         user_id = %user_id,
         session_id = %session_id,
+        archived = params.archive,
         "Peco session cleared"
     );
 
     Ok(Json(SuccessResponse {
         success: true,
-        message: Some("Session cleared".to_string()),
+        message: Some(if params.archive {
+            "Session archived and cleared".to_string()
+        } else {
+            "Session cleared".to_string()
+        }),
     }))
+}
+
+// ── Handler: GET /api/peco/archives ─────────────────────────────────────
+
+/// 归档列表项。
+#[derive(Debug, Serialize)]
+pub struct SessionArchiveItem {
+    pub id: String,
+    pub conversation_id: String,
+    pub turn_count: usize,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub created_at: String,
+}
+
+/// 列出当前用户的会话归档。
+pub async fn list_archives(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SessionArchiveItem>>, ApiError> {
+    let rows = crate::db::session_archive::list_by_user(&state.db, &user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to list archives: {e}")))?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| SessionArchiveItem {
+                id: r.id,
+                conversation_id: r.conversation_id,
+                turn_count: r.turn_count as usize,
+                total_input_tokens: r.total_input_tokens as u64,
+                total_output_tokens: r.total_output_tokens as u64,
+                created_at: r.created_at,
+            })
+            .collect(),
+    ))
+}
+
+/// 下载一条归档（Markdown）。限定所属用户 — 防越权读取。
+pub async fn download_archive(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(archive_id): axum::extract::Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    let row = crate::db::session_archive::get(&state.db, &user_id, &archive_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to load archive: {e}")))?
+        .ok_or_else(|| ApiError::NotFound("archive not found".into()))?;
+
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", "text/markdown; charset=utf-8")
+        .header(
+            "Content-Disposition",
+            format!(
+                "attachment; filename=\"peco-archive-{}.md\"",
+                row.created_at
+            ),
+        )
+        .body(axum::body::Body::from(row.content_md))
+        .unwrap())
 }
 
 // ── Router ─────────────────────────────────────────────────────────────────
@@ -444,11 +657,15 @@ pub async fn export_session(
 /// 注册到 `/api/peco`：
 /// - `GET /stream` — SSE 流式对话
 /// - `GET /session` — 获取会话快照
-/// - `DELETE /session` — 清除会话
+/// - `DELETE /session` — 清除会话（默认先归档，`?archive=false` 硬删除）
 /// - `GET /session/export` — 导出会话
+/// - `GET /archives` — 归档列表
+/// - `GET /archives/:id` — 下载归档
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
         .route("/session", get(get_session_snapshot).delete(clear_session))
         .route("/session/export", get(export_session))
+        .route("/archives", get(list_archives))
+        .route("/archives/{id}", get(download_archive))
 }

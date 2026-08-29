@@ -51,10 +51,10 @@ pub struct PecoConfig {
     /// 由 `PecoManager` 在构造时经 `EnvironmentInfo::render()` 求值一次填入。
     pub environment: Option<String>,
     /// 动态上下文（读路径）：每次用户 query 前自动检索并注入。
-    /// P2 记忆体系装配为 `MemoryRecallContext`（见 `super::memory`）。
+    /// 记忆体系装配为 `MemoryRecallContext`（见 `super::memory`）。
     pub dynamic_context: Option<Arc<dyn DynamicContext>>,
     /// Looper 钩子（写路径）：每轮完成后触发记忆提取、token 用量记录等。
-    /// P2 记忆体系装配为 `MemoryExtractionHook`（见 `super::memory`）。
+    /// 记忆体系装配为 `MemoryExtractionHook`（见 `super::memory`）。
     /// 钩子按注册顺序执行，相互独立。
     pub hooks: Vec<Arc<dyn LooperHook>>,
 }
@@ -65,9 +65,9 @@ impl Default for PecoConfig {
             event_buffer: 256,
             per_turn_timeout_secs: 300,
             total_timeout_secs: 1800,
-            history_token_budget: 12_000,
-            compaction_trigger_tokens: 24_000,
-            compaction_keep_recent_tokens: 8_000,
+            history_token_budget: 128_000,
+            compaction_trigger_tokens: 256_000,
+            compaction_keep_recent_tokens: 96_000,
             summarizer_model: "deepseek-v4-flash".to_string(),
             memory: MemoryConfig::default(),
             compaction: None,

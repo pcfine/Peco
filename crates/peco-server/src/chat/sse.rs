@@ -4,7 +4,7 @@
 
 use axum::response::sse::Event;
 use model_provider::Usage;
-use peco_core::agent::{LooperEvent, TurnFailureReason, TurnOutcome};
+use peco_core::agent::{LooperEvent, TurnFailureReason, TurnOutcome, strip_summary_wrapper};
 use serde::Serialize;
 
 /// SSE 事件类型（发给前端）。
@@ -337,7 +337,8 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             ..
         } => Some(ChatSseEvent::ContextCompacted {
             evicted_turns,
-            summary,
+            // 与恢复路径（GET /session、归档）一致：剥掉内部定界标签再下发
+            summary: strip_summary_wrapper(&summary).to_owned(),
             conversation_id: cid,
         }),
 

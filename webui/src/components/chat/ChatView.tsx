@@ -42,6 +42,8 @@ export interface ChatMessage {
   isError?: boolean;
   /** 系统通知消息（如 SSE `context_compacted`），以居中分隔样式渲染 */
   isNotice?: boolean;
+  /** 归档摘要正文（notice 消息可选）— hover 分隔条时展示 */
+  summary?: string;
 }
 
 export interface ChatViewProps {
@@ -452,10 +454,20 @@ export function ChatView({
 function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.isNotice) {
     return (
-      <div className="flex items-center gap-3 py-1 text-xs text-muted-foreground">
+      <div className="group relative flex items-center gap-3 py-1 text-xs text-muted-foreground">
         <div className="bg-border h-px flex-1" />
         <span className="whitespace-nowrap">📦 {message.content}</span>
         <div className="bg-border h-px flex-1" />
+        {message.summary && (
+          // hover 归档分隔条展示摘要正文
+          <div
+            className="bg-popover text-popover-foreground border absolute top-full left-1/2 z-10 mt-2 hidden max-h-64 max-w-md -translate-x-1/2 overflow-auto rounded-md p-3 text-xs whitespace-pre-wrap shadow-md group-hover:block"
+            role="tooltip"
+          >
+            <p className="text-muted-foreground mb-2 font-medium">归档摘要</p>
+            {message.summary}
+          </div>
+        )}
       </div>
     );
   }
@@ -612,7 +624,7 @@ export function reduceStreamEvent(
     case "usage":
       return messages;
     case "context_compacted":
-      // 更早的对话已被归档为结构化摘要 — 以居中分隔线提示
+      // 更早的对话已被归档为结构化摘要 — 以居中分隔线提示（hover 可看摘要正文）
       return [
         ...messages,
         {
@@ -620,6 +632,7 @@ export function reduceStreamEvent(
           content: `更早的 ${event.data.evicted_turns} 轮对话已归档为摘要，仍在模型上下文中`,
           turnIndex: 0,
           isNotice: true,
+          summary: event.data.summary,
         },
       ];
     case "error":

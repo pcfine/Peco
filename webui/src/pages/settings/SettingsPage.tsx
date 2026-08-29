@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { ProviderSection } from "@/components/settings/ProviderSection";
+import { ContextMetricsCard } from "@/components/settings/ContextMetricsCard";
 import { useNavigate } from "react-router-dom";
 
 export function SettingsPage() {
@@ -54,6 +55,8 @@ export function SettingsPage() {
           <ProviderSection />
         </CardContent>
       </Card>
+
+      <ContextMetricsCard />
     </div>
   );
 }

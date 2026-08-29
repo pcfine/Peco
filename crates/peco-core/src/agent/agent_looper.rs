@@ -27,6 +27,8 @@ type SharedModelTask = Arc<tokio::sync::Mutex<Option<ModelTaskHandle>>>;
 use serde::{Deserialize, Serialize};
 
 use super::agent::{Agent, MessageFilter, ModelResponse};
+use super::compaction::CompactionOutcome;
+use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
@@ -715,6 +717,9 @@ pub struct AgentLooper {
     stream_assembler: BlockAssembler,
     /// 活跃的 tool 执行任务集（增量执行模式：Spawn → Poll → 完成）
     active_tool_tasks: Option<tokio::task::JoinSet<(usize, ToolCallResult)>>,
+    /// 最近一次请求的估算上下文 token（响应到达后与实际 usage 对照）。
+    /// 估算器单点在 [`super::context`]。
+    last_request_estimated_tokens: Option<usize>,
 }
 
 impl AgentLooper {
@@ -766,6 +771,7 @@ impl AgentLooper {
             active_stream: None,
             stream_assembler: BlockAssembler::new(),
             active_tool_tasks: None,
+            last_request_estimated_tokens: None,
         }
     }
 
@@ -957,6 +963,35 @@ impl AgentLooper {
     ) {
         for hook in hooks {
             hook.on_turn_complete(turn, failure, usage, session).await;
+        }
+    }
+
+    async fn invoke_on_context_compacted(
+        hooks: &[Arc<dyn LooperHook>],
+        outcome: &CompactionOutcome,
+    ) {
+        for hook in hooks {
+            hook.on_context_compacted(outcome).await;
+        }
+    }
+
+    /// 对照请求前的估算 token 与 API 返回的实际 input_tokens。
+    ///
+    /// 只在 debug 级别记录 — 数据用于长期观测估算器偏差，非运行时告警。
+    fn log_estimate_calibration(&mut self, turn: usize, actual_input_tokens: u32) {
+        if let Some(estimated) = self.last_request_estimated_tokens.take() {
+            let ratio = if actual_input_tokens > 0 {
+                estimated as f64 / actual_input_tokens as f64
+            } else {
+                0.0
+            };
+            debug!(
+                turn,
+                estimated,
+                actual = actual_input_tokens,
+                ratio = format!("{ratio:.2}"),
+                "Token estimate calibration (estimated / actual)"
+            );
         }
     }
 
@@ -1331,7 +1366,7 @@ impl AgentLooper {
                                 &self.event_speaker,
                                 LooperEvent::ContextCompacted {
                                     evicted_turns: outcome.evicted_turns,
-                                    summary: outcome.summary,
+                                    summary: outcome.summary.clone(),
                                     estimated_tokens_before: outcome.estimated_tokens_before,
                                     estimated_tokens_after: outcome.estimated_tokens_after,
                                 },
@@ -1352,6 +1387,9 @@ impl AgentLooper {
                             {
                                 error!(error = %e, "Failed to persist session after compaction");
                             }
+
+                            // 持久化完成后通知 hooks（纯观察，失败不致命）
+                            Self::invoke_on_context_compacted(&self.config.hooks, &outcome).await;
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -1553,6 +1591,16 @@ impl AgentLooper {
         // 4. 分支：根据 ModelConfig.stream 决定路径
         let use_stream = self.agent.model_config().stream.unwrap_or(false);
 
+        // 请求前估算 token — 响应到达后经 [`Self::log_estimate_calibration`]
+        // 与实际 usage 对照。
+        let estimated_request_tokens = estimate_str_tokens(&effective_prompt)
+            + session_messages
+                .iter()
+                .map(|m| estimate_item_tokens(m))
+                .sum::<usize>();
+        self.last_request_estimated_tokens = Some(estimated_request_tokens);
+        debug!(turn, estimated_request_tokens, "Request token estimate");
+
         if use_stream {
             // ── Streaming 路径 ──
             match self
@@ -1620,6 +1668,7 @@ impl AgentLooper {
 
         // 聚合 usage
         self.session.add_usage(response.usage.clone());
+        self.log_estimate_calibration(turn, response.usage.input_tokens);
 
         // 广播 usage 事件
         self.emit_event(LooperEvent::ModelUsage {
@@ -1762,6 +1811,7 @@ impl AgentLooper {
                             call_index: turn,
                             usage: usage.clone(),
                         });
+                        self.log_estimate_calibration(turn, usage.input_tokens);
                         self.session.add_usage(usage);
                     }
 

@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use futures::stream::Stream;
 use model_provider::InputItem;
-use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent};
+use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent, strip_summary_wrapper};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
 use serde::{Deserialize, Serialize};
@@ -802,6 +802,52 @@ pub(crate) fn snapshot_to_markdown(
     conv_id: &str,
 ) -> String {
     let mut md = format!("# 对话记录 — {conv_id}\n\n");
+    md.push_str(&conversation_turns_markdown(snapshot_opt));
+    md
+}
+
+/// 归档式清空（DELETE /api/peco/session）的归档 Markdown。
+///
+/// 轮次正文与 [`snapshot_to_markdown`] 共用唯一渲染源
+/// （[`conversation_turns_markdown`]），元数据在此一次写全 —
+/// 归档文档保持单个 H1，会话信息不重复出现。
+pub(crate) fn archive_markdown(
+    snapshot_opt: &Option<(
+        peco_core::session::SessionSnapshot,
+        peco_core::session::SessionMeta,
+    )>,
+    conv_id: &str,
+    archived_at: &str,
+) -> String {
+    let mut md = format!("# Peco 会话归档 — {conv_id}\n\n- 归档时间：{archived_at}\n");
+    if let Some((snap, _meta)) = snapshot_opt {
+        md.push_str(&format!(
+            "- 轮数：{}\n- 累计用量：{} input / {} output tokens\n",
+            snap.committed_turns.len(),
+            snap.total_usage.input_tokens,
+            snap.total_usage.output_tokens,
+        ));
+        if let Some(am) = &snap.pinned_summary
+            && let InputItem::Message { content, .. } = am.message.as_ref()
+        {
+            md.push_str("\n## 历史摘要（compaction 产物）\n\n");
+            md.push_str(strip_summary_wrapper(content));
+            md.push('\n');
+        }
+    }
+    md.push_str("\n---\n\n");
+    md.push_str(&conversation_turns_markdown(snapshot_opt));
+    md
+}
+
+/// 轮次正文渲染 — `/session/export` 与归档共用的唯一渲染源。
+fn conversation_turns_markdown(
+    snapshot_opt: &Option<(
+        peco_core::session::SessionSnapshot,
+        peco_core::session::SessionMeta,
+    )>,
+) -> String {
+    let mut md = String::new();
     if let Some((snap, _meta)) = snapshot_opt {
         for turn in &snap.committed_turns {
             let items: Vec<InputItem> = turn.iter().map(|am| (*am.message).clone()).collect();

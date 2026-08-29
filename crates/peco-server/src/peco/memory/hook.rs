@@ -356,7 +356,14 @@ mod tests {
         // 不应 panic、不应上抛（on_turn_complete 无返回值即编译期保证）
         hook.on_turn_complete(0, None, &Usage::default(), &session)
             .await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // spawn 的后台任务需要时间，轮询等待提取器被调用（固定 sleep 会 flaky）
+        for _ in 0..100 {
+            if analyzer.calls.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         let docs = km.list_documents("@private_memory", 0, 10).await.unwrap();
         assert!(docs.is_empty(), "提取失败时不得写入");

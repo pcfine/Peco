@@ -2,7 +2,7 @@
 // 记忆双路径配置
 // ============================================================================
 //
-// P2 记忆体系的参数集中处。写路径（MemoryExtractionHook）与读路径
+// 记忆双路径的参数集中处。写路径（MemoryExtractionHook）与读路径
 // （MemoryRecallContext）共享同一份 MemoryConfig，由 PecoManager 在
 // 构造期装配进 PecoConfig.hooks / .dynamic_context。
 

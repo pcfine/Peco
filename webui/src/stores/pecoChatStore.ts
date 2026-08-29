@@ -57,7 +57,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     try {
       const snap = await getPecoSession();
       const restored = snapshotToMessages(snap.turns);
-      // 有 pinned 摘要时在顶部渲染归档分隔线（摘要本身不直接展示）
+      // 有 pinned 摘要时在顶部渲染归档分隔线（hover 分隔条可看摘要正文）
       const messages: ChatMessage[] = snap.pinned_summary
         ? [
             {
@@ -65,6 +65,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
               content: "更早的对话已归档为摘要，仍在模型上下文中",
               turnIndex: 0,
               isNotice: true,
+              summary: snap.pinned_summary,
             },
             ...restored,
           ]

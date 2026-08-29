@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use model_provider::{GenerateResult, InputItem, ToolCall, Usage};
 
 use super::agent_looper::{OuterState, ReActState, TurnFailureReason};
+use super::compaction::CompactionOutcome;
 use crate::session::Session;
 
 // ============================================================================
@@ -139,6 +140,14 @@ pub trait LooperHook: Send + Sync {
         _session: &Session,
     ) {
     }
+
+    // ── 压缩阶段 ──────────────────────────────────────────────────────────
+
+    /// 上下文滚动压缩成功完成后调用（重新持久化之后、pending 续接之前）。
+    ///
+    /// 纯观察方法，返回值被忽略。实现方应自行保证失败不 panic、不阻塞 —
+    /// 与其他 hook 相同，panic 会导致 looper task 终止。
+    async fn on_context_compacted(&self, _outcome: &CompactionOutcome) {}
 
     // ── 状态机 ────────────────────────────────────────────────────────────
 

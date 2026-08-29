@@ -108,6 +108,16 @@ impl PecoManager {
             )));
         }
 
+        // ── 5.6 压缩日志钩子 ──────────────────────────────────────────────
+        //   每次滚动压缩成功后追加 peco_compaction_log 记录。
+        config
+            .hooks
+            .push(Arc::new(super::metrics::CompactionMetricsHook::new(
+                state.db.clone(),
+                user_id,
+                super::session::private_session_id(user_id),
+            )));
+
         // ── 6. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
         //
         // PecoManager 在每次流连接时新建（handler 每请求调用），
