@@ -3,6 +3,7 @@ pub(crate) mod agent;
 pub mod agent_config;
 pub(crate) mod agent_looper;
 pub(crate) mod agent_manager;
+pub mod compaction;
 pub(crate) mod context;
 pub(crate) mod dynamic_context;
 pub(crate) mod error;
@@ -21,6 +22,11 @@ pub use agent_looper::{
 };
 pub use agent_manager::AgentManager;
 pub use agent_manager::AgentMeta;
+pub use compaction::{
+    CompactionOutcome, CompactionPolicy, ModelSummarizer, SUMMARY_CLOSE, SUMMARY_OPEN,
+    TurnSummarizer, strip_summary_wrapper,
+};
+pub use context::{estimate_item_tokens, estimate_str_tokens};
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;
 pub use hooks::{HookAction, LooperHook, TokenBudgetHook, ToolAllowlistHook, ToolHookAction};

@@ -139,7 +139,7 @@ describe("toChatSseEvent", () => {
     expect(result!.event).toBe("usage");
   });
 
-  it("maps all 10 known event types", () => {
+  it("maps all 11 known event types", () => {
     const events = [
       "text_delta",
       "reasoning_delta",
@@ -150,6 +150,7 @@ describe("toChatSseEvent", () => {
       "agent_call_end",
       "done",
       "usage",
+      "context_compacted",
       "error",
     ];
     for (const evt of events) {
@@ -157,5 +158,17 @@ describe("toChatSseEvent", () => {
       expect(result, `Failed for event: ${evt}`).not.toBeNull();
       expect(result!.event).toBe(evt);
     }
+  });
+
+  it("maps context_compacted event with payload", () => {
+    const result = toChatSseEvent({
+      event: "context_compacted",
+      data: { evicted_turns: 3, summary: "...", conversation_id: "1" },
+    });
+    expect(result).not.toBeNull();
+    expect(result!.event).toBe("context_compacted");
+    expect(
+      (result!.data as unknown as { evicted_turns: number }).evicted_turns,
+    ).toBe(3);
   });
 });

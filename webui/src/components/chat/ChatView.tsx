@@ -40,6 +40,8 @@ export interface ChatMessage {
   callId?: string;
   /** 错误提示消息（来自 SSE `error` 事件），以警示样式渲染 */
   isError?: boolean;
+  /** 系统通知消息（如 SSE `context_compacted`），以居中分隔样式渲染 */
+  isNotice?: boolean;
 }
 
 export interface ChatViewProps {
@@ -448,6 +450,16 @@ export function ChatView({
 // ── ChatBubble ─────────────────────────────────────────────────────────────
 
 function ChatBubble({ message }: { message: ChatMessage }) {
+  if (message.isNotice) {
+    return (
+      <div className="flex items-center gap-3 py-1 text-xs text-muted-foreground">
+        <div className="bg-border h-px flex-1" />
+        <span className="whitespace-nowrap">📦 {message.content}</span>
+        <div className="bg-border h-px flex-1" />
+      </div>
+    );
+  }
+
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
@@ -599,6 +611,17 @@ export function reduceStreamEvent(
     case "done":
     case "usage":
       return messages;
+    case "context_compacted":
+      // 更早的对话已被归档为结构化摘要 — 以居中分隔线提示
+      return [
+        ...messages,
+        {
+          role: "assistant" as const,
+          content: `更早的 ${event.data.evicted_turns} 轮对话已归档为摘要，仍在模型上下文中`,
+          turnIndex: 0,
+          isNotice: true,
+        },
+      ];
     case "error":
       // 后端失败轮次（模型错误、超时、取消等）以警示气泡展示错误信息
       return [

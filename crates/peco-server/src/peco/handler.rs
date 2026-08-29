@@ -18,7 +18,7 @@ use axum::response::sse::{KeepAlive, Sse};
 use axum::routing::get;
 use futures::stream::Stream;
 use model_provider::InputItem;
-use peco_core::agent::AgentLooper;
+use peco_core::agent::{AgentLooper, strip_summary_wrapper};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ use crate::session_dto::group_input_items;
 use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
-use super::filter::PecoMessageFilter;
+use super::filter::PecoContextFilter;
 use super::manager::PecoManager;
 use super::session::{SESSION_TITLE, private_session_id};
 
@@ -98,6 +98,9 @@ pub struct SessionSnapshotResponse {
     pub conversation_id: String,
     pub turns: Vec<TurnData>,
     pub total_usage: UsageData,
+    /// 钉扎的历史摘要（compaction 产物）。无压缩历史时缺省。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_summary: Option<String>,
 }
 
 // ── WatcherGuard ──────────────────────────────────────────────────────────
@@ -208,9 +211,9 @@ pub async fn stream_chat(
         let persister: Arc<dyn SessionPersister> =
             Arc::new(SqliteSessionPersister::new(app_state.db.clone()));
 
-        // 构建 LooperConfig（从 PecoConfig + MessageFilter）
-        let looper_config = config.to_looper_config(Arc::new(PecoMessageFilter::new(
-            config.max_history_messages,
+        // 构建 LooperConfig（从 PecoConfig + 统一上下文过滤器）
+        let looper_config = config.to_looper_config(Arc::new(PecoContextFilter::new(
+            config.history_token_budget,
         )));
 
         let handle = AgentLooper::spawn(agent, session, looper_config, persister.clone());
@@ -284,8 +287,18 @@ pub async fn get_session_snapshot(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to load session: {e}")))?;
 
-    let (turns, usage) = match snapshot_opt {
+    let (turns, usage, pinned_summary) = match snapshot_opt {
         Some((snap, _meta)) => {
+            let pinned_summary: Option<String> =
+                snap.pinned_summary
+                    .as_ref()
+                    .and_then(|am| match am.message.as_ref() {
+                        // 剥离定界标签 — 下发给前端的是纯正文（P3 hover 展示用）
+                        InputItem::Message { content, .. } => {
+                            Some(strip_summary_wrapper(content).to_string())
+                        }
+                        _ => None,
+                    });
             let turns: Vec<TurnData> = snap
                 .committed_turns
                 .iter()
@@ -328,7 +341,7 @@ pub async fn get_session_snapshot(
                 input_tokens: snap.total_usage.input_tokens,
                 output_tokens: snap.total_usage.output_tokens,
             };
-            (turns, usage)
+            (turns, usage, pinned_summary)
         }
         None => (
             Vec::new(),
@@ -336,6 +349,7 @@ pub async fn get_session_snapshot(
                 input_tokens: 0,
                 output_tokens: 0,
             },
+            None,
         ),
     };
 
@@ -350,6 +364,7 @@ pub async fn get_session_snapshot(
         conversation_id: session_id,
         turns,
         total_usage: usage,
+        pinned_summary,
     }))
 }
 

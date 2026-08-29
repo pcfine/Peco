@@ -35,6 +35,7 @@ export type ChatSseEvent =
   | { event: "agent_call_end"; data: AgentCallEndData }
   | { event: "done"; data: DoneData }
   | { event: "usage"; data: UsageEventData }
+  | { event: "context_compacted"; data: ContextCompactedData }
   | { event: "error"; data: ErrorData };
 
 export interface TextDeltaData {
@@ -99,11 +100,20 @@ export interface ErrorData {
   conversation_id: string;
 }
 
+/** 上下文滚动压缩完成 — 更早的对话轮次已被结构化摘要替换 */
+export interface ContextCompactedData {
+  evicted_turns: number;
+  summary: string;
+  conversation_id: string;
+}
+
 // Session snapshot (GET /api/conversations/:id/session)
 export interface SessionSnapshotResponse {
   conversation_id: string;
   turns: TurnData[];
   total_usage: UsageData;
+  /** 钉扎的历史摘要（compaction 产物，无压缩历史时缺省） */
+  pinned_summary?: string;
 }
 
 export interface TurnData {

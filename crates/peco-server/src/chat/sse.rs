@@ -107,6 +107,17 @@ pub enum ChatSseEvent {
         output_tokens: u32,
         conversation_id: String,
     },
+
+    /// 上下文滚动压缩完成（Peco 永续会话）。
+    ///
+    /// 更早的对话轮次已被结构化摘要替换并物理驱逐，
+    /// 前端据此渲染「更早的对话已归档」分隔线。
+    #[serde(rename = "context_compacted")]
+    ContextCompacted {
+        evicted_turns: usize,
+        summary: String,
+        conversation_id: String,
+    },
 }
 
 /// Token 用量数据（精简版，供前端展示）。
@@ -140,6 +151,7 @@ impl ChatSseEvent {
             ChatSseEvent::Error { .. } => "error",
             ChatSseEvent::Done { .. } => "done",
             ChatSseEvent::Usage { .. } => "usage",
+            ChatSseEvent::ContextCompacted { .. } => "context_compacted",
         };
         Ok(Event::default().event(event_name).data(data))
     }
@@ -316,6 +328,16 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
         LooperEvent::ModelUsage { usage, .. } => Some(ChatSseEvent::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            conversation_id: cid,
+        }),
+
+        LooperEvent::ContextCompacted {
+            evicted_turns,
+            summary,
+            ..
+        } => Some(ChatSseEvent::ContextCompacted {
+            evicted_turns,
+            summary,
             conversation_id: cid,
         }),
 

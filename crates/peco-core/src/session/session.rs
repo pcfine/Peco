@@ -43,6 +43,11 @@ pub struct Session {
     staging: StagingBuffer,
     /// 排队中的用户输入
     pending: VecDeque<PendingInput>,
+    /// 钉扎在上下文最前的历史摘要（compaction 产物）。
+    ///
+    /// 不属于任何 committed turn；`all_message_refs()` 将其排在最前，
+    /// 使压缩摘要成为每次请求上下文的第一条历史消息。
+    pinned_summary: Option<AnnotatedMessage>,
 
     // ── 运行时状态 ──
     /// 状态机
@@ -74,6 +79,7 @@ impl Session {
             committed: CommittedBuffer::new(),
             staging: StagingBuffer::new(),
             pending: VecDeque::new(),
+            pinned_summary: None,
             state: SessionState::Idle,
             turn_index: 0,
             total_usage: Usage::default(),
@@ -98,6 +104,7 @@ impl Session {
             .committed_turns
             .iter()
             .flat_map(|turn| turn.iter())
+            .chain(snapshot.pinned_summary.iter())
             .map(|am| am.id.0)
             .max()
             .map(|m| m + 1)
@@ -112,6 +119,7 @@ impl Session {
             committed: CommittedBuffer::from_turns(snapshot.committed_turns),
             staging: StagingBuffer::new(), // ← 恒为空
             pending: snapshot.pending_inputs.into(),
+            pinned_summary: snapshot.pinned_summary,
             state: SessionState::Idle, // ← 恒为 Idle
             turn_index: snapshot.turn_index,
             total_usage: snapshot.total_usage,
@@ -178,11 +186,20 @@ impl Session {
 
     // ── 消息访问（&self，零拷贝引用）──────────────────────────────────
 
-    /// 返回全部 committed + staging 消息的引用迭代器。
+    /// 返回全部 pinned 摘要 + committed + staging 消息的引用迭代器。
     ///
-    /// 顺序：committed（按 turn 顺序）→ staging（user_input 在前，messages 在后）。
+    /// 顺序：pinned 摘要（若有，恒在最前）→ committed（按 turn 顺序）
+    /// → staging（user_input 在前，messages 在后）。
     pub fn all_message_refs(&self) -> impl Iterator<Item = &AnnotatedMessage> {
-        self.committed.iter_all().chain(self.staging.iter_all())
+        self.pinned_summary
+            .iter()
+            .chain(self.committed.iter_all())
+            .chain(self.staging.iter_all())
+    }
+
+    /// 返回钉扎的历史摘要（compaction 产物）。
+    pub fn pinned_summary(&self) -> Option<&AnnotatedMessage> {
+        self.pinned_summary.as_ref()
     }
 
     /// 返回 committed turns 的切片（不可变引用）。
@@ -316,10 +333,14 @@ impl Session {
     ///
     /// 仅在 Idle 状态可调用。返回被删除的 turn 数量。
     pub fn rollback_to_turn(&mut self, turn: usize) -> Result<usize, SessionError> {
-        if turn > self.turn_index {
+        // 截断按 committed 位置进行（`truncate_to`），守卫上界也必须是位置 —
+        // compaction 后 turn_index 计数器（历史累计轮数）大于 committed 轮数，
+        // 不能作为上界，否则会放行越界请求并制造新的计数器/位置错位。
+        let max = self.committed.len();
+        if turn > max {
             return Err(SessionError::TurnOutOfBounds {
                 requested: turn,
-                max: self.turn_index,
+                max,
             });
         }
 
@@ -332,6 +353,70 @@ impl Session {
         self.state = SessionState::Idle;
         self.touch();
         Ok(removed)
+    }
+
+    // ── 上下文压缩（compaction，仅 turn 边界可调用）──────────────────
+
+    /// 物理修剪最旧的 `evict_count` 轮，并以 `summary` 钉扎替代。
+    ///
+    /// 仅在 Idle 状态（turn 边界）可调用。被驱逐轮次的内容由调用方
+    /// （compaction 模块）先行组装为摘要并交给持久层之外的归档方；
+    /// 本方法只负责：
+    /// 1. 重编号剩余消息的 `turn_index`，闭合驱逐产生的空洞，使 committed 内
+    ///    `turn_index` 单调连续且从 0 起；
+    /// 2. 从 committed 最旧端驱逐；
+    /// 3. 将摘要写入 pinned_summary（Role::System + SystemInjection 来源）。
+    ///
+    /// **注意**：`turn_index` 字段（`Self::turn_index`）是"历史累计轮数"计数器，
+    /// 本方法**不回退**它 — 压缩后新增轮次的消息 `turn_index` 取计数器值，
+    /// 会大于其 committed 位置（差值 = 历史驱逐总数）。因此
+    /// `turn_index == committed 位置` 仅对压缩时的存量消息成立，
+    /// 消费方不得以消息 `turn_index` 索引 committed 位置（用 `get_turn` 时须以位置为准）。
+    ///
+    /// 始终保留至少最后一轮 verbatim — 单轮即超预算时不驱逐（返回 0）。
+    /// 返回实际驱逐的轮数。
+    pub fn compact(&mut self, evict_count: usize, summary: String) -> Result<usize, SessionError> {
+        if self.state != SessionState::Idle {
+            return Err(SessionError::InvalidStateTransition {
+                current_state: self.state,
+                action: "compact".to_string(),
+            });
+        }
+
+        // 至少保留最后一轮
+        let evict_count = evict_count.min(self.committed.len().saturating_sub(1));
+        if evict_count == 0 {
+            return Ok(0);
+        }
+
+        // 1. 物理驱逐
+        self.committed.evict_front(evict_count);
+
+        // 2. 重编号剩余消息，闭合驱逐产生的 turn_index 空洞
+        for turn in self.committed.turns_mut() {
+            for am in turn {
+                am.turn_index -= evict_count;
+            }
+        }
+
+        // 3. 钉扎摘要（替换旧摘要 — 递归摘要由调用方合并文本后传入）
+        let id = self.allocate_message_id();
+        self.pinned_summary = Some(AnnotatedMessage {
+            id,
+            turn_index: 0,
+            message: Arc::new(InputItem::Message {
+                role: Role::System,
+                content: summary,
+            }),
+            timestamp_ms: unix_timestamp_ms(),
+            estimated_tokens: None,
+            source: MessageSource::SystemInjection {
+                reason: "compaction".to_string(),
+            },
+        });
+
+        self.touch();
+        Ok(evict_count)
     }
 
     // ── Pending 队列（&mut self）──────────────────────────────────────
@@ -431,6 +516,7 @@ impl Session {
             total_usage: self.total_usage.clone(),
             next_message_id: self.next_message_id,
             pending_inputs: self.pending.iter().cloned().collect(),
+            pinned_summary: self.pinned_summary.clone(),
         }
     }
 
@@ -658,6 +744,102 @@ mod tests {
         assert_eq!(removed, 2);
         assert_eq!(s.committed_turns().len(), 1);
         assert_eq!(s.turn_index(), 1);
+    }
+
+    #[test]
+    fn test_compact_evicts_front_and_pins_summary() {
+        let mut s = make_session();
+
+        for i in 0..4 {
+            s.start_turn(format!("q{i}")).unwrap();
+            s.stage_item(MessageSource::ModelGeneration, assistant(format!("a{i}")))
+                .unwrap();
+            let _ = s.commit_turn().unwrap();
+        }
+
+        let evicted = s.compact(2, "summary of turns 0-1".to_string()).unwrap();
+        assert_eq!(evicted, 2);
+        assert_eq!(s.committed_turns().len(), 2);
+        assert_eq!(s.turn_index(), 4); // 计数不变（历史语义）
+
+        // 剩余消息 turn_index 重编号闭合空洞
+        let refs: Vec<_> = s.all_message_refs().collect();
+        assert_eq!(refs.len(), 5); // 1 pinned + 2 turns × 2 messages
+        assert!(matches!(
+            refs[0].message.as_ref(),
+            InputItem::Message {
+                role: Role::System,
+                content
+            } if content == "summary of turns 0-1"
+        ));
+        assert_eq!(
+            refs[0].source,
+            MessageSource::SystemInjection {
+                reason: "compaction".to_string()
+            }
+        );
+        assert_eq!(refs[1].turn_index, 0);
+        assert_eq!(refs[4].turn_index, 1);
+    }
+
+    #[test]
+    fn test_compact_never_evicts_last_turn() {
+        let mut s = make_session();
+        s.start_turn("only".to_string()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("a"))
+            .unwrap();
+        let _ = s.commit_turn().unwrap();
+
+        // 单轮：无可驱逐
+        assert_eq!(s.compact(1, "s".to_string()).unwrap(), 0);
+        assert!(s.pinned_summary().is_none());
+
+        // 驱逐数超出：clamp 到 len-1 = 0
+        s.start_turn("second".to_string()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("b"))
+            .unwrap();
+        let _ = s.commit_turn().unwrap();
+        assert_eq!(s.compact(5, "s".to_string()).unwrap(), 1);
+        assert_eq!(s.committed_turns().len(), 1);
+    }
+
+    #[test]
+    fn test_compact_requires_idle() {
+        let mut s = make_session();
+        s.start_turn("q".to_string()).unwrap();
+        assert!(s.compact(1, "s".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_pinned_summary_survives_snapshot_roundtrip() {
+        let mut s = make_session();
+        for i in 0..3 {
+            s.start_turn(format!("q{i}")).unwrap();
+            s.stage_item(MessageSource::ModelGeneration, assistant(format!("a{i}")))
+                .unwrap();
+            let _ = s.commit_turn().unwrap();
+        }
+        let _ = s.compact(1, "summary v1".to_string()).unwrap();
+
+        let token = {
+            // snapshot 需要令牌：Idle 状态下通过一次空 commit 不可行，
+            // 直接用 rollback_turn 产生令牌（不改变已提交状态）
+            s.rollback_turn(false).unwrap()
+        };
+        let snap = s.snapshot(&token);
+        assert!(snap.pinned_summary.is_some());
+
+        let mut restored = Session::from_snapshot(s.id().to_string(), "d".to_string(), 0, snap);
+        assert_eq!(
+            restored.pinned_summary().unwrap().message.as_ref(),
+            &InputItem::Message {
+                role: Role::System,
+                content: "summary v1".to_string()
+            }
+        );
+        assert_eq!(restored.committed_turns().len(), 2);
+        // next_message_id 防御性兜底：恢复后新消息 id 不与 pinned 冲突
+        restored.start_turn("new".to_string()).unwrap();
     }
 
     #[test]

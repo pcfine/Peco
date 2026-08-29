@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 
 use super::format::SessionFile;
 use super::traits::{PersistError, PersistResult, SessionPersister};
-use crate::session::{AnnotatedMessage, SessionMeta, SessionSnapshot};
+use crate::session::{SessionMeta, SessionSnapshot};
 
 /// 基于 JSON 文件的 [`SessionPersister`] 实现。
 ///
@@ -84,36 +84,47 @@ impl SessionPersister for FileSessionPersister {
         let path = self.file_path(session_id);
 
         // ── 增量持久化：尝试加载已有文件，仅追加新 turn ────────────────
-        let committed_turns = if path.exists() {
-            match read_session_file(&path).await {
-                Ok(Some((existing_snapshot, _existing_meta))) => {
-                    if existing_snapshot.turn_index < snapshot.turn_index {
-                        // 追加新 turn：保留已有，从新 snapshot 中取增量
-                        let mut turns: Vec<Vec<AnnotatedMessage>> =
-                            existing_snapshot.committed_turns;
-                        let new_turns = &snapshot.committed_turns
-                            [existing_snapshot.turn_index..snapshot.turn_index];
-                        tracing::debug!(
-                            session_id = %session_id,
-                            existing = turns.len(),
-                            appended = new_turns.len(),
-                            "Incremental persistence: appending turns"
-                        );
-                        turns.extend(new_turns.iter().cloned());
-                        turns
-                    } else {
-                        // turn_index 未变化 — 保留已有
-                        existing_snapshot.committed_turns
-                    }
-                }
-                _ => {
-                    // 文件损坏或不可读，全量写入
-                    snapshot.committed_turns.clone()
+        // 注意：compaction 会物理修剪 committed_turns 且不回退 turn_index 计数器
+        // （计数器是"历史轮数"语义），因此：
+        //   1. 追加边界必须用「位置」而非 turn_index —— 否则压缩后的首次追加
+        //      会以越界切片 panic；
+        //   2. 检测到收缩（文件轮数 > 快照轮数）时必须全量重写，
+        //      否则增量追加会复活被驱逐的轮次。
+        // 前提：committed 内 turn_index 单调连续且从 0 起（由 Session::compact
+        // 重编号保证），文件内容是快照 committed_turns 的前缀。
+        let existing = if path.exists() {
+            read_session_file(&path).await.ok().flatten()
+        } else {
+            None
+        };
+        let existing_len = existing
+            .as_ref()
+            .map_or(0, |(e, _)| e.committed_turns.len());
+        let shrank = existing_len > snapshot.committed_turns.len();
+        let committed_turns = match existing {
+            Some((mut existing_snapshot, _existing_meta)) if !shrank => {
+                if existing_len < snapshot.committed_turns.len() {
+                    // 追加新 turn：保留已有前缀，从新 snapshot 中按位置取增量
+                    let new_turns = &snapshot.committed_turns[existing_len..];
+                    tracing::debug!(
+                        session_id = %session_id,
+                        existing = existing_len,
+                        appended = new_turns.len(),
+                        "Incremental persistence: appending turns"
+                    );
+                    existing_snapshot
+                        .committed_turns
+                        .extend(new_turns.iter().cloned());
+                    existing_snapshot.committed_turns
+                } else {
+                    // 轮数未变化 — 保留已有（幂等）
+                    existing_snapshot.committed_turns
                 }
             }
-        } else {
-            // 文件不存在，全量写入
-            snapshot.committed_turns.clone()
+            _ => {
+                // 文件不存在/损坏，或 compaction 收缩 — 全量写入
+                snapshot.committed_turns.clone()
+            }
         };
 
         // 构造 SessionMeta 的动态字段
@@ -134,6 +145,7 @@ impl SessionPersister for FileSessionPersister {
             total_usage: snapshot.total_usage.clone(),
             next_message_id: snapshot.next_message_id,
             pending_inputs: snapshot.pending_inputs.clone(),
+            pinned_summary: snapshot.pinned_summary.clone(),
         };
 
         let json = serde_json::to_string_pretty(&file)?;
@@ -218,6 +230,7 @@ async fn read_session_file(
         total_usage: file.total_usage,
         next_message_id: file.next_message_id,
         pending_inputs: file.pending_inputs,
+        pinned_summary: file.pinned_summary,
     };
 
     Ok(Some((snapshot, file.meta)))
@@ -320,6 +333,7 @@ mod tests {
             },
             next_message_id: 2,
             pending_inputs: Vec::new(),
+            pinned_summary: None,
         }
     }
 
@@ -417,6 +431,7 @@ mod tests {
             },
             next_message_id: 1,
             pending_inputs: Vec::new(),
+            pinned_summary: None,
         };
         p.save(&snap0, id, "desc", 1000).await.unwrap();
 
@@ -444,6 +459,7 @@ mod tests {
             },
             next_message_id: 2,
             pending_inputs: Vec::new(),
+            pinned_summary: None,
         };
         p.save(&snap1, id, "desc", 1000).await.unwrap();
 
@@ -453,6 +469,181 @@ mod tests {
         assert_eq!(loaded.turn_index, 2);
         assert_eq!(meta.completed_turns, 2);
         assert_eq!(meta.tokens_used, 30);
+
+        teardown(&p).await;
+    }
+
+    #[tokio::test]
+    async fn test_save_full_rewrite_on_compaction_shrink() {
+        // compaction 后 turn_index 不变而 committed_turns 收缩 —
+        // 增量追加逻辑必须检测到收缩并全量重写，否则被驱逐轮次会复活。
+        let p = setup("shrink").await;
+        let id = "shrink-session";
+
+        // 先保存 2 轮
+        let snap_full = SessionSnapshot {
+            committed_turns: vec![
+                vec![AnnotatedMessage::new(
+                    MessageId(0),
+                    0,
+                    user("turn0"),
+                    MessageSource::UserInput,
+                )],
+                vec![AnnotatedMessage::new(
+                    MessageId(1),
+                    1,
+                    user("turn1"),
+                    MessageSource::UserInput,
+                )],
+            ],
+            turn_index: 2,
+            total_usage: Usage::default(),
+            next_message_id: 2,
+            pending_inputs: Vec::new(),
+            pinned_summary: None,
+        };
+        p.save(&snap_full, id, "desc", 1000).await.unwrap();
+
+        // 模拟 compaction：驱逐 turn0，钉扎摘要（turn_index 仍为 2）
+        let snap_compacted = SessionSnapshot {
+            committed_turns: vec![vec![AnnotatedMessage::new(
+                MessageId(1),
+                0,
+                user("turn1"),
+                MessageSource::UserInput,
+            )]],
+            turn_index: 2,
+            total_usage: Usage::default(),
+            next_message_id: 3,
+            pending_inputs: Vec::new(),
+            pinned_summary: Some(AnnotatedMessage::new(
+                MessageId(2),
+                0,
+                InputItem::Message {
+                    role: Role::System,
+                    content: "summary".to_string(),
+                },
+                MessageSource::SystemInjection {
+                    reason: "compaction".to_string(),
+                },
+            )),
+        };
+        p.save(&snap_compacted, id, "desc", 1000).await.unwrap();
+
+        let (loaded, meta) = p.load(id).await.unwrap().expect("should exist");
+        assert_eq!(loaded.committed_turns.len(), 1, "被驱逐轮次不得复活");
+        assert_eq!(loaded.committed_turns[0][0].turn_index, 0);
+        assert!(loaded.pinned_summary.is_some());
+        assert_eq!(meta.completed_turns, 1);
+
+        teardown(&p).await;
+    }
+
+    #[tokio::test]
+    async fn test_incremental_append_after_compaction() {
+        // compaction 后 turn_index 计数器不再等于 committed_turns.len()，
+        // 增量追加必须按「位置」取边界 —— 旧实现用 turn_index 切片，
+        // 压缩后的首次追加会以越界切片 panic（committed_turns[2..3]，len=2）。
+        let p = setup("append-after-compact").await;
+        let id = "append-after-compact-session";
+
+        // 1. 保存 2 轮（turn_index == 2 == 轮数，正常状态）
+        let snap_full = SessionSnapshot {
+            committed_turns: vec![
+                vec![AnnotatedMessage::new(
+                    MessageId(0),
+                    0,
+                    user("turn0"),
+                    MessageSource::UserInput,
+                )],
+                vec![AnnotatedMessage::new(
+                    MessageId(1),
+                    1,
+                    user("turn1"),
+                    MessageSource::UserInput,
+                )],
+            ],
+            turn_index: 2,
+            total_usage: Usage::default(),
+            next_message_id: 2,
+            pending_inputs: Vec::new(),
+            pinned_summary: None,
+        };
+        p.save(&snap_full, id, "desc", 1000).await.unwrap();
+
+        // 2. compaction：驱逐 turn0（turn_index 仍为 2，轮数变为 1）
+        let snap_compacted = SessionSnapshot {
+            committed_turns: vec![vec![AnnotatedMessage::new(
+                MessageId(1),
+                0,
+                user("turn1"),
+                MessageSource::UserInput,
+            )]],
+            turn_index: 2,
+            total_usage: Usage::default(),
+            next_message_id: 3,
+            pending_inputs: Vec::new(),
+            pinned_summary: Some(AnnotatedMessage::new(
+                MessageId(2),
+                0,
+                InputItem::Message {
+                    role: Role::System,
+                    content: "summary".to_string(),
+                },
+                MessageSource::SystemInjection {
+                    reason: "compaction".to_string(),
+                },
+            )),
+        };
+        p.save(&snap_compacted, id, "desc", 1000).await.unwrap();
+
+        // 3. 压缩后新增一轮：轮数 2，但 turn_index 计数器为 3（历史轮数语义）
+        //    新 turn 的消息 turn_index == 2（计数器），与其 committed 位置（1）不等
+        let snap_new_turn = SessionSnapshot {
+            committed_turns: vec![
+                vec![AnnotatedMessage::new(
+                    MessageId(1),
+                    0,
+                    user("turn1"),
+                    MessageSource::UserInput,
+                )],
+                vec![AnnotatedMessage::new(
+                    MessageId(3),
+                    2,
+                    user("turn2"),
+                    MessageSource::UserInput,
+                )],
+            ],
+            turn_index: 3,
+            total_usage: Usage::default(),
+            next_message_id: 4,
+            pending_inputs: Vec::new(),
+            pinned_summary: snap_compacted.pinned_summary.clone(),
+        };
+        p.save(&snap_new_turn, id, "desc", 1000).await.unwrap();
+
+        let (loaded, meta) = p.load(id).await.unwrap().expect("should exist");
+        assert_eq!(
+            loaded.committed_turns.len(),
+            2,
+            "压缩后的新 turn 必须被追加（且不 panic）"
+        );
+        assert_eq!(
+            loaded.committed_turns[0][0].message.as_ref(),
+            &InputItem::Message {
+                role: Role::User,
+                content: "turn1".to_string()
+            }
+        );
+        assert_eq!(
+            loaded.committed_turns[1][0].message.as_ref(),
+            &InputItem::Message {
+                role: Role::User,
+                content: "turn2".to_string()
+            }
+        );
+        assert!(loaded.pinned_summary.is_some(), "pinned 摘要不得丢失");
+        assert_eq!(meta.completed_turns, 2);
 
         teardown(&p).await;
     }

@@ -311,6 +311,20 @@ fn build_token_budget(
     }
 }
 
+/// 单条 [`InputItem`] 的主要文本内容（校准 token 估算依据）。
+///
+/// 与 `input_item_chars` 覆盖相同的字段（Message/Reasoning 的 content、
+/// FunctionCall 的 arguments、FunctionCallOutput 的 output）。
+fn input_item_text(item: &InputItem) -> &str {
+    match item {
+        InputItem::Message { content, .. } => content,
+        InputItem::Reasoning { content } => content,
+        InputItem::FunctionCall { arguments, .. } => arguments,
+        InputItem::FunctionCallOutput { output, .. } => output,
+        _ => "",
+    }
+}
+
 /// 单条 [`InputItem`] 的字符数（粗略 token 估算依据）。
 fn input_item_chars(item: &InputItem) -> usize {
     match item {
@@ -322,10 +336,62 @@ fn input_item_chars(item: &InputItem) -> usize {
     }
 }
 
-/// 粗略 token 估算：每字符约 0.3 token（Arc 版本）。
+/// 粗略 token 估算（Arc 版本）— 委托给校准估算器，保证全项目单一口径。
+///
+/// 历史上此函数按字节 × 0.3 估算（CJK 每字 3 字节 → ≈0.9 token/字，系统性高估）；
+/// 现与 compaction / 历史预算共用同一校准实现，避免双口径漂移。
 fn estimate_tokens_arc(messages: &[Arc<InputItem>]) -> usize {
-    let char_count: usize = messages.iter().map(|m| input_item_chars(m.as_ref())).sum();
-    (char_count as f64 * 0.3) as usize
+    messages
+        .iter()
+        .map(|m| estimate_item_tokens(m.as_ref()))
+        .sum()
+}
+
+// ============================================================================
+// 校准 token 估算（compaction / 历史预算共用）
+// ============================================================================
+
+/// 校准 token 估算：CJK 字符 ≈ 0.6 token/字符，其它 ≈ 0.3 token/字符。
+///
+/// 旧的 `字节 × 0.3` 估算对中文系统性偏差（UTF-8 每汉字 3 字节 × 0.3 ≈ 0.9
+/// token/字，高估 1.5×；纯 ASCII 场景则低估）。此估算器按字符类别分别计权，
+/// 供上下文压缩、历史窗口预算与 ContextUsage 等所有 token 估算路径使用 —
+/// 全项目单一实现，防漂移。
+pub fn estimate_item_tokens(item: &InputItem) -> usize {
+    estimate_str_tokens(input_item_text(item))
+}
+
+/// 按「字符数」估算 token（同 [`estimate_item_tokens`] 的权重规则）。
+pub fn estimate_str_tokens(s: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in s.chars() {
+        if is_cjk(c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    estimate_chars_tokens(other) + estimate_cjk_tokens(cjk)
+}
+
+fn estimate_chars_tokens(chars: usize) -> usize {
+    (chars as f64 * 0.3).ceil() as usize
+}
+
+fn estimate_cjk_tokens(cjk_chars: usize) -> usize {
+    (cjk_chars as f64 * 0.6).ceil() as usize
+}
+
+/// 是否为 CJK 字符（汉字 / 日文假名 / 谚文 / 全角标点）。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x2E80..=0x9FFF   // CJK 部首、汉字、假名、谚文兼容
+        | 0xAC00..=0xD7AF // 谚文音节
+        | 0xF900..=0xFAFF // CJK 兼容表意文字
+        | 0xFF00..=0xFFEF // 全角形式
+        | 0x20000..=0x2FA1F // CJK 扩展 B-F
+    )
 }
 
 /// 粗略 token 估算：每字符约 0.3 token（`&InputItem` 版本，用于测试）。

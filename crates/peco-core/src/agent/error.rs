@@ -39,6 +39,12 @@ pub enum AgentError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// 上下文压缩失败（摘要生成未完成/为空、会话修剪状态错误等）。
+    ///
+    /// compaction 是非致命路径 — 调用方仅记录日志，不影响会话继续。
+    #[error("compaction error: {0}")]
+    Compaction(String),
+
     /// A tool execution returned an error.
     #[error("tool execution error: tool={tool}, message={message}")]
     ToolExecution { tool: String, message: String },

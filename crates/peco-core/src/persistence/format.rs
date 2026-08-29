@@ -25,4 +25,7 @@ pub(crate) struct SessionFile {
     pub next_message_id: u64,
     /// 排队中的用户输入（turn 完成时可能仍有未处理的输入）
     pub pending_inputs: Vec<PendingInput>,
+    /// 钉扎在上下文最前的历史摘要（compaction 产物）
+    #[serde(default)]
+    pub pinned_summary: Option<AnnotatedMessage>,
 }

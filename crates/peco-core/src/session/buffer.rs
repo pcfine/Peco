@@ -92,6 +92,20 @@ impl CommittedBuffer {
     pub fn get_turn(&self, turn_index: usize) -> Option<&[AnnotatedMessage]> {
         self.turns.get(turn_index).map(|t| t.as_slice())
     }
+
+    /// 从最旧端物理驱逐 N 轮，返回被驱逐的 turns。
+    ///
+    /// 仅供 compaction 使用 — 被驱逐轮次的内容已由摘要替代。
+    /// 调用方负责随之修正剩余消息的 `turn_index`（见 `Session::compact`）。
+    pub fn evict_front(&mut self, count: usize) -> Vec<Vec<AnnotatedMessage>> {
+        let count = count.min(self.turns.len());
+        self.turns.drain(..count).collect()
+    }
+
+    /// 剩余 turns 的可变切片（compaction 重编号 `turn_index` 用）。
+    pub fn turns_mut(&mut self) -> &mut [Vec<AnnotatedMessage>] {
+        &mut self.turns
+    }
 }
 
 // ============================================================================

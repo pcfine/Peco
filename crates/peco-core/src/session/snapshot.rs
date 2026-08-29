@@ -30,6 +30,15 @@ pub struct SessionSnapshot {
     // ── 排队输入（turn 完成时可能仍有未处理的输入）──
     /// 排队中的用户输入
     pub pending_inputs: Vec<PendingInput>,
+
+    // ── 上下文压缩（compaction 产物）──
+    /// 钉扎在上下文最前的历史摘要。
+    ///
+    /// 不属于任何 committed turn — 物理修剪驱逐的轮次被摘要替换后，
+    /// 摘要以独立的 pinned 消息存活，随快照持久化。
+    /// `#[serde(default)]` 保证旧快照（无此字段）可反序列化。
+    #[serde(default)]
+    pub pinned_summary: Option<AnnotatedMessage>,
 }
 
 /// Turn 边界令牌。

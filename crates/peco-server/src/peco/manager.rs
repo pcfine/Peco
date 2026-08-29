@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use peco_agents::BuiltinTemplate;
+use peco_core::agent::{CompactionPolicy, ModelSummarizer};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -73,7 +74,19 @@ impl PecoManager {
         // ── 4. 加载 @assistant Agent（从 WorkSpace 目录，非 DB）─────────
         let agent = state.workspace_manager.get_agent(user_id, "@assistant")?;
 
-        // ── 5. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
+        // ── 5. 构建上下文压缩策略（复用主 Agent 的 provider + Flash 模型）──
+        let summarizer = Arc::new(ModelSummarizer::new(
+            Arc::clone(agent.provider()),
+            config.summarizer_model.clone(),
+        ));
+        let mut config = config;
+        config.compaction = Some(Arc::new(CompactionPolicy {
+            trigger_tokens: config.compaction_trigger_tokens,
+            keep_recent_tokens: config.compaction_keep_recent_tokens,
+            summarizer,
+        }));
+
+        // ── 6. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
         //
         // PecoManager 在每次流连接时新建（handler 每请求调用），
         // 因此这里求值即保证日期新鲜度——每次续接都以当天日期重建环境块。
@@ -89,7 +102,6 @@ impl PecoManager {
             ws.root().to_path_buf(),
             &agent.config().agent.name,
         );
-        let mut config = config;
         config.environment = Some(env_info.render());
 
         tracing::info!(

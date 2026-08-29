@@ -159,6 +159,13 @@ pub struct LooperConfig {
     ///
     /// 默认为 `None`（不过滤）。每个 `AgentLooper` 实例可独立配置。
     pub message_filter: Option<Arc<dyn MessageFilter>>,
+    /// 上下文滚动压缩策略（Peco 永续会话等无界历史场景）。
+    ///
+    /// 在每个 turn 成功提交并持久化后检查：估算上下文超过
+    /// [`CompactionPolicy::trigger_tokens`](super::compaction::CompactionPolicy) 时，
+    /// 物理驱逐最旧轮次并以结构化摘要钉扎。压缩是非致命的 — 失败仅记录日志。
+    /// 默认为 `None`（不压缩）。
+    pub compaction: Option<Arc<super::compaction::CompactionPolicy>>,
 }
 
 impl Default for LooperConfig {
@@ -173,6 +180,7 @@ impl Default for LooperConfig {
             context_strategy: super::context::ContextStrategy::FullHistory,
             persist_on_failure: false,
             message_filter: None,
+            compaction: None,
         }
     }
 }
@@ -357,6 +365,21 @@ pub enum LooperEvent {
         outcome: TurnOutcome,
         /// 本轮 token 用量（该轮模型调用用量）
         usage: Usage,
+    },
+
+    /// 上下文滚动压缩完成（历史轮被结构化摘要替换并物理驱逐）。
+    ///
+    /// 仅当 `LooperConfig::compaction` 已配置且阈值触发时发出。
+    /// 前端可据此渲染「更早对话已归档」分隔线。
+    ContextCompacted {
+        /// 物理驱逐的轮数
+        evicted_turns: usize,
+        /// 合并后的结构化摘要（已含定界标签）
+        summary: String,
+        /// 压缩前估算 token
+        estimated_tokens_before: usize,
+        /// 压缩后估算 token
+        estimated_tokens_after: usize,
     },
 
     /// Looper 即将退出 `run()` 方法。
@@ -1291,6 +1314,50 @@ impl AgentLooper {
                     .await
                 {
                     error!(error = %e, "Failed to persist session after turn commit");
+                }
+
+                // ★ 上下文滚动压缩：turn 边界（提交并持久化后、pending 续接前）。
+                //   非致命：摘要模型失败只记日志，不影响会话继续。
+                if let Some(policy) = &self.config.compaction {
+                    match policy.maybe_compact(&mut self.session).await {
+                        Ok(Some(outcome)) => {
+                            info!(
+                                evicted_turns = outcome.evicted_turns,
+                                tokens_before = outcome.estimated_tokens_before,
+                                tokens_after = outcome.estimated_tokens_after,
+                                "Context compacted at turn boundary"
+                            );
+                            Self::emit_event_guaranteed(
+                                &self.event_speaker,
+                                LooperEvent::ContextCompacted {
+                                    evicted_turns: outcome.evicted_turns,
+                                    summary: outcome.summary,
+                                    estimated_tokens_before: outcome.estimated_tokens_before,
+                                    estimated_tokens_after: outcome.estimated_tokens_after,
+                                },
+                            )
+                            .await;
+
+                            // 重新持久化：快照现在含 pinned 摘要 + 修剪后的历史
+                            let snapshot = self.session.snapshot(&_token);
+                            if let Err(e) = self
+                                .persister
+                                .save(
+                                    &snapshot,
+                                    self.session.id(),
+                                    self.session.description(),
+                                    self.session.created_at(),
+                                )
+                                .await
+                            {
+                                error!(error = %e, "Failed to persist session after compaction");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!(error = %e, "Context compaction failed (non-fatal)");
+                        }
+                    }
                 }
 
                 // 检查是否有 pending 输入自动续接
