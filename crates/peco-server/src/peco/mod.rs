@@ -10,4 +10,5 @@ pub mod environment;
 pub mod filter;
 pub mod handler;
 pub mod manager;
+pub mod memory;
 pub mod session;

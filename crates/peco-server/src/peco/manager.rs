@@ -5,11 +5,9 @@
 // 职责：
 //   1. 确保 personal 模板已安装到用户 WorkSpace（首次访问幂等安装）
 //   2. 加载 @assistant Agent
-//   3. 持有 PecoConfig（含 PPA 钩子预留注入点）
+//   3. 组装 PecoConfig（compaction / 环境上下文 / 记忆双路径）
 //
-// 与 personal_agent::PersonalAgentManager 的核心差异：
-//   - 使用 PecoConfig（可扩展，预留 Hook/DynamicContext）
-//   - 位于 peco 模块（统一入口）
+// 位于 peco 模块（统一入口）。
 
 use std::sync::Arc;
 
@@ -29,7 +27,7 @@ use super::environment::EnvironmentInfo;
 pub struct PecoManager {
     /// 主助理 Agent（@assistant），从 WorkSpace 目录加载
     agent: Arc<peco_core::agent::Agent>,
-    /// Peco 配置（含 PPA 钩子预留注入点）
+    /// Peco 配置（compaction / 环境上下文 / 记忆双路径）
     config: PecoConfig,
 }
 
@@ -48,7 +46,7 @@ impl PecoManager {
 
     /// 创建带自定义配置的 PecoManager。
     ///
-    /// 用于后续接入 PPA 时注入 DynamicContext 和 LooperHook。
+    /// 用于覆盖默认的预算/压缩/记忆配置。
     pub async fn new_with_config(
         state: &AppState,
         user_id: &str,
@@ -85,6 +83,30 @@ impl PecoManager {
             keep_recent_tokens: config.compaction_keep_recent_tokens,
             summarizer,
         }));
+
+        // ── 5.5 记忆双路径（写 hook + 读 dynamic_context）────────────────
+        //
+        // 存储载体是 @private_memory KB（第 2 步模板安装保证存在）。
+        // 提取器复用主 Agent 的 provider + Flash 模型 — 与 compaction 同范式。
+        // enabled=false 时跳过装配，零开销。
+        if config.memory.enabled {
+            let km = Arc::clone(ws.knowledge_manager());
+            let analyzer = super::memory::ModelTurnAnalyzer::new(
+                Arc::clone(agent.provider()),
+                config.memory.model.clone(),
+            );
+            config
+                .hooks
+                .push(Arc::new(super::memory::MemoryExtractionHook::new(
+                    Arc::clone(&km),
+                    Arc::new(analyzer),
+                    config.memory.clone(),
+                )));
+            config.dynamic_context = Some(Arc::new(super::memory::MemoryRecallContext::new(
+                km,
+                config.memory.clone(),
+            )));
+        }
 
         // ── 6. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
         //

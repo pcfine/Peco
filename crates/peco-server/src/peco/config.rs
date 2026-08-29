@@ -1,14 +1,17 @@
 // ============================================================================
-// PecoConfig — Peco 对话配置（可扩展，预留 PPA 钩子注入点）
+// PecoConfig — Peco 对话配置
 // ============================================================================
 //
-// 首版所有可选字段为 None，后续接入 PPA 时只需填充对应字段。
+// 可选字段（compaction / environment / dynamic_context / hooks）由
+// PecoManager 构造期填充 — handler 无需改动即可增减注入组件。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use peco_core::agent::hooks::LooperHook;
 use peco_core::agent::{CompactionPolicy, DynamicContext, LooperConfig, MessageFilter};
+
+use super::memory::MemoryConfig;
 
 /// Peco 对话配置。
 #[derive(Clone)]
@@ -38,6 +41,8 @@ pub struct PecoConfig {
     pub compaction_keep_recent_tokens: usize,
     /// 摘要模型名（Flash 档，低延迟低成本）。
     pub summarizer_model: String,
+    /// 记忆双路径配置（写路径提取 hook + 读路径召回）。
+    pub memory: MemoryConfig,
 
     // ── 以下由 PecoManager 构造期填充 ──────────────────────
     /// 上下文滚动压缩策略。由 `PecoManager` 基于主 Agent 的 provider 构建。
@@ -46,9 +51,10 @@ pub struct PecoConfig {
     /// 由 `PecoManager` 在构造时经 `EnvironmentInfo::render()` 求值一次填入。
     pub environment: Option<String>,
     /// 动态上下文（读路径）：每次用户 query 前自动检索并注入。
-    /// 后续接入 PPA 时设为 `Some(Arc::new(PpaDynamicContext::new(...)))`。
+    /// P2 记忆体系装配为 `MemoryRecallContext`（见 `super::memory`）。
     pub dynamic_context: Option<Arc<dyn DynamicContext>>,
     /// Looper 钩子（写路径）：每轮完成后触发记忆提取、token 用量记录等。
+    /// P2 记忆体系装配为 `MemoryExtractionHook`（见 `super::memory`）。
     /// 钩子按注册顺序执行，相互独立。
     pub hooks: Vec<Arc<dyn LooperHook>>,
 }
@@ -63,6 +69,7 @@ impl Default for PecoConfig {
             compaction_trigger_tokens: 24_000,
             compaction_keep_recent_tokens: 8_000,
             summarizer_model: "deepseek-v4-flash".to_string(),
+            memory: MemoryConfig::default(),
             compaction: None,
             environment: None,
             dynamic_context: None,

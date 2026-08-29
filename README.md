@@ -43,12 +43,11 @@
 - **MCP 协议**：完整实现 Model Context Protocol，支持 3 种传输（Stdio / SSE / StreamableHTTP），工具自动发现与同步
 - **可扩展**：`#[peco_tool]` 宏自动生成工具定义，`Tool`/`ToolDyn` 双 trait 设计
 
-### Personal Memory（PPA）
-- **自动记忆提取**：通过 `PpaMemoryHook`（LooperHook）在每轮完成后使用独立 Flash 模型分析对话，自动识别用户偏好、决策、事实
-- **三层记忆模型**：Profile（用户身份/偏好）→ Semantic（离散事实/知识）→ Episodic（对话摘要/上下文）
-- **知识库存储**：记忆以结构化文档形式存储在 per-user KB 中（`personal_memory_{user_id}`），支持图谱双写和冲突检测（Add/Update/Delete/Noop）
-- **智能检索**：`PpaDynamicContext` 在每轮查询前自动注入相关记忆（规则引擎分类 + 向量检索 + 相关性阈值过滤）
-- **Agent 协作**：通过 `@assistant → @memory` 子 Agent 模式，使用 KB 工具直接管理记忆
+### 永续会话上下文与记忆
+- **滚动压缩**：会话超过 `compaction_trigger_tokens` 时，turn 边界自动将旧轮次用 Flash 模型递归合并为结构化摘要（用户画像/已做决定/未完成事项/关键事实），钉在上下文最前；被驱逐轮次从 Session/快照物理删除，持久层随之收缩。前端以归档分隔条展示
+- **单一截断点**：全部裁剪决策在 `PecoContextFilter` 一处完成 — pinned 摘要 → 按 token 预算整轮选择的逐字历史 → 完整保留的当前轮（CJK 校准 token 估算）
+- **记忆双路径**：存储于 per-user `@private_memory` 知识库。写路径 `MemoryExtractionHook` 每轮后台提取用户偏好/事实/事项（Flash 模型，检索既有记忆抑制重复，turn 边界零阻塞）；读路径 `MemoryRecallContext` 每次新 query 前检索相关记忆注入上下文（闲聊门控零成本跳过）
+- **Agent 协作**：通过 `@assistant → @memory` 子 Agent 模式，使用 KB 工具显式管理记忆（更新/删除）；自动路径只做新增，二者职责正交
 
 ### 知识库（RAG）
 - **多格式解析**：PDF、DOCX、HTML、Markdown、代码、纯文本
@@ -156,7 +155,7 @@ cargo run -p peco-core --example workflow_demo
 peco/
 ├── crates/
 │   ├── peco-core/              # Agent 引擎：ReAct Loop、Session、Workflow、WorkSpace、MCP、Skills、Tools
-│   ├── peco-server/            # Web 服务：Axum REST API、SSE、JWT、Cron 调度、PPA 记忆管理
+│   ├── peco-server/            # Web 服务：Axum REST API、SSE、JWT、Cron 调度、Peco 记忆管理
 │   ├── peco-cli/               # 命令行 AI 助手（交互式菜单）
 │   ├── model-provider/         # LLM 统一抽象层（DeepSeek 实现；OpenAI/Anthropic/Ollama/Groq 类型已定义）
 │   ├── knowledge-base/         # RAG 引擎：解析→分块→嵌入→混合检索（InMemory/LanceDB/HelixDB 三后端）
@@ -391,7 +390,7 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 
 - **Agent Engine**: Declarative `agent.md` definitions, dual-state-machine ReAct loop (outer Idle→Processing→Running→Paused, inner Prepare→Model/Stream→Tools), DAG workflow orchestration (`workflow.md` with topology-level parallelism, condition gating, minijinja templates, Continue/Abort/Pause failure policies), sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue, dual persistence (FileSessionPersister for CLI, SqliteSessionPersister for server), built-in workspace templates (`--init-template`)
 - **Tool System**: 26 built-in tools (shell, fetch, full CRUD for Agents/Skills/Workflows/MCP servers, 7 KB tools), full MCP protocol support (Stdio + SSE + StreamableHTTP), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design with `#[peco_tool]` macro
-- **Personal Memory (PPA)**: Auto memory extraction via `PpaMemoryHook` with independent Flash model, three-tier memory (Profile → Semantic → Episodic) stored as KB documents with graph dual-write, smart retrieval via `PpaDynamicContext` (rule-based query classification + vector search + relevance threshold), agent-driven memory management through `@assistant → @memory` sub-agent pattern using KB tools
+- **Perpetual Session Context & Memory**: Rolling compaction at turn boundaries — old turns recursively merged into a structured pinned summary by a Flash model, evicted turns physically removed from Session/snapshots; single truncation point (`PecoContextFilter`: pinned summary → token-budgeted verbatim history → intact current turn); memory dual-path over a per-user `@private_memory` KB — background extraction hook (Flash model, zero blocking at turn boundary) + per-query recall with casual-query gating; explicit memory management via `@assistant → @memory` sub-agent KB tools
 - **RAG Knowledge Base**: Multi-format parsing (PDF/DOCX/HTML/MD/Code/TXT), intelligent chunking with deterministic IDs for idempotent ingestion, hybrid search (vector + BM25 + knowledge graph) with 4-layer adaptive RRF fusion, local ONNX embeddings (Chinese-optimized `bge-small-zh-v1.5`, 512-dim), three backends (InMemory/LanceDB/HelixDB)
 - **Skill System**: 3-tier progressive loading (name+desc → full body → scripts/references/assets), `SKILL.md` format, automatic directory discovery
 - **Web UI**: SSE streaming chat with 9 event types, Agent CRUD, knowledge base management, workflow DAG editor with real-time execution tracking, cron task scheduling, JWT HS256 authentication (7-day expiry)

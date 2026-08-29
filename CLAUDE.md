@@ -46,7 +46,7 @@ Peco 是一个全栈 AI Agent 平台：**Rust 后端**（Axum + Tokio）+ **Reac
 ### Crate 依赖图（自上而下）
 
 ```
-peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, PPA 记忆管理)
+peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆管理)
   ├── peco      (Peco 永续对话 — /api/peco)
   ├── chat      (Agent 对话管理 — /api/chat)
   ├── provider  (Provider 配置管理 — /api/providers)
@@ -134,11 +134,15 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, PPA 记忆�
 - `McpClientHandler`：实现 `rmcp::ClientHandler`，自动同步工具列表变更（list_changed → 移除所有受管工具 → 重新列出 → 重新注册）。
 - MCP 配置存储在 `~/.peco/mcp_config.json`（或 `$PECO_CONFIG_DIR/mcp_config.json`），通过 `McpConfig::load()` 加载。
 
-**Personal Memory / PPA**（[crates/peco-server/src/personal_assistant/](crates/peco-server/src/personal_assistant/)）：
-- 三层记忆：Profile（用户身份/偏好）、Semantic（离散事实）、Episodic（对话摘要）。
-- `PersonalMemoryStore`：基于 `KnowledgeManager` 的记忆 CRUD + 向量搜索，记忆以文档形式存储在 per-user KB 中。
-- `PpaMemoryHook`（LooperHook）在每轮完成后调用独立 Flash 模型自动提取记忆；`PpaDynamicContext`（DynamicContext）在每轮查询前注入相关记忆。
-- Agent 可通过 `@assistant → @memory` 子 Agent 模式使用 KB 工具直接管理记忆。
+**Peco 永续会话：滚动压缩 + 记忆双路径**（详见 `docs/context-design.md`）：
+
+- **滚动压缩**（[crates/peco-core/src/agent/compaction.rs](crates/peco-core/src/agent/compaction.rs)）：`CompactionPolicy::maybe_compact()` 在 turn 边界（looper Done 分支）估算 pinned + committed token，超过 `compaction_trigger_tokens` 时用 Flash 模型递归合并旧摘要与被驱逐轮次为结构化摘要（四段固定模板），`Session::compact()` 物理驱逐最旧轮次并重编号 turn_index，摘要作为 `pinned_summary`（System 消息）钉在上下文最前。失败非致命，仅记日志。
+- **单一截断点**：全部裁剪决策在 `PecoContextFilter`（[crates/peco-server/src/peco/filter.rs](crates/peco-server/src/peco/filter.rs)）一处完成 — pinned 层（System/摘要）→ Verbatim 层（按 token 预算从最新往回整轮选择）→ 当前轮（完整保留）。`ContextStrategy` 保持 `FullHistory` 直通。
+- **token 估算**：`estimate_str_tokens()`（[crates/peco-core/src/agent/context.rs](crates/peco-core/src/agent/context.rs)）CJK 0.6 token/字、其他 0.3 token/char 的校准估算，全项目唯一实现。
+- **记忆双路径**（[crates/peco-server/src/peco/memory/](crates/peco-server/src/peco/memory/)）：存储载体是 personal 模板幂等安装的 per-user `@private_memory` KB。
+  - **写路径** `MemoryExtractionHook`（LooperHook）：每轮成功完成后守卫检查（失败轮跳过、`analyze_min_chars` 过滤），`tokio::spawn` 后台检索既有记忆抑制重复 → Flash 模型（`ModelTurnAnalyzer`，严格 JSON 输出）提取事实 → 逐条写入 KB（source 标签 `ppa_{profile|semantic|episodic}`）。turn 边界零阻塞，所有失败点 warn 后 return。
+  - **读路径** `MemoryRecallContext`（DynamicContext）：每次新用户 query 前，闲聊门控（问候/感谢关键词，零成本跳过；不按长度门控）→ 混合检索 → 按类别格式化注入 instructions 尾部，`injection_token_cap` 逐行截断。
+  - **分工**：compaction 解决"会话内上下文放不下"，记忆解决"跨会话/超长期的知识"，二者正交。记忆的更新/删除由 `@assistant → @memory` 子 Agent 的显式 KB 工具路径负责（自动路径只做 add）。
 
 **Skills**（[crates/peco-core/src/skills/](crates/peco-core/src/skills/)）：
 - 三级渐进式加载：Tier 1（启动时加载名称+描述）、Tier 2（激活时加载完整正文）、Tier 3（按需加载 scripts/references/assets）。
@@ -187,10 +191,11 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, PPA 记忆�
 - **SQLite**（通过 `sqlx`）：用户、对话、消息、Agent 索引、知识库元数据、任务定义、任务日志、Session 快照。`db/` 模块有每个表的 DAO 文件。
 - **磁盘上的 agent.md 文件**：Agent 定义的**唯一真相源**。DB 仅存储轻量索引（name、path、user_id）。Agent 始终从 `.md` 文件通过 `WorkspaceManager::get_agent()` 加载。
 
-**PersonalAssistantManager**（[crates/peco-server/src/personal_assistant/](crates/peco-server/src/personal_assistant/)）：
-- 服务端组件，在每轮完成后编排 PPA 记忆提取。
-- 使用单独的 "Flash" 模型调用来分析对话并提取记忆。
-- 有自己的 `PersonalAssistantMessageFilter`，区分当前轮消息和历史轮次 — 历史轮次的 tool_call/tool_result 对被剥离以节省 token。
+**Peco 模块**（[crates/peco-server/src/peco/](crates/peco-server/src/peco/)）：
+- `PecoManager`（[manager.rs](crates/peco-server/src/peco/manager.rs)）：每次流连接构造。确保 personal 模板幂等安装、加载 `@assistant` Agent，并组装 `PecoConfig` — 滚动压缩策略、环境上下文前缀、记忆双路径（hook + dynamic_context，`memory.enabled` 时）。
+- `PecoConfig`（[config.rs](crates/peco-server/src/peco/config.rs)）：预算/压缩/记忆参数 + 管理器构造期填充的可选组件（compaction / environment / dynamic_context / hooks）。handler 无需改动即可增减注入组件。
+- `PecoContextFilter`（[filter.rs](crates/peco-server/src/peco/filter.rs)）：单一截断点上下文组装器（见上文"滚动压缩"）。
+- SSE 事件含 `context_compacted`（归档提示），前端以居中分隔条展示。
 
 ### model-provider：LLM 抽象层
 
