@@ -4,7 +4,7 @@
 
 use axum::response::sse::Event;
 use model_provider::Usage;
-use peco_core::agent::LooperEvent;
+use peco_core::agent::{LooperEvent, TurnFailureReason, TurnOutcome};
 use serde::Serialize;
 
 /// SSE 事件类型（发给前端）。
@@ -235,6 +235,25 @@ pub fn extract_sub_agent_result(tool_result: &str, info: &SubAgentInfo, tool_nam
     }
 }
 
+/// 将 `TurnFailureReason` 格式化为面向用户的消息（随 `error` SSE 事件发送）。
+fn format_failure_message(reason: &TurnFailureReason, partial_text: &str) -> String {
+    let reason_msg = match reason {
+        TurnFailureReason::Cancelled => "对话已被取消".to_string(),
+        TurnFailureReason::TotalTimeout => "总运行超时".to_string(),
+        TurnFailureReason::PerTurnTimeout => "本轮响应超时".to_string(),
+        TurnFailureReason::MaxTurnsExceeded => "已达到最大轮数限制".to_string(),
+        TurnFailureReason::HookAbort(msg) => format!("响应已被中断: {msg}"),
+        TurnFailureReason::Other(msg) => msg.clone(),
+        // TurnFailureReason 是 #[non_exhaustive]，为未来新增的失败原因兜底
+        _ => "对话异常终止".to_string(),
+    };
+    if partial_text.is_empty() {
+        reason_msg
+    } else {
+        format!("{reason_msg}（响应中断前部分输出已展示）")
+    }
+}
+
 /// 将 `LooperEvent` 映射为 `Option<ChatSseEvent>`。
 ///
 /// 部分 LooperEvent（如状态转换）不产生面向客户端的 SSE 事件，返回 None。
@@ -270,14 +289,24 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
-        LooperEvent::TurnComplete { outcome, usage, .. } => {
-            let text = outcome.text().unwrap_or("").to_string();
-            Some(ChatSseEvent::TurnComplete {
+        LooperEvent::TurnComplete { outcome, usage, .. } => match outcome {
+            TurnOutcome::Success { text } => Some(ChatSseEvent::TurnComplete {
                 text,
                 usage: usage.into(),
                 conversation_id: cid,
-            })
-        }
+            }),
+            // 失败轮次发出 error 事件（前端据此展示错误提示），丢弃 usage。
+            TurnOutcome::Failed {
+                reason,
+                partial_text,
+            } => {
+                let message = format_failure_message(&reason, &partial_text);
+                Some(ChatSseEvent::Error {
+                    message,
+                    conversation_id: cid,
+                })
+            }
+        },
 
         LooperEvent::Shutdown { total_usage, .. } => Some(ChatSseEvent::Done {
             usage: total_usage.into(),
@@ -296,5 +325,70 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
         | LooperEvent::OuterStateChange { .. }
         | LooperEvent::TurnStart { .. }
         | _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn success_outcome_maps_to_turn_complete() {
+        let event = map_looper_event(
+            LooperEvent::TurnComplete {
+                turn_index: 0,
+                outcome: TurnOutcome::Success {
+                    text: "你好".to_string(),
+                },
+                usage: Usage::default(),
+            },
+            "conv-1",
+        );
+        assert!(matches!(
+            event,
+            Some(ChatSseEvent::TurnComplete { ref text, .. }) if text == "你好"
+        ));
+    }
+
+    #[test]
+    fn failed_outcome_maps_to_error_event() {
+        // 失败轮次必须携带错误信息发送 error 事件（而非空文本的 turn_complete）
+        let event = map_looper_event(
+            LooperEvent::TurnComplete {
+                turn_index: 0,
+                outcome: TurnOutcome::Failed {
+                    reason: TurnFailureReason::Other(
+                        "Stream error: API error (402): Insufficient Balance".to_string(),
+                    ),
+                    partial_text: String::new(),
+                },
+                usage: Usage::default(),
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::Error { message, .. }) = event else {
+            panic!("failed outcome must map to ChatSseEvent::Error, got {event:?}");
+        };
+        assert!(message.contains("Insufficient Balance"));
+    }
+
+    #[test]
+    fn cancelled_outcome_maps_to_friendly_message() {
+        let event = map_looper_event(
+            LooperEvent::TurnComplete {
+                turn_index: 0,
+                outcome: TurnOutcome::Failed {
+                    reason: TurnFailureReason::Cancelled,
+                    partial_text: "部分输出".to_string(),
+                },
+                usage: Usage::default(),
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::Error { message, .. }) = event else {
+            panic!("failed outcome must map to ChatSseEvent::Error, got {event:?}");
+        };
+        assert!(message.contains("取消"));
+        assert!(message.contains("部分输出已展示"));
     }
 }

@@ -38,6 +38,8 @@ export interface ChatMessage {
   agentName?: string;
   agentTask?: string;
   callId?: string;
+  /** 错误提示消息（来自 SSE `error` 事件），以警示样式渲染 */
+  isError?: boolean;
 }
 
 export interface ChatViewProps {
@@ -485,7 +487,13 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   // Assistant message
   return (
     <div className="flex gap-2 items-start">
-      <div className="bg-muted rounded-lg px-4 py-2 text-sm max-w-[80%]">
+      <div
+        className={
+          message.isError
+            ? "bg-destructive/10 border border-destructive/30 text-destructive rounded-lg px-4 py-2 text-sm max-w-[80%]"
+            : "bg-muted rounded-lg px-4 py-2 text-sm max-w-[80%]"
+        }
+      >
         {message.reasoning && (
           <details className="mb-2">
             <summary className="text-xs text-muted-foreground cursor-pointer">
@@ -590,8 +598,18 @@ export function reduceStreamEvent(
     case "turn_complete":
     case "done":
     case "usage":
-    case "error":
       return messages;
+    case "error":
+      // 后端失败轮次（模型错误、超时、取消等）以警示气泡展示错误信息
+      return [
+        ...messages,
+        {
+          role: "assistant" as const,
+          content: event.data.message,
+          turnIndex: 0,
+          isError: true,
+        },
+      ];
   }
 }
 
