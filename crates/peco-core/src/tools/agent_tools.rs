@@ -183,9 +183,9 @@ impl ToolDyn for SaveAgent {
             // 安全边界：'@' 前缀为系统内置 Agent 保留 — 禁止新建，
             if name.starts_with('@') {
                 return Err(ToolError::ToolCallError(Box::new(StringError(format!(
-                        "Invalid agent name '{name}' — names starting with '@' are reserved \
+                    "Invalid agent name '{name}' — names starting with '@' are reserved \
                          for built-in system agents. User-created agents must not use the '@' prefix."
-                    )))));
+                )))));
             }
 
             self.agent_access

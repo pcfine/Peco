@@ -15,7 +15,6 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod agent;
-pub mod assistant;
 pub mod auth;
 pub mod chat;
 pub mod config;
@@ -27,8 +26,6 @@ pub mod mcp_config;
 pub mod middleware;
 pub mod openapi;
 pub mod peco;
-pub mod personal_agent;
-pub mod personal_assistant;
 pub mod provider;
 pub mod session_dto;
 pub mod session_store;
