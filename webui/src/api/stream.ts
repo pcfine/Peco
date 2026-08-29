@@ -29,18 +29,29 @@ export interface ParsedSSEEvent {
  * Parse a raw SSE line buffer into parsed events.
  * Handles partial lines (incomplete chunks).
  */
+/**
+ * Parse SSE events from one network chunk.
+ *
+ * `pendingEvent` carries the most recently seen `event:` line across calls:
+ * when a `data:` line spans chunk boundaries, its event name must survive —
+ * otherwise the completed line is emitted with an empty event name and the
+ * event is silently dropped by `toChatSseEvent`. Thread the returned
+ * `pendingEvent` (together with `remaining`) into the next call.
+ */
 export function parseSSELines(
   chunk: string,
   buffer: string,
+  pendingEvent = "",
 ): {
   events: ParsedSSEEvent[];
   remaining: string;
+  pendingEvent: string;
 } {
   const lines = (buffer + chunk).split("\n");
   const remaining = lines.pop() ?? "";
 
   const events: ParsedSSEEvent[] = [];
-  let currentEvent = "";
+  let currentEvent = pendingEvent;
 
   for (const line of lines) {
     if (line.startsWith("event: ")) {
@@ -54,10 +65,14 @@ export function parseSSELines(
       } catch {
         // Skip unparseable lines (incomplete chunks)
       }
+    } else if (line.trim() === "") {
+      // Blank line = event dispatch boundary per the SSE spec — reset the
+      // event type so orphan data lines can't inherit a previous event name.
+      currentEvent = "";
     }
   }
 
-  return { events, remaining };
+  return { events, remaining, pendingEvent: currentEvent };
 }
 
 /** Map a parsed SSE event into a typed ChatSseEvent */

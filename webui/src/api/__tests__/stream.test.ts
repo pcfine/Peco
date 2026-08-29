@@ -30,21 +30,51 @@ describe("parseSSELines", () => {
 
   it("handles partial chunks (buffered remaining)", () => {
     // First chunk: incomplete line
-    const { events: e1, remaining: r1 } = parseSSELines(
-      'event: text_delta\ndata: {"content":"hel',
-      "",
-    );
-    expect(e1).toHaveLength(0);
-    expect(r1).toBe('data: {"content":"hel');
+    const r1 = parseSSELines('event: text_delta\ndata: {"content":"hel', "");
+    expect(r1.events).toHaveLength(0);
+    expect(r1.remaining).toBe('data: {"content":"hel');
+    expect(r1.pendingEvent).toBe("text_delta");
 
-    // Second chunk: completes the line
-    const { events: e2, remaining: r2 } = parseSSELines(
+    // Second chunk: completes the line — event name must survive the boundary
+    const r2 = parseSSELines(
       'lo","conversation_id":"1"}\n\n',
-      r1,
+      r1.remaining,
+      r1.pendingEvent,
     );
-    expect(e2).toHaveLength(1);
-    expect(e2[0].data.content).toBe("hello");
-    expect(r2).toBe("");
+    expect(r2.events).toHaveLength(1);
+    expect(r2.events[0].event).toBe("text_delta");
+    expect(r2.events[0].data.content).toBe("hello");
+    expect(r2.remaining).toBe("");
+  });
+
+  it("keeps the event name when the event: and data: lines split across chunks", () => {
+    // Regression: a chunk boundary between the event: line and the data: line
+    // used to reset the event name, so the event was emitted unnamed and
+    // silently dropped by toChatSseEvent.
+    const r1 = parseSSELines("event: turn_complete\n", "");
+    expect(r1.events).toHaveLength(0);
+    expect(r1.pendingEvent).toBe("turn_complete");
+
+    const r2 = parseSSELines(
+      'data: {"text":"完成"}\n\n',
+      r1.remaining,
+      r1.pendingEvent,
+    );
+    expect(r2.events).toHaveLength(1);
+    expect(r2.events[0].event).toBe("turn_complete");
+    // 事件以空行收尾，事件名随分发复位
+    expect(r2.pendingEvent).toBe("");
+  });
+
+  it("resets the event name after each complete event", () => {
+    // A data line without a preceding event: line must not inherit from a
+    // previous complete event — it dispatches unnamed (dropped downstream).
+    const chunk =
+      'event: done\ndata: {"usage":{}}\n\ndata: {"orphan":true}\n\n';
+    const { events } = parseSSELines(chunk, "");
+    expect(events).toHaveLength(2);
+    expect(events[0].event).toBe("done");
+    expect(events[1].event).toBe("");
   });
 
   it("handles tool_call_start event", () => {

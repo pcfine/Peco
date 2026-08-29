@@ -200,14 +200,20 @@ export function ChatView({
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let pendingEvent = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         const chunk = decoder.decode(value, { stream: true });
-        const { events, remaining } = parseSSELines(chunk, buffer);
+        const {
+          events,
+          remaining,
+          pendingEvent: next,
+        } = parseSSELines(chunk, buffer, pendingEvent);
         buffer = remaining;
+        pendingEvent = next;
 
         for (const parsed of events) {
           const event = toChatSseEvent(parsed);
