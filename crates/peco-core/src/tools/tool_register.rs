@@ -15,7 +15,7 @@ use crate::tools::{
     DeleteAgent, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs, ListKnowledgeBases,
     ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill, RunParallelSubAgents,
     SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellTool, ShowWorkspace,
-    SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError, ToolExecutor,
+    SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError, ToolExecutor, WebSearchTool,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -53,6 +53,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_knowledge_base_docs",
     "add_facts_to_knowledge_base",
     "query_entity_facts",
+    "web_search",
 ];
 
 /// 可选依赖（workflow_access / mcp_access）缺失时跳过该工具 —
@@ -82,6 +83,12 @@ impl ToolRegister {
                 "shell" => Some(Box::new(ShellTool::new(deps.workspace_root.clone()))),
                 "fetch" => Some(Box::new(Fetch)),
                 "list_tools" => Some(Box::new(ListTools { deps: deps.clone() })),
+
+                // ── web_search（web_search 后端缺失时 warn + skip）──
+                "web_search" => match deps.web_search.as_ref() {
+                    Some(backend) => Some(Box::new(WebSearchTool::new(backend.clone()))),
+                    None => skip_missing_dep("web_search", "web_search config"),
+                },
 
                 // ── Workspace 概览（聚合所有 trait）───
                 "show_workspace" => Some(Box::new(ShowWorkspace::new(
@@ -268,6 +275,7 @@ mod tests {
     use crate::agent::{Agent, AgentError};
     use crate::config::McpServerConfig;
     use crate::knowledge::KnowledgeManager;
+    use crate::search::{SearchBackend, searxng::SearxngClient};
     use crate::skills::SkillRegister;
     use crate::workflow::WorkflowAccess;
 
@@ -380,6 +388,7 @@ mod tests {
             mcp_access: None,
             workflow_persister: None,
             workspace_root: None,
+            web_search: None,
         }
     }
 
@@ -387,6 +396,9 @@ mod tests {
         let mut deps = base_deps();
         deps.workflow_access = Some(Arc::new(StubWorkflowAccess));
         deps.mcp_access = Some(Arc::new(StubMcpAccess));
+        deps.web_search = Some(Arc::new(SearchBackend::Searxng(
+            SearxngClient::new("http://localhost:8888").expect("client"),
+        )));
         deps
     }
 
@@ -413,7 +425,8 @@ mod tests {
         }
     }
 
-    /// 按依赖过滤：缺 workflow_access / mcp_access 时，对应工具不可注册。
+    /// 按依赖过滤：缺 workflow_access / mcp_access / web_search 后端时，
+    /// 对应工具不可注册。
     #[test]
     fn optional_dep_tools_skipped_when_deps_missing() {
         let deps = base_deps();
@@ -434,6 +447,7 @@ mod tests {
             "save_mcp_server",
             "delete_mcp_server",
             "test_mcp_connection",
+            "web_search",
         ] {
             assert!(
                 !names.contains(&name.to_string()),
@@ -442,6 +456,15 @@ mod tests {
         }
         assert!(names.contains(&"shell".to_string()));
         assert!(names.contains(&"list_tools".to_string()));
+    }
+
+    /// web_search 在后端就绪时正常注册（与 fetch 同级注册验证）。
+    #[test]
+    fn web_search_registers_with_backend() {
+        let deps = full_deps();
+        let executor = ToolRegister::build(&["web_search".to_string()], &deps);
+        let names = definition_names(executor.as_ref());
+        assert_eq!(names, vec!["web_search".to_string()]);
     }
 
     /// list_tools 输出与 build 全量注册结果一致（过滤后）。

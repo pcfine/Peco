@@ -59,6 +59,7 @@ impl SystemConfig {
             ProvidersConfig {
                 default_provider: "deepseek".into(),
                 providers,
+                web_search: None,
             }
         });
 

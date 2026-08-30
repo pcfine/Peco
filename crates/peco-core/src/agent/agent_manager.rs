@@ -19,6 +19,7 @@ use crate::agent::{Agent, AgentError};
 use crate::config::{McpConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::mcp::McpConfigStore;
+use crate::search::SearchBackend;
 use crate::skills::SkillRegister;
 use crate::tools::McpAccess;
 use crate::workflow::WorkflowAccess;
@@ -64,6 +65,10 @@ pub struct AgentManager {
     workflow_access: RwLock<Option<Arc<dyn WorkflowAccess>>>,
     /// MCP 依赖注入（由 WorkSpace 在初始化时设置）。
     mcp_access: RwLock<Option<Arc<dyn McpAccess>>>,
+    /// web 搜索后端（来自 providers.toml 的 `[web_search]` 段）。
+    /// 构造期建一次（reqwest 连接池与 `${ENV_VAR}` 解析只做一次）；
+    /// None 表示未配置或配置无效，web_search 工具随之 skip。
+    web_search: Option<Arc<SearchBackend>>,
 }
 
 impl AgentManager {
@@ -89,7 +94,6 @@ impl AgentManager {
             agents_dir,
             workspace_root,
             user_id,
-            user_config,
             mcp_config: Arc::new(mcp_config),
             skill_registry,
             knowledge_manager,
@@ -97,6 +101,10 @@ impl AgentManager {
             cache: RwLock::new(HashMap::new()),
             workflow_access: RwLock::new(None),
             mcp_access: RwLock::new(None),
+            // 构造期建一次搜索后端（连接池 + env var 解析只做一次）
+            web_search: SearchBackend::from_config_opt(user_config.providers.web_search.as_ref())
+                .map(Arc::new),
+            user_config,
         }
     }
 
@@ -250,6 +258,7 @@ impl AgentManager {
             mcp_access: self.mcp_access.read().unwrap().clone(),
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
+            web_search: self.web_search.clone(),
         }
     }
 
@@ -274,6 +283,7 @@ impl AgentManager {
                 knowledge_manager: self.knowledge_manager.clone(),
                 workflow_access: workflow_access.clone(),
                 mcp_access: mcp_access.clone(),
+                web_search: self.web_search.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -287,6 +297,7 @@ impl AgentManager {
             mcp_access,
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
+            web_search: self.web_search.clone(),
         }
     }
 
@@ -489,6 +500,8 @@ struct AmAgentAccess {
     knowledge_manager: Arc<KnowledgeManager>,
     workflow_access: Option<Arc<dyn WorkflowAccess>>,
     mcp_access: Option<Arc<dyn McpAccess>>,
+    /// AgentManager 构造期缓存的搜索后端（`web_search` 子 Agent 装配用）。
+    web_search: Option<Arc<SearchBackend>>,
 }
 
 impl AgentAccess for AmAgentAccess {
@@ -511,6 +524,7 @@ impl AgentAccess for AmAgentAccess {
                 knowledge_manager: self.knowledge_manager.clone(),
                 workflow_access: self.workflow_access.clone(),
                 mcp_access: self.mcp_access.clone(),
+                web_search: self.web_search.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -524,6 +538,7 @@ impl AgentAccess for AmAgentAccess {
             mcp_access: self.mcp_access.clone(),
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
+            web_search: self.web_search.clone(),
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;

@@ -25,5 +25,8 @@ pub use loader::{find_config_path, load_config, provider_names, save_config};
 pub use mcp_config::{McpConfig, McpServerConfig, TransportType, resolve_env_vars};
 pub use merge::merge_providers_config;
 pub use system_config::SystemConfig;
-pub use types::{LlmApiParams, ProviderEntry, ProvidersConfig, resolve_key};
+pub use types::{
+    BraveConfig, LlmApiParams, ProviderEntry, ProvidersConfig, SearxngConfig, TavilyConfig,
+    WebSearchConfig, resolve_key,
+};
 pub use user_config::UserConfig;

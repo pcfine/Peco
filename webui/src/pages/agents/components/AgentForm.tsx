@@ -557,6 +557,7 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
       <FormSection title="能力配置">
         <CheckboxSection
           title="工具选择"
+          hint="💡 web_search 需在 providers.toml 配置 [web_search]（如自托管 SearXNG），未配置时该工具不生效"
           loading={false}
           error={null}
           onRetry={() => {}}

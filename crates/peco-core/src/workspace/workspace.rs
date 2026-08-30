@@ -251,6 +251,7 @@ impl WorkSpace {
         let mut deps = self.agent_manager.build_deps();
         deps.workflow_access = Some(self.clone() as Arc<dyn WorkflowAccess>);
         deps.mcp_access = Some(self.clone() as Arc<dyn McpAccess>);
+        // web_search 后端已由 AgentManager 构造期缓存，随 build_deps() 注入；
         // workflow_persister 由 peco-server 层注入；此处保持 None
         ToolRegister::build(tool_names, &deps)
     }

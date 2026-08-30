@@ -26,6 +26,7 @@ export const PROVIDERS = [
 export const TOOLS = [
   { value: "shell", label: "Shell 执行" },
   { value: "fetch", label: "HTTP 请求" },
+  { value: "web_search", label: "网页搜索" },
   { value: "search_knowledge", label: "知识搜索" },
   { value: "list_knowledge_bases", label: "知识库列表" },
   { value: "add_to_knowledge_base", label: "添加到知识库" },

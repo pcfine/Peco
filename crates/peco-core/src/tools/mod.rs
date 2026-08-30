@@ -12,6 +12,7 @@ mod skill_tools;
 mod sub_agent;
 mod tool_factory;
 mod tool_register;
+mod web_search;
 mod workspace_info;
 
 pub use agent_tools::{DeleteAgent, ReadAgent, SaveAgent};
@@ -29,6 +30,7 @@ pub use skill_tools::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};
 pub use tool_factory::{DefaultToolsExecutor, StringError};
 pub use tool_register::ToolRegister;
+pub use web_search::WebSearchTool;
 pub use workspace_info::ShowWorkspace;
 
 use async_trait::async_trait;

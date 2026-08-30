@@ -83,6 +83,7 @@ mod tests {
         let config = ProvidersConfig {
             default_provider: "deepseek".into(),
             providers: Default::default(),
+            web_search: None,
         };
 
         let dir = std::env::temp_dir().join("peco-config-test");
@@ -102,6 +103,7 @@ mod tests {
         let mut config = ProvidersConfig {
             default_provider: "openai".into(),
             providers: Default::default(),
+            web_search: None,
         };
         config.providers.insert(
             "deepseek".into(),

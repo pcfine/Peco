@@ -555,6 +555,7 @@ mod tests {
             providers: ProvidersConfig {
                 default_provider: name.to_string(),
                 providers,
+                web_search: None,
             },
             mcp: McpConfig::empty(),
         }

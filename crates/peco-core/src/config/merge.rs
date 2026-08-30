@@ -51,6 +51,12 @@ pub fn merge_providers_config(system: &ProvidersConfig, user: &ProvidersConfig) 
     ProvidersConfig {
         default_provider,
         providers: merged_providers,
+        // web_search 段：用户有则整段覆盖，与 mcp 的覆盖语义一致
+        // （用户 providers.toml 只写一个引擎段时会丢弃系统级其余段，文档已明示）
+        web_search: user
+            .web_search
+            .clone()
+            .or_else(|| system.web_search.clone()),
     }
 }
 
@@ -112,6 +118,7 @@ fn merge_llm_params(system: &LlmApiParams, user: &LlmApiParams) -> LlmApiParams 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WebSearchConfig;
 
     fn make_system_config() -> ProvidersConfig {
         let mut providers = HashMap::new();
@@ -134,6 +141,7 @@ mod tests {
         ProvidersConfig {
             default_provider: "deepseek".to_string(),
             providers,
+            web_search: None,
         }
     }
 
@@ -158,6 +166,7 @@ mod tests {
         ProvidersConfig {
             default_provider: String::new(),
             providers,
+            web_search: None,
         }
     }
 
@@ -190,6 +199,34 @@ mod tests {
 
         // 用户未设置 default_provider，应继承系统值
         assert_eq!(merged.default_provider, "deepseek");
+    }
+
+    #[test]
+    fn test_merge_web_search_user_section_overrides() {
+        let mut system = make_system_config();
+        system.web_search = Some(WebSearchConfig {
+            provider: Some("brave".to_string()),
+            ..Default::default()
+        });
+
+        // 用户未配置 → 继承系统
+        let merged = merge_providers_config(&system, &make_user_config());
+        assert_eq!(
+            merged.web_search.as_ref().and_then(|w| w.provider.clone()),
+            Some("brave".to_string())
+        );
+
+        // 用户配置 → 整段覆盖
+        let mut user = make_user_config();
+        user.web_search = Some(WebSearchConfig {
+            provider: Some("searxng".to_string()),
+            ..Default::default()
+        });
+        let merged = merge_providers_config(&system, &user);
+        assert_eq!(
+            merged.web_search.as_ref().and_then(|w| w.provider.clone()),
+            Some("searxng".to_string())
+        );
     }
 
     #[test]

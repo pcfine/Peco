@@ -95,6 +95,7 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
         mcp_access: None,
         workflow_persister: None,
         workspace_root: None,
+        web_search: None,
     };
 
     let agent_md = agent_dir.join("agent.md");

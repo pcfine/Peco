@@ -49,6 +49,7 @@ fn load_providers(path: &std::path::Path) -> Result<ProvidersConfig, ApiError> {
         Ok(ProvidersConfig {
             default_provider: "deepseek".to_string(),
             providers: Default::default(),
+            web_search: None,
         })
     }
 }

@@ -32,6 +32,11 @@ pub struct ProvidersConfig {
     /// key 是用户自定义的简称（如 "deepseek", "openai"）。
     #[serde(default)]
     pub providers: HashMap<String, ProviderEntry>,
+
+    /// 内置 web_search 工具配置（可选段 `[web_search]`）。
+    /// 未配置时 web_search 工具不注册（warn + skip）。
+    #[serde(default)]
+    pub web_search: Option<WebSearchConfig>,
 }
 
 fn default_provider_name() -> String {
@@ -65,6 +70,64 @@ pub struct ProviderEntry {
     /// 该 provider 的默认模型和参数。
     #[serde(default)]
     pub default: Option<LlmApiParams>,
+}
+
+// ── web_search 配置 ──────────────────────────────────────────────────────────
+
+/// `[web_search]` 配置段 — 内置 web_search 工具的搜索引擎选择与凭据。
+///
+/// # Example
+///
+/// ```toml
+/// [web_search]
+/// provider = "searxng"          # "searxng" | "tavily" | "brave"
+///
+/// [web_search.searxng]
+/// base_url = "http://localhost:8888"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WebSearchConfig {
+    /// 搜索引擎名："searxng" | "tavily" | "brave"。
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// SearXNG 引擎配置（自托管，免 key，默认引擎）。
+    #[serde(default)]
+    pub searxng: Option<SearxngConfig>,
+
+    /// Tavily 引擎配置（需 API key）。
+    #[serde(default)]
+    pub tavily: Option<TavilyConfig>,
+
+    /// Brave 引擎配置（需 API key）。
+    #[serde(default)]
+    pub brave: Option<BraveConfig>,
+}
+
+/// SearXNG 引擎配置（免 key）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SearxngConfig {
+    /// 自托管实例地址（如 "http://localhost:8888"）。
+    /// 实例需在 settings.yml 的 search.formats 中启用 "json"。
+    pub base_url: String,
+}
+
+/// Tavily 引擎配置。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TavilyConfig {
+    /// API Key：字面量或 `${ENV_VAR}` 语法。
+    pub api_key: String,
+
+    /// 自定义 base URL（可选，默认官方端点）。
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+/// Brave 引擎配置。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BraveConfig {
+    /// API Key：字面量或 `${ENV_VAR}` 语法。
+    pub api_key: String,
 }
 
 /// Provider 级别的默认模型配置。

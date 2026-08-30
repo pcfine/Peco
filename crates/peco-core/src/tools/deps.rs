@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::agent::{Agent, AgentError};
 use crate::config::{McpServerConfig, TransportType};
 use crate::knowledge::KnowledgeManager;
+use crate::search::SearchBackend;
 use crate::skills::SkillRegister;
 use crate::workflow::WorkflowAccess;
 use crate::workflow::persistence::WorkflowPersister;
@@ -100,6 +101,9 @@ pub struct ToolDependencies {
     /// 工作空间根目录。用于 shell 工具的默认 cwd 与 show_workspace 的 root 输出。
     /// Optional — None 时行为与历史版本逐字节一致（examples / 非 WorkSpace 路径）。
     pub workspace_root: Option<PathBuf>,
+    /// web 搜索后端（来自 providers.toml 的 `[web_search]` 段）。
+    /// Optional — None 时 web_search 工具 warn + skip，保持向后兼容。
+    pub web_search: Option<Arc<SearchBackend>>,
 }
 
 impl Clone for ToolDependencies {
@@ -113,6 +117,7 @@ impl Clone for ToolDependencies {
             mcp_access: self.mcp_access.clone(),
             workflow_persister: self.workflow_persister.clone(),
             workspace_root: self.workspace_root.clone(),
+            web_search: self.web_search.clone(),
         }
     }
 }
