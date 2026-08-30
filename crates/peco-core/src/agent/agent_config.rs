@@ -500,7 +500,7 @@ mod tests {
         let raw = "---\nname: minimal\ndescription: Minimal\n---\n";
         let (fm, body) = split_frontmatter(raw).unwrap();
         assert_eq!(fm, "name: minimal\ndescription: Minimal");
-        assert!(body.is_empty() || body == "");
+        assert!(body.is_empty());
     }
 
     // ── assemble_agent_md / parse_agent_md round-trip ────────────────────

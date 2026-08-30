@@ -267,7 +267,7 @@ mod tests {
             let am = AnnotatedMessage::new(
                 MessageId(i),
                 i as usize,
-                user(&format!("q{i}")),
+                user(format!("q{i}")),
                 MessageSource::UserInput,
             );
             cb.push_turn(vec![am]);

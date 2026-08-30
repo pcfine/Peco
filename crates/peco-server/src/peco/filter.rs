@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn test_pinned_summary_always_kept_first() {
         let filter = PecoContextFilter::new(1); // 预算为 0 也不驱逐摘要
-        let msgs = vec![
+        let msgs = [
             make_pinned(system(
                 "<earlier_context_summary>摘要</earlier_context_summary>",
             )),
@@ -236,7 +236,7 @@ mod tests {
         // Role::System 但来源不是 SystemInjection 的消息不得被提升为 pinned —
         // pinned 判定依据 MessageSource，而非 Role。
         let filter = PecoContextFilter::new(10_000);
-        let msgs = vec![
+        let msgs = [
             make_annotated(0, system("普通 system 消息")),
             make_annotated(1, user("问题")),
         ];
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn test_current_turn_keeps_full_tool_context() {
         let filter = PecoContextFilter::new(10_000);
-        let msgs = vec![
+        let msgs = [
             make_annotated(0, user("旧问题")),
             make_annotated(0, assistant("旧回答")),
             make_annotated(1, user("新问题")),
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_history_drops_tool_items_but_keeps_text() {
         let filter = PecoContextFilter::new(10_000);
-        let msgs = vec![
+        let msgs = [
             make_annotated(0, user("查天气")),
             make_annotated(0, assistant("让我看看")),
             make_annotated(0, function_call("c1", "fetch")),

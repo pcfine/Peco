@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_full_history_no_prompt() {
-        let msgs = vec![
+        let msgs = [
             make_annotated(0, 0, user("hello")),
             make_annotated(1, 0, assistant("hi")),
         ];
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_full_history_with_prompt() {
-        let msgs = vec![make_annotated(0, 0, user("hello"))];
+        let msgs = [make_annotated(0, 0, user("hello"))];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
         let result = build_context(
             &refs,
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_truncates() {
-        let msgs = vec![
+        let msgs = [
             make_annotated(0, 0, user("q0")),
             make_annotated(1, 1, user("q1")),
             make_annotated(2, 2, user("q2")),
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_all_fit() {
-        let msgs = vec![
+        let msgs = [
             make_annotated(0, 0, user("q0")),
             make_annotated(1, 1, user("q1")),
         ];
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_zero() {
-        let msgs = vec![make_annotated(0, 0, user("q0"))];
+        let msgs = [make_annotated(0, 0, user("q0"))];
         let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
         let result = build_context(
             &refs,
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn test_token_budget_keeps_at_least_one_turn() {
         // Long messages to ensure non-zero token estimates
-        let msgs = vec![
+        let msgs = [
             make_annotated(
                 0,
                 0,
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_token_budget_truncates_correctly() {
-        let msgs = vec![
+        let msgs = [
             make_annotated(
                 0,
                 0,
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_token_budget_with_summarize() {
-        let msgs = vec![
+        let msgs = [
             make_annotated(
                 0,
                 0,

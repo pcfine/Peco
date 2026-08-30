@@ -739,7 +739,7 @@ mod pre_validate_tests {
     fn test_missing_steps() {
         let yaml =
             "---\nworkflow:\n  name: \"test\"\n  description: \"test\"\n  version: \"1.0\"\n---";
-        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        let err = pre_validate_workflow_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("Missing 'workflow.steps'"));
     }
 
@@ -753,7 +753,7 @@ mod pre_validate_tests {
     #[test]
     fn test_missing_workflow_key() {
         let yaml = "---\nname: \"test\"\n---";
-        let err = pre_validate_workflow_yaml(&yaml).unwrap_err();
+        let err = pre_validate_workflow_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("Missing top-level 'workflow:'"));
     }
 

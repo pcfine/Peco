@@ -1036,7 +1036,7 @@ mod tests {
         assert_eq!(v, 30);
         assert_eq!(t, 30);
         assert_eq!(g, 1);
-        assert!(et.iter().any(|e| *e == EdgeType::Contains));
+        assert!(et.contains(&EdgeType::Contains));
 
         let s = SearchStrategy::TextOnly;
         let (v, t, g, et, _) = decompose_strategy(&s, 10);

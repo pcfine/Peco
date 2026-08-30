@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_materialize_personal() {
-        let t = BuiltinTemplate::personal().clone();
+        let t = BuiltinTemplate::personal();
         let tmp = t.materialize().unwrap();
         assert!(tmp.path().join("agents/@assistant/agent.md").exists());
         assert!(tmp.path().join("agents/@memory/agent.md").exists());
@@ -115,14 +115,14 @@ mod tests {
 
     #[test]
     fn test_materialize_minimal() {
-        let t = BuiltinTemplate::minimal().clone();
+        let t = BuiltinTemplate::minimal();
         let tmp = t.materialize().unwrap();
         assert!(tmp.path().join("agents/basic-chat/agent.md").exists());
     }
 
     #[test]
     fn test_materialize_developer() {
-        let t = BuiltinTemplate::developer().clone();
+        let t = BuiltinTemplate::developer();
         let tmp = t.materialize().unwrap();
         assert!(
             tmp.path()

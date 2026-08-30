@@ -63,7 +63,7 @@ async fn test_create_conversation_with_specific_agent() {
         .await
         .unwrap();
     let agent: serde_json::Value = agent_resp.json().await.unwrap();
-    let agent_id = agent["id"].as_str().unwrap();
+    let _agent_id = agent["id"].as_str().unwrap();
 
     // 创建绑定该 Agent 的对话（v2: 使用 agent_name 而非 agent_id）
     let resp = app

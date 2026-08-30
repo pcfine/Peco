@@ -250,18 +250,6 @@ mod tests {
         s
     }
 
-    fn user_text(session: &Session) -> String {
-        session
-            .committed_turns()
-            .last()
-            .and_then(|t| t.first())
-            .map(|am| match am.message.as_ref() {
-                InputItem::Message { content, .. } => content.clone(),
-                _ => String::new(),
-            })
-            .unwrap()
-    }
-
     async fn make_km() -> Arc<KnowledgeManager> {
         let tmp = tempfile::tempdir().unwrap();
         let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));

@@ -349,6 +349,6 @@ metadata:
         let raw = "---\nname: minimal\ndescription: Minimal skill\n---\n";
         let (fm, body) = split_frontmatter(raw).unwrap();
         assert_eq!(fm, "name: minimal\ndescription: Minimal skill");
-        assert!(body.is_empty() || body == "");
+        assert!(body.is_empty());
     }
 }

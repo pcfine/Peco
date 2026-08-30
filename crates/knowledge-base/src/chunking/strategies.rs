@@ -318,7 +318,7 @@ mod tests {
         let chunker = FixedSizeChunker::new(20);
         let text = "abcdefghijklmnopqrstuvwxyz";
         let chunks = chunker.chunk(&test_doc(text));
-        assert!(chunks.len() >= 1);
+        assert!(!chunks.is_empty());
     }
 
     #[test]
