@@ -53,7 +53,9 @@ use async_trait::async_trait;
 pub use error::ProviderError;
 pub use generate_stream::GenerateStream;
 pub use providers::deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter};
-pub use providers::qwen::{QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter};
+pub use providers::qwen::{
+    QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter, QwenResponsesAdapter,
+};
 pub use response::{
     BlockAssembler, BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult,
     InputItem, ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk,

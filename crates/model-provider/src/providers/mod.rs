@@ -9,4 +9,6 @@ pub mod deepseek;
 pub mod qwen;
 
 pub use deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter};
-pub use qwen::{QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter};
+pub use qwen::{
+    QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter, QwenResponsesAdapter,
+};

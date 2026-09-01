@@ -202,7 +202,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - `ModelProvider` trait（async_trait）：`name()`、`chat(ChatRequest) -> ChatResponse`、`stream_chat(ChatRequest) -> ChatStream`。
 - `ChatRequest`：model、messages、tools（作为 `ToolDefinition`）、temperature、max_tokens、reasoning_effort、additional_params。
 - `StreamEvent` 枚举：`TextDelta`、`ReasoningDelta`、`ToolCallDelta`、`ToolCallComplete`、`End`。
-- 目前实现了 `DeepSeek` provider（使用 `DEEPSEEK_API_KEY` 环境变量）。Provider 类型定义支持 `openai`、`anthropic`、`ollama`、`groq`（待实现）。
+- 目前实现了两个 provider：`DeepSeek`（`DEEPSEEK_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）和 `Qwen`（`DASHSCOPE_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）。Provider 类型定义支持 `openai`、`anthropic`、`ollama`、`groq`（待实现）。
+- **Responses 适配器**：`DeepSeekResponsesAdapter`（原生 `/responses`，端点剥离 `/v1`）与 `QwenResponsesAdapter`（百炼 OpenAI 兼容 `/responses`，端点**保留** `/v1`；reasoning 输出为 `summary` 摘要形态并按原形态回传；`function_call_output` 必须紧跟对应 `function_call` 的逐对排布；`store` 显式置 `false`）。请求/响应经中立词汇表（`GenerateRequest`/`GenerateResult`/`StreamChunk`）直通映射，差异细节见 `docs/design/qwen-responses-design.md` 与 `docs/research/qwen-responses-research.md`。
 - Provider 配置位于 `providers.toml`（相对于 agent.md 文件或从标准位置解析）。
 
 **SSE 流式管道**（[crates/model-provider/src/providers/streaming.rs](crates/model-provider/src/providers/streaming.rs)）：
@@ -242,8 +243,19 @@ default_provider = "deepseek"
 type = "deepseek"
 api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com"
+# api = "responses"（默认）| "chat" — 选择 Responses 端点或 chat completions
 [providers.deepseek.default]
 model = "deepseek-v4-flash"
+temperature = 0.7
+max_tokens = 4096
+stream = true
+
+[providers.qwen]
+type = "qwen"
+api_key = "${DASHSCOPE_API_KEY}"
+# api = "responses"（默认）| "chat" — responses 走百炼 OpenAI 兼容 /responses 端点
+[providers.qwen.default]
+model = "qwen3.7-max"
 temperature = 0.7
 max_tokens = 4096
 stream = true

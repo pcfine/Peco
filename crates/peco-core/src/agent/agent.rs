@@ -10,8 +10,8 @@ use crate::agent::agent_config::{
 use crate::agent::error::AgentError;
 use model_provider::{
     DeepSeek, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult, GenerateStream, InputItem,
-    ModelProvider, QwenChatCompletionsAdapter, ReasoningConfig, ReasoningEffort, ToolChoice,
-    ToolDefinition, Usage,
+    ModelProvider, QwenChatCompletionsAdapter, QwenResponsesAdapter, ReasoningConfig,
+    ReasoningEffort, ToolChoice, ToolDefinition, Usage,
 };
 
 use serde::{Deserialize, Serialize};
@@ -505,35 +505,39 @@ pub fn build_provider_with_user(
             }
         }
         "qwen" => {
-            // Qwen 仅提供 OpenAI 兼容的 chat completions 端点，没有原生 /responses。
+            // 按 `api` 字段选择适配器：默认（含 None）→ OpenAI 兼容 /responses，
+            // `"chat"` → chat completions（显式选择时保留），其它值显式报错。
             let api_mode = entry
                 .api
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
 
-            match api_mode {
-                Some(api) if api.eq_ignore_ascii_case("chat") => {}
-                Some(api) if api.eq_ignore_ascii_case("responses") => {
-                    return Err(AgentError::Config(format!(
-                        "provider '{provider_name}' has no '/responses' endpoint: \
-                         Qwen only supports chat completions (api = 'chat')"
-                    )));
-                }
+            let use_responses = match api_mode {
+                Some(api) if api.eq_ignore_ascii_case("chat") => false,
+                Some(api) if api.eq_ignore_ascii_case("responses") => true,
+                None => true,
                 Some(other) => {
                     return Err(AgentError::Config(format!(
                         "unsupported api mode '{other}' for provider '{provider_name}'. \
-                         Expected 'chat'"
+                         Expected 'chat' or 'responses'"
                     )));
                 }
-                None => {}
-            }
+            };
 
-            let mut provider = QwenChatCompletionsAdapter::new(api_key)?;
-            if let Some(ref url) = entry.base_url {
-                provider = provider.with_base_url(url.clone());
+            if use_responses {
+                let mut provider = QwenResponsesAdapter::new(api_key)?;
+                if let Some(ref url) = entry.base_url {
+                    provider = provider.with_base_url(url.clone());
+                }
+                Ok(Arc::new(provider))
+            } else {
+                let mut provider = QwenChatCompletionsAdapter::new(api_key)?;
+                if let Some(ref url) = entry.base_url {
+                    provider = provider.with_base_url(url.clone());
+                }
+                Ok(Arc::new(provider))
             }
-            Ok(Arc::new(provider))
         }
         other => Err(AgentError::Config(format!(
             "unsupported provider type: '{other}'. Currently supported: deepseek, qwen"
@@ -582,39 +586,82 @@ mod tests {
         }
     }
 
+    /// 未配置 `api` 时默认走 OpenAI 兼容 /responses。
     #[test]
-    fn test_qwen_branch_builds_chat_adapter() {
+    fn test_qwen_branch_defaults_to_responses_adapter() {
         let entry = qwen_entry();
+        assert!(entry.api.is_none());
         let config = user_config("qwen", entry);
         let provider =
             build_provider_with_user(&model_config("qwen"), &config).expect("qwen must build");
+        assert_eq!(provider.name(), "qwen-responses");
+    }
+
+    #[test]
+    fn test_qwen_branch_builds_chat_adapter() {
+        let entry = ProviderEntry {
+            api: Some("chat".to_string()),
+            ..qwen_entry()
+        };
+        let config = user_config("qwen", entry);
+        let provider = build_provider_with_user(&model_config("qwen"), &config)
+            .expect("qwen api = 'chat' must build");
         assert_eq!(provider.name(), "qwen");
     }
 
     #[test]
     fn test_qwen_branch_applies_base_url() {
         let entry = ProviderEntry {
+            api: Some("chat".to_string()),
             base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
             ..qwen_entry()
         };
         let config = user_config("qwen", entry);
-        let provider =
-            build_provider_with_user(&model_config("qwen"), &config).expect("qwen must build");
+        let provider = build_provider_with_user(&model_config("qwen"), &config)
+            .expect("qwen api = 'chat' must build");
         assert_eq!(provider.name(), "qwen");
     }
 
     #[test]
-    fn test_qwen_branch_rejects_responses_api() {
+    fn test_qwen_branch_builds_responses_adapter() {
         let entry = ProviderEntry {
             api: Some("responses".to_string()),
             ..qwen_entry()
         };
         let config = user_config("qwen", entry);
+        let provider = build_provider_with_user(&model_config("qwen"), &config)
+            .expect("qwen api = 'responses' must build");
+        assert_eq!(provider.name(), "qwen-responses");
+    }
+
+    #[test]
+    fn test_qwen_branch_applies_base_url_to_responses_adapter() {
+        let entry = ProviderEntry {
+            api: Some("responses".to_string()),
+            base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+            ..qwen_entry()
+        };
+        let config = user_config("qwen", entry);
+        let provider = build_provider_with_user(&model_config("qwen"), &config)
+            .expect("qwen api = 'responses' must build");
+        assert_eq!(provider.name(), "qwen-responses");
+    }
+
+    #[test]
+    fn test_qwen_branch_rejects_unknown_api_mode() {
+        let entry = ProviderEntry {
+            api: Some("native".to_string()),
+            ..qwen_entry()
+        };
+        let config = user_config("qwen", entry);
         let err = build_provider_with_user(&model_config("qwen"), &config)
             .err()
-            .expect("api = 'responses' must be rejected");
+            .expect("unknown api mode must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("no '/responses'"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("unsupported api mode 'native'"),
+            "unexpected message: {msg}"
+        );
     }
 
     #[test]
