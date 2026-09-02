@@ -62,7 +62,7 @@ tokio = { version = "1.49.0", features = [
 ] }
 tokio-stream = "0.1"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "chrono"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
 jsonwebtoken = "9"

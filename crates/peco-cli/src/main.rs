@@ -142,10 +142,13 @@ async fn ensure_workspace_initialized(config: &CliConfig) -> anyhow::Result<()> 
 /// 初始化 `tracing_subscriber`，日志级别由 `RUST_LOG` 环境变量控制。
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::time::ChronoLocal;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
+    // 默认 timer 打 UTC，改用本机时区；offset 后缀让时间戳自描述，可与 UTC 时间戳对账。
     tracing_subscriber::fmt()
+        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f%:z".into()))
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)

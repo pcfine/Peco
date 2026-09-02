@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::ChronoLocal;
 
 use peco_server::config::ServerConfig;
 use peco_server::db;
@@ -19,7 +20,9 @@ async fn main() -> anyhow::Result<()> {
     // EnvFilter 的 ERROR 默认级别，而该 crate 只发 warn/debug —— 于是 LLM 调用层的
     // 所有异常（非 2xx、SSE 重连、丢弃工具调用）都会静默。
     // 排查 LLM 问题：`RUST_LOG=model_provider=debug`，看完整请求体用 `=trace`。
+    // 日志时间戳用本机时区（默认 timer 打 UTC）；offset 后缀让时间戳自描述，便于与 UTC 落库时间戳对账。
     tracing_subscriber::fmt()
+        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f%:z".into()))
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 EnvFilter::new("peco=info,model_provider=info,tower_http=info")
