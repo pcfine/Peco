@@ -12,6 +12,7 @@ pub mod qwen;
 pub use deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter};
 pub use openai::{
     OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI, OpenAiChatCompletionsAdapter,
+    OpenAiResponsesAdapter,
 };
 pub use qwen::{
     QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter, QwenResponsesAdapter,

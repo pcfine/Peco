@@ -27,12 +27,13 @@ use crate::{GenerateStream, ModelProvider, ProviderError, ToolCall, ToolDefiniti
 // OpenAI 客户端
 // ============================================================================
 
-/// OpenAI API 的基础 URL（chat completions 端点位于其 `v1` 路径下）。
-const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
+/// OpenAI API 的基础 URL（chat completions 与原生 responses 端点都挂在 `v1` 路径下）。
+pub(crate) const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 
-/// 思考模式下生成预算的建议下限提示（推理 token 计入 `max_completion_tokens`，
-/// 预算过小会导致可见输出被推理挤占；仅 `debug!` 记录，不改写用户配置）。
-const OPENAI_REASONING_MIN_BUDGET: u32 = 25_000;
+/// 思考模式下生成预算的建议下限提示（推理 token 计入输出预算：chat 为
+/// `max_completion_tokens`，responses 为 `max_output_tokens`；预算过小会导致可见
+/// 输出被推理挤占。仅 `debug!` 记录，不改写用户配置）。
+pub(crate) const OPENAI_REASONING_MIN_BUDGET: u32 = 25_000;
 
 /// OpenAI API 客户端，实现 [`ModelProvider`]。
 ///

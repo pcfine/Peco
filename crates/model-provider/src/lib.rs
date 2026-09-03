@@ -55,6 +55,7 @@ pub use generate_stream::GenerateStream;
 pub use providers::deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter};
 pub use providers::openai::{
     OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI, OpenAiChatCompletionsAdapter,
+    OpenAiResponsesAdapter,
 };
 pub use providers::qwen::{
     QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter, QwenResponsesAdapter,
