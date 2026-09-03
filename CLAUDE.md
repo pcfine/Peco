@@ -202,8 +202,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - `ModelProvider` trait（async_trait）：`name()`、`generate_full(&GenerateRequest) -> GenerateResult`、`generate_stream(&GenerateRequest) -> GenerateStream`。
 - `GenerateRequest`：model、instructions、input（`InputItem` 列表）、tools（作为 `ToolDefinition`）、tool_choice、temperature、top_p、max_output_tokens、reasoning（`ReasoningConfig`）、text（`TextFormat`）、additional_params。
 - `StreamChunk` 枚举：`BlockStart`、`TextDelta`、`ReasoningDelta`、`ToolCallDelta`、`BlockEnd`、`Usage`、`Finish`。
-- 目前实现了三个 provider：`DeepSeek`（`DEEPSEEK_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）、`Qwen`（`DASHSCOPE_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）和 `OpenAI`（`OPENAI_API_KEY`，chat completions 适配器，`api` 默认 `"chat"`，`"responses"` 显式报错未实现；OpenAI 兼容网关经 `base_url` 覆盖接入）。Provider 类型定义支持 `anthropic`、`ollama`、`groq`（待实现）。
-- **Responses 适配器**：`DeepSeekResponsesAdapter`（原生 `/responses`，端点剥离 `/v1`）与 `QwenResponsesAdapter`（百炼 OpenAI 兼容 `/responses`，端点**保留** `/v1`；reasoning 输出为 `summary` 摘要形态并按原形态回传；`function_call_output` 必须紧跟对应 `function_call` 的逐对排布；`store` 显式置 `false`）。请求/响应经中立词汇表（`GenerateRequest`/`GenerateResult`/`StreamChunk`）直通映射，差异细节见 `docs/design/qwen-responses-design.md` 与 `docs/research/qwen-responses-research.md`。
+- 目前实现了三个 provider：`DeepSeek`（`DEEPSEEK_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）、`Qwen`（`DASHSCOPE_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）和 `OpenAI`（`OPENAI_API_KEY`，chat + Responses 双路径，`api` 默认 `"chat"`；OpenAI 兼容网关经 `base_url` 覆盖接入）。Provider 类型定义支持 `anthropic`、`ollama`、`groq`（待实现）。
+- **Responses 适配器**：`DeepSeekResponsesAdapter`（原生 `/responses`，端点剥离 `/v1`）与 `QwenResponsesAdapter`（百炼 OpenAI 兼容 `/responses`，端点**保留** `/v1`；reasoning 输出为 `summary` 摘要形态并按原形态回传；`function_call_output` 必须紧跟对应 `function_call` 的逐对排布；`store` 显式置 `false`）。`OpenAiResponsesAdapter`（OpenAI 原生 `/responses`，端点保留 `/v1`；`store` 显式置 `false`、顶层 `instructions` 直传、`Role::Developer` 原生直传、reasoning `{effort, summary:"auto"}` 与 chat 同名档位、历史 `Reasoning` 项不回传、非流式块序归一为 Reasoning→Text→ToolCall）。请求/响应经中立词汇表（`GenerateRequest`/`GenerateResult`/`StreamChunk`）直通映射，差异细节见 `docs/design/qwen-responses-design.md` 与 `docs/research/qwen-responses-research.md`。
 - Provider 配置位于 `providers.toml`（相对于 agent.md 文件或从标准位置解析）。
 
 **SSE 流式管道**（[crates/model-provider/src/streaming/pipeline.rs](crates/model-provider/src/streaming/pipeline.rs)）：
@@ -264,7 +264,7 @@ stream = true
 type = "openai"
 api_key = "${OPENAI_API_KEY}"
 base_url = "https://api.openai.com/v1"   # 可省略；覆盖为兼容网关（vLLM/OpenRouter）地址
-# api = "chat"（默认）— "responses" 尚未实现，配置会显式报错
+# api = "chat"（默认）| "responses" — responses 走 OpenAI 原生 /responses 端点
 [providers.openai.default]
 model = "gpt-5.2"
 temperature = 0.7
