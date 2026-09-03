@@ -64,8 +64,8 @@ pub struct ProviderEntry {
     /// 使用的 API 风格：`"responses"` | `"chat"`（可选，默认随 provider 类型）。
     ///
     /// `None` 时由 merge 继承 system 配置，分发时按类型回退：`deepseek` / `qwen`
-    /// 回退 `"responses"`，`openai` 回退 `"chat"`（其 `"responses"` 尚未实现，
-    /// 显式配置时报错，见 `build_provider_with_user`）。
+    /// 回退 `"responses"`，`openai` 回退 `"chat"`（三种类型两种风格均已实现，
+    /// 分发逻辑见 `build_provider_with_user`）。
     #[serde(default)]
     pub api: Option<String>,
 

@@ -10,8 +10,8 @@ use crate::agent::agent_config::{
 use crate::agent::error::AgentError;
 use model_provider::{
     DeepSeek, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult, GenerateStream, InputItem,
-    ModelProvider, OpenAI, QwenChatCompletionsAdapter, QwenResponsesAdapter, ReasoningConfig,
-    ReasoningEffort, ToolChoice, ToolDefinition, Usage,
+    ModelProvider, OpenAI, OpenAiResponsesAdapter, QwenChatCompletionsAdapter,
+    QwenResponsesAdapter, ReasoningConfig, ReasoningEffort, ToolChoice, ToolDefinition, Usage,
 };
 
 use serde::{Deserialize, Serialize};
@@ -541,33 +541,38 @@ pub fn build_provider_with_user(
             }
         }
         "openai" => {
-            // 按 `api` 字段选择适配器：默认（含 None）与 `"chat"` → chat completions；
-            // `"responses"` → 显式报错（OpenAI 原生 /responses 适配器尚未实现，禁止
-            // 静默落到 chat 难排错）；其它值同样显式报错。
+            // 按 `api` 字段选择适配器：默认（含 None）与 `"chat"` → chat completions
+            // （存量默认不变更，兼容网关也走 chat）；`"responses"` → OpenAI 原生
+            // /responses（显式 opt-in）；其它值显式报错。
             let api_mode = api_mode_of(entry);
 
             match api_mode {
                 Some(api) if api.eq_ignore_ascii_case("responses") => {
-                    return Err(AgentError::Config(format!(
-                        "provider '{provider_name}': openai '/responses' adapter is not \
-                         implemented yet; use api=\"chat\" or omit api"
-                    )));
+                    let mut provider = OpenAiResponsesAdapter::new(api_key)?;
+                    if let Some(ref url) = entry.base_url {
+                        provider = provider.with_base_url(url.clone());
+                    }
+                    Ok(Arc::new(provider))
                 }
-                Some(api) if api.eq_ignore_ascii_case("chat") => {}
-                None => {}
-                Some(other) => {
-                    return Err(AgentError::Config(format!(
-                        "unsupported api mode '{other}' for provider '{provider_name}'. \
+                Some(api) if api.eq_ignore_ascii_case("chat") => {
+                    let mut provider = OpenAI::new(api_key)?;
+                    if let Some(ref url) = entry.base_url {
+                        provider = provider.with_base_url(url.clone());
+                    }
+                    Ok(Arc::new(provider))
+                }
+                None => {
+                    let mut provider = OpenAI::new(api_key)?;
+                    if let Some(ref url) = entry.base_url {
+                        provider = provider.with_base_url(url.clone());
+                    }
+                    Ok(Arc::new(provider))
+                }
+                Some(other) => Err(AgentError::Config(format!(
+                    "unsupported api mode '{other}' for provider '{provider_name}'. \
                          Expected 'chat' or 'responses'"
-                    )));
-                }
+                ))),
             }
-
-            let mut provider = OpenAI::new(api_key)?;
-            if let Some(ref url) = entry.base_url {
-                provider = provider.with_base_url(url.clone());
-            }
-            Ok(Arc::new(provider))
         }
         other => Err(AgentError::Config(format!(
             "unsupported provider type: '{other}'. Currently supported: deepseek, qwen, openai"
@@ -704,7 +709,7 @@ mod tests {
         }
     }
 
-    /// 未配置 `api` 时默认走 chat completions（OpenAI 原生 /responses 尚未实现）。
+    /// 未配置 `api` 时默认走 chat completions（存量默认不变更，兼容网关也走 chat）。
     #[test]
     fn test_openai_branch_defaults_to_chat_adapter() {
         let entry = openai_entry();
@@ -740,19 +745,29 @@ mod tests {
         assert_eq!(provider.name(), "openai");
     }
 
-    /// `api="responses"` 显式报错：OpenAI 原生 /responses 适配器尚未实现。
     #[test]
-    fn test_openai_branch_rejects_responses_api_mode() {
+    fn test_openai_branch_builds_responses_adapter() {
         let entry = ProviderEntry {
             api: Some("responses".to_string()),
             ..openai_entry()
         };
         let config = user_config("openai", entry);
-        let err = build_provider_with_user(&model_config("openai"), &config)
-            .err()
-            .expect("responses api mode must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("not implemented"), "unexpected message: {msg}");
+        let provider = build_provider_with_user(&model_config("openai"), &config)
+            .expect("openai api = 'responses' must build");
+        assert_eq!(provider.name(), "openai-responses");
+    }
+
+    #[test]
+    fn test_openai_branch_applies_base_url_to_responses_adapter() {
+        let entry = ProviderEntry {
+            api: Some("responses".to_string()),
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            ..openai_entry()
+        };
+        let config = user_config("openai", entry);
+        let provider = build_provider_with_user(&model_config("openai"), &config)
+            .expect("openai api = 'responses' must build");
+        assert_eq!(provider.name(), "openai-responses");
     }
 
     #[test]
