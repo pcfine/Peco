@@ -199,17 +199,17 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 
 ### model-provider：LLM 抽象层
 
-- `ModelProvider` trait（async_trait）：`name()`、`chat(ChatRequest) -> ChatResponse`、`stream_chat(ChatRequest) -> ChatStream`。
-- `ChatRequest`：model、messages、tools（作为 `ToolDefinition`）、temperature、max_tokens、reasoning_effort、additional_params。
-- `StreamEvent` 枚举：`TextDelta`、`ReasoningDelta`、`ToolCallDelta`、`ToolCallComplete`、`End`。
-- 目前实现了两个 provider：`DeepSeek`（`DEEPSEEK_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）和 `Qwen`（`DASHSCOPE_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）。Provider 类型定义支持 `openai`、`anthropic`、`ollama`、`groq`（待实现）。
+- `ModelProvider` trait（async_trait）：`name()`、`generate_full(&GenerateRequest) -> GenerateResult`、`generate_stream(&GenerateRequest) -> GenerateStream`。
+- `GenerateRequest`：model、instructions、input（`InputItem` 列表）、tools（作为 `ToolDefinition`）、tool_choice、temperature、top_p、max_output_tokens、reasoning（`ReasoningConfig`）、text（`TextFormat`）、additional_params。
+- `StreamChunk` 枚举：`BlockStart`、`TextDelta`、`ReasoningDelta`、`ToolCallDelta`、`BlockEnd`、`Usage`、`Finish`。
+- 目前实现了三个 provider：`DeepSeek`（`DEEPSEEK_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）、`Qwen`（`DASHSCOPE_API_KEY`，chat + Responses 双路径，`api` 默认 `"responses"`）和 `OpenAI`（`OPENAI_API_KEY`，chat completions 适配器，`api` 默认 `"chat"`，`"responses"` 显式报错未实现；OpenAI 兼容网关经 `base_url` 覆盖接入）。Provider 类型定义支持 `anthropic`、`ollama`、`groq`（待实现）。
 - **Responses 适配器**：`DeepSeekResponsesAdapter`（原生 `/responses`，端点剥离 `/v1`）与 `QwenResponsesAdapter`（百炼 OpenAI 兼容 `/responses`，端点**保留** `/v1`；reasoning 输出为 `summary` 摘要形态并按原形态回传；`function_call_output` 必须紧跟对应 `function_call` 的逐对排布；`store` 显式置 `false`）。请求/响应经中立词汇表（`GenerateRequest`/`GenerateResult`/`StreamChunk`）直通映射，差异细节见 `docs/design/qwen-responses-design.md` 与 `docs/research/qwen-responses-research.md`。
 - Provider 配置位于 `providers.toml`（相对于 agent.md 文件或从标准位置解析）。
 
-**SSE 流式管道**（[crates/model-provider/src/providers/streaming.rs](crates/model-provider/src/providers/streaming.rs)）：
-- 与 provider 无关的设计：`process_normalized_sse_stream()` 是一个共享状态机，消费原始 SSE 事件并生成 `StreamEvent`。
-- 添加新 provider（如 OpenAI）只需实现 `StreamingProfile`（将 provider 特定的块规范化为 `NormalizedChunk`）和 `ModelProvider` — SSE 解析、重连和工具调用累积逻辑可复用。
-- `StreamingEventSource<R>`（[sse.rs](crates/model-provider/src/providers/sse.rs)）：一个 5 状态 SSE 流（`Connecting → Open → WaitingToRetry → Reconnecting → Closed`），带有 `Last-Event-Id` 追踪和可插拔的 `RetryPolicy`（默认指数退避：起始 300ms，2x 倍数，5s 上限）。
+**SSE 流式管道**（[crates/model-provider/src/streaming/pipeline.rs](crates/model-provider/src/streaming/pipeline.rs)）：
+- 与 provider 无关的设计：`process_normalized_sse_stream_chunks()` 是一个共享状态机，消费原始 SSE 数据帧，经 `StreamingProfile` 将 provider 特定的块规范化为 `NormalizedChunk` 并生成 `StreamChunk`。
+- 添加新 provider（如 groq）只需实现 `StreamingProfile` 和 `ModelProvider` — SSE 解析、重连和工具调用累积逻辑可复用。
+- `StreamingEventSource<R>`（[sse.rs](crates/model-provider/src/streaming/sse.rs)）：一个 5 状态 SSE 流（`Connecting → Open → WaitingToRetry → Reconnecting → Closed`），带有 `Last-Event-Id` 追踪和可插拔的 `RetryPolicy`（默认指数退避：起始 300ms，2x 倍数，5s 上限）。
 - DeepSeek 思考/推理：`ChatRequest.reasoning_effort` 映射到 DeepSeek 的 `thinking` 字段（`"disabled"` / `{"type": "enabled", "effort": "<value>"}`）。未设置时默认：`{"type": "enabled", "effort": "high"}`。
 
 ### knowledge-base：RAG 引擎
@@ -256,6 +256,17 @@ api_key = "${DASHSCOPE_API_KEY}"
 # api = "responses"（默认）| "chat" — responses 走百炼 OpenAI 兼容 /responses 端点
 [providers.qwen.default]
 model = "qwen3.7-max"
+temperature = 0.7
+max_tokens = 4096
+stream = true
+
+[providers.openai]
+type = "openai"
+api_key = "${OPENAI_API_KEY}"
+base_url = "https://api.openai.com/v1"   # 可省略；覆盖为兼容网关（vLLM/OpenRouter）地址
+# api = "chat"（默认）— "responses" 尚未实现，配置会显式报错
+[providers.openai.default]
+model = "gpt-5.2"
 temperature = 0.7
 max_tokens = 4096
 stream = true
