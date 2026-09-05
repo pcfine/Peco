@@ -12,7 +12,7 @@ use std::sync::Arc;
 use model_provider::ToolDefinition;
 
 use crate::agent::agent::Agent;
-use crate::tools::{ToolDyn, ToolError};
+use crate::tools::{Content, ToolDyn, ToolError};
 
 use super::{AgentExecutor, ExecutorInput};
 
@@ -96,7 +96,7 @@ impl ToolDyn for AgentExecutorTool {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             // 1. 解析参数
             let parsed: serde_json::Value =
@@ -120,9 +120,9 @@ impl ToolDyn for AgentExecutorTool {
 
             // 4. 返回结果：优先 structured_data，否则 content
             if let Some(data) = output.structured_data {
-                Ok(data.to_string())
+                Ok(Content::Text(data.to_string()))
             } else {
-                Ok(output.content)
+                Ok(Content::Text(output.content))
             }
         })
     }

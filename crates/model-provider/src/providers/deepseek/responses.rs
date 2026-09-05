@@ -1854,4 +1854,36 @@ mod tests {
         };
         assert!(build_responses_request_body(&request, false, true).is_err());
     }
+
+    #[test]
+    fn test_deepseek_responses_tool_output_images_stripped_in_body() {
+        // 含图工具输出不进入请求体：output 退化为纯文本字符串，
+        // `function_call_output` 仍紧跟对应 `function_call`。
+        let mut request = make_request();
+        request.input = Arc::from([
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "screenshot".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "截图结果".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                ]),
+            }),
+        ]);
+        let body = build_responses_request_body(&request, false, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let input = json["input"].as_array().unwrap();
+        let types: Vec<&str> = input.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["function_call", "function_call_output"]);
+        assert_eq!(input[1]["output"], "截图结果");
+    }
 }

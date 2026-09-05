@@ -11,7 +11,7 @@ use model_provider::ToolDefinition;
 use serde_json::json;
 
 use crate::tools::{
-    AddFactsToKnowledgeBase, AddToKnowledgeBase, DefaultToolsExecutor, DelegateSubAgent,
+    AddFactsToKnowledgeBase, AddToKnowledgeBase, Content, DefaultToolsExecutor, DelegateSubAgent,
     DeleteAgent, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs, ListKnowledgeBases,
     ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill, RunParallelSubAgents,
     SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellTool, ShowWorkspace,
@@ -246,7 +246,7 @@ impl ToolDyn for ListTools {
     fn call<'a>(
         &'a self,
         _args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             // 惰性构建：build 会再次构造 ListTools（仅存储 deps，无递归）。
             // 缺失可选依赖的工具被 warn + skip，因此输出即为当前环境
@@ -259,7 +259,9 @@ impl ToolDyn for ListTools {
                 .map(|d| json!({ "name": d.name, "description": d.description }))
                 .collect();
             tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-            serde_json::to_string_pretty(&json!({ "tools": tools })).map_err(ToolError::JsonError)
+            serde_json::to_string_pretty(&json!({ "tools": tools }))
+                .map_err(ToolError::JsonError)
+                .map(Content::Text)
         })
     }
 }
@@ -472,7 +474,12 @@ mod tests {
     async fn list_tools_returns_available_tools() {
         let deps = full_deps();
         let executor = ToolRegister::build(&["list_tools".to_string()], &deps);
-        let output = executor.execute("list_tools", "{}").await.expect("call");
+        let output = executor
+            .execute("list_tools", "{}")
+            .await
+            .expect("call")
+            .text_view()
+            .into_owned();
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("json");
         let listed: Vec<&str> = parsed["tools"]
             .as_array()

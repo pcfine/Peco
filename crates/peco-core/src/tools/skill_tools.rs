@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::deps::SkillProvider;
-use super::{StringError, ToolDyn, ToolError};
+use super::{Content, StringError, ToolDyn, ToolError};
 
 pub struct ReadSkill {
     skill_registry: Arc<crate::skills::SkillRegister>,
@@ -53,7 +53,7 @@ impl ToolDyn for ReadSkill {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(serde::Deserialize)]
             struct ReadSkillArgs {
@@ -122,7 +122,7 @@ impl ToolDyn for ReadSkill {
             output.push_str("\n---\n\n");
             output.push_str(&skill.body);
 
-            Ok(output)
+            Ok(Content::Text(output))
         })
     }
 }
@@ -162,7 +162,7 @@ impl ToolDyn for ListSkills {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let _ = args;
             let metas = self.skill_registry.all_meta();
@@ -177,6 +177,7 @@ impl ToolDyn for ListSkills {
                 .collect();
             serde_json::to_string_pretty(&skills)
                 .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e.to_string()))))
+                .map(Content::Text)
         })
     }
 }
@@ -242,7 +243,7 @@ impl ToolDyn for SaveSkill {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct SaveSkillArgs {
@@ -273,7 +274,7 @@ impl ToolDyn for SaveSkill {
                     ))))
                 })?;
 
-            Ok(format!("Skill '{name}' saved successfully."))
+            Ok(Content::Text(format!("Skill '{name}' saved successfully.")))
         })
     }
 }
@@ -322,7 +323,7 @@ impl ToolDyn for DeleteSkill {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct DeleteSkillArgs {
@@ -352,7 +353,9 @@ impl ToolDyn for DeleteSkill {
                 ))))
             })?;
 
-            Ok(format!("Skill '{name}' deleted successfully."))
+            Ok(Content::Text(format!(
+                "Skill '{name}' deleted successfully."
+            )))
         })
     }
 }

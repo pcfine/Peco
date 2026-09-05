@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use model_provider::{
-    BlockAssembler, ContentBlock, GenerateResult, GenerateStream, InputItem, ResponseStatus, Role,
-    StreamChunk, ToolCall, Usage,
+    BlockAssembler, Content, ContentBlock, GenerateResult, GenerateStream, InputItem,
+    ResponseStatus, Role, StreamChunk, ToolCall, Usage,
 };
 
 type ModelTaskHandle = tokio::task::JoinHandle<Result<ModelResponse, AgentError>>;
@@ -112,10 +112,13 @@ pub(crate) struct PendingToolCall {
 }
 
 /// Tool 执行结果
+///
+/// `result` 为中立的 `Content`：纯文本工具结果为 `Text`，回图工具（MCP 截图等）
+/// 为 `Parts`，写入 session 时零转换；事件与 hook 侧需要文本时取 text 视图。
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallResult {
     call: Arc<ToolCall>,
-    result: String,
+    result: Content,
     is_error: bool,
 }
 
@@ -2025,7 +2028,7 @@ impl AgentLooper {
                     ToolHookAction::Override(result) => {
                         self.react_ctx.pending_tool_calls[idx].result = Some(ToolCallResult {
                             call: call.clone(),
-                            result: result.clone(),
+                            result: Content::Text(result.clone()),
                             is_error: false,
                         });
                         self.emit_event(LooperEvent::ToolResult {
@@ -2037,7 +2040,7 @@ impl AgentLooper {
                     ToolHookAction::Reject(reason) => {
                         self.react_ctx.pending_tool_calls[idx].result = Some(ToolCallResult {
                             call: call.clone(),
-                            result: reason.clone(),
+                            result: Content::Text(reason.clone()),
                             is_error: true,
                         });
                         self.emit_event(LooperEvent::ToolResult {
@@ -2075,9 +2078,10 @@ impl AgentLooper {
                             result: r,
                             is_error: false,
                         },
+                        // 错误路径保持纯文本
                         Err(e) => ToolCallResult {
                             call: call.clone(),
-                            result: e,
+                            result: Content::Text(e),
                             is_error: true,
                         },
                     };
@@ -2119,14 +2123,14 @@ impl AgentLooper {
                 self.emit_event(LooperEvent::ToolResult {
                     id: tool_result.call.id.clone(),
                     name: tool_result.call.function.name.clone(),
-                    result: tool_result.result.clone(),
+                    result: tool_result.result.text_view().into_owned(),
                 });
 
                 Self::invoke_on_after_tool(
                     &self.config.hooks,
                     turn,
                     &tool_result.call,
-                    &tool_result.result,
+                    &tool_result.result.text_view(),
                     tool_result.is_error,
                 )
                 .await;
@@ -2145,14 +2149,14 @@ impl AgentLooper {
                             self.emit_event(LooperEvent::ToolResult {
                                 id: tr.call.id.clone(),
                                 name: tr.call.function.name.clone(),
-                                result: tr.result.clone(),
+                                result: tr.result.text_view().into_owned(),
                             });
 
                             Self::invoke_on_after_tool(
                                 &self.config.hooks,
                                 turn,
                                 &tr.call,
-                                &tr.result,
+                                &tr.result.text_view(),
                                 tr.is_error,
                             )
                             .await;
@@ -2207,7 +2211,7 @@ impl AgentLooper {
                     },
                     InputItem::FunctionCallOutput {
                         call_id: ptc.call.id.clone(),
-                        output: result.result.clone().into(),
+                        output: result.result.clone(),
                     },
                 );
             }
@@ -2324,7 +2328,7 @@ mod tests {
         let tc = Arc::new(ToolCall::new("id1", "test_tool", "{}"));
         let result = ToolCallResult {
             call: Arc::clone(&tc),
-            result: "output".to_string(),
+            result: Content::Text("output".to_string()),
             is_error: false,
         };
         let ptc = PendingToolCall {

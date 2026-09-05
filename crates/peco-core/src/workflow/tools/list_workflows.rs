@@ -9,7 +9,7 @@ use futures::Future;
 use model_provider::ToolDefinition;
 use serde_json::json;
 
-use crate::tools::{StringError, ToolDyn, ToolError};
+use crate::tools::{Content, StringError, ToolDyn, ToolError};
 use crate::workflow::WorkflowAccess;
 
 pub struct ListWorkflows {
@@ -45,7 +45,7 @@ impl ToolDyn for ListWorkflows {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let _ = args;
             let metas = self.workflow_access.list_workflow_meta();
@@ -62,6 +62,7 @@ impl ToolDyn for ListWorkflows {
                 .collect();
             serde_json::to_string_pretty(&workflows)
                 .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e.to_string()))))
+                .map(Content::Text)
         })
     }
 }

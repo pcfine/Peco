@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::deps::McpAccess;
-use super::{StringError, ToolDyn, ToolError};
+use super::{Content, StringError, ToolDyn, ToolError};
 
 // ── ListMcpServers ──────────────────────────────────────────────────────────
 
@@ -47,13 +47,13 @@ impl ToolDyn for ListMcpServers {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let _ = args;
             let servers = self.mcp_access.list_mcp_servers();
             let json = serde_json::to_string_pretty(&servers)
                 .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e.to_string()))))?;
-            Ok(json)
+            Ok(Content::Text(json))
         })
     }
 }
@@ -148,7 +148,7 @@ impl ToolDyn for SaveMcpServer {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct SaveMcpServerArgs {
@@ -203,9 +203,9 @@ impl ToolDyn for SaveMcpServer {
                     ))))
                 })?;
 
-            Ok(format!(
+            Ok(Content::Text(format!(
                 "MCP server '{name}' saved successfully. Reload the agent for changes to take effect."
-            ))
+            )))
         })
     }
 }
@@ -254,7 +254,7 @@ impl ToolDyn for DeleteMcpServer {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct DeleteMcpServerArgs {
@@ -284,9 +284,9 @@ impl ToolDyn for DeleteMcpServer {
                 ))))
             })?;
 
-            Ok(format!(
+            Ok(Content::Text(format!(
                 "MCP server '{name}' deleted successfully. Reload the agent for changes to take effect."
-            ))
+            )))
         })
     }
 }
@@ -334,7 +334,7 @@ impl ToolDyn for TestMcpConnection {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct TestMcpConnectionArgs {
@@ -359,9 +359,9 @@ impl ToolDyn for TestMcpConnection {
                         name,
                         format!("MCP server '{name}' not found in configuration"),
                     );
-                    return serde_json::to_string_pretty(&result).map_err(|e| {
-                        ToolError::ToolCallError(Box::new(StringError(e.to_string())))
-                    });
+                    return serde_json::to_string_pretty(&result)
+                        .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e.to_string()))))
+                        .map(Content::Text);
                 }
             };
 
@@ -370,6 +370,7 @@ impl ToolDyn for TestMcpConnection {
 
             serde_json::to_string_pretty(&result)
                 .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e.to_string()))))
+                .map(Content::Text)
         })
     }
 }

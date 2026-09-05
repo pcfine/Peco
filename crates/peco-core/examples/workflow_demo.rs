@@ -492,7 +492,9 @@ async fn demo_execute_workflow_tool() {
     let result = tool
         .call(r#"{"workflow_name": "health-check"}"#.to_string())
         .await
-        .unwrap();
+        .unwrap()
+        .text_view()
+        .into_owned();
 
     println!("  📤 Agent receives:\n{result}");
     println!();

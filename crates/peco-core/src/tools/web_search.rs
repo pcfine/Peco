@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::search::{SearchBackend, SearchError, SearchQuery};
 
-use super::{ToolDyn, ToolError};
+use super::{Content, ToolDyn, ToolError};
 
 /// 搜索引擎层错误 → 工具层错误（Display 文案保留机器可读关键字）。
 fn search_err(err: SearchError) -> ToolError {
@@ -73,7 +73,7 @@ impl ToolDyn for WebSearchTool {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -90,7 +90,9 @@ impl ToolDyn for WebSearchTool {
 
             // 输出契约：{"results": [...]}；零结果是合法业务态，返回空数组。
             // compact JSON — 结果直接进模型上下文，缩进空格是纯 token 开销。
-            serde_json::to_string(&json!({ "results": results })).map_err(ToolError::JsonError)
+            serde_json::to_string(&json!({ "results": results }))
+                .map_err(ToolError::JsonError)
+                .map(Content::Text)
         })
     }
 }

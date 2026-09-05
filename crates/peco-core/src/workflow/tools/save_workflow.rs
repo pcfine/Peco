@@ -10,7 +10,7 @@ use model_provider::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::tools::{StringError, ToolDyn, ToolError};
+use crate::tools::{Content, StringError, ToolDyn, ToolError};
 use crate::workflow::WorkflowAccess;
 
 pub struct SaveWorkflow {
@@ -79,7 +79,7 @@ impl ToolDyn for SaveWorkflow {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct SaveWorkflowArgs {
@@ -110,7 +110,9 @@ impl ToolDyn for SaveWorkflow {
                     ))))
                 })?;
 
-            Ok(format!("Workflow '{name}' saved successfully."))
+            Ok(Content::Text(format!(
+                "Workflow '{name}' saved successfully."
+            )))
         })
     }
 }

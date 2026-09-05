@@ -20,7 +20,7 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::{Peer, RoleClient, model};
 use tracing::warn;
 
-use crate::tools::{ToolDyn, ToolError};
+use crate::tools::{Content, ToolDyn, ToolError};
 use model_provider::ToolDefinition;
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ impl ToolDyn for McpTool {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             // 1. Parse JSON arguments into rmcp's JsonObject
             let arguments: model::JsonObject = if args.trim().is_empty() {
@@ -175,9 +175,7 @@ impl ToolDyn for McpTool {
             }
 
             // 5. Parse the response content
-            let output: Vec<String> = result.content.iter().map(format_content).collect();
-
-            Ok(output.join("\n"))
+            Ok(rmcp_content_to_output(&result.content))
         })
     }
 }
@@ -189,7 +187,6 @@ fn extract_text_from_content(content: &rmcp::model::Content) -> Option<String> {
     use rmcp::model::RawContent;
     match &content.raw {
         RawContent::Text(t) => Some(t.text.clone()),
-        RawContent::Image(img) => Some(format!("data:{};base64,{}", img.mime_type, img.data)),
         RawContent::Resource(res) => match &res.resource {
             rmcp::model::ResourceContents::TextResourceContents {
                 uri,
@@ -221,19 +218,57 @@ fn extract_text_from_content(content: &rmcp::model::Content) -> Option<String> {
     }
 }
 
-/// Format a single [`rmcp::model::Content`] block into a string suitable for
-/// returning as tool output.
+/// Convert MCP `tools/call` 响应内容为工具输出 [`Content`]。
 ///
-/// - **Text** → raw text
-/// - **Image** → `data:{mime_type};base64,{data}` data URL
-/// - **Resource** → `{mime_type}:{uri}:{text_or_blob}`
-/// - **Audio** → warning (not supported)
-fn format_content(content: &rmcp::model::Content) -> String {
-    // Delegate to extract_text_from_content; fallback is an empty string
-    extract_text_from_content(content).unwrap_or_else(|| {
-        warn!("MCP tool returned unsupported content, skipping");
-        String::new()
-    })
+/// - **Text** → text 部件
+/// - **Image** → `data:{mime_type};base64,{data}` 图片部件（MCP 截图类服务器
+///   零改动获得回图能力）
+/// - **Resource / ResourceLink** → 描述性文本部件
+/// - **Audio** → warning 后跳过
+///
+/// 全部为文本时折叠为 `Content::Text`（与既有纯文本输出形状逐字节一致），
+/// 出现任意图片时保持 `Content::Parts`。
+fn rmcp_content_to_output(contents: &[rmcp::model::Content]) -> Content {
+    use model_provider::ContentPart;
+
+    let mut parts: Vec<ContentPart> = Vec::with_capacity(contents.len());
+    let mut has_image = false;
+    for content in contents {
+        match &content.raw {
+            rmcp::model::RawContent::Text(t) => {
+                parts.push(ContentPart::Text {
+                    text: t.text.clone(),
+                });
+            }
+            rmcp::model::RawContent::Image(img) => {
+                has_image = true;
+                parts.push(ContentPart::Image {
+                    url: format!("data:{};base64,{}", img.mime_type, img.data),
+                    detail: None,
+                });
+            }
+            _ => match extract_text_from_content(content) {
+                Some(text) => parts.push(ContentPart::Text { text }),
+                None => warn!("MCP tool returned unsupported content, skipping"),
+            },
+        }
+    }
+
+    if parts.is_empty() {
+        return Content::Text(String::new());
+    }
+    if !has_image {
+        let text = parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => text.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Content::Text(text);
+    }
+    Content::Parts(parts)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -285,5 +320,66 @@ mod tests {
     #[test]
     fn test_default_timeout_value() {
         assert_eq!(DEFAULT_MCP_TOOL_TIMEOUT, Duration::from_secs(300));
+    }
+
+    // ── rmcp_content_to_output 映射 ──
+
+    fn rmcp_text(text: &str) -> rmcp::model::Content {
+        rmcp::model::Annotated::new(rmcp::model::RawContent::text(text), None)
+    }
+
+    fn rmcp_image(data: &str, mime_type: &str) -> rmcp::model::Content {
+        rmcp::model::Annotated::new(rmcp::model::RawContent::image(data, mime_type), None)
+    }
+
+    #[test]
+    fn rmcp_all_text_collapses_to_text_content() {
+        // 全文本响应折叠为 Content::Text（\n 连接），与既有纯文本输出形状一致。
+        let contents = vec![rmcp_text("第一行"), rmcp_text("第二行")];
+        let out = rmcp_content_to_output(&contents);
+        assert_eq!(out, Content::Text("第一行\n第二行".to_string()));
+    }
+
+    #[test]
+    fn rmcp_image_maps_to_data_uri_part() {
+        // Image{data, mime_type} → `data:{mime};base64,{data}` 图片部件。
+        let out = rmcp_content_to_output(&[rmcp_image("QUJD", "image/png")]);
+        assert_eq!(
+            out,
+            Content::Parts(vec![model_provider::ContentPart::Image {
+                url: "data:image/png;base64,QUJD".to_string(),
+                detail: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn rmcp_mixed_text_image_keeps_parts_shape() {
+        // 文本 + 图片混排保持 Parts（不折叠为 Text）。
+        let out =
+            rmcp_content_to_output(&[rmcp_text("截图如下"), rmcp_image("QUJD", "image/jpeg")]);
+        let Content::Parts(parts) = out else {
+            panic!("expected Parts for mixed content, got {out:?}");
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            model_provider::ContentPart::Text {
+                text: "截图如下".to_string()
+            }
+        );
+        assert_eq!(
+            parts[1],
+            model_provider::ContentPart::Image {
+                url: "data:image/jpeg;base64,QUJD".to_string(),
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rmcp_empty_content_yields_empty_text() {
+        let out = rmcp_content_to_output(&[]);
+        assert_eq!(out, Content::Text(String::new()));
     }
 }

@@ -18,7 +18,7 @@ use serde_json::json;
 use super::deps::AgentAccess;
 use crate::agent::simple_looper::SimpleAgentLooper;
 
-use super::{StringError, ToolDyn, ToolError};
+use super::{Content, StringError, ToolDyn, ToolError};
 
 // ============================================================================
 // DelegateSubAgent
@@ -66,7 +66,7 @@ impl ToolDyn for DelegateSubAgent {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct SubAgentArgs {
@@ -96,7 +96,7 @@ impl ToolDyn for DelegateSubAgent {
                 ))))
             })?;
 
-            Ok(output)
+            Ok(Content::Text(output))
         })
     }
 }
@@ -162,7 +162,7 @@ impl ToolDyn for RunParallelSubAgents {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct TasksWrapper {
@@ -231,7 +231,9 @@ impl ToolDyn for RunParallelSubAgents {
                 }
             }
 
-            serde_json::to_string_pretty(&results).map_err(ToolError::JsonError)
+            serde_json::to_string_pretty(&results)
+                .map_err(ToolError::JsonError)
+                .map(Content::Text)
         })
     }
 }

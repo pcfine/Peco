@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::deps::KnowledgeAccess;
 
-use super::{StringError, ToolDyn, ToolError};
+use super::{Content, StringError, ToolDyn, ToolError};
 use tracing::{info, warn};
 
 fn string_err(msg: impl ToString) -> ToolError {
@@ -87,7 +87,7 @@ impl ToolDyn for SearchKnowledge {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -139,7 +139,9 @@ impl ToolDyn for SearchKnowledge {
                     .collect::<Vec<_>>()
             };
 
-            serde_json::to_string_pretty(&formatted).map_err(string_err)
+            serde_json::to_string_pretty(&formatted)
+                .map_err(string_err)
+                .map(Content::Text)
         })
     }
 }
@@ -179,7 +181,7 @@ impl ToolDyn for ListKnowledgeBases {
     fn call<'a>(
         &'a self,
         _args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let km = self.access.knowledge_manager();
             km.ensure_loaded().await.map_err(string_err)?;
@@ -197,7 +199,9 @@ impl ToolDyn for ListKnowledgeBases {
                 })
                 .collect();
 
-            serde_json::to_string_pretty(&display).map_err(string_err)
+            serde_json::to_string_pretty(&display)
+                .map_err(string_err)
+                .map(Content::Text)
         })
     }
 }
@@ -250,7 +254,7 @@ impl ToolDyn for AddToKnowledgeBase {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -293,7 +297,10 @@ impl ToolDyn for AddToKnowledgeBase {
                 .map_err(string_err)?;
 
             info!(kb = %parsed.kb_name, title = %parsed.title, doc_id = %doc.id, "Document added via tool");
-            Ok(format!("已添加文档: {} (id: {})", doc.title, doc.id))
+            Ok(Content::Text(format!(
+                "已添加文档: {} (id: {})",
+                doc.title, doc.id
+            )))
         })
     }
 }
@@ -339,7 +346,7 @@ impl ToolDyn for SyncKnowledgeBase {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -354,7 +361,7 @@ impl ToolDyn for SyncKnowledgeBase {
                 check_kb_access(&self.allowed_kbs, &name)?;
                 let report = km.sync_kb(&name).await.map_err(string_err)?;
                 info!(kb = %name, added = report.added, updated = report.updated, removed = report.removed, "KB synced via tool");
-                Ok(format!(
+                Ok(Content::Text(format!(
                     "知识库 '{}' 同步完成:\n- 新增: {} 个文件\n- 更新: {} 个文件\n- 删除: {} 个文件\n- 跳过: {} 个文件\n- 耗时: {}ms",
                     report.kb_name,
                     report.added,
@@ -362,7 +369,7 @@ impl ToolDyn for SyncKnowledgeBase {
                     report.removed,
                     report.skipped,
                     report.duration_ms
-                ))
+                )))
             } else {
                 // 仅在允许列表中的 KB 上执行同步
                 let mut reports = Vec::new();
@@ -398,7 +405,10 @@ impl ToolDyn for SyncKnowledgeBase {
                     failed = errors.len(),
                     "All KBs synced via tool"
                 );
-                Ok(format!("知识库同步完成:\n{}", lines.join("\n")))
+                Ok(Content::Text(format!(
+                    "知识库同步完成:\n{}",
+                    lines.join("\n")
+                )))
             }
         })
     }
@@ -444,7 +454,7 @@ impl ToolDyn for GetKnowledgeBaseDocs {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -470,7 +480,9 @@ impl ToolDyn for GetKnowledgeBaseDocs {
                 })
                 .collect();
 
-            serde_json::to_string_pretty(&display).map_err(string_err)
+            serde_json::to_string_pretty(&display)
+                .map_err(string_err)
+                .map(Content::Text)
         })
     }
 }
@@ -550,7 +562,7 @@ impl ToolDyn for AddFactsToKnowledgeBase {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -599,7 +611,10 @@ impl ToolDyn for AddFactsToKnowledgeBase {
                 .map_err(string_err)?;
 
             info!(kb = %parsed.kb_name, fact_count = stored.len(), "Facts added via tool");
-            Ok(format!("已添加 {} 条事实到知识库", stored.len()))
+            Ok(Content::Text(format!(
+                "已添加 {} 条事实到知识库",
+                stored.len()
+            )))
         })
     }
 }
@@ -657,7 +672,7 @@ impl ToolDyn for QueryEntityFacts {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct Args {
@@ -697,7 +712,9 @@ impl ToolDyn for QueryEntityFacts {
                 })
                 .collect();
 
-            serde_json::to_string_pretty(&display).map_err(string_err)
+            serde_json::to_string_pretty(&display)
+                .map_err(string_err)
+                .map(Content::Text)
         })
     }
 }

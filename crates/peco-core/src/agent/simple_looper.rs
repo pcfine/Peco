@@ -16,14 +16,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use model_provider::{ContentBlock, InputItem, Role, ToolCall};
+use model_provider::{Content, ContentBlock, InputItem, Role, ToolCall};
 
 use super::agent::Agent;
 use super::error::AgentError;
 use crate::tools::ToolExecutor;
 
 /// Concurrent tool execution result: (index, tool_call, output).
-type ToolExecResult = (usize, ToolCall, Result<String, String>);
+type ToolExecResult = (usize, ToolCall, Result<Content, String>);
 type ToolExecHandle = tokio::task::JoinHandle<ToolExecResult>;
 type SimpleTaskHandle = tokio::task::JoinHandle<Result<String, AgentError>>;
 type SharedSimpleTask = Arc<tokio::sync::Mutex<Option<SimpleTaskHandle>>>;
@@ -270,15 +270,16 @@ impl SimpleAgentLooper {
             }
             match handle.await {
                 Ok((idx, tc, output)) => {
-                    let content = match output {
+                    // 错误路径保持纯文本；成功路径的 Content 零转换直通
+                    let output = match output {
                         Ok(r) => r,
-                        Err(e) => e,
+                        Err(e) => Content::Text(e),
                     };
                     results.push((
                         idx,
                         Arc::new(InputItem::FunctionCallOutput {
                             call_id: tc.id,
-                            output: content.into(),
+                            output,
                         }),
                     ));
                 }

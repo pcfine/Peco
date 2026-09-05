@@ -343,9 +343,125 @@ pub(crate) fn strip_image_parts<'a>(
     Ok((Cow::Owned(stripped), dropped))
 }
 
+/// 工具输出级图片剥离：仅剥离 [`InputItem::FunctionCallOutput`] 中的图片部件，
+/// 消息条目原样保留 — 供用户图直通、工具图剥离的 chat 适配器（openai / qwen）
+/// 在映射前调用。不含工具图时零分配直通。
+///
+/// 工具输出剥离后永不整条丢弃（必须紧跟对应的 function_call），只清空为纯文本。
+/// 不做日志 — 调用方按请求聚合后统一 `warn!`。
+pub(crate) fn strip_tool_output_images<'a>(
+    items: &'a [Arc<InputItem>],
+    strict: bool,
+) -> StripItemsResult<'a> {
+    let tool_images: usize = items
+        .iter()
+        .map(|item| match &**item {
+            InputItem::FunctionCallOutput { output, .. } => output.image_count(),
+            _ => 0,
+        })
+        .sum();
+    if tool_images == 0 {
+        return Ok((Cow::Borrowed(items), 0));
+    }
+    if strict {
+        return Err(ProviderError::Request(
+            "请求的工具输出包含图片部件，当前 provider 不支持工具回图".to_string(),
+        ));
+    }
+
+    let mut stripped: Vec<Arc<InputItem>> = Vec::with_capacity(items.len());
+    let mut dropped = 0usize;
+    for item in items {
+        match &**item {
+            InputItem::FunctionCallOutput { call_id, output } => {
+                let (output, n) = strip_content_images(output, false)?;
+                dropped += n;
+                if n == 0 {
+                    stripped.push(Arc::clone(item));
+                } else {
+                    stripped.push(Arc::new(InputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: output.into_owned(),
+                    }));
+                }
+            }
+            _ => stripped.push(Arc::clone(item)),
+        }
+    }
+    Ok((Cow::Owned(stripped), dropped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造含图工具输出条目。
+    fn tool_output_with_image() -> Arc<InputItem> {
+        Arc::new(InputItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "截图结果".to_string(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,BBBB".to_string(),
+                    detail: None,
+                },
+            ]),
+        })
+    }
+
+    #[test]
+    fn strip_tool_output_images_flattens_tool_images_keeps_message_parts() {
+        // 工具输出剥离为文本视图；用户消息部件原样保留。
+        let items = vec![
+            Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "看这张图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "https://example.com/cat.png".to_string(),
+                        detail: None,
+                    },
+                ]),
+            }),
+            tool_output_with_image(),
+        ];
+        let (stripped, dropped) = strip_tool_output_images(&items, false).unwrap();
+        assert_eq!(dropped, 1);
+        match &*stripped[0] {
+            InputItem::Message { content, .. } => {
+                assert_eq!(content.image_count(), 1, "用户消息部件不受影响");
+            }
+            other => panic!("expected message item, got {other:?}"),
+        }
+        match &*stripped[1] {
+            InputItem::FunctionCallOutput { output, .. } => {
+                assert_eq!(*output, Content::Text("截图结果".to_string()));
+            }
+            other => panic!("expected function_call_output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_tool_output_images_strict_rejects() {
+        let items = vec![tool_output_with_image()];
+        assert!(strip_tool_output_images(&items, true).is_err());
+    }
+
+    #[test]
+    fn strip_tool_output_images_borrows_when_no_tool_images() {
+        // 纯文本工具输出零分配直通（Cow::Borrowed），计数为 0。
+        let items = vec![Arc::new(InputItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: "晴".into(),
+        })];
+        let (stripped, dropped) = strip_tool_output_images(&items, true).unwrap();
+        assert_eq!(dropped, 0);
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+    }
 
     fn tool_message() -> WireMessage<'static> {
         WireMessage::Tool {

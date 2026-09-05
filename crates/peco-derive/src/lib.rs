@@ -242,6 +242,53 @@ fn extract_result_types(
     }
 }
 
+/// 标注 fn 返回类型的分派类别。
+///
+/// 分派矩阵（`Ok` 类型决定路径，`Result<T, E>` 先解包）：
+/// - `String` / `Result<String, E>` → `Tool` 路径，blanket impl 序列化为裸文本
+/// - `Content` / `Result<Content, E>` → 直接生成 `ToolDyn` impl，部件透传零转换
+/// - 其他类型 → `Tool` 路径（要求 `Serialize`），blanket impl 序列化为 JSON 文本
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputClass {
+    /// fn 返回裸值（非 Result）
+    Bare,
+    /// fn 返回 `Result<_, E>`
+    Wrapped,
+}
+
+/// 分类 fn 的返回类型：`(类别, Ok 类型是否为 Content)`。
+fn classify_return(output: &ReturnType) -> (OutputClass, bool) {
+    let is_content = |ty: &Type| {
+        matches!(
+            ty,
+            Type::Path(type_path)
+                if type_path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|seg| seg.ident == "Content")
+        )
+    };
+    match output {
+        ReturnType::Default => (OutputClass::Bare, false),
+        ReturnType::Type(_, ty) => {
+            if let Type::Path(type_path) = &**ty
+                && let Some(segment) = type_path.path.segments.last()
+                && segment.ident == "Result"
+                && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+            {
+                let ok_ty = args.args.iter().find_map(|a| match a {
+                    syn::GenericArgument::Type(t) => Some(t),
+                    _ => None,
+                });
+                (OutputClass::Wrapped, ok_ty.is_some_and(is_content))
+            } else {
+                (OutputClass::Bare, is_content(ty))
+            }
+        }
+    }
+}
+
 // ── 入口 ─────────────────────────────────────────────────────────────────────
 
 /// Generate a `Tool` implementation for a function.
@@ -285,6 +332,10 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
 
     // ── Extract Result<T, E> ─────────────────────────────────────────────
     let (output_type, error_type) = extract_result_types(&input_fn.sig.output);
+
+    // ── 返回类型分派 ─────────────────────────────────────────────────────
+    // `Content`（含 `Result<Content, E>`）走 ToolDyn 直通路径；其余走 Tool 路径。
+    let (ret_class, output_is_content) = classify_return(&input_fn.sig.output);
 
     // ── Build struct names ────────────────────────────────────────────────
     let struct_name = format_ident!("{}", fn_name_str.to_case(Case::Pascal));
@@ -353,22 +404,101 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
             .collect()
     });
 
-    // ── call() implementation ─────────────────────────────────────────────
-    let call_impl = if is_async {
+    // ── call() 实现 — 见下方 trait_impl 分派 ─────────────────────────────
+
+    let peco_core = peco_core_path();
+
+    // Tool 路径：`impl Tool`，blanket impl 负责序列化到 Content。
+    // ToolDyn 路径：`impl ToolDyn`，部件透传零转换。
+    let invoke = if is_async {
+        quote! { #fn_name(#(parsed.#param_names,)*).await }
+    } else {
+        quote! { #fn_name(#(parsed.#param_names,)*) }
+    };
+
+    let trait_impl = if output_is_content {
+        let call_body = match ret_class {
+            OutputClass::Wrapped => quote! {
+                #invoke.map_err(|e| #peco_core::tools::ToolError::ToolCallError(Box::new(e)))
+            },
+            OutputClass::Bare => quote! { Ok(#invoke) },
+        };
         quote! {
-            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-                #fn_name(#(args.#param_names,)*).await
+            impl #peco_core::tools::ToolDyn for #struct_name {
+                fn name(&self) -> String {
+                    #tool_name.to_string()
+                }
+
+                fn definition(&self) -> #peco_core::tools::ToolDefinition {
+                    let mut schema = serde_json::to_value(
+                        schemars::schema_for!(#params_struct_name)
+                    ).expect("schema serialization failed");
+                    schema["required"] = serde_json::json!([#(#required_args),*]);
+
+                    #peco_core::tools::ToolDefinition {
+                        name: #tool_name.to_string(),
+                        description: #tool_description,
+                        parameters: schema,
+                    }
+                }
+
+                fn call<'a>(
+                    &'a self,
+                    args: String,
+                ) -> std::pin::Pin<Box<dyn std::future::Future<
+                    Output = Result<#peco_core::tools::Content, #peco_core::tools::ToolError>,
+                > + Send + 'a>> {
+                    Box::pin(async move {
+                        let parsed: #params_struct_name =
+                            serde_json::from_str(&args).map_err(#peco_core::tools::ToolError::JsonError)?;
+                        #call_body
+                    })
+                }
             }
         }
     } else {
+        let call_impl = if is_async {
+            quote! {
+                async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                    #fn_name(#(args.#param_names,)*).await
+                }
+            }
+        } else {
+            quote! {
+                async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                    #fn_name(#(args.#param_names,)*)
+                }
+            }
+        };
         quote! {
-            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-                #fn_name(#(args.#param_names,)*)
+            impl #peco_core::tools::Tool for #struct_name {
+                const NAME: &'static str = #tool_name;
+
+                type Args = #params_struct_name;
+                type Output = #output_type;
+                type Error = #error_type;
+
+                fn name(&self) -> String {
+                    #tool_name.to_string()
+                }
+
+                fn definition(&self) -> #peco_core::tools::ToolDefinition {
+                    let mut schema = serde_json::to_value(
+                        schemars::schema_for!(#params_struct_name)
+                    ).expect("schema serialization failed");
+                    schema["required"] = serde_json::json!([#(#required_args),*]);
+
+                    #peco_core::tools::ToolDefinition {
+                        name: #tool_name.to_string(),
+                        description: #tool_description,
+                        parameters: schema,
+                    }
+                }
+
+                #call_impl
             }
         }
     };
-
-    let peco_core = peco_core_path();
 
     let expanded = quote! {
         #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -381,32 +511,7 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
         #[derive(Default)]
         #vis struct #struct_name;
 
-        impl #peco_core::tools::Tool for #struct_name {
-            const NAME: &'static str = #tool_name;
-
-            type Args = #params_struct_name;
-            type Output = #output_type;
-            type Error = #error_type;
-
-            fn name(&self) -> String {
-                #tool_name.to_string()
-            }
-
-            fn definition(&self) -> #peco_core::tools::ToolDefinition {
-                let mut schema = serde_json::to_value(
-                    schemars::schema_for!(#params_struct_name)
-                ).expect("schema serialization failed");
-                schema["required"] = serde_json::json!([#(#required_args),*]);
-
-                #peco_core::tools::ToolDefinition {
-                    name: #tool_name.to_string(),
-                    description: #tool_description,
-                    parameters: schema,
-                }
-            }
-
-            #call_impl
-        }
+        #trait_impl
 
         #[allow(dead_code)]
         #vis static #static_name: #struct_name = #struct_name;

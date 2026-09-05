@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tools::AgentAccess;
-use crate::tools::{StringError, ToolDyn, ToolError};
+use crate::tools::{Content, StringError, ToolDyn, ToolError};
 
 use super::super::access::WorkflowAccess;
 use super::super::engine::{WorkflowConfig, WorkflowEngine};
@@ -77,7 +77,7 @@ impl ToolDyn for ExecuteWorkflow {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct ExecuteArgs {
@@ -130,11 +130,11 @@ impl ToolDyn for ExecuteWorkflow {
                         steps_failed,
                         ..
                     }) => {
-                        return Ok(format!(
+                        return Ok(Content::Text(format!(
                             "Workflow completed: {steps_completed} steps succeeded, \
                              {steps_failed} steps failed.\n\nOutputs:\n{}",
                             outputs.join("\n---\n")
-                        ));
+                        )));
                     }
                     Some(WorkflowEvent::Failed { error, .. }) => {
                         return Err(ToolError::ToolCallError(Box::new(StringError(format!(
@@ -283,7 +283,9 @@ mod tests {
         let result = tool
             .call(r#"{"workflow_name": "test-wf"}"#.to_string())
             .await
-            .unwrap();
+            .unwrap()
+            .text_view()
+            .into_owned();
         assert!(result.contains("Workflow completed"));
         assert!(result.contains("1 steps succeeded"));
     }

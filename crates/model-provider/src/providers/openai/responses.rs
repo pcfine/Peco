@@ -133,11 +133,31 @@ fn function_call_item(call_id: &str, name: &str, arguments: &str) -> Value {
 }
 
 /// 构建单个 Responses `input[]` function_call_output 元素。
-fn function_call_output_item(call_id: &str, output: &str) -> Value {
+///
+/// 纯文本输出保持 `output` 字符串形态（与既有请求体逐字节一致）；
+/// 部件数组输出用 2025-11+ 的数组形态：`output_text` / `output_image`
+/// （`image_url` 为字符串形态，不发送 `detail`）。
+fn function_call_output_item(call_id: &str, output: &Content) -> Value {
+    let output_value = match output {
+        Content::Text(s) => serde_json::json!(s),
+        Content::Parts(parts) => serde_json::json!(
+            parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => {
+                        serde_json::json!({ "type": "output_text", "text": text })
+                    }
+                    ContentPart::Image { url, .. } => {
+                        serde_json::json!({ "type": "output_image", "image_url": url })
+                    }
+                })
+                .collect::<Vec<_>>()
+        ),
+    };
     serde_json::json!({
         "type": "function_call_output",
         "call_id": call_id,
-        "output": output
+        "output": output_value
     })
 }
 
@@ -171,8 +191,7 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> Vec<Value> {
                 arguments,
             } => out.push(function_call_item(call_id, name, arguments)),
             InputItem::FunctionCallOutput { call_id, output } => {
-                let text = output.text_view();
-                out.push(function_call_output_item(call_id, &text));
+                out.push(function_call_output_item(call_id, output));
             }
             InputItem::Reasoning { .. } => dropped_reasoning += 1,
         }
@@ -1441,6 +1460,55 @@ mod tests {
         );
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[2]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn test_function_call_output_text_keeps_string_form() {
+        // 纯文本工具输出保持 `output` 字符串形态（与既有请求体逐字节一致）。
+        let mut request = make_request();
+        request.input = Arc::from([Arc::new(InputItem::FunctionCallOutput {
+            call_id: "call_1".to_string(),
+            output: "晴".into(),
+        })]);
+        let body = build_responses_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let input = json["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["output"], "晴");
+    }
+
+    #[test]
+    fn test_function_call_output_parts_use_output_array_shape() {
+        // 部件数组工具输出 → output_text + output_image 数组形态；
+        // data URI 与 https URL 两形态都直通，`output_image` 不发送 `detail`。
+        let mut request = make_request();
+        request.input = Arc::from([Arc::new(InputItem::FunctionCallOutput {
+            call_id: "call_1".to_string(),
+            output: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "截图如下".to_string(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                    detail: Some(ImageDetail::Low),
+                },
+                ContentPart::Image {
+                    url: "https://example.com/shot.png".to_string(),
+                    detail: None,
+                },
+            ]),
+        })]);
+        let body = build_responses_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let arr = json["input"][0]["output"].as_array().unwrap();
+        assert_eq!(arr[0]["type"], "output_text");
+        assert_eq!(arr[0]["text"], "截图如下");
+        assert_eq!(arr[1]["type"], "output_image");
+        assert_eq!(arr[1]["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(arr[2]["type"], "output_image");
+        assert_eq!(arr[2]["image_url"], "https://example.com/shot.png");
+        assert!(arr[1].get("detail").is_none());
+        assert!(arr[2].get("detail").is_none());
     }
 
     #[test]

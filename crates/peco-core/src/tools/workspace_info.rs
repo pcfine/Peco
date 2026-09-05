@@ -11,7 +11,7 @@ use model_provider::ToolDefinition;
 use serde_json::json;
 
 use super::deps::{AgentAccess, KnowledgeAccess, McpAccess, SkillProvider};
-use super::{StringError, ToolDyn, ToolError};
+use super::{Content, StringError, ToolDyn, ToolError};
 use crate::workflow::WorkflowAccess;
 
 pub struct ShowWorkspace {
@@ -69,7 +69,7 @@ impl ToolDyn for ShowWorkspace {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let _ = args;
 
@@ -192,6 +192,7 @@ impl ToolDyn for ShowWorkspace {
 
             serde_json::to_string_pretty(&output)
                 .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e.to_string()))))
+                .map(Content::Text)
         })
     }
 }

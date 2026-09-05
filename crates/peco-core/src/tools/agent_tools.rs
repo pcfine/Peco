@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::deps::AgentAccess;
-use super::{StringError, ToolDyn, ToolError};
+use super::{Content, StringError, ToolDyn, ToolError};
 
 // ── ReadAgent ────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ impl ToolDyn for ReadAgent {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(serde::Deserialize)]
             struct ReadAgentArgs {
@@ -73,11 +73,14 @@ impl ToolDyn for ReadAgent {
                 ))));
             }
 
-            self.agent_access.read_agent(name).map_err(|e| {
-                ToolError::ToolCallError(Box::new(StringError(format!(
-                    "failed to read agent '{name}': {e}"
-                ))))
-            })
+            self.agent_access
+                .read_agent(name)
+                .map_err(|e| {
+                    ToolError::ToolCallError(Box::new(StringError(format!(
+                        "failed to read agent '{name}': {e}"
+                    ))))
+                })
+                .map(Content::Text)
         })
     }
 }
@@ -156,7 +159,7 @@ impl ToolDyn for SaveAgent {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct SaveAgentArgs {
@@ -196,7 +199,7 @@ impl ToolDyn for SaveAgent {
                     ))))
                 })?;
 
-            Ok(format!("Agent '{name}' saved successfully."))
+            Ok(Content::Text(format!("Agent '{name}' saved successfully.")))
         })
     }
 }
@@ -248,7 +251,7 @@ impl ToolDyn for DeleteAgent {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             #[derive(Deserialize)]
             struct DeleteAgentArgs {
@@ -278,7 +281,9 @@ impl ToolDyn for DeleteAgent {
                 ))))
             })?;
 
-            Ok(format!("Agent '{name}' deleted successfully."))
+            Ok(Content::Text(format!(
+                "Agent '{name}' deleted successfully."
+            )))
         })
     }
 }

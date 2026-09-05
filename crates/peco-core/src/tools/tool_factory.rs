@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use model_provider::ToolDefinition;
 
-use super::{ToolDyn, ToolError, ToolExecutor};
+use super::{Content, ToolDyn, ToolError, ToolExecutor};
 
 // ── FnToolAdapter ──────────────────────────────────────────────────────────────
 
@@ -41,11 +41,13 @@ impl ToolDyn for FnToolAdapter {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         let result = (self.executor)(args);
-        Box::pin(
-            async move { result.map_err(|e| ToolError::ToolCallError(Box::new(StringError(e)))) },
-        )
+        Box::pin(async move {
+            result
+                .map_err(|e| ToolError::ToolCallError(Box::new(StringError(e))))
+                .map(Content::Text)
+        })
     }
 }
 
@@ -129,10 +131,10 @@ impl DefaultToolsExecutor {
 impl ToolExecutor for DefaultToolsExecutor {
     /// Execute a tool by name with JSON-encoded arguments.
     ///
-    /// Returns `Ok(result_string)` on success, or `Err(error_message)` on failure.
+    /// Returns `Ok(Content)` on success, or `Err(error_message)` on failure.
     /// The error message includes both lookup failures (tool not found) and
     /// execution errors from the tool itself.
-    async fn execute(&self, name: &str, args: &str) -> Result<String, String> {
+    async fn execute(&self, name: &str, args: &str) -> Result<Content, String> {
         let args = args.to_string();
         let tool: Option<Arc<dyn ToolDyn>> = { self.tools.read().unwrap().get(name).cloned() };
         match tool {

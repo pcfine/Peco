@@ -5,7 +5,7 @@ use futures::Future;
 use peco_derive::peco_tool;
 use serde_json::json;
 
-use super::{Tool, ToolDefinition, ToolDyn, ToolError};
+use super::{Content, Tool, ToolDefinition, ToolDyn, ToolError};
 
 /// Shell command execution tool.
 ///
@@ -113,13 +113,13 @@ impl ToolDyn for ShellTool {
     fn call<'a>(
         &'a self,
         args: String,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             // 直接复用宏生成的参数结构 — 避免手写副本与 schema 漂移
             let params: <ShellExec as Tool>::Args =
                 serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             let cwd = resolve_cwd(params.cwd, self.default_cwd.as_deref());
-            shell_exec(params.command, cwd).await
+            shell_exec(params.command, cwd).await.map(Content::Text)
         })
     }
 }
@@ -189,7 +189,9 @@ mod tests {
         let out = tool
             .call(r#"{"command": "pwd"}"#.to_string())
             .await
-            .unwrap();
+            .unwrap()
+            .text_view()
+            .into_owned();
         let prefix = dir.display().to_string();
         assert!(
             out.trim().starts_with(&prefix),

@@ -11,7 +11,9 @@ use tracing::Instrument;
 use tracing::{debug, trace, warn};
 
 use crate::logging;
-use crate::providers::chat_common::{WireMessage, input_items_to_wire_messages};
+use crate::providers::chat_common::{
+    WireMessage, input_items_to_wire_messages, strip_tool_output_images,
+};
 use crate::response::{
     ContentBlock, GenerateRequest, GenerateResult, InputItem, ReasoningConfig, ReasoningEffort,
     ResponseError, ResponseStatus, Role, TextFormat, ToolChoice,
@@ -265,17 +267,28 @@ fn convert_usage(api_usage: OpenAiApiUsage) -> Usage {
 /// 构建请求体并序列化为 JSON 字节。
 ///
 /// OpenAI chat 协议没有"消息末尾必须为 user"的约束，不做末尾 user 防御。
+/// chat 协议的 tool 消息仅承载字符串：工具输出中的图片部件映射前按 `strict`
+/// 剥离（用户消息部件不受影响，用户图直通）；宽松模式剥离发生时 `warn!` 一次。
 fn build_request_body(
     request: &GenerateRequest,
     stream: bool,
-) -> Result<Vec<u8>, serde_json::Error> {
+    strict: bool,
+) -> Result<Vec<u8>, ProviderError> {
+    let (input, tool_images_dropped) = strip_tool_output_images(&request.input, strict)?;
+    if tool_images_dropped > 0 {
+        warn!(
+            target: "model_provider::openai",
+            images = tool_images_dropped,
+            "chat 协议的 tool 消息不承载图片，工具输出中的图片部件已剥离（保留文本）"
+        );
+    }
     let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(WireMessage::System {
             content: instructions.as_str().into(),
         });
     }
-    messages.extend(input_items_to_wire_messages(&request.input));
+    messages.extend(input_items_to_wire_messages(&input));
 
     // 流式同样携带 tools：OpenAI 的流式工具调用是标准 ReAct 路径。
     let tools: Vec<ApiToolDef> = request
@@ -327,7 +340,7 @@ fn build_request_body(
         extra: request.additional_params.as_ref(),
     };
 
-    serde_json::to_vec(&api_request)
+    serde_json::to_vec(&api_request).map_err(|e| ProviderError::Request(e.to_string()))
 }
 
 /// 将中立 [`ReasoningConfig`] 映射为 OpenAI 顶层 `reasoning_effort` 字符串。
@@ -482,7 +495,7 @@ impl ModelProvider for OpenAI {
             self.validate_generate_request(request)?;
 
             let started = std::time::Instant::now();
-            let body = build_request_body(request, false)?;
+            let body = build_request_body(request, false, self.strict_feature_validation)?;
             let input = logging::summarize_input(&request.input);
 
             debug!(
@@ -583,7 +596,7 @@ impl ModelProvider for OpenAI {
     ) -> Result<GenerateStream, ProviderError> {
         self.validate_generate_request(request)?;
 
-        let body = build_request_body(request, true)?;
+        let body = build_request_body(request, true, self.strict_feature_validation)?;
 
         let endpoint = self.chat_endpoint();
         let model = request.model.clone();
@@ -885,7 +898,7 @@ mod tests {
     fn test_openai_build_request_body() {
         // 非流式请求
         let request = text_request();
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["model"], "gpt-5.2");
         assert_eq!(json["temperature"], 0.7);
@@ -896,7 +909,7 @@ mod tests {
         assert_eq!(json["messages"].as_array().unwrap().len(), 2);
 
         // 流式请求
-        let body = build_request_body(&request, true).unwrap();
+        let body = build_request_body(&request, true, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["stream"], true);
         assert_eq!(json["stream_options"]["include_usage"], true);
@@ -908,7 +921,7 @@ mod tests {
             max_output_tokens: Some(4096),
             ..text_request()
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         // 生成预算字段是 max_completion_tokens（推理 token 计入其中）
         assert_eq!(json["max_completion_tokens"], 4096);
@@ -922,13 +935,13 @@ mod tests {
             top_p: Some(0.9),
             ..text_request()
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["top_p"], 0.9);
 
         // 未配置时字段省略
         let request = text_request();
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("top_p").is_none());
     }
@@ -943,7 +956,7 @@ mod tests {
         };
 
         // enabled=false → "none"（显式关闭推理）
-        let body = build_request_body(&effort_request(false, None), false).unwrap();
+        let body = build_request_body(&effort_request(false, None), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["reasoning_effort"], "none");
 
@@ -953,18 +966,19 @@ mod tests {
             (ReasoningEffort::High, "high"),
             (ReasoningEffort::Max, "xhigh"),
         ] {
-            let body = build_request_body(&effort_request(true, Some(effort)), false).unwrap();
+            let body =
+                build_request_body(&effort_request(true, Some(effort)), false, false).unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["reasoning_effort"], expected, "effort {effort:?}");
         }
 
         // enabled=true 但未指定 effort → 字段省略（沿用模型默认）
-        let body = build_request_body(&effort_request(true, None), false).unwrap();
+        let body = build_request_body(&effort_request(true, None), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("reasoning_effort").is_none());
 
         // 未配置 reasoning → 字段省略
-        let body = build_request_body(&text_request(), false).unwrap();
+        let body = build_request_body(&text_request(), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("reasoning_effort").is_none());
     }
@@ -980,7 +994,7 @@ mod tests {
             }),
             ..text_request()
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["max_completion_tokens"], 4096);
 
@@ -993,7 +1007,7 @@ mod tests {
             }),
             ..text_request()
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["max_completion_tokens"], 4096);
     }
@@ -1019,13 +1033,13 @@ mod tests {
             ),
         ];
         for (choice, expected) in cases {
-            let body = build_request_body(&choice_request(Some(choice)), false).unwrap();
+            let body = build_request_body(&choice_request(Some(choice)), false, false).unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["tool_choice"], expected);
         }
 
         // 未配置时字段省略
-        let body = build_request_body(&choice_request(None), false).unwrap();
+        let body = build_request_body(&choice_request(None), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("tool_choice").is_none());
     }
@@ -1040,8 +1054,8 @@ mod tests {
         };
 
         // JsonObject → {"type":"json_object"}
-        let body =
-            build_request_body(&format_request(Some(TextFormat::JsonObject)), false).unwrap();
+        let body = build_request_body(&format_request(Some(TextFormat::JsonObject)), false, false)
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json["response_format"],
@@ -1054,6 +1068,7 @@ mod tests {
                 name: "result".to_string(),
                 schema: serde_json::json!({"type": "object", "properties": {}}),
             })),
+            false,
             false,
         )
         .unwrap();
@@ -1072,7 +1087,7 @@ mod tests {
 
         // Text 与未配置 → 字段省略
         for format in [None, Some(TextFormat::Text)] {
-            let body = build_request_body(&format_request(format), false).unwrap();
+            let body = build_request_body(&format_request(format), false, false).unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
             assert!(json.get("response_format").is_none());
         }
@@ -1091,7 +1106,7 @@ mod tests {
         };
         // 流式与非流式同样携带 tools（OpenAI 的流式工具调用是标准 ReAct 路径）
         for stream in [false, true] {
-            let body = build_request_body(&request, stream).unwrap();
+            let body = build_request_body(&request, stream, false).unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
             let tools = json["tools"].as_array().unwrap();
             assert_eq!(tools.len(), 1);
@@ -1127,7 +1142,7 @@ mod tests {
             text: None,
             additional_params: Some(serde_json::json!({"top_k": 5})),
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         let assistant = &json["messages"][0];
@@ -1179,7 +1194,7 @@ mod tests {
             text: None,
             additional_params: None,
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let messages = json["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
@@ -1815,7 +1830,7 @@ mod tests {
             .into(),
             ..text_request()
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json["messages"][1],
@@ -1828,5 +1843,61 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// 构造含图工具输出的请求：用户消息带图（直通），工具输出带图（待剥离）。
+    fn tool_image_request() -> GenerateRequest {
+        GenerateRequest {
+            input: vec![
+                Arc::new(InputItem::Message {
+                    role: Role::User,
+                    content: Content::Parts(vec![
+                        ContentPart::Text {
+                            text: "看这张图".to_string(),
+                        },
+                        ContentPart::Image {
+                            url: "https://example.com/cat.png".to_string(),
+                            detail: None,
+                        },
+                    ]),
+                }),
+                Arc::new(InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "screenshot".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                Arc::new(InputItem::FunctionCallOutput {
+                    call_id: "c1".to_string(),
+                    output: Content::Parts(vec![
+                        ContentPart::Text {
+                            text: "截图结果".to_string(),
+                        },
+                        ContentPart::Image {
+                            url: "data:image/png;base64,BBBB".to_string(),
+                            detail: None,
+                        },
+                    ]),
+                }),
+            ]
+            .into(),
+            ..text_request()
+        }
+    }
+
+    #[test]
+    fn test_openai_tool_output_image_stripped_lenient() {
+        // chat 协议 tool 消息仅承载字符串：含图工具输出剥离为文本视图；
+        // 同一请求内用户消息部件不受影响（用户图直通）。
+        let body = build_request_body(&tool_image_request(), false, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"][1]["type"], "image_url");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["content"], "截图结果");
+    }
+
+    #[test]
+    fn test_openai_tool_output_image_strict_rejected() {
+        assert!(build_request_body(&tool_image_request(), false, true).is_err());
     }
 }

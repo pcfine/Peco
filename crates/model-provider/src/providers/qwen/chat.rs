@@ -11,7 +11,7 @@ use tracing::{debug, trace, warn};
 
 use crate::logging;
 use crate::providers::chat_common::{
-    WireMessage, ensure_trailing_user, input_items_to_wire_messages,
+    WireMessage, ensure_trailing_user, input_items_to_wire_messages, strip_tool_output_images,
 };
 use crate::response::{
     ContentBlock, GenerateRequest, GenerateResult, InputItem, ReasoningConfig, ResponseError,
@@ -250,19 +250,32 @@ fn convert_usage(api_usage: QwenApiUsage) -> Usage {
 /// 构建请求体并序列化为 JSON 字节。
 ///
 /// `stream = true` 时携带 `stream: true` 与 `stream_options.include_usage = true`，
-/// 且**绝不携带 tools** —— 千问官方明确 tools 与 stream=True 不可并用（D-3 红线），
+/// 且**绝不携带 tools** —— 千问官方明确 tools 与 stream=True 不可并用，
 /// 调用方传入的 tools 会被丢弃。
+///
+/// chat 协议的 tool 消息仅承载字符串：工具输出中的图片部件映射前按 `strict`
+/// 剥离（用户消息部件不受影响，VL 模型的用户图直通）；宽松模式剥离发生时
+/// `warn!` 一次。
 fn build_request_body(
     request: &GenerateRequest,
     stream: bool,
-) -> Result<Vec<u8>, serde_json::Error> {
+    strict: bool,
+) -> Result<Vec<u8>, ProviderError> {
+    let (input, tool_images_dropped) = strip_tool_output_images(&request.input, strict)?;
+    if tool_images_dropped > 0 {
+        warn!(
+            target: "model_provider::qwen",
+            images = tool_images_dropped,
+            "chat 协议的 tool 消息不承载图片，工具输出中的图片部件已剥离（保留文本）"
+        );
+    }
     let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(WireMessage::System {
             content: instructions.as_str().into(),
         });
     }
-    messages.extend(input_items_to_wire_messages(&request.input));
+    messages.extend(input_items_to_wire_messages(&input));
     // 千问网关要求最后一条消息为 user；工具轮末条是 `tool`，需追加一条空 user。
     ensure_trailing_user(&mut messages);
 
@@ -322,13 +335,13 @@ fn build_request_body(
         extra: request.additional_params.as_ref(),
     };
 
-    serde_json::to_vec(&api_request)
+    serde_json::to_vec(&api_request).map_err(|e| ProviderError::Request(e.to_string()))
 }
 
 /// 将中立 [`ReasoningConfig`] 映射为 Qwen 顶层 `enable_thinking` bool。
 ///
 /// Qwen 的思考开关是请求体顶层的 `enable_thinking`（非 DeepSeek 的
-/// `thinking{type,effort}` 嵌套对象，D-5 红线）；未配置时返回 `None`（字段省略，
+/// `thinking{type,effort}` 嵌套对象）；未配置时返回 `None`（字段省略，
 /// 沿用模型默认行为）。Qwen 不支持 effort 力度概念——携带 effort 时仅 `debug!`
 /// 记录后丢弃，不报错。
 fn reasoning_config_to_enable_thinking(reasoning: Option<&ReasoningConfig>) -> Option<bool> {
@@ -435,7 +448,7 @@ impl ModelProvider for Qwen {
             self.validate_generate_request(request)?;
 
             let started = std::time::Instant::now();
-            let body = build_request_body(request, false)?;
+            let body = build_request_body(request, false, self.strict_feature_validation)?;
             let input = logging::summarize_input(&request.input);
 
             debug!(
@@ -536,7 +549,7 @@ impl ModelProvider for Qwen {
     ) -> Result<GenerateStream, ProviderError> {
         self.validate_generate_request(request)?;
 
-        let body = build_request_body(request, true)?;
+        let body = build_request_body(request, true, self.strict_feature_validation)?;
 
         let endpoint = self.chat_endpoint();
         let model = request.model.clone();
@@ -900,7 +913,7 @@ mod tests {
             .validate_generate_request(&developer_request())
             .expect("loose mode must not reject Developer role");
 
-        let body = build_request_body(&developer_request(), false).unwrap();
+        let body = build_request_body(&developer_request(), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let messages = json["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
@@ -946,7 +959,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_shape() {
-        let body = build_request_body(&text_request(), false).unwrap();
+        let body = build_request_body(&text_request(), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["model"], "qwen3.7-plus");
@@ -973,15 +986,15 @@ mod tests {
         let mut request = text_request();
         request.temperature = None;
         request.max_output_tokens = Some(2048);
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("temperature").is_none());
         assert_eq!(json["max_tokens"], 2048);
     }
 
-    // ── 思考模式映射（AC-6.1 / AC-6.2 / AC-6.4）──
+    // ── 思考模式映射 ──
 
-    /// AC-6.1：`ReasoningConfig.enabled=false` → 请求体 `enable_thinking:false`。
+    /// `ReasoningConfig.enabled=false` → 请求体 `enable_thinking:false`。
     #[test]
     fn test_reasoning_disabled_sets_enable_thinking_false() {
         let mut request = text_request();
@@ -989,14 +1002,14 @@ mod tests {
             enabled: false,
             effort: None,
         });
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["enable_thinking"], false);
-        // D-5 红线：绝不出现 DeepSeek 形状的 thinking 嵌套对象
+        // 绝不出现 DeepSeek 形状的 thinking 嵌套对象
         assert!(json.get("thinking").is_none());
     }
 
-    /// AC-6.2：effort（Low/Medium/High/Max）无 Qwen 对应概念——省略字段不报错。
+    /// effort（Low/Medium/High/Max）无 Qwen 对应概念——省略字段不报错。
     #[test]
     fn test_reasoning_effort_is_dropped_not_sent() {
         for effort in [
@@ -1010,7 +1023,7 @@ mod tests {
                 enabled: true,
                 effort: Some(effort),
             });
-            let body = build_request_body(&request, false).unwrap();
+            let body = build_request_body(&request, false, false).unwrap();
             let json: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["enable_thinking"], true);
             // effort 不产生任何 wire 字段
@@ -1024,7 +1037,7 @@ mod tests {
     #[test]
     fn test_reasoning_none_omits_enable_thinking() {
         assert!(text_request().reasoning.is_none());
-        let body = build_request_body(&text_request(), false).unwrap();
+        let body = build_request_body(&text_request(), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("enable_thinking").is_none());
     }
@@ -1038,13 +1051,13 @@ mod tests {
             effort: None,
         });
         request.max_output_tokens = Some(40_000);
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["enable_thinking"], true);
         assert_eq!(json["max_tokens"], 40_000);
     }
 
-    /// AC-6.3：`reasoning_content` 与 `content` 同时出现时，Reasoning 块在前、Text 在后。
+    /// `reasoning_content` 与 `content` 同时出现时，Reasoning 块在前、Text 在后。
     #[test]
     fn test_response_reasoning_block_precedes_text_block() {
         let json = r#"{
@@ -1090,7 +1103,7 @@ mod tests {
             description: "获取天气信息".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let tools = json["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
@@ -1137,7 +1150,7 @@ mod tests {
             text: None,
             additional_params: Some(serde_json::json!({"top_k": 5})),
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         let assistant = &json["messages"][0];
@@ -1161,7 +1174,7 @@ mod tests {
         assert!(json.get("reasoning_effort").is_none());
     }
 
-    /// D-4：工具轮末条是 `tool`，出口必须追加一条空 content 的 user。
+    /// 工具轮末条是 `tool`，出口必须追加一条空 content 的 user。
     #[test]
     fn test_build_request_body_appends_trailing_user_after_tool_round() {
         let request = GenerateRequest {
@@ -1188,7 +1201,7 @@ mod tests {
             text: None,
             additional_params: None,
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         let messages = json["messages"].as_array().unwrap();
@@ -1200,7 +1213,7 @@ mod tests {
         assert_eq!(messages[3]["content"], "");
 
         // 流式路径同样追加（流式虽不带 tools，但历史回放仍可能以 tool 结尾）
-        let body = build_request_body(&request, true).unwrap();
+        let body = build_request_body(&request, true, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let messages = json["messages"].as_array().unwrap();
         assert_eq!(messages.last().unwrap()["role"], "user");
@@ -1210,7 +1223,7 @@ mod tests {
     /// 末条已是 user 时不得重复追加。
     #[test]
     fn test_build_request_body_keeps_existing_trailing_user() {
-        let body = build_request_body(&text_request(), false).unwrap();
+        let body = build_request_body(&text_request(), false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let messages = json["messages"].as_array().unwrap();
         // system + user，无追加
@@ -1447,19 +1460,19 @@ mod tests {
 
     #[test]
     fn test_build_stream_request_body_shape() {
-        let body = build_request_body(&text_request(), true).unwrap();
+        let body = build_request_body(&text_request(), true, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["stream"], true);
         assert_eq!(json["stream_options"]["include_usage"], true);
-        // 流式请求绝不携带 tools（D-3）
+        // 流式请求绝不携带 tools
         assert!(json.get("tools").is_none());
         // 绝不出现 DeepSeek 形状的 thinking 嵌套对象
         assert!(json.get("thinking").is_none());
         assert!(json.get("enable_thinking").is_none());
     }
 
-    /// D-3 红线：流式请求体 tools 恒为 None —— 传入 tools 仅 debug! 后忽略。
+    /// 流式请求体 tools 恒为 None —— 传入 tools 仅 debug! 后忽略。
     #[test]
     fn test_build_stream_request_body_never_carries_tools() {
         let mut request = text_request();
@@ -1468,12 +1481,12 @@ mod tests {
             description: "获取天气信息".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }];
-        let body = build_request_body(&request, true).unwrap();
+        let body = build_request_body(&request, true, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("tools").is_none());
 
         // 非流式路径不受影响，tools 正常携带
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["tools"].as_array().map(|t| t.len()), Some(1));
     }
@@ -1779,7 +1792,7 @@ mod tests {
             .into(),
             ..text_request()
         };
-        let body = build_request_body(&request, false).unwrap();
+        let body = build_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json["messages"][1],
@@ -1791,5 +1804,66 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// 构造含图工具输出的请求：用户消息带图（直通），工具输出带图（待剥离）。
+    fn tool_image_request() -> GenerateRequest {
+        GenerateRequest {
+            input: vec![
+                Arc::new(InputItem::Message {
+                    role: Role::User,
+                    content: Content::Parts(vec![
+                        ContentPart::Text {
+                            text: "看这张图".to_string(),
+                        },
+                        ContentPart::Image {
+                            url: "https://example.com/cat.png".to_string(),
+                            detail: None,
+                        },
+                    ]),
+                }),
+                Arc::new(InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "screenshot".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                Arc::new(InputItem::FunctionCallOutput {
+                    call_id: "c1".to_string(),
+                    output: Content::Parts(vec![
+                        ContentPart::Text {
+                            text: "截图结果".to_string(),
+                        },
+                        ContentPart::Image {
+                            url: "data:image/png;base64,BBBB".to_string(),
+                            detail: None,
+                        },
+                    ]),
+                }),
+            ]
+            .into(),
+            ..text_request()
+        }
+    }
+
+    #[test]
+    fn test_qwen_tool_output_image_stripped_lenient() {
+        // chat 协议 tool 消息仅承载字符串：含图工具输出剥离为文本视图；
+        // 同一请求内用户消息部件不受影响（VL 模型的用户图直通）。
+        let body = build_request_body(&tool_image_request(), false, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["content"][1]["type"], "image_url");
+        let tool_idx = messages
+            .iter()
+            .position(|m| m["role"] == "tool")
+            .expect("tool message");
+        assert_eq!(messages[tool_idx]["content"], "截图结果");
+        // 末尾补 user 的约束不受影响：最后一条仍是 user
+        assert_eq!(messages.last().unwrap()["role"], "user");
+    }
+
+    #[test]
+    fn test_qwen_tool_output_image_strict_rejected() {
+        assert!(build_request_body(&tool_image_request(), false, true).is_err());
     }
 }

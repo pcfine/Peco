@@ -22,7 +22,7 @@ use model_provider::ToolDefinition;
 use crate::agent::agent::Agent;
 use crate::agent::error::AgentError;
 use crate::agent::simple_looper::SimpleAgentLooper;
-use crate::tools::ToolExecutor;
+use crate::tools::{Content, ToolExecutor};
 
 use super::{AgentExecutor, ExecutorError, ExecutorInput, ExecutorOutput, ExecutorType};
 
@@ -68,13 +68,13 @@ impl OutputToolWrapper {
 
 #[async_trait]
 impl ToolExecutor for OutputToolWrapper {
-    async fn execute(&self, name: &str, args: &str) -> Result<String, String> {
+    async fn execute(&self, name: &str, args: &str) -> Result<Content, String> {
         if name == "__submit_output__" {
             // ★ 拦截：不执行实际操作，仅捕获参数
             let parsed: serde_json::Value =
                 serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
             *self.captured_data.lock().unwrap() = Some(parsed);
-            Ok("输出已提交。".to_string())
+            Ok(Content::Text("输出已提交。".to_string()))
         } else {
             // 代理到原始执行器
             self.inner.execute(name, args).await
@@ -434,7 +434,7 @@ mod tests {
         // __submit_output__ 被拦截
         let result = rt.block_on(wrapper.execute("__submit_output__", r#"{"x": 1}"#));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "输出已提交。");
+        assert_eq!(result.unwrap(), Content::Text("输出已提交。".to_string()));
 
         // 未知工具代理到原始执行器
         let result = rt.block_on(wrapper.execute("nonexistent_tool", "{}"));
