@@ -24,6 +24,7 @@ use serde_json::Value;
 use tracing::{Instrument, debug, trace, warn};
 
 use crate::logging;
+use crate::providers::chat_common::strip_image_parts;
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, ToolChoice,
@@ -219,6 +220,9 @@ fn flush_text(out: &mut Vec<Value>, pending: &mut Option<String>) {
 
 /// 将有序 [`InputItem`] 列表合并为 Responses `input[]` 元素。
 ///
+/// 调用方已先经 [`strip_image_parts`] 剥离图片部件（百炼 /responses 的图片支持
+/// 未确认，保守剥离），本函数只见纯文本内容 — 消息一律编码为裸字符串形态。
+///
 /// 与 [`DeepSeekResponsesAdapter`](crate::DeepSeekResponsesAdapter) 的编码器对称，
 /// 但排布遵循百炼的逐对约束：
 ///
@@ -391,12 +395,22 @@ fn build_responses_request_body(
     stream: bool,
     strict: bool,
 ) -> Result<Vec<u8>, ProviderError> {
+    // 百炼 /responses 的图片支持未确认：映射前剥离消息与工具输出中的图片部件，
+    // 宽松模式（剥离发生时）按请求 warn 一次（含张数），严格模式返回错误。
+    let (stripped_input, images_dropped) = strip_image_parts(&request.input, strict)?;
+    if images_dropped > 0 {
+        warn!(
+            target: "model_provider::qwen_responses",
+            images = images_dropped,
+            "qwen responses 已剥离图片部件（保留文本）"
+        );
+    }
     let carry_reasoning = should_carry_reasoning(
-        &request.input,
+        &stripped_input,
         !request.tools.is_empty(),
         reasoning_enabled(request),
     );
-    let input = input_items_to_responses_values(&request.input, carry_reasoning);
+    let input = input_items_to_responses_values(&stripped_input, carry_reasoning);
 
     let mut body = serde_json::Map::new();
     body.insert("model".into(), serde_json::json!(request.model));
@@ -1144,7 +1158,7 @@ impl ModelProvider for QwenResponsesAdapter {
             trace!(
                 target: "model_provider::qwen_responses",
                 request_id = %request_id,
-                body = %String::from_utf8_lossy(&body),
+                body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
                 "responses 请求体全文"
             );
 
@@ -1284,7 +1298,7 @@ impl ModelProvider for QwenResponsesAdapter {
         trace!(
             target: "model_provider::qwen_responses",
             request_id = %request_id,
-            body = %String::from_utf8_lossy(&body),
+            body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
             "responses 流式请求体全文"
         );
 
@@ -1321,6 +1335,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::response::{Content, ContentPart};
 
     fn make_request() -> GenerateRequest {
         GenerateRequest {
@@ -2321,5 +2336,51 @@ mod tests {
             ] if text == "你好"
                 && *usage == Usage::default()
         ));
+    }
+
+    #[test]
+    fn test_qwen_responses_user_images_stripped_in_body() {
+        // 保守剥离：用户消息图片不进入百炼 /responses 请求体，content 退化为
+        // 单 input_text；图片支持经冒烟确认后再开正映射。
+        let request = GenerateRequest {
+            input: Arc::from([Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "这是什么图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                ]),
+            })]),
+            ..make_request()
+        };
+        let body = build_responses_request_body(&request, false, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["input"][0],
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "这是什么图"}]
+            })
+        );
+    }
+
+    #[test]
+    fn test_qwen_responses_strict_rejects_images() {
+        let request = GenerateRequest {
+            input: Arc::from([Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![ContentPart::Image {
+                    url: "https://example.com/cat.png".to_string(),
+                    detail: None,
+                }]),
+            })]),
+            ..make_request()
+        };
+        assert!(build_responses_request_body(&request, false, true).is_err());
     }
 }

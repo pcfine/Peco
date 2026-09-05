@@ -462,7 +462,7 @@ impl ModelProvider for Qwen {
             trace!(
                 target: "model_provider::qwen",
                 request_id = %request_id,
-                body = %String::from_utf8_lossy(&body),
+                body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
                 "chat 请求体全文"
             );
 
@@ -567,7 +567,7 @@ impl ModelProvider for Qwen {
         trace!(
             target: "model_provider::qwen",
             request_id = %request_id,
-            body = %String::from_utf8_lossy(&body),
+            body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
             "chat 流式请求体全文"
         );
 
@@ -774,7 +774,9 @@ pub const QWEN_FLASH: &str = "qwen3.8-flash";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::{BlockType, FinishReason, StreamChunk};
+    use crate::response::{
+        BlockType, Content, ContentPart, FinishReason, ImageDetail, StreamChunk,
+    };
     use futures::StreamExt;
     use std::sync::Arc;
 
@@ -1754,6 +1756,40 @@ mod tests {
         assert!(
             err.to_string().contains("DASHSCOPE_API_KEY"),
             "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_qwen_chat_user_parts_body_passthrough() {
+        // qwen chat 用户消息图片直通（VL 模型由服务端判定）：
+        // 部件数组逐字段进请求体，非 VL 模型由服务端 400。
+        let request = GenerateRequest {
+            input: vec![Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "这是什么图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/jpeg;base64,BBBB".to_string(),
+                        detail: Some(ImageDetail::Auto),
+                    },
+                ]),
+            })]
+            .into(),
+            ..text_request()
+        };
+        let body = build_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["messages"][1],
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这是什么图"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB", "detail": "auto"}},
+                ]
+            })
         );
     }
 }

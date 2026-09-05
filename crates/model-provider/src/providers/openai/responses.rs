@@ -27,9 +27,9 @@ use tracing::{Instrument, debug, trace, warn};
 use super::chat::{OPENAI_API_BASE_URL, OPENAI_REASONING_MIN_BUDGET};
 use crate::logging;
 use crate::response::{
-    BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
-    ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, TextConfig,
-    TextFormat, ToolChoice,
+    BlockType, Content, ContentBlock, ContentPart, FinishReason, GenerateRequest, GenerateResult,
+    InputItem, ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk,
+    TextConfig, TextFormat, ToolChoice,
 };
 use crate::streaming::pipeline::normalize_tool_call_arguments;
 use crate::streaming::sse::{SseEvent, StreamingEventSource};
@@ -151,13 +151,20 @@ fn function_call_output_item(call_id: &str, output: &str) -> Value {
 fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut dropped_reasoning = 0usize;
+    let mut dropped_role_images = 0usize;
 
     for item in items {
         match &**item {
-            InputItem::Message { role, content } => {
-                let text = content.text_view();
-                out.push(message_item(*role, &text));
-            }
+            InputItem::Message { role, content } => match role {
+                // 用户消息部件数组正映射：input_text + input_image 混排。
+                Role::User => out.push(user_message_item(content)),
+                _ => {
+                    // messages 之外的角色不承载图片，经文本视图收窄并计数。
+                    dropped_role_images += content.image_count();
+                    let text = content.text_view();
+                    out.push(message_item(*role, &text));
+                }
+            },
             InputItem::FunctionCall {
                 call_id,
                 name,
@@ -178,8 +185,47 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> Vec<Value> {
             "历史中的思考内容不回传，已丢弃"
         );
     }
+    if dropped_role_images > 0 {
+        warn!(
+            target: "model_provider::openai",
+            images = dropped_role_images,
+            "system/assistant 消息中的图片部件不参与传输，已丢弃（保留文本）"
+        );
+    }
 
     out
+}
+
+/// 构建单个 Responses `input[]` user message 元素。
+///
+/// 纯文本 → 单 `input_text`；部件数组 → `input_text` / `input_image` 混排
+/// （`image_url` 为字符串形态，`detail` 仅显式设置时发送）。
+fn user_message_item(content: &Content) -> Value {
+    match content {
+        Content::Text(s) => message_item(Role::User, s),
+        Content::Parts(parts) => {
+            let content_parts: Vec<Value> = parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => {
+                        serde_json::json!({ "type": "input_text", "text": text })
+                    }
+                    ContentPart::Image { url, detail } => {
+                        let mut v = serde_json::json!({ "type": "input_image", "image_url": url });
+                        if let Some(detail) = detail {
+                            v["detail"] = serde_json::json!(detail);
+                        }
+                        v
+                    }
+                })
+                .collect();
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": content_parts
+            })
+        }
+    }
 }
 
 /// reasoning 配置 → wire `reasoning` 对象。
@@ -1078,7 +1124,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
             trace!(
                 target: "model_provider::openai",
                 request_id = %request_id,
-                body = %String::from_utf8_lossy(&body),
+                body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
                 "responses 请求体全文"
             );
 
@@ -1202,7 +1248,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
         trace!(
             target: "model_provider::openai",
             request_id = %request_id,
-            body = %String::from_utf8_lossy(&body),
+            body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
             "responses 流式请求体全文"
         );
 
@@ -1239,6 +1285,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::response::ImageDetail;
 
     fn make_request() -> GenerateRequest {
         GenerateRequest {
@@ -2258,5 +2305,44 @@ mod tests {
                 reason: FinishReason::Stop
             }))
         ));
+    }
+
+    #[test]
+    fn test_openai_responses_user_image_parts_body() {
+        // 用户消息部件数组 → input_text + input_image 混排；
+        // image_url 为字符串形态，detail 仅显式设置时发送。
+        let request = GenerateRequest {
+            input: Arc::from([Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "这是什么图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "https://example.com/cat.png".to_string(),
+                        detail: Some(ImageDetail::High),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                ]),
+            })]),
+            ..make_request()
+        };
+        let body = build_responses_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["input"][0],
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "这是什么图"},
+                    {"type": "input_image", "image_url": "https://example.com/cat.png", "detail": "high"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ]
+            })
+        );
     }
 }

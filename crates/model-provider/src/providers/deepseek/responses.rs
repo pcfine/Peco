@@ -12,9 +12,10 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 
 use crate::logging;
+use crate::providers::chat_common::strip_image_parts;
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, TextConfig,
@@ -37,6 +38,7 @@ pub struct DeepSeekResponsesAdapter {
     http_client: reqwest::Client,
     api_key: String,
     base_url: String,
+    strict_feature_validation: bool,
 }
 
 impl DeepSeekResponsesAdapter {
@@ -51,6 +53,7 @@ impl DeepSeekResponsesAdapter {
             http_client,
             api_key: api_key.into(),
             base_url: DEEPSEEK_API_BASE_URL.to_string(),
+            strict_feature_validation: false,
         })
     }
 
@@ -64,6 +67,12 @@ impl DeepSeekResponsesAdapter {
     /// 设置自定义基础 URL。
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// 开启严格特性校验：不支持的输入（如图片部件）直接报错而非宽松降级。
+    pub fn strict_feature_validation(mut self, strict: bool) -> Self {
+        self.strict_feature_validation = strict;
         self
     }
 
@@ -197,6 +206,9 @@ fn flush_text(out: &mut Vec<Value>, pending: &mut Option<String>) {
 }
 
 /// 将有序 [`InputItem`] 列表合并为 Responses `input[]` 元素。
+///
+/// 调用方已先经 [`strip_image_parts`] 剥离图片部件（DeepSeek 不支持图片输入），
+/// 本函数只见纯文本内容 — 消息一律编码为裸字符串形态。
 ///
 /// 与 chat 适配器的 `input_items_to_wire_messages` 对称，但排布必须额外满足 DeepSeek
 /// thinking 模式的回放约束（以下均为对 `/responses` 实测得出）：
@@ -360,13 +372,24 @@ fn tool_choice_to_value(choice: &ToolChoice) -> Value {
 fn build_responses_request_body(
     request: &GenerateRequest,
     stream: bool,
+    strict: bool,
 ) -> Result<Vec<u8>, ProviderError> {
+    // deepseek 不支持图片输入：映射前剥离消息与工具输出中的图片部件，
+    // 宽松模式（剥离发生时）按请求 warn 一次（含张数），严格模式返回错误。
+    let (stripped_input, images_dropped) = strip_image_parts(&request.input, strict)?;
+    if images_dropped > 0 {
+        warn!(
+            target: "model_provider::deepseek",
+            images = images_dropped,
+            "deepseek 不支持图片输入，已剥离图片部件（保留文本）"
+        );
+    }
     let carry_reasoning = should_carry_reasoning(
-        &request.input,
+        &stripped_input,
         !request.tools.is_empty(),
         reasoning_enabled(request),
     );
-    let input = input_items_to_responses_values(&request.input, carry_reasoning);
+    let input = input_items_to_responses_values(&stripped_input, carry_reasoning);
 
     let mut body = serde_json::Map::new();
     body.insert("model".into(), serde_json::json!(request.model));
@@ -1012,7 +1035,8 @@ impl ModelProvider for DeepSeekResponsesAdapter {
 
         async move {
             let started = std::time::Instant::now();
-            let body = build_responses_request_body(request, false)?;
+            let body =
+                build_responses_request_body(request, false, self.strict_feature_validation)?;
             let input = logging::summarize_input(&request.input);
 
             tracing::debug!(
@@ -1044,7 +1068,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
             tracing::trace!(
                 target: "model_provider::responses",
                 request_id = %request_id,
-                body = %String::from_utf8_lossy(&body),
+                body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
                 "responses 请求体全文"
             );
 
@@ -1150,7 +1174,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         &self,
         request: &GenerateRequest,
     ) -> Result<GenerateStream, ProviderError> {
-        let body = build_responses_request_body(request, true)?;
+        let body = build_responses_request_body(request, true, self.strict_feature_validation)?;
         let endpoint = self.responses_endpoint();
         let model = request.model.clone();
         let request_id = logging::next_request_id();
@@ -1184,7 +1208,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         tracing::trace!(
             target: "model_provider::responses",
             request_id = %request_id,
-            body = %String::from_utf8_lossy(&body),
+            body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
             "responses 流式请求体全文"
         );
 
@@ -1221,6 +1245,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::response::{Content, ContentPart};
 
     fn make_request() -> GenerateRequest {
         GenerateRequest {
@@ -1244,7 +1269,7 @@ mod tests {
     #[test]
     fn test_build_request_body_basic() {
         let request = make_request();
-        let body = build_responses_request_body(&request, false).unwrap();
+        let body = build_responses_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["model"], "deepseek-v4-pro");
         assert_eq!(json["instructions"], "你是一个助手");
@@ -1264,7 +1289,7 @@ mod tests {
             parameters: serde_json::json!({ "type": "object" }),
         }];
         request.tool_choice = Some(ToolChoice::None);
-        let body = build_responses_request_body(&request, true).unwrap();
+        let body = build_responses_request_body(&request, true, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["name"], "get_weather");
@@ -1292,7 +1317,7 @@ mod tests {
                 content: "思考".into(),
             }),
         ]);
-        let body = build_responses_request_body(&request, false).unwrap();
+        let body = build_responses_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let input = json["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);
@@ -1314,7 +1339,7 @@ mod tests {
                 content: "思考".into(),
             }),
         ]);
-        let body = build_responses_request_body(&request, false).unwrap();
+        let body = build_responses_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         // 未携带 tools 且历史无工具调用时，reasoning 会被 API 忽略，序列化时直接丢弃。
         assert_eq!(json["input"].as_array().unwrap().len(), 1);
@@ -1342,7 +1367,7 @@ mod tests {
         ]);
         assert!(request.tools.is_empty());
 
-        let body = build_responses_request_body(&request, false).unwrap();
+        let body = build_responses_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let types: Vec<&str> = json["input"]
             .as_array()
@@ -1379,7 +1404,7 @@ mod tests {
             }),
         ]);
 
-        let body = build_responses_request_body(&request, false).unwrap();
+        let body = build_responses_request_body(&request, false, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         let types: Vec<&str> = json["input"]
             .as_array()
@@ -1783,5 +1808,50 @@ mod tests {
             types,
             vec!["function_call", "function_call_output", "message"]
         );
+    }
+
+    #[test]
+    fn test_deepseek_responses_user_images_stripped_in_body() {
+        // 宽松模式：用户消息图片剥离后进请求体，content 退化为单 input_text。
+        let request = GenerateRequest {
+            input: Arc::from([Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "这是什么图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "https://example.com/cat.png".to_string(),
+                        detail: None,
+                    },
+                ]),
+            })]),
+            ..make_request()
+        };
+        let body = build_responses_request_body(&request, false, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["input"][0],
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "这是什么图"}]
+            })
+        );
+    }
+
+    #[test]
+    fn test_deepseek_responses_strict_rejects_images() {
+        let request = GenerateRequest {
+            input: Arc::from([Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![ContentPart::Image {
+                    url: "https://example.com/cat.png".to_string(),
+                    detail: None,
+                }]),
+            })]),
+            ..make_request()
+        };
+        assert!(build_responses_request_body(&request, false, true).is_err());
     }
 }

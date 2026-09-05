@@ -509,7 +509,7 @@ impl ModelProvider for OpenAI {
             trace!(
                 target: "model_provider::openai",
                 request_id = %request_id,
-                body = %String::from_utf8_lossy(&body),
+                body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
                 "chat 请求体全文"
             );
 
@@ -614,7 +614,7 @@ impl ModelProvider for OpenAI {
         trace!(
             target: "model_provider::openai",
             request_id = %request_id,
-            body = %String::from_utf8_lossy(&body),
+            body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
             "chat 流式请求体全文"
         );
 
@@ -812,7 +812,9 @@ pub const OPENAI_GPT5_MINI: &str = "gpt-5-mini";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::{BlockType, FinishReason, StreamChunk};
+    use crate::response::{
+        BlockType, Content, ContentPart, FinishReason, ImageDetail, StreamChunk,
+    };
     use futures::StreamExt;
     use std::sync::Arc;
 
@@ -1786,6 +1788,45 @@ mod tests {
             !chunks
                 .iter()
                 .any(|c| matches!(c, Ok(StreamChunk::Finish { .. })))
+        );
+    }
+
+    #[test]
+    fn test_openai_user_parts_body_passthrough() {
+        // openai chat 用户消息图片直通：部件数组逐字段进请求体，
+        // detail 仅显式设置时发送；https URL 与 data URI 两形态都接受。
+        let request = GenerateRequest {
+            input: vec![Arc::new(InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "这是什么图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "https://example.com/cat.png".to_string(),
+                        detail: Some(ImageDetail::Low),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/png;base64,AAAA".to_string(),
+                        detail: None,
+                    },
+                ]),
+            })]
+            .into(),
+            ..text_request()
+        };
+        let body = build_request_body(&request, false).unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["messages"][1],
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这是什么图"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png", "detail": "low"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ]
+            })
         );
     }
 }

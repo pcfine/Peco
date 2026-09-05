@@ -110,6 +110,56 @@ pub(crate) fn request_id_header(response: &reqwest::Response) -> Option<String> 
     })
 }
 
+/// trace 级请求体全文日志中，把超长 `data:` URI 截断为占位符。
+///
+/// base64 图片动辄数百 KB，整段进 trace 日志既刷屏又拖慢格式化。
+/// 超过 4 KiB 的 `data:...;base64,<...>`（到 JSON 字符串的闭合引号为止）替换为
+/// `data:<media>;base64,<...N bytes>` 占位符；不超过阈值的请求体零分配原样返回。
+pub(crate) fn truncate_data_uris(body: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    const MAX_DATA_URI_LEN: usize = 4 * 1024;
+    if !body.contains("data:") {
+        return Cow::Borrowed(body);
+    }
+
+    let mut out = String::new();
+    let mut rest = body;
+    let mut truncated = false;
+    while let Some(pos) = rest.find("data:") {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        // data URI 作为 JSON 字符串值出现，以引号结尾。
+        let end = tail.find('"').unwrap_or(tail.len());
+        let uri = &tail[..end];
+        if uri.len() > MAX_DATA_URI_LEN {
+            match uri.find(";base64,") {
+                Some(media_len) => {
+                    let payload_len = uri.len() - media_len - ";base64,".len();
+                    out.push_str(&uri[..media_len]);
+                    out.push_str(&format!(";base64,<...{payload_len} bytes>"));
+                }
+                None => {
+                    // 非 base64 的 data URI（如 svg 文本），按阈值硬截断。
+                    out.push_str(&uri[..MAX_DATA_URI_LEN]);
+                    out.push_str("<...truncated>");
+                }
+            }
+            truncated = true;
+        } else {
+            out.push_str(uri);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+
+    if truncated {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -367,6 +417,34 @@ mod tests {
         let b = next_request_id();
         assert!(a.starts_with("req-"));
         assert_ne!(a, b);
+    }
+
+    /// 超过 4 KiB 的 base64 data URI 截断为占位符，字节数保留在占位符里。
+    #[test]
+    fn truncate_data_uris_replaces_long_base64_uri() {
+        let payload = "A".repeat(8 * 1024);
+        let body = format!(r#"{{"url":"data:image/png;base64,{payload}"}}"#);
+        let out = truncate_data_uris(&body);
+        assert!(out.contains("data:image/png;base64,<...8192 bytes>"));
+        assert!(!out.contains(&payload), "占位符必须替换掉完整 base64 载荷");
+        // 阈值内的 URI 原样保留。
+        let short = r#"{"url":"data:image/png;base64,AAAA"}"#;
+        assert_eq!(truncate_data_uris(short), short);
+    }
+
+    /// 不含 data URI（或不含超长 URI）的请求体零分配原样返回。
+    #[test]
+    fn truncate_data_uris_borrows_when_nothing_to_replace() {
+        let plain = r#"{"messages":[{"content":"看这张图 https://e.com/a.png"}]}"#;
+        assert!(matches!(
+            truncate_data_uris(plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let short_uri = r#"{"url":"data:image/png;base64,AAAA"}"#;
+        assert!(matches!(
+            truncate_data_uris(short_uri),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]
