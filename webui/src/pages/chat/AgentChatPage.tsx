@@ -10,6 +10,7 @@ import {
   updateConversation,
   deleteConversation as deleteConversationApi,
   createConversation,
+  uploadConversationImage,
 } from "@/api/conversations";
 import { getAgent, listAgents } from "@/api/agents";
 import type { AgentDetail } from "@/types/agent";
@@ -634,8 +635,15 @@ export function AgentChatPage() {
               visible={convId === visibleConvId}
               className="h-full"
               contextWindowTokens={contextWindowForModel(agent?.model)}
-              streamUrl={(msg) =>
-                `/api/chat/${encodeURIComponent(agentId ?? "")}/conversations/${convId}/stream?message=${encodeURIComponent(msg)}`
+              streamUrl={(msg, imageIds) =>
+                `/api/chat/${encodeURIComponent(agentId ?? "")}/conversations/${convId}/stream?message=${encodeURIComponent(msg)}` +
+                (imageIds.length > 0 ? `&image_ids=${imageIds.join(",")}` : "")
+              }
+              supportsImages={agent?.supports_images ?? false}
+              uploadImage={
+                agentId && convId
+                  ? (file) => uploadConversationImage(agentId, convId, file)
+                  : undefined
               }
               initialMessages={snapshots.get(convId) ?? EMPTY_MESSAGES}
               initialQuery={

@@ -80,6 +80,15 @@ pub trait ModelProvider: Send + Sync {
     /// 返回提供商标识（例如 `"deepseek"`、`"openai"`）。
     fn name(&self) -> &str;
 
+    /// 用户消息是否承载图片部件（适配器级能力矩阵）。
+    ///
+    /// 默认不支持；支持者（openai chat/responses、qwen chat）用户消息部件
+    /// 直通进请求体，不支持者映射前剥离（宽松 warn / 严格报错）。
+    /// 工具输出图片是另一维度，不在此反映。
+    fn supports_image_input(&self) -> bool {
+        false
+    }
+
     /// 发送中立非流式生成请求。
     ///
     /// 返回有序 [`ContentBlock`] 列表 + 状态 + 用量。

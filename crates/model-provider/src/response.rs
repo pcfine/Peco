@@ -119,6 +119,16 @@ impl Content {
         self.image_parts().count()
     }
 
+    /// 全部图片部件的 URL（https URL 或 data URI），与 [`Self::image_parts`] 同序。
+    pub fn image_urls(&self) -> Vec<&str> {
+        self.image_parts()
+            .filter_map(|p| match p {
+                ContentPart::Image { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn as_parts(&self) -> Option<&[ContentPart]> {
         match self {
             Content::Text(_) => None,

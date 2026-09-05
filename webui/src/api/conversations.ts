@@ -86,3 +86,26 @@ export async function getSessionSnapshot(
   );
   return res.data;
 }
+
+export interface UploadedImage {
+  /** 图片引用 id，发送消息时以 image_ids 传给 stream 端点 */
+  id: string;
+  /** 图片访问 URL，直接用于前端渲染 */
+  url: string;
+}
+
+/** 上传会话图片（multipart），返回引用 id 与渲染 URL。 */
+export async function uploadConversationImage(
+  agentId: string,
+  convId: string,
+  file: File,
+): Promise<UploadedImage> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await api.post<UploadedImage>(
+    `${chatBase(agentId)}/${convId}/images`,
+    form,
+    { headers: { "Content-Type": "multipart/form-data" } },
+  );
+  return res.data;
+}

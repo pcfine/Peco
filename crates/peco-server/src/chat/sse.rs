@@ -37,11 +37,16 @@ pub enum ChatSseEvent {
     },
 
     /// 工具执行结果
+    ///
+    /// `images` 携带工具输出中的图片部件（data URI 或 https URL），
+    /// 纯文本工具结果为空数组不序列化。
     #[serde(rename = "tool_result")]
     ToolResult {
         id: String,
         name: String,
         result: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
         conversation_id: String,
     },
 
@@ -294,10 +299,16 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
-        LooperEvent::ToolResult { id, name, result } => Some(ChatSseEvent::ToolResult {
+        LooperEvent::ToolResult {
             id,
             name,
             result,
+            images,
+        } => Some(ChatSseEvent::ToolResult {
+            id,
+            name,
+            result,
+            images,
             conversation_id: cid,
         }),
 

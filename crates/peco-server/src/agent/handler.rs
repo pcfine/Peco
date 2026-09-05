@@ -119,8 +119,10 @@ pub struct AgentDetail {
     pub stream: Option<bool>,             // agent.md llm.stream
     pub reasoning_effort: Option<String>, // agent.md llm.reasoning_effort
     pub max_turns: usize,                 // agent.md max_turns
-    pub created_at: String,               // DB
-    pub updated_at: String,               // DB
+    /// 用户消息图片输入能力（provider 类型 + api 分派，未实例化）
+    pub supports_images: bool,
+    pub created_at: String, // DB
+    pub updated_at: String, // DB
 }
 
 /// 简单成功响应。
@@ -137,6 +139,7 @@ fn agent_detail_from_profile(
     db_row: &agents::AgentRow,
     profile: &AgentProfile,
     body: &str,
+    supports_images: bool,
 ) -> AgentDetail {
     let llm = profile.llm.as_ref();
     AgentDetail {
@@ -158,6 +161,7 @@ fn agent_detail_from_profile(
         stream: llm.and_then(|l| l.stream),
         reasoning_effort: llm.and_then(|l| l.reasoning_effort.clone()),
         max_turns: profile.max_turns,
+        supports_images,
         created_at: db_row.created_at.clone(),
         updated_at: db_row.updated_at.clone(),
     }
@@ -403,6 +407,14 @@ pub async fn create(
             updated_at: String::new(),
         });
 
+    let supports_images = peco_core::agent::supports_image_input_for(
+        ws.config(),
+        if assemble_params.provider.is_empty() {
+            None
+        } else {
+            Some(assemble_params.provider.as_str())
+        },
+    );
     let detail = AgentDetail {
         id: agent_id,
         name: name.to_string(),
@@ -430,6 +442,7 @@ pub async fn create(
         stream: assemble_params.stream,
         reasoning_effort: assemble_params.reasoning_effort,
         max_turns: assemble_params.max_turns,
+        supports_images,
         created_at: db_row.created_at,
         updated_at: db_row.updated_at,
     };
@@ -467,7 +480,11 @@ pub async fn get(
     let (profile, body) = agent_config::parse_agent_md(&content)
         .map_err(|e| ApiError::Internal(format!("agent.md parse error: {e}")))?;
 
-    let detail = agent_detail_from_profile(&agent_id, &db_row, &profile, &body);
+    let supports_images = peco_core::agent::supports_image_input_for(
+        ws.config(),
+        profile.llm.as_ref().and_then(|l| l.provider.as_deref()),
+    );
+    let detail = agent_detail_from_profile(&agent_id, &db_row, &profile, &body, supports_images);
     info!(user_id = %user_id, agent_id = %agent_id, name = %db_row.name, "Agent fetched");
     Ok(Json(detail))
 }
@@ -579,6 +596,14 @@ pub async fn update(
         .await?
         .ok_or_else(|| ApiError::Internal("agent updated but not found".into()))?;
 
+    let supports_images = peco_core::agent::supports_image_input_for(
+        ws.config(),
+        if merged.provider.is_empty() {
+            None
+        } else {
+            Some(merged.provider.as_str())
+        },
+    );
     let detail = AgentDetail {
         id: agent_id,
         name: merged.name,
@@ -606,6 +631,7 @@ pub async fn update(
         stream: merged.stream,
         reasoning_effort: merged.reasoning_effort,
         max_turns: merged.max_turns,
+        supports_images,
         created_at: updated_row.created_at,
         updated_at: updated_row.updated_at,
     };

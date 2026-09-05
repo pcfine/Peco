@@ -473,6 +473,11 @@ fn chat_response_to_generate_result(
 
 #[async_trait]
 impl ModelProvider for OpenAI {
+    fn supports_image_input(&self) -> bool {
+        // chat 协议用户消息部件直通（tool 消息仍 string-only，工具图剥离）
+        true
+    }
+
     fn name(&self) -> &str {
         "openai"
     }

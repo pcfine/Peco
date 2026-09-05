@@ -426,6 +426,11 @@ fn chat_response_to_generate_result(
 
 #[async_trait]
 impl ModelProvider for Qwen {
+    fn supports_image_input(&self) -> bool {
+        // VL 模型直通；非 VL 模型由服务端 400 兜底，不做模型名预判
+        true
+    }
+
     fn name(&self) -> &str {
         "qwen"
     }

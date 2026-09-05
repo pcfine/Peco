@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use futures::stream::Stream;
-use model_provider::InputItem;
+use model_provider::{Content, ContentPart, InputItem};
 use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent, strip_summary_wrapper};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
@@ -92,6 +92,9 @@ pub struct MessageResponse {
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
     pub message: String,
+    /// 逗号分隔的图片引用 id（上传端点返回）；发送时解析为图片部件。
+    #[serde(default)]
+    pub image_ids: Option<String>,
 }
 
 /// 消息列表查询参数。
@@ -322,6 +325,28 @@ pub async fn stream_chat(
         return Err(ApiError::BadRequest("message is required".into()));
     }
 
+    // ── 0. 解析图片引用（跨用户 / 非法 id 一律 4xx）────────────────────
+    let image_ids: Vec<String> = params
+        .image_ids
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let image_parts = super::images::resolve_image_parts(&state, &user_id, &image_ids).await?;
+    let message_content = if image_parts.is_empty() {
+        Content::Text(message.clone())
+    } else {
+        let mut parts = Vec::with_capacity(1 + image_parts.len());
+        parts.push(ContentPart::Text {
+            text: message.clone(),
+        });
+        parts.extend(image_parts);
+        Content::Parts(parts)
+    };
+
     // ── 1. 加载对话 ──────────────────────────────────────────────────────
     let conv = conversations::find_by_id_and_user(&state.db, &conv_id, &user_id)
         .await?
@@ -390,6 +415,7 @@ pub async fn stream_chat(
     let db_for_bg = state.db.clone();
     let conv_id_for_bg = conv_id.clone();
     let message_for_bg = message.clone();
+    let message_content_for_bg = message_content;
     let user_id_for_bg = user_id.clone();
 
     // ── 5. 后台执行 AgentLooper ──────────────────────────────────────────
@@ -407,7 +433,7 @@ pub async fn stream_chat(
 
         let handle = AgentLooper::spawn(agent, session, config, persister.clone());
 
-        if let Err(e) = handle.send_query(message_for_bg.clone()).await {
+        if let Err(e) = handle.send_query_content(message_content_for_bg).await {
             let err_event = ChatSseEvent::Error {
                 message: format!("Failed to send message: {e}"),
                 conversation_id: conv_id_for_bg.clone(),
@@ -515,6 +541,7 @@ pub async fn stream_chat(
                     ref id,
                     ref name,
                     ref result,
+                    ..
                 }) if name == "delegate_sub_agent" || name == "run_parallel_sub_agents" => {
                     if let Some(infos) = sub_agent_registry.remove(id.as_str()) {
                         for info in infos {
@@ -539,6 +566,7 @@ pub async fn stream_chat(
                             id: id.clone(),
                             name: name.clone(),
                             result: String::new(),
+                            images: Vec::new(),
                         },
                         &conv_id_for_bg,
                     ) && let Ok(ev) = sse_ev.to_sse_event()

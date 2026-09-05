@@ -11,7 +11,7 @@ pub mod hooks;
 pub(crate) mod simple_looper;
 mod stream;
 
-pub use agent::{Agent, MessageFilter};
+pub use agent::{Agent, MessageFilter, supports_image_input_for};
 pub use agent_config::{
     AgentIdentity, AgentProfile, AssembleAgentMdParams, LlmConfig, ModelConfig, ModelConfigBuilder,
     assemble_agent_md, parse_agent_md, resolve_api_key, split_frontmatter,

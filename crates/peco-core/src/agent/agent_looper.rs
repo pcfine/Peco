@@ -326,10 +326,14 @@ pub enum LooperEvent {
         arguments: String,
     },
     /// Tool 执行结果
+    ///
+    /// `result` 为文本视图；`images` 携带输出中的图片部件 URL（data URI 或
+    /// https URL），纯文本工具结果恒为空。
     ToolResult {
         id: String,
         name: String,
         result: String,
+        images: Vec<String>,
     },
     /// 模型调用 token 用量
     ModelUsage {
@@ -402,8 +406,8 @@ pub enum LooperEvent {
 /// 用户输入消息
 #[derive(Debug, Clone)]
 pub enum UserMsg {
-    /// 用户查询文本
-    Query(String),
+    /// 用户查询（纯文本或文本 + 图片部件混排）
+    Query(Content),
     /// 关闭请求
     Shutdown,
 }
@@ -507,7 +511,18 @@ impl LooperHandle {
         &self,
         text: String,
     ) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
-        self.user_speaker.send(UserMsg::Query(text)).await
+        self.send_query_content(Content::Text(text)).await
+    }
+
+    /// 发送携带图片部件的用户查询（[`Content::Parts`]）。
+    ///
+    /// 纯文本查询走 [`Self::send_query`] 即可；部件混排时文本与图片部件
+    /// 整体进入 Session 的用户输入（rollback 重排队同样保留部件）。
+    pub async fn send_query_content(
+        &self,
+        content: Content,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
+        self.user_speaker.send(UserMsg::Query(content)).await
     }
 
     // ── 控制 ──────────────────────────────────────────────────────────────
@@ -1118,10 +1133,10 @@ impl AgentLooper {
                     break;
                 }
                 match user_listener.recv().await {
-                    Some(UserMsg::Query(text)) => {
+                    Some(UserMsg::Query(content)) => {
                         // 暂停期间收到的输入放入 pending 队列
                         info!("Message queued (looper paused). Will process after resume.");
-                        self.session.enqueue_pending(text.into());
+                        self.session.enqueue_pending(content);
                     }
                     Some(UserMsg::Shutdown) => break,
                     None => {
@@ -1156,8 +1171,8 @@ impl AgentLooper {
                 // 用户输入优先
                 maybe_msg = user_listener.recv() => {
                     match maybe_msg {
-                        Some(UserMsg::Query(text)) => {
-                            self.handle_user_query(text).await?;
+                        Some(UserMsg::Query(content)) => {
+                            self.handle_user_query(content).await?;
                         }
                         Some(UserMsg::Shutdown) => {
                             break;
@@ -1215,12 +1230,14 @@ impl AgentLooper {
     // ── 用户输入处理 ──────────────────────────────────────────────────────
 
     /// 处理用户查询：根据 Session 状态决定直接启动 turn 或放入 pending 队列。
-    async fn handle_user_query(&mut self, text: String) -> Result<(), AgentError> {
+    async fn handle_user_query(&mut self, content: Content) -> Result<(), AgentError> {
+        // 事件面保持文本视图；部件整体进入 Session（rollback 重排队同样保留）
+        let text = content.text_view().into_owned();
         match self.session.state() {
             SessionState::Idle => {
                 // 直接启动新 turn
                 self.session
-                    .start_turn(text.clone().into())
+                    .start_turn(content)
                     .map_err(|e| AgentError::AgentProtocol(e.to_string()))?;
 
                 // 记录启动时间（首次查询时记录 run_start_time）
@@ -2035,6 +2052,7 @@ impl AgentLooper {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
                             result,
+                            images: Vec::new(),
                         });
                     }
                     ToolHookAction::Reject(reason) => {
@@ -2047,6 +2065,7 @@ impl AgentLooper {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
                             result: reason,
+                            images: Vec::new(),
                         });
                     }
                     ToolHookAction::Abort(reason) => {
@@ -2124,6 +2143,12 @@ impl AgentLooper {
                     id: tool_result.call.id.clone(),
                     name: tool_result.call.function.name.clone(),
                     result: tool_result.result.text_view().into_owned(),
+                    images: tool_result
+                        .result
+                        .image_urls()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
                 });
 
                 Self::invoke_on_after_tool(
@@ -2150,6 +2175,12 @@ impl AgentLooper {
                                 id: tr.call.id.clone(),
                                 name: tr.call.function.name.clone(),
                                 result: tr.result.text_view().into_owned(),
+                                images: tr
+                                    .result
+                                    .image_urls()
+                                    .into_iter()
+                                    .map(str::to_string)
+                                    .collect(),
                             });
 
                             Self::invoke_on_after_tool(

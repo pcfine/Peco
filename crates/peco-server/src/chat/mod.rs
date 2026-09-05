@@ -4,12 +4,13 @@
 
 pub(crate) mod conversation;
 pub(crate) mod handler;
+pub(crate) mod images;
 pub(crate) mod sse;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{delete, get, patch};
+use axum::routing::{delete, get, patch, post};
 
 use peco_core::persistence::SessionPersister;
 
@@ -33,6 +34,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/{agentId}/conversations/{id}/session",
             get(handler::get_session_snapshot),
+        )
+        .route(
+            "/{agentId}/conversations/{id}/images",
+            post(images::upload_conversation_image),
         )
         .route(
             "/{agentId}/conversations/{id}/stream",

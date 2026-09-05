@@ -15,7 +15,7 @@ import type {
   TurnData,
   UsageData,
 } from "@/types/chat";
-import { Send, Square, Paperclip } from "lucide-react";
+import { Send, Square, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
@@ -33,11 +33,15 @@ export interface ChatMessage {
     name: string;
     arguments: string;
     result?: string;
+    /** 工具输出图片（data URI），来自 SSE `tool_result` 事件 */
+    images?: string[];
   }[];
   reasoning?: string;
   agentName?: string;
   agentTask?: string;
   callId?: string;
+  /** 用户消息携带的图片（渲染 URL），仅发送当轮可见 */
+  images?: string[];
   /** 错误提示消息（来自 SSE `error` 事件），以警示样式渲染 */
   isError?: boolean;
   /** 系统通知消息（如 SSE `context_compacted`），以居中分隔样式渲染 */
@@ -47,8 +51,12 @@ export interface ChatMessage {
 }
 
 export interface ChatViewProps {
-  /** 生成 SSE 流式 URL 的函数，接收用户输入消息，返回完整 URL */
-  streamUrl: (message: string) => string;
+  /** 生成 SSE 流式 URL 的函数，接收用户输入消息与引用图片 id，返回完整 URL */
+  streamUrl: (message: string, imageIds: string[]) => string;
+  /** 是否支持图片输入。false 时附件入口禁用（provider 无图片能力） */
+  supportsImages?: boolean;
+  /** 上传图片回调，返回引用 id 与渲染 URL。supportsImages 时必需 */
+  uploadImage?: (file: File) => Promise<{ id: string; url: string }>;
   /** 初始消息列表（从快照恢复） */
   initialMessages?: ChatMessage[];
   /** 头部右侧操作区（如清除对话按钮、归档按钮） */
@@ -89,6 +97,8 @@ export interface ChatViewProps {
 
 export function ChatView({
   streamUrl,
+  supportsImages = false,
+  uploadImage,
   initialMessages = [],
   headerActions,
   headerTitle = "对话",
@@ -118,8 +128,14 @@ export function ChatView({
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [usage, setUsage] = useState<UsageData | null>(null);
+  /** 已上传待发送的图片（引用 id + 渲染 URL） */
+  const [pendingImages, setPendingImages] = useState<
+    { id: string; url: string }[]
+  >([]);
+  const [uploadingImage, setUploadingImage] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const token = useAuthStore((s) => s.token);
   const unreadCountRef = useRef(0);
   const unreadDebounceRef = useRef<ReturnType<typeof setTimeout>>();
@@ -131,6 +147,8 @@ export function ChatView({
   streamingRef.current = streaming;
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
+  const pendingImagesRef = useRef(pendingImages);
+  pendingImagesRef.current = pendingImages;
 
   // StrictMode-safe unmount timer: setTimeout in cleanup is cleared on remount,
   // so abort only fires for genuine unmounts, not StrictMode double-invocation.
@@ -167,15 +185,22 @@ export function ChatView({
 
   const sendMessage = useCallback(async (text: string) => {
     const tok = tokenRef.current;
-    if (!text.trim() || !tok || streamingRef.current) return;
+    if ((!text.trim() && pendingImagesRef.current.length === 0) || !tok || streamingRef.current)
+      return;
+
+    // 上传中的图片不允许随消息发送（upload 完成前禁用发送即可达，这里兜底跳过）
+    const images = pendingImagesRef.current;
+    const imageIds = images.map((img) => img.id);
 
     const userMsg: ChatMessage = {
       role: "user",
       content: text,
       turnIndex: 0,
+      images: images.map((img) => img.url),
     };
     setMessages((prev) => [...prev, userMsg]);
     setStreaming(true);
+    setPendingImages([]);
 
     const assistantMsg: ChatMessage = {
       role: "assistant",
@@ -188,7 +213,7 @@ export function ChatView({
     abortRef.current = controller;
 
     try {
-      const url = streamUrlRef.current(text);
+      const url = streamUrlRef.current(text, imageIds);
       const response = await fetch(url, {
         headers: { Authorization: `Bearer ${tok}` },
         signal: controller.signal,
@@ -277,7 +302,12 @@ export function ChatView({
     const currentInput = inputRef.current;
     const tok = tokenRef.current;
     const streaming = externalIsStreamingRef.current ?? streamingRef.current;
-    if (!currentInput.trim() || !tok || streaming) return;
+    if (
+      (!currentInput.trim() && pendingImagesRef.current.length === 0) ||
+      !tok ||
+      streaming
+    )
+      return;
     setInput("");
     if (onExternalSendRef.current) {
       onExternalSendRef.current(currentInput);
@@ -371,6 +401,45 @@ export function ChatView({
     }
   };
 
+  // ── 图片上传：附件按钮 + 粘贴（supportsImages 时可用）─────────────────
+
+  const addImageFiles = useCallback(
+    async (files: File[]) => {
+      if (!uploadImage || files.length === 0) return;
+      setUploadingImage(true);
+      try {
+        for (const file of files) {
+          try {
+            const uploaded = await uploadImage(file);
+            setPendingImages((prev) => [...prev, uploaded]);
+          } catch {
+            toast.error(`图片上传失败：${file.name}`);
+          }
+        }
+      } finally {
+        setUploadingImage(false);
+      }
+    },
+    [uploadImage],
+  );
+
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ""; // 允许重复选择同一文件
+    void addImageFiles(files);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!supportsImages || !uploadImage) return;
+    const files = Array.from(e.clipboardData.files).filter((f) =>
+      f.type.startsWith("image/"),
+    );
+    if (files.length > 0) {
+      e.preventDefault();
+      void addImageFiles(files);
+    }
+  };
+
   const isInputDisabled = (externalIsStreaming ?? streaming) || !visible;
 
   // ── Render ──────────────────────────────────────────────────────────────
@@ -407,25 +476,80 @@ export function ChatView({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             disabled={isInputDisabled}
             rows={1}
           />
 
-          {/* 底部工具行：左侧预留扩展按钮，右侧用量圆环 + 发送/停止 */}
+          {/* 待发送图片预览（hover 出移除按钮） */}
+          {pendingImages.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-2">
+              {pendingImages.map((img) => (
+                <div key={img.id} className="group relative">
+                  <img
+                    src={img.url}
+                    alt="待发送图片"
+                    className="h-16 w-16 rounded-md border object-cover"
+                  />
+                  <button
+                    type="button"
+                    aria-label="移除图片"
+                    onClick={() =>
+                      setPendingImages((prev) =>
+                        prev.filter((p) => p.id !== img.id),
+                      )
+                    }
+                    className="absolute -top-1.5 -right-1.5 hidden h-5 w-5 items-center justify-center rounded-full bg-destructive text-destructive-foreground group-hover:flex"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 底部工具行：左侧附件按钮，右侧用量圆环 + 发送/停止 */}
           <div className="flex items-center justify-between gap-2 px-1.5 py-1">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  disabled
-                  aria-label="文件上传（即将推出）"
-                >
-                  <Paperclip className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>文件上传（即将推出）</TooltipContent>
-            </Tooltip>
+            {supportsImages && uploadImage ? (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  multiple
+                  hidden
+                  onChange={handleFileInputChange}
+                />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={isInputDisabled || uploadingImage}
+                      aria-label="添加图片"
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <Paperclip className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>添加图片</TooltipContent>
+                </Tooltip>
+              </>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    disabled
+                    aria-label="当前模型不支持图片输入"
+                  >
+                    <Paperclip className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>当前模型不支持图片输入</TooltipContent>
+              </Tooltip>
+            )}
 
             <div className="flex items-center gap-1">
               {/* 用量圆环：external 模式（Peco）的 usage 由父组件传入。 */}
@@ -442,7 +566,9 @@ export function ChatView({
                 <Button
                   size="sm"
                   onClick={handleSend}
-                  disabled={!input.trim() || !visible}
+                  disabled={
+                    (!input.trim() && pendingImages.length === 0) || !visible
+                  }
                 >
                   <Send className="h-4 w-4" />
                 </Button>
@@ -482,6 +608,18 @@ function ChatBubble({ message }: { message: ChatMessage }) {
     return (
       <div className="flex justify-end">
         <div className="bg-primary text-primary-foreground rounded-lg px-4 py-2 max-w-[80%] text-sm">
+          {message.images && message.images.length > 0 && (
+            <div className="mb-2 flex flex-wrap justify-end gap-2">
+              {message.images.map((url, i) => (
+                <img
+                  key={i}
+                  src={url}
+                  alt="用户图片"
+                  className="max-h-48 max-w-[240px] rounded-md border border-primary-foreground/20 object-contain"
+                />
+              ))}
+            </div>
+          )}
           {message.content}
         </div>
       </div>
@@ -539,6 +677,18 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             <summary className="text-xs font-medium cursor-pointer">
               🔧 {tc.name} {tc.result ? "✓" : "..."}
             </summary>
+            {tc.images && tc.images.length > 0 && (
+              <div className="mt-1 flex flex-wrap gap-2">
+                {tc.images.map((url, i) => (
+                  <img
+                    key={i}
+                    src={url}
+                    alt={`${tc.name} 输出图片`}
+                    className="max-h-48 max-w-[240px] rounded-md border object-contain"
+                  />
+                ))}
+              </div>
+            )}
             <pre className="text-xs text-muted-foreground mt-1 whitespace-pre-wrap max-h-32 overflow-y-auto">
               {tc.result || tc.arguments}
             </pre>
@@ -601,7 +751,13 @@ export function reduceStreamEvent(
       const last = messages[messages.length - 1];
       if (last?.role === "assistant" && last.toolCalls) {
         const updated = last.toolCalls.map((tc) =>
-          tc.id === event.data.id ? { ...tc, result: event.data.result } : tc,
+          tc.id === event.data.id
+            ? {
+                ...tc,
+                result: event.data.result,
+                images: event.data.images,
+              }
+            : tc,
         );
         return [...messages.slice(0, -1), { ...last, toolCalls: updated }];
       }

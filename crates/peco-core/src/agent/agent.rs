@@ -457,6 +457,24 @@ fn api_mode_of(entry: &ProviderEntry) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// 解析 provider（未实例化）的用户消息图片输入能力。
+///
+/// 与 [`build_provider_with_user`] 的适配器分派同源：openai 两 API 皆支持；
+/// qwen 仅 chat completions（responses 保守剥离）；deepseek 不支持；
+/// 未知 provider 名或类型不支持。仅反映用户消息维度 — 工具输出图片
+/// 是另一维度，各适配器另有矩阵。
+pub fn supports_image_input_for(user_config: &UserConfig, provider_name: Option<&str>) -> bool {
+    let provider_name = provider_name.unwrap_or_else(|| user_config.default_provider_name());
+    match user_config.provider_entry(Some(provider_name)) {
+        Some(entry) => match entry.provider_type.as_str() {
+            "openai" => true,
+            "qwen" => api_mode_of(entry).is_some_and(|a| a.eq_ignore_ascii_case("chat")),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
 /// 从 ModelConfig 构建 ModelProvider（使用 UserConfig 替代 GlobalHandler）。
 pub fn build_provider_with_user(
     model_config: &ModelConfig,
@@ -714,6 +732,51 @@ mod tests {
     }
 
     /// 未配置 `api` 时默认走 OpenAI 兼容 /responses。
+    fn entry_of(provider_type: &str, api: Option<&str>) -> ProviderEntry {
+        ProviderEntry {
+            provider_type: provider_type.to_string(),
+            api_key: Some("sk-test".to_string()),
+            base_url: None,
+            api: api.map(str::to_string),
+            default: None,
+        }
+    }
+
+    #[test]
+    fn test_supports_image_input_openai_both_apis() {
+        for api in [None, Some("chat"), Some("responses")] {
+            let config = user_config("openai", entry_of("openai", api));
+            assert!(
+                supports_image_input_for(&config, Some("openai")),
+                "openai api={api:?} 应支持用户图片输入"
+            );
+        }
+    }
+
+    #[test]
+    fn test_supports_image_input_qwen_chat_only() {
+        let responses = user_config("qwen", entry_of("qwen", None));
+        assert!(!supports_image_input_for(&responses, Some("qwen")));
+
+        let chat = user_config("qwen", entry_of("qwen", Some("chat")));
+        assert!(supports_image_input_for(&chat, Some("qwen")));
+    }
+
+    #[test]
+    fn test_supports_image_input_unsupported_and_unknown() {
+        let deepseek = user_config("deepseek", entry_of("deepseek", None));
+        assert!(!supports_image_input_for(&deepseek, Some("deepseek")));
+
+        // provider 名在配置中不存在 → 不支持
+        assert!(!supports_image_input_for(&deepseek, Some("nope")));
+    }
+
+    #[test]
+    fn test_supports_image_input_falls_back_to_default_provider() {
+        let config = user_config("qwen", entry_of("qwen", Some("chat")));
+        assert!(supports_image_input_for(&config, None));
+    }
+
     #[test]
     fn test_qwen_branch_defaults_to_responses_adapter() {
         let entry = qwen_entry();

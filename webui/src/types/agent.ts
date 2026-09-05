@@ -21,6 +21,8 @@ export interface AgentDetail extends AgentListItem {
   max_tokens?: number;
   reasoning_effort?: string;
   max_turns: number;
+  /** agent 绑定的 provider 是否支持用户消息图片输入 */
+  supports_images: boolean;
   updated_at: string;
 }
 

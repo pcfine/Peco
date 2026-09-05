@@ -59,6 +59,8 @@ export interface ToolResultData {
   id: string;
   name: string;
   result: string;
+  /** 工具输出中的图片（data URI），无图片时缺省 */
+  images?: string[];
   conversation_id: string;
 }
 

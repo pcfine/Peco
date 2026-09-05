@@ -1096,6 +1096,10 @@ fn process_responses_sse_stream(
 
 #[async_trait]
 impl ModelProvider for OpenAiResponsesAdapter {
+    fn supports_image_input(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "openai-responses"
     }

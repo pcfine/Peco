@@ -226,7 +226,10 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     println!("Prompt: {prompt}\n");
 
     // Send the user query
-    user_speaker.send(UserMsg::Query(prompt)).await.ok();
+    user_speaker
+        .send(UserMsg::Query(model_provider::Content::Text(prompt)))
+        .await
+        .ok();
     // Drop speaker so looper.run() exits after processing all messages
     drop(user_speaker);
 
