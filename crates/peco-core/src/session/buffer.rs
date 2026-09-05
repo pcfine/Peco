@@ -204,15 +204,15 @@ impl StagingBuffer {
 mod tests {
     use super::*;
     use crate::session::types::{MessageId, MessageSource};
-    use model_provider::{InputItem, Role};
+    use model_provider::{Content, InputItem, Role};
 
-    fn user(text: impl Into<String>) -> InputItem {
+    fn user(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::User,
             content: text.into(),
         }
     }
-    fn assistant(text: impl Into<String>) -> InputItem {
+    fn assistant(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::Assistant,
             content: text.into(),
@@ -421,7 +421,7 @@ mod tests {
             0,
             InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "result".to_string(),
+                output: "result".into(),
             },
             MessageSource::ToolExecution {
                 tool_name: "tool".to_string(),

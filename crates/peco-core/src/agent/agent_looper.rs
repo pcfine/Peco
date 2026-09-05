@@ -1118,7 +1118,7 @@ impl AgentLooper {
                     Some(UserMsg::Query(text)) => {
                         // 暂停期间收到的输入放入 pending 队列
                         info!("Message queued (looper paused). Will process after resume.");
-                        self.session.enqueue_pending(text);
+                        self.session.enqueue_pending(text.into());
                     }
                     Some(UserMsg::Shutdown) => break,
                     None => {
@@ -1217,7 +1217,7 @@ impl AgentLooper {
             SessionState::Idle => {
                 // 直接启动新 turn
                 self.session
-                    .start_turn(text.clone())
+                    .start_turn(text.clone().into())
                     .map_err(|e| AgentError::AgentProtocol(e.to_string()))?;
 
                 // 记录启动时间（首次查询时记录 run_start_time）
@@ -1245,11 +1245,11 @@ impl AgentLooper {
             SessionState::Active => {
                 // InnerLoop 进行中 — 放入 pending 队列
                 info!("Message queued. Will process after current turn.");
-                self.session.enqueue_pending(text);
+                self.session.enqueue_pending(text.into());
             }
             _ => {
                 // Cancelling / Interrupted — 也放入 pending
-                self.session.enqueue_pending(text);
+                self.session.enqueue_pending(text.into());
             }
         }
         Ok(())
@@ -1533,6 +1533,15 @@ impl AgentLooper {
         let owned_filtered: Vec<AnnotatedMessage>;
         let refs: Vec<&AnnotatedMessage> = if let Some(filter) = &self.config.message_filter {
             owned_filtered = filter.filter(&all_refs);
+            // 图片部件可见性：过滤器输入含图时 warn 一次（含计数）—
+            // 脱敏类过滤器不处理图片即原样进入模型上下文，这一事实不能静默。
+            let image_count: usize = all_refs.iter().map(|am| am.message.image_count()).sum();
+            if image_count > 0 {
+                warn!(
+                    images = image_count,
+                    "MessageFilter input contains image parts; images pass through unless the filter handles them"
+                );
+            }
             owned_filtered.iter().collect()
         } else {
             all_refs
@@ -1561,11 +1570,11 @@ impl AgentLooper {
                     InputItem::Message {
                         role: Role::User,
                         content,
-                    } => Some(content.as_str()),
+                    } => Some(content.text_view()),
                     _ => None,
                 })
-                .unwrap_or("");
-            self.dynamic_context = dc.query(query_text).await;
+                .unwrap_or_default();
+            self.dynamic_context = dc.query(&query_text).await;
         }
 
         // ── 合并 system prompt → instructions ──────────────────────────
@@ -1920,7 +1929,7 @@ impl AgentLooper {
                         MessageSource::ModelGeneration,
                         InputItem::Message {
                             role: Role::Assistant,
-                            content: t.clone(),
+                            content: t.clone().into(),
                         },
                     );
                 }
@@ -2198,7 +2207,7 @@ impl AgentLooper {
                     },
                     InputItem::FunctionCallOutput {
                         call_id: ptc.call.id.clone(),
-                        output: result.result.clone(),
+                        output: result.result.clone().into(),
                     },
                 );
             }

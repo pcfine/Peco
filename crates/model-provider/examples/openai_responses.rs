@@ -33,7 +33,7 @@ fn make_request(model: &str, question: &str) -> GenerateRequest {
         instructions: Some("You are a helpful assistant. Keep answers concise.".to_string()),
         input: Arc::from([Arc::new(InputItem::Message {
             role: Role::User,
-            content: question.to_string(),
+            content: question.into(),
         })]),
         tools: vec![],
         tool_choice: None,

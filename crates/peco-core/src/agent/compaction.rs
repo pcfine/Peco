@@ -106,7 +106,7 @@ impl TurnSummarizer for ModelSummarizer {
             instructions: Some(SUMMARY_SYSTEM_PROMPT.to_string()),
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: user_content,
+                content: user_content.into(),
             })]
             .into(),
             tools: vec![],
@@ -251,12 +251,17 @@ impl CompactionPolicy {
         let previous = session
             .pinned_summary()
             .and_then(|am| match am.message.as_ref() {
-                InputItem::Message { content, .. } => Some(strip_summary_wrapper(content)),
+                InputItem::Message { content, .. } => {
+                    Some(strip_summary_wrapper(&content.text_view()).to_owned())
+                }
                 _ => None,
             })
             .filter(|s| !s.is_empty());
 
-        let summary = self.summarizer.summarize(previous, &transcript).await?;
+        let summary = self
+            .summarizer
+            .summarize(previous.as_deref(), &transcript)
+            .await?;
 
         let evicted = session
             .compact(evict_count, summary.clone())
@@ -296,10 +301,12 @@ fn build_transcript(evicted_turns: &[Vec<crate::session::AnnotatedMessage>]) -> 
         for am in turn {
             let line = match am.message.as_ref() {
                 InputItem::Message { role, content } => {
-                    format!("{}: {}", role_label(*role), content)
+                    format!("{}: {}", role_label(*role), content.text_view())
                 }
                 InputItem::FunctionCall { name, .. } => format!("[调用工具 {name}]"),
-                InputItem::FunctionCallOutput { output, .. } => format!("[工具输出] {output}"),
+                InputItem::FunctionCallOutput { output, .. } => {
+                    format!("[工具输出] {}", output.text_view())
+                }
                 InputItem::Reasoning { .. } => continue,
                 _ => continue,
             };
@@ -352,15 +359,13 @@ mod tests {
     fn make_session_with_turns(n: usize) -> Session {
         let mut s = Session::new("test".to_string(), "test".to_string());
         for i in 0..n {
-            s.start_turn(format!(
-                "这是第 {i} 轮的问题，内容足够长以产生 token 占用。"
-            ))
-            .unwrap();
+            s.start_turn(format!("这是第 {i} 轮的问题，内容足够长以产生 token 占用。").into())
+                .unwrap();
             s.stage_item(
                 MessageSource::ModelGeneration,
                 InputItem::Message {
                     role: Role::Assistant,
-                    content: format!("这是第 {i} 轮的回答，同样足够长以产生 token 占用。"),
+                    content: format!("这是第 {i} 轮的回答，同样足够长以产生 token 占用。").into(),
                 },
             )
             .unwrap();
@@ -479,10 +484,13 @@ mod tests {
         // 最后一次压缩后 pinned = "v2"
         let pinned = session.pinned_summary().unwrap();
         assert_eq!(
-            strip_summary_wrapper(match pinned.message.as_ref() {
-                InputItem::Message { content, .. } => content.as_str(),
-                _ => panic!("expected message"),
-            }),
+            strip_summary_wrapper(
+                match pinned.message.as_ref() {
+                    InputItem::Message { content, .. } => content.text_view(),
+                    _ => panic!("expected message"),
+                }
+                .as_ref(),
+            ),
             "v2"
         );
     }

@@ -143,22 +143,23 @@ pub(crate) fn is_history_viewable(item: &InputItem) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model_provider::Content;
     use peco_core::agent::estimate_str_tokens;
     use peco_core::session::{MessageId, MessageSource};
 
-    fn user(text: impl Into<String>) -> InputItem {
+    fn user(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::User,
             content: text.into(),
         }
     }
-    fn assistant(text: impl Into<String>) -> InputItem {
+    fn assistant(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::Assistant,
             content: text.into(),
         }
     }
-    fn system(text: impl Into<String>) -> InputItem {
+    fn system(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::System,
             content: text.into(),

@@ -21,7 +21,7 @@
 //!         instructions: Some("你是一个乐于助人的助手。".to_string()),
 //!         input: vec![Arc::new(InputItem::Message {
 //!             role: Role::User,
-//!             content: "你好！".to_string(),
+//!             content: "你好！".into(),
 //!         })]
 //!         .into(),
 //!         tools: vec![],
@@ -61,9 +61,9 @@ pub use providers::qwen::{
     QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter, QwenResponsesAdapter,
 };
 pub use response::{
-    BlockAssembler, BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult,
-    InputItem, ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk,
-    TextConfig, TextFormat, ToolChoice,
+    BlockAssembler, BlockType, Content, ContentBlock, ContentPart, FinishReason, GenerateRequest,
+    GenerateResult, ImageDetail, InputItem, ReasoningConfig, ReasoningEffort, ResponseError,
+    ResponseStatus, Role, StreamChunk, TextConfig, TextFormat, ToolChoice,
 };
 pub use types::{ToolCall, ToolCallFunction, ToolDefinition, Usage};
 

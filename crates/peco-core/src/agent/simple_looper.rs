@@ -141,7 +141,7 @@ impl SimpleAgentLooper {
         // Build initial message list: [User(prompt)]
         self.messages.push(Arc::new(InputItem::Message {
             role: Role::User,
-            content: prompt,
+            content: prompt.into(),
         }));
 
         loop {
@@ -200,7 +200,7 @@ impl SimpleAgentLooper {
             if !text.is_empty() {
                 self.messages.push(Arc::new(InputItem::Message {
                     role: Role::Assistant,
-                    content: text.clone(),
+                    content: text.clone().into(),
                 }));
             }
             if !reasoning.is_empty() {
@@ -278,7 +278,7 @@ impl SimpleAgentLooper {
                         idx,
                         Arc::new(InputItem::FunctionCallOutput {
                             call_id: tc.id,
-                            output: content,
+                            output: content.into(),
                         }),
                     ));
                 }
@@ -289,7 +289,7 @@ impl SimpleAgentLooper {
                         expected_idx,
                         Arc::new(InputItem::FunctionCallOutput {
                             call_id: "unknown".into(),
-                            output: format!("tool panicked: {join_err}"),
+                            output: format!("tool panicked: {join_err}").into(),
                         }),
                     ));
                 }

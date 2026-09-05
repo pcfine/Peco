@@ -132,7 +132,7 @@ impl TurnAnalyzer for ModelTurnAnalyzer {
             instructions: Some(ANALYZER_SYSTEM_PROMPT.to_string()),
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: user_content,
+                content: user_content.into(),
             })]
             .into(),
             tools: vec![],

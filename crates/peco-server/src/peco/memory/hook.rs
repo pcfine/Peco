@@ -13,6 +13,7 @@
 // 检索、LLM 提取与 KB 写入全部 `tokio::spawn` 到后台 — turn 边界零阻塞。
 // spawn 前数据全部转 owned，无借用问题；单用户场景写入乱序风险可接受。
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -49,16 +50,16 @@ impl MemoryExtractionHook {
     /// 跳过 tool 过程与 reasoning）。返回 `None` 表示无可提取内容。
     fn collect_turn_dialogue(session: &Session) -> Option<String> {
         let turn = session.committed_turns().last()?;
-        let mut user_parts: Vec<&str> = Vec::new();
-        let mut assistant_parts: Vec<&str> = Vec::new();
+        let mut user_parts: Vec<Cow<'_, str>> = Vec::new();
+        let mut assistant_parts: Vec<Cow<'_, str>> = Vec::new();
         for am in turn {
             if let InputItem::Message { role, content } = am.message.as_ref() {
-                if content.trim().is_empty() {
+                if content.text_view().trim().is_empty() {
                     continue;
                 }
                 match role {
-                    Role::User => user_parts.push(content),
-                    Role::Assistant => assistant_parts.push(content),
+                    Role::User => user_parts.push(content.text_view()),
+                    Role::Assistant => assistant_parts.push(content.text_view()),
                     _ => {}
                 }
             }
@@ -69,12 +70,12 @@ impl MemoryExtractionHook {
         let mut dialogue = String::new();
         for p in user_parts {
             dialogue.push_str("用户: ");
-            dialogue.push_str(p);
+            dialogue.push_str(&p);
             dialogue.push('\n');
         }
         for p in assistant_parts {
             dialogue.push_str("助手: ");
-            dialogue.push_str(p);
+            dialogue.push_str(&p);
             dialogue.push('\n');
         }
         Some(dialogue)
@@ -237,12 +238,12 @@ mod tests {
     /// 构造一个已提交一轮对话的 session（User + Assistant 文本）。
     fn make_session_with_turn(user: &str, assistant: &str) -> Session {
         let mut s = Session::new("test".to_string(), "test".to_string());
-        s.start_turn(user.to_string()).unwrap();
+        s.start_turn(user.into()).unwrap();
         s.stage_item(
             MessageSource::ModelGeneration,
             InputItem::Message {
                 role: Role::Assistant,
-                content: assistant.to_string(),
+                content: assistant.into(),
             },
         )
         .unwrap();

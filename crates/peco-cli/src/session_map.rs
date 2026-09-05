@@ -127,9 +127,9 @@ impl SessionPersister for AgentAwareSessionPersister {
         created_at: u64,
     ) -> Result<PersistResult, PersistError> {
         // 从 snapshot 提取首条 User query 作为真实 description
-        let real_desc = extract_first_query(snapshot).unwrap_or(description);
+        let real_desc = extract_first_query(snapshot).unwrap_or_else(|| description.to_string());
         self.inner
-            .save(snapshot, session_id, real_desc, created_at)
+            .save(snapshot, session_id, &real_desc, created_at)
             .await
     }
 
@@ -156,7 +156,7 @@ impl SessionPersister for AgentAwareSessionPersister {
 /// 从 SessionSnapshot 中提取第一条 User 消息文本。
 ///
 /// 会话的首条消息总是用户 query，位于 `committed_turns[0][0]`。
-fn extract_first_query(snapshot: &SessionSnapshot) -> Option<&str> {
+fn extract_first_query(snapshot: &SessionSnapshot) -> Option<String> {
     snapshot
         .committed_turns
         .first()?
@@ -165,7 +165,7 @@ fn extract_first_query(snapshot: &SessionSnapshot) -> Option<&str> {
             InputItem::Message {
                 role: Role::User,
                 content,
-            } => Some(content.as_str()),
+            } => Some(content.text_view().into_owned()),
             _ => None,
         })
 }

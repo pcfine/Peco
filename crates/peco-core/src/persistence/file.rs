@@ -288,9 +288,9 @@ fn sanitize_session_id(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::session::{AnnotatedMessage, MessageId, MessageSource};
-    use model_provider::{InputItem, Role, Usage};
+    use model_provider::{Content, ContentPart, ImageDetail, InputItem, Role, Usage};
 
-    fn user(text: impl Into<String>) -> InputItem {
+    fn user(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::User,
             content: text.into(),
@@ -362,6 +362,48 @@ mod tests {
         assert_eq!(meta.tokens_used, 30);
         assert_eq!(meta.completed_turns, 1);
         assert!(meta.updated_at > 0);
+
+        teardown(&p).await;
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_roundtrip_preserves_parts_content() {
+        // 带图片部件的用户消息经 JSON 快照往返后部件必须原样保留。
+        let p = setup("parts-roundtrip").await;
+        let id = "parts-session";
+
+        let parts = Content::Parts(vec![
+            ContentPart::Text {
+                text: "看这张图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/cat.png".to_string(),
+                detail: Some(ImageDetail::Low),
+            },
+        ]);
+        let snap = SessionSnapshot {
+            committed_turns: vec![vec![AnnotatedMessage::new(
+                MessageId(0),
+                0,
+                InputItem::Message {
+                    role: Role::User,
+                    content: parts.clone(),
+                },
+                MessageSource::UserInput,
+            )]],
+            turn_index: 1,
+            total_usage: Usage::default(),
+            next_message_id: 1,
+            pending_inputs: Vec::new(),
+            pinned_summary: None,
+        };
+        p.save(&snap, id, "parts", 1000).await.unwrap();
+
+        let (loaded, _) = p.load(id).await.unwrap().expect("should exist");
+        match &loaded.committed_turns[0][0].message.as_ref() {
+            InputItem::Message { content, .. } => assert_eq!(content, &parts),
+            other => panic!("expected message, got {other:?}"),
+        }
 
         teardown(&p).await;
     }
@@ -521,7 +563,7 @@ mod tests {
                 0,
                 InputItem::Message {
                     role: Role::System,
-                    content: "summary".to_string(),
+                    content: "summary".into(),
                 },
                 MessageSource::SystemInjection {
                     reason: "compaction".to_string(),
@@ -588,7 +630,7 @@ mod tests {
                 0,
                 InputItem::Message {
                     role: Role::System,
-                    content: "summary".to_string(),
+                    content: "summary".into(),
                 },
                 MessageSource::SystemInjection {
                     reason: "compaction".to_string(),
@@ -632,14 +674,14 @@ mod tests {
             loaded.committed_turns[0][0].message.as_ref(),
             &InputItem::Message {
                 role: Role::User,
-                content: "turn1".to_string()
+                content: "turn1".into()
             }
         );
         assert_eq!(
             loaded.committed_turns[1][0].message.as_ref(),
             &InputItem::Message {
                 role: Role::User,
-                content: "turn2".to_string()
+                content: "turn2".into()
             }
         );
         assert!(loaded.pinned_summary.is_some(), "pinned 摘要不得丢失");

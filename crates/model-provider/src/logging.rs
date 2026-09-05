@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::response::{ContentBlock, InputItem};
+use crate::response::{ContentBlock, InputItem, Role};
 
 /// 进程内自增的请求序号。
 ///
@@ -39,6 +39,8 @@ pub(crate) struct InputSummary {
     pub function_calls: usize,
     pub function_call_outputs: usize,
     pub reasoning: usize,
+    /// 用户消息与工具输出里的图片部件合计。
+    pub images: usize,
 }
 
 /// 统计 [`InputItem`] 各变体数量（O(items)，不触碰文本内容）。
@@ -46,9 +48,17 @@ pub(crate) fn summarize_input(input: &[std::sync::Arc<InputItem>]) -> InputSumma
     let mut s = InputSummary::default();
     for item in input {
         match &**item {
-            InputItem::Message { .. } => s.messages += 1,
+            InputItem::Message { role, content } => {
+                s.messages += 1;
+                if matches!(role, Role::User) {
+                    s.images += content.image_count();
+                }
+            }
             InputItem::FunctionCall { .. } => s.function_calls += 1,
-            InputItem::FunctionCallOutput { .. } => s.function_call_outputs += 1,
+            InputItem::FunctionCallOutput { output, .. } => {
+                s.function_call_outputs += 1;
+                s.images += output.image_count();
+            }
             InputItem::Reasoning { .. } => s.reasoning += 1,
         }
     }
@@ -111,8 +121,21 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::response::{GenerateRequest, Role};
+    use crate::response::{Content, ContentPart, GenerateRequest, Role};
     use crate::{DeepSeek, ModelProvider, ProviderError};
+
+    /// 一个 text + image 混排的内容，供图片计数断言共用。
+    fn sample_parts() -> Content {
+        Content::Parts(vec![
+            ContentPart::Text {
+                text: "看这张图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/a.png".to_string(),
+                detail: None,
+            },
+        ])
+    }
 
     // ========================================================================
     // 日志管线端到端验证
@@ -191,10 +214,10 @@ mod tests {
             input: vec![
                 Arc::new(InputItem::Message {
                     role: Role::User,
-                    content: "北京天气如何".to_string(),
+                    content: "北京天气如何".into(),
                 }),
                 Arc::new(InputItem::Reasoning {
-                    content: "需要查天气".to_string(),
+                    content: "需要查天气".into(),
                 }),
                 Arc::new(InputItem::FunctionCall {
                     call_id: "call_1".to_string(),
@@ -203,7 +226,7 @@ mod tests {
                 }),
                 Arc::new(InputItem::FunctionCallOutput {
                     call_id: "call_1".to_string(),
-                    output: "晴 25C".to_string(),
+                    output: "晴 25C".into(),
                 }),
             ]
             .into(),
@@ -351,10 +374,10 @@ mod tests {
         let input = vec![
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "你好".to_string(),
+                content: "你好".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "think".to_string(),
+                content: "think".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -363,7 +386,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ];
         let s = summarize_input(&input);
@@ -371,6 +394,30 @@ mod tests {
         assert_eq!(s.reasoning, 1);
         assert_eq!(s.function_calls, 1);
         assert_eq!(s.function_call_outputs, 1);
+        // 纯文本历史不产生图片计数。
+        assert_eq!(s.images, 0);
+    }
+
+    /// 图片计数只来自用户消息与工具输出的图片部件；其他角色的图片不计入。
+    #[test]
+    fn summarize_input_counts_images_from_user_and_tool_output_only() {
+        let input = vec![
+            Arc::new(InputItem::Message {
+                role: Role::User,
+                content: sample_parts(),
+            }),
+            Arc::new(InputItem::Message {
+                role: Role::Assistant,
+                content: sample_parts(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: sample_parts(),
+            }),
+        ];
+        let s = summarize_input(&input);
+        // user 1 图 + 工具输出 1 图；assistant 图不计入。
+        assert_eq!(s.images, 2);
     }
 
     #[test]

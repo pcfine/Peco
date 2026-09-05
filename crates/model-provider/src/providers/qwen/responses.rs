@@ -259,12 +259,13 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>], carry_reasoning: bo
                 Role::System | Role::Developer | Role::User => {
                     flush_call_pairs(&mut out, &mut calls, &mut outputs);
                     flush_text(&mut out, &mut pending_text);
-                    out.push(message_item(*role, content));
+                    let text = content.text_view();
+                    out.push(message_item(*role, &text));
                 }
                 // 仅累积，实际输出时机由下面各分支的 flush_text 决定（相邻文本自然合并）。
                 Role::Assistant => match &mut pending_text {
-                    Some(existing) => existing.push_str(content),
-                    None => pending_text = Some(content.clone()),
+                    Some(existing) => existing.push_str(&content.text_view()),
+                    None => pending_text = Some(content.text_view().into_owned()),
                 },
             },
             InputItem::FunctionCall {
@@ -282,7 +283,8 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>], carry_reasoning: bo
                 ));
             }
             InputItem::FunctionCallOutput { call_id, output } => {
-                outputs.push((call_id.clone(), function_call_output_item(call_id, output)));
+                let text = output.text_view();
+                outputs.push((call_id.clone(), function_call_output_item(call_id, &text)));
             }
         }
     }
@@ -1326,7 +1328,7 @@ mod tests {
             instructions: Some("你是一个助手".to_string()),
             input: Arc::from([Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "你好".to_string(),
+                content: "你好".into(),
             })]),
             tools: vec![],
             tool_choice: None,
@@ -1507,10 +1509,10 @@ mod tests {
         request.input = Arc::from([
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "hi".to_string(),
+                content: "hi".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "思考".to_string(),
+                content: "思考".into(),
             }),
         ]);
         let body = build_responses_request_body(&request, false, false).unwrap();
@@ -1529,10 +1531,10 @@ mod tests {
         request.input = Arc::from([
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "hi".to_string(),
+                content: "hi".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "思考".to_string(),
+                content: "思考".into(),
             }),
         ]);
         let body = build_responses_request_body(&request, false, false).unwrap();
@@ -1547,7 +1549,7 @@ mod tests {
         let mut request = make_request();
         request.input = Arc::from([
             Arc::new(InputItem::Reasoning {
-                content: "思考".to_string(),
+                content: "思考".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -1556,7 +1558,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ]);
         assert!(request.tools.is_empty());
@@ -1585,7 +1587,7 @@ mod tests {
         });
         request.input = Arc::from([
             Arc::new(InputItem::Reasoning {
-                content: "思考".to_string(),
+                content: "思考".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -1594,7 +1596,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ]);
 
@@ -1784,7 +1786,7 @@ mod tests {
         let items = vec![
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "hi".to_string(),
+                content: "hi".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -1793,7 +1795,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -1811,7 +1813,7 @@ mod tests {
         // 顺序重排配对，产出逐对相邻的 call_a,out_a,call_b,out_b。
         let items = vec![
             Arc::new(InputItem::Reasoning {
-                content: "同时查两个城市".to_string(),
+                content: "同时查两个城市".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "a".to_string(),
@@ -1825,11 +1827,11 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "b".to_string(),
-                output: "Tokyo 20C".to_string(),
+                output: "Tokyo 20C".into(),
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "a".to_string(),
-                output: "Paris 18C".to_string(),
+                output: "Paris 18C".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -1854,7 +1856,7 @@ mod tests {
         // 多轮 ReAct：每组 pair 前都有自己的 reasoning。
         let items = vec![
             Arc::new(InputItem::Reasoning {
-                content: "r1".to_string(),
+                content: "r1".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -1863,10 +1865,10 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "o1".to_string(),
+                output: "o1".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "r2".to_string(),
+                content: "r2".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c2".to_string(),
@@ -1875,7 +1877,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c2".to_string(),
-                output: "o2".to_string(),
+                output: "o2".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -1898,7 +1900,7 @@ mod tests {
         // 反之无配对 call 的 output 同样丢弃。
         let items = vec![
             Arc::new(InputItem::Reasoning {
-                content: "r".to_string(),
+                content: "r".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "done".to_string(),
@@ -1912,11 +1914,11 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "done".to_string(),
-                output: "ok".to_string(),
+                output: "ok".into(),
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "ghost".to_string(),
-                output: "orphan".to_string(),
+                output: "orphan".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -1934,15 +1936,15 @@ mod tests {
         let items = vec![
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "查天气".to_string(),
+                content: "查天气".into(),
             }),
             // ↓ SimpleAgentLooper 的落库顺序：Text 在 Reasoning 之前
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "我查一下".to_string(),
+                content: "我查一下".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "需要调用工具".to_string(),
+                content: "需要调用工具".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -1951,7 +1953,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "18C".to_string(),
+                output: "18C".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -1982,11 +1984,11 @@ mod tests {
             }),
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "预览文本".to_string(),
+                content: "预览文本".into(),
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -2004,7 +2006,7 @@ mod tests {
         let items = vec![
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "先说两句".to_string(),
+                content: "先说两句".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -2013,7 +2015,7 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);
@@ -2029,11 +2031,11 @@ mod tests {
         let items = vec![
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "前半".to_string(),
+                content: "前半".into(),
             }),
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "后半".to_string(),
+                content: "后半".into(),
             }),
         ];
         let values = input_items_to_responses_values(&items, true);

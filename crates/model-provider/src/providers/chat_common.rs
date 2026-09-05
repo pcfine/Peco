@@ -15,22 +15,21 @@ use crate::response::{InputItem, Role};
 ///
 /// 承载 chat 协议需要的形状：`system` / `user` / `assistant` / `tool`。
 ///
-/// 所有文本字段借用自 [`GenerateRequest`](crate::response::GenerateRequest)
-/// （`'a` 即请求的借用期），序列化前不复制字符串；
-/// 唯一例外是 `reasoning_content` — 多个 `Reasoning` 项需要拼接，故用 [`Cow`]：
-/// 单项时借用，需拼接时才转为 owned。
+/// 文本字段用 [`Cow`] 借用自 [`GenerateRequest`](crate::response::GenerateRequest)
+/// （`'a` 即请求的借用期）：消息内容为纯文本时零拷贝借用；
+/// 为 `Parts` 混排时经 `text_view()` 拼接才转 owned。序列化形状与裸 `&str` 一致。
 #[derive(Debug, Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub(crate) enum WireMessage<'a> {
     System {
-        content: &'a str,
+        content: Cow<'a, str>,
     },
     User {
-        content: &'a str,
+        content: Cow<'a, str>,
     },
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<&'a str>,
+        content: Option<Cow<'a, str>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<WireToolCall<'a>>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,7 +38,7 @@ pub(crate) enum WireMessage<'a> {
     #[serde(rename = "tool")]
     Tool {
         tool_call_id: &'a str,
-        content: &'a str,
+        content: Cow<'a, str>,
     },
 }
 
@@ -61,7 +60,7 @@ pub(crate) struct WireToolCallFunction<'a> {
 /// 合并累加器中「当前 assistant 消息」的构建状态。
 #[derive(Default)]
 struct WireAssistantBuilder<'a> {
-    content: Option<&'a str>,
+    content: Option<Cow<'a, str>>,
     tool_calls: Vec<WireToolCall<'a>>,
     reasoning_content: Option<Cow<'a, str>>,
 }
@@ -113,20 +112,24 @@ pub(crate) fn input_items_to_wire_messages<'a>(
                 // chat 无法承载 Developer，宽松模式下降级为 system。
                 Role::System | Role::Developer => {
                     flush(&mut messages, &mut current);
-                    messages.push(WireMessage::System { content });
+                    messages.push(WireMessage::System {
+                        content: content.text_view(),
+                    });
                 }
                 Role::User => {
                     flush(&mut messages, &mut current);
-                    messages.push(WireMessage::User { content });
+                    messages.push(WireMessage::User {
+                        content: content.text_view(),
+                    });
                 }
                 Role::Assistant => match current.as_mut() {
                     Some(builder) if builder.content.is_none() => {
-                        builder.content = Some(content);
+                        builder.content = Some(content.text_view());
                     }
                     _ => {
                         flush(&mut messages, &mut current);
                         current = Some(WireAssistantBuilder {
-                            content: Some(content),
+                            content: Some(content.text_view()),
                             ..Default::default()
                         });
                     }
@@ -158,7 +161,7 @@ pub(crate) fn input_items_to_wire_messages<'a>(
                 flush(&mut messages, &mut current);
                 messages.push(WireMessage::Tool {
                     tool_call_id: call_id,
-                    content: output,
+                    content: output.text_view(),
                 });
             }
         }
@@ -176,7 +179,9 @@ pub(crate) fn ensure_trailing_user(messages: &mut Vec<WireMessage<'_>>) {
     if matches!(messages.last(), Some(WireMessage::User { .. })) {
         return;
     }
-    messages.push(WireMessage::User { content: "" });
+    messages.push(WireMessage::User {
+        content: Cow::Borrowed(""),
+    });
 }
 
 #[cfg(test)]
@@ -186,25 +191,30 @@ mod tests {
     fn tool_message() -> WireMessage<'static> {
         WireMessage::Tool {
             tool_call_id: "c1",
-            content: "72F",
+            content: "72F".into(),
         }
     }
 
     #[test]
     fn test_ensure_trailing_user_appends_after_tool() {
-        let mut messages = vec![WireMessage::User { content: "hi" }, tool_message()];
+        let mut messages = vec![
+            WireMessage::User {
+                content: "hi".into(),
+            },
+            tool_message(),
+        ];
         ensure_trailing_user(&mut messages);
         assert_eq!(messages.len(), 3);
         assert!(matches!(
             messages.last(),
-            Some(WireMessage::User { content: "" })
+            Some(WireMessage::User { content }) if content.is_empty()
         ));
     }
 
     #[test]
     fn test_ensure_trailing_user_appends_after_assistant() {
         let mut messages = vec![WireMessage::Assistant {
-            content: Some("done"),
+            content: Some("done".into()),
             tool_calls: None,
             reasoning_content: None,
         }];
@@ -212,15 +222,19 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(matches!(
             messages.last(),
-            Some(WireMessage::User { content: "" })
+            Some(WireMessage::User { content }) if content.is_empty()
         ));
     }
 
     #[test]
     fn test_ensure_trailing_user_keeps_existing_user() {
         let mut messages = vec![
-            WireMessage::System { content: "sys" },
-            WireMessage::User { content: "hi" },
+            WireMessage::System {
+                content: "sys".into(),
+            },
+            WireMessage::User {
+                content: "hi".into(),
+            },
         ];
         ensure_trailing_user(&mut messages);
         assert_eq!(messages.len(), 2);

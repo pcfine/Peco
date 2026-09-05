@@ -328,7 +328,7 @@ pub async fn get_session_snapshot(
                     .and_then(|am| match am.message.as_ref() {
                         // 剥离定界标签 — 下发给前端的是纯正文（归档分隔条 hover 展示用）
                         InputItem::Message { content, .. } => {
-                            Some(strip_summary_wrapper(content).to_string())
+                            Some(strip_summary_wrapper(&content.text_view()).to_string())
                         }
                         _ => None,
                     });

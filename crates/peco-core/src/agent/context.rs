@@ -7,6 +7,7 @@
 //
 // Session 的 system prompt 在此外层注入，不存入 Session。
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use model_provider::{InputItem, Role};
@@ -290,7 +291,7 @@ fn build_token_budget(
         );
         result.push(Arc::new(InputItem::Message {
             role: Role::System,
-            content: summary,
+            content: summary.into(),
         }));
     }
 
@@ -315,23 +316,23 @@ fn build_token_budget(
 ///
 /// 与 `input_item_chars` 覆盖相同的字段（Message/Reasoning 的 content、
 /// FunctionCall 的 arguments、FunctionCallOutput 的 output）。
-fn input_item_text(item: &InputItem) -> &str {
+fn input_item_text(item: &InputItem) -> Cow<'_, str> {
     match item {
-        InputItem::Message { content, .. } => content,
-        InputItem::Reasoning { content } => content,
-        InputItem::FunctionCall { arguments, .. } => arguments,
-        InputItem::FunctionCallOutput { output, .. } => output,
-        _ => "",
+        InputItem::Message { content, .. } => content.text_view(),
+        InputItem::Reasoning { content } => Cow::Borrowed(content),
+        InputItem::FunctionCall { arguments, .. } => Cow::Borrowed(arguments),
+        InputItem::FunctionCallOutput { output, .. } => output.text_view(),
+        _ => Cow::Borrowed(""),
     }
 }
 
 /// 单条 [`InputItem`] 的字符数（粗略 token 估算依据）。
 fn input_item_chars(item: &InputItem) -> usize {
     match item {
-        InputItem::Message { content, .. } => content.len(),
+        InputItem::Message { content, .. } => content.text_view().len(),
         InputItem::Reasoning { content } => content.len(),
         InputItem::FunctionCall { arguments, .. } => arguments.len(),
-        InputItem::FunctionCallOutput { output, .. } => output.len(),
+        InputItem::FunctionCallOutput { output, .. } => output.text_view().len(),
         _ => 0,
     }
 }
@@ -358,7 +359,7 @@ fn estimate_tokens_arc(messages: &[Arc<InputItem>]) -> usize {
 /// 供上下文压缩、历史窗口预算与 ContextUsage 等所有 token 估算路径使用 —
 /// 全项目单一实现，防漂移。
 pub fn estimate_item_tokens(item: &InputItem) -> usize {
-    estimate_str_tokens(input_item_text(item))
+    estimate_str_tokens(&input_item_text(item))
 }
 
 /// 按「字符数」估算 token（同 [`estimate_item_tokens`] 的权重规则）。
@@ -409,15 +410,15 @@ fn estimate_tokens(messages: &[InputItem]) -> usize {
 mod tests {
     use super::*;
     use crate::session::{AnnotatedMessage, MessageId, MessageSource};
-    use model_provider::{InputItem, Role};
+    use model_provider::{Content, ContentPart, InputItem, Role};
 
-    fn user(text: impl Into<String>) -> InputItem {
+    fn user(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::User,
             content: text.into(),
         }
     }
-    fn assistant(text: impl Into<String>) -> InputItem {
+    fn assistant(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::Assistant,
             content: text.into(),
@@ -595,5 +596,24 @@ mod tests {
         let msgs = vec![user("hello world")]; // 11 chars * 0.3 ≈ 3
         let tokens = estimate_tokens(&msgs);
         assert_eq!(tokens, 3);
+    }
+
+    #[test]
+    fn test_estimate_tokens_parts_uses_text_view_joining() {
+        // Parts 消息按 text_view 拼接后的口径估算，图片部件不产生 token。
+        let joined = "第一段\n第二段";
+        let parts_msg = user(Content::Parts(vec![
+            ContentPart::Text {
+                text: "第一段".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/cat.png".to_string(),
+                detail: None,
+            },
+            ContentPart::Text {
+                text: "第二段".to_string(),
+            },
+        ]));
+        assert_eq!(estimate_tokens(&[parts_msg]), estimate_str_tokens(joined));
     }
 }

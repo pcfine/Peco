@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use model_provider::{InputItem, Role};
+use model_provider::{Content, InputItem, Role};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -132,7 +132,7 @@ impl AnnotatedMessage {
             InputItem::Message {
                 role: Role::Assistant,
                 content,
-            } => !content.is_empty(),
+            } => !content.text_view().is_empty(),
             _ => false,
         }
     }
@@ -144,7 +144,7 @@ impl AnnotatedMessage {
             InputItem::Message {
                 role: Role::Assistant,
                 content
-            } if !content.is_empty()
+            } if !content.text_view().is_empty()
         )
     }
 
@@ -219,8 +219,11 @@ pub enum InputPriority {
 /// 高优先级输入（`InputPriority::Interrupt`）优先于普通输入处理。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInput {
-    /// 用户输入文本
-    pub text: String,
+    /// 用户输入内容（纯文本或文本 + 图片部件混排）。
+    ///
+    /// `alias = "text"`：旧快照以 String 承载该字段，反序列化时按旧字段名读取。
+    #[serde(alias = "text")]
+    pub content: Content,
     /// 到达时间（Unix 毫秒）
     pub arrived_at_ms: u64,
     /// 优先级（默认 Normal）
@@ -229,18 +232,18 @@ pub struct PendingInput {
 
 impl PendingInput {
     /// 创建新的排队输入（默认 Normal 优先级）。
-    pub fn new(text: String) -> Self {
+    pub fn new(content: Content) -> Self {
         Self {
-            text,
+            content,
             arrived_at_ms: unix_timestamp_ms(),
             priority: InputPriority::Normal,
         }
     }
 
     /// 创建指定优先级的排队输入。
-    pub fn with_priority(text: String, priority: InputPriority) -> Self {
+    pub fn with_priority(content: Content, priority: InputPriority) -> Self {
         Self {
-            text,
+            content,
             arrived_at_ms: unix_timestamp_ms(),
             priority,
         }

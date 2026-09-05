@@ -243,7 +243,7 @@ fn build_request_body(
     let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(WireMessage::System {
-            content: instructions,
+            content: instructions.as_str().into(),
         });
     }
     messages.extend(input_items_to_wire_messages(&request.input));
@@ -854,7 +854,7 @@ mod tests {
             instructions: Some("You are helpful.".to_string()),
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "Hello".to_string(),
+                content: "Hello".into(),
             })]
             .into(),
             tools: vec![],
@@ -892,7 +892,7 @@ mod tests {
             instructions: None,
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "天气怎么样？".to_string(),
+                content: "天气怎么样？".into(),
             })]
             .into(),
             tools: vec![tool],
@@ -926,7 +926,7 @@ mod tests {
                 }),
                 Arc::new(InputItem::FunctionCallOutput {
                     call_id: "c1".to_string(),
-                    output: "72F".to_string(),
+                    output: "72F".into(),
                 }),
             ]
             .into(),
@@ -964,10 +964,10 @@ mod tests {
         let items = vec![
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "hi".to_string(),
+                content: "hi".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "step 1".to_string(),
+                content: "step 1".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "c1".to_string(),
@@ -976,11 +976,11 @@ mod tests {
             }),
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "done".to_string(),
+                content: "done".into(),
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "c1".to_string(),
-                output: "72F".to_string(),
+                output: "72F".into(),
             }),
         ];
         let msgs = input_items_to_wire_messages(&items);

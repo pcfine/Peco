@@ -6,6 +6,7 @@
 // 换协议 = 加/改一个适配器（adapter），引擎层（peco-core）无感。
 //
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -36,6 +37,121 @@ pub enum ContentBlock {
 }
 
 // ============================================================================
+// Content — 消息 / 工具输出内容（string | parts[]）
+// ============================================================================
+
+/// 消息/工具输出内容：纯文本（绝大多数）或部件数组（文本 + 图片混排）。
+///
+/// untagged 序列化：`Text` 落为裸 JSON 字符串 — 既有快照与请求体形状不变；
+/// `Parts` 落为部件数组。下游所有"当文本用"的场景（估算/压缩/展示/DTO）
+/// 一律经 [`Content::text_view`] 收窄。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// 内容部件（内部标记 serde：`{"type":"text",...}` / `{"type":"image",...}`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text {
+        text: String,
+    },
+    /// 图片输入；`url` 为 https(s) URL 或 `data:image/...;base64,...` URI
+    ///（data URI 自描述媒体类型）。
+    Image {
+        url: String,
+        /// 图片细节档位；仅显式设置时参与序列化。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+    },
+}
+
+/// 图片细节档位（透传语义，由适配器按 wire 协议映射）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Auto,
+    Low,
+    High,
+}
+
+impl Content {
+    /// 统一文本视图：`Text` → 原文；`Parts` → text 部件以 "\n" 连接（图片跳过）。
+    pub fn text_view(&self) -> Cow<'_, str> {
+        match self {
+            Content::Text(s) => Cow::Borrowed(s),
+            Content::Parts(parts) => {
+                let mut joined = String::new();
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        if !joined.is_empty() {
+                            joined.push('\n');
+                        }
+                        joined.push_str(text);
+                    }
+                }
+                Cow::Owned(joined)
+            }
+        }
+    }
+
+    /// 纯文本判定：`Text` 恒真；`Parts` 含任何图片部件即假。
+    pub fn is_plain_text(&self) -> bool {
+        match self {
+            Content::Text(_) => true,
+            Content::Parts(parts) => parts.iter().all(|p| matches!(p, ContentPart::Text { .. })),
+        }
+    }
+
+    /// 迭代全部图片部件。
+    pub fn image_parts(&self) -> impl Iterator<Item = &ContentPart> {
+        self.as_parts()
+            .into_iter()
+            .flatten()
+            .filter(|p| matches!(p, ContentPart::Image { .. }))
+    }
+
+    /// 图片部件计数。
+    pub fn image_count(&self) -> usize {
+        self.image_parts().count()
+    }
+
+    fn as_parts(&self) -> Option<&[ContentPart]> {
+        match self {
+            Content::Text(_) => None,
+            Content::Parts(parts) => Some(parts),
+        }
+    }
+}
+
+impl From<String> for Content {
+    fn from(s: String) -> Self {
+        Content::Text(s)
+    }
+}
+
+impl From<&str> for Content {
+    fn from(s: &str) -> Self {
+        Content::Text(s.to_owned())
+    }
+}
+
+impl From<Vec<ContentPart>> for Content {
+    fn from(parts: Vec<ContentPart>) -> Self {
+        // 空 parts 与空文本同值：构造期归一化，避免 `Parts([])` 与 `Text("")`
+        // 两个语义相同却不想等的形状流入下游。
+        if parts.is_empty() {
+            Content::Text(String::new())
+        } else {
+            Content::Parts(parts)
+        }
+    }
+}
+
+// ============================================================================
 // InputItem — 输入项（历史回放）
 // ============================================================================
 
@@ -48,18 +164,29 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum InputItem {
-    /// 单条文本消息（含角色）。
-    Message { role: Role, content: String },
+    /// 单条消息（含角色）；`content` 为纯文本或文本 + 图片部件混排。
+    Message { role: Role, content: Content },
     /// 工具调用（回放历史时与相邻 assistant 消息合并）；`arguments` 为 raw JSON 字符串。
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
     },
-    /// 工具结果。
-    FunctionCallOutput { call_id: String, output: String },
+    /// 工具结果；`output` 为纯文本或部件数组。
+    FunctionCallOutput { call_id: String, output: Content },
     /// 推理（回传可选，多数情况下回放时丢弃）。
     Reasoning { content: String },
+}
+
+impl InputItem {
+    /// 本项携带的图片部件数（Message 内容与 FunctionCallOutput 输出中的图片）。
+    pub fn image_count(&self) -> usize {
+        match self {
+            InputItem::Message { content, .. } => content.image_count(),
+            InputItem::FunctionCallOutput { output, .. } => output.image_count(),
+            _ => 0,
+        }
+    }
 }
 
 /// 消息角色。
@@ -378,7 +505,7 @@ mod tests {
     fn input_item_serde_roundtrip() {
         let item = InputItem::Message {
             role: Role::User,
-            content: "你好".to_string(),
+            content: "你好".into(),
         };
         let json = serde_json::to_string(&item).unwrap();
         assert_eq!(json, r#"{"Message":{"role":"user","content":"你好"}}"#);
@@ -392,6 +519,116 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Role::Assistant).unwrap(),
             r#""assistant""#
+        );
+    }
+
+    #[test]
+    fn content_plain_text_keeps_legacy_json_shape() {
+        // 旧快照/旧请求体中 content 是裸字符串，纯文本路径必须逐字节不变。
+        let content = Content::Text("你好".to_string());
+        assert_eq!(serde_json::to_string(&content).unwrap(), r#""你好""#);
+        let back: Content = serde_json::from_str(r#""你好""#).unwrap();
+        assert_eq!(back, content);
+    }
+
+    #[test]
+    fn content_parts_roundtrip_and_omit_none_detail() {
+        let parts = vec![
+            ContentPart::Text {
+                text: "看这张图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/cat.png".to_string(),
+                detail: None,
+            },
+        ];
+        let content = Content::Parts(parts);
+        let json = serde_json::to_string(&content).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"type":"text","text":"看这张图"},{"type":"image","url":"https://example.com/cat.png"}]"#
+        );
+        let back: Content = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, content);
+    }
+
+    #[test]
+    fn content_rejects_null() {
+        // null 不对应任何变体：反序列化必须失败，不得静默变成空文本。
+        assert!(serde_json::from_str::<Content>("null").is_err());
+    }
+
+    #[test]
+    fn from_empty_parts_normalizes_to_empty_text() {
+        assert_eq!(
+            Content::from(Vec::<ContentPart>::new()),
+            Content::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn text_view_joins_text_parts_and_skips_images() {
+        let content = Content::Parts(vec![
+            ContentPart::Text {
+                text: "第一段".to_string(),
+            },
+            ContentPart::Image {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: Some(ImageDetail::Low),
+            },
+            ContentPart::Text {
+                text: "第二段".to_string(),
+            },
+        ]);
+        assert_eq!(content.text_view(), "第一段\n第二段");
+        assert_eq!(content.image_count(), 1);
+        assert!(!content.is_plain_text());
+        assert!(Content::Text("hi".to_string()).is_plain_text());
+    }
+
+    #[test]
+    fn input_item_image_count_counts_message_and_tool_output() {
+        let image = || ContentPart::Image {
+            url: "https://example.com/x.png".to_string(),
+            detail: None,
+        };
+        let message = InputItem::Message {
+            role: Role::User,
+            content: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "q".to_string(),
+                },
+                image(),
+            ]),
+        };
+        let tool_output = InputItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: Content::Parts(vec![image()]),
+        };
+        let plain = InputItem::Message {
+            role: Role::User,
+            content: Content::Text("q".to_string()),
+        };
+        assert_eq!(message.image_count(), 1);
+        assert_eq!(tool_output.image_count(), 1);
+        assert_eq!(plain.image_count(), 0);
+    }
+
+    #[test]
+    fn content_part_match_must_be_exhaustive() {
+        // 防漂移：ContentPart 新增变体时此处编译失败，迫使所有 strip/映射逻辑
+        // 显式处理新部件，而不是通配符静默放过。
+        fn describe(part: &ContentPart) -> &'static str {
+            match part {
+                ContentPart::Text { .. } => "text",
+                ContentPart::Image { .. } => "image",
+            }
+        }
+        assert_eq!(
+            describe(&ContentPart::Text {
+                text: String::new()
+            }),
+            "text"
         );
     }
 

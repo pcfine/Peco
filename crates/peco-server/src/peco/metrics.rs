@@ -138,19 +138,19 @@ mod tests {
     fn user(text: &str) -> InputItem {
         InputItem::Message {
             role: Role::User,
-            content: text.to_string(),
+            content: text.into(),
         }
     }
     fn assistant(text: &str) -> InputItem {
         InputItem::Message {
             role: Role::Assistant,
-            content: text.to_string(),
+            content: text.into(),
         }
     }
     fn tool_output(text: &str) -> InputItem {
         InputItem::FunctionCallOutput {
             call_id: "c1".into(),
-            output: text.to_string(),
+            output: text.into(),
         }
     }
     fn pinned(text: &str) -> AnnotatedMessage {
@@ -159,7 +159,7 @@ mod tests {
             0,
             InputItem::Message {
                 role: Role::System,
-                content: text.to_string(),
+                content: text.into(),
             },
             MessageSource::SystemInjection {
                 reason: "compaction".to_string(),

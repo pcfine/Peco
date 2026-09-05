@@ -19,14 +19,14 @@ use peco_server::session_store::SqliteSessionPersister;
 fn user_msg(text: &str) -> InputItem {
     InputItem::Message {
         role: Role::User,
-        content: text.to_string(),
+        content: text.into(),
     }
 }
 
 fn assistant_msg(text: &str) -> InputItem {
     InputItem::Message {
         role: Role::Assistant,
-        content: text.to_string(),
+        content: text.into(),
     }
 }
 
@@ -36,7 +36,7 @@ fn pinned_summary(text: &str) -> AnnotatedMessage {
         0,
         InputItem::Message {
             role: Role::System,
-            content: text.to_string(),
+            content: text.into(),
         },
         MessageSource::SystemInjection {
             reason: "compaction".to_string(),

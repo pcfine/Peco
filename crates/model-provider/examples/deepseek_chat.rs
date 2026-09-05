@@ -36,7 +36,7 @@ fn request(
         instructions: Some(instructions.to_string()),
         input: vec![Arc::new(InputItem::Message {
             role: Role::User,
-            content: user_content.to_string(),
+            content: user_content.into(),
         })]
         .into(),
         tools,

@@ -154,14 +154,18 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> Vec<Value> {
 
     for item in items {
         match &**item {
-            InputItem::Message { role, content } => out.push(message_item(*role, content)),
+            InputItem::Message { role, content } => {
+                let text = content.text_view();
+                out.push(message_item(*role, &text));
+            }
             InputItem::FunctionCall {
                 call_id,
                 name,
                 arguments,
             } => out.push(function_call_item(call_id, name, arguments)),
             InputItem::FunctionCallOutput { call_id, output } => {
-                out.push(function_call_output_item(call_id, output));
+                let text = output.text_view();
+                out.push(function_call_output_item(call_id, &text));
             }
             InputItem::Reasoning { .. } => dropped_reasoning += 1,
         }
@@ -1242,7 +1246,7 @@ mod tests {
             instructions: Some("You are a helpful assistant.".to_string()),
             input: Arc::from([Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "你好".to_string(),
+                content: "你好".into(),
             })]),
             tools: vec![],
             tool_choice: None,
@@ -1301,11 +1305,11 @@ mod tests {
         request.input = Arc::from([
             Arc::new(InputItem::Message {
                 role: Role::System,
-                content: "历史系统消息".to_string(),
+                content: "历史系统消息".into(),
             }),
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "你好".to_string(),
+                content: "你好".into(),
             }),
         ]);
         let body = build_responses_request_body(&request, false).unwrap();
@@ -1323,7 +1327,7 @@ mod tests {
         let mut request = make_request();
         request.input = Arc::from([Arc::new(InputItem::Message {
             role: Role::Developer,
-            content: "开发指令".to_string(),
+            content: "开发指令".into(),
         })]);
         let body = build_responses_request_body(&request, false).unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
@@ -1339,11 +1343,11 @@ mod tests {
         request.input = Arc::from([
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "前半".to_string(),
+                content: "前半".into(),
             }),
             Arc::new(InputItem::Message {
                 role: Role::Assistant,
-                content: "后半".to_string(),
+                content: "后半".into(),
             }),
         ]);
         let body = build_responses_request_body(&request, false).unwrap();
@@ -1363,10 +1367,10 @@ mod tests {
         request.input = Arc::from([
             Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "问题".to_string(),
+                content: "问题".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "思考".to_string(),
+                content: "思考".into(),
             }),
             Arc::new(InputItem::FunctionCall {
                 call_id: "call_1".to_string(),
@@ -1375,10 +1379,10 @@ mod tests {
             }),
             Arc::new(InputItem::FunctionCallOutput {
                 call_id: "call_1".to_string(),
-                output: "晴".to_string(),
+                output: "晴".into(),
             }),
             Arc::new(InputItem::Reasoning {
-                content: "再思考".to_string(),
+                content: "再思考".into(),
             }),
         ]);
         let body = build_responses_request_body(&request, false).unwrap();

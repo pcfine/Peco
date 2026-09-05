@@ -58,6 +58,14 @@ pub struct ModelResponse {
 /// 默认为 `None`（不过滤），可通过外部注入 `dyn` trait 对象覆盖。
 pub trait MessageFilter: Send + Sync {
     /// 对 AnnotatedMessage 引用列表进行过滤/转换，返回处理后的结果。
+    ///
+    /// # 图片部件契约
+    ///
+    /// 消息内容可为纯文本或文本 + 图片部件混排（[`model_provider::Content`]）。
+    /// 只处理文本的实现应将含图消息**整体透传**；需要删除或变换图片的过滤器
+    /// 自行处理 image 部件。调用方在过滤器输入含图片部件时会发出 `warn!` 日志
+    ///（含计数），保证"图片未经本过滤器处理"对排障始终可见 — 脱敏类过滤器
+    /// 不允许静默旁路图片。
     fn filter(
         &self,
         messages: &[&crate::session::AnnotatedMessage],
@@ -584,7 +592,91 @@ pub fn build_provider_with_user(
 mod tests {
     use super::*;
     use crate::config::{McpConfig, ProviderEntry, ProvidersConfig};
+    use crate::session::{AnnotatedMessage, MessageId, MessageSource};
+    use model_provider::{Content, ContentPart, InputItem, Role};
     use std::collections::HashMap;
+
+    /// 只处理文本的过滤器：纯文本消息被替换为占位符（模拟脱敏逻辑），
+    /// 含图消息整体透传 — 只懂文本的实现不允许拆散部件数组。
+    struct TextOnlyFilter;
+
+    impl MessageFilter for TextOnlyFilter {
+        fn filter(
+            &self,
+            messages: &[&crate::session::AnnotatedMessage],
+        ) -> Vec<crate::session::AnnotatedMessage> {
+            messages
+                .iter()
+                .map(|am| {
+                    let replaced = match am.message.as_ref() {
+                        InputItem::Message { role, content } if content.is_plain_text() => {
+                            InputItem::Message {
+                                role: *role,
+                                content: Content::Text(format!(
+                                    "[filtered] {}",
+                                    content.text_view()
+                                )),
+                            }
+                        }
+                        other => other.clone(),
+                    };
+                    AnnotatedMessage::new(am.id, am.turn_index, replaced, am.source.clone())
+                })
+                .collect()
+        }
+    }
+
+    /// MessageFilter 图片部件契约：只处理文本的过滤器把含图消息整体透传，
+    /// 图片部件不被静默旁路（旁路本身由调用方的 warn! 日志保证可见）。
+    #[test]
+    fn test_message_filter_text_only_passes_parts_through_intact() {
+        let parts = Content::Parts(vec![
+            ContentPart::Text {
+                text: "机密文件截图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/secret.png".to_string(),
+                detail: None,
+            },
+        ]);
+        let annotated = AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            InputItem::Message {
+                role: Role::User,
+                content: parts.clone(),
+            },
+            MessageSource::UserInput,
+        );
+        let plain = AnnotatedMessage::new(
+            MessageId(1),
+            0,
+            InputItem::Message {
+                role: Role::User,
+                content: Content::Text("纯文本消息".to_string()),
+            },
+            MessageSource::UserInput,
+        );
+        let refs = vec![&annotated, &plain];
+
+        let out = TextOnlyFilter.filter(&refs);
+        assert_eq!(out.len(), 2);
+        // 含图消息原样通过
+        match out[0].message.as_ref() {
+            InputItem::Message { content, .. } => {
+                assert_eq!(content, &parts);
+                assert_eq!(content.image_count(), 1);
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+        // 纯文本消息被过滤器改写
+        match out[1].message.as_ref() {
+            InputItem::Message { content, .. } => {
+                assert_eq!(content.text_view(), "[filtered] 纯文本消息");
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
 
     /// 构造一个仅含指定 provider 条目的最小 UserConfig。
     fn user_config(name: &str, entry: ProviderEntry) -> UserConfig {

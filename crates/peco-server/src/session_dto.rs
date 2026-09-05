@@ -74,7 +74,7 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                     flush(&mut messages, &mut current);
                     messages.push(GroupedMessage {
                         role: "system",
-                        content: Some(content.clone()),
+                        content: Some(content.text_view().into_owned()),
                         tool_calls: Vec::new(),
                         reasoning_content: None,
                         tool_call_id: None,
@@ -85,7 +85,7 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                     flush(&mut messages, &mut current);
                     messages.push(GroupedMessage {
                         role: "user",
-                        content: Some(content.clone()),
+                        content: Some(content.text_view().into_owned()),
                         tool_calls: Vec::new(),
                         reasoning_content: None,
                         tool_call_id: None,
@@ -98,12 +98,12 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                     // 该组首个 item 的时间戳。
                     match current.as_mut() {
                         Some(builder) if builder.content.is_none() => {
-                            builder.content = Some(content.clone());
+                            builder.content = Some(content.text_view().into_owned());
                         }
                         _ => {
                             flush(&mut messages, &mut current);
                             current = Some(AssistantBuilder {
-                                content: Some(content.clone()),
+                                content: Some(content.text_view().into_owned()),
                                 timestamp_ms: ts,
                                 ..Default::default()
                             });
@@ -142,7 +142,7 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                 flush(&mut messages, &mut current);
                 messages.push(GroupedMessage {
                     role: "tool",
-                    content: Some(output.clone()),
+                    content: Some(output.text_view().into_owned()),
                     tool_calls: Vec::new(),
                     reasoning_content: None,
                     tool_call_id: Some(call_id.clone()),

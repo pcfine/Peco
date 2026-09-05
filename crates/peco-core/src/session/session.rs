@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use model_provider::{InputItem, Role, Usage};
+use model_provider::{Content, InputItem, Role, Usage};
 
 use super::buffer::{CommittedBuffer, StagingBuffer};
 use super::error::SessionError;
@@ -225,7 +225,7 @@ impl Session {
     // ── Turn 生命周期（&mut self，状态机守卫）─────────────────────────
 
     /// 开始新 turn（仅 Idle 状态）。
-    pub fn start_turn(&mut self, user_text: String) -> Result<(), SessionError> {
+    pub fn start_turn(&mut self, user_text: Content) -> Result<(), SessionError> {
         if !self.state.can_start_turn() {
             return Err(SessionError::InvalidStateTransition {
                 current_state: self.state,
@@ -311,15 +311,16 @@ impl Session {
     /// 返回 `TurnBoundaryToken`，用于后续调用 `snapshot()`。
     pub fn rollback_turn(&mut self, requeue: bool) -> Result<TurnBoundaryToken, SessionError> {
         if requeue && let Some(ui) = self.staging.take_user_input() {
-            let text = match ui.message.as_ref() {
+            let content = match ui.message.as_ref() {
                 InputItem::Message {
                     role: Role::User,
                     content,
                 } => content.clone(),
-                _ => String::new(),
+                _ => Content::Text(String::new()),
             };
-            if !text.is_empty() {
-                self.pending.push_front(PendingInput::new(text));
+            // 空文本且无图片的输入不回队；其余（含纯图片输入）整体保留
+            if !content.text_view().is_empty() || content.image_count() > 0 {
+                self.pending.push_front(PendingInput::new(content));
             }
         }
 
@@ -406,7 +407,7 @@ impl Session {
             turn_index: 0,
             message: Arc::new(InputItem::Message {
                 role: Role::System,
-                content: summary,
+                content: summary.into(),
             }),
             timestamp_ms: unix_timestamp_ms(),
             estimated_tokens: None,
@@ -422,14 +423,14 @@ impl Session {
     // ── Pending 队列（&mut self）──────────────────────────────────────
 
     /// 将用户输入加入 pending 队列（默认 Normal 优先级）。
-    pub fn enqueue_pending(&mut self, text: String) {
-        self.pending.push_back(PendingInput::new(text));
+    pub fn enqueue_pending(&mut self, content: Content) {
+        self.pending.push_back(PendingInput::new(content));
     }
 
     /// 将指定优先级的用户输入加入 pending 队列。
-    pub fn enqueue_pending_with_priority(&mut self, text: String, priority: InputPriority) {
+    pub fn enqueue_pending_with_priority(&mut self, content: Content, priority: InputPriority) {
         self.pending
-            .push_back(PendingInput::with_priority(text, priority));
+            .push_back(PendingInput::with_priority(content, priority));
     }
 
     /// 从 pending 队列取出下一个输入并启动新 turn。
@@ -458,7 +459,7 @@ impl Session {
             None => return Ok(false),
         };
 
-        match self.start_turn(input.text.clone()) {
+        match self.start_turn(input.content.clone()) {
             Ok(()) => Ok(true),
             Err(e) => {
                 // 失败时将输入重新放入队列头部
@@ -544,21 +545,21 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::{InputItem, Role};
+    use model_provider::{Content, ContentPart, InputItem, Role};
 
-    fn user(text: impl Into<String>) -> InputItem {
+    fn user(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::User,
             content: text.into(),
         }
     }
-    fn assistant(text: impl Into<String>) -> InputItem {
+    fn assistant(text: impl Into<Content>) -> InputItem {
         InputItem::Message {
             role: Role::Assistant,
             content: text.into(),
         }
     }
-    fn tool(call_id: impl Into<String>, content: impl Into<String>) -> InputItem {
+    fn tool(call_id: impl Into<String>, content: impl Into<Content>) -> InputItem {
         InputItem::FunctionCallOutput {
             call_id: call_id.into(),
             output: content.into(),
@@ -589,7 +590,7 @@ mod tests {
     #[test]
     fn test_start_turn_transitions_to_active() {
         let mut s = make_session();
-        s.start_turn("hello".to_string()).unwrap();
+        s.start_turn("hello".into()).unwrap();
         assert_eq!(s.state(), SessionState::Active);
         assert_eq!(s.message_count(), 1); // user input in staging
     }
@@ -597,8 +598,8 @@ mod tests {
     #[test]
     fn test_start_turn_when_active_fails() {
         let mut s = make_session();
-        s.start_turn("first".to_string()).unwrap();
-        let result = s.start_turn("second".to_string());
+        s.start_turn("first".into()).unwrap();
+        let result = s.start_turn("second".into());
         assert!(result.is_err());
         match result.unwrap_err() {
             SessionError::InvalidStateTransition { current_state, .. } => {
@@ -618,7 +619,7 @@ mod tests {
     #[test]
     fn test_stage_and_commit_turn() {
         let mut s = make_session();
-        s.start_turn("hello".to_string()).unwrap();
+        s.start_turn("hello".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("hi there"))
             .unwrap();
 
@@ -656,13 +657,13 @@ mod tests {
         let mut s = make_session();
 
         // Turn 0
-        s.start_turn("q1".to_string()).unwrap();
+        s.start_turn("q1".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("a1"))
             .unwrap();
         let _token = s.commit_turn().unwrap();
 
         // Turn 1 (staging, not committed)
-        s.start_turn("q2".to_string()).unwrap();
+        s.start_turn("q2".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("a2"))
             .unwrap();
 
@@ -673,7 +674,7 @@ mod tests {
     #[test]
     fn test_rollback_turn() {
         let mut s = make_session();
-        s.start_turn("hello".to_string()).unwrap();
+        s.start_turn("hello".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("partial"))
             .unwrap();
 
@@ -685,7 +686,7 @@ mod tests {
     #[test]
     fn test_rollback_turn_requeue() {
         let mut s = make_session();
-        s.start_turn("hello".to_string()).unwrap();
+        s.start_turn("hello".into()).unwrap();
 
         let _token = s.rollback_turn(true).unwrap();
         assert!(s.has_pending());
@@ -696,15 +697,44 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_turn_requeue_preserves_parts() {
+        // 带图片部件的回放输入在 rollback 后重新入队，部件必须原样保留。
+        let parts = Content::Parts(vec![
+            ContentPart::Text {
+                text: "看这张图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/cat.png".to_string(),
+                detail: None,
+            },
+        ]);
+        let mut s = make_session();
+        s.start_turn(parts.clone()).unwrap();
+
+        let _token = s.rollback_turn(true).unwrap();
+        assert!(s.has_pending());
+        s.dequeue_and_start_turn().unwrap();
+
+        let staged = s.staging_user_input().unwrap();
+        match staged.message.as_ref() {
+            InputItem::Message { role, content } => {
+                assert_eq!(*role, Role::User);
+                assert_eq!(content, &parts);
+            }
+            _ => panic!("expected user message"),
+        }
+    }
+
+    #[test]
     fn test_pending_queue_flow() {
         let mut s = make_session();
 
         // Start a turn to make it active
-        s.start_turn("q1".to_string()).unwrap();
+        s.start_turn("q1".into()).unwrap();
 
         // Enqueue pending while active
-        s.enqueue_pending("q2".to_string());
-        s.enqueue_pending("q3".to_string());
+        s.enqueue_pending("q2".into());
+        s.enqueue_pending("q3".into());
         assert!(s.has_pending());
 
         // Complete current turn
@@ -732,7 +762,7 @@ mod tests {
 
         // Create 3 turns
         for i in 0..3 {
-            s.start_turn(format!("q{i}")).unwrap();
+            s.start_turn(format!("q{i}").into()).unwrap();
             s.stage_item(MessageSource::ModelGeneration, assistant(format!("a{i}")))
                 .unwrap();
             let _ = s.commit_turn().unwrap();
@@ -751,7 +781,7 @@ mod tests {
         let mut s = make_session();
 
         for i in 0..4 {
-            s.start_turn(format!("q{i}")).unwrap();
+            s.start_turn(format!("q{i}").into()).unwrap();
             s.stage_item(MessageSource::ModelGeneration, assistant(format!("a{i}")))
                 .unwrap();
             let _ = s.commit_turn().unwrap();
@@ -770,7 +800,7 @@ mod tests {
             InputItem::Message {
                 role: Role::System,
                 content
-            } if content == "summary of turns 0-1"
+            } if *content == Content::Text("summary of turns 0-1".to_string())
         ));
         assert_eq!(
             refs[0].source,
@@ -785,7 +815,7 @@ mod tests {
     #[test]
     fn test_compact_never_evicts_last_turn() {
         let mut s = make_session();
-        s.start_turn("only".to_string()).unwrap();
+        s.start_turn("only".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("a"))
             .unwrap();
         let _ = s.commit_turn().unwrap();
@@ -795,7 +825,7 @@ mod tests {
         assert!(s.pinned_summary().is_none());
 
         // 驱逐数超出：clamp 到 len-1 = 0
-        s.start_turn("second".to_string()).unwrap();
+        s.start_turn("second".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("b"))
             .unwrap();
         let _ = s.commit_turn().unwrap();
@@ -806,7 +836,7 @@ mod tests {
     #[test]
     fn test_compact_requires_idle() {
         let mut s = make_session();
-        s.start_turn("q".to_string()).unwrap();
+        s.start_turn("q".into()).unwrap();
         assert!(s.compact(1, "s".to_string()).is_err());
     }
 
@@ -814,7 +844,7 @@ mod tests {
     fn test_pinned_summary_survives_snapshot_roundtrip() {
         let mut s = make_session();
         for i in 0..3 {
-            s.start_turn(format!("q{i}")).unwrap();
+            s.start_turn(format!("q{i}").into()).unwrap();
             s.stage_item(MessageSource::ModelGeneration, assistant(format!("a{i}")))
                 .unwrap();
             let _ = s.commit_turn().unwrap();
@@ -834,12 +864,12 @@ mod tests {
             restored.pinned_summary().unwrap().message.as_ref(),
             &InputItem::Message {
                 role: Role::System,
-                content: "summary v1".to_string()
+                content: "summary v1".into()
             }
         );
         assert_eq!(restored.committed_turns().len(), 2);
         // next_message_id 防御性兜底：恢复后新消息 id 不与 pinned 冲突
-        restored.start_turn("new".to_string()).unwrap();
+        restored.start_turn("new".into()).unwrap();
     }
 
     #[test]
@@ -868,7 +898,7 @@ mod tests {
 
         // Turn with tool calls. In the neutral model the assistant's text preamble,
         // function call, and final answer are all separate items.
-        s.start_turn("weather?".to_string()).unwrap();
+        s.start_turn("weather?".into()).unwrap();
         // Assistant preamble text — a real text item, IS displayable
         s.stage_item(MessageSource::ModelGeneration, assistant("Let me check..."))
             .unwrap();
@@ -924,7 +954,7 @@ mod tests {
     #[test]
     fn test_cancel_active_turn() {
         let mut s = make_session();
-        s.start_turn("hello".to_string()).unwrap();
+        s.start_turn("hello".into()).unwrap();
         assert_eq!(s.state(), SessionState::Active);
 
         s.cancel().unwrap();
@@ -946,7 +976,7 @@ mod tests {
     fn test_from_snapshot_normalizes_state() {
         // Create a snapshot with some data
         let mut s = make_session();
-        s.start_turn("q".to_string()).unwrap();
+        s.start_turn("q".into()).unwrap();
         s.stage_item(MessageSource::ModelGeneration, assistant("a"))
             .unwrap();
         let token = s.commit_turn().unwrap();
@@ -981,9 +1011,9 @@ mod tests {
         let mut s = make_session();
 
         // Enqueue normal input, then interrupt input
-        s.enqueue_pending("normal".to_string());
-        s.enqueue_pending_with_priority("interrupt".to_string(), InputPriority::Interrupt);
-        s.enqueue_pending("later".to_string());
+        s.enqueue_pending("normal".into());
+        s.enqueue_pending_with_priority("interrupt".into(), InputPriority::Interrupt);
+        s.enqueue_pending("later".into());
 
         // Dequeue — should get interrupt first
         let result = s.dequeue_and_start_turn().unwrap();

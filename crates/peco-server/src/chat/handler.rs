@@ -831,7 +831,7 @@ pub(crate) fn archive_markdown(
             && let InputItem::Message { content, .. } = am.message.as_ref()
         {
             md.push_str("\n## 历史摘要（compaction 产物）\n\n");
-            md.push_str(strip_summary_wrapper(content));
+            md.push_str(strip_summary_wrapper(&content.text_view()));
             md.push('\n');
         }
     }

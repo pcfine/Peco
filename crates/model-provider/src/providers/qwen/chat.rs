@@ -259,7 +259,7 @@ fn build_request_body(
     let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(WireMessage::System {
-            content: instructions,
+            content: instructions.as_str().into(),
         });
     }
     messages.extend(input_items_to_wire_messages(&request.input));
@@ -784,7 +784,7 @@ mod tests {
             instructions: Some("You are helpful.".to_string()),
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "Hello".to_string(),
+                content: "Hello".into(),
             })]
             .into(),
             tools: vec![],
@@ -871,11 +871,11 @@ mod tests {
             input: vec![
                 Arc::new(InputItem::Message {
                     role: Role::Developer,
-                    content: "policy".to_string(),
+                    content: "policy".into(),
                 }),
                 Arc::new(InputItem::Message {
                     role: Role::User,
-                    content: "Hello".to_string(),
+                    content: "Hello".into(),
                 }),
             ]
             .into(),
@@ -1119,7 +1119,7 @@ mod tests {
                 }),
                 Arc::new(InputItem::FunctionCallOutput {
                     call_id: "c1".to_string(),
-                    output: "72F".to_string(),
+                    output: "72F".into(),
                 }),
             ]
             .into(),
@@ -1173,7 +1173,7 @@ mod tests {
                 }),
                 Arc::new(InputItem::FunctionCallOutput {
                     call_id: "c1".to_string(),
-                    output: "72F".to_string(),
+                    output: "72F".into(),
                 }),
             ]
             .into(),

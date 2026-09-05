@@ -272,7 +272,7 @@ fn build_request_body(
     let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(WireMessage::System {
-            content: instructions,
+            content: instructions.as_str().into(),
         });
     }
     messages.extend(input_items_to_wire_messages(&request.input));
@@ -822,7 +822,7 @@ mod tests {
             instructions: Some("You are helpful.".to_string()),
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "Hello".to_string(),
+                content: "Hello".into(),
             })]
             .into(),
             tools: vec![],
@@ -1112,7 +1112,7 @@ mod tests {
                 }),
                 Arc::new(InputItem::FunctionCallOutput {
                     call_id: "c1".to_string(),
-                    output: "72F".to_string(),
+                    output: "72F".into(),
                 }),
             ]
             .into(),
@@ -1155,7 +1155,7 @@ mod tests {
             input: vec![
                 Arc::new(InputItem::Message {
                     role: Role::User,
-                    content: "天气怎么样？".to_string(),
+                    content: "天气怎么样？".into(),
                 }),
                 Arc::new(InputItem::FunctionCall {
                     call_id: "c1".to_string(),
@@ -1164,7 +1164,7 @@ mod tests {
                 }),
                 Arc::new(InputItem::FunctionCallOutput {
                     call_id: "c1".to_string(),
-                    output: "72F".to_string(),
+                    output: "72F".into(),
                 }),
             ]
             .into(),
@@ -1194,11 +1194,11 @@ mod tests {
             input: vec![
                 Arc::new(InputItem::Message {
                     role: Role::Developer,
-                    content: "policy".to_string(),
+                    content: "policy".into(),
                 }),
                 Arc::new(InputItem::Message {
                     role: Role::User,
-                    content: "Hello".to_string(),
+                    content: "Hello".into(),
                 }),
             ]
             .into(),
@@ -1232,7 +1232,7 @@ mod tests {
             instructions: None,
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
-                content: "Hello".to_string(),
+                content: "Hello".into(),
             })]
             .into(),
             tools: vec![],
