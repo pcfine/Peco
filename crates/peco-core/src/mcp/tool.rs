@@ -28,6 +28,10 @@ use model_provider::ToolDefinition;
 /// Default timeout for MCP tool calls (5 minutes).
 pub const DEFAULT_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 嵌入文本资源进入 text 视图的字符上限。超限截断并标注总长，
+/// 防止单个资源把 token 估算与压缩管线撑爆。
+pub const MAX_EMBEDDED_TEXT_RESOURCE_CHARS: usize = 8 * 1024;
+
 // ── McpTool ───────────────────────────────────────────────────────────────────
 
 /// A [`ToolDyn`] adapter for a single MCP tool.
@@ -154,14 +158,7 @@ impl ToolDyn for McpTool {
             })?;
 
             // 4. If the server flagged this as an error, surface it
-            if result.is_error == Some(true) {
-                // Still try to extract meaningful text from the content
-                let error_text = result
-                    .content
-                    .iter()
-                    .filter_map(extract_text_from_content)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            if let Some(error_text) = error_message_from_result(&result) {
                 return Err(ToolError::ToolCallError(Box::new(std::io::Error::other(
                     if error_text.is_empty() {
                         format!(
@@ -182,6 +179,22 @@ impl ToolDyn for McpTool {
 
 // ── Content formatting helpers ────────────────────────────────────────────────
 
+/// is_error 响应的错误文本；正常响应返回 `None`。
+/// 纯函数以便对错误内容抽取做单元测试（`Peer` 无法脱离连接构造）。
+fn error_message_from_result(result: &model::CallToolResult) -> Option<String> {
+    if result.is_error != Some(true) {
+        return None;
+    }
+    Some(
+        result
+            .content
+            .iter()
+            .filter_map(extract_text_from_content)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// Extract human-readable text from any [`rmcp::model::RawContent`] variant.
 fn extract_text_from_content(content: &rmcp::model::Content) -> Option<String> {
     use rmcp::model::RawContent;
@@ -195,7 +208,7 @@ fn extract_text_from_content(content: &rmcp::model::Content) -> Option<String> {
                 ..
             } => {
                 let mime = mime_type.as_deref().unwrap_or("text/plain");
-                Some(format!("{mime}:{uri}:{text}",))
+                Some(format!("{mime}:{uri}:{}", truncate_embedded_text(text)))
             }
             rmcp::model::ResourceContents::BlobResourceContents {
                 uri,
@@ -203,8 +216,14 @@ fn extract_text_from_content(content: &rmcp::model::Content) -> Option<String> {
                 mime_type,
                 ..
             } => {
+                // 二进制资源永不内联 base64 —— 完整内联会原样进入 token 估算
+                // 与压缩管线，单个资源即 text bomb。保留 uri/mime 让模型仍可
+                // 通过相应 MCP 工具按需请求该资源。
                 let mime = mime_type.as_deref().unwrap_or("application/octet-stream");
-                Some(format!("{mime}:{uri}:{blob}",))
+                Some(format!(
+                    "{mime}:{uri}:<binary resource omitted, {} base64 chars>",
+                    blob.len()
+                ))
             }
             #[allow(unreachable_patterns)]
             _ => None,
@@ -216,6 +235,21 @@ fn extract_text_from_content(content: &rmcp::model::Content) -> Option<String> {
         #[allow(unreachable_patterns)]
         _ => None,
     }
+}
+
+/// 嵌入文本资源超 [`MAX_EMBEDDED_TEXT_RESOURCE_CHARS`] 时截断并标注总长。
+fn truncate_embedded_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().count() <= MAX_EMBEDDED_TEXT_RESOURCE_CHARS {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let truncated: String = text
+        .chars()
+        .take(MAX_EMBEDDED_TEXT_RESOURCE_CHARS)
+        .collect();
+    std::borrow::Cow::Owned(format!(
+        "{truncated}\n[truncated, {} chars total]",
+        text.chars().count()
+    ))
 }
 
 /// Convert MCP `tools/call` 响应内容为工具输出 [`Content`]。
@@ -381,5 +415,104 @@ mod tests {
     fn rmcp_empty_content_yields_empty_text() {
         let out = rmcp_content_to_output(&[]);
         assert_eq!(out, Content::Text(String::new()));
+    }
+
+    // ── 资源 text 视图截断 ──
+
+    fn rmcp_resource(res: rmcp::model::ResourceContents) -> rmcp::model::Content {
+        rmcp::model::Annotated::new(rmcp::model::RawContent::resource(res), None)
+    }
+
+    #[test]
+    fn blob_resource_never_inlines_base64() {
+        // 二进制资源输出占位符 + base64 长度，blob 内容不得进入 text 视图。
+        let content = rmcp_resource(
+            rmcp::model::ResourceContents::blob("QUJDREVGRw==", "file:///tmp/report.pdf")
+                .with_mime_type("application/pdf"),
+        );
+        let text = extract_text_from_content(&content).unwrap();
+        assert_eq!(
+            text,
+            "application/pdf:file:///tmp/report.pdf:<binary resource omitted, 12 base64 chars>"
+        );
+        assert!(!text.contains("QUJDREVGRw=="));
+    }
+
+    #[test]
+    fn text_resource_within_limit_is_kept() {
+        let content = rmcp_resource(rmcp::model::ResourceContents::text(
+            "短文本内容",
+            "file:///notes.txt",
+        ));
+        let text = extract_text_from_content(&content).unwrap();
+        assert!(text.contains("短文本内容"));
+        assert!(!text.contains("[truncated"));
+    }
+
+    #[test]
+    fn text_resource_over_limit_is_truncated() {
+        // 1 万中文字符远超 8 KiB 上限，须截断并标注总长。
+        let long_text = "字".repeat(10_000);
+        let content = rmcp_resource(rmcp::model::ResourceContents::text(
+            long_text,
+            "file:///big.txt",
+        ));
+        let text = extract_text_from_content(&content).unwrap();
+        assert!(text.contains("[truncated, 10000 chars total]"));
+        assert!(text.chars().count() < MAX_EMBEDDED_TEXT_RESOURCE_CHARS + 100);
+    }
+
+    #[test]
+    fn audio_content_is_skipped_in_output() {
+        let audio = rmcp::model::Annotated::new(
+            rmcp::model::RawContent::Audio(rmcp::model::RawAudioContent {
+                data: "QUJD".to_string(),
+                mime_type: "audio/wav".to_string(),
+            }),
+            None,
+        );
+        assert_eq!(extract_text_from_content(&audio), None);
+        let out = rmcp_content_to_output(&[audio]);
+        assert_eq!(out, Content::Text(String::new()));
+    }
+
+    // ── is_error 错误文本抽取 ──
+
+    fn call_result(
+        is_error: bool,
+        content: Vec<rmcp::model::Content>,
+    ) -> rmcp::model::CallToolResult {
+        if is_error {
+            rmcp::model::CallToolResult::error(content)
+        } else {
+            rmcp::model::CallToolResult::success(content)
+        }
+    }
+
+    #[test]
+    fn error_message_none_for_success() {
+        let result = call_result(false, vec![rmcp_text("ok")]);
+        assert_eq!(error_message_from_result(&result), None);
+        let result = call_result(false, vec![]);
+        assert_eq!(error_message_from_result(&result), None);
+    }
+
+    #[test]
+    fn error_message_extracts_content_text() {
+        let result = call_result(
+            true,
+            vec![rmcp_text("file not found"), rmcp_text("path: /a/b")],
+        );
+        assert_eq!(
+            error_message_from_result(&result),
+            Some("file not found\npath: /a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn error_message_empty_content_yields_empty_string() {
+        // 空内容交由调用方回退到固定文案，纯函数只负责如实抽取。
+        let result = call_result(true, vec![]);
+        assert_eq!(error_message_from_result(&result), Some(String::new()));
     }
 }
