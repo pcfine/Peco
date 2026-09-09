@@ -143,7 +143,7 @@ pub(crate) fn is_history_viewable(item: &InputItem) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::Content;
+    use model_provider::{Content, ContentPart};
     use peco_core::agent::estimate_str_tokens;
     use peco_core::session::{MessageId, MessageSource};
 
@@ -318,5 +318,65 @@ mod tests {
         assert_eq!(estimate_str_tokens("abcdefghij"), 3);
         // 混合：ceil(6.0) + ceil(0.9) = 6 + 1 = 7
         assert_eq!(estimate_str_tokens("一二三四五六七八九十abc"), 7);
+    }
+
+    fn user_with_image() -> InputItem {
+        InputItem::Message {
+            role: Role::User,
+            content: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "看看这张图".to_string(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,QUJD".to_string(),
+                    detail: None,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn test_history_turn_with_image_keeps_parts_intact() {
+        // 含图历史轮按整轮规则参与预算；轮内含图用户消息的部件随整轮保留。
+        let filter = PecoContextFilter::new(10_000);
+        let msgs = [
+            make_annotated(0, user_with_image()),
+            make_annotated(0, assistant("图中是一只猫")),
+            make_annotated(1, user("谢谢")),
+        ];
+        let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
+        let result = filter.filter(&refs);
+        // 历史 turn 0（User + Assistant 文本）+ 当前轮 1 条
+        assert_eq!(result.len(), 3);
+        match result[0].message.as_ref() {
+            InputItem::Message {
+                role: Role::User,
+                content: Content::Parts(parts),
+            } => {
+                assert_eq!(parts.len(), 2);
+                assert!(parts.iter().any(
+                    |p| matches!(p, ContentPart::Image { url, .. } if url.starts_with("data:image/png"))
+                ));
+            }
+            other => panic!("含图用户消息应原样保留，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_image_turn_evicted_by_budget_like_any_turn() {
+        // 图片不计入 token 估算，含图轮次按 text 口径与其他轮次同样
+        // 参与预算 —— 超预算即整轮裁掉，无特殊豁免。
+        // turn 0 文本 ≈ 3 + 4 = 7 token，预算 5 不足以容纳。
+        let filter = PecoContextFilter::new(5);
+        let msgs = [
+            make_annotated(0, user_with_image()),
+            make_annotated(0, assistant("图中是一只猫")),
+            make_annotated(1, user("谢谢")),
+        ];
+        let refs: Vec<&AnnotatedMessage> = msgs.iter().collect();
+        let result = filter.filter(&refs);
+        // turn 0（约 7 token）被预算 5 整轮裁掉，仅剩当前轮
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].turn_index, 1);
     }
 }

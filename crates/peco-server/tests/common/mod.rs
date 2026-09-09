@@ -205,6 +205,7 @@ impl TestApp {
     }
 
     /// 发送带认证的 GET 请求。
+    #[allow(dead_code)]
     pub fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.client
             .get(format!("{}{}", self.base_url, path))

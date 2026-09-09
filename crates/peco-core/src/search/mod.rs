@@ -221,7 +221,7 @@ pub(crate) fn make_result(title: String, url: String, raw_snippet: Option<String
     }
 }
 
-/// 共享 HTTP client 构造：统一超时（设计 D-8：单请求 30s）与 User-Agent。
+/// 共享 HTTP client 构造：统一超时（单请求 30s）与 User-Agent。
 pub(crate) fn http_client() -> Result<reqwest::Client, SearchError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
