@@ -430,6 +430,7 @@ impl ModelProvider for DeepSeek {
                 function_calls = input.function_calls,
                 function_call_outputs = input.function_call_outputs,
                 reasoning_items = input.reasoning,
+                images = input.images,
                 tools = request.tools.len(),
                 instructions_chars = request
                     .instructions
@@ -535,6 +536,7 @@ impl ModelProvider for DeepSeek {
             function_calls = input.function_calls,
             function_call_outputs = input.function_call_outputs,
             reasoning_items = input.reasoning,
+            images = input.images,
             tools = request.tools.len(),
             instructions_chars = request
                 .instructions

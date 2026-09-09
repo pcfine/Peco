@@ -1139,6 +1139,7 @@ impl ModelProvider for QwenResponsesAdapter {
                 function_calls = input.function_calls,
                 function_call_outputs = input.function_call_outputs,
                 reasoning_items = input.reasoning,
+                images = input.images,
                 carry_reasoning = should_carry_reasoning(
                     &request.input,
                     !request.tools.is_empty(),
@@ -1280,6 +1281,7 @@ impl ModelProvider for QwenResponsesAdapter {
             function_calls = input.function_calls,
             function_call_outputs = input.function_call_outputs,
             reasoning_items = input.reasoning,
+            images = input.images,
             carry_reasoning = should_carry_reasoning(
                 &request.input,
                 !request.tools.is_empty(),

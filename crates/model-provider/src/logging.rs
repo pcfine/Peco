@@ -264,7 +264,7 @@ mod tests {
             input: vec![
                 Arc::new(InputItem::Message {
                     role: Role::User,
-                    content: "北京天气如何".into(),
+                    content: sample_parts(),
                 }),
                 Arc::new(InputItem::Reasoning {
                     content: "需要查天气".into(),
@@ -343,6 +343,10 @@ mod tests {
         assert!(
             logs.contains("reasoning_items=1"),
             "缺少 reasoning 计数：\n{logs}"
+        );
+        assert!(
+            logs.contains("images=1"),
+            "缺少图片计数（user 消息 1 图）：\n{logs}"
         );
         assert!(logs.contains("stream=false"), "缺少 stream 标记：\n{logs}");
 
