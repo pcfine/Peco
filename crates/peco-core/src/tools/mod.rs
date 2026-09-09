@@ -133,9 +133,12 @@ mod tests {
 
     // ── 宏分派矩阵验证 ──────────────────────────────────────────────────
     //
-    // 返回 `String` 的 fn 走 Tool + blanket 路径（裸文本，非 JSON dump）；
-    // 返回 `Content` 的 fn 直接生成 ToolDyn impl（部件透传零转换）。
-    // 两条路径都以 ToolDyn::call 的动态分发请求路径为准断言。
+    // 分派矩阵覆盖裸值与 Result 包裹两类：
+    // - `String` / `Result<String, E>` → Tool + blanket 路径（裸文本，非 JSON dump）
+    // - `Content` / `Result<Content, E>` → 直接生成 ToolDyn impl（部件透传零转换）
+    // - 其他 Serialize 类型 → Tool + blanket 路径（JSON dump）
+    // 裸（非 Result）返回类型生成 `Error = Infallible`，由生成代码包一层 `Ok`。
+    // 全部路径都以 ToolDyn::call 的动态分发请求路径为准断言。
 
     use peco_derive::peco_tool;
 
@@ -147,6 +150,16 @@ mod tests {
     )]
     async fn echo_text_tool(text: String) -> Result<String, ToolError> {
         Ok(format!("echo: {text}"))
+    }
+
+    /// 裸 String 返回（Tool 路径，Error = Infallible）。
+    #[peco_tool(
+        name = "echo_bare_text",
+        description = "echo bare text",
+        params(text = "text to echo")
+    )]
+    async fn echo_bare_text_tool(text: String) -> String {
+        format!("bare: {text}")
     }
 
     /// 返回 Content 的样例工具（ToolDyn 直通路径）。
@@ -167,6 +180,36 @@ mod tests {
         ]))
     }
 
+    /// 裸 Content 返回（ToolDyn 直通路径）。
+    #[peco_tool(
+        name = "echo_bare_parts",
+        description = "echo bare parts",
+        params(text = "text to echo")
+    )]
+    async fn echo_bare_parts_tool(text: String) -> Content {
+        Content::Text(format!("bare parts: {text}"))
+    }
+
+    /// 裸其他 Serialize 类型返回（Tool + blanket 路径，JSON dump）。
+    #[peco_tool(
+        name = "echo_struct",
+        description = "echo a struct",
+        params(items = "items to echo")
+    )]
+    async fn echo_struct_tool(items: Vec<String>) -> Vec<String> {
+        items
+    }
+
+    /// 同步裸 String 返回（Tool 路径，非 async 分支）。
+    #[peco_tool(
+        name = "echo_sync_text",
+        description = "echo sync text",
+        params(text = "text to echo")
+    )]
+    fn echo_sync_text_tool(text: String) -> String {
+        format!("sync: {text}")
+    }
+
     #[tokio::test]
     async fn string_output_tool_yields_bare_text_content() {
         // 裸文本而非 JSON dump：`"echo: hi"` 不带引号、无转义
@@ -174,6 +217,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, Content::Text("echo: hi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn bare_string_output_wraps_into_text_content() {
+        // 裸 String 返回：Error = Infallible，生成代码包 Ok 后经 blanket 转裸文本。
+        let out = ToolDyn::call(&ECHO_BARE_TEXT_TOOL, r#"{"text": "hi"}"#.to_string())
+            .await
+            .unwrap();
+        assert_eq!(out, Content::Text("bare: hi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sync_bare_string_output_wraps_into_text_content() {
+        // 非 async 裸 String 返回走同一 Tool 路径。
+        let out = ToolDyn::call(&ECHO_SYNC_TEXT_TOOL, r#"{"text": "hi"}"#.to_string())
+            .await
+            .unwrap();
+        assert_eq!(out, Content::Text("sync: hi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn bare_content_output_passthrough_parts_unconverted() {
+        let out = ToolDyn::call(&ECHO_BARE_PARTS_TOOL, r#"{"text": "hi"}"#.to_string())
+            .await
+            .unwrap();
+        assert_eq!(out, Content::Text("bare parts: hi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn other_serialize_output_json_dumps() {
+        // 其他 Serialize 类型（Vec<String>）经 blanket 序列化为 JSON 文本。
+        let out = ToolDyn::call(&ECHO_STRUCT_TOOL, r#"{"items": ["a", "b"]}"#.to_string())
+            .await
+            .unwrap();
+        assert_eq!(out, Content::Text(r#"["a","b"]"#.to_string()));
     }
 
     #[tokio::test]

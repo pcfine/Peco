@@ -207,8 +207,10 @@ fn validate_tool_name(name: &str) -> syn::Result<()> {
     Ok(())
 }
 
-/// Extract `(OutputType, ErrorType)` from a `Result<T, E>` return type.
-/// Falls back to `((), ())` if the return type is not `Result<_, _>`.
+/// Extract `(OutputType, ErrorType)` from the fn return type.
+///
+/// `Result<T, E>` 解包为 `(T, E)`；裸返回类型 `T` 映射为 `(T, Infallible)`
+/// （infallible fn 的自然映射）；无返回类型映射为 `((), Infallible)`。
 fn extract_result_types(
     output: &ReturnType,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
@@ -236,9 +238,10 @@ fn extract_result_types(
                     .unwrap_or_else(|| quote!(()));
                 return (output_type, error_type);
             }
-            (quote!((())), quote!((())))
+            // 裸返回类型：fn 不产生错误，Error 落到 Infallible。
+            (quote!(#ty), quote!(std::convert::Infallible))
         }
-        ReturnType::Default => (quote!((())), quote!((()))),
+        ReturnType::Default => (quote!(()), quote!(std::convert::Infallible)),
     }
 }
 
@@ -457,18 +460,28 @@ pub fn peco_tool(args: TokenStream, input: TokenStream) -> TokenStream {
             }
         }
     } else {
-        let call_impl = if is_async {
-            quote! {
+        // 裸（非 Result）返回类型：fn 不返回 Result，由生成代码包一层 `Ok`。
+        let call_impl = match (ret_class, is_async) {
+            (OutputClass::Bare, true) => quote! {
+                async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                    Ok(#fn_name(#(args.#param_names,)*).await)
+                }
+            },
+            (OutputClass::Bare, false) => quote! {
+                async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                    Ok(#fn_name(#(args.#param_names,)*))
+                }
+            },
+            (OutputClass::Wrapped, true) => quote! {
                 async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                     #fn_name(#(args.#param_names,)*).await
                 }
-            }
-        } else {
-            quote! {
+            },
+            (OutputClass::Wrapped, false) => quote! {
                 async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                     #fn_name(#(args.#param_names,)*)
                 }
-            }
+            },
         };
         quote! {
             impl #peco_core::tools::Tool for #struct_name {
