@@ -40,7 +40,7 @@ export interface ChatMessage {
   agentName?: string;
   agentTask?: string;
   callId?: string;
-  /** 用户消息携带的图片（渲染 URL），仅发送当轮可见 */
+  /** 用户消息携带的图片（data URI）。发送当轮来自 pendingImages，刷新后经快照 DTO 恢复 */
   images?: string[];
   /** 错误提示消息（来自 SSE `error` 事件），以警示样式渲染 */
   isError?: boolean;
@@ -185,7 +185,11 @@ export function ChatView({
 
   const sendMessage = useCallback(async (text: string) => {
     const tok = tokenRef.current;
-    if ((!text.trim() && pendingImagesRef.current.length === 0) || !tok || streamingRef.current)
+    if (
+      (!text.trim() && pendingImagesRef.current.length === 0) ||
+      !tok ||
+      streamingRef.current
+    )
       return;
 
     // 上传中的图片不允许随消息发送（upload 完成前禁用发送即可达，这里兜底跳过）
@@ -855,6 +859,7 @@ export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
           role: "user",
           content: md.content ?? "",
           turnIndex: turn.turn_index,
+          images: md.images,
         };
       }
       if (md.role === "tool") {

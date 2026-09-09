@@ -14,6 +14,8 @@ pub struct GroupedMessage {
     /// 角色名称："system" / "user" / "assistant" / "tool"。
     pub role: &'static str,
     pub content: Option<String>,
+    /// 用户消息携带的图片部件 URL（含 data URI），其余角色恒为空。
+    pub images: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
     pub reasoning_content: Option<String>,
     pub tool_call_id: Option<String>,
@@ -39,6 +41,7 @@ impl AssistantBuilder {
         Some(GroupedMessage {
             role: "assistant",
             content: self.content,
+            images: Vec::new(),
             tool_calls: self.tool_calls,
             reasoning_content: self.reasoning_content,
             tool_call_id: None,
@@ -75,6 +78,7 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                     messages.push(GroupedMessage {
                         role: "system",
                         content: Some(content.text_view().into_owned()),
+                        images: Vec::new(),
                         tool_calls: Vec::new(),
                         reasoning_content: None,
                         tool_call_id: None,
@@ -83,9 +87,16 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                 }
                 Role::User => {
                     flush(&mut messages, &mut current);
+                    // 图片部件随 text 视图一并透出，供前端刷新后恢复渲染。
+                    let images = content
+                        .image_urls()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
                     messages.push(GroupedMessage {
                         role: "user",
                         content: Some(content.text_view().into_owned()),
+                        images,
                         tool_calls: Vec::new(),
                         reasoning_content: None,
                         tool_call_id: None,
@@ -143,6 +154,7 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
                 messages.push(GroupedMessage {
                     role: "tool",
                     content: Some(output.text_view().into_owned()),
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                     reasoning_content: None,
                     tool_call_id: Some(call_id.clone()),
@@ -155,4 +167,92 @@ pub fn group_input_items(items: &[InputItem], timestamps: &[u64]) -> Vec<Grouped
     flush(&mut messages, &mut current);
 
     messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model_provider::{Content, ContentPart};
+
+    fn user_parts_message() -> InputItem {
+        InputItem::Message {
+            role: Role::User,
+            content: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "看看这张图".to_string(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,QUJD".to_string(),
+                    detail: None,
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn user_message_with_images_exposes_image_urls() {
+        let items = vec![user_parts_message()];
+        let grouped = group_input_items(&items, &[1]);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].role, "user");
+        assert_eq!(grouped[0].images, vec!["data:image/png;base64,QUJD"]);
+        // text 视图保持文本部件拼接。
+        assert_eq!(grouped[0].content.as_deref(), Some("看看这张图"));
+    }
+
+    #[test]
+    fn text_only_user_message_has_empty_images() {
+        let items = vec![InputItem::Message {
+            role: Role::User,
+            content: Content::Text("纯文本".to_string()),
+        }];
+        let grouped = group_input_items(&items, &[1]);
+        assert_eq!(grouped[0].role, "user");
+        assert!(grouped[0].images.is_empty());
+    }
+
+    #[test]
+    fn non_user_roles_never_carry_images() {
+        // assistant 图不计入：图片仅对 user 角色有输入语义。
+        let items = vec![
+            InputItem::Message {
+                role: Role::User,
+                content: Content::Text("问".to_string()),
+            },
+            InputItem::Message {
+                role: Role::Assistant,
+                content: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "答".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/png;base64,QUJD".to_string(),
+                        detail: None,
+                    },
+                ]),
+            },
+            InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: user_parts_message_content(),
+            },
+        ];
+        let grouped = group_input_items(&items, &[1, 2, 3]);
+        assert!(
+            grouped
+                .iter()
+                .all(|m| m.role == "user" || m.images.is_empty())
+        );
+    }
+
+    fn user_parts_message_content() -> Content {
+        Content::Parts(vec![
+            ContentPart::Text {
+                text: "工具输出文本".to_string(),
+            },
+            ContentPart::Image {
+                url: "data:image/png;base64,QUJD".to_string(),
+                detail: None,
+            },
+        ])
+    }
 }

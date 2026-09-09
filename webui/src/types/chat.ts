@@ -150,6 +150,8 @@ export interface TurnData {
 export interface MessageData {
   role: string;
   content?: string;
+  /** 用户消息携带的图片（data URI），无图时缺省 */
+  images?: string[];
   tool_calls?: ToolCallData[];
   reasoning_content?: string;
   tool_call_id?: string;

@@ -673,6 +673,9 @@ pub struct MessageData {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// 用户消息携带的图片部件 URL（含 data URI），无图时不序列化。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -722,6 +725,7 @@ pub async fn get_session_snapshot(
                             .map(|msg| MessageData {
                                 role: msg.role.to_string(),
                                 content: msg.content,
+                                images: msg.images,
                                 tool_calls: if msg.tool_calls.is_empty() {
                                     None
                                 } else {
@@ -885,6 +889,9 @@ fn conversation_turns_markdown(
                     "user" => {
                         if let Some(content) = msg.content {
                             md.push_str(&format!("\n## 用户\n{content}\n"));
+                        }
+                        if !msg.images.is_empty() {
+                            md.push_str(&format!("[图片 x{}]\n", msg.images.len()));
                         }
                     }
                     "assistant" => {
