@@ -10,6 +10,7 @@ pub(crate) mod sse;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
 
 use peco_core::persistence::SessionPersister;
@@ -37,7 +38,10 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route(
             "/{agentId}/conversations/{id}/images",
-            post(images::upload_conversation_image),
+            // layer 加在 MethodRouter 上，只作用于本路由（Router 级 layer 会
+            // 波及之前已注册的所有路由）
+            post(images::upload_conversation_image)
+                .layer(DefaultBodyLimit::max(images::MAX_UPLOAD_BODY_BYTES)),
         )
         .route(
             "/{agentId}/conversations/{id}/stream",

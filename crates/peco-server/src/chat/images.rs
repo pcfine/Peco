@@ -31,6 +31,11 @@ const ALLOWED_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "i
 /// 单张图片大小上限：10 MB。
 const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// 上传请求体上限：图片本身 10 MB，另留 multipart 编码边界等开销。
+/// 路由层用 `DefaultBodyLimit` 抬高 axum multipart 默认的 2 MB body 限制，
+/// 否则本模块的大小检查永远不可达。
+pub(crate) const MAX_UPLOAD_BODY_BYTES: usize = MAX_IMAGE_SIZE + 1024 * 1024;
+
 /// 上传响应：`id` 用于发送消息时引用，`url` 用于前端直接渲染。
 #[derive(Debug, Serialize)]
 pub struct ConversationImageResponse {
