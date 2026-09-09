@@ -726,6 +726,39 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_enqueue_preserves_parts() {
+        // Active 期间排队的带图输入在下一轮启动时，部件必须与 turn 启动、
+        // rollback 重排队同样原样保留（三条入队路径对称）。
+        let parts = Content::Parts(vec![
+            ContentPart::Text {
+                text: "排队带图输入".to_string(),
+            },
+            ContentPart::Image {
+                url: "data:image/png;base64,aGVsbG8=".to_string(),
+                detail: None,
+            },
+        ]);
+        let mut s = make_session();
+        s.start_turn("q1".into()).unwrap();
+        s.enqueue_pending(parts.clone());
+        assert!(s.has_pending());
+
+        s.stage_item(MessageSource::ModelGeneration, assistant("a1"))
+            .unwrap();
+        let _token = s.commit_turn().unwrap();
+        s.dequeue_and_start_turn().unwrap();
+
+        let staged = s.staging_user_input().unwrap();
+        match staged.message.as_ref() {
+            InputItem::Message { role, content } => {
+                assert_eq!(*role, Role::User);
+                assert_eq!(content, &parts);
+            }
+            _ => panic!("expected user message"),
+        }
+    }
+
+    #[test]
     fn test_pending_queue_flow() {
         let mut s = make_session();
 

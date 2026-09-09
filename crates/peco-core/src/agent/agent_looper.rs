@@ -1262,14 +1262,11 @@ impl AgentLooper {
                     user_input: text,
                 });
             }
-            SessionState::Active => {
-                // InnerLoop 进行中 — 放入 pending 队列
+            SessionState::Active | SessionState::Cancelling | SessionState::Interrupted => {
+                // InnerLoop 进行中或收尾中 — 放入 pending 队列；
+                // 整体入队保留部件，与 turn 启动、rollback 重排队对称
                 info!("Message queued. Will process after current turn.");
-                self.session.enqueue_pending(text.into());
-            }
-            _ => {
-                // Cancelling / Interrupted — 也放入 pending
-                self.session.enqueue_pending(text.into());
+                self.session.enqueue_pending(content);
             }
         }
         Ok(())
