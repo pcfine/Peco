@@ -106,9 +106,9 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - 双 trait 设计：`Tool`（静态、泛型、类型化）和 `ToolDyn`（对象安全，`Pin<Box<dyn Future>>`）。
 - blanket impl `impl<T: Tool> ToolDyn for T` 桥接二者。
 - `ToolExecutor` trait：运行时接口 — `execute(name, args) -> Result<String, String>` + `definitions() -> Vec<ToolDefinition>`。
-- **DI 契约**（`deps.rs`）：定义 5 个窄 trait — `AgentAccess`、`SkillProvider`、`KnowledgeAccess`、`WorkflowAccess`、`McpAccess` — 以及聚合结构体 `ToolDependencies`。工具只依赖这些 trait，不直接依赖 `WorkSpace`。
+- **DI 契约**（`deps.rs`）：定义 6 个窄 trait — `AgentAccess`、`SkillProvider`、`KnowledgeAccess`、`WorkflowAccess`、`McpAccess`、`MemoryAuditAccess` — 以及聚合结构体 `ToolDependencies`。工具只依赖这些 trait，不直接依赖 `WorkSpace`。
 - **工具组装**（`tool_register.rs`）：`ToolRegister::build()` 根据 tool_names 和 `ToolDependencies` 一次性构建包含所有工具的 `ToolExecutor`。权威工具名清单为 `BUILTIN_TOOL_NAMES` 常量（由防漂移测试保障与 match arms 一致）；可选依赖（`workflow_access`/`mcp_access`）缺失时对应工具 warn + skip，不 panic。
-- 内置工具（29 个）：`shell`、`fetch`、`web_search`、`show_workspace`、`list_tools`、`read_skill`、`list_skills`、`save_skill`、`delete_skill`、`delegate_sub_agent`、`run_parallel_sub_agents`、`save_agent`、`read_agent`、`delete_agent`、`execute_workflow`、`list_workflows`、`save_workflow`、`delete_workflow`、`list_mcp_servers`、`save_mcp_server`、`delete_mcp_server`、`test_mcp_connection`、`search_knowledge`、`list_knowledge_bases`、`add_to_knowledge_base`、`sync_knowledge_base`、`get_knowledge_base_docs`、`add_facts_to_knowledge_base`、`query_entity_facts`。
+- 内置工具（31 个）：`shell`、`fetch`、`web_search`、`show_workspace`、`list_tools`、`read_skill`、`list_skills`、`save_skill`、`delete_skill`、`delegate_sub_agent`、`run_parallel_sub_agents`、`save_agent`、`read_agent`、`delete_agent`、`execute_workflow`、`list_workflows`、`save_workflow`、`delete_workflow`、`list_mcp_servers`、`save_mcp_server`、`delete_mcp_server`、`test_mcp_connection`、`search_knowledge`、`list_knowledge_bases`、`add_to_knowledge_base`、`sync_knowledge_base`、`get_knowledge_base_docs`、`add_facts_to_knowledge_base`、`query_entity_facts`、`delete_kb_document`、`delete_kb_documents`。
 - KB 工具通过 `check_kb_access()` 执行 Agent 级别访问控制（基于 agent.md `knowledge_bases` 白名单）。
 - `#[peco_tool]` 宏（来自 `peco-derive`）：标注一个 async fn，生成实现 `Tool` 的零大小结构体、带有 `#[derive(Deserialize, JsonSchema)]` 的类型化 `Parameters` 结构体，以及 `static TOOL_NAME` 常量。
 - `DefaultToolsExecutor` 是标准实现：持有 `HashMap<String, Box<dyn ToolDyn>>` 并按名称分发。
@@ -142,7 +142,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **记忆双路径**（[crates/peco-server/src/peco/memory/](crates/peco-server/src/peco/memory/)）：存储载体是 personal 模板幂等安装的 per-user `@private_memory` KB。
   - **写路径** `MemoryExtractionHook`（LooperHook）：每轮成功完成后守卫检查（失败轮跳过、`analyze_min_chars` 过滤），`tokio::spawn` 后台检索既有记忆抑制重复 → Flash 模型（`ModelTurnAnalyzer`，严格 JSON 输出）提取事实 → 逐条写入 KB（source 标签 `ppa_{profile|semantic|episodic}`）。turn 边界零阻塞，所有失败点 warn 后 return。
   - **读路径** `MemoryRecallContext`（DynamicContext）：每次新用户 query 前，闲聊门控（问候/感谢关键词，零成本跳过；不按长度门控）→ 混合检索 → 按类别格式化注入 instructions 尾部，`injection_token_cap` 逐行截断。
-  - **分工**：compaction 解决"会话内上下文放不下"，记忆解决"跨会话/超长期的知识"，二者正交。记忆的更新/删除由 `@assistant → @memory` 子 Agent 的显式 KB 工具路径负责（自动路径只做 add）。
+  - **分工**：compaction 解决"会话内上下文放不下"，记忆解决"跨会话/超长期的知识"，二者正交。记忆的更新/删除由 `@assistant → @memory` 子 Agent 的显式 KB 工具路径负责（自动路径只做 add）：删除走 `delete_kb_document(s)`（outbox 审计：删除前写 pending、成功 done、失败 cancelled，偏好类 `ppa_profile` 硬拒绝），审计落 SQLite `memory_audit` 表（含完整原文，不在任何检索面），`POST /api/peco/memory/audit/:id/restore` 按审计行重放回滚；审计注入在 `WorkspaceManager::open_workspace` 统一完成，审计存储缺失时删除工具运行时拒绝（fail-closed）。召回统计 / 整理水位表（`memory_recall_stats` / `memory_consolidation_state`）已建，供后续巩固流水线使用。
 
 **Skills**（[crates/peco-core/src/skills/](crates/peco-core/src/skills/)）：
 - 三级渐进式加载：Tier 1（启动时加载名称+描述）、Tier 2（激活时加载完整正文）、Tier 3（按需加载 scripts/references/assets）。

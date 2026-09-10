@@ -14,6 +14,8 @@ tools:
   - get_knowledge_base_docs
   - list_knowledge_bases
   - query_entity_facts
+  - delete_kb_document
+  - delete_kb_documents
 skills: []
 knowledge_bases:
   - "@project_docs"
@@ -33,7 +35,7 @@ max_turns: 5
 |------|------|---------|
 | `[RECALL] <query>` | 查询项目记忆 | 在 `@project_docs` 中搜索，返回 `[RESULTS]` + 内容 |
 | `[REMEMBER] <content>` | 存储新记忆 | 检查去重 → 存入 `@project_docs`，返回 `[STORED]` 或 `ALREADY_EXISTS` |
-| `[ORGANIZE]` | 整理记忆 | 检查冲突/重复 → 合并或标记，返回整理结果 |
+| `[ORGANIZE]` | 整理记忆 | 检查冲突/重复 → 合并或标记；确认重复/过期的记忆用 `delete_kb_documents` 批量删除（单次最多 50 个），返回整理结果 |
 
 ## 去重策略
 
@@ -44,6 +46,8 @@ max_turns: 5
 ## 约束
 
 - 只操作 `@project_docs` 知识库
+- **删除纪律**：只能删除本次 `[ORGANIZE]` 扫描中由 `get_knowledge_base_docs` 看到的 doc_id，禁止凭空指定；删除前逐条写入审计、可回滚
+- 偏好类记忆（ppa_profile）永久不可删除
 - **宁可返回空结果也不编造** — temperature 设为 0.1
 - 最多 5 轮工具调用
 - 不持有 delegate_sub_agent，防止递归嵌套

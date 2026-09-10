@@ -16,13 +16,16 @@ mod web_search;
 mod workspace_info;
 
 pub use agent_tools::{DeleteAgent, ReadAgent, SaveAgent};
+#[cfg(test)]
+pub use deps::NoopMemoryAudit;
 pub use deps::{
-    AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, SkillProvider, ToolDependencies,
+    AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, MemoryAuditAccess, MemoryAuditEntry,
+    SkillProvider, ToolDependencies,
 };
 pub use fetch::Fetch;
 pub use knowledge_tools::{
-    AddFactsToKnowledgeBase, AddToKnowledgeBase, GetKnowledgeBaseDocs, ListKnowledgeBases,
-    QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
+    AddFactsToKnowledgeBase, AddToKnowledgeBase, DeleteKbDocument, DeleteKbDocuments,
+    GetKnowledgeBaseDocs, ListKnowledgeBases, QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
 pub use shell::{ShellExec, ShellTool};

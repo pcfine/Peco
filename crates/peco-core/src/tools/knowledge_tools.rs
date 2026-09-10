@@ -1,5 +1,5 @@
 // ============================================================================
-// Knowledge Tools — 5 个知识库工具（依赖注入版）
+// Knowledge Tools — 9 个知识库工具（依赖注入版）
 // ============================================================================
 //
 // CLI 和 Web 使用同一个工具实现。
@@ -13,9 +13,10 @@ use model_provider::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::deps::KnowledgeAccess;
+use super::deps::{KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry};
 
 use super::{Content, StringError, ToolDyn, ToolError};
+use crate::knowledge::hash_manifest::now_iso8601;
 use tracing::{info, warn};
 
 fn string_err(msg: impl ToString) -> ToolError {
@@ -716,5 +717,631 @@ impl ToolDyn for QueryEntityFacts {
                 .map_err(string_err)
                 .map(Content::Text)
         })
+    }
+}
+
+// ============================================================================
+// 删除编排（DeleteKbDocument / DeleteKbDocuments 共用）
+// ============================================================================
+
+/// 偏好类记忆的硬守卫标签 — source_path 为该值的文档一律拒绝删除，
+/// 不接受参数绕过（用户显式删除 profile 走独立 REST 端点 + 二次确认）。
+const PROFILE_SOURCE: &str = "ppa_profile";
+
+/// agent 路径删除的执行者标识（'agent:@memory' | 'worker' | 'user'）。
+const AGENT_DELETED_BY: &str = "agent:@memory";
+
+/// agent 路径删除的默认原因（工具删除是人工整理动作）。
+const AGENT_DELETE_REASON: &str = "manual_organize";
+
+/// 批量删除的单次上限。
+const MAX_BATCH_DELETIONS: usize = 50;
+
+/// 单条删除的收口结果（outbox 已迁移为 done）。
+struct DeletedDoc {
+    doc_id: String,
+    title: String,
+    audit_id: i64,
+    removed_chunks: usize,
+}
+
+impl DeletedDoc {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "doc_id": self.doc_id,
+            "title": self.title,
+            "audit_id": self.audit_id,
+            "removed_chunks": self.removed_chunks,
+        })
+    }
+}
+
+/// 单条删除编排（outbox：pending → done / cancelled）。
+///
+/// 取原文（title / content / source 是审计记录与回滚重放的依据）→ profile
+/// 硬守卫 → 写 pending 审计 → 删除 → 成功 mark_done / 失败 mark_cancelled
+/// 并返回错误。删除失败时 pending 行必须收口为 cancelled，否则会留下
+/// 永远无法回滚的假成功记录；文档不存在时不产生审计行。
+///
+/// 文档删除成功后 mark_done 失败只降级为 warn：删除已是既成事实，
+/// 向调用方报错会得到「文档已删却报告失败」的假失败（模型可能重试并撞上
+/// 文档不存在）；残留的 pending 行保留完整原文，可人工恢复，等待启动期对账。
+async fn delete_one(
+    access: &Arc<dyn KnowledgeAccess>,
+    audit: &Arc<dyn MemoryAuditAccess>,
+    kb_name: &str,
+    doc_id: &str,
+) -> Result<DeletedDoc, ToolError> {
+    let km = access.knowledge_manager();
+    km.ensure_loaded().await.map_err(string_err)?;
+
+    let doc = km
+        .get_document(kb_name, doc_id)
+        .await
+        .map_err(string_err)?
+        .ok_or_else(|| {
+            string_err(format!(
+                "Document not found: '{doc_id}' (knowledge base '{kb_name}')"
+            ))
+        })?;
+
+    if doc.source_path == PROFILE_SOURCE {
+        return Err(string_err(format!(
+            "Deletion rejected: document '{doc_id}' is a profile memory ({PROFILE_SOURCE}) and cannot be deleted via tools."
+        )));
+    }
+
+    let audit_id = audit
+        .record_pending(MemoryAuditEntry {
+            user_id: access.user_id().to_string(),
+            kb_name: kb_name.to_string(),
+            doc_id: doc.id.clone(),
+            title: doc.title.clone(),
+            content: doc.content.clone(),
+            source: doc.source_path.clone(),
+            reason: AGENT_DELETE_REASON.to_string(),
+            deleted_by: AGENT_DELETED_BY.to_string(),
+            deleted_at: now_iso8601(),
+        })
+        .await
+        .map_err(string_err)?;
+
+    match km.delete_document(kb_name, &doc.id).await {
+        Ok(report) => {
+            if let Err(e) = audit.mark_done(audit_id).await {
+                warn!(
+                    audit_id,
+                    error = %e,
+                    "Failed to mark audit row done; a pending row remains (original content retained for manual restore)"
+                );
+            }
+            info!(
+                kb = %kb_name,
+                doc_id = %doc.id,
+                audit_id,
+                removed_chunks = report.removed_chunks,
+                "Document deleted via tool"
+            );
+            Ok(DeletedDoc {
+                doc_id: doc.id,
+                title: doc.title,
+                audit_id,
+                removed_chunks: report.removed_chunks,
+            })
+        }
+        Err(e) => {
+            if let Err(cancel_err) = audit.mark_cancelled(audit_id).await {
+                warn!(audit_id, error = %cancel_err, "Failed to mark audit row cancelled; a pending row may remain");
+            }
+            Err(string_err(e))
+        }
+    }
+}
+
+/// 审计访问的 fail-closed 门：审计存储不可用时删除必须拒绝执行。
+///
+/// 与 workflow_access 等 Optional 依赖的 warn + skip 不同 — 删除工具始终注册，
+/// 只在执行时被拒（审计不可用 ≠ 工具不存在）。
+fn require_audit(
+    memory_audit: &Option<Arc<dyn MemoryAuditAccess>>,
+) -> Result<&Arc<dyn MemoryAuditAccess>, ToolError> {
+    memory_audit
+        .as_ref()
+        .ok_or_else(|| string_err("Deletion rejected: audit storage is unavailable (deletions must be auditable and restorable)."))
+}
+
+// ============================================================================
+// DeleteKbDocument
+// ============================================================================
+
+pub struct DeleteKbDocument {
+    access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
+    memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+}
+
+impl DeleteKbDocument {
+    pub fn new(
+        access: Arc<dyn KnowledgeAccess>,
+        allowed_kbs: Vec<String>,
+        memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+            memory_audit,
+        }
+    }
+}
+
+impl ToolDyn for DeleteKbDocument {
+    fn name(&self) -> String {
+        "delete_kb_document".to_string()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "delete_kb_document".to_string(),
+            description: "Delete a single document from a knowledge base. An audit record is \
+                          written before deletion so the document can be restored by audit id; \
+                          profile memories (ppa_profile) can never be deleted."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
+                    "doc_id": {
+                        "type": "string",
+                        "description": "Id of the document to delete (query via get_knowledge_base_docs)"
+                    }
+                },
+                "required": ["kb_name", "doc_id"]
+            }),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Args {
+                kb_name: String,
+                doc_id: String,
+            }
+
+            let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+            let audit = require_audit(&self.memory_audit)?;
+
+            let deleted = delete_one(&self.access, audit, &parsed.kb_name, &parsed.doc_id).await?;
+
+            serde_json::to_string_pretty(&json!({
+                "kb_name": parsed.kb_name,
+                "deleted": [deleted.to_json()],
+            }))
+            .map_err(string_err)
+            .map(Content::Text)
+        })
+    }
+}
+
+// ============================================================================
+// DeleteKbDocuments
+// ============================================================================
+
+pub struct DeleteKbDocuments {
+    access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
+    memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+}
+
+impl DeleteKbDocuments {
+    pub fn new(
+        access: Arc<dyn KnowledgeAccess>,
+        allowed_kbs: Vec<String>,
+        memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+            memory_audit,
+        }
+    }
+}
+
+impl ToolDyn for DeleteKbDocuments {
+    fn name(&self) -> String {
+        "delete_kb_documents".to_string()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "delete_kb_documents".to_string(),
+            description: "Delete multiple documents from a knowledge base (up to 50 per call). \
+                          An audit record is written for each document before deletion so they \
+                          can be restored by audit id; profile memories (ppa_profile) can never \
+                          be deleted."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
+                    "doc_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": MAX_BATCH_DELETIONS,
+                        "description": "Ids of the documents to delete"
+                    }
+                },
+                "required": ["kb_name", "doc_ids"]
+            }),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Args {
+                kb_name: String,
+                doc_ids: Vec<String>,
+            }
+
+            let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            if parsed.doc_ids.len() > MAX_BATCH_DELETIONS {
+                return Err(string_err(format!(
+                    "Batch deletion accepts at most {} documents per call, got {}. Split into multiple calls.",
+                    MAX_BATCH_DELETIONS,
+                    parsed.doc_ids.len()
+                )));
+            }
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+            let audit = require_audit(&self.memory_audit)?;
+
+            // 逐条独立编排：单条失败不影响其余条目（各自的审计行已收口），
+            // 全部结束后把已删与未删明细一起交还调用方。
+            let mut deleted = Vec::new();
+            let mut failed = Vec::new();
+            for doc_id in &parsed.doc_ids {
+                match delete_one(&self.access, audit, &parsed.kb_name, doc_id).await {
+                    Ok(d) => deleted.push(d.to_json()),
+                    Err(e) => failed.push(json!({ "doc_id": doc_id, "error": e.to_string() })),
+                }
+            }
+
+            let summary = json!({
+                "kb_name": parsed.kb_name,
+                "deleted": deleted,
+                "failed": failed,
+            });
+            if failed.is_empty() {
+                serde_json::to_string_pretty(&summary)
+                    .map_err(string_err)
+                    .map(Content::Text)
+            } else {
+                Err(string_err(summary))
+            }
+        })
+    }
+}
+
+// ============================================================================
+// 测试 — outbox 顺序 / profile 硬守卫 / fail-closed / 批量上限
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge::KnowledgeManager;
+    use async_trait::async_trait;
+    use knowledge_base::{BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    const KB: &str = "@private_memory";
+
+    fn make_test_config(name: &str) -> KbConfig {
+        KbConfig {
+            name: name.to_string(),
+            description: "测试记忆库".into(),
+            embedding_model: FastembedModelTypeSerde::AllMiniLML6V2Q,
+            chunking: ChunkingStrategySerde::FixedSize { size: 100 },
+            backend: BackendType::InMemory,
+            storage_path: None,
+            default_storage_mode: Default::default(),
+        }
+    }
+
+    /// 建好 KB 的测试管理器（TempDir 由调用方持有保活）。
+    async fn make_km() -> (tempfile::TempDir, Arc<KnowledgeManager>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config(KB)).await.unwrap();
+        (tmp, km)
+    }
+
+    struct StubAccess {
+        manager: Arc<KnowledgeManager>,
+    }
+    impl KnowledgeAccess for StubAccess {
+        fn user_id(&self) -> &str {
+            "test-user"
+        }
+        fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+            &self.manager
+        }
+    }
+
+    fn access_of(km: &Arc<KnowledgeManager>) -> Arc<dyn KnowledgeAccess> {
+        Arc::new(StubAccess {
+            manager: Arc::clone(km),
+        })
+    }
+
+    /// Spy 审计 — 记录 outbox 事件顺序；可选在 pending 落库后立即删掉该文档，
+    /// 模拟「审计写入后文档被并发删除」，覆盖 pending → cancelled 分支。
+    struct SpyAudit {
+        log: Mutex<Vec<String>>,
+        next_id: AtomicI64,
+        concurrent_delete: Option<(Arc<KnowledgeManager>, String)>,
+    }
+
+    impl SpyAudit {
+        fn new() -> Self {
+            Self {
+                log: Mutex::new(Vec::new()),
+                next_id: AtomicI64::new(0),
+                concurrent_delete: None,
+            }
+        }
+
+        fn with_concurrent_delete(mut self, km: Arc<KnowledgeManager>, kb_name: &str) -> Self {
+            self.concurrent_delete = Some((km, kb_name.to_string()));
+            self
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MemoryAuditAccess for SpyAudit {
+        async fn record_pending(&self, entry: MemoryAuditEntry) -> Result<i64, String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("pending:{}", entry.doc_id));
+            if let Some((km, kb)) = &self.concurrent_delete {
+                km.delete_document(kb, &entry.doc_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(self.next_id.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+
+        async fn mark_done(&self, id: i64) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("done:{id}"));
+            Ok(())
+        }
+
+        async fn mark_cancelled(&self, id: i64) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("cancelled:{id}"));
+            Ok(())
+        }
+
+        async fn get(&self, _id: i64) -> Result<Option<MemoryAuditEntry>, String> {
+            Ok(None)
+        }
+    }
+
+    fn single_tool(
+        km: &Arc<KnowledgeManager>,
+        audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> DeleteKbDocument {
+        DeleteKbDocument::new(access_of(km), vec![KB.to_string()], audit)
+    }
+
+    fn batch_tool(
+        km: &Arc<KnowledgeManager>,
+        audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> DeleteKbDocuments {
+        DeleteKbDocuments::new(access_of(km), vec![KB.to_string()], audit)
+    }
+
+    #[tokio::test]
+    async fn delete_single_writes_outbox_pending_then_done() {
+        let (_tmp, km) = make_km().await;
+        let doc = km
+            .add_text_to_kb(KB, "memory_1", "用户偏好 Rust 语言", "ppa_semantic")
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyAudit::new());
+        let tool = single_tool(&km, Some(spy.clone()));
+
+        let out = tool
+            .call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
+            .await
+            .unwrap();
+        let text = out.text_view().into_owned();
+        assert!(text.contains(&doc.id), "结果应包含被删 doc_id: {text}");
+
+        assert_eq!(
+            spy.log(),
+            vec![format!("pending:{}", doc.id), "done:1".to_string()]
+        );
+        assert!(km.get_document(KB, &doc.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_failure_after_pending_marks_cancelled() {
+        let (_tmp, km) = make_km().await;
+        let doc = km
+            .add_text_to_kb(KB, "memory_2", "用户在做 Rust 后端开发", "ppa_episodic")
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyAudit::new().with_concurrent_delete(Arc::clone(&km), KB));
+        let tool = single_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            spy.log(),
+            vec![format!("pending:{}", doc.id), "cancelled:1".to_string()]
+        );
+        assert!(
+            err.to_string().contains("not found"),
+            "删除失败信息应透传: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_memory_rejected_before_any_audit_write() {
+        let (_tmp, km) = make_km().await;
+        let doc = km
+            .add_text_to_kb(KB, "memory_3", "用户自称小明", "ppa_profile")
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyAudit::new());
+        let tool = single_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ppa_profile"), "{err}");
+        assert!(spy.log().is_empty(), "profile 守卫不得写审计行");
+        assert!(km.get_document(KB, &doc.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_document_rejected_without_audit_row() {
+        let (_tmp, km) = make_km().await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = single_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_id": "no-such-doc" }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Document not found"), "{err}");
+        assert!(spy.log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_over_limit_rejected() {
+        let (_tmp, km) = make_km().await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = batch_tool(&km, Some(spy.clone()));
+
+        let ids: Vec<String> = (0..51).map(|i| format!("doc-{i}")).collect();
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_ids": ids }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("50"), "{err}");
+        assert!(spy.log().is_empty(), "超限请求不得产生审计行");
+    }
+
+    #[tokio::test]
+    async fn batch_delete_writes_outbox_for_each_doc() {
+        let (_tmp, km) = make_km().await;
+        let d1 = km
+            .add_text_to_kb(KB, "memory_4", "用户喜欢黑咖啡", "ppa_semantic")
+            .await
+            .unwrap();
+        let d2 = km
+            .add_text_to_kb(KB, "memory_5", "用户周三下午开会", "ppa_episodic")
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyAudit::new());
+        let tool = batch_tool(&km, Some(spy.clone()));
+
+        tool.call(json!({ "kb_name": KB, "doc_ids": [d1.id, d2.id] }).to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spy.log(),
+            vec![
+                format!("pending:{}", d1.id),
+                "done:1".to_string(),
+                format!("pending:{}", d2.id),
+                "done:2".to_string(),
+            ]
+        );
+        assert!(km.list_documents(KB, 0, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_partial_failure_reports_deleted_and_failed() {
+        let (_tmp, km) = make_km().await;
+        let ok_doc = km
+            .add_text_to_kb(KB, "memory_6", "用户在学日语", "ppa_semantic")
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyAudit::new());
+        let tool = batch_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_ids": [ok_doc.id, "no-such-doc"] }).to_string())
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&ok_doc.id) && text.contains("no-such-doc"),
+            "汇总应同时包含已删与失败明细: {text}"
+        );
+
+        // 成功条目已收口 done；失败条目（文档不存在）不产生审计行
+        assert_eq!(
+            spy.log(),
+            vec![format!("pending:{}", ok_doc.id), "done:1".to_string()]
+        );
+        assert!(km.get_document(KB, &ok_doc.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_rejected_without_audit_storage() {
+        let (_tmp, km) = make_km().await;
+        let doc = km
+            .add_text_to_kb(KB, "memory_7", "用户住在杭州", "ppa_semantic")
+            .await
+            .unwrap();
+        let tool = single_tool(&km, None);
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("audit"), "{err}");
+        // fail-closed：文档保持原样
+        assert!(km.get_document(KB, &doc.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn kb_outside_allowlist_rejected() {
+        let (_tmp, km) = make_km().await;
+        let doc = km
+            .add_text_to_kb(KB, "memory_8", "用户怕狗", "ppa_semantic")
+            .await
+            .unwrap();
+        // 空白名单 = 无权访问任何 KB
+        let tool = DeleteKbDocument::new(access_of(&km), vec![], Some(Arc::new(SpyAudit::new())));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("访问被拒绝"), "{err}");
+        assert!(km.get_document(KB, &doc.id).await.unwrap().is_some());
     }
 }

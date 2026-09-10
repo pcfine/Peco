@@ -25,6 +25,7 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = "2"
+chrono = { workspace = true }
 reqwest = { workspace = true, optional = true }
 
 # 嵌入引擎（可选）

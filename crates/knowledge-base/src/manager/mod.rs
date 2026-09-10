@@ -69,6 +69,37 @@ mod tests {
         }
     }
 
+    /// `add_text` 必须填充 `created_at` 且为可解析的 ISO 8601 时刻，
+    /// 作为 TTL 判定的可靠时间源。
+    #[tokio::test]
+    async fn add_text_fills_created_at_iso8601() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr
+            .create_kb(make_kb_config("created-at-test"))
+            .await
+            .unwrap();
+
+        let before = chrono::Utc::now();
+        let doc = kb
+            .add_text("Test", "Rust is a systems programming language.", "test")
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+
+        let created = doc
+            .metadata
+            .created_at
+            .expect("add_text 必须填充 metadata.created_at");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&created)
+            .expect("created_at 应为合法 ISO 8601 / RFC 3339")
+            .with_timezone(&chrono::Utc);
+        assert!(
+            parsed >= before && parsed <= after,
+            "created_at ({created}) 应落在写入时刻附近"
+        );
+    }
+
     #[tokio::test]
     async fn test_add_facts_and_query() {
         let tmp = tempfile::tempdir().unwrap();

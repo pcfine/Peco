@@ -7,6 +7,9 @@ pub mod compaction_log;
 pub mod conversations;
 pub mod documents;
 pub mod knowledge_bases;
+pub mod memory_audit;
+pub mod memory_consolidation_state;
+pub mod memory_recall_stats;
 pub mod messages;
 pub mod session_archive;
 pub mod sync;
@@ -248,6 +251,29 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 008 skipped: peco_session_archives table already exists");
     }
 
+    // ── Migration 009: 记忆巩固基建（删除审计 / 召回统计 / 整理水位）──────
+    // 门控检查迁移文件中的最后一张表：run_migration 逐条语句执行、无事务，
+    // 进程在部分执行后崩溃时，查首表会误判为已完成而跳过余下表；
+    // 查末表 + 文件内全部 IF NOT EXISTS 保证部分执行后可安全重跑（同迁移 005）。
+    let has_memory_consolidation_state = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_consolidation_state'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_memory_consolidation_state {
+        run_migration(
+            pool,
+            "009",
+            include_str!("migrations/009_peco_memory_consolidation.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 009 completed");
+    } else {
+        tracing::debug!("Migration 009 skipped: memory_consolidation_state table already exists");
+    }
+
     Ok(())
 }
 
@@ -299,4 +325,73 @@ pub async fn set_server_config(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_pool() -> (SqlitePool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = connect(&url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        (pool, dir)
+    }
+
+    /// 迁移 009：首次执行建出三张记忆巩固表；已有数据在二次执行后保持不变
+    /// （前置存在性检查命中 → 跳过，不重建、不清空）。
+    #[tokio::test]
+    async fn migration_009_creates_tables_once_and_survives_rerun() {
+        let (pool, _dir) = test_pool().await;
+
+        for table in [
+            "memory_audit",
+            "memory_recall_stats",
+            "memory_consolidation_state",
+        ] {
+            let count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "表 {table} 应已由迁移 009 创建");
+        }
+
+        // 写入一行审计数据后重跑迁移，数据与表数量必须保持不变
+        sqlx::query(
+            "INSERT INTO memory_audit \
+             (user_id, kb_name, doc_id, title, content, source, reason, deleted_by, deleted_at) \
+             VALUES ('u1', '@private_memory', 'doc-1', 't', 'c', 'ppa_semantic', \
+             'manual_organize', 'agent:@memory', '2026-09-10T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let audit_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audit_rows, 1, "重跑迁移不得清空已有审计数据");
+
+        for table in [
+            "memory_audit",
+            "memory_recall_stats",
+            "memory_consolidation_state",
+        ] {
+            let count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "重跑迁移后表 {table} 不得重复创建");
+        }
+    }
 }

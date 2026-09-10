@@ -3558,6 +3558,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "chrono",
  "fastembed",
  "futures",
  "hex",

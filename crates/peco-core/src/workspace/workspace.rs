@@ -14,8 +14,8 @@ use crate::workflow::{WorkflowAccess, WorkflowManager};
 
 use super::error::WorkspaceError;
 use crate::tools::{
-    AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, SkillProvider, ToolExecutor,
-    ToolRegister,
+    AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, MemoryAuditAccess, SkillProvider,
+    ToolExecutor, ToolRegister,
 };
 
 // ============================================================================
@@ -150,6 +150,14 @@ impl WorkSpace {
             .set_workflow_access(self.clone() as Arc<dyn WorkflowAccess>);
         self.agent_manager
             .set_mcp_access(self.clone() as Arc<dyn McpAccess>);
+    }
+
+    /// 注入记忆删除审计依赖（由 peco-server 层在 workspace 就绪后调用）。
+    ///
+    /// WorkSpace 自身没有审计存储，无法像 workflow/mcp 那样在 `inject_deps`
+    /// 中自注入；不注入（默认 None）= 删除工具运行时拒绝执行（fail-closed）。
+    pub fn set_memory_audit(&self, ma: Arc<dyn MemoryAuditAccess>) {
+        self.agent_manager.set_memory_audit(ma);
     }
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager

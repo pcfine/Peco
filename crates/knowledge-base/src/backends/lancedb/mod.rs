@@ -339,13 +339,17 @@ impl VectorIndex for LanceDbBackend {
     }
     async fn remove(&self, ids: &[String]) -> Result<(), KnowledgeError> {
         let _lock = self.write_lock.lock().await;
+        let mut failures = Vec::new();
         for id in ids {
-            let _ = self
+            if let Err(e) = self
                 .table
                 .delete(&format!("{} = '{}'", ID_COL, id.replace('\'', "''")))
-                .await;
+                .await
+            {
+                failures.push((id.clone(), e.to_string()));
+            }
         }
-        Ok(())
+        super::aggregate_remove_failures(failures, KnowledgeError::VectorError)
     }
 }
 
@@ -404,13 +408,17 @@ impl FullTextIndex for LanceDbBackend {
     }
     async fn remove(&self, ids: &[String]) -> Result<(), KnowledgeError> {
         let _lock = self.write_lock.lock().await;
+        let mut failures = Vec::new();
         for id in ids {
-            let _ = self
+            if let Err(e) = self
                 .table
                 .delete(&format!("{} = '{}'", ID_COL, id.replace('\'', "''")))
-                .await;
+                .await
+            {
+                failures.push((id.clone(), e.to_string()));
+            }
         }
-        Ok(())
+        super::aggregate_remove_failures(failures, KnowledgeError::TextSearchError)
     }
 }
 
@@ -570,5 +578,55 @@ mod tests {
         let schema = chunk_table_schema(384);
         assert!(schema.column_with_name("id").is_some());
         assert!(schema.column_with_name("embedding").is_some());
+    }
+
+    /// 成功路径不误报：存在的 id 被真正删除，不存在的 id 删除成功属正常语义。
+    #[tokio::test]
+    async fn remove_deletes_rows_and_tolerates_missing_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = LanceDbBackend::connect(tmp.path(), "remove_test", 4)
+            .await
+            .unwrap();
+
+        let doc = Document {
+            kb_id: None,
+            id: "doc-1".into(),
+            title: "Remove Test".into(),
+            source_path: "/tmp/remove.md".into(),
+            content: "hello world".into(),
+            metadata: DocumentMetadata::default(),
+        };
+        let chunks = vec![
+            Chunk {
+                id: "doc-1-0001-aaaa".into(),
+                document_id: doc.id.clone(),
+                text: "first".into(),
+                sequence_index: 0,
+                page_number: None,
+                embedding: vec![0.0; 4],
+                metadata: ChunkMetadata::default(),
+            },
+            Chunk {
+                id: "doc-1-0002-bbbb".into(),
+                document_id: doc.id.clone(),
+                text: "second".into(),
+                sequence_index: 1,
+                page_number: None,
+                embedding: vec![0.0; 4],
+                metadata: ChunkMetadata::default(),
+            },
+        ];
+        backend.store(doc, chunks).await.unwrap();
+
+        // VectorIndex::remove 与 FullTextIndex::remove 同名，需显式按 trait 调用
+        VectorIndex::remove(&backend, &["doc-1-0001-aaaa".into(), "missing-id".into()])
+            .await
+            .unwrap();
+        FullTextIndex::remove(&backend, &["doc-1-0002-bbbb".into(), "missing-id".into()])
+            .await
+            .unwrap();
+
+        let remaining = backend.chunks(&"doc-1".into()).await.unwrap();
+        assert!(remaining.is_empty(), "两个 chunk 都应已被删除");
     }
 }

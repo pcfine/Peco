@@ -25,6 +25,27 @@ type BackendComponents = (
     Option<Arc<dyn GraphStore>>,
 );
 
+/// 构建文本型 `Document`（`add_text` / `add_text_with_mode` 共用）。
+///
+/// `created_at` 记录写入时刻（ISO 8601），供 TTL 判定等下游逻辑使用。
+fn build_text_document(kb_name: &str, title: &str, content: &str, source: &str) -> Document {
+    let hash = sha2::Sha256::digest(content.as_bytes());
+    let doc_id = hex::encode(&hash[..8]);
+
+    Document {
+        id: doc_id,
+        kb_id: Some(kb_name.to_string()),
+        title: title.to_string(),
+        source_path: source.to_string(),
+        content: content.to_string(),
+        metadata: DocumentMetadata {
+            file_type: Some("txt".into()),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KnowledgeBase
 // ---------------------------------------------------------------------------
@@ -221,20 +242,7 @@ impl KnowledgeBase {
         source: &str,
         mode: StorageMode,
     ) -> Result<Document, KnowledgeError> {
-        let hash = sha2::Sha256::digest(content.as_bytes());
-        let doc_id = hex::encode(&hash[..8]);
-
-        let doc = Document {
-            id: doc_id,
-            kb_id: Some(self.config.name.clone()),
-            title: title.to_string(),
-            source_path: source.to_string(),
-            content: content.to_string(),
-            metadata: DocumentMetadata {
-                file_type: Some("txt".into()),
-                ..Default::default()
-            },
-        };
+        let doc = build_text_document(&self.config.name, title, content, source);
 
         self.pipeline.ingest_with_mode(doc.clone(), mode).await?;
         Ok(doc)
@@ -260,9 +268,14 @@ impl KnowledgeBase {
             .await
     }
 
-    /// 删除文档。
-    pub async fn remove_document(&self, doc_id: &str) -> Result<(), KnowledgeError> {
+    /// 删除文档，返回删除计数报告。
+    pub async fn remove_document(&self, doc_id: &str) -> Result<DeleteReport, KnowledgeError> {
         self.pipeline.delete_document(&doc_id.to_string()).await
+    }
+
+    /// 读取单个文档（含原文内容）；文档不存在时返回 `None`。
+    pub async fn get_document(&self, doc_id: &str) -> Result<Option<Document>, KnowledgeError> {
+        self.pipeline.get_document(&doc_id.to_string()).await
     }
 
     /// 获取统计信息。

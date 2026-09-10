@@ -460,11 +460,14 @@ impl VectorIndex for HelixDbBackend {
     }
 
     async fn remove(&self, ids: &[String]) -> Result<(), KnowledgeError> {
+        let mut failures = Vec::new();
         for id in ids {
             let query = queries::delete_chunk_by_id(&self.schema, id);
-            let _ = self.client.execute_write(query).await;
+            if let Err(e) = self.client.execute_write(query).await {
+                failures.push((id.clone(), e.to_string()));
+            }
         }
-        Ok(())
+        super::aggregate_remove_failures(failures, KnowledgeError::VectorError)
     }
 }
 
@@ -523,11 +526,14 @@ impl FullTextIndex for HelixDbBackend {
 
     async fn remove(&self, ids: &[String]) -> Result<(), KnowledgeError> {
         // 通过 VectorIndex::remove 或 DocumentStore::delete 级联处理。
+        let mut failures = Vec::new();
         for id in ids {
             let query = queries::delete_chunk_by_id(&self.schema, id);
-            let _ = self.client.execute_write(query).await;
+            if let Err(e) = self.client.execute_write(query).await {
+                failures.push((id.clone(), e.to_string()));
+            }
         }
-        Ok(())
+        super::aggregate_remove_failures(failures, KnowledgeError::TextSearchError)
     }
 }
 

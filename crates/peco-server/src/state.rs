@@ -69,11 +69,12 @@ impl AppState {
         // 加载系统级配置
         let system_config = Arc::new(SystemConfig::load());
 
-        // 创建 WorkspaceManager（LRU 容量 128）
+        // 创建 WorkspaceManager（LRU 容量 128；持有连接池用于审计注入）
         let workspace_manager = Arc::new(WorkspaceManager::new(
             config.data_dir.clone(),
             system_config,
             128,
+            db.clone(),
         ));
 
         Self {

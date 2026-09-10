@@ -6,6 +6,8 @@
 //   - GET  /api/peco/stream?message=xxx   SSE 流式对话
 //   - GET  /api/peco/session               会话快照
 //   - DELETE /api/peco/session              清除/重置会话
+//   - GET  /api/peco/memory/audit           记忆删除审计（分页）
+//   - POST /api/peco/memory/audit/:id/restore  按审计行回滚删除
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -15,10 +17,11 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::sse::{KeepAlive, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use futures::stream::Stream;
 use model_provider::InputItem;
 use peco_core::agent::{AgentLooper, strip_summary_wrapper};
+use peco_core::knowledge::KnowledgeModuleError;
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
 use serde::{Deserialize, Serialize};
@@ -615,6 +618,166 @@ pub async fn download_archive(
         .unwrap())
 }
 
+// ── Handler: GET /api/peco/memory/audit + POST /memory/audit/{id}/restore ──
+
+/// 记忆审计查询分页参数。
+#[derive(Debug, Deserialize)]
+pub struct AuditQuery {
+    /// 页大小（默认 20，上限 100）。
+    #[serde(default = "default_audit_limit")]
+    pub limit: i64,
+    /// 偏移量。
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_audit_limit() -> i64 {
+    20
+}
+
+/// 单条记忆删除审计记录（含被删原文 — 仅供本人查阅）。
+#[derive(Debug, Serialize)]
+pub struct MemoryAuditItem {
+    pub id: i64,
+    pub kb_name: String,
+    pub doc_id: String,
+    pub title: String,
+    pub content: String,
+    pub source: String,
+    pub reason: String,
+    pub deleted_by: String,
+    pub status: String,
+    pub deleted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restored_doc_id: Option<String>,
+}
+
+impl From<crate::db::memory_audit::MemoryAuditRow> for MemoryAuditItem {
+    fn from(r: crate::db::memory_audit::MemoryAuditRow) -> Self {
+        Self {
+            id: r.id,
+            kb_name: r.kb_name,
+            doc_id: r.doc_id,
+            title: r.title,
+            content: r.content,
+            source: r.source,
+            reason: r.reason,
+            deleted_by: r.deleted_by,
+            status: r.status,
+            deleted_at: r.deleted_at,
+            restored_at: r.restored_at,
+            restored_doc_id: r.restored_doc_id,
+        }
+    }
+}
+
+/// 分页列出当前用户的记忆删除审计（deleted_at 倒序）。
+pub async fn list_memory_audit(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AuditQuery>,
+) -> Result<Json<Vec<MemoryAuditItem>>, ApiError> {
+    let rows = crate::db::memory_audit::list_by_user(
+        &state.db,
+        &user_id,
+        params.limit.clamp(1, 100),
+        params.offset.max(0),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("failed to list memory audit: {e}")))?;
+
+    Ok(Json(rows.into_iter().map(MemoryAuditItem::from).collect()))
+}
+
+/// 回滚响应。
+#[derive(Debug, Serialize)]
+pub struct RestoreMemoryResponse {
+    pub success: bool,
+    pub doc_id: String,
+    pub restored_at: String,
+}
+
+/// 按审计行回滚一条记忆删除：重放 `add_text`（doc_id 为内容哈希前缀，幂等复原），
+/// 成功后回填 restored_at / restored_doc_id。
+///
+/// 他人审计行与不存在的行一律 404 — 不泄露记录的存在性。
+pub async fn restore_memory_audit(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<RestoreMemoryResponse>, ApiError> {
+    // 1. 归属校验：仅本人审计行可见可回滚
+    let row = crate::db::memory_audit::get(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to load memory audit: {e}")))?
+        .filter(|r| r.user_id == user_id)
+        .ok_or_else(|| ApiError::NotFound(format!("memory audit record #{id} not found")))?;
+
+    // 2. 状态校验：仅 done 且未回滚的行可回滚
+    //   （pending 是未决的删除流程；cancelled 表示删除未发生，无需回滚）
+    if row.status != "done" {
+        return Err(ApiError::Conflict(format!(
+            "审计行 #{id} 状态为 '{}'，仅 done 记录可回滚",
+            row.status
+        )));
+    }
+    if row.restored_at.is_some() {
+        return Err(ApiError::Conflict(format!(
+            "审计行 #{id} 已回滚，不可重复回滚"
+        )));
+    }
+
+    // 3. 重放写入（内容哈希幂等 → doc_id 复原）
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let doc = ws
+        .knowledge_manager()
+        .add_text_to_kb(&row.kb_name, &row.title, &row.content, &row.source)
+        .await
+        .map_err(|e| match &e {
+            KnowledgeModuleError::NotFound(name) => {
+                ApiError::NotFound(format!("知识库 '{name}' 不存在，无法回滚审计行 #{id}"))
+            }
+            other => ApiError::Internal(format!("failed to replay add_text: {other}")),
+        })?;
+
+    if doc.id != row.doc_id {
+        return Err(ApiError::Conflict(format!(
+            "回滚后的文档 id '{}' 与审计行 doc_id '{}' 不一致（内容应逐字节一致）",
+            doc.id, row.doc_id
+        )));
+    }
+
+    // 4. 回填 restored_at / restored_doc_id
+    let restored_at = chrono::Utc::now().to_rfc3339();
+    let updated = crate::db::memory_audit::mark_restored(&state.db, id, &restored_at, &doc.id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to mark audit restored: {e}")))?;
+    if updated == 0 {
+        return Err(ApiError::Conflict(format!(
+            "审计行 #{id} 状态已变化，本次回滚未记录"
+        )));
+    }
+
+    tracing::info!(
+        user_id = %user_id,
+        audit_id = id,
+        doc_id = %doc.id,
+        kb = %row.kb_name,
+        "Memory deletion restored from audit"
+    );
+
+    Ok(Json(RestoreMemoryResponse {
+        success: true,
+        doc_id: doc.id,
+        restored_at,
+    }))
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/peco/session/export?format=json|markdown`
@@ -665,6 +828,8 @@ pub async fn export_session(
 /// - `GET /session/export` — 导出会话
 /// - `GET /archives` — 归档列表
 /// - `GET /archives/:id` — 下载归档
+/// - `GET /memory/audit` — 记忆删除审计（分页，仅本人）
+/// - `POST /memory/audit/:id/restore` — 按审计行回滚删除
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
@@ -672,4 +837,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/session/export", get(export_session))
         .route("/archives", get(list_archives))
         .route("/archives/{id}", get(download_archive))
+        .route("/memory/audit", get(list_memory_audit))
+        .route("/memory/audit/{id}/restore", post(restore_memory_audit))
 }

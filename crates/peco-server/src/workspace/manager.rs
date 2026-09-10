@@ -112,6 +112,10 @@ pub struct WorkspaceManager {
     data_dir: PathBuf,
     /// 系统级配置（所有 WorkSpace 共享）。
     system_config: Arc<SystemConfig>,
+    /// 连接池 — 记忆删除审计注入的依赖来源。持有它使每条 workspace 创建
+    /// 路径（get / get_synced → open_workspace）都能统一注入审计，
+    /// 避免「某条路径创建的 workspace 漏注入、又被 LRU 缓存放大为永久 fail-closed」。
+    db: SqlitePool,
     /// LRU: user_id → CacheEntry (WorkSpace + WatcherState)
     cache: RwLock<LruCache<String, CacheEntry>>,
     /// username 缓存（user_id → 原始查询结果，None = 用户无 username）。
@@ -122,11 +126,17 @@ pub struct WorkspaceManager {
 
 impl WorkspaceManager {
     /// 创建新的 WorkspaceManager。
-    pub fn new(data_dir: PathBuf, system_config: Arc<SystemConfig>, capacity: usize) -> Self {
+    pub fn new(
+        data_dir: PathBuf,
+        system_config: Arc<SystemConfig>,
+        capacity: usize,
+        db: SqlitePool,
+    ) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             data_dir,
             system_config,
+            db,
             cache: RwLock::new(LruCache::new(cap)),
             usernames: RwLock::new(HashMap::new()),
         }
@@ -239,7 +249,7 @@ impl WorkspaceManager {
             }
         }
 
-        // 4. 打开 WorkSpace（总会初始化内存缓存）
+        // 4. 打开 WorkSpace（总会初始化内存缓存；审计注入见 open_workspace）
         let ws = self.open_workspace(user_id, &root)?;
         let ws = Arc::new(ws);
         ws.inject_deps();
@@ -393,9 +403,17 @@ impl WorkspaceManager {
     // ── 私有方法 ────────────────────────────────────────────────────────
 
     /// 打开 WorkSpace（纯 I/O，不含缓存逻辑）。
+    ///
+    /// 所有创建路径（get / get_synced）的公共必经点 — 记忆删除审计在此统一
+    /// 注入：任何路径创建的 workspace 都携带审计，不会因创建顺序不同而
+    /// 漏注入后被 LRU 缓存放大为删除工具永久拒绝。
     fn open_workspace(&self, user_id: &str, root: &std::path::Path) -> Result<WorkSpace, ApiError> {
-        WorkSpace::open(root.to_path_buf(), user_id.to_string(), &self.system_config)
-            .map_err(|e| ApiError::Internal(format!("failed to open workspace: {e}")))
+        let ws = WorkSpace::open(root.to_path_buf(), user_id.to_string(), &self.system_config)
+            .map_err(|e| ApiError::Internal(format!("failed to open workspace: {e}")))?;
+        ws.set_memory_audit(Arc::new(super::memory_audit::SqliteMemoryAudit::new(
+            self.db.clone(),
+        )));
+        Ok(ws)
     }
 
     /// 计算所有模块的哈希。
@@ -444,5 +462,49 @@ impl WorkspaceManager {
                 tracing::warn!(%user_id, module, error = %e, "Failed to update hash after sync");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peco_core::config::{McpConfig, ProvidersConfig};
+    use std::collections::HashMap;
+
+    fn test_manager(dir: &std::path::Path, pool: sqlx::SqlitePool) -> WorkspaceManager {
+        let system_config = Arc::new(SystemConfig {
+            providers: ProvidersConfig {
+                default_provider: "deepseek".into(),
+                providers: HashMap::new(),
+                web_search: None,
+            },
+            mcp: McpConfig::empty(),
+            skills_root: dir.join("skills"),
+            knowledge_dir: dir.join("knowledge"),
+        });
+        WorkspaceManager::new(dir.to_path_buf(), system_config, 8, pool)
+    }
+
+    /// 审计注入发生在 open_workspace — get 与 get_synced 两条创建路径的
+    /// 公共必经点，因此无论哪个先到，workspace 都必须携带审计实现。
+    /// 漏注入的路径会被 LRU 缓存放大为删除工具永久拒绝。
+    #[tokio::test]
+    async fn both_get_and_get_synced_inject_memory_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+
+        let mgr = test_manager(dir.path(), pool.clone());
+        let user_id = "audit-inject-user";
+
+        // get_synced 路径注入
+        let ws = mgr.get_synced(user_id, &pool).await.unwrap();
+        assert!(ws.agent_manager().build_deps().memory_audit.is_some());
+
+        // 经 get() 重建（LRU 驱逐后）同样注入 — 不依赖创建顺序
+        mgr.invalidate_user(user_id);
+        let ws = mgr.get(user_id).unwrap();
+        assert!(ws.agent_manager().build_deps().memory_audit.is_some());
     }
 }

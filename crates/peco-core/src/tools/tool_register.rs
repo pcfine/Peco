@@ -12,10 +12,11 @@ use serde_json::json;
 
 use crate::tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, Content, DefaultToolsExecutor, DelegateSubAgent,
-    DeleteAgent, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs, ListKnowledgeBases,
-    ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill, RunParallelSubAgents,
-    SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellTool, ShowWorkspace,
-    SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError, ToolExecutor, WebSearchTool,
+    DeleteAgent, DeleteKbDocument, DeleteKbDocuments, DeleteMcpServer, DeleteSkill, Fetch,
+    GetKnowledgeBaseDocs, ListKnowledgeBases, ListMcpServers, ListSkills, QueryEntityFacts,
+    ReadAgent, ReadSkill, RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSkill,
+    SearchKnowledge, ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn,
+    ToolError, ToolExecutor, WebSearchTool,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -53,6 +54,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_knowledge_base_docs",
     "add_facts_to_knowledge_base",
     "query_entity_facts",
+    "delete_kb_document",
+    "delete_kb_documents",
     "web_search",
 ];
 
@@ -197,6 +200,20 @@ impl ToolRegister {
                     deps.allowed_kbs.clone(),
                 ))),
 
+                // ── Knowledge + 审计（删除工具）──────────────────────────
+                // memory_audit 为 None 时不在此过滤：删除工具始终注册，
+                // 执行时被 require_audit 拒绝（fail-closed，运行时门）。
+                "delete_kb_document" => Some(Box::new(DeleteKbDocument::new(
+                    deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
+                    deps.memory_audit.clone(),
+                ))),
+                "delete_kb_documents" => Some(Box::new(DeleteKbDocuments::new(
+                    deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
+                    deps.memory_audit.clone(),
+                ))),
+
                 _ => {
                     tracing::warn!(tool = %name, "Unknown tool, skipping");
                     None
@@ -280,6 +297,8 @@ mod tests {
     use crate::search::{SearchBackend, searxng::SearxngClient};
     use crate::skills::SkillRegister;
     use crate::workflow::WorkflowAccess;
+
+    use super::super::NoopMemoryAudit;
 
     // ── 最小 stub 实现（工具构造阶段不会被调用）─────────────────────────
 
@@ -391,6 +410,8 @@ mod tests {
             workflow_persister: None,
             workspace_root: None,
             web_search: None,
+            // fail-closed 默认：审计存储未注入，删除工具运行时拒绝
+            memory_audit: None,
         }
     }
 
@@ -432,6 +453,9 @@ mod tests {
     #[test]
     fn optional_dep_tools_skipped_when_deps_missing() {
         let deps = base_deps();
+        // memory_audit 走的是运行时拒绝（fail-closed），不是注册期过滤：
+        // None 只表示删除工具执行被拒，注册集合不受影响（见下一条测试）。
+        assert!(deps.memory_audit.is_none());
         let executor = ToolRegister::build(
             &BUILTIN_TOOL_NAMES
                 .iter()
@@ -458,6 +482,25 @@ mod tests {
         }
         assert!(names.contains(&"shell".to_string()));
         assert!(names.contains(&"list_tools".to_string()));
+        // 删除工具不在跳过清单：审计缺失是运行时门（fail-closed），不是注册门
+        assert!(names.contains(&"delete_kb_document".to_string()));
+        assert!(names.contains(&"delete_kb_documents".to_string()));
+    }
+
+    /// 注入 NoopMemoryAudit（测试中显式放行删除的方式）不改变任何工具的
+    /// 注册集合 — 审计可用性是运行时门，不是注册门。
+    #[test]
+    fn memory_audit_injection_does_not_change_registration() {
+        let all_names: Vec<String> = BUILTIN_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+
+        let deps = full_deps();
+        let without = definition_names(ToolRegister::build(&all_names, &deps).as_ref());
+
+        let mut with = deps.clone();
+        with.memory_audit = Some(Arc::new(NoopMemoryAudit));
+        let with = definition_names(ToolRegister::build(&all_names, &with).as_ref());
+
+        assert_eq!(without, with);
     }
 
     /// web_search 在后端就绪时正常注册（与 fetch 同级注册验证）。

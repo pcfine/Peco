@@ -22,6 +22,7 @@ use crate::mcp::McpConfigStore;
 use crate::search::SearchBackend;
 use crate::skills::SkillRegister;
 use crate::tools::McpAccess;
+use crate::tools::MemoryAuditAccess;
 use crate::workflow::WorkflowAccess;
 use crate::workspace::{
     AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, WorkspaceError,
@@ -65,6 +66,9 @@ pub struct AgentManager {
     workflow_access: RwLock<Option<Arc<dyn WorkflowAccess>>>,
     /// MCP 依赖注入（由 WorkSpace 在初始化时设置）。
     mcp_access: RwLock<Option<Arc<dyn McpAccess>>>,
+    /// 记忆删除审计注入（由 peco-server 层在 workspace 就绪后设置）。
+    /// None（默认）= 删除工具运行时拒绝（fail-closed）。
+    memory_audit: RwLock<Option<Arc<dyn MemoryAuditAccess>>>,
     /// web 搜索后端（来自 providers.toml 的 `[web_search]` 段）。
     /// 构造期建一次（reqwest 连接池与 `${ENV_VAR}` 解析只做一次）；
     /// None 表示未配置或配置无效，web_search 工具随之 skip。
@@ -101,6 +105,7 @@ impl AgentManager {
             cache: RwLock::new(HashMap::new()),
             workflow_access: RwLock::new(None),
             mcp_access: RwLock::new(None),
+            memory_audit: RwLock::new(None),
             // 构造期建一次搜索后端（连接池 + env var 解析只做一次）
             web_search: SearchBackend::from_config_opt(user_config.providers.web_search.as_ref())
                 .map(Arc::new),
@@ -118,6 +123,14 @@ impl AgentManager {
     /// 注入 MCP 管理依赖（由 WorkSpace 在初始化时调用）。
     pub fn set_mcp_access(&self, ma: Arc<dyn McpAccess>) {
         *self.mcp_access.write().unwrap() = Some(ma);
+    }
+
+    /// 注入记忆删除审计依赖（由 peco-server 层在 workspace 就绪后调用）。
+    ///
+    /// 不注入（默认 None）= 删除工具运行时拒绝执行（fail-closed）；
+    /// 注入 [`crate::tools::deps::NoopMemoryAudit`] 仅限测试放行删除。
+    pub fn set_memory_audit(&self, ma: Arc<dyn MemoryAuditAccess>) {
+        *self.memory_audit.write().unwrap() = Some(ma);
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
@@ -259,6 +272,7 @@ impl AgentManager {
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
             web_search: self.web_search.clone(),
+            memory_audit: self.memory_audit.read().unwrap().clone(),
         }
     }
 
@@ -273,6 +287,7 @@ impl AgentManager {
         config.mcp = self.mcp_config.get();
         let workflow_access = self.workflow_access.read().unwrap().clone();
         let mcp_access = self.mcp_access.read().unwrap().clone();
+        let memory_audit = self.memory_audit.read().unwrap().clone();
         ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
@@ -284,6 +299,7 @@ impl AgentManager {
                 workflow_access: workflow_access.clone(),
                 mcp_access: mcp_access.clone(),
                 web_search: self.web_search.clone(),
+                memory_audit: memory_audit.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -298,6 +314,7 @@ impl AgentManager {
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
             web_search: self.web_search.clone(),
+            memory_audit,
         }
     }
 
@@ -502,6 +519,8 @@ struct AmAgentAccess {
     mcp_access: Option<Arc<dyn McpAccess>>,
     /// AgentManager 构造期缓存的搜索后端（`web_search` 子 Agent 装配用）。
     web_search: Option<Arc<SearchBackend>>,
+    /// 记忆删除审计（透传给子 Agent 的 ToolDependencies）。
+    memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
 }
 
 impl AgentAccess for AmAgentAccess {
@@ -525,6 +544,7 @@ impl AgentAccess for AmAgentAccess {
                 workflow_access: self.workflow_access.clone(),
                 mcp_access: self.mcp_access.clone(),
                 web_search: self.web_search.clone(),
+                memory_audit: self.memory_audit.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -539,6 +559,7 @@ impl AgentAccess for AmAgentAccess {
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
             web_search: self.web_search.clone(),
+            memory_audit: self.memory_audit.clone(),
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;
@@ -622,5 +643,79 @@ impl KnowledgeAccess for AmKnowledgeAccess {
 
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.km
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{McpConfig, ProvidersConfig};
+    use crate::tools::{MemoryAuditEntry, NoopMemoryAudit};
+    use std::collections::HashMap;
+
+    fn test_agent_manager(root: &Path) -> Arc<AgentManager> {
+        let user_config = UserConfig {
+            providers: ProvidersConfig {
+                default_provider: "deepseek".into(),
+                providers: HashMap::new(),
+                web_search: None,
+            },
+            mcp: McpConfig::empty(),
+        };
+        Arc::new(AgentManager::new(
+            root.join("agents"),
+            "test-user".into(),
+            user_config,
+            McpConfigStore::new(McpConfig::empty()),
+            Arc::new(SkillRegister::new(root.join("skills")).expect("skill register")),
+            Arc::new(KnowledgeManager::new(root.join("knowledge"))),
+        ))
+    }
+
+    /// 未注入时 memory_audit 必须保持 None（fail-closed：删除工具运行时拒绝）；
+    /// 注入后经 build_deps 透传到 ToolDependencies。
+    #[test]
+    fn memory_audit_defaults_to_none_and_injects_via_build_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = test_agent_manager(tmp.path());
+
+        assert!(
+            am.build_deps().memory_audit.is_none(),
+            "未注入审计时必须保持 None（fail-closed）"
+        );
+
+        am.set_memory_audit(Arc::new(NoopMemoryAudit));
+        assert!(
+            am.build_deps().memory_audit.is_some(),
+            "注入后 build_deps 必须携带审计访问"
+        );
+    }
+
+    /// 注入的审计实现可经 trait 对象正常调用（透传后接口可用）。
+    #[tokio::test]
+    async fn injected_memory_audit_is_callable_through_trait_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = test_agent_manager(tmp.path());
+        am.set_memory_audit(Arc::new(NoopMemoryAudit));
+
+        let audit = am.build_deps().memory_audit.expect("audit injected");
+        let entry = MemoryAuditEntry {
+            user_id: "test-user".into(),
+            kb_name: "@private_memory".into(),
+            doc_id: "abcd1234".into(),
+            title: "memory_1".into(),
+            content: "用户偏好 Rust".into(),
+            source: "ppa_semantic".into(),
+            reason: "manual_organize".into(),
+            deleted_by: "agent:@memory".into(),
+            deleted_at: "2026-09-10T00:00:00+00:00".into(),
+        };
+
+        let id = audit.record_pending(entry).await.unwrap();
+        assert!(audit.get(id).await.unwrap().is_none()); // Noop 不留存
     }
 }

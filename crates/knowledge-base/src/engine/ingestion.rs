@@ -67,6 +67,18 @@ impl IngestionPipeline {
             "正在摄入文档"
         );
 
+        // 同 id 重复摄入 = 替换语义：doc_id 由内容哈希派生，逐字重复的内容
+        // 会命中同一 doc_id。先级联清掉既有行再写入，否则追加式后端
+        // （LanceDB 的 store 为纯 append）会累积重复 chunk 行。
+        if self.doc_store.get(&doc_id).await?.is_some() {
+            // 并发删除的竞态下文档可能刚好消失 — 此时无需替换，继续摄入
+            if let Err(e) = self.delete_document(&doc_id).await
+                && !matches!(e, KnowledgeError::NotFound(_))
+            {
+                return Err(e);
+            }
+        }
+
         let need_chunks = mode_requires_chunks(&mode);
         let need_embed = mode_requires_embed(&mode);
         let need_vector = mode_requires_vector(&mode);
@@ -188,15 +200,26 @@ impl IngestionPipeline {
     /// 删除文档及其在所有索引中的关联数据。
     ///
     /// 步骤：
-    /// 1. 获取文档的所有分块 ID
-    /// 2. 从向量索引中移除
-    /// 3. 从全文索引中移除
-    /// 4. 从图谱中移除边（如有）
-    /// 5. 从文档存储中删除（LanceDB 会级联删除分块行）
+    /// 1. 确认文档存在（重复删除或未知文档直接报错，不误报为成功）
+    /// 2. 获取文档的所有分块 ID
+    /// 3. 从向量索引中移除
+    /// 4. 从全文索引中移除
+    /// 5. 从图谱中移除边（如有）
+    /// 6. 从文档存储中删除（LanceDB 会级联删除分块行）
     ///
     /// 各后端自行保证内部一致性；部分步骤可能冗余但确保跨后端的正确性。
-    pub async fn delete_document(&self, doc_id: &DocumentId) -> Result<(), KnowledgeError> {
-        // 1. 收集与此文档关联的分块 ID
+    pub async fn delete_document(
+        &self,
+        doc_id: &DocumentId,
+    ) -> Result<DeleteReport, KnowledgeError> {
+        // 1. 文档必须存在
+        if self.doc_store.get(doc_id).await?.is_none() {
+            return Err(KnowledgeError::NotFound(format!(
+                "Document not found: '{doc_id}'"
+            )));
+        }
+
+        // 2. 收集与此文档关联的分块 ID
         let chunks = self
             .doc_store
             .chunks(doc_id)
@@ -204,7 +227,7 @@ impl IngestionPipeline {
             .map_err(|e| KnowledgeError::StoreError(e.to_string()))?;
         let chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.clone()).collect();
 
-        // 2. 按分块 ID 移除向量条目
+        // 3. 按分块 ID 移除向量条目
         if let Some(ref vi) = self.vector_index
             && !chunk_ids.is_empty()
         {
@@ -213,7 +236,7 @@ impl IngestionPipeline {
                 .map_err(|e| KnowledgeError::VectorError(e.to_string()))?;
         }
 
-        // 3. 按分块 ID 移除全文条目
+        // 4. 按分块 ID 移除全文条目
         if let Some(ref ft) = self.fulltext_index
             && !chunk_ids.is_empty()
         {
@@ -222,14 +245,14 @@ impl IngestionPipeline {
                 .map_err(|e| KnowledgeError::TextSearchError(e.to_string()))?;
         }
 
-        // 4. 移除此文档节点的图谱边
+        // 5. 移除此文档节点的图谱边
         if let Some(ref gs) = self.graph_store {
             gs.remove_node_edges(doc_id)
                 .await
                 .map_err(|e| KnowledgeError::GraphError(e.to_string()))?;
         }
 
-        // 5. 从 doc_store 删除文档及其分块
+        // 6. 从 doc_store 删除文档及其分块
         self.doc_store
             .delete(doc_id)
             .await
@@ -241,7 +264,18 @@ impl IngestionPipeline {
             "文档已删除"
         );
 
-        Ok(())
+        Ok(DeleteReport {
+            doc_id: doc_id.clone(),
+            removed_chunks: chunk_ids.len(),
+        })
+    }
+
+    /// 读取单个文档（含原文内容）；文档不存在时返回 `None`。
+    pub async fn get_document(
+        &self,
+        doc_id: &DocumentId,
+    ) -> Result<Option<Document>, KnowledgeError> {
+        self.doc_store.get(doc_id).await
     }
 
     /// 返回存储的聚合统计信息。
@@ -359,6 +393,49 @@ mod tests {
         assert_eq!(stats1.chunk_count, stats2.chunk_count);
     }
 
+    /// LanceDB 是追加式存储（store 为纯 table.add），同 doc_id 重复摄入
+    /// 必须由管道的替换语义兜底：先级联删除旧行再写入，chunk 行数不翻倍。
+    /// InMemory 后端本身覆盖写入，测不出该回归，故用 LanceDB 实测。
+    #[tokio::test]
+    async fn reingest_same_doc_id_on_lancedb_replaces_instead_of_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            crate::backends::lancedb::LanceDbBackend::connect(tmp.path(), "reingest", 4)
+                .await
+                .unwrap(),
+        );
+        let pipeline = IngestionPipeline::new(
+            backend.clone() as Arc<dyn DocumentStore>,
+            Some(backend.clone() as Arc<dyn VectorIndex>),
+            None,
+            Some(backend.clone() as Arc<dyn FullTextIndex>),
+            Arc::new(MockEmbedding { ndims: 4 }),
+            make_chunker(ChunkingStrategy::FixedSize { size: 50 }),
+        );
+
+        let doc = Document {
+            content: "a".repeat(150),
+            ..test_doc()
+        };
+        pipeline.ingest(doc.clone()).await.unwrap();
+        let first = backend.chunks(&doc.id).await.unwrap().len();
+        assert!(first >= 1);
+
+        pipeline.ingest(doc).await.unwrap();
+        let second = backend.chunks(&"test-ingest-1".into()).await.unwrap().len();
+        assert_eq!(
+            second, first,
+            "重复摄入不得累积 chunk 行（替换语义，而非追加）"
+        );
+        assert!(
+            pipeline
+                .get_document(&"test-ingest-1".into())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn ingest_batch() {
         let backend = Arc::new(InMemoryBackend::new());
@@ -400,5 +477,76 @@ mod tests {
 
         let stats = backend.stats().await.unwrap();
         assert_eq!(stats.document_count, 2);
+    }
+
+    // ── delete_document ─────────────────────────────────────────────────
+
+    /// 150 字符内容 + FixedSize { size: 50 } → 恰好 3 个分块。
+    fn three_chunk_doc() -> Document {
+        Document {
+            kb_id: None,
+            id: "delete-me-1".into(),
+            title: "Delete Me".into(),
+            source_path: "/tmp/delete-me.md".into(),
+            content: "a".repeat(150),
+            metadata: DocumentMetadata::default(),
+        }
+    }
+
+    fn pipeline_with_fixed_chunks(backend: &Arc<InMemoryBackend>) -> IngestionPipeline {
+        IngestionPipeline::new(
+            backend.clone() as Arc<dyn DocumentStore>,
+            Some(backend.clone() as Arc<dyn VectorIndex>),
+            Some(backend.clone() as Arc<dyn GraphStore>),
+            Some(backend.clone() as Arc<dyn FullTextIndex>),
+            Arc::new(MockEmbedding { ndims: 384 }),
+            make_chunker(ChunkingStrategy::FixedSize { size: 50 }),
+        )
+    }
+
+    /// 删除报告给出真实移除的分块数，且各索引与文档存储同步清空（无幽灵行）。
+    #[tokio::test]
+    async fn delete_document_reports_removed_chunks() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pipeline = pipeline_with_fixed_chunks(&backend);
+
+        let doc = three_chunk_doc();
+        pipeline.ingest(doc.clone()).await.unwrap();
+        assert_eq!(backend.chunks(&doc.id).await.unwrap().len(), 3);
+
+        let report = pipeline.delete_document(&doc.id).await.unwrap();
+        assert_eq!(report.doc_id, doc.id);
+        assert_eq!(report.removed_chunks, 3);
+
+        assert!(pipeline.get_document(&doc.id).await.unwrap().is_none());
+        assert!(backend.chunks(&doc.id).await.unwrap().is_empty());
+        let stats = backend.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 0);
+    }
+
+    /// 重复删除与未知文档一律报 NotFound，不误报为成功。
+    #[tokio::test]
+    async fn delete_document_twice_and_unknown_report_not_found() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pipeline = pipeline_with_fixed_chunks(&backend);
+
+        let doc = three_chunk_doc();
+        pipeline.ingest(doc.clone()).await.unwrap();
+        pipeline.delete_document(&doc.id).await.unwrap();
+
+        let err = pipeline.delete_document(&doc.id).await.unwrap_err();
+        assert!(
+            matches!(err, KnowledgeError::NotFound(_)),
+            "重复删除应报 NotFound，实际: {err}"
+        );
+
+        let err = pipeline
+            .delete_document(&"no-such-doc".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KnowledgeError::NotFound(_)),
+            "未知文档应报 NotFound，实际: {err}"
+        );
     }
 }

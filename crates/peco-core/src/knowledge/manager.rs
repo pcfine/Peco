@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::config::KnowledgeConfig;
 use super::error::KnowledgeModuleError;
@@ -298,6 +298,62 @@ impl KnowledgeManager {
         Ok(doc)
     }
 
+    /// 读取指定知识库中的单个文档（含原文内容）。
+    ///
+    /// 文档不存在时返回 `None`；知识库不存在时返回
+    /// [`KnowledgeModuleError::NotFound`]，其余打开失败（后端 IO 等）
+    /// 保留原始错误 — 不把基础设施故障伪装成「不存在」。
+    pub async fn get_document(
+        &self,
+        kb_name: &str,
+        doc_id: &str,
+    ) -> Result<Option<knowledge_base::Document>, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr.open_kb(kb_name).await.map_err(|e| match e {
+            knowledge_base::KnowledgeError::NotFound(_) => {
+                KnowledgeModuleError::NotFound(kb_name.to_string())
+            }
+            other => other.into(),
+        })?;
+
+        Ok(kb.get_document(doc_id).await?)
+    }
+
+    /// 删除指定知识库中的单个文档，返回删除计数报告。
+    ///
+    /// 知识库不存在时返回 [`KnowledgeModuleError::NotFound`]，其余打开失败
+    /// （后端 IO 等）保留原始错误 — 不把基础设施故障伪装成「不存在」。
+    pub async fn delete_document(
+        &self,
+        kb_name: &str,
+        doc_id: &str,
+    ) -> Result<knowledge_base::DeleteReport, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr.open_kb(kb_name).await.map_err(|e| match e {
+            knowledge_base::KnowledgeError::NotFound(_) => {
+                KnowledgeModuleError::NotFound(kb_name.to_string())
+            }
+            other => other.into(),
+        })?;
+
+        let report = kb.remove_document(doc_id).await?;
+        info!(
+            kb = %kb_name,
+            doc_id = %doc_id,
+            removed_chunks = report.removed_chunks,
+            "Document deleted from knowledge base"
+        );
+        Ok(report)
+    }
+
     // ── 图谱操作 ────────────────────────────────────────────────────────────
 
     /// 添加结构化事实到知识图谱。
@@ -458,12 +514,37 @@ impl KnowledgeManager {
         for (path, entry) in &manifest.files {
             if !new_manifest.files.contains_key(path) {
                 match kb.remove_document(&entry.doc_id).await {
-                    Ok(()) => {
+                    Ok(deleted) => {
                         report.removed += 1;
-                        info!(kb = %name, path = %path, doc_id = %entry.doc_id, "已删除文件");
+                        info!(
+                            kb = %name,
+                            path = %path,
+                            doc_id = %entry.doc_id,
+                            removed_chunks = deleted.removed_chunks,
+                            "Deleted file missing from docs/ directory"
+                        );
                     }
+                    // 文档已不存在（如同内容文件共享同一 doc_id，已被前一路径删除）：
+                    // 幂等跳过，不记为错误
+                    Err(knowledge_base::KnowledgeError::NotFound(_)) => {
+                        debug!(
+                            kb = %name,
+                            path = %path,
+                            doc_id = %entry.doc_id,
+                            "Document no longer exists, skipping deletion"
+                        );
+                    }
+                    // 删除失败：把该路径写回新清单，下一轮同步重试 —
+                    // 否则失败路径随清单保存而消失，文档永久滞留在召回面上
                     Err(e) => {
                         report.errors.push((path.clone(), e.to_string()));
+                        new_manifest.files.insert(path.clone(), entry.clone());
+                        warn!(
+                            kb = %name,
+                            path = %path,
+                            error = %e,
+                            "Deletion failed, keeping manifest entry for retry on next sync"
+                        );
                     }
                 }
             }
@@ -638,6 +719,83 @@ mod tests {
 
         let docs = km.list_documents("test-search", 0, 10).await.unwrap();
         assert!(!docs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_and_delete_document_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config("test-doc-ops"))
+            .await
+            .unwrap();
+
+        let doc = km
+            .add_text_to_kb(
+                "test-doc-ops",
+                "Hello",
+                "Rust is a systems programming language.",
+                "ppa_semantic",
+            )
+            .await
+            .unwrap();
+
+        // get_document 往返：删除前可读取原文（审计/回滚的前置能力）
+        let fetched = km
+            .get_document("test-doc-ops", &doc.id)
+            .await
+            .unwrap()
+            .expect("文档应存在");
+        assert_eq!(fetched.id, doc.id);
+        assert_eq!(fetched.title, "Hello");
+        assert_eq!(fetched.content, "Rust is a systems programming language.");
+        assert_eq!(fetched.source_path, "ppa_semantic");
+
+        // 删除：报告给出 doc_id 与真实分块计数，文档随后消失
+        let report = km.delete_document("test-doc-ops", &doc.id).await.unwrap();
+        assert_eq!(report.doc_id, doc.id);
+        assert!(report.removed_chunks >= 1);
+
+        assert!(
+            km.get_document("test-doc-ops", &doc.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let docs = km.list_documents("test-doc-ops", 0, 10).await.unwrap();
+        assert!(docs.is_empty());
+
+        // 重复删除 → 底层 NotFound（经 Knowledge 变体透传）
+        let err = km
+            .delete_document("test-doc-ops", &doc.id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KnowledgeModuleError::Knowledge(knowledge_base::KnowledgeError::NotFound(_))
+            ),
+            "重复删除应报 NotFound，实际: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_ops_on_missing_kb_report_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+
+        let err = km.get_document("no-such-kb", "doc-1").await.unwrap_err();
+        assert!(
+            matches!(err, KnowledgeModuleError::NotFound(_)),
+            "KB 不存在应报 NotFound，实际: {err}"
+        );
+
+        let err = km.delete_document("no-such-kb", "doc-1").await.unwrap_err();
+        assert!(
+            matches!(err, KnowledgeModuleError::NotFound(_)),
+            "KB 不存在应报 NotFound，实际: {err}"
+        );
     }
 
     #[tokio::test]

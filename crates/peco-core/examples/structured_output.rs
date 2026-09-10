@@ -96,6 +96,7 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
         workflow_persister: None,
         workspace_root: None,
         web_search: None,
+        memory_audit: None, // fail-closed：无审计存储时删除工具运行时拒绝
     };
 
     let agent_md = agent_dir.join("agent.md");

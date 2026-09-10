@@ -64,6 +64,15 @@ impl From<&Document> for DocumentSummary {
     }
 }
 
+/// 文档删除结果报告 — 提供删除计数的可核对依据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteReport {
+    /// 被删除的文档 ID。
+    pub doc_id: DocumentId,
+    /// 实际移除的分块数量。
+    pub removed_chunks: usize,
+}
+
 /// 文本分块 — 最小的检索单元。
 ///
 /// 分块 ID 是确定性计算的，因此相同内容的重新摄入是幂等的。
