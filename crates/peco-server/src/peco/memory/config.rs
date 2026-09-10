@@ -39,8 +39,8 @@ impl Default for MemoryConfig {
             model: "deepseek-v4-flash".to_string(),
             analyze_min_chars: 50,
             extraction_top_k: 5,
-            recall_top_k: 3,
-            injection_token_cap: 800,
+            recall_top_k: 5,
+            injection_token_cap: 1000,
             analyzer_timeout_secs: 10,
         }
     }
@@ -57,6 +57,8 @@ mod tests {
         assert_eq!(c.kb_name, "@private_memory");
         assert_eq!(c.model, "deepseek-v4-flash");
         assert_eq!(c.analyze_min_chars, 50);
-        assert_eq!(c.injection_token_cap, 800);
+        // P5-T1：召回窗口 3 → 5、注入上限 800 → 1000（实测见 reports/）
+        assert_eq!(c.recall_top_k, 5);
+        assert_eq!(c.injection_token_cap, 1000);
     }
 }
