@@ -47,8 +47,9 @@ impl OutputToolWrapper {
     fn new(inner: Arc<dyn ToolExecutor>, schema: &serde_json::Value) -> Self {
         let output_tool_def = ToolDefinition {
             name: "__submit_output__".to_string(),
-            description: "提交最终结构化输出。你必须调用此工具，\
-                         以要求的 JSON 格式提交结果，不要返回纯文本。"
+            description: "Submit the final structured output. You must call this tool to \
+                          submit the result in the required JSON format; do not return plain \
+                          text."
                 .to_string(),
             parameters: schema.clone(),
         };
@@ -71,10 +72,10 @@ impl ToolExecutor for OutputToolWrapper {
     async fn execute(&self, name: &str, args: &str) -> Result<Content, String> {
         if name == "__submit_output__" {
             // ★ 拦截：不执行实际操作，仅捕获参数
-            let parsed: serde_json::Value =
-                serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+            let parsed: serde_json::Value = serde_json::from_str(args)
+                .map_err(|e| format!("Failed to parse arguments: {e}"))?;
             *self.captured_data.lock().unwrap() = Some(parsed);
-            Ok(Content::Text("输出已提交。".to_string()))
+            Ok(Content::Text("Output submitted.".to_string()))
         } else {
             // 代理到原始执行器
             self.inner.execute(name, args).await
@@ -164,10 +165,10 @@ impl StructuredOutputExecutor {
     /// 构建带错误反馈的重试 prompt。
     fn build_retry_prompt(original_prompt: &str, error: &str, _attempt: usize) -> String {
         format!(
-            "你的上一次回复存在以下问题：\n\n\
+            "Your previous reply had the following issues:\n\n\
              {error}\n\n\
-             请修正后重新调用 __submit_output__ 工具提交有效数据。\n\n\
-             原始请求：{original_prompt}"
+             Fix them and call the __submit_output__ tool again to submit valid data.\n\n\
+             Original request: {original_prompt}"
         )
     }
 
@@ -223,7 +224,7 @@ impl StructuredOutputExecutor {
             };
             if actual_type != expected_type {
                 errors.push(format!(
-                    "根类型应为 '{expected_type}'，实际为 '{actual_type}'"
+                    "Root type must be '{expected_type}', got '{actual_type}'"
                 ));
                 return Err(errors);
             }
@@ -236,7 +237,7 @@ impl StructuredOutputExecutor {
                     if let Some(field_name) = field.as_str()
                         && !obj.contains_key(field_name)
                     {
-                        errors.push(format!("缺少必需字段 '{field_name}'"));
+                        errors.push(format!("Missing required field '{field_name}'"));
                     }
                 }
             }
@@ -255,8 +256,8 @@ impl StructuredOutputExecutor {
                             };
                             if !matches {
                                 errors.push(format!(
-                                    "字段 '{prop_name}' 应为 {expected} 类型，\
-                                     实际为 {}",
+                                    "Field '{prop_name}' must be of type {expected}, \
+                                     got {}",
                                     match val {
                                         serde_json::Value::String(_) => "string",
                                         serde_json::Value::Number(_) => "number",
@@ -274,7 +275,7 @@ impl StructuredOutputExecutor {
                             let allowed_str: Vec<String> =
                                 allowed.iter().map(|v| format!("{v}")).collect();
                             errors.push(format!(
-                                "字段 '{prop_name}' 的值不在允许范围: [{}]",
+                                "Field '{prop_name}' value is not in the allowed set: [{}]",
                                 allowed_str.join(", ")
                             ));
                         }
@@ -307,13 +308,13 @@ impl AgentExecutor for StructuredOutputExecutor {
             .as_ref()
             .ok_or_else(|| ExecutorError::Schema {
                 retries: 0,
-                message: "StructuredOutputExecutor 需要 output_schema".into(),
+                message: "StructuredOutputExecutor requires output_schema".into(),
             })?;
 
         if !schema.is_object() || schema.get("type").is_none() {
             return Err(ExecutorError::Schema {
                 retries: 0,
-                message: "output_schema 必须是包含 'type' 字段的 JSON Schema 对象".into(),
+                message: "output_schema must be a JSON Schema object with a 'type' field".into(),
             });
         }
 
@@ -335,8 +336,9 @@ impl AgentExecutor for StructuredOutputExecutor {
                 Some(d) => d,
                 None => {
                     last_error = Some(
-                        "未调用 __submit_output__ 工具。请在收集所需信息后，\
-                         调用 __submit_output__ 提交结构化结果。"
+                        "The __submit_output__ tool was not called. After gathering the \
+                         needed information, call __submit_output__ to submit the \
+                         structured result."
                             .to_string(),
                     );
                     continue;
@@ -355,7 +357,7 @@ impl AgentExecutor for StructuredOutputExecutor {
                 }
                 Err(errors) => {
                     last_error = Some(format!(
-                        "输出验证失败，请修正以下问题：\n{}",
+                        "Output validation failed, fix the following issues:\n{}",
                         errors
                             .iter()
                             .enumerate()
@@ -370,7 +372,7 @@ impl AgentExecutor for StructuredOutputExecutor {
         Err(ExecutorError::Schema {
             retries: self.max_retries,
             message: format!(
-                "经过 {} 次重试仍无法产生有效的结构化输出。最后错误: {}",
+                "Failed to produce valid structured output after {} attempts. Last error: {}",
                 self.max_retries + 1,
                 last_error.unwrap_or_default()
             ),
@@ -434,7 +436,10 @@ mod tests {
         // __submit_output__ 被拦截
         let result = rt.block_on(wrapper.execute("__submit_output__", r#"{"x": 1}"#));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Content::Text("输出已提交。".to_string()));
+        assert_eq!(
+            result.unwrap(),
+            Content::Text("Output submitted.".to_string())
+        );
 
         // 未知工具代理到原始执行器
         let result = rt.block_on(wrapper.execute("nonexistent_tool", "{}"));

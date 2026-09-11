@@ -29,8 +29,8 @@ fn string_err(msg: impl ToString) -> ToolError {
 fn check_kb_access(allowed: &[String], kb_name: &str) -> Result<(), ToolError> {
     if !allowed.contains(&kb_name.to_string()) {
         return Err(ToolError::ToolCallError(Box::new(StringError(format!(
-            "访问被拒绝：知识库 '{kb_name}' 不在 Agent 的 knowledge_bases 列表中。\
-             请在 agent.md 中声明此 Agent 可访问的知识库。"
+            "Access denied: knowledge base '{kb_name}' is not in the agent's \
+             knowledge_bases list. Declare accessible knowledge bases in agent.md."
         )))));
     }
     Ok(())
@@ -62,22 +62,23 @@ impl ToolDyn for SearchKnowledge {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_knowledge".to_string(),
-            description: "在知识库中搜索信息。支持跨所有知识库或指定单个知识库的混合检索。"
+            description: "Search knowledge bases for information. Supports hybrid retrieval \
+                          across all knowledge bases or a single specified one."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "搜索查询，支持自然语言描述。"
+                        "description": "Search query, natural language."
                     },
                     "kb_name": {
                         "type": "string",
-                        "description": "指定知识库名称。不指定则搜索所有知识库。"
+                        "description": "Knowledge base name to search. If omitted, searches all knowledge bases."
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认 5"
+                        "description": "Number of results to return, default 5"
                     }
                 },
                 "required": ["query"]
@@ -173,7 +174,8 @@ impl ToolDyn for ListKnowledgeBases {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_knowledge_bases".to_string(),
-            description: "列出所有可用的知识库，包括名称、描述、文档数量、后端类型等信息。"
+            description: "List all available knowledge bases with name, description, document \
+                          count, backend type, and other details."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
@@ -233,18 +235,20 @@ impl ToolDyn for AddToKnowledgeBase {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "add_to_knowledge_base".to_string(),
-            description: "添加文本内容到知识库。支持指定存储模式以控制摄入路径。".to_string(),
+            description: "Add text content to a knowledge base. Supports specifying a storage \
+                          mode to control the ingestion path."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "kb_name": { "type": "string", "description": "目标知识库名称" },
-                    "title": { "type": "string", "description": "内容标题" },
-                    "content": { "type": "string", "description": "文本内容" },
-                    "source": { "type": "string", "description": "来源标识" },
+                    "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
+                    "title": { "type": "string", "description": "Title of the content" },
+                    "content": { "type": "string", "description": "Text content" },
+                    "source": { "type": "string", "description": "Source identifier" },
                     "storage_mode": {
                         "type": "string",
                         "enum": ["full", "vector_only", "text_only", "graph_only", "vector_and_text", "vector_and_graph", "text_and_graph"],
-                        "description": "存储模式：full(全部)、vector_only(仅向量)、text_only(仅全文)、graph_only(仅图谱)、vector_and_text、vector_and_graph、text_and_graph。默认 full"
+                        "description": "Storage mode: full (everything), vector_only, text_only, graph_only, vector_and_text, vector_and_graph, text_and_graph. Default full"
                     }
                 },
                 "required": ["kb_name", "title", "content"]
@@ -299,7 +303,7 @@ impl ToolDyn for AddToKnowledgeBase {
 
             info!(kb = %parsed.kb_name, title = %parsed.title, doc_id = %doc.id, "Document added via tool");
             Ok(Content::Text(format!(
-                "已添加文档: {} (id: {})",
+                "Document added: {} (id: {})",
                 doc.title, doc.id
             )))
         })
@@ -332,12 +336,14 @@ impl ToolDyn for SyncKnowledgeBase {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "sync_knowledge_base".to_string(),
-            description: "同步知识库：扫描原始文档目录，自动检测新文件、变更文件、已删除文件，增量更新向量数据库。"
+            description: "Sync a knowledge base: scan the source documents directory, detect \
+                          added, changed, and deleted files, and incrementally update the \
+                          vector database."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "kb_name": { "type": "string", "description": "知识库名称。不指定则同步所有知识库。" }
+                    "kb_name": { "type": "string", "description": "Knowledge base name. If omitted, syncs all knowledge bases." }
                 },
                 "required": []
             }),
@@ -363,7 +369,7 @@ impl ToolDyn for SyncKnowledgeBase {
                 let report = km.sync_kb(&name).await.map_err(string_err)?;
                 info!(kb = %name, added = report.added, updated = report.updated, removed = report.removed, "KB synced via tool");
                 Ok(Content::Text(format!(
-                    "知识库 '{}' 同步完成:\n- 新增: {} 个文件\n- 更新: {} 个文件\n- 删除: {} 个文件\n- 跳过: {} 个文件\n- 耗时: {}ms",
+                    "Knowledge base '{}' synced:\n- Added: {} files\n- Updated: {} files\n- Removed: {} files\n- Skipped: {} files\n- Duration: {}ms",
                     report.kb_name,
                     report.added,
                     report.updated,
@@ -379,7 +385,7 @@ impl ToolDyn for SyncKnowledgeBase {
                     match km.sync_kb(kb_name).await {
                         Ok(report) => reports.push((kb_name.clone(), report)),
                         Err(e) => {
-                            warn!(kb = %kb_name, error = %e, "同步失败");
+                            warn!(kb = %kb_name, error = %e, "KB sync failed");
                             errors.push((kb_name.clone(), e.to_string()));
                         }
                     }
@@ -388,14 +394,14 @@ impl ToolDyn for SyncKnowledgeBase {
                     .iter()
                     .map(|(name, report)| {
                         format!(
-                            "  '{}': +{}/~{} 跳过{}",
+                            "  '{}': +{}/~{} skipped {}",
                             name, report.added, report.updated, report.skipped
                         )
                     })
                     .collect();
                 if !errors.is_empty() {
                     lines.push(String::new());
-                    lines.push("以下知识库同步失败:".to_string());
+                    lines.push("The following knowledge bases failed to sync:".to_string());
                     for (name, err) in &errors {
                         lines.push(format!("  '{}': {err}", name));
                     }
@@ -407,7 +413,7 @@ impl ToolDyn for SyncKnowledgeBase {
                     "All KBs synced via tool"
                 );
                 Ok(Content::Text(format!(
-                    "知识库同步完成:\n{}",
+                    "Knowledge bases synced:\n{}",
                     lines.join("\n")
                 )))
             }
@@ -441,11 +447,11 @@ impl ToolDyn for GetKnowledgeBaseDocs {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "get_knowledge_base_docs".to_string(),
-            description: "查看指定知识库中的文档列表。".to_string(),
+            description: "List documents in the specified knowledge base.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "kb_name": { "type": "string", "description": "知识库名称" }
+                    "kb_name": { "type": "string", "description": "Knowledge base name" }
                 },
                 "required": ["kb_name"]
             }),
@@ -514,37 +520,38 @@ impl ToolDyn for AddFactsToKnowledgeBase {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "add_facts_to_knowledge_base".to_string(),
-            description: "将结构化事实（三元组）直接写入知识图谱，跳过文档分块和嵌入。\
-                          适合存储用户偏好、关系、事件等离散知识。"
+            description: "Write structured facts (triples) directly into the knowledge graph, \
+                          skipping document chunking and embedding. Suited for storing \
+                          discrete knowledge such as user preferences, relations, and events."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "kb_name": {
                         "type": "string",
-                        "description": "目标知识库名称"
+                        "description": "Name of the target knowledge base"
                     },
                     "facts": {
                         "type": "array",
-                        "description": "事实列表",
+                        "description": "List of facts",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "subject": {
                                     "type": "string",
-                                    "description": "主体实体名称（如 '用户'、'张三'）"
+                                    "description": "Subject entity name (e.g. 'user', 'Alice')"
                                 },
                                 "predicate": {
                                     "type": "string",
-                                    "description": "谓词/关系类型（如 'prefers'、'works_for'）"
+                                    "description": "Predicate / relation type (e.g. 'prefers', 'works_for')"
                                 },
                                 "object": {
                                     "type": "string",
-                                    "description": "客体实体名称"
+                                    "description": "Object entity name"
                                 },
                                 "confidence": {
                                     "type": "number",
-                                    "description": "置信度 0.0-1.0，默认 0.8"
+                                    "description": "Confidence 0.0-1.0, default 0.8"
                                 }
                             },
                             "required": ["subject", "predicate", "object"]
@@ -552,7 +559,7 @@ impl ToolDyn for AddFactsToKnowledgeBase {
                     },
                     "index_text": {
                         "type": "boolean",
-                        "description": "是否同时建立全文索引，默认 true"
+                        "description": "Whether to also build the full-text index, default true"
                     }
                 },
                 "required": ["kb_name", "facts"]
@@ -613,7 +620,7 @@ impl ToolDyn for AddFactsToKnowledgeBase {
 
             info!(kb = %parsed.kb_name, fact_count = stored.len(), "Facts added via tool");
             Ok(Content::Text(format!(
-                "已添加 {} 条事实到知识库",
+                "Added {} facts to the knowledge base",
                 stored.len()
             )))
         })
@@ -646,23 +653,25 @@ impl ToolDyn for QueryEntityFacts {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "query_entity_facts".to_string(),
-            description: "查询知识图谱中某个实体的相关事实。从指定实体出发，沿边遍历图谱，\
-                          返回可达节点及其关系边。适合探索实体间的关联关系。"
+            description: "Query facts related to an entity in the knowledge graph. Traverses \
+                          the graph along edges from the specified entity and returns \
+                          reachable nodes with their relation edges. Suited for exploring \
+                          relations between entities."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "kb_name": {
                         "type": "string",
-                        "description": "目标知识库名称"
+                        "description": "Name of the target knowledge base"
                     },
                     "entity_name": {
                         "type": "string",
-                        "description": "实体名称（如 '用户'、'张三'）"
+                        "description": "Entity name (e.g. 'user', 'Alice')"
                     },
                     "max_depth": {
                         "type": "integer",
-                        "description": "最大遍历深度（跳数），默认 2"
+                        "description": "Max traversal depth (hops), default 2"
                     }
                 },
                 "required": ["kb_name", "entity_name"]
@@ -1341,7 +1350,7 @@ mod tests {
             .call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("访问被拒绝"), "{err}");
+        assert!(err.to_string().contains("Access denied"), "{err}");
         assert!(km.get_document(KB, &doc.id).await.unwrap().is_some());
     }
 }
