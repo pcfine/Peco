@@ -72,22 +72,22 @@ pub trait TurnAnalyzer: Send + Sync {
 }
 
 /// 提取器的系统提示词。
-const ANALYZER_SYSTEM_PROMPT: &str = r#"你是个人助理的记忆提取器。分析一轮对话，判断是否包含值得长期记住的**新**信息。
+const ANALYZER_SYSTEM_PROMPT: &str = r#"You are the personal assistant's memory extractor. Analyze one turn of dialogue and decide whether it contains **new** information worth remembering long-term.
 
-记忆分三类：
-- profile：用户身份与偏好（称呼、语言、沟通风格、长期偏好）
-- semantic：离散事实（技术栈、工作背景、项目环境、知识背景）
-- episodic：事件与进行中的事项（正在做的任务、约定、待办）
+Three memory categories:
+- profile: user identity and preferences (how to address the user, language, communication style, long-term preferences)
+- semantic: discrete facts (tech stack, work background, project environment, knowledge background)
+- episodic: events and ongoing matters (tasks in progress, commitments, todos)
 
-规则：
-1. 只提取**新**信息 — 「既有记忆」中已包含的内容不要重复输出；
-2. 每条记忆一句话，中文，陈述事实而非引用原文；
-3. 一次性技术问答、纯知识问答、寒暄、过程性描述一律不提取；
-4. 没有值得提取的内容时输出 {"facts": []}；
-5. 只输出 JSON，不要任何其他文字或 markdown 代码块标记。
+Rules:
+1. Extract only **new** information — do not repeat content already covered by the "existing memories";
+2. Each memory is one sentence, in Chinese, stating the fact rather than quoting the original text;
+3. Never extract one-off technical Q&A, pure knowledge questions, chitchat, or procedural narration;
+4. When there is nothing worth extracting, output {"facts": []};
+5. Output JSON only, with no other text or markdown code fence markers.
 
-输出格式：
-{"facts": [{"category": "profile|semantic|episodic", "content": "一句话事实"}]}"#;
+Output format:
+{"facts": [{"category": "profile|semantic|episodic", "content": "one-sentence fact"}]}"#;
 
 /// 基于 [`model_provider::ModelProvider`] 的提取器。
 pub struct ModelTurnAnalyzer {
@@ -113,9 +113,9 @@ impl TurnAnalyzer for ModelTurnAnalyzer {
         turn_dialogue: &str,
         existing_memories: &[String],
     ) -> Result<Vec<MemoryFact>, String> {
-        let mut user_content = String::from("【既有记忆】\n");
+        let mut user_content = String::from("[Existing memories]\n");
         if existing_memories.is_empty() {
-            user_content.push_str("（无）\n\n");
+            user_content.push_str("(none)\n\n");
         } else {
             for m in existing_memories {
                 user_content.push_str("- ");
@@ -124,7 +124,7 @@ impl TurnAnalyzer for ModelTurnAnalyzer {
             }
             user_content.push('\n');
         }
-        user_content.push_str("【本轮对话】\n");
+        user_content.push_str("[Current turn dialogue]\n");
         user_content.push_str(turn_dialogue);
 
         let request = GenerateRequest {

@@ -69,12 +69,12 @@ impl MemoryExtractionHook {
         }
         let mut dialogue = String::new();
         for p in user_parts {
-            dialogue.push_str("用户: ");
+            dialogue.push_str("User: ");
             dialogue.push_str(&p);
             dialogue.push('\n');
         }
         for p in assistant_parts {
-            dialogue.push_str("助手: ");
+            dialogue.push_str("Assistant: ");
             dialogue.push_str(&p);
             dialogue.push('\n');
         }

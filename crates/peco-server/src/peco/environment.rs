@@ -94,16 +94,16 @@ impl EnvironmentInfo {
 
         format!(
             "<environment>\n\
-             用户: {username}\n\
-             工作空间: {workspace_root}\n\
-             当前 Agent: {agent_name}\n\
-             日期: {date} (UTC{timezone})\n\
-             平台: {platform}\n\
+             User: {username}\n\
+             Workspace: {workspace_root}\n\
+             Current agent: {agent_name}\n\
+             Date: {date} (UTC{timezone})\n\
+             Platform: {platform}\n\
              \n\
-             工作空间目录结构：\n\
-             \x20 {workspace_root}/agents/{{name}}/agent.md   — Agent 定义\n\
-             \x20 {workspace_root}/skills/{{name}}/SKILL.md   — Skill 定义\n\
-             \x20 {workspace_root}/knowledge/{{name}}/        — 知识库\n\
+             Workspace directory layout:\n\
+             \x20 {workspace_root}/agents/{{name}}/agent.md   — agent definition\n\
+             \x20 {workspace_root}/skills/{{name}}/SKILL.md   — skill definition\n\
+             \x20 {workspace_root}/knowledge/{{name}}/        — knowledge base\n\
              </environment>"
         )
     }
@@ -179,11 +179,11 @@ mod tests {
     #[test]
     fn test_render_normal_fields() {
         let rendered = info("alice", "/data/ws/uuid-1", "@assistant").render();
-        assert!(rendered.starts_with("<environment>\n用户: alice"));
-        assert!(rendered.contains("工作空间: /data/ws/uuid-1"));
-        assert!(rendered.contains("当前 Agent: @assistant"));
-        assert!(rendered.contains("日期: 2026-08-27 (UTC+08:00)"));
-        assert!(rendered.contains("平台: linux"));
+        assert!(rendered.starts_with("<environment>\nUser: alice"));
+        assert!(rendered.contains("Workspace: /data/ws/uuid-1"));
+        assert!(rendered.contains("Current agent: @assistant"));
+        assert!(rendered.contains("Date: 2026-08-27 (UTC+08:00)"));
+        assert!(rendered.contains("Platform: linux"));
         assert!(rendered.contains("/data/ws/uuid-1/agents/{name}/agent.md"));
         assert!(rendered.ends_with("</environment>"));
         // 恰好一对定界标签
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn test_render_empty_username_falls_back_to_user_id() {
         let rendered = info("", "/data/ws", "@assistant").render();
-        assert!(rendered.contains("用户: user-123"));
+        assert!(rendered.contains("User: user-123"));
     }
 
     #[test]
