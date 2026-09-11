@@ -117,7 +117,7 @@ impl LooperHook for MemoryExtractionHook {
             {
                 Ok(results) => results.into_iter().map(|r| r.snippet).collect(),
                 Err(e) => {
-                    warn!(error = %e, kb = %config.kb_name, "记忆提取前检索失败（继续无既有记忆的提取）");
+                    warn!(error = %e, kb = %config.kb_name, "Pre-extraction recall failed (proceeding without existing memories)");
                     Vec::new()
                 }
             };
@@ -131,13 +131,13 @@ impl LooperHook for MemoryExtractionHook {
             let facts = match analyzed {
                 Ok(Ok(facts)) => facts,
                 Ok(Err(e)) => {
-                    warn!(error = %e, "记忆提取失败（非致命）");
+                    warn!(error = %e, "Memory extraction failed (non-fatal)");
                     return;
                 }
                 Err(_) => {
                     warn!(
                         timeout_secs = config.analyzer_timeout_secs,
-                        "记忆提取超时（非致命）"
+                        "Memory extraction timed out (non-fatal)"
                     );
                     return;
                 }
@@ -159,11 +159,11 @@ impl LooperHook for MemoryExtractionHook {
                         info!(
                             kb = %config.kb_name,
                             category = fact.category.as_str(),
-                            "已写入记忆"
+                            "Memory written"
                         );
                     }
                     Err(e) => {
-                        warn!(error = %e, kb = %config.kb_name, "记忆写入失败（非致命）");
+                        warn!(error = %e, kb = %config.kb_name, "Memory write failed (non-fatal)");
                     }
                 }
             }

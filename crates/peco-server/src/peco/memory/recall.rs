@@ -112,7 +112,7 @@ impl DynamicContext for MemoryRecallContext {
             Ok(r) => r,
             // KB 缺失（模板未装/被删）按无记忆处理，不影响对话
             Err(e) => {
-                warn!(error = %e, kb = %self.config.kb_name, "记忆检索失败（按无记忆处理）");
+                warn!(error = %e, kb = %self.config.kb_name, "Memory recall failed (proceeding without memory)");
                 return None;
             }
         };

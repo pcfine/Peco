@@ -287,7 +287,7 @@ async fn load_or_new_session(
             warn!(
                 user_id = %user_id,
                 error = %e,
-                "Peco 会话快照加载失败，创建新会话（历史会话丢失）"
+                "Failed to load Peco session snapshot, creating a new session (history lost)"
             );
             Box::new(Session::new(session_id.clone(), SESSION_TITLE.to_string()))
         }
@@ -392,7 +392,7 @@ async fn runner_loop(
                         break;
                     }
                     if looper_idle && runs.try_reclaim_if_unsubscribed(&user_id) {
-                        info!(user_id = %user_id, "轮边界无活跃连接，回收停靠的 looper");
+                        info!(user_id = %user_id, "No active connection at turn boundary, recycling docked looper");
                         break;
                     }
                 }
@@ -409,7 +409,7 @@ async fn runner_loop(
             },
             _ = reclaim_notify.notified() => {
                 if looper_idle && runs.try_reclaim_if_unsubscribed(&user_id) {
-                    info!(user_id = %user_id, "订阅者全部断开且 looper 停靠，回收 looper");
+                    info!(user_id = %user_id, "All subscribers disconnected and looper docked, recycling looper");
                     break;
                 }
             }
@@ -456,7 +456,7 @@ fn bridge_sse_response(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(conversation_id = %conv_id, skipped = n, "SSE 订阅者积压，事件被跳过");
+                    warn!(conversation_id = %conv_id, skipped = n, "SSE subscribers lagging, dropping events");
                     let err_ev = ChatSseEvent::Error {
                         message: format!("事件消费过慢，{n} 条更新被跳过"),
                         conversation_id: conv_id.clone(),
