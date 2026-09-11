@@ -58,33 +58,33 @@ pub enum KnowledgeModuleError {
     /// - `EmbeddingError` — 嵌入模型推理失败
     /// - `SearchFailed` — 搜索执行异常
     /// - `NotFound` / `InvalidInput` / `Internal` — 其他引擎错误
-    #[error("知识库错误: {0}")]
+    #[error("Knowledge base error: {0}")]
     Knowledge(#[from] KnowledgeError),
 
     /// 文件系统 I/O 错误。
     ///
     /// 常见场景：读取配置/清单文件失败、创建 KB 目录失败、扫描 docs/ 时目录不存在。
-    #[error("IO 错误: {0}")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
     /// JSON 序列化/反序列化错误。
     ///
     /// 常见场景：`knowledge_config.json` 或 `file_hashes.json` 格式损坏。
-    #[error("JSON 错误: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
     /// 指定的知识库不存在。
     ///
     /// 触发条件：`search_kb` / `sync_kb` / `open_kb` 时指定了未创建的知识库名称。
-    #[error("知识库 '{0}' 不存在")]
+    #[error("Knowledge base '{0}' not found")]
     NotFound(String),
 
     /// 知识库已存在，无法重复创建。
-    #[error("知识库 '{0}' 已存在")]
+    #[error("Knowledge base '{0}' already exists")]
     AlreadyExists(String),
 
     /// 配置无效（参数校验失败）。
-    #[error("无效配置: {0}")]
+    #[error("Invalid config: {0}")]
     InvalidConfig(String),
 
     /// 知识库管理器尚未初始化。
@@ -93,6 +93,6 @@ pub enum KnowledgeModuleError {
     /// 此错误仅在直接访问内部状态时出现。
     ///
     /// [`ensure_loaded()`]: super::KnowledgeManager::ensure_loaded
-    #[error("知识库管理器尚未初始化，请先调用 ensure_loaded()")]
+    #[error("Knowledge base manager not initialized, call ensure_loaded() first")]
     NotInitialized,
 }

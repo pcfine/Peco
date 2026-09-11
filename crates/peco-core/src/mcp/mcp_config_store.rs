@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::RwLock;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::McpConfig;
 
@@ -94,7 +94,7 @@ impl McpConfigStore {
         // 4. 写盘成功后，才更新内存
         let count = new_config.mcp_servers.len();
         *guard = new_config;
-        info!(servers = count, "MCP 配置已原子更新");
+        info!(servers = count, "MCP config updated atomically");
         Ok(())
     }
 
@@ -112,10 +112,10 @@ impl McpConfigStore {
                 Ok(content) => match McpConfig::from_json_str(&content) {
                     Ok(config) => config,
                     Err(e) => {
-                        tracing::warn!(
+                        warn!(
                             error = %e,
                             path = %user_mcp_path.display(),
-                            "解析用户 mcpconfig.json 失败，保留当前内存配置"
+                            "Failed to parse user mcpconfig.json, keeping current in-memory config"
                         );
                         return self
                             .config
@@ -126,10 +126,10 @@ impl McpConfigStore {
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         error = %e,
                         path = %user_mcp_path.display(),
-                        "读取用户 mcpconfig.json 失败，保留当前内存配置"
+                        "Failed to read user mcpconfig.json, keeping current in-memory config"
                     );
                     return self
                         .config
@@ -145,7 +145,7 @@ impl McpConfigStore {
 
         let count = new_config.mcp_servers.len();
         *self.config.write().expect("McpConfigStore RwLock poisoned") = new_config;
-        info!(servers = count, "MCP 配置已重新加载");
+        info!(servers = count, "MCP config reloaded");
         count
     }
 }

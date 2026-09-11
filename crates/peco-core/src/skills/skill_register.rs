@@ -311,7 +311,7 @@ impl SkillRegister {
 
         let count = inner.metas.len();
         drop(inner);
-        info!(count, "Skill 注册表已重新扫描");
+        info!(count, "Skill registry rescanned");
         count
     }
 
@@ -333,12 +333,12 @@ impl SkillRegister {
         match metas.into_iter().find(|m| m.name == name) {
             Some(meta) => {
                 inner.metas.insert(name.to_string(), meta);
-                debug!(name = %name, "Skill 缓存已刷新");
+                debug!(name = %name, "Skill cache refreshed");
             }
             None => {
                 // Skill 在磁盘上已不存在 — 完全移除
                 inner.metas.remove(name);
-                debug!(name = %name, "Skill 已从缓存中移除（磁盘上已不存在）");
+                debug!(name = %name, "Skill removed from cache (no longer on disk)");
             }
         }
     }
@@ -351,7 +351,7 @@ impl SkillRegister {
         let mut inner = self.inner.write().expect("RwLock poisoned");
         inner.metas.remove(name);
         inner.activated.remove(name);
-        debug!(name = %name, "Skill 已从缓存中移除");
+        debug!(name = %name, "Skill removed from cache");
     }
 
     // ── 写操作 ─────────────────────────────────────────────────────────
@@ -422,7 +422,7 @@ impl SkillRegister {
         // 6. 刷新缓存
         self.refresh_one(name);
 
-        info!(name = %name, "Skill 已保存");
+        info!(name = %name, "Skill saved");
         Ok(())
     }
 
@@ -438,7 +438,7 @@ impl SkillRegister {
         }
 
         self.remove_one(name);
-        info!(name = %name, "Skill 已删除");
+        info!(name = %name, "Skill deleted");
         Ok(())
     }
 }

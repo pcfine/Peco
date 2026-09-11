@@ -64,11 +64,11 @@ impl std::fmt::Display for SyncReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "知识库 '{}' 同步完成: 新增 {}, 更新 {}, 删除 {}, 跳过 {} ({}ms)",
+            "Knowledge base '{}' synced: added {}, updated {}, removed {}, skipped {} ({}ms)",
             self.kb_name, self.added, self.updated, self.removed, self.skipped, self.duration_ms
         )?;
         if self.has_errors() {
-            write!(f, ", {} 个错误", self.errors.len())?;
+            write!(f, ", {} errors", self.errors.len())?;
         }
         Ok(())
     }

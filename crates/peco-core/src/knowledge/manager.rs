@@ -112,12 +112,12 @@ impl KnowledgeManager {
         for name in &names {
             match self.sync_kb_impl(name).await {
                 Ok(report) => total_changes += report.total_changes(),
-                Err(e) => warn!(kb = %name, error = %e, "auto_sync 失败"),
+                Err(e) => warn!(kb = %name, error = %e, "auto_sync failed"),
             }
         }
 
         if total_changes > 0 {
-            info!(total_changes, "auto_sync_on_start 完成");
+            info!(total_changes, "auto_sync_on_start completed");
         }
         Ok(())
     }
@@ -152,7 +152,7 @@ impl KnowledgeManager {
         let manifest = FileHashManifest::default();
         manifest.save(&kb_dir).await?;
 
-        info!(%name, "知识库已创建（含 docs/ 目录和哈希清单）");
+        info!(%name, "Knowledge base created (with docs/ directory and hash manifest)");
 
         // 第三步：获取摘要信息
         let guard = self.underlying.lock().await;
@@ -171,7 +171,7 @@ impl KnowledgeManager {
         let mgr = guard.as_mut().ok_or(KnowledgeModuleError::NotInitialized)?;
         mgr.delete_kb(name).await?;
 
-        info!(%name, "知识库已删除");
+        info!(%name, "Knowledge base deleted");
         Ok(())
     }
 
@@ -554,7 +554,7 @@ impl KnowledgeManager {
         new_manifest.save(&kb_dir).await?;
 
         report.duration_ms = start.elapsed().as_millis() as u64;
-        info!(%report, "知识库同步完成");
+        info!(%report, "Knowledge base sync completed");
 
         Ok(report)
     }
@@ -576,7 +576,7 @@ impl KnowledgeManager {
         for name in names {
             match self.sync_kb_impl(&name).await {
                 Ok(report) => results.push((name, report)),
-                Err(e) => warn!(kb = %name, error = %e, "同步失败，跳过"),
+                Err(e) => warn!(kb = %name, error = %e, "Sync failed, skipping"),
             }
         }
 
@@ -608,7 +608,7 @@ impl KnowledgeManager {
                     path = %relative_str,
                     old_hash = %entry.hash,
                     new_hash = %hash,
-                    "文件已变更，重新摄入"
+                    "File changed, re-ingesting"
                 );
                 // 删除旧数据（失败不阻塞，记录警告）
                 if let Err(e) = kb.remove_document(&entry.doc_id).await {
@@ -616,7 +616,7 @@ impl KnowledgeManager {
                         kb = %kb_name,
                         doc_id = %entry.doc_id,
                         error = %e,
-                        "删除旧文档失败，继续摄入新版本"
+                        "Failed to delete old document, continuing with new version"
                     );
                 }
 
@@ -630,7 +630,7 @@ impl KnowledgeManager {
             }
             None => {
                 // 新文件 → 摄入
-                info!(kb = %kb_name, path = %relative_str, "新文件，摄入中");
+                info!(kb = %kb_name, path = %relative_str, "New file, ingesting");
                 let doc = kb.add_file(file_path).await?;
                 Ok(FileAction::Added(FileEntry {
                     hash,
