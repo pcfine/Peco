@@ -12,6 +12,7 @@ use peco_core::workflow::WorkflowEvent;
 use tokio::sync::broadcast;
 
 use crate::config::ServerConfig;
+use crate::peco::active::PecoActiveRuns;
 use crate::workflow::WorkflowEventSource;
 use crate::workflow::persister::SqliteWorkflowPersister;
 use crate::workflow::scheduler::CronScheduler;
@@ -31,6 +32,10 @@ pub struct AppState {
     // ── Workflow 子系统 ──────────────────────────────────────────────
     /// 定时调度器。
     pub cron_scheduler: Arc<CronScheduler>,
+
+    // ── Peco 子系统 ──────────────────────────────────────────────────
+    /// 活跃 Peco 运行注册表（runner 与 SSE 连接解耦的枢纽）。
+    pub peco_runs: Arc<PecoActiveRuns>,
 }
 
 impl AppState {
@@ -83,6 +88,7 @@ impl AppState {
             data_dir: config.data_dir.clone(),
             workspace_manager,
             cron_scheduler,
+            peco_runs: Arc::new(PecoActiveRuns::new()),
         }
     }
 

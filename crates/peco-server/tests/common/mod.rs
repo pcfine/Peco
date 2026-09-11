@@ -243,6 +243,14 @@ impl TestApp {
             .get(format!("{}{}", self.base_url, path))
             .bearer_auth(token)
     }
+
+    /// 使用第二个用户的 token 发送 POST 请求。
+    #[allow(dead_code)]
+    pub fn post_as(&self, path: &str, token: &str) -> reqwest::RequestBuilder {
+        self.client
+            .post(format!("{}{}", self.base_url, path))
+            .bearer_auth(token)
+    }
 }
 
 // ── TestServerConfig ───────────────────────────────────────────────────────────
