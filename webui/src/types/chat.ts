@@ -136,6 +136,8 @@ export interface SessionSnapshotResponse {
   conversation_id: string;
   turns: TurnData[];
   total_usage: UsageData;
+  /** 是否有进行中的任务（前端据此重新附着到任务流） */
+  is_running: boolean;
   /** 钉扎的历史摘要（compaction 产物，无压缩历史时缺省） */
   pinned_summary?: string;
   /** 上下文指标（会话不存在时缺省） */

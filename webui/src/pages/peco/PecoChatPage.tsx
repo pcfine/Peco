@@ -16,6 +16,7 @@ export function PecoChatPage() {
   const isStreaming = usePecoChatStore((s) => s.isStreaming);
   const usage = usePecoChatStore((s) => s.usage);
   const load = usePecoChatStore((s) => s.load);
+  const refresh = usePecoChatStore((s) => s.refresh);
   const clear = usePecoChatStore((s) => s.clear);
   const sendMessage = usePecoChatStore((s) => s.sendMessage);
   const abortStream = usePecoChatStore((s) => s.abortStream);
@@ -26,6 +27,20 @@ export function PecoChatPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // 切回标签页 / 窗口获焦时追平会话（多窗口最终一致）：
+  // 重拉快照恢复已提交轮次，并检测服务端进行中的任务重新附着。
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [refresh]);
 
   // Surface streaming errors via toast.
   useEffect(() => {

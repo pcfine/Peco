@@ -27,3 +27,19 @@ export async function clearPecoSession(): Promise<{
 export function pecoStreamUrl(message: string): string {
   return `${SSE_BASE}/stream?message=${encodeURIComponent(message)}`;
 }
+
+/** 纯附着模式：无 message 参数，接上当前用户进行中的任务流。 */
+export function pecoAttachUrl(): string {
+  return `${SSE_BASE}/stream`;
+}
+
+/** 取消当前用户进行中的任务（无任务时服务端返回 404）。 */
+export async function cancelPecoStream(): Promise<{
+  success: boolean;
+  message?: string;
+}> {
+  const resp = await api.post<{ success: boolean; message?: string }>(
+    `${PATH}/stream/cancel`,
+  );
+  return resp.data;
+}
