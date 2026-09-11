@@ -155,7 +155,9 @@ async fn execute_agent_step(
     // 2. 构造最终 prompt（含可选的 schema 指令）
     let final_prompt = if let Some(schema) = &output_schema {
         let schema_str = serde_json::to_string_pretty(schema).unwrap_or_default();
-        format!("{prompt}\n\n请以 JSON 格式输出，必须符合以下 schema:\n```json\n{schema_str}\n```")
+        format!(
+            "{prompt}\n\nOutput in JSON format conforming to the following schema:\n```json\n{schema_str}\n```"
+        )
     } else {
         prompt.to_string()
     };

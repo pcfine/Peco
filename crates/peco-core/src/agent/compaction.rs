@@ -30,21 +30,21 @@ pub const SUMMARY_OPEN: &str = "<earlier_context_summary>";
 pub const SUMMARY_CLOSE: &str = "</earlier_context_summary>";
 
 /// 摘要器的系统提示词。
-const SUMMARY_SYSTEM_PROMPT: &str = r#"你是会话摘要器。将一段更早的对话历史合并进既有的会话摘要。
+const SUMMARY_SYSTEM_PROMPT: &str = r#"You are a conversation summarizer. Merge an earlier portion of the conversation history into the existing session summary.
 
-输出格式（Markdown，四段固定标题，无其它内容）：
+Output format (Markdown, four fixed section headings, nothing else):
 
-## 用户画像与偏好
-## 已做决定
-## 未完成事项
-## 关键事实与结论
+## User Profile & Preferences
+## Decisions Made
+## Unfinished Items
+## Key Facts & Conclusions
 
-规则：
-1. 若提供了「既有摘要」，新对话中的信息**合并**进对应段落，重复条目去重，冲突时以新对话为准；
-2. 若无既有摘要，直接从新对话中提取；
-3. 只保留对后续对话有用的事实性内容，丢弃寒暄、过程性描述；
-4. 工具调用只保留结论，不保留命令细节；
-5. 每段最多 8 条，每条一行，总长度不超过 500 字。"#;
+Rules:
+1. If an "existing summary" is provided, merge the new conversation's information into the matching sections, dedupe repeated items, and prefer the new conversation on conflicts;
+2. If there is no existing summary, extract directly from the new conversation;
+3. Keep only factual content useful for future conversation; discard chitchat and procedural narration;
+4. For tool calls keep only conclusions, not command details;
+5. At most 8 items per section, one line each, total length under 500 characters. Write summary content in the same language as the conversation."#;
 
 // ============================================================================
 // TurnSummarizer
@@ -92,13 +92,13 @@ impl TurnSummarizer for ModelSummarizer {
         let mut user_content = String::new();
         match previous_summary.filter(|s| !s.trim().is_empty()) {
             Some(prev) => {
-                user_content.push_str("【既有摘要】\n");
+                user_content.push_str("[Existing summary]\n");
                 user_content.push_str(prev);
                 user_content.push_str("\n\n");
             }
-            None => user_content.push_str("【既有摘要】（无）\n\n"),
+            None => user_content.push_str("[Existing summary] (none)\n\n"),
         }
-        user_content.push_str("【被摘要的对话】\n");
+        user_content.push_str("[Conversation to summarize]\n");
         user_content.push_str(evicted_transcript);
 
         let request = GenerateRequest {
@@ -303,9 +303,9 @@ fn build_transcript(evicted_turns: &[Vec<crate::session::AnnotatedMessage>]) -> 
                 InputItem::Message { role, content } => {
                     format!("{}: {}", role_label(*role), content.text_view())
                 }
-                InputItem::FunctionCall { name, .. } => format!("[调用工具 {name}]"),
+                InputItem::FunctionCall { name, .. } => format!("[tool call {name}]"),
                 InputItem::FunctionCallOutput { output, .. } => {
-                    format!("[工具输出] {}", output.text_view())
+                    format!("[tool output] {}", output.text_view())
                 }
                 InputItem::Reasoning { .. } => continue,
                 _ => continue,
@@ -325,9 +325,9 @@ fn build_transcript(evicted_turns: &[Vec<crate::session::AnnotatedMessage>]) -> 
 
 fn role_label(role: Role) -> &'static str {
     match role {
-        Role::User => "用户",
-        Role::Assistant => "助手",
-        Role::System | Role::Developer => "系统",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System | Role::Developer => "system",
     }
 }
 
