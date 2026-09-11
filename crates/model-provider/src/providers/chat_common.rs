@@ -231,11 +231,14 @@ pub(crate) fn input_items_to_wire_messages<'a>(
     if dropped_role_images > 0 {
         warn!(
             images = dropped_role_images,
-            "system/assistant 消息中的图片部件不参与 chat 传输，已丢弃（保留文本）"
+            "Image parts in system/assistant messages are not transportable via chat, dropped (text kept)"
         );
     }
     if dropped_empty_users > 0 {
-        warn!(count = dropped_empty_users, "部件为空的用户消息已整条丢弃");
+        warn!(
+            count = dropped_empty_users,
+            "User messages with empty parts dropped entirely"
+        );
     }
 
     messages
