@@ -15,7 +15,7 @@ use lancedb::DistanceType;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase, QueryExecutionOptions};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::KnowledgeError;
 use crate::traits::*;
@@ -45,31 +45,33 @@ impl LanceDbBackend {
         let db = lancedb::connect(path_str)
             .execute()
             .await
-            .map_err(|e| KnowledgeError::Internal(format!("LanceDB 连接失败: {e}")))?;
+            .map_err(|e| KnowledgeError::Internal(format!("Failed to connect to LanceDB: {e}")))?;
 
         let table_name_safe = crate::sanitize_kb_name(table_name);
 
         let table = match db.open_table(&table_name_safe).execute().await {
             Ok(t) => {
-                info!(%table_name_safe, "打开已有 LanceDB 表");
+                info!(%table_name_safe, "Opened existing LanceDB table");
                 t
             }
             Err(_) => {
-                info!(%table_name_safe, ndims, "创建新的 LanceDB 表");
+                info!(%table_name_safe, ndims, "Created new LanceDB table");
                 let arrow_schema = chunk_table_schema(ndims);
                 let empty_batch = RecordBatch::new_empty(Arc::new(arrow_schema));
                 let t = db
                     .create_table(&table_name_safe, empty_batch)
                     .execute()
                     .await
-                    .map_err(|e| KnowledgeError::Internal(format!("LanceDB 建表失败: {e}")))?;
+                    .map_err(|e| {
+                        KnowledgeError::Internal(format!("Failed to create LanceDB table: {e}"))
+                    })?;
                 match t
                     .create_index(&[TEXT_COL], lancedb::index::Index::FTS(Default::default()))
                     .execute()
                     .await
                 {
-                    Ok(_) => info!(%table_name_safe, "FTS 索引创建成功"),
-                    Err(e) => tracing::warn!(%table_name_safe, error = %e, "FTS 索引创建失败"),
+                    Ok(_) => info!(%table_name_safe, "FTS index created"),
+                    Err(e) => warn!(%table_name_safe, error = %e, "FTS index creation failed"),
                 }
                 t
             }
@@ -99,7 +101,7 @@ async fn collect_batches(
     stream
         .try_collect()
         .await
-        .map_err(|e| KnowledgeError::Internal(format!("读取数据流失败: {e}")))
+        .map_err(|e| KnowledgeError::Internal(format!("Failed to read data stream: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ impl DocumentStore for LanceDbBackend {
                 .add(batch)
                 .execute()
                 .await
-                .map_err(|e| KnowledgeError::StoreError(format!("写入失败: {e}")))?;
+                .map_err(|e| KnowledgeError::StoreError(format!("Failed to write: {e}")))?;
             return Ok(());
         }
 
@@ -126,9 +128,9 @@ impl DocumentStore for LanceDbBackend {
             .add(batch)
             .execute()
             .await
-            .map_err(|e| KnowledgeError::StoreError(format!("写入失败: {e}")))?;
+            .map_err(|e| KnowledgeError::StoreError(format!("Failed to write: {e}")))?;
 
-        debug!(doc_id = %doc.id, chunks = chunks.len(), "文档存储完成");
+        debug!(doc_id = %doc.id, chunks = chunks.len(), "Document stored");
         Ok(())
     }
 
@@ -141,7 +143,7 @@ impl DocumentStore for LanceDbBackend {
             .limit(1)
             .execute_with_options(QueryExecutionOptions::default())
             .await
-            .map_err(|e| KnowledgeError::StoreError(format!("查询失败: {e}")))?;
+            .map_err(|e| KnowledgeError::StoreError(format!("Failed to query: {e}")))?;
 
         let batches = collect_batches(stream).await?;
         if batches.is_empty() || batches[0].num_rows() == 0 {
@@ -171,7 +173,7 @@ impl DocumentStore for LanceDbBackend {
                 id.replace('\'', "''")
             ))
             .await
-            .map_err(|e| KnowledgeError::StoreError(format!("删除失败: {e}")))?;
+            .map_err(|e| KnowledgeError::StoreError(format!("Failed to delete: {e}")))?;
         Ok(())
     }
 
@@ -186,7 +188,7 @@ impl DocumentStore for LanceDbBackend {
             .limit(limit + offset)
             .execute_with_options(QueryExecutionOptions::default())
             .await
-            .map_err(|e| KnowledgeError::StoreError(format!("列表查询失败: {e}")))?;
+            .map_err(|e| KnowledgeError::StoreError(format!("Failed to list: {e}")))?;
 
         let batches = collect_batches(stream).await?;
         let mut seen = std::collections::HashSet::new();
@@ -223,7 +225,7 @@ impl DocumentStore for LanceDbBackend {
             .only_if(&filter)
             .execute_with_options(QueryExecutionOptions::default())
             .await
-            .map_err(|e| KnowledgeError::StoreError(format!("分块查询失败: {e}")))?;
+            .map_err(|e| KnowledgeError::StoreError(format!("Failed to query chunks: {e}")))?;
 
         let batches = collect_batches(stream).await?;
         let mut result = Vec::new();
@@ -249,7 +251,7 @@ impl DocumentStore for LanceDbBackend {
             .query()
             .execute_with_options(QueryExecutionOptions::default())
             .await
-            .map_err(|e| KnowledgeError::StoreError(format!("统计查询失败: {e}")))?;
+            .map_err(|e| KnowledgeError::StoreError(format!("Failed to query stats: {e}")))?;
 
         let batches = collect_batches(stream).await?;
         let mut doc_ids = std::collections::HashSet::new();
@@ -296,7 +298,7 @@ impl VectorIndex for LanceDbBackend {
             .table
             .query()
             .nearest_to(qv)
-            .map_err(|e| KnowledgeError::VectorError(format!("nearest_to 失败: {e}")))?
+            .map_err(|e| KnowledgeError::VectorError(format!("nearest_to failed: {e}")))?
             .distance_type(DistanceType::Cosine)
             .limit(top_k);
 
@@ -315,7 +317,7 @@ impl VectorIndex for LanceDbBackend {
         let stream = vq
             .execute()
             .await
-            .map_err(|e| KnowledgeError::VectorError(format!("向量搜索失败: {e}")))?;
+            .map_err(|e| KnowledgeError::VectorError(format!("Vector search failed: {e}")))?;
         let batches = collect_batches(stream).await?;
 
         let mut hits = Vec::new();
@@ -384,7 +386,9 @@ impl FullTextIndex for LanceDbBackend {
         let stream = q
             .execute_with_options(QueryExecutionOptions::default())
             .await
-            .map_err(|e| KnowledgeError::TextSearchError(format!("全文搜索失败: {e}")))?;
+            .map_err(|e| {
+                KnowledgeError::TextSearchError(format!("Full-text search failed: {e}"))
+            })?;
         let batches = collect_batches(stream).await?;
 
         let mut hits = Vec::new();
@@ -501,7 +505,7 @@ fn build_batch(
             Arc::new(Float32Array::from(embs)),
             None,
         )
-        .map_err(|e| KnowledgeError::Internal(format!("嵌入数组构建失败: {e}")))?,
+        .map_err(|e| KnowledgeError::Internal(format!("Failed to build embedding array: {e}")))?,
     );
 
     RecordBatch::try_new(
@@ -520,7 +524,7 @@ fn build_batch(
             emb_arr,
         ],
     )
-    .map_err(|e| KnowledgeError::Internal(format!("RecordBatch 构建失败: {e}")))
+    .map_err(|e| KnowledgeError::Internal(format!("Failed to build RecordBatch: {e}")))
 }
 
 fn str_col<'a>(batch: &'a RecordBatch, col: &str, row: usize) -> Option<&'a str> {

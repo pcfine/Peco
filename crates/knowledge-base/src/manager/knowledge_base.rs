@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sha2::Digest;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::chunking::make_chunker;
 use crate::embedding::{FastembedEngine, FastembedModelType};
@@ -63,9 +63,9 @@ impl KnowledgeBase {
     /// 根据配置构建知识库实例。
     pub(super) async fn build(base_dir: &Path, config: &KbConfig) -> Result<Self, KnowledgeError> {
         let kb_dir = base_dir.join(crate::sanitize_kb_name(&config.name));
-        tokio::fs::create_dir_all(&kb_dir)
-            .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法创建目录: {e}")))?;
+        tokio::fs::create_dir_all(&kb_dir).await.map_err(|e| {
+            KnowledgeError::InvalidInput(format!("Failed to create directory: {e}"))
+        })?;
 
         // 构建嵌入引擎
         let model_type: FastembedModelType = config.embedding_model.clone().into();
@@ -111,7 +111,7 @@ impl KnowledgeBase {
                 #[cfg(feature = "helixdb")]
                 BackendType::HelixDb => {
                     return Err(KnowledgeError::InvalidInput(
-                        "HelixDB 后端需通过高级 API 配置，请使用 HelixDbBackend::connect()".into(),
+                        "HelixDB backend must be configured via the advanced API, use HelixDbBackend::connect()".into(),
                     ));
                 }
             };
@@ -131,12 +131,12 @@ impl KnowledgeBase {
                 #[cfg(feature = "helixdb")]
                 BackendType::HelixDb => {
                     return Err(KnowledgeError::InvalidInput(
-                        "HelixDB 后端需通过高级 API 配置".into(),
+                        "HelixDB backend must be configured via the advanced API".into(),
                     ));
                 }
                 _ => {
                     return Err(KnowledgeError::InvalidInput(
-                        "LanceDB feature 未启用".into(),
+                        "LanceDB feature is not enabled".into(),
                     ));
                 }
             };
@@ -196,7 +196,7 @@ impl KnowledgeBase {
         };
 
         self.pipeline.ingest_with_mode(doc.clone(), mode).await?;
-        info!(kb = %self.config.name, doc_id = %doc.id, title = %doc.title, mode = ?mode, "文档已添加");
+        info!(kb = %self.config.name, doc_id = %doc.id, title = %doc.title, mode = ?mode, "Document added");
         Ok(doc)
     }
 
@@ -205,18 +205,18 @@ impl KnowledgeBase {
         let mut docs = Vec::new();
         let mut entries = tokio::fs::read_dir(dir)
             .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("读取目录失败: {e}")))?;
+            .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to read directory: {e}")))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("遍历目录失败: {e}")))?
+            .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to walk directory: {e}")))?
         {
             let path = entry.path();
             if path.is_file() {
                 match self.add_file(&path).await {
                     Ok(doc) => docs.push(doc),
-                    Err(e) => tracing::warn!(path = %path.display(), error = %e, "跳过文件"),
+                    Err(e) => warn!(path = %path.display(), error = %e, "Skipping file"),
                 }
             }
         }
@@ -309,10 +309,9 @@ impl KnowledgeBase {
         facts: &[Fact],
         index_text: bool,
     ) -> Result<Vec<Fact>, KnowledgeError> {
-        let gs = self
-            .graph_store
-            .as_ref()
-            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
 
         let mut edges = Vec::with_capacity(facts.len());
         let mut seen_fact_ids: std::collections::HashSet<&str> =
@@ -402,10 +401,9 @@ impl KnowledgeBase {
 
     /// 批量添加实体节点到图谱。
     pub async fn add_entities(&self, entities: &[Entity]) -> Result<(), KnowledgeError> {
-        let gs = self
-            .graph_store
-            .as_ref()
-            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
 
         for entity in entities {
             let node = GraphNode {
@@ -428,10 +426,9 @@ impl KnowledgeBase {
 
     /// 批量添加自定义关系边到图谱。
     pub async fn add_relation_edges(&self, edges: &[KnowledgeEdge]) -> Result<(), KnowledgeError> {
-        let gs = self
-            .graph_store
-            .as_ref()
-            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
 
         gs.add_edges(edges).await?;
         Ok(())
@@ -458,10 +455,9 @@ impl KnowledgeBase {
         entity_type: &str,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        let gs = self
-            .graph_store
-            .as_ref()
-            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
 
         let entity_id = compute_entity_id(entity_name, entity_type);
         gs.traverse(&entity_id, &[], TraversalDirection::Both, max_depth)
@@ -487,10 +483,9 @@ impl KnowledgeBase {
         to_entity: &str,
         entity_type: &str,
     ) -> Result<Option<Vec<TraversalStep>>, KnowledgeError> {
-        let gs = self
-            .graph_store
-            .as_ref()
-            .ok_or_else(|| KnowledgeError::InvalidInput("当前后端不支持图存储".into()))?;
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
 
         let from_id = compute_entity_id(from_entity, entity_type);
         let to_id = compute_entity_id(to_entity, entity_type);

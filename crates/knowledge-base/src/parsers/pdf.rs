@@ -34,18 +34,19 @@ impl DocumentParser for PdfParser {
 
         let bytes = tokio::fs::read(path)
             .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法读取 PDF 文件: {e}")))?;
+            .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to read PDF file: {e}")))?;
 
         let content = tokio::task::spawn_blocking(move || {
-            pdf_extract::extract_text_from_mem(&bytes).map_err(|e| format!("PDF 解析失败: {e}"))
+            pdf_extract::extract_text_from_mem(&bytes)
+                .map_err(|e| format!("Failed to parse PDF: {e}"))
         })
         .await
-        .map_err(|e| KnowledgeError::InvalidInput(format!("spawn_blocking 失败: {e}")))?
+        .map_err(|e| KnowledgeError::InvalidInput(format!("spawn_blocking failed: {e}")))?
         .map_err(KnowledgeError::InvalidInput)?;
 
         if content.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(
-                "PDF 文件内容为空: {path_str}"
+                "PDF file content is empty: {path_str}"
             )));
         }
 
@@ -56,7 +57,7 @@ impl DocumentParser for PdfParser {
             path = %path_str,
             chars = cleaned.chars().count(),
             ?page_count,
-            "PDF 解析成功"
+            "PDF parsed successfully"
         );
 
         Ok(ParsedDocument {

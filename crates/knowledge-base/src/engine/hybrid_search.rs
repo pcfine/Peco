@@ -185,7 +185,7 @@ impl HybridSearchEngine {
             if vi_dims != 0 && ee_dims != 0 {
                 assert_eq!(
                     vi_dims, ee_dims,
-                    "VectorIndex 维度 ({vi_dims}) != EmbeddingEngine 维度 ({ee_dims})"
+                    "VectorIndex dims ({vi_dims}) != EmbeddingEngine dims ({ee_dims})"
                 );
             }
         }
@@ -268,7 +268,7 @@ impl HybridSearchEngine {
             strategy = ?strategy,
             query = %request.query,
             adaptive = self.has_adaptive_pipeline(),
-            "混合搜索"
+            "Hybrid search"
         );
 
         // ── 快速路径：CombinedSearch ──
@@ -294,7 +294,7 @@ impl HybridSearchEngine {
             .embedding
             .embed_query(&request.query)
             .await
-            .map_err(|e| KnowledgeError::EmbeddingError(format!("查询嵌入失败: {e}")))?;
+            .map_err(|e| KnowledgeError::EmbeddingError(format!("Failed to embed query: {e}")))?;
 
         let (vec_top_k, text_top_k, graph_depth, graph_edge_types, _fusion) =
             decompose_strategy(strategy, request.top_k);
@@ -352,9 +352,9 @@ impl HybridSearchEngine {
                             any_success = true;
                         }
                     }
-                    Err(e) => warn!("向量搜索失败: {e}"),
+                    Err(e) => warn!("Vector search failed: {e}"),
                 },
-                Err(e) => warn!("嵌入失败: {e}"),
+                Err(e) => warn!("Embedding failed: {e}"),
             }
         }
 
@@ -375,7 +375,7 @@ impl HybridSearchEngine {
                         any_success = true;
                     }
                 }
-                Err(e) => warn!("全文搜索失败: {e}"),
+                Err(e) => warn!("Full-text search failed: {e}"),
             }
         }
 
@@ -406,7 +406,7 @@ impl HybridSearchEngine {
                             any_success = true;
                         }
                     }
-                    Err(e) => warn!("图扩展失败: {e}"),
+                    Err(e) => warn!("Graph expansion failed: {e}"),
                 }
             }
         }
@@ -422,7 +422,7 @@ impl HybridSearchEngine {
                 info!(
                     query = %request.query,
                     path_count = ranked_lists.len(),
-                    "单路径弱信号 — 判定为噪声，返回空结果"
+                    "Single-path weak signal — judged as noise, returning empty result"
                 );
                 return Ok(Vec::new());
             }
@@ -496,7 +496,7 @@ impl HybridSearchEngine {
             txt_w = txt_weight,
             grph_w = grph_weight,
             intent = ?analysis.as_ref().map(|a| a.intent),
-            "Layer 1: 权重已调整"
+            "Layer 1: weights adjusted"
         );
 
         let vec_top_k = if should_use_vector(strategy) && vec_weight > 0.0 {
@@ -530,10 +530,10 @@ impl HybridSearchEngine {
                                 hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
                             );
                         }
-                        Err(e) => warn!("向量搜索失败: {e}"),
+                        Err(e) => warn!("Vector search failed: {e}"),
                     }
                 }
-                Err(e) => warn!("嵌入失败: {e}"),
+                Err(e) => warn!("Embedding failed: {e}"),
             }
         }
 
@@ -550,7 +550,7 @@ impl HybridSearchEngine {
                         hits.into_iter().map(|h| (h.document_id, h.score)).collect(),
                     );
                 }
-                Err(e) => warn!("全文搜索失败: {e}"),
+                Err(e) => warn!("Full-text search failed: {e}"),
             }
         }
 
@@ -592,7 +592,7 @@ impl HybridSearchEngine {
                                 .collect(),
                         );
                     }
-                    Err(e) => warn!("图扩展失败: {e}"),
+                    Err(e) => warn!("Graph expansion failed: {e}"),
                 }
             }
         }
@@ -618,7 +618,7 @@ impl HybridSearchEngine {
             grph_signal = grph_cal.has_signal,
             vec_threshold = vec_cal.adaptive_threshold,
             txt_threshold = txt_cal.adaptive_threshold,
-            "Layer 2: 路径校准完成"
+            "Layer 2: path calibration completed"
         );
 
         // ── Layer 3: 交叉验证 ──
@@ -632,13 +632,13 @@ impl HybridSearchEngine {
         info!(
             query = %request.query,
             cross_validation = ?cv,
-            "Layer 3: 交叉验证"
+            "Layer 3: cross-validation"
         );
 
         if cv == CrossValidation::NoSignal {
             info!(
                 query = %request.query,
-                "Layer 3: NoSignal — 返回空结果"
+                "Layer 3: NoSignal — returning empty result"
             );
             return Ok(Vec::new());
         }

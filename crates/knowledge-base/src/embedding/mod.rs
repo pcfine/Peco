@@ -105,11 +105,11 @@ impl FastembedEngine {
     pub fn new(model_type: FastembedModelType) -> Result<Self, KnowledgeError> {
         let fastembed_model = model_type.to_fastembed_model();
         let model = TextEmbedding::try_new(InitOptions::new(fastembed_model)).map_err(|e| {
-            KnowledgeError::EmbeddingError(format!("无法初始化 fastembed 模型: {e}"))
+            KnowledgeError::EmbeddingError(format!("Failed to initialize fastembed model: {e}"))
         })?;
 
         let ndims = model_type.ndims();
-        tracing::info!(?model_type, ndims, "Fastembed 嵌入引擎初始化成功");
+        tracing::info!(?model_type, ndims, "Fastembed embedding engine initialized");
 
         Ok(Self {
             model: Arc::new(model),
@@ -130,7 +130,7 @@ impl FastembedEngine {
             "MultilingualE5Small" => FastembedModelType::MultilingualE5Small,
             other => {
                 return Err(KnowledgeError::InvalidInput(format!(
-                    "未知嵌入模型: {other}。支持: BGESmallZHV15, BGELargeZHV15, AllMiniLML6V2Q, MultilingualE5Small"
+                    "Unknown embedding model: {other}. Supported: BGESmallZHV15, BGELargeZHV15, AllMiniLML6V2Q, MultilingualE5Small"
                 )));
             }
         };
@@ -176,14 +176,18 @@ impl EmbeddingEngine for FastembedEngine {
         let result =
             tokio::task::spawn_blocking(move || model.embed(vec![query_text.as_str()], None))
                 .await
-                .map_err(|e| KnowledgeError::EmbeddingError(format!("spawn_blocking 失败: {e}")))?;
+                .map_err(|e| {
+                    KnowledgeError::EmbeddingError(format!("spawn_blocking failed: {e}"))
+                })?;
 
         match result {
             Ok(mut vecs) => {
                 let v = vecs.pop().unwrap_or_default();
                 Ok(v)
             }
-            Err(e) => Err(KnowledgeError::EmbeddingError(format!("查询嵌入失败: {e}"))),
+            Err(e) => Err(KnowledgeError::EmbeddingError(format!(
+                "Failed to embed query: {e}"
+            ))),
         }
     }
 
@@ -200,9 +204,9 @@ impl EmbeddingEngine for FastembedEngine {
             model.embed(refs, None)
         })
         .await
-        .map_err(|e| KnowledgeError::EmbeddingError(format!("spawn_blocking 失败: {e}")))?;
+        .map_err(|e| KnowledgeError::EmbeddingError(format!("spawn_blocking failed: {e}")))?;
 
-        result.map_err(|e| KnowledgeError::EmbeddingError(format!("批量嵌入失败: {e}")))
+        result.map_err(|e| KnowledgeError::EmbeddingError(format!("Failed to embed batch: {e}")))
     }
 }
 

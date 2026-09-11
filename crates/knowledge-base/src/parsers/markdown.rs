@@ -30,13 +30,13 @@ impl DocumentParser for MarkdownParser {
 
     async fn parse_file(&self, path: &Path) -> Result<ParsedDocument, KnowledgeError> {
         let path_str = path.to_string_lossy().to_string();
-        let raw = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法读取 Markdown 文件: {e}")))?;
+        let raw = tokio::fs::read_to_string(path).await.map_err(|e| {
+            KnowledgeError::InvalidInput(format!("Failed to read Markdown file: {e}"))
+        })?;
 
         if raw.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(
-                "Markdown 文件内容为空: {path_str}"
+                "Markdown file content is empty: {path_str}"
             )));
         }
 
@@ -51,7 +51,7 @@ impl DocumentParser for MarkdownParser {
             path = %path_str,
             chars = cleaned.chars().count(),
             title = %title,
-            "Markdown 解析成功"
+            "Markdown parsed successfully"
         );
 
         Ok(ParsedDocument {

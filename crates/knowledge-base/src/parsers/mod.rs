@@ -48,9 +48,9 @@ pub trait DocumentParser: Send + Sync {
         tokio::fs::create_dir_all(&tmp_dir).await.ok();
 
         let tmp_path = tmp_dir.join(filename);
-        tokio::fs::write(&tmp_path, data)
-            .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法写入临时文件: {e}")))?;
+        tokio::fs::write(&tmp_path, data).await.map_err(|e| {
+            KnowledgeError::InvalidInput(format!("Failed to write temporary file: {e}"))
+        })?;
 
         let result = self.parse_file(&tmp_path).await;
         let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -240,7 +240,7 @@ pub fn make_parser_for_format(
             #[cfg(not(feature = "pdf"))]
             {
                 Err(KnowledgeError::InvalidInput(
-                    "PDF 解析未启用。请启用 'pdf' feature。".into(),
+                    "PDF parsing is not enabled. Enable the 'pdf' feature.".into(),
                 ))
             }
         }

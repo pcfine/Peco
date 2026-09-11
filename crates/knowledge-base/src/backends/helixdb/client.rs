@@ -23,12 +23,12 @@ pub(crate) struct HelixDbClient {
 impl HelixDbClient {
     /// 连接到 HelixDB 服务器。
     pub async fn connect(base_url: &str) -> Result<Self, KnowledgeError> {
-        info!(%base_url, "正在连接 HelixDB");
+        info!(%base_url, "Connecting to HelixDB");
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| KnowledgeError::Internal(format!("构建 HTTP 客户端失败: {e}")))?;
+            .map_err(|e| KnowledgeError::Internal(format!("Failed to build HTTP client: {e}")))?;
 
         Ok(Self {
             http,
@@ -44,13 +44,13 @@ impl HelixDbClient {
 
     /// 发送写查询并返回 JSON 响应。
     pub async fn execute_write(&self, query: Value) -> Result<Value, KnowledgeError> {
-        debug!("执行写查询");
+        debug!("Executing write query");
         self.send_query(query).await
     }
 
     /// 发送读查询并返回 JSON 响应。
     pub async fn execute_read(&self, query: Value) -> Result<Value, KnowledgeError> {
-        debug!("执行读查询");
+        debug!("Executing read query");
         self.send_query(query).await
     }
 
@@ -76,25 +76,26 @@ impl HelixDbClient {
             .json(&query)
             .send()
             .await
-            .map_err(|e| KnowledgeError::Internal(format!("HelixDB HTTP 请求失败: {e}")))?;
+            .map_err(|e| KnowledgeError::Internal(format!("HTTP request failed: {e}")))?;
 
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| KnowledgeError::Internal(format!("读取 HelixDB 响应 body 失败: {e}")))?;
+        let response_text = response.text().await.map_err(|e| {
+            KnowledgeError::Internal(format!("Failed to read HelixDB response body: {e}"))
+        })?;
 
         let response_body: Value = serde_json::from_str(&response_text).map_err(|e| {
-            KnowledgeError::Internal(format!("解析 HelixDB 响应失败: {e}: {response_text}"))
+            KnowledgeError::Internal(format!(
+                "Failed to parse HelixDB response: {e}: {response_text}"
+            ))
         })?;
 
         if !status.is_success() {
             let err_msg = response_body
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("未知错误");
+                .unwrap_or("unknown error");
             return Err(KnowledgeError::Internal(format!(
-                "HelixDB 返回 {}: {}",
+                "HelixDB returned {}: {}",
                 status.as_u16(),
                 err_msg
             )));

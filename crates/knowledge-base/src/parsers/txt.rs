@@ -40,11 +40,11 @@ impl DocumentParser for TextParser {
 
         let content = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法读取文件: {e}")))?;
+            .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to read file: {e}")))?;
 
         if content.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(
-                "文件内容为空: {path_str}"
+                "File content is empty: {path_str}"
             )));
         }
 
@@ -54,7 +54,7 @@ impl DocumentParser for TextParser {
             path = %path_str,
             chars = cleaned.chars().count(),
             format = %file_type,
-            "文本解析成功"
+            "Text parsed successfully"
         );
 
         Ok(ParsedDocument {

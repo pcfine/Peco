@@ -32,11 +32,11 @@ impl DocumentParser for HtmlParser {
 
         let raw = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法读取 HTML 文件: {e}")))?;
+            .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to read HTML file: {e}")))?;
 
         if raw.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(
-                "HTML 文件内容为空: {path_str}"
+                "HTML file content is empty: {path_str}"
             )));
         }
 
@@ -45,14 +45,14 @@ impl DocumentParser for HtmlParser {
 
         if cleaned.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(
-                "HTML 文件无可提取文本: {path_str}"
+                "No extractable text in HTML file: {path_str}"
             )));
         }
 
         tracing::info!(
             path = %path_str,
             chars = cleaned.chars().count(),
-            "HTML 解析成功"
+            "HTML parsed successfully"
         );
 
         Ok(ParsedDocument {

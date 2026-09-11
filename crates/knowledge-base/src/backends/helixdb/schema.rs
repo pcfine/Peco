@@ -28,7 +28,7 @@ pub async fn init_schema(
     info!(
         content_label = %schema.content_node_label,
         fragment_label = %schema.fragment_node_label,
-        "初始化 HelixDB schema"
+        "Initializing HelixDB schema"
     );
 
     // 片段节点向量索引
@@ -74,7 +74,7 @@ pub async fn init_schema(
         create_index_spec(client, idx).await?;
     }
 
-    info!("HelixDB schema 初始化完成");
+    info!("HelixDB schema initialized");
     Ok(())
 }
 
@@ -84,7 +84,7 @@ async fn create_vector_index(
     node_label: &str,
     property: &str,
 ) -> Result<(), KnowledgeError> {
-    info!(%node_label, %property, "创建向量索引");
+    info!(%node_label, %property, "Creating vector index");
     let query = json!({
         "request_type": "write",
         "query": {
@@ -118,7 +118,7 @@ async fn create_text_index(
     node_label: &str,
     property: &str,
 ) -> Result<(), KnowledgeError> {
-    info!(%node_label, %property, "创建全文索引");
+    info!(%node_label, %property, "Creating full-text index");
     let query = json!({
         "request_type": "write",
         "query": {
@@ -152,7 +152,7 @@ async fn create_equality_index(
     node_label: &str,
     property: &str,
 ) -> Result<(), KnowledgeError> {
-    info!(%node_label, %property, "创建相等索引");
+    info!(%node_label, %property, "Creating equality index");
     let query = json!({
         "request_type": "write",
         "query": {
@@ -189,7 +189,7 @@ async fn create_index_spec(
         index_type = ?idx.index_type,
         label = %idx.node_label,
         property = %idx.property,
-        "创建额外索引"
+        "Creating additional indexes"
     );
 
     let spec = match idx.index_type {

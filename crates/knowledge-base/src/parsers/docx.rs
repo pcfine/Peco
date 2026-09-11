@@ -33,7 +33,8 @@ impl DocumentParser for DocxParser {
         // 当前作为纯文本回退处理（DOCX 二进制格式无法直接当 UTF-8 读取）
         // 完整的 DOCX 解析器将在后续版本中通过 docx-rs 实现
         Err(KnowledgeError::InvalidInput(
-            "DOCX 解析引擎尚未就绪。请将文档转换为 PDF 或 Markdown 格式后重试。".into(),
+            "DOCX parsing engine is not ready yet. Convert the document to PDF or Markdown and retry."
+                .into(),
         ))
     }
 }

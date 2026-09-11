@@ -64,7 +64,7 @@ impl IngestionPipeline {
             title = %doc.title,
             chunker = chunker_name,
             mode = ?mode,
-            "正在摄入文档"
+            "Ingesting document"
         );
 
         // 同 id 重复摄入 = 替换语义：doc_id 由内容哈希派生，逐字重复的内容
@@ -180,7 +180,7 @@ impl IngestionPipeline {
             doc_id = %doc_id,
             chunk_count = chunks.len(),
             mode = ?mode,
-            "文档摄入完成"
+            "Document ingestion completed"
         );
 
         Ok(())
@@ -261,7 +261,7 @@ impl IngestionPipeline {
         info!(
             doc_id = %doc_id,
             chunk_count = chunk_ids.len(),
-            "文档已删除"
+            "Document deleted"
         );
 
         Ok(DeleteReport {

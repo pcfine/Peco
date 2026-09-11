@@ -4,43 +4,43 @@
 #[derive(Debug, thiserror::Error)]
 pub enum KnowledgeError {
     /// 文档存储操作失败。
-    #[error("文档存储错误: {0}")]
+    #[error("Document store error: {0}")]
     StoreError(String),
 
     /// 向量索引操作失败。
-    #[error("向量索引错误: {0}")]
+    #[error("Vector index error: {0}")]
     VectorError(String),
 
     /// 图存储操作失败。
-    #[error("图存储错误: {0}")]
+    #[error("Graph store error: {0}")]
     GraphError(String),
 
     /// 全文索引操作失败。
-    #[error("全文搜索错误: {0}")]
+    #[error("Full-text search error: {0}")]
     TextSearchError(String),
 
     /// 嵌入向量生成失败。
-    #[error("嵌入错误: {0}")]
+    #[error("Embedding error: {0}")]
     EmbeddingError(String),
 
     /// 文本分块失败。
-    #[error("分块错误: {0}")]
+    #[error("Chunking error: {0}")]
     ChunkingError(String),
 
     /// 所有搜索路径均失败 — 未能检索到任何结果。
-    #[error("搜索失败: 所有检索策略均返回错误")]
+    #[error("Search failed: all retrieval strategies returned errors")]
     SearchFailed,
 
     /// 请求的文档或实体未找到。
-    #[error("未找到: {0}")]
+    #[error("Not found: {0}")]
     NotFound(String),
 
     /// 无效输入或配置。
-    #[error("无效输入: {0}")]
+    #[error("Invalid input: {0}")]
     InvalidInput(String),
 
     /// 内部错误（意外状态）。
-    #[error("内部错误: {0}")]
+    #[error("Internal error: {0}")]
     Internal(String),
 }
 
@@ -51,13 +51,16 @@ mod tests {
     #[test]
     fn error_display() {
         let err = KnowledgeError::StoreError("磁盘已满".into());
-        assert_eq!(format!("{err}"), "文档存储错误: 磁盘已满");
+        assert_eq!(format!("{err}"), "Document store error: 磁盘已满");
 
         let err = KnowledgeError::NotFound("doc-123".into());
-        assert_eq!(format!("{err}"), "未找到: doc-123");
+        assert_eq!(format!("{err}"), "Not found: doc-123");
 
         let err = KnowledgeError::SearchFailed;
-        assert_eq!(format!("{err}"), "搜索失败: 所有检索策略均返回错误");
+        assert_eq!(
+            format!("{err}"),
+            "Search failed: all retrieval strategies returned errors"
+        );
     }
 
     #[test]

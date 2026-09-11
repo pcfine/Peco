@@ -181,7 +181,7 @@ impl DocumentStore for HelixDbBackend {
             doc_id = %doc.id,
             title = %doc.title,
             chunk_count = chunks.len(),
-            "存储文档到 HelixDB"
+            "Storing document to HelixDB"
         );
 
         let metadata_json = serde_json::to_string(&doc.metadata).unwrap_or_default();
@@ -225,12 +225,12 @@ impl DocumentStore for HelixDbBackend {
             }
         }
 
-        info!(doc_id = %doc.id, "文档存储完成");
+        info!(doc_id = %doc.id, "Document stored");
         Ok(())
     }
 
     async fn get(&self, id: &DocumentId) -> Result<Option<Document>, KnowledgeError> {
-        debug!(%id, "获取文档");
+        debug!(%id, "Getting document");
         let query = queries::get_document_by_id(&self.schema, id);
         let response = self.client.execute_read(query).await?;
 
@@ -276,10 +276,10 @@ impl DocumentStore for HelixDbBackend {
     }
 
     async fn delete(&self, id: &DocumentId) -> Result<(), KnowledgeError> {
-        info!(%id, "删除文档");
+        info!(%id, "Deleting document");
         let query = queries::delete_document_cascade(&self.schema, id);
         self.client.execute_write(query).await?;
-        info!(%id, "文档已删除");
+        info!(%id, "Document deleted");
         Ok(())
     }
 
@@ -288,7 +288,7 @@ impl DocumentStore for HelixDbBackend {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<DocumentSummary>, KnowledgeError> {
-        debug!(offset, limit, "列出文档");
+        debug!(offset, limit, "Listing documents");
         let query = queries::list_documents(&self.schema, offset, limit);
         let response = self.client.execute_read(query).await?;
 
@@ -330,7 +330,7 @@ impl DocumentStore for HelixDbBackend {
     }
 
     async fn chunks(&self, doc_id: &DocumentId) -> Result<Vec<Chunk>, KnowledgeError> {
-        debug!(%doc_id, "获取文档分块");
+        debug!(%doc_id, "Getting document chunks");
         let query = queries::get_document_chunks(&self.schema, doc_id);
         let response = self.client.execute_read(query).await?;
 
@@ -375,7 +375,7 @@ impl DocumentStore for HelixDbBackend {
     }
 
     async fn stats(&self) -> Result<StoreStats, KnowledgeError> {
-        debug!("获取存储统计");
+        debug!("Getting storage stats");
 
         let doc_count = self
             .count_nodes(&self.schema.content_node_label)
@@ -676,7 +676,7 @@ impl GraphStore for HelixDbBackend {
         // 作为简化实现，通过双向 BFS 在应用层实现最短路径搜索。
         // 对于生产使用，当 HelixDB 添加原生 shortestPath 支持后
         // 可替换为原生查询。
-        info!(%from, %to, "计算最短路径（应用层 BFS）");
+        info!(%from, %to, "Computing shortest path (application-level BFS)");
 
         // 检查两端节点是否存在
         let to_query = queries::get_document_by_id(&self.schema, to);
@@ -781,7 +781,7 @@ impl CombinedSearch for HelixDbBackend {
             vec_k = query.vector_top_k,
             txt_k = query.text_top_k,
             graph_depth = query.graph_expansion_depth,
-            "执行 HelixDB 组合搜索"
+            "Executing HelixDB combined search"
         );
 
         // 1. 构建并发送单次 readBatch
@@ -859,7 +859,7 @@ impl CombinedSearch for HelixDbBackend {
             }
         }
 
-        info!(result_count = results.len(), "组合搜索完成");
+        info!(result_count = results.len(), "Combined search completed");
         Ok(results)
     }
 }

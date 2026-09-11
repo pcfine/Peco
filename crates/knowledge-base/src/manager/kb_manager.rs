@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::KnowledgeError;
 use crate::types::SearchResult;
@@ -57,9 +57,9 @@ impl KnowledgeBaseManager {
     /// 扫描 `knowledge/*/kb_config.json` 子目录来发现知识库。
     /// 若旧的中心化 `kb_configs.json` 仍存在，会自动迁移到各 KB 目录。
     pub async fn load(base_dir: &Path) -> Result<Self, KnowledgeError> {
-        tokio::fs::create_dir_all(base_dir)
-            .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法创建目录: {e}")))?;
+        tokio::fs::create_dir_all(base_dir).await.map_err(|e| {
+            KnowledgeError::InvalidInput(format!("Failed to create directory: {e}"))
+        })?;
 
         let mut config_map = HashMap::new();
 
@@ -77,10 +77,10 @@ impl KnowledgeBaseManager {
                 if let Some(config) = read_kb_config_json(&entry.path())
                     .await
                     .unwrap_or_else(|e| {
-                        tracing::warn!(
+                        warn!(
                             dir = %entry.path().display(),
                             error = %e,
-                            "读取 kb_config.json 失败，跳过此目录"
+                            "Failed to read kb_config.json, skipping this directory"
                         );
                         None
                     })
@@ -101,18 +101,18 @@ impl KnowledgeBaseManager {
             for cfg in &legacy.kb_configs {
                 let kb_dir = base_dir.join(crate::sanitize_kb_name(&cfg.name));
                 if let Err(e) = tokio::fs::create_dir_all(&kb_dir).await {
-                    tracing::warn!(
+                    warn!(
                         kb = %cfg.name,
                         error = %e,
-                        "迁移：创建 KB 目录失败，跳过"
+                        "Migration: failed to create KB directory, skipping"
                     );
                     continue;
                 }
                 if let Err(e) = write_kb_config_json_file(&kb_dir, cfg).await {
-                    tracing::warn!(
+                    warn!(
                         kb = %cfg.name,
                         error = %e,
-                        "迁移：写入 kb_config.json 失败，跳过"
+                        "Migration: failed to write kb_config.json, skipping"
                     );
                     continue;
                 }
@@ -123,13 +123,13 @@ impl KnowledgeBaseManager {
             }
             // 备份旧文件
             let _ = tokio::fs::rename(&legacy_path, base_dir.join("kb_configs.json.bak")).await;
-            info!("旧 kb_configs.json 已迁移为各 KB 目录下的 kb_config.json");
+            info!("Migrated legacy kb_configs.json into per-KB kb_config.json files");
         }
 
         info!(
             base_dir = %base_dir.display(),
             kb_count = config_map.len(),
-            "知识库管理器已加载"
+            "Knowledge base manager loaded"
         );
 
         Ok(Self {
@@ -148,7 +148,7 @@ impl KnowledgeBaseManager {
             let instances = self.instances.read().await;
             if instances.contains_key(&name) {
                 return Err(KnowledgeError::InvalidInput(format!(
-                    "知识库 '{name}' 已存在"
+                    "Knowledge base '{name}' already exists"
                 )));
             }
         }
@@ -172,7 +172,7 @@ impl KnowledgeBaseManager {
             instances.insert(name.clone(), kb.clone());
         }
 
-        info!(%name, "知识库已创建");
+        info!(%name, "Knowledge base created");
         Ok(kb)
     }
 
@@ -189,10 +189,9 @@ impl KnowledgeBaseManager {
         // 从配置创建
         let config = {
             let configs = self.configs.read().await;
-            configs
-                .get(name)
-                .cloned()
-                .ok_or_else(|| KnowledgeError::NotFound(format!("知识库 '{name}' 未找到")))?
+            configs.get(name).cloned().ok_or_else(|| {
+                KnowledgeError::NotFound(format!("Knowledge base '{name}' not found"))
+            })?
         };
 
         let kb = KnowledgeBase::build(&self.base_dir, &config).await?;
@@ -202,7 +201,7 @@ impl KnowledgeBaseManager {
             instances.insert(name.to_string(), kb.clone());
         }
 
-        info!(%name, "知识库已打开");
+        info!(%name, "Knowledge base opened");
         Ok(kb)
     }
 
@@ -223,12 +222,12 @@ impl KnowledgeBaseManager {
         // 删除整个 KB 目录（配置 + 数据一起删除）
         let kb_dir = self.base_dir.join(crate::sanitize_kb_name(name));
         if kb_dir.exists() {
-            tokio::fs::remove_dir_all(&kb_dir)
-                .await
-                .map_err(|e| KnowledgeError::Internal(format!("删除知识库目录失败: {e}")))?;
+            tokio::fs::remove_dir_all(&kb_dir).await.map_err(|e| {
+                KnowledgeError::Internal(format!("Failed to delete knowledge base directory: {e}"))
+            })?;
         }
 
-        info!(%name, "知识库已删除");
+        info!(%name, "Knowledge base deleted");
         Ok(())
     }
 
@@ -302,7 +301,7 @@ impl KnowledgeBaseManager {
                 Ok(Some(entry)) => results.push(entry),
                 Ok(None) => { /* 空结果，跳过 */ }
                 Err(e) => {
-                    tracing::warn!(error = %e, "并发搜索知识库失败，跳过");
+                    warn!(error = %e, "Failed to search knowledge base concurrently, skipping");
                 }
             }
         }
@@ -322,9 +321,10 @@ async fn read_kb_config_json(kb_dir: &Path) -> Result<Option<KbConfig>, Knowledg
     }
     let data = tokio::fs::read_to_string(&path)
         .await
-        .map_err(|e| KnowledgeError::InvalidInput(format!("读取 kb_config.json 失败: {e}")))?;
-    let config: KbConfig = serde_json::from_str(&data)
-        .map_err(|e| KnowledgeError::InvalidInput(format!("解析 kb_config.json 失败: {e}")))?;
+        .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to read kb_config.json: {e}")))?;
+    let config: KbConfig = serde_json::from_str(&data).map_err(|e| {
+        KnowledgeError::InvalidInput(format!("Failed to parse kb_config.json: {e}"))
+    })?;
     Ok(Some(config))
 }
 
@@ -333,13 +333,14 @@ async fn write_kb_config_json_file(kb_dir: &Path, config: &KbConfig) -> Result<(
     // 确保目录存在（KnowledgeBase::build 已创建，此处作为安全网）
     tokio::fs::create_dir_all(kb_dir)
         .await
-        .map_err(|e| KnowledgeError::InvalidInput(format!("无法创建 KB 目录: {e}")))?;
+        .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to create KB directory: {e}")))?;
     let path = kb_dir.join(KB_CONFIG_FILE);
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| KnowledgeError::Internal(format!("序列化 kb_config.json 失败: {e}")))?;
+    let json = serde_json::to_string_pretty(config).map_err(|e| {
+        KnowledgeError::Internal(format!("Failed to serialize kb_config.json: {e}"))
+    })?;
     tokio::fs::write(&path, json)
         .await
-        .map_err(|e| KnowledgeError::Internal(format!("写入 kb_config.json 失败: {e}")))?;
+        .map_err(|e| KnowledgeError::Internal(format!("Failed to write kb_config.json: {e}")))?;
     Ok(())
 }
 

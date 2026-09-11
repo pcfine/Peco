@@ -35,11 +35,11 @@ impl DocumentParser for CodeFileParser {
 
         let content = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| KnowledgeError::InvalidInput(format!("无法读取代码文件: {e}")))?;
+            .map_err(|e| KnowledgeError::InvalidInput(format!("Failed to read code file: {e}")))?;
 
         if content.trim().is_empty() {
             return Err(KnowledgeError::InvalidInput(format!(
-                "代码文件内容为空: {path_str}"
+                "Code file content is empty: {path_str}"
             )));
         }
 
@@ -47,7 +47,7 @@ impl DocumentParser for CodeFileParser {
             path = %path_str,
             chars = content.chars().count(),
             format = format.as_str(),
-            "代码文件解析成功"
+            "Code file parsed successfully"
         );
 
         Ok(ParsedDocument {
