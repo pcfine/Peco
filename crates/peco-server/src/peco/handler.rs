@@ -9,6 +9,7 @@
 //   - DELETE /api/peco/session              清除/重置会话
 //   - GET  /api/peco/memory/audit           记忆删除审计（分页）
 //   - POST /api/peco/memory/audit/:id/restore  按审计行回滚删除
+//   - POST /api/peco/memory/consolidate     手动触发一轮记忆自动整理
 //
 // 任务生命周期与 SSE 连接解耦：runner 任务独占 LooperHandle 持续驱动，
 // 桥接任务把 broadcast 事件流转发给每个 SSE 连接。连接断开只结束桥接，
@@ -1002,6 +1003,62 @@ pub async fn restore_memory_audit(
     }))
 }
 
+// ── Handler: POST /api/peco/memory/consolidate ─────────────────────────────
+
+/// 手动触发整理的响应。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ConsolidateResponse {
+    /// 整理未开启（`memory.consolidation.enabled = false`）。
+    Disabled {
+        enabled: bool,
+        message: String,
+    },
+    /// 一轮整理的统计。
+    Stats(super::memory::RunStats),
+}
+
+/// 手动触发一轮记忆自动整理（不经 agent 通道，直接调 ConsolidationWorker）。
+///
+/// 首版同步执行（batch 200 + ≤20 次 Flash 调用，分钟级；超时风险已知，
+/// 必要时改 202 + 后台 spawn，以 `last_run_stats` 观测）。灰度第一批
+/// 触发方式 — cron 触发与空闲判定另行接入。
+pub async fn consolidate_now(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ConsolidateResponse>, ApiError> {
+    let memory = super::config::PecoConfig::default().memory;
+    if !memory.consolidation.enabled {
+        return Ok(Json(ConsolidateResponse::Disabled {
+            enabled: false,
+            message: "自动整理未开启（memory.consolidation.enabled = false）".into(),
+        }));
+    }
+
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let km = std::sync::Arc::clone(ws.knowledge_manager());
+    // Flash 档 provider 复用主 Agent 的（与 compaction / 记忆提取同范式）
+    let agent = state.workspace_manager.get_agent(&user_id, "@assistant")?;
+
+    let worker = super::memory::ConsolidationWorker::new(
+        km,
+        state.db.clone(),
+        &memory.kb_name,
+        &memory.model,
+        memory.consolidation.clone(),
+        agent.provider().clone(),
+    );
+    let stats = worker
+        .run_once(&user_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(ConsolidateResponse::Stats(stats)))
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/peco/session/export?format=json|markdown`
@@ -1065,4 +1122,5 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/archives/{id}", get(download_archive))
         .route("/memory/audit", get(list_memory_audit))
         .route("/memory/audit/{id}/restore", post(restore_memory_audit))
+        .route("/memory/consolidate", post(consolidate_now))
 }

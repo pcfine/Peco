@@ -105,6 +105,8 @@ impl PecoManager {
             config.dynamic_context = Some(Arc::new(super::memory::MemoryRecallContext::new(
                 km,
                 config.memory.clone(),
+                user_id,
+                Some(state.db.clone()),
             )));
         }
 

@@ -15,19 +15,53 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use peco_core::agent::{DynamicContext, estimate_str_tokens};
 use peco_core::knowledge::KnowledgeManager;
+use sqlx::SqlitePool;
 use tracing::warn;
 
 use super::config::MemoryConfig;
 
 /// 记忆召回读路径。
+///
+/// 检索命中后经 `tokio::spawn` 批量记账到 `memory_recall_stats`
+/// （巩固流水线「无近期召回」判定的数据来源）；统计写入失败仅
+/// warn，不影响召回主链路。`db` 为 `None` 时（CLI/测试）不记账。
 pub struct MemoryRecallContext {
     km: Arc<KnowledgeManager>,
     config: MemoryConfig,
+    user_id: String,
+    db: Option<SqlitePool>,
 }
 
 impl MemoryRecallContext {
-    pub fn new(km: Arc<KnowledgeManager>, config: MemoryConfig) -> Self {
-        Self { km, config }
+    pub fn new(
+        km: Arc<KnowledgeManager>,
+        config: MemoryConfig,
+        user_id: impl Into<String>,
+        db: Option<SqlitePool>,
+    ) -> Self {
+        Self {
+            km,
+            config,
+            user_id: user_id.into(),
+            db,
+        }
+    }
+
+    /// 后台记账本轮命中的 doc_id 集合（零阻塞，失败仅 warn）。
+    fn record_hits(&self, doc_ids: Vec<String>) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        let user_id = self.user_id.clone();
+        let recalled_at = chrono::Utc::now().to_rfc3339();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::db::memory_recall_stats::record_recalls_batch(&db, &user_id, &doc_ids, &recalled_at)
+                    .await
+            {
+                warn!(user_id = %user_id, error = %e, "Failed to record recall stats");
+            }
+        });
     }
 }
 
@@ -116,6 +150,15 @@ impl DynamicContext for MemoryRecallContext {
                 return None;
             }
         };
+
+        // 命中记账（闲聊门控命中在上方提前返回，不写统计）
+        if !results.is_empty() {
+            let doc_ids: Vec<String> = results
+                .iter()
+                .map(|r| r.document_id.clone())
+                .collect();
+            self.record_hits(doc_ids);
+        }
 
         format_memories(&results, self.config.injection_token_cap)
     }
@@ -227,14 +270,14 @@ mod tests {
     #[tokio::test]
     async fn test_casual_query_skips_search() {
         let km = make_km_with_memories().await;
-        let ctx = MemoryRecallContext::new(km, MemoryConfig::default());
+        let ctx = MemoryRecallContext::new(km, MemoryConfig::default(), "test-user", None);
         assert!(ctx.query("你好").await.is_none(), "闲聊不得触发检索");
     }
 
     #[tokio::test]
     async fn test_recall_formats_memories() {
         let km = make_km_with_memories().await;
-        let ctx = MemoryRecallContext::new(km, MemoryConfig::default());
+        let ctx = MemoryRecallContext::new(km, MemoryConfig::default(), "test-user", None);
         let out = ctx
             .query("用户希望以后回答用什么风格，还记得吗？")
             .await
@@ -246,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn test_short_query_still_searches() {
         let km = make_km_with_memories().await;
-        let ctx = MemoryRecallContext::new(km, MemoryConfig::default());
+        let ctx = MemoryRecallContext::new(km, MemoryConfig::default(), "test-user", None);
         let out = ctx.query("我的偏好是什么").await;
         assert!(out.is_some(), "短的记忆召回 query 不得被门控跳过");
     }
@@ -258,10 +301,98 @@ mod tests {
         km.ensure_loaded().await.unwrap();
         std::mem::forget(tmp);
 
-        let ctx = MemoryRecallContext::new(km, MemoryConfig::default());
+        let ctx = MemoryRecallContext::new(km, MemoryConfig::default(), "test-user", None);
         assert!(
             ctx.query("这是一个需要检索记忆的正常提问").await.is_none(),
             "KB 缺失应按无记忆处理而非报错"
         );
+    }
+
+    // ── 召回记账（P4-T6 扩展测试，独立模块避免与既有 helper 纠缠）────
+    #[tokio::test]
+    async fn test_recall_records_stats_for_hits() {
+        let km = make_km_with_memories().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        std::mem::forget(dir);
+
+        let ctx = MemoryRecallContext::new(
+            km.clone(),
+            MemoryConfig::default(),
+            "stats-user",
+            Some(pool.clone()),
+        );
+        ctx.query("用户的主开发语言是什么，还记得吗").await;
+
+        // 记账经 tokio::spawn 后台写入 — 轮询等待落库
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = sqlx::query_as::<_, (String, i64)>(
+                "SELECT doc_id, recall_count FROM memory_recall_stats WHERE user_id = 'stats-user'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!rows.is_empty(), "命中应记账");
+        assert!(rows.len() <= 5, "记账条数不超过 recall_top_k");
+
+        // 重复召回 → recall_count 累加
+        ctx.query("用户的主开发语言是什么，还记得吗").await;
+        for _ in 0..50 {
+            let after = sqlx::query_as::<_, (String, i64)>(
+                "SELECT doc_id, recall_count FROM memory_recall_stats WHERE user_id = 'stats-user'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if after.iter().any(|(_, c)| *c >= 2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let counts: Vec<i64> = sqlx::query_as::<_, (String, i64)>(
+            "SELECT doc_id, recall_count FROM memory_recall_stats WHERE user_id = 'stats-user'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect();
+        assert!(counts.iter().any(|c| *c >= 2), "重复召回应累加: {counts:?}");
+    }
+
+    #[tokio::test]
+    async fn test_casual_query_records_nothing() {
+        let km = make_km_with_memories().await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        std::mem::forget(dir);
+
+        let ctx = MemoryRecallContext::new(
+            km,
+            MemoryConfig::default(),
+            "casual-user",
+            Some(pool.clone()),
+        );
+        ctx.query("你好").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM memory_recall_stats WHERE user_id = 'casual-user'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "闲聊门控命中不得写统计");
     }
 }
