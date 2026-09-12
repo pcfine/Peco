@@ -278,6 +278,15 @@ impl IngestionPipeline {
         self.doc_store.get(doc_id).await
     }
 
+    /// 对任意文本批量生成向量（重嵌入路径）。
+    ///
+    /// 供余弦相似度比较等上层逻辑使用。这是文档级全文向量，
+    /// 与库内 chunk 级（滑动窗口）粒度不同 — 记忆条目普遍短于窗口，实际等价。
+    pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KnowledgeError> {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        self.embedding.embed_batch(&refs).await
+    }
+
     /// 返回存储的聚合统计信息。
     pub async fn stats(&self) -> Result<StoreStats, KnowledgeError> {
         self.doc_store.stats().await
@@ -548,5 +557,54 @@ mod tests {
             matches!(err, KnowledgeError::NotFound(_)),
             "未知文档应报 NotFound，实际: {err}"
         );
+    }
+
+    /// embed_texts 返回与嵌入引擎维度一致的向量，且空批返回空。
+    #[tokio::test]
+    async fn embed_texts_shapes() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pipeline = IngestionPipeline::new(
+            backend.clone() as Arc<dyn DocumentStore>,
+            None,
+            None,
+            None,
+            Arc::new(MockEmbedding { ndims: 384 }),
+            make_chunker(ChunkingStrategy::FixedSize { size: 50 }),
+        );
+
+        let texts = vec!["记忆一".to_string(), "记忆二".to_string()];
+        let vectors = pipeline.embed_texts(&texts).await.unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!(vectors.iter().all(|v| v.len() == 384));
+
+        assert!(pipeline.embed_texts(&[]).await.unwrap().is_empty());
+    }
+
+    /// V-2 检查点：FastEmbed 重嵌入确定性 — 同文本两次嵌入 bit 级一致。
+    ///
+    /// 依赖本地模型缓存（~/.fastembed_cache/）或网络下载；
+    /// 环境不可用时跳过（与 mock 无关，此断言针对真实引擎）。
+    #[tokio::test]
+    async fn embed_texts_is_deterministic_on_fastembed() {
+        let engine = match crate::embedding::FastembedEngine::new(
+            crate::embedding::FastembedModelType::BGESmallZHV15,
+        ) {
+            Ok(e) => Arc::new(e),
+            Err(_) => return,
+        };
+        let backend = Arc::new(InMemoryBackend::new());
+        let pipeline = IngestionPipeline::new(
+            backend as Arc<dyn DocumentStore>,
+            None,
+            None,
+            None,
+            engine,
+            make_chunker(ChunkingStrategy::FixedSize { size: 50 }),
+        );
+
+        let texts = vec!["用户偏好深色主题".to_string(), "喜欢手冲咖啡".to_string()];
+        let first = pipeline.embed_texts(&texts).await.unwrap();
+        let second = pipeline.embed_texts(&texts).await.unwrap();
+        assert_eq!(first, second, "同文本两次嵌入应 bit 级一致");
     }
 }

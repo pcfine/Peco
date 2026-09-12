@@ -278,6 +278,11 @@ impl KnowledgeBase {
         self.pipeline.get_document(&doc_id.to_string()).await
     }
 
+    /// 对任意文本批量生成向量（重嵌入路径），供余弦相似度比较使用。
+    pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KnowledgeError> {
+        self.pipeline.embed_texts(texts).await
+    }
+
     /// 获取统计信息。
     pub async fn stats(&self) -> Result<StoreStats, KnowledgeError> {
         self.pipeline.stats().await

@@ -5,6 +5,7 @@ pub mod ingestion;
 pub mod query_analysis;
 pub mod query_router;
 pub mod score_calibration;
+pub mod similarity;
 
 pub use cross_validation::{CrossValidation, validate_signals};
 pub use hybrid_search::{AdaptiveFusionConfig, HybridSearchEngine, adaptive_fusion_config};
@@ -15,3 +16,4 @@ pub use query_analysis::{
 };
 pub use query_router::{BackendCapabilities, QueryRouter};
 pub use score_calibration::{PathCalibration, calibrate_path};
+pub use similarity::{connected_component_clusters, cosine_similarity};
