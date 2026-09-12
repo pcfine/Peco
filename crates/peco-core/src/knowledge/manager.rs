@@ -354,6 +354,31 @@ impl KnowledgeManager {
         Ok(report)
     }
 
+    /// 用指定知识库的嵌入引擎对任意文本批量生成向量（重嵌入路径）。
+    ///
+    /// 供余弦相似度比较（自动整理的聚类去重）使用；向量维度与该库
+    /// 配置的嵌入模型一致。知识库不存在时返回
+    /// [`KnowledgeModuleError::NotFound`]。
+    pub async fn embed_texts(
+        &self,
+        kb_name: &str,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr.open_kb(kb_name).await.map_err(|e| match e {
+            knowledge_base::KnowledgeError::NotFound(_) => {
+                KnowledgeModuleError::NotFound(kb_name.to_string())
+            }
+            other => other.into(),
+        })?;
+
+        Ok(kb.embed_texts(texts).await?)
+    }
+
     // ── 图谱操作 ────────────────────────────────────────────────────────────
 
     /// 添加结构化事实到知识图谱。

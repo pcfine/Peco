@@ -18,10 +18,12 @@
 
 pub mod analyzer;
 pub mod config;
+pub mod consolidation;
 pub mod hook;
 pub mod recall;
 
 pub use analyzer::{MemoryCategory, MemoryFact, ModelTurnAnalyzer, TurnAnalyzer};
-pub use config::MemoryConfig;
+pub use config::{ConsolidationConfig, MemoryConfig};
+pub use consolidation::{ConsolidationWorker, Distiller, ModelDistiller, RunStats, WorkerError};
 pub use hook::MemoryExtractionHook;
 pub use recall::MemoryRecallContext;

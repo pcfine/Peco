@@ -6,6 +6,58 @@
 // （MemoryRecallContext）共享同一份 MemoryConfig，由 PecoManager 在
 // 构造期装配进 PecoConfig.hooks / .dynamic_context。
 
+/// 自动整理（巩固流水线）配置。
+///
+/// ConsolidationWorker 的行为参数。默认 `enabled: false`（灰度开启）——
+/// 未开启时不创建 worker、不注册 cron，零开销。
+#[derive(Debug, Clone)]
+pub struct ConsolidationConfig {
+    /// 全局总开关。`false` 默认关闭。
+    pub enabled: bool,
+    /// per-user 单轮处理条数上限。
+    pub batch_size: usize,
+    /// 聚类阈值（cosine similarity）。
+    ///
+    /// 占位默认 0.85，待标定脚本产出报告后回填操作点。
+    pub min_cluster_cos: f32,
+    /// 硬去重阈值（cosine similarity）。
+    ///
+    /// 占位默认 0.92，待标定脚本产出报告后回填操作点。
+    pub dedup_cos: f32,
+    /// episodic 过期天数。
+    pub episodic_ttl_days: u64,
+    /// per-user 单轮 LLM 调用上限（只调 Flash 档）。
+    pub max_llm_calls: usize,
+    /// 每 cron tick 最多整理用户数。
+    pub max_users_per_round: usize,
+    /// 空闲判定阈值（秒）：距上次活动超过该值才参与本轮整理。
+    pub idle_after_secs: u64,
+    /// 整理 cron 表达式（默认每 30 分钟）。
+    pub cron_expr: String,
+    /// "近期召回"窗口（天）：`last_recalled_at` 距今超过该窗口视为无近期召回。
+    pub recall_fresh_days: u64,
+    /// 审计行保留期（天）：终态审计行超过该期物理清除。
+    pub audit_retention_days: u64,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: 200,
+            min_cluster_cos: 0.85,
+            dedup_cos: 0.92,
+            episodic_ttl_days: 60,
+            max_llm_calls: 20,
+            max_users_per_round: 3,
+            idle_after_secs: 600,
+            cron_expr: "*/30 * * * *".to_string(),
+            recall_fresh_days: 14,
+            audit_retention_days: 90,
+        }
+    }
+}
+
 /// 记忆双路径配置。
 ///
 /// 存储载体是 workspace 内的 `@private_memory` 知识库（personal 模板
@@ -29,6 +81,8 @@ pub struct MemoryConfig {
     pub injection_token_cap: usize,
     /// 单次提取调用的超时（秒）。
     pub analyzer_timeout_secs: u64,
+    /// 自动整理（巩固流水线）配置。
+    pub consolidation: ConsolidationConfig,
 }
 
 impl Default for MemoryConfig {
@@ -42,6 +96,7 @@ impl Default for MemoryConfig {
             recall_top_k: 5,
             injection_token_cap: 1000,
             analyzer_timeout_secs: 10,
+            consolidation: ConsolidationConfig::default(),
         }
     }
 }
@@ -60,5 +115,24 @@ mod tests {
         // P5-T1：召回窗口 3 → 5、注入上限 800 → 1000（实测见 reports/）
         assert_eq!(c.recall_top_k, 5);
         assert_eq!(c.injection_token_cap, 1000);
+    }
+
+    #[test]
+    fn test_consolidation_defaults() {
+        let c = ConsolidationConfig::default();
+        // 默认关闭 — 灰度开启，未开启时零开销
+        assert!(!c.enabled);
+        assert_eq!(c.batch_size, 200);
+        // 0.85 / 0.92 为占位值，以标定报告回填为准
+        assert!((c.min_cluster_cos - 0.85).abs() < f32::EPSILON);
+        assert!((c.dedup_cos - 0.92).abs() < f32::EPSILON);
+        assert!(c.dedup_cos > c.min_cluster_cos);
+        assert_eq!(c.episodic_ttl_days, 60);
+        assert_eq!(c.max_llm_calls, 20);
+        assert_eq!(c.max_users_per_round, 3);
+        assert_eq!(c.idle_after_secs, 600);
+        assert_eq!(c.cron_expr, "*/30 * * * *");
+        assert_eq!(c.recall_fresh_days, 14);
+        assert_eq!(c.audit_retention_days, 90);
     }
 }
