@@ -447,11 +447,18 @@ impl ToolDyn for GetKnowledgeBaseDocs {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "get_knowledge_base_docs".to_string(),
-            description: "List documents in the specified knowledge base.".to_string(),
+            description: "List documents in the specified knowledge base with pagination. \
+Use offset/limit to page through large knowledge bases (has_more tells you to keep going), \
+and source_filter to restrict to entries whose source starts with the given prefix \
+(e.g. \"ppa_episodic\")."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "kb_name": { "type": "string", "description": "Knowledge base name" }
+                    "kb_name": { "type": "string", "description": "Knowledge base name" },
+                    "offset": { "type": "integer", "description": "Number of matching documents to skip (default 0)" },
+                    "limit": { "type": "integer", "description": "Max documents to return (default 50, max 200)" },
+                    "source_filter": { "type": "string", "description": "Only return documents whose source starts with this prefix" }
                 },
                 "required": ["kb_name"]
             }),
@@ -466,20 +473,67 @@ impl ToolDyn for GetKnowledgeBaseDocs {
             #[derive(Deserialize)]
             struct Args {
                 kb_name: String,
+                #[serde(default)]
+                offset: Option<usize>,
+                #[serde(default)]
+                limit: Option<usize>,
+                #[serde(default)]
+                source_filter: Option<String>,
             }
+
+            const DEFAULT_LIMIT: usize = 50;
+            const MAX_LIMIT: usize = 200;
+            const RAW_PAGE: usize = 200;
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
             let km = self.access.knowledge_manager();
             km.ensure_loaded().await.map_err(string_err)?;
 
-            let docs = km
-                .list_documents(&parsed.kb_name, 0, 100)
-                .await
-                .map_err(string_err)?;
+            let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+            let offset = parsed.offset.unwrap_or(0);
 
-            let display: Vec<_> = docs
-                .into_iter()
+            // source 过滤在工具层实现（list_documents 本身无此参数）：
+            // offset / has_more 均按「过滤后」的条目计数，内部按原始列表
+            // 分页推进，直到凑满一页或扫完全库。这样调用方对过滤结果的
+            // 翻页语义与无过滤时完全一致。
+            let mut docs_out = Vec::new();
+            let mut skipped = 0usize;
+            let mut has_more = false;
+            let mut raw_offset = 0usize;
+            loop {
+                let batch = km
+                    .list_documents(&parsed.kb_name, raw_offset, RAW_PAGE)
+                    .await
+                    .map_err(string_err)?;
+                let batch_len = batch.len();
+                raw_offset += batch_len;
+                for d in batch {
+                    let hit = parsed
+                        .source_filter
+                        .as_ref()
+                        .is_none_or(|f| d.source_path.starts_with(f.as_str()));
+                    if !hit {
+                        continue;
+                    }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    if docs_out.len() < limit {
+                        docs_out.push(d);
+                    } else {
+                        has_more = true;
+                        break;
+                    }
+                }
+                if has_more || batch_len < RAW_PAGE {
+                    break;
+                }
+            }
+
+            let display: Vec<_> = docs_out
+                .iter()
                 .map(|d| {
                     json!({
                         "id": d.id, "title": d.title, "source": d.source_path,
@@ -487,7 +541,16 @@ impl ToolDyn for GetKnowledgeBaseDocs {
                 })
                 .collect();
 
-            serde_json::to_string_pretty(&display)
+            let body = json!({
+                "kb_name": parsed.kb_name,
+                "offset": offset,
+                "limit": limit,
+                "count": display.len(),
+                "has_more": has_more,
+                "documents": display,
+            });
+
+            serde_json::to_string_pretty(&body)
                 .map_err(string_err)
                 .map(Content::Text)
         })
@@ -1352,5 +1415,133 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Access denied"), "{err}");
         assert!(km.get_document(KB, &doc.id).await.unwrap().is_some());
+    }
+
+    fn docs_tool(km: &Arc<KnowledgeManager>) -> GetKnowledgeBaseDocs {
+        GetKnowledgeBaseDocs::new(access_of(km), vec![KB.to_string()])
+    }
+
+    /// 分页翻页可取全量：120 条 → 50/50/20 三页取完，has_more 按页推进。
+    #[tokio::test]
+    async fn docs_pagination_walks_all_pages() {
+        let (_tmp, km) = make_km().await;
+        for i in 0..120 {
+            km.add_text_to_kb(KB, &format!("memory_{i}"), &format!("事实 {i}"), "ppa_semantic")
+                .await
+                .unwrap();
+        }
+        let tool = docs_tool(&km);
+
+        let mut collected = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let out = tool
+                .call(json!({ "kb_name": KB, "offset": offset, "limit": 50 }).to_string())
+                .await
+                .unwrap();
+            let Content::Text(text) = out else {
+                panic!("expected text content");
+            };
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["offset"], offset);
+            assert_eq!(body["limit"], 50);
+            for doc in body["documents"].as_array().unwrap() {
+                collected.push(doc["id"].as_str().unwrap().to_string());
+            }
+            if !body["has_more"].as_bool().unwrap() {
+                break;
+            }
+            offset += 50;
+        }
+        assert_eq!(collected.len(), 120);
+        let mut sorted = collected.clone();
+        sorted.sort();
+        collected.sort();
+        assert_eq!(collected, sorted, "翻页结果不得重复或遗漏");
+    }
+
+    /// source 过滤只命中前缀匹配条目，且 offset 按「过滤后」计数。
+    #[tokio::test]
+    async fn docs_source_filter_and_filtered_offset() {
+        let (_tmp, km) = make_km().await;
+        for i in 0..3 {
+            km.add_text_to_kb(KB, &format!("ep_{i}"), &format!("事件 {i}"), "ppa_episodic")
+                .await
+                .unwrap();
+        }
+        for i in 0..2 {
+            km.add_text_to_kb(KB, &format!("se_{i}"), &format!("事实 {i}"), "ppa_semantic")
+                .await
+                .unwrap();
+        }
+        let tool = docs_tool(&km);
+
+        let out = tool
+            .call(json!({ "kb_name": KB, "source_filter": "ppa_episodic" }).to_string())
+            .await
+            .unwrap();
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let sources: Vec<&str> = body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["source"].as_str().unwrap())
+            .collect();
+        assert_eq!(sources.len(), 3);
+        assert!(sources.iter().all(|s| s.starts_with("ppa_episodic")));
+        assert_eq!(body["has_more"], false);
+
+        // offset=1 跳过的是「过滤后」的第一条 episodic，而不是原始列表第一条
+        let out = tool
+            .call(
+                json!({ "kb_name": KB, "source_filter": "ppa_episodic", "offset": 1, "limit": 50 })
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["count"], 2);
+    }
+
+    /// limit 上限 200：请求更大值被钳制；默认 limit 50。
+    #[tokio::test]
+    async fn docs_limit_clamped_and_default() {
+        let (_tmp, km) = make_km().await;
+        for i in 0..7 {
+            km.add_text_to_kb(KB, &format!("m_{i}"), &format!("事实 {i}"), "ppa_semantic")
+                .await
+                .unwrap();
+        }
+        let tool = docs_tool(&km);
+
+        // 超大 limit 被钳制到 200 — 7 条全返回且 has_more=false
+        let out = tool
+            .call(json!({ "kb_name": KB, "limit": 100000 }).to_string())
+            .await
+            .unwrap();
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["limit"], 200);
+        assert_eq!(body["count"], 7);
+
+        // 缺省 limit = 50
+        let out = tool
+            .call(json!({ "kb_name": KB }).to_string())
+            .await
+            .unwrap();
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["count"], 7);
     }
 }
