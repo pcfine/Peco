@@ -55,6 +55,12 @@ pub struct AgentProfile {
     /// 单次响应最大对话轮数。未配置时默认为 50。
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
+
+    /// 模板版本号 — 仅内置模板的 agent.md 携带，供 `init_from_template`
+    /// 做增量迁移比对（版本更高则备份覆盖）。用户手写 agent.md 无此字段，
+    /// 迁移时视为版本 0。
+    #[serde(default)]
+    pub template_version: Option<u32>,
 }
 
 /// `max_turns` 的默认值：50 轮对话。

@@ -32,12 +32,25 @@ pub struct TemplateInitReport {
     pub agents_installed: Vec<String>,
     /// 跳过了哪些 Agent（已存在）
     pub agents_skipped: Vec<String>,
+    /// 因模板版本更高而备份覆盖的 Agent（名称列表）
+    pub agents_updated: Vec<String>,
     /// 创建了哪些知识库
     pub kbs_created: Vec<String>,
     /// 跳过了哪些知识库（已存在）
     pub kbs_skipped: Vec<String>,
     /// 初始化过程中的错误（非致命）：(名称, 错误描述)
     pub errors: Vec<(String, String)>,
+}
+
+/// 解析 agent.md frontmatter 中的模板版本号。
+///
+/// 无字段、解析失败或非模板文件一律视为 0 — 保证存量用户
+/// 能通过版本比对拿到模板升级内容。
+fn agent_template_version(content: &str) -> u32 {
+    crate::agent::agent_config::parse_agent_md(content)
+        .ok()
+        .and_then(|(profile, _)| profile.template_version)
+        .unwrap_or(0)
 }
 
 // ============================================================================
@@ -277,11 +290,15 @@ impl WorkSpace {
 
     /// 从模板目录初始化 workspace。
     ///
-    /// 幂等操作：已存在的 agent 和 KB 不会被覆盖。
+    /// 幂等操作：已存在的 agent 和 KB 不会被覆盖。仅当模板 `agent.md`
+    /// frontmatter 的 `template_version` 高于现存文件时（现存文件无版本号
+    /// 视为 0），先将现存文件备份为 `agent.md.bak.{旧版本}` 再覆盖写入，
+    /// 用于存量用户的模板升级；不做内容合并，用户手写改动只能从备份找回。
     ///
     /// 流程：
     /// 1. 扫描 `template_dir/agents/*/agent.md`
     ///    → 对于 workspace 中尚不存在的 agent，复制 `agent.md` 到 `agents/{name}/agent.md`
+    ///    → 已存在的 agent 按模板版本比对决定跳过或升级
     /// 2. 扫描 `template_dir/knowledge/*/kb_config.json`
     ///    → 对于 workspace 中尚不存在的 KB，读取配置 → `KnowledgeManager::create_kb()`
     /// 3. 不处理 skills/、providers.toml、config.toml（非模板关注范围）
@@ -311,7 +328,38 @@ impl WorkSpace {
                 let dst_md = self.agent_manager().md_path(&name);
 
                 if dst_md.exists() {
-                    report.agents_skipped.push(name);
+                    // 版本比对迁移：模板版本更高 → 备份后覆盖；
+                    // 版本相同或更高（用户自定义改版）→ 维持跳过
+                    let existing_version = std::fs::read_to_string(&dst_md)
+                        .map(|c| agent_template_version(&c))
+                        .unwrap_or(0);
+                    let template_version = std::fs::read_to_string(&src_md)
+                        .map(|c| agent_template_version(&c))
+                        .unwrap_or(0);
+                    if template_version <= existing_version {
+                        report.agents_skipped.push(name);
+                        continue;
+                    }
+
+                    let backup = dst_md.with_extension(format!("md.bak.{existing_version}"));
+                    if let Err(e) = std::fs::copy(&dst_md, &backup) {
+                        report
+                            .errors
+                            .push((name.clone(), format!("备份现存 agent.md 失败: {e}")));
+                        continue;
+                    }
+
+                    match std::fs::read_to_string(&src_md) {
+                        Ok(content) => match self.agent_manager().save(&name, &content) {
+                            Ok(()) => report.agents_updated.push(name),
+                            Err(e) => report
+                                .errors
+                                .push((name, format!("覆盖写入 agent.md 失败: {e}"))),
+                        },
+                        Err(e) => report
+                            .errors
+                            .push((name, format!("读取模板 agent.md 失败: {e}"))),
+                    }
                     continue;
                 }
 
@@ -561,5 +609,131 @@ impl McpAccess for WorkSpace {
     fn get_mcp_server_config(&self, name: &str) -> Option<crate::config::McpServerConfig> {
         let config = self.agent_manager.mcp_config_store().get();
         config.mcp_servers.get(name).cloned()
+    }
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{McpConfig, ProvidersConfig, SystemConfig};
+    use std::collections::HashMap;
+
+    /// 构造带可选版本号的 agent.md 文本。
+    fn md(version: Option<u32>, body: &str) -> String {
+        let version_line = version
+            .map(|v| format!("template_version: {v}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\nagent:\n  name: \"@demo\"\n  description: \"demo agent\"\n{version_line}llm:\n  provider: \"deepseek\"\n---\n{body}"
+        )
+    }
+
+    fn make_workspace(root: &std::path::Path) -> WorkSpace {
+        let system_config = SystemConfig {
+            providers: ProvidersConfig {
+                default_provider: "deepseek".into(),
+                providers: HashMap::new(),
+                web_search: None,
+            },
+            mcp: McpConfig {
+                mcp_servers: HashMap::new(),
+                extra: HashMap::new(),
+            },
+            skills_root: root.join("skills"),
+            knowledge_dir: root.join("knowledge"),
+        };
+        WorkSpace::open(root.join("workspace"), "test-user".into(), &system_config).unwrap()
+    }
+
+    /// 写出只含一个 agent 的模板目录，返回模板路径。
+    fn make_template(root: &std::path::Path, content: &str) -> PathBuf {
+        let template_dir = root.join("template");
+        let agent_dir = template_dir.join("agents").join("@demo");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.md"), content).unwrap();
+        template_dir
+    }
+
+    fn installed_agent_dir(root: &std::path::Path) -> PathBuf {
+        root.join("workspace").join("agents").join("@demo")
+    }
+
+    /// 存量无版本号（视为 0）→ 模板版本更高 → 备份 .bak.0 且覆盖为新内容；
+    /// 二次 init 版本持平 → skipped（幂等）。
+    #[tokio::test]
+    async fn legacy_agent_upgraded_with_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_workspace(tmp.path());
+
+        let agents_dir = installed_agent_dir(tmp.path());
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("agent.md"), md(None, "# 旧协议")).unwrap();
+
+        let template = make_template(tmp.path(), &md(Some(2), "# 新协议 v2"));
+        let report = ws.init_from_template(&template).await.unwrap();
+
+        assert_eq!(report.agents_updated, vec!["@demo".to_string()]);
+        assert!(report.agents_skipped.is_empty());
+        let upgraded = std::fs::read_to_string(agents_dir.join("agent.md")).unwrap();
+        assert!(upgraded.contains("# 新协议 v2"));
+        let backup = std::fs::read_to_string(agents_dir.join("agent.md.bak.0")).unwrap();
+        assert!(backup.contains("# 旧协议"));
+
+        // 幂等：升级后再跑一次，版本持平 → skipped
+        let report = ws.init_from_template(&template).await.unwrap();
+        assert_eq!(report.agents_skipped, vec!["@demo".to_string()]);
+        assert!(report.agents_updated.is_empty());
+    }
+
+    /// 现存版本与模板持平 → skipped，用户改动保留，不产生备份。
+    #[tokio::test]
+    async fn same_version_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_workspace(tmp.path());
+        let agents_dir = installed_agent_dir(tmp.path());
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("agent.md"), md(Some(2), "# 用户手写内容")).unwrap();
+
+        let template = make_template(tmp.path(), &md(Some(2), "# 新协议 v2"));
+        let report = ws.init_from_template(&template).await.unwrap();
+
+        assert_eq!(report.agents_skipped, vec!["@demo".to_string()]);
+        assert!(report.agents_updated.is_empty());
+        let content = std::fs::read_to_string(agents_dir.join("agent.md")).unwrap();
+        assert!(content.contains("# 用户手写内容"));
+        assert!(!agents_dir.join("agent.md.bak.2").exists());
+    }
+
+    /// 现存版本比模板更高（用户侧已改版）→ skipped。
+    #[tokio::test]
+    async fn lower_template_version_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_workspace(tmp.path());
+        let agents_dir = installed_agent_dir(tmp.path());
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("agent.md"), md(Some(3), "# 用户改版")).unwrap();
+
+        let template = make_template(tmp.path(), &md(Some(2), "# 新协议 v2"));
+        let report = ws.init_from_template(&template).await.unwrap();
+        assert_eq!(report.agents_skipped, vec!["@demo".to_string()]);
+        assert!(report.agents_updated.is_empty());
+    }
+
+    /// 新用户首次安装 → installed，不产生备份。
+    #[tokio::test]
+    async fn fresh_install_reported_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = make_workspace(tmp.path());
+        let template = make_template(tmp.path(), &md(Some(2), "# 新协议 v2"));
+        let report = ws.init_from_template(&template).await.unwrap();
+
+        assert_eq!(report.agents_installed, vec!["@demo".to_string()]);
+        let agents_dir = installed_agent_dir(tmp.path());
+        assert!(agents_dir.join("agent.md").exists());
+        assert!(!agents_dir.join("agent.md.bak.0").exists());
     }
 }
