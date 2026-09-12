@@ -47,6 +47,9 @@ required-features = ["helixdb"]
 [[example]]
 name = "kb_demo"
 
+[[example]]
+name = "calibrate_thresholds"
+
 [dev-dependencies]
 fastembed = { workspace = true }
 pdf-extract = "0.9"
