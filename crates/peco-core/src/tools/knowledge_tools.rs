@@ -1426,9 +1426,14 @@ mod tests {
     async fn docs_pagination_walks_all_pages() {
         let (_tmp, km) = make_km().await;
         for i in 0..120 {
-            km.add_text_to_kb(KB, &format!("memory_{i}"), &format!("事实 {i}"), "ppa_semantic")
-                .await
-                .unwrap();
+            km.add_text_to_kb(
+                KB,
+                &format!("memory_{i}"),
+                &format!("事实 {i}"),
+                "ppa_semantic",
+            )
+            .await
+            .unwrap();
         }
         let tool = docs_tool(&km);
 

@@ -55,9 +55,13 @@ impl MemoryRecallContext {
         let user_id = self.user_id.clone();
         let recalled_at = chrono::Utc::now().to_rfc3339();
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::db::memory_recall_stats::record_recalls_batch(&db, &user_id, &doc_ids, &recalled_at)
-                    .await
+            if let Err(e) = crate::db::memory_recall_stats::record_recalls_batch(
+                &db,
+                &user_id,
+                &doc_ids,
+                &recalled_at,
+            )
+            .await
             {
                 warn!(user_id = %user_id, error = %e, "Failed to record recall stats");
             }
@@ -153,10 +157,7 @@ impl DynamicContext for MemoryRecallContext {
 
         // 命中记账（闲聊门控命中在上方提前返回，不写统计）
         if !results.is_empty() {
-            let doc_ids: Vec<String> = results
-                .iter()
-                .map(|r| r.document_id.clone())
-                .collect();
+            let doc_ids: Vec<String> = results.iter().map(|r| r.document_id.clone()).collect();
             self.record_hits(doc_ids);
         }
 

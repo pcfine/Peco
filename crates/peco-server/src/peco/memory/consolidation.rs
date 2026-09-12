@@ -447,7 +447,14 @@ impl ConsolidationWorker {
     async fn run_machine_steps(
         &self,
         candidates: &[Candidate],
-    ) -> Result<(Vec<Vec<usize>>, Vec<knowledge_base::Document>, Vec<Vec<f32>>), String> {
+    ) -> Result<
+        (
+            Vec<Vec<usize>>,
+            Vec<knowledge_base::Document>,
+            Vec<Vec<f32>>,
+        ),
+        String,
+    > {
         let mut docs: Vec<knowledge_base::Document> = Vec::with_capacity(candidates.len());
         for c in candidates {
             match self.km.get_document(&self.kb_name, &c.doc_id).await {
@@ -558,7 +565,10 @@ impl ConsolidationWorker {
                 let Some(doc) = docs.get(victim) else {
                     continue;
                 };
-                match self.delete_with_audit(user_id, doc, REASON_DEDUP, now).await {
+                match self
+                    .delete_with_audit(user_id, doc, REASON_DEDUP, now)
+                    .await
+                {
                     Ok(true) => stats.dedup_deleted += 1,
                     Ok(false) => {}
                     Err(e) => tracing::warn!(user_id = %user_id, error = %e, "Dedup delete failed"),
@@ -791,8 +801,14 @@ mod tests {
 
     #[test]
     fn parse_title_millis_extracts_first_segment() {
-        assert_eq!(parse_title_millis("memory_1727500000000_3"), Some(1727500000000));
-        assert_eq!(parse_title_millis("memory_1727500000000_c0"), Some(1727500000000));
+        assert_eq!(
+            parse_title_millis("memory_1727500000000_3"),
+            Some(1727500000000)
+        );
+        assert_eq!(
+            parse_title_millis("memory_1727500000000_c0"),
+            Some(1727500000000)
+        );
         assert_eq!(parse_title_millis("memory_abc_1"), None);
         assert_eq!(parse_title_millis("meeting-notes"), None);
         assert_eq!(parse_title_millis("memory_"), None);
@@ -818,7 +834,11 @@ mod tests {
         doc.metadata.created_at = Some("2026-09-01T00:00:00+00:00".into());
         assert_eq!(
             doc_time(&doc),
-            Some(DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00").unwrap().with_timezone(&Utc))
+            Some(
+                DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
         );
 
         // 两者皆无 → None
@@ -900,10 +920,7 @@ mod tests {
 
         // 时间不可比 → content 较短者被淘汰
         let same = vec![vec![1.0f32, 0.0], vec![1.0, 0.0]];
-        assert_eq!(
-            pick_dedup_victims(&[0, 1], &docs, &same, 0.90),
-            vec![0]
-        );
+        assert_eq!(pick_dedup_victims(&[0, 1], &docs, &same, 0.90), vec![0]);
     }
 
     // ── 集成（真实嵌入 + InMemory KB + SQLite）──────────────────────────
@@ -918,8 +935,16 @@ mod tests {
         // 内容主题两两互异（模板句式会因样板词占主导而意外聚组），
         // 保证机器判定不产生删除；distiller 注入 mock 保证测试封闭。
         const TOPICS: [&str; 10] = [
-            "hiking", "piano", "astronomy", "swimming", "carpentry", "pottery",
-            "gardening", "chess", "photography", "cycling",
+            "hiking",
+            "piano",
+            "astronomy",
+            "swimming",
+            "carpentry",
+            "pottery",
+            "gardening",
+            "chess",
+            "photography",
+            "cycling",
         ];
         for (i, topic) in TOPICS.iter().enumerate() {
             add(
@@ -950,7 +975,11 @@ mod tests {
         assert_eq!(stats.scanned, 20, "profile 不入候选池");
         assert_eq!(stats.candidates, 20);
         assert_eq!(stats.machine_steps_skipped, None);
-        assert_eq!(stats.dedup_deleted + stats.ttl_deleted, 0, "内容互异不应有删除");
+        assert_eq!(
+            stats.dedup_deleted + stats.ttl_deleted,
+            0,
+            "内容互异不应有删除"
+        );
 
         // 水位与统计落库
         let state = crate::db::memory_consolidation_state::get_state(&pool, USER)
@@ -1005,7 +1034,10 @@ mod tests {
         assert_eq!(rows[0].deleted_by, "worker");
         assert_eq!(rows[0].reason, "consolidation_dedup");
         assert_eq!(rows[0].doc_id, old_id);
-        assert_eq!(rows[0].content, "The user likes strong coffee in the morning.");
+        assert_eq!(
+            rows[0].content,
+            "The user likes strong coffee in the morning."
+        );
     }
 
     #[tokio::test]
@@ -1040,7 +1072,13 @@ mod tests {
         let mut stats = RunStats::default();
         let now = Utc::now();
         worker
-            .distill_groups(USER, &[vec![0, 1, 2], vec![3, 4, 5]], &docs, now, &mut stats)
+            .distill_groups(
+                USER,
+                &[vec![0, 1, 2], vec![3, 4, 5]],
+                &docs,
+                now,
+                &mut stats,
+            )
             .await;
 
         assert_eq!(mock.call_count(), 1, "预算 1 次，第二组被跳过");
@@ -1071,7 +1109,13 @@ mod tests {
         let e1 = add(&km, "memory_1000_0", "episodic one", "ppa_episodic").await;
         let e2 = add(&km, "memory_1001_1", "episodic two", "ppa_episodic").await;
         let e3 = add(&km, "memory_1002_2", "episodic three", "ppa_episodic").await;
-        add(&km, "memory_1003_3", "episodic not distilled", "ppa_episodic").await;
+        add(
+            &km,
+            "memory_1003_3",
+            "episodic not distilled",
+            "ppa_episodic",
+        )
+        .await;
         add(&km, "memory_1004_4", "old semantic", "ppa_semantic").await;
         add(
             &km,
@@ -1085,7 +1129,10 @@ mod tests {
         let mut stats = RunStats::default();
         worker.ttl_cleanup(USER, future_now, &mut stats).await;
 
-        assert_eq!(stats.ttl_deleted, 3, "仅 footer 引用且过期的 episodic 被清理");
+        assert_eq!(
+            stats.ttl_deleted, 3,
+            "仅 footer 引用且过期的 episodic 被清理"
+        );
         for id in [&e1, &e2, &e3] {
             assert!(km.get_document(KB, id).await.unwrap().is_none());
         }

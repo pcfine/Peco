@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use knowledge_base::KnowledgeBaseManager;
-use knowledge_base::engine::{cosine_similarity, connected_component_clusters};
+use knowledge_base::engine::{connected_component_clusters, cosine_similarity};
 
 /// 一对候选重复 — 人工标注清单的行。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -97,14 +97,22 @@ fn parse_args() -> Result<Args, String> {
             }
             "--kb" => kb = Some(it.next().ok_or("--kb 需要一个名称")?),
             "--mode" => {
-                mode = match it.next().ok_or("--mode 需要 generate 或 calibrate")?.as_str() {
+                mode = match it
+                    .next()
+                    .ok_or("--mode 需要 generate 或 calibrate")?
+                    .as_str()
+                {
                     "generate" => Mode::Generate,
                     "calibrate" => Mode::Calibrate,
-                    other => return Err(format!("未知 mode: {other}（可选 generate | calibrate）")),
+                    other => {
+                        return Err(format!("未知 mode: {other}（可选 generate | calibrate）"));
+                    }
                 }
             }
             "--out" => out = PathBuf::from(it.next().ok_or("--out 需要一个路径")?),
-            "--annotated" => annotated = Some(PathBuf::from(it.next().ok_or("--annotated 需要一个路径")?)),
+            "--annotated" => {
+                annotated = Some(PathBuf::from(it.next().ok_or("--annotated 需要一个路径")?))
+            }
             other => return Err(format!("未知参数: {other}")),
         }
     }
@@ -114,7 +122,9 @@ fn parse_args() -> Result<Args, String> {
     }
 
     Ok(Args {
-        knowledge_dir: PathBuf::from(knowledge_dir.ok_or("缺少 --knowledge-dir（workspace 的 knowledge/ 目录）")?),
+        knowledge_dir: PathBuf::from(
+            knowledge_dir.ok_or("缺少 --knowledge-dir（workspace 的 knowledge/ 目录）")?,
+        ),
         kb: kb.ok_or("缺少 --kb（如 @private_memory）")?,
         mode,
         out,
@@ -239,7 +249,8 @@ async fn run_generate(args: &Args) -> Result<(), String> {
     }
 
     let json = serde_json::to_string_pretty(&candidates).map_err(|e| e.to_string())?;
-    std::fs::write(&args.out, json).map_err(|e| format!("写入 {} 失败: {e}", args.out.display()))?;
+    std::fs::write(&args.out, json)
+        .map_err(|e| format!("写入 {} 失败: {e}", args.out.display()))?;
     println!(
         "\n已导出 {} 对候选到 {}（label 全为 null，人工标注为 0/1 后用 --mode calibrate 标定）",
         candidates.len(),
@@ -304,10 +315,7 @@ async fn run_calibrate(args: &Args) -> Result<(), String> {
     let mut rows: Vec<(f32, f64, f64, f64)> = Vec::new(); // (threshold, precision, recall, f1)
     let mut t = THRESHOLD_FLOOR;
     while t <= THRESHOLD_CEIL {
-        let predicted = labeled
-            .iter()
-            .filter(|p| p.cosine >= t)
-            .collect::<Vec<_>>();
+        let predicted = labeled.iter().filter(|p| p.cosine >= t).collect::<Vec<_>>();
         let tp = predicted.iter().filter(|p| p.label == Some(1)).count();
         let precision = if predicted.is_empty() {
             1.0

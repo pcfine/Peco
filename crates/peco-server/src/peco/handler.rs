@@ -1010,10 +1010,7 @@ pub async fn restore_memory_audit(
 #[serde(untagged)]
 pub enum ConsolidateResponse {
     /// 整理未开启（`memory.consolidation.enabled = false`）。
-    Disabled {
-        enabled: bool,
-        message: String,
-    },
+    Disabled { enabled: bool, message: String },
     /// 一轮整理的统计。
     Stats(super::memory::RunStats),
 }
