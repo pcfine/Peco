@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["fastembed-embedding", "pdf", "lancedb"]
-fastembed-embedding = ["dep:fastembed"]
+fastembed-embedding = ["dep:fastembed", "dep:hf-hub"]
 pdf = ["dep:pdf-extract"]
 lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 helixdb = ["dep:reqwest"]
@@ -30,6 +30,7 @@ reqwest = { workspace = true, optional = true }
 
 # 嵌入引擎（可选）
 fastembed = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
 
 # 向量存储（可选）
 lancedb = { workspace = true, optional = true }

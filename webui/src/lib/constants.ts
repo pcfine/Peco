@@ -34,7 +34,8 @@ export const TOOLS = [
 ] as const;
 
 export const EMBEDDING_MODELS = [
-  { value: "bge-small-zh-v15", label: "BGE Small ZH (中文推荐)" },
+  { value: "bge-small-zh-v15", label: "BGE Small ZH (中文轻量)" },
+  { value: "bge-base-zh-v15", label: "BGE Base ZH (中文推荐)" },
   { value: "bge-large-zh-v15", label: "BGE Large ZH" },
   { value: "all-minilm-l6-v2q", label: "All-MiniLM-L6 (英文推荐)" },
 ] as const;

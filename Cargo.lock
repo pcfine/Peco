@@ -3562,6 +3562,7 @@ dependencies = [
  "fastembed",
  "futures",
  "hex",
+ "hf-hub",
  "lancedb",
  "pdf-extract",
  "reqwest 0.13.4",

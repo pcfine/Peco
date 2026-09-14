@@ -56,6 +56,7 @@ pub enum BackendType {
 #[serde(rename_all = "kebab-case")]
 pub enum FastembedModelTypeSerde {
     BGESmallZHV15,
+    BGEBaseZHV15,
     BGELargeZHV15,
     AllMiniLML6V2Q,
     MultilingualE5Small,
@@ -65,6 +66,7 @@ impl From<FastembedModelTypeSerde> for FastembedModelType {
     fn from(s: FastembedModelTypeSerde) -> Self {
         match s {
             FastembedModelTypeSerde::BGESmallZHV15 => FastembedModelType::BGESmallZHV15,
+            FastembedModelTypeSerde::BGEBaseZHV15 => FastembedModelType::BGEBaseZHV15,
             FastembedModelTypeSerde::BGELargeZHV15 => FastembedModelType::BGELargeZHV15,
             FastembedModelTypeSerde::AllMiniLML6V2Q => FastembedModelType::AllMiniLML6V2Q,
             FastembedModelTypeSerde::MultilingualE5Small => FastembedModelType::MultilingualE5Small,
@@ -76,6 +78,7 @@ impl From<FastembedModelType> for FastembedModelTypeSerde {
     fn from(m: FastembedModelType) -> Self {
         match m {
             FastembedModelType::BGESmallZHV15 => FastembedModelTypeSerde::BGESmallZHV15,
+            FastembedModelType::BGEBaseZHV15 => FastembedModelTypeSerde::BGEBaseZHV15,
             FastembedModelType::BGELargeZHV15 => FastembedModelTypeSerde::BGELargeZHV15,
             FastembedModelType::AllMiniLML6V2Q => FastembedModelTypeSerde::AllMiniLML6V2Q,
             FastembedModelType::MultilingualE5Small => FastembedModelTypeSerde::MultilingualE5Small,
@@ -156,5 +159,41 @@ mod tests {
                 overlap: 100
             }
         ));
+    }
+
+    /// kb_config.json 的磁盘契约 — 既有文件使用 kebab-case 序列化形式，
+    /// 变体名与 JSON 字符串必须保持向后兼容。
+    #[test]
+    fn embedding_model_serde_roundtrip() {
+        let cases = [
+            (
+                FastembedModelTypeSerde::BGESmallZHV15,
+                "\"b-g-e-small-z-h-v15\"",
+            ),
+            (
+                FastembedModelTypeSerde::BGEBaseZHV15,
+                "\"b-g-e-base-z-h-v15\"",
+            ),
+            (
+                FastembedModelTypeSerde::BGELargeZHV15,
+                "\"b-g-e-large-z-h-v15\"",
+            ),
+            (
+                FastembedModelTypeSerde::AllMiniLML6V2Q,
+                "\"all-mini-l-m-l6-v2-q\"",
+            ),
+            (
+                FastembedModelTypeSerde::MultilingualE5Small,
+                "\"multilingual-e5-small\"",
+            ),
+        ];
+        for (variant, expected) in cases {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let round: FastembedModelTypeSerde = serde_json::from_str(&json).unwrap();
+            let model_type: FastembedModelType = round.into();
+            let back: FastembedModelTypeSerde = model_type.into();
+            assert_eq!(serde_json::to_string(&back).unwrap(), expected);
+        }
     }
 }

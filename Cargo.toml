@@ -31,6 +31,10 @@ fastembed = "4.9.1"
 futures = "0.3"
 hex = "0.4"
 futures-timer = "3"
+hf-hub = { version = "0.4", default-features = false, features = [
+  "ureq",
+  "native-tls",
+] }
 http = "1"
 lancedb = "0.30"
 mime_guess = "2"

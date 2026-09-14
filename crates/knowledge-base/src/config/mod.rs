@@ -72,6 +72,21 @@ impl EmbeddingModelConfig {
         }
     }
 
+    /// BGE-base-zh-v1.5 — 中文嵌入模型，质量与开销居中（768 维）。
+    ///
+    /// C-MTEB 均分介于 small（~57.8）与 large（~64.5）之间（~63.1），
+    /// 而模型体积（~400 MB）远小于 large（~1.3 GB）。
+    /// 噪声底噪介于两者之间，沿用 0.55 阈值。
+    pub fn bge_base_zh() -> Self {
+        Self {
+            model_name: "BGE-base-zh-v1.5",
+            ndims: 768,
+            min_vector_score: 0.55,
+            query_instruction: Some("为这个句子生成表示以用于检索相关文章："),
+            chinese_optimized: true,
+        }
+    }
+
     /// BGE-M3 — 顶级多语言嵌入模型（1024 维，稀疏+密集）。
     ///
     /// 当 fastembed 支持 BGE-M3 枚举变体时使用。
@@ -131,6 +146,15 @@ mod tests {
         assert_eq!(cfg.ndims, 512);
         assert!(cfg.min_vector_score > 0.4);
         assert!(cfg.chinese_optimized);
+    }
+
+    #[test]
+    fn bge_base_zh_config() {
+        let cfg = EmbeddingModelConfig::bge_base_zh();
+        assert_eq!(cfg.ndims, 768);
+        assert!(cfg.min_vector_score > 0.4);
+        assert!(cfg.chinese_optimized);
+        assert!(cfg.query_instruction.is_some());
     }
 
     #[test]

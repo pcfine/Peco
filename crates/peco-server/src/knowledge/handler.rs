@@ -127,6 +127,7 @@ fn default_limit() -> i64 {
 /// 解析嵌入模型字符串为 FastembedModelTypeSerde。
 fn parse_embedding_model(s: Option<&str>) -> FastembedModelTypeSerde {
     match s {
+        Some("bge-base-zh-v15") => FastembedModelTypeSerde::BGEBaseZHV15,
         Some("bge-large-zh-v15") => FastembedModelTypeSerde::BGELargeZHV15,
         Some("all-minilm-l6-v2q") | Some("all-MiniLM-L6-v2") => {
             FastembedModelTypeSerde::AllMiniLML6V2Q
