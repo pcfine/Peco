@@ -10,6 +10,8 @@
 //   - GET  /api/peco/memory/audit           记忆删除审计（分页）
 //   - POST /api/peco/memory/audit/:id/restore  按审计行回滚删除
 //   - POST /api/peco/memory/consolidate     手动触发一轮记忆自动整理
+//   - GET  /api/peco/memory/consolidation/optin  查询自动整理 opt-in 开关
+//   - PUT  /api/peco/memory/consolidation/optin  写入自动整理 opt-in 开关
 //
 // 任务生命周期与 SSE 连接解耦：runner 任务独占 LooperHandle 持续驱动，
 // 桥接任务把 broadcast 事件流转发给每个 SSE 连接。连接断开只结束桥接，
@@ -22,9 +24,10 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
 use axum::response::sse::{KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use futures::stream::Stream;
 use model_provider::InputItem;
 use peco_core::agent::{AgentLooper, LooperEvent, LooperHandle, OuterState, strip_summary_wrapper};
@@ -1056,6 +1059,57 @@ pub async fn consolidate_now(
     Ok(Json(ConsolidateResponse::Stats(stats)))
 }
 
+// ── Handler: GET/PUT /api/peco/memory/consolidation/optin ──────────────────
+
+/// opt-in 开关的查询/写入响应。
+#[derive(Debug, Serialize)]
+pub struct OptinResponse {
+    /// 当前用户是否已 opt-in 自动整理（无行 = false，fail-closed）。
+    pub enabled: bool,
+}
+
+/// opt-in 写入请求体。
+#[derive(Debug, Deserialize)]
+pub struct SetOptinRequest {
+    pub enabled: bool,
+}
+
+/// 查询当前用户的自动整理 opt-in 开关。
+pub async fn get_memory_optin(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OptinResponse>, ApiError> {
+    let enabled = crate::db::memory_consolidation_optin::is_opted_in(&state.db, &user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to read consolidation opt-in: {e}")))?;
+
+    Ok(Json(OptinResponse { enabled }))
+}
+
+/// 写入当前用户的自动整理 opt-in 开关。
+///
+/// 存意愿不即时生效：服务器总开关（`memory.consolidation.enabled`）关闭时
+/// 同样可写，避免放开灰度时前端再补交互；手动触发端点不读此开关
+/// （用户主动发起即同意，两通道语义分离）。
+pub async fn set_memory_optin(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SetOptinRequest>, JsonRejection>,
+) -> Result<Json<OptinResponse>, ApiError> {
+    // 显式归一：缺字段 / 类型不符 / 非法 JSON / Content-Type 缺失一律 400
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(format!("请求体不合法：{e}")))?;
+
+    crate::db::memory_consolidation_optin::set_enabled(&state.db, &user_id, req.enabled)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to write consolidation opt-in: {e}")))?;
+
+    tracing::info!(user_id = %user_id, enabled = req.enabled, "Memory consolidation opt-in updated");
+
+    Ok(Json(OptinResponse {
+        enabled: req.enabled,
+    }))
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/peco/session/export?format=json|markdown`
@@ -1109,6 +1163,9 @@ pub async fn export_session(
 /// - `GET /archives/:id` — 下载归档
 /// - `GET /memory/audit` — 记忆删除审计（分页，仅本人）
 /// - `POST /memory/audit/:id/restore` — 按审计行回滚删除
+/// - `POST /memory/consolidate` — 手动触发一轮自动整理
+/// - `GET /memory/consolidation/optin` — 查询自动整理 opt-in 开关
+/// - `PUT /memory/consolidation/optin` — 写入自动整理 opt-in 开关
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
@@ -1120,4 +1177,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/audit", get(list_memory_audit))
         .route("/memory/audit/{id}/restore", post(restore_memory_audit))
         .route("/memory/consolidate", post(consolidate_now))
+        .route("/memory/consolidation/optin", get(get_memory_optin))
+        .route("/memory/consolidation/optin", put(set_memory_optin))
 }

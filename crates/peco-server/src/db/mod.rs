@@ -8,6 +8,7 @@ pub mod conversations;
 pub mod documents;
 pub mod knowledge_bases;
 pub mod memory_audit;
+pub mod memory_consolidation_optin;
 pub mod memory_consolidation_state;
 pub mod memory_recall_stats;
 pub mod messages;
@@ -274,6 +275,26 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 009 skipped: memory_consolidation_state table already exists");
     }
 
+    // ── Migration 010: 自动整理用户级 opt-in 开关 ──────────────────────────
+    let has_consolidation_optin = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_consolidation_optin'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_consolidation_optin {
+        run_migration(
+            pool,
+            "010",
+            include_str!("migrations/010_peco_memory_consolidation_optin.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 010 completed");
+    } else {
+        tracing::debug!("Migration 010 skipped: memory_consolidation_optin table already exists");
+    }
+
     Ok(())
 }
 
@@ -393,5 +414,55 @@ mod tests {
             .unwrap();
             assert_eq!(count, 1, "重跑迁移后表 {table} 不得重复创建");
         }
+    }
+
+    /// 迁移 010：首次执行建出 opt-in 表；已有数据在二次执行后保持不变
+    /// （前置存在性检查命中 → 跳过，不重建、不清空）。
+    #[tokio::test]
+    async fn migration_010_creates_table_once_and_survives_rerun() {
+        let (pool, _dir) = test_pool().await;
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("memory_consolidation_optin")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "表 memory_consolidation_optin 应已由迁移 010 创建"
+        );
+
+        // 写入一行 opt-in 记录后重跑迁移，数据与表数量必须保持不变
+        sqlx::query(
+            "INSERT INTO memory_consolidation_optin (user_id, enabled, opted_in_at, updated_at) \
+             VALUES ('u1', 1, '2026-09-10T00:00:00+00:00', '2026-09-10T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let optin_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM memory_consolidation_optin WHERE enabled = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(optin_rows, 1, "重跑迁移不得清空已有 opt-in 记录");
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("memory_consolidation_optin")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "重跑迁移后表 memory_consolidation_optin 不得重复创建"
+        );
     }
 }

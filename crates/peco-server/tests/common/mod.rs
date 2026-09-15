@@ -220,6 +220,14 @@ impl TestApp {
             .bearer_auth(&self.user_token)
     }
 
+    /// 发送带认证的 PUT 请求。
+    #[allow(dead_code)]
+    pub fn put(&self, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .put(format!("{}{}", self.base_url, path))
+            .bearer_auth(&self.user_token)
+    }
+
     /// 发送带认证的 PATCH 请求。
     #[allow(dead_code)]
     pub fn patch(&self, path: &str) -> reqwest::RequestBuilder {
