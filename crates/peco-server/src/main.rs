@@ -5,9 +5,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::time::ChronoLocal;
-
 use peco_server::config::ServerConfig;
 use peco_server::db;
 use peco_server::state::AppState;
@@ -15,23 +12,15 @@ use peco_server::workflow::scheduler::CronScheduler;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // ── 1. 初始化 tracing ──────────────────────────────────────────────────
-    // `model_provider` 必须显式列出：它不以 `peco` 开头，没有自己的 directive 时会落到
-    // EnvFilter 的 ERROR 默认级别，而该 crate 只发 warn/debug —— 于是 LLM 调用层的
-    // 所有异常（非 2xx、SSE 重连、丢弃工具调用）都会静默。
-    // 排查 LLM 问题：`RUST_LOG=model_provider=debug`，看完整请求体用 `=trace`。
-    // 日志时间戳用本机时区（默认 timer 打 UTC）；offset 后缀让时间戳自描述，便于与 UTC 落库时间戳对账。
-    tracing_subscriber::fmt()
-        .with_timer(ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f%:z".into()))
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new("peco=info,model_provider=info,tower_http=info")
-            }),
-        )
-        .init();
-
-    // ── 2. 加载 .env ───────────────────────────────────────────────────────
+    // ── 1. 加载 .env ───────────────────────────────────────────────────────
+    // 先于 tracing 初始化，让 .env 中的 RUST_LOG / PECO_LOG_* 配置生效。
+    // dotenvy 不覆盖已存在的环境变量，后续 ServerConfig 的读取不受影响。
     dotenvy::dotenv().ok();
+
+    // ── 2. 初始化 tracing ──────────────────────────────────────────────────
+    // stdout + 按大小轮转的日志文件双写；默认过滤器与 PECO_LOG_* 环境变量
+    // 见 `peco_server::logging` 模块文档。
+    peco_server::logging::init_tracing();
 
     // ── 3. 加载初步配置（获取 database_url 和 data_dir）─────────────────
     let config_prelim = ServerConfig::from_env()?;

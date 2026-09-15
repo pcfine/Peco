@@ -96,12 +96,17 @@ fn parse_common_env() -> (String, u16, String, PathBuf) {
         format!("sqlite:{}?mode=rwc", db_path.display())
     });
 
-    let data_dir = std::env::var("PECO_DATA_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".peco"));
+    let data_dir = resolve_data_dir();
 
     (host, port, database_url, data_dir)
+}
+
+/// 解析数据根目录：`PECO_DATA_DIR` 环境变量 > `$HOME/.peco`。
+pub(crate) fn resolve_data_dir() -> PathBuf {
+    std::env::var("PECO_DATA_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".peco"))
 }
 
 /// JWT 密钥解析（无 DB 持久化）：环境变量 > 随机生成。

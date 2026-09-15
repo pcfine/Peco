@@ -421,7 +421,16 @@ Workflow 支持 Shell 和 Agent 两种步骤类型，DAG 拓扑分层并行执�
 | `PECO_JWT_SECRET` | 自动生成+持久化 | JWT 签名密钥（三层降级） |
 | `PECO_DATA_DIR` | `~/.peco/` | 数据存储根目录 |
 | `DEEPSEEK_API_KEY` | — | DeepSeek API 密钥（必填） |
-| `RUST_LOG` | `peco_server=info,tower_http=info` | 日志级别 |
+| `RUST_LOG` | `peco=info,model_provider=info,tower_http=info` | 日志级别 |
+| `PECO_LOG_TO_FILE` | `true` | 日志文件落盘开关（`false`/`0`/`off` 时仅 stdout） |
+| `PECO_LOG_DIR` | `~/.peco/logs` | 日志目录（默认跟随 `PECO_DATA_DIR`） |
+| `PECO_LOG_MAX_SIZE_MB` | `10` | 单个日志文件大小上限（MB） |
+| `PECO_LOG_MAX_FILES` | `5` | 保留的日志文件总数上限（含当前文件） |
+
+日志默认双写 stdout 与文件：文件层写入 `peco-server.log`，超过大小上限后轮转为
+`peco-server.log.1`（最新）→ `.N-1`（最旧），超出保留数即删除，因此磁盘占用有硬上界；
+单文件上限为软上限（单条超大日志允许整体落入新文件）。文件层不带 ANSI 颜色码；
+目录/文件创建失败时自动降级为仅 stdout，不影响服务启动。
 
 ### JWT 密钥三层降级策略
 

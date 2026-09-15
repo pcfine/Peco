@@ -22,6 +22,7 @@ pub mod db;
 pub mod error;
 pub mod file_watcher;
 pub mod knowledge;
+pub mod logging;
 pub mod mcp_config;
 pub mod middleware;
 pub mod openapi;
