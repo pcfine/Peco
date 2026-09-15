@@ -31,6 +31,10 @@
 //! cargo run -p knowledge-base --example calibrate_thresholds -- \
 //!     --mode synthetic --pairs reports/data/synthetic_calibration_pairs.csv \
 //!     --out /tmp/t1/annotated_synthetic.json
+//! # 换 base 模型重跑同一合成集（模型名随标注 JSON 透传给报告）：
+//! cargo run -p knowledge-base --example calibrate_thresholds -- \
+//!     --mode synthetic --model base --pairs reports/data/synthetic_calibration_pairs.csv \
+//!     --out /tmp/t1/annotated_synthetic_base.json
 //! # 然后复用既有 calibrate 模式出报告：
 //! cargo run -p knowledge-base --example calibrate_thresholds -- \
 //!     --knowledge-dir <任意非空库> --kb @private_memory --mode calibrate \
@@ -43,6 +47,10 @@
 //!
 //! 注：calibrate 模式只消费标注 JSON 里的 cosine 字段，不重嵌入，
 //! `--knowledge-dir` / `--kb` 在该模式下仅为兼容而接受（可省略）。
+//!
+//! 注：`--model` 只影响 synthetic 模式（决定临时库的嵌入引擎）。在其它模式下
+//! 显式传入会报错 — 那两种模式的嵌入要么由真实库配置决定，要么根本不重嵌入，
+//! 静默忽略会让「以为跑了 base」的错误结论混进报告。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -66,6 +74,11 @@ struct CandidatePair {
     text_b: String,
     /// 人工标注：1 = 语义重复，0 = 非重复。generate 阶段为 null。
     label: Option<u8>,
+    /// 产出这批余弦的嵌入模型名。仅 synthetic 模式写入（generate 走真实库配置，
+    /// 由 KB 自己记录）；`skip_serializing_if` 保证 generate 的导出格式不变，
+    /// calibrate 读到旧文件（无此字段）时退回默认描述。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 const THRESHOLD_FLOOR: f32 = 0.50;
@@ -103,6 +116,36 @@ enum Mode {
     Synthetic,
 }
 
+/// synthetic 模式的嵌入模型选项 — 决定临时知识库用哪套权重算余弦。
+///
+/// 同一合成集换模型重跑即可得到同尺对比：small（512 维，fastembed 内置清单）
+/// 与 base（768 维，走 `Xenova/bge-base-zh-v1.5` 的 user-defined ONNX 路径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SyntheticModel {
+    /// 默认 small — 与回填到 KB 配置的模型一致，保持既有行为不变。
+    #[default]
+    Small,
+    Base,
+}
+
+impl SyntheticModel {
+    /// 人类可读模型名 — 写进标注 JSON 并透传到标定报告，供两份报告对照。
+    fn name(self) -> &'static str {
+        match self {
+            SyntheticModel::Small => "bge-small-zh-v1.5",
+            SyntheticModel::Base => "bge-base-zh-v1.5",
+        }
+    }
+
+    /// 模型对应的 KB 嵌入配置枚举 — `KnowledgeBase` 据此构造嵌入引擎。
+    fn kb_model(self) -> FastembedModelTypeSerde {
+        match self {
+            SyntheticModel::Small => FastembedModelTypeSerde::BGESmallZHV15,
+            SyntheticModel::Base => FastembedModelTypeSerde::BGEBaseZHV15,
+        }
+    }
+}
+
 struct Args {
     /// 仅 generate 模式需要。
     knowledge_dir: Option<PathBuf>,
@@ -111,6 +154,8 @@ struct Args {
     /// 仅 synthetic 模式需要。
     pairs: Option<PathBuf>,
     mode: Mode,
+    /// 仅 synthetic 模式生效。
+    model: SyntheticModel,
     out: PathBuf,
     annotated: Option<PathBuf>,
 }
@@ -120,6 +165,8 @@ fn parse_args() -> Result<Args, String> {
     let mut kb = None;
     let mut pairs = None;
     let mut mode = Mode::Generate;
+    let mut model = SyntheticModel::default();
+    let mut model_given = false;
     let mut out = None;
     let mut annotated = None;
 
@@ -147,6 +194,16 @@ fn parse_args() -> Result<Args, String> {
                     }
                 }
             }
+            "--model" => {
+                model = match it.next().ok_or("--model 需要 small 或 base")?.as_str() {
+                    "small" => SyntheticModel::Small,
+                    "base" => SyntheticModel::Base,
+                    other => {
+                        return Err(format!("未知 model: {other}（可选 small | base）"));
+                    }
+                };
+                model_given = true;
+            }
             "--out" => out = Some(PathBuf::from(it.next().ok_or("--out 需要一个路径")?)),
             "--annotated" => {
                 annotated = Some(PathBuf::from(it.next().ok_or("--annotated 需要一个路径")?))
@@ -170,12 +227,18 @@ fn parse_args() -> Result<Args, String> {
             return Err("缺少 --kb（如 @private_memory）".into());
         }
     }
+    // generate 的嵌入模型由真实库配置决定，calibrate 根本不重嵌入 — 两种模式下
+    // 显式传 --model 都无处生效，报错而不是静默忽略
+    if model_given && !matches!(mode, Mode::Synthetic) {
+        return Err("--model 仅对 synthetic 模式有效".into());
+    }
 
     Ok(Args {
         knowledge_dir: knowledge_dir.map(PathBuf::from),
         kb,
         pairs,
         mode,
+        model,
         out,
         annotated,
     })
@@ -323,6 +386,7 @@ fn make_pair(docs: &[knowledge_base::Document], i: usize, j: usize, cos: f32) ->
         text_a: docs[i].content.clone(),
         text_b: docs[j].content.clone(),
         label: None,
+        model: None,
     }
 }
 
@@ -407,7 +471,12 @@ async fn run_calibrate(args: &Args) -> Result<(), String> {
         labeled.len(),
         labeled.len() - positives
     ));
-    report.push_str("- 嵌入模型：KB 配置默认（bge-small-zh-v1.5, 512 维）\n\n");
+    // 标注 JSON 自带模型名（synthetic 写入）时如实标注；旧文件无此字段，
+    // 退回 generate 时代的默认描述
+    match pairs.iter().find_map(|p| p.model.as_deref()) {
+        Some(m) => report.push_str(&format!("- 嵌入模型：{m}（合成集实算余弦）\n\n")),
+        None => report.push_str("- 嵌入模型：KB 配置默认（bge-small-zh-v1.5, 512 维）\n\n"),
+    }
     report.push_str("| 阈值 | precision | recall | F1 |\n|---|---|---|---|\n");
     for (t, p, r, f1) in &rows {
         report.push_str(&format!("| {t:.2} | {p:.3} | {r:.3} | {f1:.3} |\n"));
@@ -461,6 +530,7 @@ async fn run_synthetic(args: &Args) -> Result<(), String> {
         }
     }
     println!("去重后待嵌入文本 {} 条", texts.len());
+    println!("嵌入模型：{}（--model）", args.model.name());
 
     // 临时库：只为借它的嵌入引擎（InMemory 后端，不落盘向量表），用完连目录一起删
     let temp_dir = make_temp_dir()?;
@@ -472,7 +542,7 @@ async fn run_synthetic(args: &Args) -> Result<(), String> {
         .create_kb(KbConfig {
             name: SYNTHETIC_KB.into(),
             description: "合成标定集临时库（用完即删）".into(),
-            embedding_model: FastembedModelTypeSerde::BGESmallZHV15,
+            embedding_model: args.model.kb_model(),
             chunking: ChunkingStrategySerde::default(),
             backend: BackendType::InMemory,
             storage_path: None,
@@ -508,10 +578,11 @@ async fn run_synthetic(args: &Args) -> Result<(), String> {
             text_a: p.text_a.clone(),
             text_b: p.text_b.clone(),
             label: Some(p.label),
+            model: Some(args.model.name().to_string()),
         });
     }
 
-    print_synthetic_summary(&out);
+    print_synthetic_summary(&out, args.model);
 
     let json = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
     std::fs::write(&args.out, json)
@@ -541,8 +612,11 @@ fn lookup_vector<'a>(
 }
 
 /// 按 label 分组打印 cosine 分布 — 正例均值应明显高于负例，用于快速 sanity check。
-fn print_synthetic_summary(pairs: &[CandidatePair]) {
+///
+/// 模型名打在首行：同一合成集换模型重跑时，两份输出靠这一行区分。
+fn print_synthetic_summary(pairs: &[CandidatePair], model: SyntheticModel) {
     println!("\n合成标定集 cosine 统计：");
+    println!("  模型：{}", model.name());
     println!("  总对数：{}", pairs.len());
     let mut means = [0.0f32; 2];
     for (label, name) in [(1u8, "正例"), (0u8, "负例")] {
