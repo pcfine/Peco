@@ -7,8 +7,8 @@
 //!
 //! | 模型 | 维度 | 大小 | 适用场景 |
 //! |------|------|------|----------|
-//! | `BGESmallZHV15` | 512 | ~100 MB | 中文优化（默认） |
-//! | `BGEBaseZHV15` | 768 | ~400 MB | 中文优化（质量居中） |
+//! | `BGEBaseZHV15` | 768 | ~400 MB | 中文优化（默认） |
+//! | `BGESmallZHV15` | 512 | ~100 MB | 中文优化，轻量 |
 //! | `BGELargeZHV15` | 1024 | ~1.3 GB | 最佳中文质量 |
 //! | `AllMiniLML6V2Q` | 384 | ~80 MB | 英文快速 |
 //! | `MultilingualE5Small` | 384 | ~120 MB | 多语言 |
@@ -41,9 +41,9 @@ const BGE_BASE_ZH_V15_REPO: &str = "Xenova/bge-base-zh-v1.5";
 /// 支持的嵌入模型类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastembedModelType {
-    /// BGESmallZHV15 — 512 维，中文优化（默认）。
+    /// BGESmallZHV15 — 512 维，中文优化，轻量。
     BGESmallZHV15,
-    /// BGEBaseZHV15 — 768 维，中文优化（质量居中）。
+    /// BGEBaseZHV15 — 768 维，中文优化（默认）。
     BGEBaseZHV15,
     /// BGELargeZHV15 — 1024 维，最佳中文质量。
     BGELargeZHV15,

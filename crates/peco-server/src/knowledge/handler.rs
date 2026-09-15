@@ -127,13 +127,16 @@ fn default_limit() -> i64 {
 /// 解析嵌入模型字符串为 FastembedModelTypeSerde。
 fn parse_embedding_model(s: Option<&str>) -> FastembedModelTypeSerde {
     match s {
+        Some("bge-small-zh-v15") | Some("bge-small-zh-v1.5") => {
+            FastembedModelTypeSerde::BGESmallZHV15
+        }
         Some("bge-base-zh-v15") => FastembedModelTypeSerde::BGEBaseZHV15,
         Some("bge-large-zh-v15") => FastembedModelTypeSerde::BGELargeZHV15,
         Some("all-minilm-l6-v2q") | Some("all-MiniLM-L6-v2") => {
             FastembedModelTypeSerde::AllMiniLML6V2Q
         }
         Some("multilingual-e5-small") => FastembedModelTypeSerde::MultilingualE5Small,
-        _ => FastembedModelTypeSerde::BGESmallZHV15, // 默认中文模型
+        _ => FastembedModelTypeSerde::BGEBaseZHV15, // 默认中文模型
     }
 }
 
@@ -207,7 +210,7 @@ pub async fn list_knowledge_bases(
             name: row.name.clone(),
             description: row.description.clone(),
             backend: "LanceDB".to_string(),
-            embedding_model: "BGESmallZHV15".to_string(),
+            embedding_model: "BGEBaseZHV15".to_string(),
             document_count: doc_count,
             chunk_count,
             created_at: row.created_at.clone(),
@@ -282,7 +285,7 @@ pub async fn create_knowledge_base(
         name,
         description: req.description,
         backend: "LanceDB".to_string(),
-        embedding_model: "BGESmallZHV15".to_string(),
+        embedding_model: "BGEBaseZHV15".to_string(),
         document_count: 0,
         chunk_count: 0,
         created_at: String::new(), // 由 DB 填充
@@ -329,7 +332,7 @@ pub async fn get_knowledge_base(
         name: row.name,
         description: row.description,
         backend: "LanceDB".to_string(),
-        embedding_model: "BGESmallZHV15".to_string(),
+        embedding_model: "BGEBaseZHV15".to_string(),
         document_count: doc_count,
         chunk_count,
         created_at: row.created_at,

@@ -21,7 +21,7 @@ fn default_backend() -> String {
 }
 
 fn default_embedding_model() -> String {
-    "BGESmallZHV15".into()
+    "BGEBaseZHV15".into()
 }
 
 const fn default_true() -> bool {
@@ -49,7 +49,8 @@ pub struct KnowledgeConfig {
     pub default_backend: String,
 
     /// 默认嵌入模型。
-    /// 可选 "BGESmallZHV15"、"BGELargeZHV15"、"AllMiniLML6V2Q"、"MultilingualE5Small"
+    /// 可选 "BGEBaseZHV15"（默认）、"BGESmallZHV15"、"BGELargeZHV15"、
+    /// "AllMiniLML6V2Q"、"MultilingualE5Small"
     #[serde(default = "default_embedding_model")]
     pub default_embedding_model: String,
 
@@ -133,7 +134,7 @@ mod tests {
     fn default_config_has_sane_values() {
         let cfg = KnowledgeConfig::default();
         assert_eq!(cfg.default_backend, "lancedb");
-        assert_eq!(cfg.default_embedding_model, "BGESmallZHV15");
+        assert_eq!(cfg.default_embedding_model, "BGEBaseZHV15");
         assert!(cfg.recursive_scan);
         assert!(!cfg.auto_sync_on_start);
         assert!(!cfg.watch_files);

@@ -78,7 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | 模型 | 维度 | 大小 | 适用 |
 |------|------|------|------|
-| `BGESmallZHV15` | 512 | ~100 MB | 中文（默认） |
+| `BGEBaseZHV15` | 768 | ~400 MB | 中文（默认） |
+| `BGESmallZHV15` | 512 | ~100 MB | 中文，轻量 |
 | `BGELargeZHV15` | 1024 | ~1.3 GB | 中文最佳 |
 | `AllMiniLML6V2Q` | 384 | ~80 MB | 英文 |
 | `MultilingualE5Small` | 384 | ~120 MB | 多语言 |

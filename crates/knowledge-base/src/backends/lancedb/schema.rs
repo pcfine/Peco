@@ -16,7 +16,7 @@ pub fn chunk_table_schema(ndims: usize) -> Schema {
         Field::new("page_number", DataType::UInt32, true),
         Field::new("file_type", DataType::Utf8, true),
         Field::new(
-            "embedding",
+            EMBEDDING_COL,
             DataType::FixedSizeList(
                 std::sync::Arc::new(Field::new("item", DataType::Float32, true)),
                 ndims as i32,
@@ -29,6 +29,8 @@ pub fn chunk_table_schema(ndims: usize) -> Schema {
 pub const ID_COL: &str = "id";
 pub const TEXT_COL: &str = "text";
 pub const DOCUMENT_ID_COL: &str = "document_id";
+/// 向量列 — `FixedSizeList<Float32>`，长度在表创建时固定为嵌入模型的维度。
+pub const EMBEDDING_COL: &str = "embedding";
 #[allow(dead_code)]
 pub const CONTENT_COL: &str = "content";
 #[allow(dead_code)]

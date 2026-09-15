@@ -39,6 +39,20 @@ pub enum KnowledgeError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// 已有向量表的维度与当前配置的嵌入模型不一致。
+    ///
+    /// 旧模型的向量在新模型的嵌入空间中没有任何意义，静默查询会返回
+    /// 看似正常实则错配的结果，因此打开表时必须拒绝。
+    #[error(
+        "KB '{table_name}' 的现有向量表为 {actual} 维，与配置的嵌入模型（{expected} 维）不匹配。\
+旧模型的向量不可复用：请删除该 KB 的数据目录后重建，或将配置切回原嵌入模型。"
+    )]
+    DimensionMismatch {
+        table_name: String,
+        expected: usize,
+        actual: usize,
+    },
+
     /// 内部错误（意外状态）。
     #[error("Internal error: {0}")]
     Internal(String),

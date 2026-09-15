@@ -21,7 +21,7 @@ use crate::error::KnowledgeError;
 use crate::traits::*;
 use crate::types::*;
 
-use self::schema::{DOCUMENT_ID_COL, ID_COL, TEXT_COL, chunk_table_schema};
+use self::schema::{DOCUMENT_ID_COL, EMBEDDING_COL, ID_COL, TEXT_COL, chunk_table_schema};
 
 // ---------------------------------------------------------------------------
 // LanceDbBackend
@@ -51,7 +51,26 @@ impl LanceDbBackend {
 
         let table = match db.open_table(&table_name_safe).execute().await {
             Ok(t) => {
-                info!(%table_name_safe, "Opened existing LanceDB table");
+                // 表一旦创建，向量列维度即固定 —— 换了嵌入模型的配置再打开旧表，
+                // 查询会静默错配（维度不同甚至无法比较，维度相同也语义错位）。
+                // 这里 fail-closed：宁可拒绝打开，也不返回看似正常的结果。
+                let schema = t.schema().await.map_err(|e| {
+                    KnowledgeError::Internal(format!("Failed to read LanceDB table schema: {e}"))
+                })?;
+                match vector_dim(&schema) {
+                    Some(actual) if actual != ndims => {
+                        return Err(KnowledgeError::DimensionMismatch {
+                            table_name: table_name_safe,
+                            expected: ndims,
+                            actual,
+                        });
+                    }
+                    Some(_) => info!(%table_name_safe, ndims, "Opened existing LanceDB table"),
+                    None => warn!(
+                        %table_name_safe,
+                        "Existing LanceDB table has no fixed-size vector column; dimension check skipped"
+                    ),
+                }
                 t
             }
             Err(_) => {
@@ -91,6 +110,18 @@ impl LanceDbBackend {
     }
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+}
+
+/// 读取表 schema 中向量列的固定维度。
+///
+/// 分块表只有 [`EMBEDDING_COL`] 一列为 `FixedSizeList`；列缺失或类型不符时
+/// 返回 `None`（表不是本模块创建的分块表，无从比对维度）。
+fn vector_dim(schema: &arrow_schema::Schema) -> Option<usize> {
+    let (_, field) = schema.column_with_name(EMBEDDING_COL)?;
+    match field.data_type() {
+        arrow_schema::DataType::FixedSizeList(_, dim) => Some(*dim as usize),
+        _ => None,
     }
 }
 
@@ -582,6 +613,50 @@ mod tests {
         let schema = chunk_table_schema(384);
         assert!(schema.column_with_name("id").is_some());
         assert!(schema.column_with_name("embedding").is_some());
+    }
+
+    /// 换嵌入模型后旧表必须被拒绝打开，而不是静默按新维度查询。
+    #[tokio::test]
+    async fn connect_rejects_existing_table_with_mismatched_dim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _old = LanceDbBackend::connect(tmp.path(), "dim_mismatch", 512)
+            .await
+            .unwrap();
+
+        let err = match LanceDbBackend::connect(tmp.path(), "dim_mismatch", 768).await {
+            Ok(_) => panic!("512 维旧表不应被 768 维配置打开"),
+            Err(e) => e,
+        };
+
+        match err {
+            KnowledgeError::DimensionMismatch {
+                table_name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(table_name, "dim_mismatch");
+                assert_eq!(expected, 768);
+                assert_eq!(actual, 512);
+            }
+            other => panic!("期望 DimensionMismatch，实际为 {other:?}"),
+        }
+    }
+
+    /// 回归保护：维度一致时重复打开仍然成功。
+    #[tokio::test]
+    async fn connect_reopens_table_with_matching_dim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = LanceDbBackend::connect(tmp.path(), "dim_match", 512)
+            .await
+            .unwrap();
+        assert_eq!(first.ndims, 512);
+        assert_eq!(vector_dim(&first.table.schema().await.unwrap()), Some(512));
+        drop(first);
+
+        let second = LanceDbBackend::connect(tmp.path(), "dim_match", 512)
+            .await
+            .unwrap();
+        assert_eq!(second.ndims, 512);
     }
 
     /// 成功路径不误报：存在的 id 被真正删除，不存在的 id 删除成功属正常语义。

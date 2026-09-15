@@ -475,7 +475,7 @@ async fn run_calibrate(args: &Args) -> Result<(), String> {
     // 退回 generate 时代的默认描述
     match pairs.iter().find_map(|p| p.model.as_deref()) {
         Some(m) => report.push_str(&format!("- 嵌入模型：{m}（合成集实算余弦）\n\n")),
-        None => report.push_str("- 嵌入模型：KB 配置默认（bge-small-zh-v1.5, 512 维）\n\n"),
+        None => report.push_str("- 嵌入模型：KB 配置默认（bge-base-zh-v1.5, 768 维）\n\n"),
     }
     report.push_str("| 阈值 | precision | recall | F1 |\n|---|---|---|---|\n");
     for (t, p, r, f1) in &rows {

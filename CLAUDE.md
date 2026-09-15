@@ -214,7 +214,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 
 ### knowledge-base：RAG 引擎
 
-- **摄入管道**（6 步）：解析（PDF/DOCX/HTML/MD/代码/纯文本）→ 分块（滑动窗口，句子边界对齐，默认 800 字符窗口，200 字符重叠）→ 批量嵌入（FastEmbed ONNX，默认 `bge-small-zh-v1.5`，512 维）→ 存储文档 → upsert 向量 → 全文索引 + 构建结构图谱边（`CONTAINS`、`NEXT_CHUNK`）。
+- **摄入管道**（6 步）：解析（PDF/DOCX/HTML/MD/代码/纯文本）→ 分块（滑动窗口，句子边界对齐，默认 800 字符窗口，200 字符重叠）→ 批量嵌入（FastEmbed ONNX，默认 `bge-base-zh-v1.5`，768 维）→ 存储文档 → upsert 向量 → 全文索引 + 构建结构图谱边（`CONTAINS`、`NEXT_CHUNK`）。
 - **Chunk ID 是确定性的**：`{doc_id}-{seq:04}-{sha256[0..8]}` — 幂等摄入。
 - **基于 trait 的后端抽象**：5 个 trait（`DocumentStore`、`VectorIndex`、`FullTextIndex`、`GraphStore`、`CombinedSearch`）。三种后端：`InMemoryBackend`（测试用，暴力余弦 + CJK 感知分词器）、`LanceDbBackend`（生产用，基于 Arrow）、`HelixDbBackend`（feature-gated，HTTP 客户端，带 `CombinedSearch` 快速路径实现单次往返多路搜索）。
 - **自适应 4 层检索**（`QueryAnalyzer` → `PathCalibration` → `CrossValidation` → `AdaptiveFusion`）：分类查询意图（FactLookup/Conceptual/Relational/Exploratory/ShortKeyword），校准每条路径的分数分布，跨路径交叉验证（StrongAgreement/WeakAgreement/SinglePath），并相应调整 RRF 融合权重和置信度。当 `QueryAnalyzer` 不存在时优雅降级。

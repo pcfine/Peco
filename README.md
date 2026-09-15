@@ -53,7 +53,7 @@
 - **多格式解析**：PDF、DOCX、HTML、Markdown、代码、纯文本
 - **智能分块**：滑动窗口（句子边界对齐）、固定大小、按句子
 - **混合检索**：向量搜索 + BM25 全文搜索 + 知识图谱，自适应 RRF 融合（4 层：QueryAnalyzer → PathCalibration → CrossValidation → AdaptiveFusion）
-- **本地嵌入**：FastEmbed ONNX 推理，默认 `bge-small-zh-v1.5`（中文优化，512 维）
+- **本地嵌入**：FastEmbed ONNX 推理，默认 `bge-base-zh-v1.5`（中文优化，768 维）
 - **增量同步**：基于确定性 Chunk ID（`{doc_id}-{seq}-{sha256[0..8]}`）的幂等摄入
 - **多后端**：InMemory（测试）、LanceDB（Arrow，生产）、HelixDB（feature-gated，HTTP 客户端）
 
@@ -410,7 +410,7 @@ A full-stack AI Agent platform built on **Rust + React**. Provides Agent definit
 - **Agent Engine**: Declarative `agent.md` definitions, dual-state-machine ReAct loop (outer Idle→Processing→Running→Paused, inner Prepare→Model/Stream→Tools), DAG workflow orchestration (`workflow.md` with topology-level parallelism, condition gating, minijinja templates, Continue/Abort/Pause failure policies), sub-agent orchestration (serial delegation / parallel execution), state-machine-based Session management with rollback & interrupt queue, dual persistence (FileSessionPersister for CLI, SqliteSessionPersister for server), built-in workspace templates (`--init-template`)
 - **Tool System**: 26 built-in tools (shell, fetch, full CRUD for Agents/Skills/Workflows/MCP servers, 7 KB tools), full MCP protocol support (Stdio + SSE + StreamableHTTP), auto tool discovery & sync, extensible `Tool`/`ToolDyn` trait design with `#[peco_tool]` macro
 - **Perpetual Session Context & Memory**: Rolling compaction at turn boundaries — old turns recursively merged into a structured pinned summary by a Flash model, evicted turns physically removed from Session/snapshots; single truncation point (`PecoContextFilter`: pinned summary → token-budgeted verbatim history → intact current turn); memory dual-path over a per-user `@private_memory` KB — background extraction hook (Flash model, zero blocking at turn boundary) + per-query recall with casual-query gating; explicit memory management via `@assistant → @memory` sub-agent KB tools
-- **RAG Knowledge Base**: Multi-format parsing (PDF/DOCX/HTML/MD/Code/TXT), intelligent chunking with deterministic IDs for idempotent ingestion, hybrid search (vector + BM25 + knowledge graph) with 4-layer adaptive RRF fusion, local ONNX embeddings (Chinese-optimized `bge-small-zh-v1.5`, 512-dim), three backends (InMemory/LanceDB/HelixDB)
+- **RAG Knowledge Base**: Multi-format parsing (PDF/DOCX/HTML/MD/Code/TXT), intelligent chunking with deterministic IDs for idempotent ingestion, hybrid search (vector + BM25 + knowledge graph) with 4-layer adaptive RRF fusion, local ONNX embeddings (Chinese-optimized `bge-base-zh-v1.5`, 768-dim), three backends (InMemory/LanceDB/HelixDB)
 - **Skill System**: 3-tier progressive loading (name+desc → full body → scripts/references/assets), `SKILL.md` format, automatic directory discovery
 - **Web UI**: SSE streaming chat with 9 event types, Agent CRUD, knowledge base management, workflow DAG editor with real-time execution tracking, cron task scheduling, JWT HS256 authentication (7-day expiry)
 - **Operations**: One-command deploy via `deploy.sh`, Swagger API docs, GCRA rate limiting (20 req/s default, 1 req/s for SSE), graceful shutdown
