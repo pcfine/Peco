@@ -7,21 +7,27 @@
 // 触发方（REST 手动 / cron）只负责调用 `run_once`，不经 agent 通道。
 //
 // 流水线（每轮顺序）：
-//   ① 候选收集：分页扫描 → 过滤 ppa_episodic/ppa_semantic → 取最近 batch_size 条
+//   ① 候选收集：分页扫描 → 过滤 ppa_episodic/ppa_semantic → 水位窗口选择
 //   ② 主题聚类：候选重嵌入 → 进程内两两余弦 → 连通分量（min_cluster_cos）
 //   ③ 沉淀：≥3 条 episodic 的组经 Flash 归纳为一条 semantic（原组交⑤判定）
 //   ④ 硬去重：组内 cos ≥ dedup_cos 的对保留最新一条，其余硬删 + 审计
 //   ⑤ TTL 清理：已沉淀 + 超 episodic_ttl_days 的 episodic 硬删 + 审计
-//   ⑥ 图谱补边：图后端持久化迁移验收前显式跳过
-//   ⑦ 审计与水位：删除走 outbox（pending→done/cancelled）；回写
+//   ⑥ 审计保留期清理：超 audit_retention_days 的终态审计行物理清除
+//   ⑦ 图谱补边：图后端持久化迁移验收前显式跳过
+//   ⑧ 状态回写：删除走 outbox（pending→done/cancelled）；回写
 //      memory_consolidation_state 水位与统计
+//
+// 候选水位（`last_scanned_ts`）：已覆盖区间的下界 W —— `sort_key >= W`
+// 的条目至少被完整扫描过一轮，`sort_key < W` 是尚未覆盖的存量 backlog。
+// 窗口先取 backlog 降序（越老越先补齐），不足部分由最新条目补齐；水位
+// 单调向下推进，追平后 backlog 恒空 → 回落「取最近 batch_size 条」。
 //
 // 安全护栏：
 //   - ppa_profile 永不进候选池（① 过滤）；自动删除仅限 ④⑤ 两类
 //   - ppa_semantic 只参与硬去重，不参与沉淀删除
 //   - 审计先行：审计写入失败（存储不可用）→ 拒绝删除（fail-closed）
 //   - 无数据不判定：时间源（created_at → title 毫秒）皆无 → 不参与 TTL
-//   - 机器判定基建（嵌入/聚类）不可用 → 跳过 ②③④ 并 warn，仅执行 ①⑤⑦
+//   - 机器判定基建（嵌入/聚类）不可用 → 跳过 ②③④ 并 warn，仅执行 ①⑤⑥⑧
 //   - 任一步失败 warn 后继续，不中断整轮；成本上限 max_llm_calls（Flash 档）
 
 use std::collections::HashSet;
@@ -67,6 +73,8 @@ pub struct RunStats {
     pub dedup_deleted: usize,
     /// ⑤ TTL 清理删除条数。
     pub ttl_deleted: usize,
+    /// ⑥ 审计保留期清理删除的终态审计行数。
+    pub audit_purged: usize,
     /// 本轮 Flash 调用次数。
     pub llm_calls: usize,
     /// 机器判定步骤被跳过的原因（嵌入/聚类基建不可用时非空）。
@@ -96,6 +104,60 @@ impl Candidate {
     /// 排序键：无时刻视为最旧（保守参与机器判定，不主导"保留最新"）。
     fn sort_key(&self) -> DateTime<Utc> {
         self.time.unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    }
+}
+
+/// ① 一轮候选窗口：入选候选 + 本轮推进后的水位 + 扫描基数。
+#[derive(Debug)]
+struct CandidateWindow {
+    /// 扫描到的 episodic/semantic 文档总数。
+    scanned: usize,
+    /// 入选候选（≤ batch_size）。
+    candidates: Vec<Candidate>,
+    /// 本轮推进后的水位；无候选时保留既有水位（`None` = 从未有过水位）。
+    watermark: Option<DateTime<Utc>>,
+}
+
+/// ① 候选窗口选择（纯函数）。
+///
+/// `watermark`（W）是已覆盖区间的下界：`sort_key >= W` 的条目至少被完整
+/// 扫描过一轮（fresh），`sort_key < W` 是尚未覆盖的存量（backlog，降序
+/// 即越老越先补齐）。窗口先吃 backlog，不足部分由 fresh 降序补齐 ——
+/// 存量再大也不会饿死老条目，追平后 backlog 恒空即回落「取最近」。
+/// 无水位（首轮）→ backlog 为空，等价于旧的「最近 batch_size 条」行为。
+///
+/// 新水位取 `min(旧水位, 入选最老 sort_key)`：只向下推进，已有覆盖
+/// 不回退（避免下一轮重复扫描同一批 backlog 造成震荡）。
+fn select_window(
+    all: &[Candidate],
+    watermark: Option<DateTime<Utc>>,
+    batch_size: usize,
+) -> CandidateWindow {
+    let mut sorted: Vec<Candidate> = all.to_vec();
+    sorted.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
+
+    // partition 保序 → backlog / fresh 各自仍是降序（最新在前）
+    let (backlog, fresh): (Vec<Candidate>, Vec<Candidate>) = match watermark {
+        Some(w) => sorted.into_iter().partition(|c| c.sort_key() < w),
+        None => (Vec::new(), sorted),
+    };
+
+    let mut candidates: Vec<Candidate> = backlog.into_iter().take(batch_size).collect();
+    if candidates.len() < batch_size {
+        let fill = batch_size - candidates.len();
+        candidates.extend(fresh.into_iter().take(fill));
+    }
+
+    let watermark = match candidates.iter().map(|c| c.sort_key()).min() {
+        Some(t_oldest) => Some(watermark.map_or(t_oldest, |w| w.min(t_oldest))),
+        // 无候选：本轮不含新信息，保留既有水位
+        None => watermark,
+    };
+
+    CandidateWindow {
+        scanned: all.len(),
+        candidates,
+        watermark,
     }
 }
 
@@ -338,24 +400,18 @@ impl ConsolidationWorker {
     ) -> Result<RunStats, WorkerError> {
         let mut stats = RunStats::default();
 
-        // ── ① 候选收集 ─────────────────────────────────────────────
-        let summaries = self.list_memory_summaries().await?;
-        stats.scanned = summaries.len();
-        let mut candidates: Vec<Candidate> = summaries
-            .iter()
-            .map(|s| Candidate {
-                time: parse_title_millis(&s.title).and_then(DateTime::from_timestamp_millis),
-                doc_id: s.id.clone(),
-            })
-            .collect();
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
-        candidates.truncate(self.config.batch_size);
-        stats.candidates = candidates.len();
+        // ── ① 候选收集（水位窗口）───────────────────────────────────
+        let window = self.collect_candidates(user_id).await?;
+        let watermark_str = window.watermark.map(|t| t.to_rfc3339());
+        stats.scanned = window.scanned;
+        stats.candidates = window.candidates.len();
+        let candidates = window.candidates;
         tracing::info!(
             user_id = %user_id,
             kb = %self.kb_name,
             scanned = stats.scanned,
             candidates = stats.candidates,
+            watermark = watermark_str.as_deref().unwrap_or("none"),
             "Consolidation round started"
         );
 
@@ -383,19 +439,22 @@ impl ConsolidationWorker {
         // ── ⑤ TTL 清理（不需要向量基建，恒执行）──────────────────────
         self.ttl_cleanup(user_id, now, &mut stats).await;
 
-        // ── ⑥ 图谱补边 — 图后端持久化迁移验收前显式跳过 ──────────────
+        // ── ⑥ 审计保留期清理（不需要向量基建，恒执行）────────────────
+        self.purge_audit(user_id, now, &mut stats).await;
+
+        // ── ⑦ 图谱补边 — 图后端持久化迁移验收前显式跳过 ──────────────
         tracing::debug!(
             user_id = %user_id,
             "Graph edge backfill suspended until graph backend migration is accepted"
         );
 
-        // ── ⑦ 水位与统计回写 ───────────────────────────────────────
+        // ── ⑧ 水位与统计回写 ───────────────────────────────────────
         let stats_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
         let now_str = now.to_rfc3339();
         crate::db::memory_consolidation_state::upsert_state(
             &self.db,
             user_id,
-            Some(now_str.as_str()),
+            watermark_str.as_deref(),
             Some(now_str.as_str()),
             Some(stats_json.as_str()),
         )
@@ -407,10 +466,46 @@ impl ConsolidationWorker {
             merged = stats.merged,
             dedup_deleted = stats.dedup_deleted,
             ttl_deleted = stats.ttl_deleted,
+            audit_purged = stats.audit_purged,
             llm_calls = stats.llm_calls,
             "Consolidation round finished"
         );
         Ok(stats)
+    }
+
+    /// ① 读水位 → 全量扫描 → 窗口选择。
+    async fn collect_candidates(&self, user_id: &str) -> Result<CandidateWindow, WorkerError> {
+        let watermark = self.read_watermark(user_id).await;
+        let summaries = self.list_memory_summaries().await?;
+        let all: Vec<Candidate> = summaries
+            .iter()
+            .map(|s| Candidate {
+                time: parse_title_millis(&s.title).and_then(DateTime::from_timestamp_millis),
+                doc_id: s.id.clone(),
+            })
+            .collect();
+        Ok(select_window(&all, watermark, self.config.batch_size))
+    }
+
+    /// 读候选水位；无行或时间戳解析失败 → `None`（按首轮窗口处理）。
+    ///
+    /// 读失败只 warn 不中断整轮：水位是防饥饿的调度优化，不是正确性前置，
+    /// 降级为「取最近一批」不会造成数据面损伤。
+    async fn read_watermark(&self, user_id: &str) -> Option<DateTime<Utc>> {
+        let row = match crate::db::memory_consolidation_state::get_state(&self.db, user_id).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "Watermark read failed, falling back to most-recent window"
+                );
+                return None;
+            }
+        };
+        row.and_then(|r| r.last_scanned_ts)
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| t.with_timezone(&Utc))
     }
 
     /// ① 分页扫描全库，过滤出 episodic/semantic 摘要（profile 永不入池）。
@@ -617,6 +712,30 @@ impl ConsolidationWorker {
         }
     }
 
+    /// ⑥ 审计保留期清理：物理清除超出 `audit_retention_days` 的终态审计行。
+    ///
+    /// pending 未决行不清（DAO 契约：删除流程尚未收口，原文仍需保留）。
+    /// 失败 warn 后继续 — 审计清理只影响 SQLite 体积，不参与记忆数据面，
+    /// 不应让整轮整理因此失败。
+    async fn purge_audit(&self, user_id: &str, now: DateTime<Utc>, stats: &mut RunStats) {
+        let cutoff =
+            (now - chrono::Duration::days(self.config.audit_retention_days as i64)).to_rfc3339();
+        match crate::db::memory_audit::purge_older_than(&self.db, &cutoff).await {
+            Ok(purged) => {
+                stats.audit_purged = purged as usize;
+                if purged > 0 {
+                    tracing::info!(
+                        user_id = %user_id,
+                        purged,
+                        cutoff = %cutoff,
+                        "Expired audit rows purged"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(user_id = %user_id, error = %e, "Audit purge failed"),
+        }
+    }
+
     /// 审计先行删除：pending → 删除 → done / cancelled（fail-closed）。
     async fn delete_with_audit(
         &self,
@@ -790,6 +909,71 @@ mod tests {
         )
     }
 
+    /// 构造 n 条候选：标题毫秒递增（下标越大越新，`d000` 最老）。
+    fn synthetic_candidates(n: usize) -> Vec<Candidate> {
+        (0..n)
+            .map(|i| Candidate {
+                doc_id: format!("d{i:03}"),
+                time: DateTime::from_timestamp_millis(T0 + i as i64),
+            })
+            .collect()
+    }
+
+    /// `T0` 偏移 i 毫秒的时刻。
+    fn ms(i: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(T0 + i).unwrap()
+    }
+
+    fn window_ids(window: &CandidateWindow) -> HashSet<String> {
+        window.candidates.iter().map(|c| c.doc_id.clone()).collect()
+    }
+
+    /// 读取落库的候选水位。
+    async fn stored_watermark(pool: &SqlitePool, user_id: &str) -> Option<String> {
+        crate::db::memory_consolidation_state::get_state(pool, user_id)
+            .await
+            .unwrap()
+            .and_then(|r| r.last_scanned_ts)
+    }
+
+    /// 插入一条审计行并落到指定状态（`pending` 保持未决）。
+    async fn insert_audit(
+        pool: &SqlitePool,
+        user_id: &str,
+        doc_id: &str,
+        deleted_at: &str,
+        status: &str,
+    ) -> i64 {
+        let id = crate::db::memory_audit::insert_pending(
+            pool,
+            &MemoryAuditEntry {
+                user_id: user_id.into(),
+                kb_name: KB.into(),
+                doc_id: doc_id.into(),
+                title: format!("memory_{T0}_0"),
+                content: format!("{doc_id} 的原文"),
+                source: "ppa_semantic".into(),
+                reason: REASON_TTL.into(),
+                deleted_by: DELETED_BY_WORKER.into(),
+                deleted_at: deleted_at.into(),
+            },
+        )
+        .await
+        .unwrap();
+        match status {
+            "done" => {
+                crate::db::memory_audit::mark_done(pool, id).await.unwrap();
+            }
+            "cancelled" => {
+                crate::db::memory_audit::mark_cancelled(pool, id)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        id
+    }
+
     async fn add(km: &KnowledgeManager, title: &str, content: &str, source: &str) -> String {
         km.add_text_to_kb(KB, title, content, source)
             .await
@@ -923,6 +1107,73 @@ mod tests {
         assert_eq!(pick_dedup_victims(&[0, 1], &docs, &same, 0.90), vec![0]);
     }
 
+    #[test]
+    fn select_window_catches_up_backlog_then_settles() {
+        let all = synthetic_candidates(300);
+
+        // 首轮（无水位）：回落「最近 200 条」（d100..d299），
+        // 最老 100 条尚未覆盖；水位落在窗口内最老条目 d100
+        let r1 = select_window(&all, None, 200);
+        assert_eq!(r1.scanned, 300);
+        assert_eq!(r1.candidates.len(), 200);
+        assert_eq!(r1.candidates[0].doc_id, "d299");
+        assert!(!window_ids(&r1).contains("d000"), "首轮不覆盖最老存量");
+        assert_eq!(r1.watermark, Some(ms(100)));
+
+        // 次轮：未覆盖的最老 100 条 backlog 全量入选，余量 100 由 fresh 补齐
+        let r2 = select_window(&all, r1.watermark, 200);
+        assert_eq!(r2.candidates.len(), 200);
+        let ids2 = window_ids(&r2);
+        for i in 0..100 {
+            assert!(ids2.contains(&format!("d{i:03}")), "backlog d{i:03} 应入选");
+        }
+        assert!(ids2.contains("d299"), "fresh 侧补齐最新端");
+        assert_eq!(r2.watermark, Some(ms(0)), "追平到最老存量");
+
+        // 第三轮：backlog 空 → 回落现有行为（最近 200 条），水位不回跳
+        let r3 = select_window(&all, r2.watermark, 200);
+        assert_eq!(r3.candidates.len(), 200);
+        assert_eq!(r3.candidates[0].doc_id, "d299");
+        assert!(!window_ids(&r3).contains("d000"));
+        assert_eq!(r3.watermark, r2.watermark);
+
+        // 追平后稳定：再来一轮，窗口集合与水位均不变
+        let r4 = select_window(&all, r3.watermark, 200);
+        assert_eq!(window_ids(&r4), window_ids(&r3));
+        assert_eq!(r4.watermark, r3.watermark);
+    }
+
+    #[test]
+    fn select_window_edge_cases_keep_watermark() {
+        // 空库：无候选 → 水位保持原值（首轮即无水位）
+        let empty: Vec<Candidate> = Vec::new();
+        let w = select_window(&empty, None, 200);
+        assert!(w.candidates.is_empty());
+        assert_eq!(w.watermark, None);
+        let w = select_window(&empty, Some(ms(5)), 200);
+        assert_eq!(w.watermark, Some(ms(5)), "无候选不推进水位");
+
+        // 无时间戳候选（EPOCH）视为最老 → 降序里排在有时间戳者之后
+        let all = vec![
+            Candidate {
+                doc_id: "no-ts".into(),
+                time: None,
+            },
+            Candidate {
+                doc_id: "t9".into(),
+                time: Some(ms(9)),
+            },
+        ];
+        let w = select_window(&all, Some(ms(10)), 1);
+        assert_eq!(w.candidates[0].doc_id, "t9");
+        assert_eq!(w.watermark, Some(ms(9)));
+
+        // batch_size = 0 → 不选任何候选，水位不动
+        let w = select_window(&synthetic_candidates(5), Some(ms(2)), 0);
+        assert!(w.candidates.is_empty());
+        assert_eq!(w.watermark, Some(ms(2)));
+    }
+
     // ── 集成（真实嵌入 + InMemory KB + SQLite）──────────────────────────
 
     #[tokio::test]
@@ -997,6 +1248,139 @@ mod tests {
         let stats2 = worker.run_once(USER).await.unwrap();
         assert_eq!(stats2.scanned, stats.scanned + stats.merged);
         assert_eq!(stats2.dedup_deleted + stats2.ttl_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn watermark_rounds_persist_and_settle_on_existing_stock() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+        // 关闭聚类（阈值 >1 恒不成组）：本轮只验证 ① 候选窗口与水位推进
+        let config = ConsolidationConfig {
+            min_cluster_cos: 1.1,
+            dedup_cos: 1.2,
+            ..test_config()
+        };
+        let worker = make_worker(&km, &pool, config);
+
+        // 300 条存量：标题毫秒递增（下标越大越新），内容互异避免幂等替换
+        for i in 0..300 {
+            add(
+                &km,
+                &format!("memory_{}_{i}", T0 + i),
+                &format!("The user mentioned topic number {i} during a conversation."),
+                "ppa_episodic",
+            )
+            .await;
+        }
+        let ts = |i: i64| {
+            DateTime::from_timestamp_millis(T0 + i)
+                .unwrap()
+                .to_rfc3339()
+        };
+
+        // 首轮：扫 300、选最近 200 条，水位落在窗口内最老条目
+        let s1 = worker.run_once(USER).await.unwrap();
+        assert_eq!(s1.scanned, 300);
+        assert_eq!(s1.candidates, 200);
+        assert_eq!(stored_watermark(&pool, USER).await, Some(ts(100)));
+
+        // 次轮：未覆盖的最老 100 条补齐（backlog）+ fresh 补齐窗口 → 追平
+        let s2 = worker.run_once(USER).await.unwrap();
+        assert_eq!(s2.candidates, 200);
+        assert_eq!(stored_watermark(&pool, USER).await, Some(ts(0)));
+
+        // 第三轮起：backlog 空 → 回落最近 200 条；水位不回跳，连续两轮稳定
+        let s3 = worker.run_once(USER).await.unwrap();
+        assert_eq!(s3.candidates, 200);
+        assert_eq!(stored_watermark(&pool, USER).await, Some(ts(0)));
+        let s4 = worker.run_once(USER).await.unwrap();
+        assert_eq!(s4.candidates, s3.candidates);
+        assert_eq!(stored_watermark(&pool, USER).await, Some(ts(0)));
+
+        // 聚类关闭 → 无沉淀/去重删除；保留期内审计无行可清
+        assert_eq!(s4.merged + s4.dedup_deleted + s4.ttl_deleted, 0);
+        assert_eq!(s4.audit_purged, 0);
+    }
+
+    #[tokio::test]
+    async fn run_once_purges_only_expired_terminal_audit_rows() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+        let worker = make_worker(&km, &pool, test_config()); // 保留期 90 天
+
+        let now = Utc::now();
+        let expired = (now - Duration::days(120)).to_rfc3339();
+        let recent = (now - Duration::days(10)).to_rfc3339();
+        let old_done = insert_audit(&pool, USER, "doc-old-done", &expired, "done").await;
+        let old_cancelled =
+            insert_audit(&pool, USER, "doc-old-cancelled", &expired, "cancelled").await;
+        let old_pending = insert_audit(&pool, USER, "doc-old-pending", &expired, "pending").await;
+        let recent_done = insert_audit(&pool, USER, "doc-recent-done", &recent, "done").await;
+
+        let stats = worker.run_once(USER).await.unwrap();
+        assert_eq!(stats.audit_purged, 2, "只清保留期外的终态行");
+
+        assert!(
+            crate::db::memory_audit::get(&pool, old_done)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::db::memory_audit::get(&pool, old_cancelled)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // pending 未决行与保留期内行不受影响
+        assert!(
+            crate::db::memory_audit::get(&pool, old_pending)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::db::memory_audit::get(&pool, recent_done)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // 统计落库 JSON 含 audit_purged
+        let state = crate::db::memory_consolidation_state::get_state(&pool, USER)
+            .await
+            .unwrap()
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(state.last_run_stats.as_deref().unwrap()).unwrap();
+        assert_eq!(saved["audit_purged"], 2);
+    }
+
+    #[tokio::test]
+    async fn run_once_keeps_audit_rows_within_long_retention() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+        // 保留期极大 → 截止时刻远早于任何审计行 → 零删除
+        let config = ConsolidationConfig {
+            audit_retention_days: 100_000,
+            ..test_config()
+        };
+        let worker = make_worker(&km, &pool, config);
+
+        let expired = (Utc::now() - Duration::days(120)).to_rfc3339();
+        insert_audit(&pool, USER, "doc-old-done", &expired, "done").await;
+        insert_audit(&pool, USER, "doc-old-pending", &expired, "pending").await;
+
+        let stats = worker.run_once(USER).await.unwrap();
+        assert_eq!(stats.audit_purged, 0);
+        assert_eq!(
+            crate::db::memory_audit::list_by_user(&pool, USER, 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "保留期内审计行全部保留"
+        );
     }
 
     #[tokio::test]
