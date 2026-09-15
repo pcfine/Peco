@@ -19,6 +19,7 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use super::config::MemoryConfig;
+use super::dedup::{greedy_dedup_indices, rerank_score};
 
 /// 记忆召回读路径。
 ///
@@ -47,6 +48,55 @@ impl MemoryRecallContext {
         }
     }
 
+    /// 命中后的去重与重排（`format_memories` 之前）。
+    ///
+    /// - shadow（`dedup_enforce == false`）：不嵌入、不去重，只做重排；
+    /// - enforce：一次批量嵌入全部命中 snippet，按 score 降序贪心剔除
+    ///   近重复（余弦 ≥ `dedup_cos` 只留 score 最高一条），再去重后重排；
+    ///   去重后不足 top-k **不回补**（相似条目本就不提供额外信息）；
+    /// - 嵌入不可用或返回条数不符 → 原序返回：去重是增益而非正确性前置，
+    ///   不得因基建故障改变召回行为。
+    async fn dedup_and_rerank(
+        &self,
+        results: Vec<knowledge_base::SearchResult>,
+    ) -> Vec<knowledge_base::SearchResult> {
+        let now = chrono::Utc::now();
+        let half_life_days = self.config.recall_half_life_days;
+        if !self.config.consolidation.dedup_enforce || results.len() < 2 {
+            return rerank(results, half_life_days, now);
+        }
+
+        let texts: Vec<String> = results.iter().map(|r| r.snippet.clone()).collect();
+        let vectors = match self.km.embed_texts(&self.config.kb_name, &texts).await {
+            Ok(v) if v.len() == results.len() => v,
+            Ok(v) => {
+                warn!(
+                    expected = results.len(),
+                    got = v.len(),
+                    "Recall dedup embedding count mismatch, keeping original order"
+                );
+                return results;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    kb = %self.config.kb_name,
+                    "Recall dedup embedding failed, keeping original order"
+                );
+                return results;
+            }
+        };
+
+        let mut order: Vec<usize> = (0..results.len()).collect();
+        order.sort_by(|&a, &b| results[b].score.total_cmp(&results[a].score));
+        let kept = greedy_dedup_indices(&vectors, &order, self.config.consolidation.dedup_cos);
+        let deduped: Vec<knowledge_base::SearchResult> = kept
+            .into_iter()
+            .filter_map(|i| results.get(i).cloned())
+            .collect();
+        rerank(deduped, half_life_days, now)
+    }
+
     /// 后台记账本轮命中的 doc_id 集合（零阻塞，失败仅 warn）。
     fn record_hits(&self, doc_ids: Vec<String>) {
         let Some(db) = self.db.clone() else {
@@ -67,6 +117,32 @@ impl MemoryRecallContext {
             }
         });
     }
+}
+
+/// 重排：`score * 类别权重 * 时间衰减` 降序。
+///
+/// 稳定排序 —— 重排分相同时保持检索原序。不入库、不记账，纯计算。
+fn rerank(
+    results: Vec<knowledge_base::SearchResult>,
+    half_life_days: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<knowledge_base::SearchResult> {
+    let mut scored: Vec<(f32, knowledge_base::SearchResult)> = results
+        .into_iter()
+        .map(|r| {
+            let s = rerank_score(
+                r.score,
+                &r.source_path,
+                &r.title,
+                &r.snippet,
+                now,
+                half_life_days,
+            );
+            (s, r)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.into_iter().map(|(_, r)| r).collect()
 }
 
 /// 零成本闲聊门控：纯问候/感谢关键词规则，命中则不检索不调 LLM。
@@ -161,6 +237,7 @@ impl DynamicContext for MemoryRecallContext {
             self.record_hits(doc_ids);
         }
 
+        let results = self.dedup_and_rerank(results).await;
         format_memories(&results, self.config.injection_token_cap)
     }
 }
@@ -229,6 +306,36 @@ mod tests {
         assert_eq!(category_label("ppa_semantic"), "事实");
         assert_eq!(category_label("ppa_episodic"), "事项");
         assert_eq!(category_label("uploaded/doc.md"), "记忆");
+    }
+
+    /// 构造检索结果（测试专用；`title` 为空表示无可读时间源）。
+    fn result(
+        snippet: &str,
+        source: &str,
+        score: f32,
+        title: &str,
+    ) -> knowledge_base::SearchResult {
+        knowledge_base::SearchResult {
+            document_id: format!("{source}-{snippet}"),
+            title: title.to_string(),
+            snippet: snippet.to_string(),
+            score,
+            source_path: source.to_string(),
+            match_sources: vec![],
+            confidence: knowledge_base::ConfidenceLevel::High,
+            diagnostic: None,
+        }
+    }
+
+    /// 去重门控配置（`dedup_cos` 与写路径同档）。
+    fn dedup_config(enforce: bool) -> MemoryConfig {
+        MemoryConfig {
+            consolidation: super::super::config::ConsolidationConfig {
+                dedup_enforce: enforce,
+                ..Default::default()
+            },
+            ..MemoryConfig::default()
+        }
     }
 
     #[test]
@@ -368,6 +475,114 @@ mod tests {
         .map(|(_, c)| c)
         .collect();
         assert!(counts.iter().any(|c| *c >= 2), "重复召回应累加: {counts:?}");
+    }
+
+    // ── 读路径去重与重排（Stage 4 / 事项 5）──────────────────────────────
+
+    /// 两条近重复记忆（标点变体，余弦 ≈1.0）+ 一条互异记忆。
+    async fn make_km_with_near_duplicates() -> Arc<KnowledgeManager> {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_kb_config("@private_memory"))
+            .await
+            .unwrap();
+        km.add_text_to_kb(
+            "@private_memory",
+            "m1",
+            "The user prefers strong coffee in the morning.",
+            "ppa_profile",
+        )
+        .await
+        .unwrap();
+        km.add_text_to_kb(
+            "@private_memory",
+            "m2",
+            "The user prefers strong coffee in the morning!",
+            "ppa_profile",
+        )
+        .await
+        .unwrap();
+        std::mem::forget(tmp);
+        km
+    }
+
+    /// `days_ago` 天前的 title 毫秒时间源。
+    fn title_days_ago(days: i64) -> String {
+        let ts = chrono::Utc::now() - chrono::Duration::days(days);
+        format!("memory_{}_0", ts.timestamp_millis())
+    }
+
+    const QUERY: &str = "What kind of coffee does the user prefer in the morning?";
+
+    #[tokio::test]
+    async fn test_recall_dedup_enforce_drops_near_duplicate() {
+        let km = make_km_with_near_duplicates().await;
+        let ctx = MemoryRecallContext::new(km, dedup_config(true), "dedup-user".to_string(), None);
+
+        let out = ctx.query(QUERY).await.expect("命中应返回注入文本");
+        assert_eq!(
+            out.matches("strong coffee").count(),
+            1,
+            "enforce 下近重复只保留 score 最高一条:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_shadow_keeps_near_duplicates() {
+        let km = make_km_with_near_duplicates().await;
+        let ctx =
+            MemoryRecallContext::new(km, dedup_config(false), "shadow-user".to_string(), None);
+
+        let out = ctx.query(QUERY).await.expect("命中应返回注入文本");
+        assert_eq!(
+            out.matches("strong coffee").count(),
+            2,
+            "shadow 只重排不去重:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_shadow_reranks_profile_above_stale_episodic() {
+        // shadow 不嵌入 → 用不存在的 KB 也能走到重排（重排是纯计算）
+        let tmp = tempfile::tempdir().unwrap();
+        let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
+        km.ensure_loaded().await.unwrap();
+        std::mem::forget(tmp);
+
+        let ctx =
+            MemoryRecallContext::new(km, dedup_config(false), "rerank-user".to_string(), None);
+        let results = vec![
+            result("陈旧事项", "ppa_episodic", 1.0, &title_days_ago(365)),
+            result("新鲜偏好", "ppa_profile", 1.0, &title_days_ago(0)),
+        ];
+
+        let ordered = ctx.dedup_and_rerank(results).await;
+        assert_eq!(
+            ordered[0].snippet, "新鲜偏好",
+            "同分下 profile 权重应压过一年前的 episodic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recall_embed_failure_returns_original_order() {
+        // KB 不存在 → enforce 路径嵌入失败 → 原序返回，不得影响对话
+        let tmp = tempfile::tempdir().unwrap();
+        let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
+        km.ensure_loaded().await.unwrap();
+        std::mem::forget(tmp);
+
+        let ctx =
+            MemoryRecallContext::new(km, dedup_config(true), "fallback-user".to_string(), None);
+        let results = vec![
+            result("第一条", "ppa_profile", 0.1, &title_days_ago(365)),
+            result("第二条", "ppa_profile", 0.9, &title_days_ago(0)),
+        ];
+
+        let ordered = ctx.dedup_and_rerank(results.clone()).await;
+        let before: Vec<&str> = results.iter().map(|r| r.snippet.as_str()).collect();
+        let after: Vec<&str> = ordered.iter().map(|r| r.snippet.as_str()).collect();
+        assert_eq!(after, before, "嵌入不可用时保持检索原序");
     }
 
     #[tokio::test]

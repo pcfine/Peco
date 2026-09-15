@@ -19,6 +19,7 @@
 pub mod analyzer;
 pub mod config;
 pub mod consolidation;
+pub mod dedup;
 pub mod hook;
 pub mod recall;
 

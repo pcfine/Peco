@@ -175,14 +175,28 @@ fn select_window(
 /// 生产路径实际生效的是 hook 写入的 title 毫秒解析；@memory agent 合并
 /// 写入的文档标题自拟，退到 footer 一级。
 pub fn doc_time(doc: &knowledge_base::Document) -> Option<DateTime<Utc>> {
-    if let Some(created_at) = &doc.metadata.created_at
+    time_from_parts(doc.metadata.created_at.as_deref(), &doc.title, &doc.content)
+}
+
+/// 时间源优先级链的共享核心：`created_at`（ISO 8601）→ title 毫秒 →
+/// `[captured-at: ...]` footer → `None`。
+///
+/// 与 [`doc_time`] 同链，只是入参从整篇文档拆成三个可读字段 —— 读路径
+/// 只有 `search_kb` 返回的 `(title, snippet)`（`SearchResult` 不带
+/// metadata），共用同一份实现避免两条路径的时间口径分叉。
+pub fn time_from_parts(
+    created_at: Option<&str>,
+    title: &str,
+    content: &str,
+) -> Option<DateTime<Utc>> {
+    if let Some(created_at) = created_at
         && let Ok(t) = DateTime::parse_from_rfc3339(created_at)
     {
         return Some(t.with_timezone(&Utc));
     }
-    parse_title_millis(&doc.title)
+    parse_title_millis(title)
         .and_then(DateTime::from_timestamp_millis)
-        .or_else(|| parse_captured_at(&doc.content))
+        .or_else(|| parse_captured_at(content))
 }
 
 /// 从 title `memory_{millis}_{seq}` 解析毫秒时间戳。

@@ -14,6 +14,7 @@
 // spawn 前数据全部转 owned，无借用问题；单用户场景写入乱序风险可接受。
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,8 +24,9 @@ use peco_core::knowledge::KnowledgeManager;
 use peco_core::session::Session;
 use tracing::{info, warn};
 
-use super::analyzer::TurnAnalyzer;
+use super::analyzer::{MemoryFact, TurnAnalyzer};
 use super::config::MemoryConfig;
+use super::dedup::max_cosine;
 
 /// 记忆提取写路径。
 pub struct MemoryExtractionHook {
@@ -80,6 +82,87 @@ impl MemoryExtractionHook {
         }
         Some(dialogue)
     }
+
+    /// 写路径近重复判定：一次批量嵌入后，逐条求「同类目既有记忆」的
+    /// 最大余弦，返回与 `facts` 等长的标记（`true` = 近重复）。
+    ///
+    /// 同类目 = fact 的 `ppa_{category}` 与既有 snippet 的 `source` 一致。
+    /// 返回 `None` 表示嵌入基建不可用 —— 调用方降级放行全部，嵌入故障
+    /// 不得阻塞写路径。
+    async fn near_duplicate_flags(
+        km: &KnowledgeManager,
+        kb_name: &str,
+        facts: &[MemoryFact],
+        existing: &[(String, String)],
+        dedup_cos: f32,
+    ) -> Option<Vec<bool>> {
+        let categories: HashSet<String> = facts.iter().map(source_of).collect();
+
+        // 同类目既有片段：跨 fact 去重（同一片段可能被多条同类别 fact 引用），
+        // 空白片段不参与嵌入
+        let mut seen: HashSet<&str> = HashSet::new();
+        let same_category: Vec<&(String, String)> = existing
+            .iter()
+            .filter(|(src, snippet)| {
+                categories.contains(src)
+                    && !snippet.trim().is_empty()
+                    && seen.insert(snippet.as_str())
+            })
+            .collect();
+
+        let mut texts: Vec<String> = facts.iter().map(|f| f.content.clone()).collect();
+        texts.extend(same_category.iter().map(|(_, snippet)| snippet.clone()));
+
+        let vectors = match km.embed_texts(kb_name, &texts).await {
+            Ok(v) if v.len() == texts.len() => v,
+            Ok(v) => {
+                warn!(
+                    expected = texts.len(),
+                    got = v.len(),
+                    "Embedding count mismatch, dedup check skipped"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    kb = %kb_name,
+                    "Embedding unavailable, dedup check skipped (writing as-is)"
+                );
+                return None;
+            }
+        };
+
+        let (fact_vectors, existing_vectors) = vectors.split_at(facts.len());
+        let mut by_category: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+        for ((src, _), vector) in same_category.iter().zip(existing_vectors) {
+            by_category
+                .entry(src.clone())
+                .or_default()
+                .push(vector.clone());
+        }
+
+        // 无同类目既有记忆 → 空候选（max_cosine 恒 0.0，不判重）
+        let no_candidates: Vec<Vec<f32>> = Vec::new();
+        Some(
+            facts
+                .iter()
+                .enumerate()
+                .map(|(i, fact)| {
+                    let Some(vector) = fact_vectors.get(i) else {
+                        return false;
+                    };
+                    let others = by_category.get(&source_of(fact)).unwrap_or(&no_candidates);
+                    max_cosine(vector, others) >= dedup_cos
+                })
+                .collect(),
+        )
+    }
+}
+
+/// fact 对应的 KB source 标签（与写入时一致）。
+fn source_of(fact: &MemoryFact) -> String {
+    format!("ppa_{}", fact.category.as_str())
 }
 
 #[async_trait]
@@ -111,20 +194,26 @@ impl LooperHook for MemoryExtractionHook {
             // 提取前检索既有相关记忆（进入 prompt 抑制重复提取）。
             // 检索失败不阻断 — 只是失去去重提示。
             let query = dialogue.chars().take(200).collect::<String>();
-            let existing: Vec<String> = match km
+            // 保留 (source_path, snippet) 两份视图：snippet 序列进 analyzer
+            // 抑制重复提取，source_path 供写前近重复判定按类目比对
+            let existing: Vec<(String, String)> = match km
                 .search_kb(&config.kb_name, &query, config.extraction_top_k)
                 .await
             {
-                Ok(results) => results.into_iter().map(|r| r.snippet).collect(),
+                Ok(results) => results
+                    .into_iter()
+                    .map(|r| (r.source_path, r.snippet))
+                    .collect(),
                 Err(e) => {
                     warn!(error = %e, kb = %config.kb_name, "Pre-extraction recall failed (proceeding without existing memories)");
                     Vec::new()
                 }
             };
+            let existing_snippets: Vec<String> = existing.iter().map(|(_, s)| s.clone()).collect();
 
             let analyzed = tokio::time::timeout(
                 std::time::Duration::from_secs(config.analyzer_timeout_secs),
-                analyzer.analyze(&dialogue, &existing),
+                analyzer.analyze(&dialogue, &existing_snippets),
             )
             .await;
 
@@ -146,11 +235,40 @@ impl LooperHook for MemoryExtractionHook {
                 return;
             }
 
+            // 写前近重复判定（shadow 下只记日志）。嵌入不可用 → None → 全部放行
+            let duplicates = Self::near_duplicate_flags(
+                &km,
+                &config.kb_name,
+                &facts,
+                &existing,
+                config.consolidation.dedup_cos,
+            )
+            .await
+            .unwrap_or_else(|| vec![false; facts.len()]);
+            let enforce = config.consolidation.dedup_enforce;
+
             // KB 由 personal 模板幂等安装保证存在；缺失（NotFound）按非致命处理
             let base_ts = chrono::Utc::now().timestamp_millis();
             for (i, fact) in facts.iter().enumerate() {
+                let source = source_of(fact);
+                if duplicates.get(i).copied().unwrap_or(false) {
+                    if enforce {
+                        info!(
+                            kb = %config.kb_name,
+                            category = fact.category.as_str(),
+                            content = %fact.content,
+                            "Near-duplicate memory skipped (dedup enforce)"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        kb = %config.kb_name,
+                        category = fact.category.as_str(),
+                        content = %fact.content,
+                        "dedup shadow: near-duplicate memory would be suppressed (written anyway)"
+                    );
+                }
                 let title = format!("memory_{base_ts}_{i}");
-                let source = format!("ppa_{}", fact.category.as_str());
                 match km
                     .add_text_to_kb(&config.kb_name, &title, &fact.content, &source)
                     .await
@@ -233,6 +351,52 @@ mod tests {
             extraction_top_k: 3,
             ..MemoryConfig::default()
         }
+    }
+
+    /// 去重门控配置：`dedup_cos` 取 0.9（与既有 consolidation 测试同档，
+    /// 标点变体近重复对实测 ≈0.999）。
+    fn dedup_config(enforce: bool) -> MemoryConfig {
+        MemoryConfig {
+            analyze_min_chars: 10,
+            extraction_top_k: 3,
+            consolidation: super::super::config::ConsolidationConfig {
+                dedup_enforce: enforce,
+                dedup_cos: 0.9,
+                ..Default::default()
+            },
+            ..MemoryConfig::default()
+        }
+    }
+
+    /// 已有一条既有记忆的 KB（写路径去重的比对对象）。
+    async fn make_km_with_existing(
+        title: &str,
+        content: &str,
+        source: &str,
+    ) -> Arc<KnowledgeManager> {
+        let km = make_km().await;
+        km.add_text_to_kb("@private_memory", title, content, source)
+            .await
+            .unwrap();
+        km
+    }
+
+    /// 轮询等待后台任务被分析器调用（`on_turn_complete` 的 spawn 是异步的）。
+    async fn wait_for_analyzer(analyzer: &MockAnalyzer) {
+        for _ in 0..100 {
+            if !analyzer.calls.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("分析器应在超时前被调用");
+    }
+
+    async fn doc_count(km: &KnowledgeManager) -> usize {
+        km.list_documents("@private_memory", 0, 100)
+            .await
+            .unwrap()
+            .len()
     }
 
     /// 构造一个已提交一轮对话的 session（User + Assistant 文本）。
@@ -361,5 +525,139 @@ mod tests {
             1,
             "提取器应被调用一次"
         );
+    }
+
+    // ── 写路径去重（Stage 4 / 事项 5）────────────────────────────────────
+
+    /// 既有记忆与本轮提取结果近重复（标点变体，余弦 ≈1.0）。
+    const EXISTING: &str = "The user prefers concise answers when discussing Rust.";
+    const NEAR_DUP: &str = "The user prefers concise answers when discussing Rust!";
+
+    fn near_dup_facts() -> Vec<MemoryFact> {
+        vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: NEAR_DUP.to_string(),
+        }]
+    }
+
+    fn dedup_session() -> Session {
+        make_session_with_turn(
+            "Please remember that I prefer concise answers when discussing Rust topics.",
+            "Got it — I will keep answers about Rust concise from now on.",
+        )
+    }
+
+    #[tokio::test]
+    async fn dedup_enforce_skips_near_duplicate_write() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let analyzer = Arc::new(MockAnalyzer::ok(near_dup_facts()));
+        let hook = MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), dedup_config(true));
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_analyzer(&analyzer).await;
+        // 判定后无写入发生 —— 留足后台任务收尾时间再断言
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        assert_eq!(
+            doc_count(&km).await,
+            1,
+            "enforce 下近重复事实不得写入（仅存量那条）"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_shadow_writes_near_duplicate() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let analyzer = Arc::new(MockAnalyzer::ok(near_dup_facts()));
+        let hook =
+            MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), dedup_config(false));
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+
+        // shadow：判定照算、日志照记，但写入照常发生 → 条数增至 2
+        for _ in 0..100 {
+            if doc_count(&km).await == 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("shadow 模式下近重复事实应照常写入");
+    }
+
+    #[tokio::test]
+    async fn dedup_ignores_other_categories() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        // 同样的文本但归为 episodic → 与既有 ppa_profile 不同类目，不判重
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![MemoryFact {
+            category: MemoryCategory::Episodic,
+            content: NEAR_DUP.to_string(),
+        }]));
+        let hook = MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), dedup_config(true));
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+
+        for _ in 0..100 {
+            if doc_count(&km).await == 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("跨类目不判重，事实应照常写入");
+    }
+
+    #[tokio::test]
+    async fn dedup_check_degrades_when_embedding_unavailable() {
+        // KB 不存在 → embed_texts 失败 → 返回 None（调用方降级放行全部）
+        let tmp = tempfile::tempdir().unwrap();
+        let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
+        km.ensure_loaded().await.unwrap();
+        std::mem::forget(tmp);
+
+        let flags = MemoryExtractionHook::near_duplicate_flags(
+            &km,
+            "@private_memory",
+            &near_dup_facts(),
+            &[("ppa_profile".to_string(), EXISTING.to_string())],
+            0.9,
+        )
+        .await;
+        assert!(flags.is_none(), "嵌入不可用应返回 None 供调用方降级放行");
+    }
+
+    #[tokio::test]
+    async fn dedup_flags_only_same_category_near_duplicates() {
+        let km = make_km().await;
+        let facts = vec![
+            MemoryFact {
+                category: MemoryCategory::Profile,
+                content: NEAR_DUP.to_string(),
+            },
+            MemoryFact {
+                category: MemoryCategory::Semantic,
+                content: "The user's primary programming language is Rust.".to_string(),
+            },
+        ];
+        let existing = vec![
+            ("ppa_profile".to_string(), EXISTING.to_string()),
+            (
+                "ppa_semantic".to_string(),
+                "The user commutes by bicycle every day.".to_string(),
+            ),
+        ];
+
+        let flags = MemoryExtractionHook::near_duplicate_flags(
+            &km,
+            "@private_memory",
+            &facts,
+            &existing,
+            0.9,
+        )
+        .await
+        .expect("KB 存在时嵌入可用");
+
+        assert_eq!(flags, vec![true, false], "只对同类目近重复置位");
     }
 }

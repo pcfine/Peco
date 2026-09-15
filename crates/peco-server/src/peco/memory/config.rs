@@ -38,6 +38,11 @@ pub struct ConsolidationConfig {
     pub recall_fresh_days: u64,
     /// 审计行保留期（天）：终态审计行超过该期物理清除。
     pub audit_retention_days: u64,
+    /// 去重执行开关（读写双路径共用）。
+    ///
+    /// `false`（默认）= shadow：判定照常计算并记日志，但写路径照常写入、
+    /// 读路径只重排不去重。标定报告人工抽检通过前必须保持 `false`。
+    pub dedup_enforce: bool,
 }
 
 impl Default for ConsolidationConfig {
@@ -54,6 +59,7 @@ impl Default for ConsolidationConfig {
             cron_expr: "*/30 * * * *".to_string(),
             recall_fresh_days: 14,
             audit_retention_days: 90,
+            dedup_enforce: false,
         }
     }
 }
@@ -81,6 +87,11 @@ pub struct MemoryConfig {
     pub injection_token_cap: usize,
     /// 单次提取调用的超时（秒）。
     pub analyzer_timeout_secs: u64,
+    /// 读路径重排的 episodic 半衰期（天）。
+    ///
+    /// `recency_factor = 0.5^(age_days / recall_half_life_days)`，只作用于
+    /// episodic（事件类记忆随时间失效）；profile/semantic 不衰减。
+    pub recall_half_life_days: u64,
     /// 自动整理（巩固流水线）配置。
     pub consolidation: ConsolidationConfig,
 }
@@ -96,6 +107,7 @@ impl Default for MemoryConfig {
             recall_top_k: 5,
             injection_token_cap: 1000,
             analyzer_timeout_secs: 10,
+            recall_half_life_days: 30,
             consolidation: ConsolidationConfig::default(),
         }
     }
@@ -115,6 +127,7 @@ mod tests {
         // P5-T1：召回窗口 3 → 5、注入上限 800 → 1000（实测见 reports/）
         assert_eq!(c.recall_top_k, 5);
         assert_eq!(c.injection_token_cap, 1000);
+        assert_eq!(c.recall_half_life_days, 30);
     }
 
     #[test]
@@ -134,5 +147,7 @@ mod tests {
         assert_eq!(c.cron_expr, "*/30 * * * *");
         assert_eq!(c.recall_fresh_days, 14);
         assert_eq!(c.audit_retention_days, 90);
+        // shadow 优先 — 标定报告人工抽检通过前保持 false
+        assert!(!c.dedup_enforce);
     }
 }
