@@ -40,6 +40,14 @@ pub struct ConsolidationConfig {
     pub cron_expr: String,
     /// "近期召回"窗口（天）：`last_recalled_at` 距今超过该窗口视为无近期召回。
     pub recall_fresh_days: u64,
+    /// 召回统计观察期（天）：统计缺失（从未召回或统计面缺损）的条目
+    /// 须达到该条目龄才视为"无召回"可删 —— 统计缺失 ≠ 无召回。
+    ///
+    /// 与 `episodic_ttl_days` 同为条目龄门槛，二者取大者生效：默认
+    /// 30 < 60（TTL），观察期被 TTL 完全覆盖，缺失统计的条目自动回落
+    /// 双条件（已沉淀 + 超 TTL）；仅当运维把观察期调得比 TTL 更长时，
+    /// 该分支才额外多拦一段。
+    pub recall_observation_days: u64,
     /// 审计行保留期（天）：终态审计行超过该期物理清除。
     pub audit_retention_days: u64,
     /// 去重执行开关（读写双路径共用）。
@@ -62,6 +70,7 @@ impl Default for ConsolidationConfig {
             idle_after_secs: 600,
             cron_expr: "0 */30 * * * *".to_string(),
             recall_fresh_days: 14,
+            recall_observation_days: 30,
             audit_retention_days: 90,
             dedup_enforce: false,
         }
@@ -151,6 +160,7 @@ mod tests {
         // 6 字段（含秒）：调度器要求 with_seconds_required
         assert_eq!(c.cron_expr, "0 */30 * * * *");
         assert_eq!(c.recall_fresh_days, 14);
+        assert_eq!(c.recall_observation_days, 30);
         assert_eq!(c.audit_retention_days, 90);
         // shadow 优先 — 标定报告人工抽检通过前保持 false
         assert!(!c.dedup_enforce);

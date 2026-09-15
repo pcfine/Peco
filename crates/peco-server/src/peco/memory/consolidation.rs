@@ -11,7 +11,8 @@
 //   ② 主题聚类：候选重嵌入 → 进程内两两余弦 → 连通分量（min_cluster_cos）
 //   ③ 沉淀：≥3 条 episodic 的组经 Flash 归纳为一条 semantic（原组交⑤判定）
 //   ④ 硬去重：组内 cos ≥ dedup_cos 的对保留最新一条，其余硬删 + 审计
-//   ⑤ TTL 清理：已沉淀 + 超 episodic_ttl_days 的 episodic 硬删 + 审计
+//   ⑤ TTL 清理：已沉淀 + 超 episodic_ttl_days + 无近期召回的 episodic
+//      硬删 + 审计（统计缺失者须出观察期，见 `ttl_eligible`）
 //   ⑥ 审计保留期清理：超 audit_retention_days 的终态审计行物理清除
 //   ⑦ 图谱补边：图后端持久化迁移验收前显式跳过
 //   ⑧ 状态回写：删除走 outbox（pending→done/cancelled）；回写
@@ -31,7 +32,7 @@
 //   - 机器判定基建（嵌入/聚类）不可用 → 跳过 ②③④ 并 warn，仅执行 ①⑤⑥⑧
 //   - 任一步失败 warn 后继续，不中断整轮；成本上限 max_llm_calls（Flash 档）
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -206,13 +207,53 @@ pub fn parse_title_millis(title: &str) -> Option<i64> {
     millis_str.parse::<i64>().ok()
 }
 
-/// TTL 到期判定（纯函数，显式传 `now`）。
+/// 条目龄（整天，`now − t`；时间倒挂时为负）。
+fn age_days(now: DateTime<Utc>, t: DateTime<Utc>) -> i64 {
+    now.signed_duration_since(t).num_days()
+}
+
+/// TTL 到期判定（纯函数，显式传 `now`）—— 三条件里的时间门槛本身，
+/// 清理决策请走 [`ttl_eligible`]（另含召回统计门控）。
 ///
 /// 时间源不可得（`doc_time == None`）→ 不清理（无数据不判定）。
 pub fn is_ttl_expired(doc: &knowledge_base::Document, now: DateTime<Utc>, ttl_days: u64) -> bool {
-    doc_time(doc)
-        .map(|t| now.signed_duration_since(t).num_days() >= ttl_days as i64)
-        .unwrap_or(false)
+    doc_time(doc).is_some_and(|t| age_days(now, t) >= ttl_days as i64)
+}
+
+/// ⑤ TTL 三条件判定（纯函数，显式传 `now`）：**超 TTL && 无近期召回 &&
+/// 非观察期保守分支**才可删。
+///
+/// - `doc_time`：四级时间源解析结果；`None` → 无数据不判定，不删；
+/// - `last_recalled_at`：该文档的召回统计时刻串；`None` = 统计缺失；
+/// - 近期召回（stat 存在且 `now − last_recalled_at < fresh_days`）→ 不删；
+///   `last_recalled_at` 解析失败 → 视为近期召回（保守不删，统计面不可信
+///   时不误删）；
+/// - 统计缺失 ≠ 无召回：条目龄未达 `observation_days` → 不删（观察期保守
+///   分支）；达龄后视为无召回，回落「已沉淀 + 超 TTL」双条件。
+///
+/// 「已沉淀」判定依赖 semantic footer 集合，留在调用侧（本函数只吃时间与
+/// 召回统计两路输入）。
+pub fn ttl_eligible(
+    doc_time: Option<DateTime<Utc>>,
+    last_recalled_at: Option<&str>,
+    now: DateTime<Utc>,
+    ttl_days: u64,
+    fresh_days: u64,
+    observation_days: u64,
+) -> bool {
+    let Some(doc_time) = doc_time else {
+        return false;
+    };
+    let doc_age = age_days(now, doc_time);
+    if doc_age < ttl_days as i64 {
+        return false;
+    }
+    match last_recalled_at {
+        Some(ts) => DateTime::parse_from_rfc3339(ts)
+            .map(|t| age_days(now, t.with_timezone(&Utc)) >= fresh_days as i64)
+            .unwrap_or(false),
+        None => doc_age >= observation_days as i64,
+    }
 }
 
 /// 解析沉淀文档内容尾部的溯源标记，返回原组 doc_id 列表。
@@ -714,10 +755,12 @@ impl ConsolidationWorker {
         }
     }
 
-    /// ⑤ TTL 清理：已沉淀（被 semantic footer 引用）+ 超 TTL 的 episodic。
+    /// ⑤ TTL 清理：已沉淀（被 semantic footer 引用）+ 超 TTL + 无近期召回
+    /// 的 episodic（详见 [`ttl_eligible`]）。
     ///
     /// 与水位无关 — TTL 判定需要看到老文档，每次全量扫描 episodic。
-    /// 三个保守分支：时间源皆无不清理；未被沉淀引用不清理；semantic
+    /// 四个保守分支：时间源皆无不清理；未被沉淀引用不清理；近期召回过不
+    /// 清理；统计缺失且未出观察期不清理（统计缺失 ≠ 无召回）。semantic
     /// 本身不清理（只参与硬去重）。
     async fn ttl_cleanup(&self, user_id: &str, now: DateTime<Utc>, stats: &mut RunStats) {
         let summaries = match self.list_memory_summaries().await {
@@ -736,11 +779,22 @@ impl ConsolidationWorker {
             }
         }
 
+        // 召回统计：单查询批量读入内存，逐条判定不再查库
+        let recall_stats = self.load_recall_stats(user_id).await;
+
         for s in summaries.iter().filter(|s| s.source_path == "ppa_episodic") {
             let Ok(Some(doc)) = self.km.get_document(&self.kb_name, &s.id).await else {
                 continue;
             };
-            if !is_ttl_expired(&doc, now, self.config.episodic_ttl_days) {
+            let stat = recall_stats.get(&doc.id).map(String::as_str);
+            if !ttl_eligible(
+                doc_time(&doc),
+                stat,
+                now,
+                self.config.episodic_ttl_days,
+                self.config.recall_fresh_days,
+                self.config.recall_observation_days,
+            ) {
                 continue;
             }
             if !distilled.contains(&doc.id) {
@@ -750,6 +804,27 @@ impl ConsolidationWorker {
                 Ok(true) => stats.ttl_deleted += 1,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(user_id = %user_id, error = %e, "TTL delete failed"),
+            }
+        }
+    }
+
+    /// ⑤ 读入本用户全部召回统计（doc_id → last_recalled_at 原串）。
+    ///
+    /// 读失败只 warn 不中断：返回空表 → 全体按「统计缺失」走观察期分支
+    /// （保守，宁可晚删不可误删）。
+    async fn load_recall_stats(&self, user_id: &str) -> HashMap<String, String> {
+        match crate::db::memory_recall_stats::list_by_user(&self.db, user_id).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| (r.doc_id, r.last_recalled_at))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "Recall stats read failed, treating all docs as unobserved"
+                );
+                HashMap::new()
             }
         }
     }
@@ -1194,6 +1269,185 @@ mod tests {
         // 无时间源 → 不清理（无数据不判定）
         doc.title = "no-timestamp".into();
         assert!(!is_ttl_expired(&doc, now, 60));
+    }
+
+    // ── TTL 三条件（纯函数）──────────────────────────────────────────────
+
+    /// 判定入参默认值：TTL 60 天 / 近期召回 14 天 / 观察期 30 天
+    /// （与 `ConsolidationConfig::default` 一致）。
+    const TTL: u64 = 60;
+    const FRESH: u64 = 14;
+    const OBS: u64 = 30;
+
+    /// `now` 往前 `d` 天的 RFC 3339 串（召回统计时刻构造用）。
+    fn days_ago(now: DateTime<Utc>, d: i64) -> String {
+        (now - Duration::days(d)).to_rfc3339()
+    }
+
+    #[test]
+    fn ttl_eligible_keeps_recently_recalled() {
+        let now = Utc::now();
+        let old = Some(now - Duration::days(90));
+
+        // 3 天前召回过（< fresh 14）→ 不删
+        assert!(!ttl_eligible(
+            old,
+            Some(&days_ago(now, 3)),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        // 边界：恰好 13 天前 → 仍在窗口内，不删
+        assert!(!ttl_eligible(
+            old,
+            Some(&days_ago(now, 13)),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        // 召回时刻晚于 now（时钟倒挂）→ 负龄 < fresh，保守不删
+        assert!(!ttl_eligible(
+            old,
+            Some(&(now + Duration::days(1)).to_rfc3339()),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+    }
+
+    #[test]
+    fn ttl_eligible_deletes_stale_recall_when_expired() {
+        let now = Utc::now();
+        let expired = Some(now - Duration::days(90));
+
+        // 超窗未召回（≥ fresh 14）+ 超 TTL → 可删
+        assert!(ttl_eligible(
+            expired,
+            Some(&days_ago(now, 15)),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        assert!(ttl_eligible(
+            expired,
+            Some(&days_ago(now, 80)),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        // 未超 TTL：召回再陈旧也不删（TTL 是硬门槛）
+        assert!(!ttl_eligible(
+            Some(now - Duration::days(59)),
+            Some(&days_ago(now, 58)),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+    }
+
+    #[test]
+    fn ttl_eligible_keeps_unobserved_within_observation_window() {
+        let now = Utc::now();
+
+        // 统计缺失 + 条目龄 75 天：超 TTL（60）但未出观察期（90）→ 不删
+        assert!(!ttl_eligible(
+            Some(now - Duration::days(75)),
+            None,
+            now,
+            TTL,
+            FRESH,
+            90
+        ));
+        // 恰好压在观察期边界前一天 → 仍不删
+        assert!(!ttl_eligible(
+            Some(now - Duration::days(89)),
+            None,
+            now,
+            TTL,
+            FRESH,
+            90
+        ));
+    }
+
+    #[test]
+    fn ttl_eligible_deletes_unobserved_after_observation_window() {
+        let now = Utc::now();
+
+        // 统计缺失 + 条目龄达观察期 → 视为无召回，回落双条件（可删）
+        assert!(ttl_eligible(
+            Some(now - Duration::days(90)),
+            None,
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        // 边界：观察期长于 TTL（90 > 60）时恰好达龄 → 可删
+        assert!(ttl_eligible(
+            Some(now - Duration::days(90)),
+            None,
+            now,
+            TTL,
+            FRESH,
+            90
+        ));
+        // 默认观察期（30）短于 TTL（60）：条目够得着 TTL 就已出观察期，
+        // 保守分支不生效，等价于双条件
+        assert!(ttl_eligible(
+            Some(now - Duration::days(61)),
+            None,
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        // 统计缺失但未超 TTL → 不删（TTL 门槛先于观察期）
+        assert!(!ttl_eligible(
+            Some(now - Duration::days(10)),
+            None,
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+    }
+
+    #[test]
+    fn ttl_eligible_keeps_unparsable_recall_timestamp() {
+        let now = Utc::now();
+        let expired = Some(now - Duration::days(365));
+
+        // 统计面不可信 → 视为近期召回，保守不删（区别于「无统计」分支）
+        assert!(!ttl_eligible(
+            expired,
+            Some("not-a-timestamp"),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
+        assert!(!ttl_eligible(expired, Some(""), now, TTL, FRESH, OBS));
+    }
+
+    #[test]
+    fn ttl_eligible_requires_time_source() {
+        let now = Utc::now();
+        // 时间源不可得 → 不判定，无论召回统计如何
+        assert!(!ttl_eligible(None, None, now, TTL, FRESH, OBS));
+        assert!(!ttl_eligible(
+            None,
+            Some(&days_ago(now, 365)),
+            now,
+            TTL,
+            FRESH,
+            OBS
+        ));
     }
 
     #[test]
@@ -1787,6 +2041,131 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].doc_id, merged);
+    }
+
+    /// 集成：TTL 三条件的召回门控 —— 召回统计经真实 DAO 落库后逐条生效。
+    ///
+    /// 默认参数（TTL 60 / fresh 14 / 观察期 30）+ future 判定时钟：
+    /// 同批「已沉淀 + 已过期」episodic 里，只有超窗未召回与出观察期的
+    /// 无统计条目被清理，其余三类保守分支各留一条。
+    #[tokio::test]
+    async fn ttl_three_conditions_gate_deletion_with_recall_stats() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+        let worker = make_worker(&km, &pool, test_config());
+
+        let e_recent = add(&km, "memory_1000_0", "三天前还被召回", "ppa_episodic").await;
+        let e_stale = add(&km, "memory_1001_1", "很久没被召回", "ppa_episodic").await;
+        let e_broken = add(&km, "memory_1002_2", "统计时刻不可解析", "ppa_episodic").await;
+        let e_unobserved = add(&km, "memory_1003_3", "从未进过统计表", "ppa_episodic").await;
+        let e_unreferenced = add(&km, "memory_1004_4", "未被沉淀引用", "ppa_episodic").await;
+        add(
+            &km,
+            "合并总结",
+            &format!("稳定事实\n[merged-from: {e_recent},{e_stale},{e_broken},{e_unobserved}]"),
+            "ppa_semantic",
+        )
+        .await;
+
+        // 判定时钟推后 61 天：created_at（写入时刻）→ 全部超 TTL 60 / 观察期 30
+        let future_now = Utc::now() + Duration::days(61);
+        crate::db::memory_recall_stats::record_recall(
+            &pool,
+            USER,
+            &e_recent,
+            &(future_now - Duration::days(3)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        crate::db::memory_recall_stats::record_recall(
+            &pool,
+            USER,
+            &e_stale,
+            &(future_now - Duration::days(20)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        crate::db::memory_recall_stats::record_recall(&pool, USER, &e_broken, "not-a-timestamp")
+            .await
+            .unwrap();
+
+        let mut stats = RunStats::default();
+        worker.ttl_cleanup(USER, future_now, &mut stats).await;
+
+        assert_eq!(
+            stats.ttl_deleted, 2,
+            "仅超窗未召回 + 出观察期的无统计条目被清理"
+        );
+        assert!(km.get_document(KB, &e_recent).await.unwrap().is_some());
+        assert!(km.get_document(KB, &e_broken).await.unwrap().is_some());
+        assert!(
+            km.get_document(KB, &e_unreferenced)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(km.get_document(KB, &e_stale).await.unwrap().is_none());
+        assert!(km.get_document(KB, &e_unobserved).await.unwrap().is_none());
+
+        let rows = crate::db::memory_audit::list_by_user(&pool, USER, 10, 0)
+            .await
+            .unwrap();
+        let deleted: HashSet<String> = rows.iter().map(|r| r.doc_id.clone()).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(deleted, HashSet::from([e_stale, e_unobserved]));
+        assert!(rows.iter().all(|r| r.reason == REASON_TTL));
+    }
+
+    /// 集成：观察期分支 —— 「统计缺失 ≠ 无召回」的保守延迟。
+    ///
+    /// 同一份数据先经观察期更长的配置（120 天）跑一轮：条目已超 TTL 但
+    /// 未出观察期 → 不删；再用默认配置（30 天）跑一轮 → 出观察期，回落
+    /// 双条件删除。两轮共享 km/db，验证分支切换而非数据差异。
+    #[tokio::test]
+    async fn ttl_observation_window_defers_unobserved_deletion() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+
+        let long_observation = make_worker(
+            &km,
+            &pool,
+            ConsolidationConfig {
+                recall_observation_days: 120,
+                ..test_config()
+            },
+        );
+        let default_worker = make_worker(&km, &pool, test_config());
+
+        let e1 = add(&km, "memory_1000_0", "无统计的旧记忆", "ppa_episodic").await;
+        add(
+            &km,
+            "合并总结",
+            &format!("稳定事实\n[merged-from: {e1}]"),
+            "ppa_semantic",
+        )
+        .await;
+
+        let future_now = Utc::now() + Duration::days(61);
+
+        let mut stats = RunStats::default();
+        long_observation
+            .ttl_cleanup(USER, future_now, &mut stats)
+            .await;
+        assert_eq!(stats.ttl_deleted, 0, "未出观察期（61 < 120）不删");
+        assert!(km.get_document(KB, &e1).await.unwrap().is_some());
+
+        let mut stats = RunStats::default();
+        default_worker
+            .ttl_cleanup(USER, future_now, &mut stats)
+            .await;
+        assert_eq!(stats.ttl_deleted, 1, "出观察期（61 ≥ 30）回落双条件删除");
+        assert!(km.get_document(KB, &e1).await.unwrap().is_none());
+
+        let rows = crate::db::memory_audit::list_by_user(&pool, USER, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].doc_id, e1);
     }
 
     #[tokio::test]
