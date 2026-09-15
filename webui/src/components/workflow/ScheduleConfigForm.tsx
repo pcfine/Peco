@@ -76,7 +76,8 @@ export function ScheduleConfigForm({
             placeholder="0 9 * * 1-5（5 字段，后端自动补秒）"
           />
           <p className="text-xs text-muted-foreground">
-            5 字段（分 时 日 月 周）或 6 字段（秒 分 时 日 月 周）均可；5 字段由后端自动补秒。
+            5 字段（分 时 日 月 周）或 6 字段（秒 分 时 日 月 周）均可；5
+            字段由后端自动补秒。
           </p>
           <div className="flex flex-wrap gap-1 mt-1">
             {CRON_PRESETS.map((preset) => (
