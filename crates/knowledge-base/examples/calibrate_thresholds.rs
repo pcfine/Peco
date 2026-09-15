@@ -1,13 +1,16 @@
 //! 相似度阈值标定脚本。
 //!
 //! 把 `ConsolidationConfig` 的 `min_cluster_cos` / `dedup_cos` 从占位默认值
-//! 变成有数据来源的操作点。两步工作流：
+//! 变成有数据来源的操作点。三个模式：
 //!
 //! 1. **generate** — 读取真实记忆库，全部文档重嵌入后计算全对余弦分布，
 //!    导出待人工标注的候选对（正例为主 + 少量跨阈值负例）；
 //! 2. **calibrate** — 读回人工填好 0/1 标签的清单，按阈值网格计算
 //!    PR 曲线，输出 `min_cluster_cos`（F1 最优）与 `dedup_cos`
 //!    （precision ≥ 0.98 的最小阈值，硬删除必须高精度）候选操作点。
+//! 3. **synthetic** — 真实库无近重复样本时的替代路径：读入人工编写的合成
+//!    真值对 CSV，嵌入后逐对算余弦，产出与 generate 同 schema 的标注 JSON
+//!    （label 已填），再交给 calibrate 出报告。
 //!
 //! # 用法
 //!
@@ -23,12 +26,33 @@
 //!     --knowledge-dir ~/.peco/workspaces/<user>/knowledge \
 //!     --kb @private_memory \
 //!     --mode calibrate --annotated annotation_candidates.json --out report.md
+//!
+//! # 替代路径：合成标定集（真实库无近重复样本时）
+//! cargo run -p knowledge-base --example calibrate_thresholds -- \
+//!     --mode synthetic --pairs reports/data/synthetic_calibration_pairs.csv \
+//!     --out /tmp/t1/annotated_synthetic.json
+//! # 然后复用既有 calibrate 模式出报告：
+//! cargo run -p knowledge-base --example calibrate_thresholds -- \
+//!     --knowledge-dir <任意非空库> --kb @private_memory --mode calibrate \
+//!     --annotated /tmp/t1/annotated_synthetic.json --out reports/p2-t3-synthetic-calibration.md
 //! ```
+//!
+//! 三个模式的 `--out` 均可省略，省略时取各自默认值：generate →
+//! `annotation_candidates.json`，calibrate → `calibration_report.md`，
+//! synthetic → `annotated_synthetic.json`。
+//!
+//! 注：calibrate 模式只消费标注 JSON 里的 cosine 字段，不重嵌入，
+//! `--knowledge-dir` / `--kb` 在该模式下仅为兼容而接受（可省略）。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use knowledge_base::KnowledgeBaseManager;
+use knowledge_base::calibration::parse_labeled_pairs;
 use knowledge_base::engine::{connected_component_clusters, cosine_similarity};
+use knowledge_base::manager::config::{
+    BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
+};
 
 /// 一对候选重复 — 人工标注清单的行。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -48,8 +72,11 @@ const THRESHOLD_FLOOR: f32 = 0.50;
 const THRESHOLD_CEIL: f32 = 0.99;
 const NEGATIVE_SAMPLE_COUNT: usize = 100;
 const EMBED_BATCH: usize = 64;
-/// 聚类预览用占位阈值 — 以标定报告回填值为准。
-const PREVIEW_CLUSTER_COS: f32 = 0.85;
+/// 聚类预览阈值：与回填后的 min_cluster_cos 标定值保持一致（0.77，见
+/// reports/p2-t3-synthetic-calibration.md），预览才有「放量后真实效果」的参考价值。
+const PREVIEW_CLUSTER_COS: f32 = 0.77;
+/// synthetic 模式临时知识库名（用完即删，不落用户 workspace）。
+const SYNTHETIC_KB: &str = "@synthetic_calibration";
 
 fn main() {
     let args = parse_args();
@@ -62,6 +89,7 @@ fn main() {
     let result = match args.mode {
         Mode::Generate => rt.block_on(run_generate(&args)),
         Mode::Calibrate => rt.block_on(run_calibrate(&args)),
+        Mode::Synthetic => rt.block_on(run_synthetic(&args)),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -72,11 +100,16 @@ fn main() {
 enum Mode {
     Generate,
     Calibrate,
+    Synthetic,
 }
 
 struct Args {
-    knowledge_dir: PathBuf,
-    kb: String,
+    /// 仅 generate 模式需要。
+    knowledge_dir: Option<PathBuf>,
+    /// 仅 generate 模式需要。
+    kb: Option<String>,
+    /// 仅 synthetic 模式需要。
+    pairs: Option<PathBuf>,
     mode: Mode,
     out: PathBuf,
     annotated: Option<PathBuf>,
@@ -85,8 +118,9 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut knowledge_dir = None;
     let mut kb = None;
+    let mut pairs = None;
     let mut mode = Mode::Generate;
-    let mut out = PathBuf::from("annotation_candidates.json");
+    let mut out = None;
     let mut annotated = None;
 
     let mut it = std::env::args().skip(1);
@@ -96,20 +130,24 @@ fn parse_args() -> Result<Args, String> {
                 knowledge_dir = Some(it.next().ok_or("--knowledge-dir 需要一个路径")?)
             }
             "--kb" => kb = Some(it.next().ok_or("--kb 需要一个名称")?),
+            "--pairs" => pairs = Some(PathBuf::from(it.next().ok_or("--pairs 需要一个路径")?)),
             "--mode" => {
                 mode = match it
                     .next()
-                    .ok_or("--mode 需要 generate 或 calibrate")?
+                    .ok_or("--mode 需要 generate、calibrate 或 synthetic")?
                     .as_str()
                 {
                     "generate" => Mode::Generate,
                     "calibrate" => Mode::Calibrate,
+                    "synthetic" => Mode::Synthetic,
                     other => {
-                        return Err(format!("未知 mode: {other}（可选 generate | calibrate）"));
+                        return Err(format!(
+                            "未知 mode: {other}（可选 generate | calibrate | synthetic）"
+                        ));
                     }
                 }
             }
-            "--out" => out = PathBuf::from(it.next().ok_or("--out 需要一个路径")?),
+            "--out" => out = Some(PathBuf::from(it.next().ok_or("--out 需要一个路径")?)),
             "--annotated" => {
                 annotated = Some(PathBuf::from(it.next().ok_or("--annotated 需要一个路径")?))
             }
@@ -117,23 +155,30 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    if mode_is_calibrate(&mode) {
-        out = PathBuf::from("calibration_report.md");
+    let out = match mode {
+        Mode::Generate => out.unwrap_or_else(|| PathBuf::from("annotation_candidates.json")),
+        Mode::Calibrate => out.unwrap_or_else(|| PathBuf::from("calibration_report.md")),
+        Mode::Synthetic => out.unwrap_or_else(|| PathBuf::from("annotated_synthetic.json")),
+    };
+
+    // 只有 generate 需要真实知识库；calibrate 只读标注 JSON，synthetic 只读 CSV
+    if matches!(mode, Mode::Generate) {
+        if knowledge_dir.is_none() {
+            return Err("缺少 --knowledge-dir（workspace 的 knowledge/ 目录）".into());
+        }
+        if kb.is_none() {
+            return Err("缺少 --kb（如 @private_memory）".into());
+        }
     }
 
     Ok(Args {
-        knowledge_dir: PathBuf::from(
-            knowledge_dir.ok_or("缺少 --knowledge-dir（workspace 的 knowledge/ 目录）")?,
-        ),
-        kb: kb.ok_or("缺少 --kb（如 @private_memory）")?,
+        knowledge_dir: knowledge_dir.map(PathBuf::from),
+        kb,
+        pairs,
         mode,
         out,
         annotated,
     })
-}
-
-fn mode_is_calibrate(mode: &Mode) -> bool {
-    matches!(mode, Mode::Calibrate)
 }
 
 /// 打开知识库并把全部文档（含原文）加载进内存。
@@ -189,13 +234,22 @@ async fn embed_all(
 }
 
 async fn run_generate(args: &Args) -> Result<(), String> {
-    let manager = KnowledgeBaseManager::load(&args.knowledge_dir)
+    let knowledge_dir = args
+        .knowledge_dir
+        .as_ref()
+        .ok_or("generate 模式需要 --knowledge-dir（workspace 的 knowledge/ 目录）")?;
+    let kb_name = args
+        .kb
+        .as_ref()
+        .ok_or("generate 模式需要 --kb（如 @private_memory）")?;
+
+    let manager = KnowledgeBaseManager::load(knowledge_dir)
         .await
         .map_err(|e| format!("加载 knowledge 目录失败: {e}"))?;
     let kb = manager
-        .get_kb(&args.kb)
+        .get_kb(kb_name)
         .await
-        .ok_or_else(|| format!("知识库不存在: {}", args.kb))?;
+        .ok_or_else(|| format!("知识库不存在: {kb_name}"))?;
 
     let docs = load_docs(&kb).await?;
     if docs.len() < 2 {
@@ -368,4 +422,186 @@ async fn run_calibrate(args: &Args) -> Result<(), String> {
     println!("{}", report);
     println!("报告已写入 {}", args.out.display());
     Ok(())
+}
+
+/// synthetic 模式：合成真值对 CSV → 嵌入 → 余弦 → 标注 JSON（label 已填）。
+///
+/// 产出的 JSON 与 generate 模式同 schema，可直接喂给 calibrate 模式；
+/// calibrate 只读其中的 cosine 字段，不重嵌入。
+async fn run_synthetic(args: &Args) -> Result<(), String> {
+    let pairs_path = args
+        .pairs
+        .as_ref()
+        .ok_or("synthetic 模式需要 --pairs <CSV 路径>")?;
+    let raw = std::fs::read_to_string(pairs_path)
+        .map_err(|e| format!("读取 {} 失败: {e}", pairs_path.display()))?;
+    let rows = parse_labeled_pairs(&raw)
+        .map_err(|e| format!("解析 {} 失败: {e}", pairs_path.display()))?;
+
+    let positives = rows.iter().filter(|p| p.label == 1).count();
+    println!(
+        "已解析 {} 对合成样本（{}）：正例 {positives}，负例 {}",
+        rows.len(),
+        pairs_path.display(),
+        rows.len() - positives
+    );
+
+    // 两列文本合并去重 — 同一段文本只嵌入一次；owner 记录首个使用者，供嵌入失败时报出 pair_id
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut owner: HashMap<String, String> = HashMap::new();
+    let mut texts: Vec<String> = Vec::new();
+    for p in &rows {
+        for t in [&p.text_a, &p.text_b] {
+            if index.contains_key(t) {
+                continue;
+            }
+            index.insert(t.clone(), texts.len());
+            owner.insert(t.clone(), p.pair_id.clone());
+            texts.push(t.clone());
+        }
+    }
+    println!("去重后待嵌入文本 {} 条", texts.len());
+
+    // 临时库：只为借它的嵌入引擎（InMemory 后端，不落盘向量表），用完连目录一起删
+    let temp_dir = make_temp_dir()?;
+    let _guard = TempDirGuard(temp_dir.clone());
+    let manager = KnowledgeBaseManager::load(&temp_dir)
+        .await
+        .map_err(|e| format!("创建临时知识库目录失败: {e}"))?;
+    let kb = manager
+        .create_kb(KbConfig {
+            name: SYNTHETIC_KB.into(),
+            description: "合成标定集临时库（用完即删）".into(),
+            embedding_model: FastembedModelTypeSerde::BGESmallZHV15,
+            chunking: ChunkingStrategySerde::default(),
+            backend: BackendType::InMemory,
+            storage_path: None,
+            default_storage_mode: Default::default(),
+        })
+        .await
+        .map_err(|e| format!("创建临时知识库失败: {e}"))?;
+
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(EMBED_BATCH) {
+        let batch: Vec<String> = chunk.to_vec();
+        let vs = kb.embed_texts(&batch).await.map_err(|e| {
+            let pair_id = owner.get(&chunk[0]).map(String::as_str).unwrap_or("?");
+            format!(
+                "嵌入失败（pair_id {pair_id} 起的一批 {} 条，样本 {:?}）: {e}",
+                chunk.len(),
+                truncate_chars(&chunk[0], 40)
+            )
+        })?;
+        vectors.extend(vs);
+    }
+
+    let mut out: Vec<CandidatePair> = Vec::with_capacity(rows.len());
+    for p in &rows {
+        let va = lookup_vector(&vectors, &index, &p.text_a, &p.pair_id)?;
+        let vb = lookup_vector(&vectors, &index, &p.text_b, &p.pair_id)?;
+        out.push(CandidatePair {
+            doc_id_a: format!("{}_a", p.pair_id),
+            doc_id_b: format!("{}_b", p.pair_id),
+            title_a: p.category.clone(),
+            title_b: p.category.clone(),
+            cosine: cosine_similarity(va, vb),
+            text_a: p.text_a.clone(),
+            text_b: p.text_b.clone(),
+            label: Some(p.label),
+        });
+    }
+
+    print_synthetic_summary(&out);
+
+    let json = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+    std::fs::write(&args.out, json)
+        .map_err(|e| format!("写入 {} 失败: {e}", args.out.display()))?;
+    println!(
+        "\n已导出 {} 对（label 已填）到 {}，可用 --mode calibrate 出阈值报告",
+        out.len(),
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// 取某段文本的向量（缺失即为内部错误 — 去重阶段应保证全覆盖）。
+fn lookup_vector<'a>(
+    vectors: &'a [Vec<f32>],
+    index: &HashMap<String, usize>,
+    text: &str,
+    pair_id: &str,
+) -> Result<&'a [f32], String> {
+    let i = index
+        .get(text)
+        .ok_or_else(|| format!("内部错误：pair_id {pair_id} 的文本未参与嵌入"))?;
+    vectors
+        .get(*i)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("内部错误：pair_id {pair_id} 的向量下标 {i} 越界"))
+}
+
+/// 按 label 分组打印 cosine 分布 — 正例均值应明显高于负例，用于快速 sanity check。
+fn print_synthetic_summary(pairs: &[CandidatePair]) {
+    println!("\n合成标定集 cosine 统计：");
+    println!("  总对数：{}", pairs.len());
+    let mut means = [0.0f32; 2];
+    for (label, name) in [(1u8, "正例"), (0u8, "负例")] {
+        let cos: Vec<f32> = pairs
+            .iter()
+            .filter(|p| p.label == Some(label))
+            .map(|p| p.cosine)
+            .collect();
+        if cos.is_empty() {
+            println!("  {name}（label={label}）：0 对");
+            continue;
+        }
+        let min = cos.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = cos.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mean = cos.iter().sum::<f32>() / cos.len() as f32;
+        means[label as usize] = mean;
+        println!(
+            "  {name}（label={label}）：{} 对 | min {min:.4} | max {max:.4} | 均值 {mean:.4}",
+            cos.len()
+        );
+    }
+    if means[0] > 0.0 && means[1] > 0.0 && means[1] <= means[0] {
+        println!("  ⚠ 正例均值未高于负例均值，标定集区分度可疑 — 请核对标注或样本");
+    }
+}
+
+/// 在系统临时目录下建一个唯一子目录（进程 id + 纳秒时间戳）。
+fn make_temp_dir() -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "peco_synthetic_calib_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建临时目录 {} 失败: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// 离开作用域时递归删除临时目录（含 KB 写出的 kb_config.json）。
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("warn: 清理临时目录 {} 失败: {e}", self.0.display());
+        }
+    }
+}
+
+/// 按字符（而非字节）截断，避免在多字节 UTF-8 边界上断开。
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }

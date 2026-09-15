@@ -1,4 +1,5 @@
 pub mod backends;
+pub mod calibration;
 pub mod chunking;
 pub mod config;
 pub mod embedding;

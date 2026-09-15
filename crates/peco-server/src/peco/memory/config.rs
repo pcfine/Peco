@@ -18,11 +18,13 @@ pub struct ConsolidationConfig {
     pub batch_size: usize,
     /// 聚类阈值（cosine similarity）。
     ///
-    /// 占位默认 0.85，待标定脚本产出报告后回填操作点。
+    /// 标定值（bge-small-zh-v1.5, 512 维, 2026-09-15, 113 对合成真值集,
+    /// 人工编写待抽检）— 见 reports/p2-t3-synthetic-calibration.md
     pub min_cluster_cos: f32,
     /// 硬去重阈值（cosine similarity）。
     ///
-    /// 占位默认 0.92，待标定脚本产出报告后回填操作点。
+    /// 标定值（bge-small-zh-v1.5, 512 维, 2026-09-15, 113 对合成真值集,
+    /// 人工编写待抽检）— 见 reports/p2-t3-synthetic-calibration.md
     pub dedup_cos: f32,
     /// episodic 过期天数。
     pub episodic_ttl_days: u64,
@@ -62,7 +64,7 @@ impl Default for ConsolidationConfig {
         Self {
             enabled: false,
             batch_size: 200,
-            min_cluster_cos: 0.85,
+            min_cluster_cos: 0.77,
             dedup_cos: 0.92,
             episodic_ttl_days: 60,
             max_llm_calls: 20,
@@ -149,8 +151,8 @@ mod tests {
         // 默认关闭 — 灰度开启，未开启时零开销
         assert!(!c.enabled);
         assert_eq!(c.batch_size, 200);
-        // 0.85 / 0.92 为占位值，以标定报告回填为准
-        assert!((c.min_cluster_cos - 0.85).abs() < f32::EPSILON);
+        // 0.77 / 0.92 为标定值（113 对合成真值集），见 reports/p2-t3-synthetic-calibration.md
+        assert!((c.min_cluster_cos - 0.77).abs() < f32::EPSILON);
         assert!((c.dedup_cos - 0.92).abs() < f32::EPSILON);
         assert!(c.dedup_cos > c.min_cluster_cos);
         assert_eq!(c.episodic_ttl_days, 60);
