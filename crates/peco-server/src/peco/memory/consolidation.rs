@@ -26,7 +26,8 @@
 //   - ppa_profile 永不进候选池（① 过滤）；自动删除仅限 ④⑤ 两类
 //   - ppa_semantic 只参与硬去重，不参与沉淀删除
 //   - 审计先行：审计写入失败（存储不可用）→ 拒绝删除（fail-closed）
-//   - 无数据不判定：时间源（created_at → title 毫秒）皆无 → 不参与 TTL
+//   - 无数据不判定：时间源（created_at → title 毫秒 → captured-at footer）
+//     皆无 → 不参与 TTL
 //   - 机器判定基建（嵌入/聚类）不可用 → 跳过 ②③④ 并 warn，仅执行 ①⑤⑥⑧
 //   - 任一步失败 warn 后继续，不中断整轮；成本上限 max_llm_calls（Flash 档）
 
@@ -57,6 +58,12 @@ pub const REASON_TTL: &str = "consolidation_ttl";
 /// 用内容 footer 而非 metadata 承载溯源：LanceDB 后端不持久化
 /// metadata，footer 随内容存储跨重启可靠。
 pub const MERGED_FROM_PREFIX: &str = "[merged-from: ";
+
+/// 内容尾部捕获时刻标记（RFC 3339）：四级时间源的最后一级。
+///
+/// 合并写入的内容标题未必是 `memory_{millis}_{seq}` 格式（@memory agent
+/// 归纳时标题自由生成），此时正文 footer 是唯一可读的时间源。
+pub const CAPTURED_AT_PREFIX: &str = "[captured-at: ";
 
 /// 一轮整理的统计（写回 `memory_consolidation_state.last_run_stats`）。
 #[derive(Debug, Default, Serialize)]
@@ -161,18 +168,21 @@ fn select_window(
     }
 }
 
-/// 文档时间源：`metadata.created_at`（ISO 8601）优先 → title
-/// `memory_{millis}_{seq}` 毫秒解析兜底 → `None`。
+/// 文档时间源（四级）：`metadata.created_at`（ISO 8601）→ title
+/// `memory_{millis}_{seq}` 毫秒 → 正文 `[captured-at: ...]` footer → `None`。
 ///
 /// 注：LanceDB 后端不持久化 metadata（get_document 重建默认值），
-/// 生产路径实际生效的是 title 毫秒解析 — hook 写入的标题格式保证可解析。
+/// 生产路径实际生效的是 hook 写入的 title 毫秒解析；@memory agent 合并
+/// 写入的文档标题自拟，退到 footer 一级。
 pub fn doc_time(doc: &knowledge_base::Document) -> Option<DateTime<Utc>> {
     if let Some(created_at) = &doc.metadata.created_at
         && let Ok(t) = DateTime::parse_from_rfc3339(created_at)
     {
         return Some(t.with_timezone(&Utc));
     }
-    parse_title_millis(&doc.title).and_then(DateTime::from_timestamp_millis)
+    parse_title_millis(&doc.title)
+        .and_then(DateTime::from_timestamp_millis)
+        .or_else(|| parse_captured_at(&doc.content))
 }
 
 /// 从 title `memory_{millis}_{seq}` 解析毫秒时间戳。
@@ -210,6 +220,21 @@ pub fn parse_merged_from(content: &str) -> Vec<String> {
             )
         })
         .unwrap_or_default()
+}
+
+/// 解析内容尾部的捕获时刻标记（RFC 3339 ISO 8601）。
+///
+/// 取最后一条匹配行（与 `parse_merged_from` 同模式）；时间串解析失败的行
+/// 忽略并继续向前找，全无合法行 → `None`（回落既有优先级链）。与
+/// merged-from footer 并存时各认各的前缀，互不干扰。
+pub fn parse_captured_at(content: &str) -> Option<DateTime<Utc>> {
+    content.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix(CAPTURED_AT_PREFIX)?;
+        let ts = rest.strip_suffix(']')?;
+        DateTime::parse_from_rfc3339(ts.trim())
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    })
 }
 
 /// ④ 纯函数：组内硬去重受害者挑选。
@@ -608,13 +633,16 @@ impl ConsolidationWorker {
                 Ok(content) => {
                     stats.llm_calls += 1;
                     let title = format!("memory_{}_c{}", now.timestamp_millis(), stats.merged);
+                    // 双 footer：merged-from 供「已沉淀」判定，captured-at 供 TTL
+                    // 时间源（标题格式被后续人工/agent 整理改动后仍有时间可读）
                     let footer = format!(
-                        "{MERGED_FROM_PREFIX}{}]",
+                        "{MERGED_FROM_PREFIX}{}]\n{CAPTURED_AT_PREFIX}{}]",
                         episodic
                             .iter()
                             .map(|d| d.id.as_str())
                             .collect::<Vec<_>>()
-                            .join(",")
+                            .join(","),
+                        now.to_rfc3339()
                     );
                     match self
                         .km
@@ -924,6 +952,25 @@ mod tests {
         DateTime::from_timestamp_millis(T0 + i).unwrap()
     }
 
+    /// RFC 3339 字符串 → UTC 时刻（时间源断言用）。
+    fn rfc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// 构造时间源测试文档：三个时间入口独立可设。
+    fn timed_doc(created_at: Option<&str>, title: &str, content: &str) -> knowledge_base::Document {
+        let mut doc = knowledge_base::Document {
+            id: "d1".into(),
+            kb_id: None,
+            title: title.into(),
+            source_path: "ppa_episodic".into(),
+            content: content.into(),
+            metadata: Default::default(),
+        };
+        doc.metadata.created_at = created_at.map(String::from);
+        doc
+    }
+
     fn window_ids(window: &CandidateWindow) -> HashSet<String> {
         window.candidates.iter().map(|c| c.doc_id.clone()).collect()
     }
@@ -1029,6 +1076,91 @@ mod tests {
         doc.title = "no-timestamp".into();
         doc.metadata.created_at = None;
         assert_eq!(doc_time(&doc), None);
+    }
+
+    #[test]
+    fn doc_time_four_level_priority_matrix() {
+        let footer = "[captured-at: 2020-01-01T00:00:00+00:00]";
+
+        // 四级齐备 → created_at 胜出
+        assert_eq!(
+            doc_time(&timed_doc(
+                Some("2026-09-01T00:00:00+00:00"),
+                "memory_1727500000000_0",
+                footer
+            )),
+            Some(rfc("2026-09-01T00:00:00+00:00"))
+        );
+
+        // created_at 非法 → 回落 title 毫秒（压过 footer）
+        assert_eq!(
+            doc_time(&timed_doc(
+                Some("not-a-date"),
+                "memory_1727500000000_0",
+                footer
+            )),
+            DateTime::from_timestamp_millis(1727500000000)
+        );
+        // 无 created_at → title 毫秒胜出
+        assert_eq!(
+            doc_time(&timed_doc(None, "memory_1727500000000_0", footer)),
+            DateTime::from_timestamp_millis(1727500000000)
+        );
+
+        // 标题不可解析（@memory 自拟标题）→ footer 兜底
+        assert_eq!(
+            doc_time(&timed_doc(None, "日语学习记录", footer)),
+            Some(rfc("2020-01-01T00:00:00+00:00"))
+        );
+
+        // 三级皆无 → None（无数据不判定）
+        assert_eq!(
+            doc_time(&timed_doc(None, "日语学习记录", "普通记忆内容")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_captured_at_takes_last_valid_line() {
+        // 多条合法行 → 取最后一条
+        let content =
+            "事实\n[captured-at: 2020-01-01T00:00:00+00:00]\n[captured-at: 2021-02-03T04:05:06Z]";
+        assert_eq!(
+            parse_captured_at(content),
+            Some(rfc("2021-02-03T04:05:06Z"))
+        );
+
+        // 尾部混有非法行 → 忽略并继续向前找最后一条合法行
+        let mixed =
+            "[captured-at: 2020-01-01T00:00:00+00:00]\n[captured-at: 不是时间]\n[captured-at: ]";
+        assert_eq!(
+            parse_captured_at(mixed),
+            Some(rfc("2020-01-01T00:00:00+00:00"))
+        );
+
+        // 全无合法行 / 无标记 → None
+        assert_eq!(parse_captured_at("事实\n[captured-at: not-a-time]"), None);
+        assert_eq!(parse_captured_at("普通记忆内容"), None);
+    }
+
+    #[test]
+    fn captured_at_and_merged_from_footers_coexist() {
+        // 生产顺序：merged-from 在前、captured-at 在后
+        let content =
+            "合并事实\n[merged-from: aaaa0000,bbbb1111]\n[captured-at: 2021-02-03T04:05:06+00:00]";
+        assert_eq!(parse_merged_from(content), vec!["aaaa0000", "bbbb1111"]);
+        assert_eq!(
+            parse_captured_at(content),
+            Some(rfc("2021-02-03T04:05:06+00:00"))
+        );
+
+        // 反向排布亦各认各的前缀
+        let reversed = "[captured-at: 2021-02-03T04:05:06+00:00]\n[merged-from: cccc2222]";
+        assert_eq!(parse_merged_from(reversed), vec!["cccc2222"]);
+        assert_eq!(
+            parse_captured_at(reversed),
+            Some(rfc("2021-02-03T04:05:06+00:00"))
+        );
     }
 
     #[test]
@@ -1483,6 +1615,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distill_appends_captured_at_footer() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+        let worker = make_worker(&km, &pool, test_config())
+            .with_distiller(Arc::new(MockDistiller::new("用户在系统学习日语")));
+
+        let docs: Vec<knowledge_base::Document> = (0..3)
+            .map(|i| knowledge_base::Document {
+                id: format!("e{i}"),
+                kb_id: None,
+                title: format!("memory_{}_0", T0 + i as i64),
+                source_path: "ppa_episodic".into(),
+                content: format!("event number {i}"),
+                metadata: Default::default(),
+            })
+            .collect();
+        for d in &docs {
+            km.add_text_to_kb(KB, &d.title, &d.content, "ppa_episodic")
+                .await
+                .unwrap();
+        }
+
+        let now = Utc::now();
+        let mut stats = RunStats::default();
+        worker
+            .distill_groups(USER, &[vec![0, 1, 2]], &docs, now, &mut stats)
+            .await;
+        assert_eq!(stats.merged, 1);
+
+        let written = km
+            .list_documents(KB, 0, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.source_path == "ppa_semantic")
+            .expect("distilled semantic doc written");
+        let doc = km.get_document(KB, &written.id).await.unwrap().unwrap();
+
+        // 双 footer 并存：溯源在前、本轮 now 捕获时刻在后
+        assert_eq!(parse_merged_from(&doc.content), vec!["e0", "e1", "e2"]);
+        assert_eq!(parse_captured_at(&doc.content), Some(now));
+    }
+
+    #[tokio::test]
     async fn ttl_deletes_only_distilled_and_expired_episodic() {
         let (_tmp, km) = make_km().await;
         let (pool, _db_tmp) = make_db().await;
@@ -1528,6 +1704,75 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|r| r.reason == "consolidation_ttl"));
+    }
+
+    /// 集成：@memory agent 合并写入的 episodic 标题自拟（title 毫秒不可解析），
+    /// 时间源由 doc_time 四级链取 KB 层强制的 metadata.created_at（写入时刻）。
+    ///
+    /// 用 future 判定时钟（同 `ttl_deletes_only_distilled_and_expired_episodic`）
+    /// 验证全链路：已沉淀且过期 → 清理 + 审计；未沉淀 → 保留。
+    /// 注：km 写入路径强制 created_at，「created_at 缺失、仅 footer 可读」的
+    /// 兜底分支在集成层不可构造，由纯函数矩阵
+    /// （`doc_time_four_level_priority_matrix`）覆盖。footer 仍随内容落库，
+    /// 供 created_at 元数据丢失（legacy / 导入文档）时兜底。
+    #[tokio::test]
+    async fn ttl_cleans_agent_merged_memory_end_to_end() {
+        let (_tmp, km) = make_km().await;
+        let (pool, _db_tmp) = make_db().await;
+        let worker = make_worker(&km, &pool, test_config());
+
+        let stale_at = (Utc::now() - Duration::days(120)).to_rfc3339();
+        let merged = add(
+            &km,
+            "搬家的回忆",
+            &format!("两次搬家的记录\n[captured-at: {stale_at}]"),
+            "ppa_episodic",
+        )
+        .await;
+        let other = add(&km, "别的记忆", "无关记录", "ppa_episodic").await;
+        // 沉淀语义文档只引用前者（真实合并产物形态：双 footer）
+        let semantic = add(
+            &km,
+            "搬家总结",
+            &format!(
+                "稳定事实\n[merged-from: {merged}]\n[captured-at: {}]",
+                Utc::now().to_rfc3339()
+            ),
+            "ppa_semantic",
+        )
+        .await;
+
+        // 落库核验：自拟标题 → title 毫秒不可解析；footer 随内容保留，
+        // created_at 由 KB 层强制填充 —— 四级链前两级分别就位
+        let stored = km.get_document(KB, &merged).await.unwrap().unwrap();
+        assert_eq!(parse_title_millis(&stored.title), None);
+        assert_eq!(
+            parse_captured_at(&stored.content),
+            Some(
+                DateTime::parse_from_rfc3339(&stale_at)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(stored.metadata.created_at.is_some());
+
+        let future_now = Utc::now() + Duration::days(61);
+        let mut stats = RunStats::default();
+        worker.ttl_cleanup(USER, future_now, &mut stats).await;
+
+        assert_eq!(
+            stats.ttl_deleted, 1,
+            "已沉淀且过期的 agent 合并记忆被清理（时间源 = created_at）"
+        );
+        assert!(km.get_document(KB, &merged).await.unwrap().is_none());
+        assert!(km.get_document(KB, &other).await.unwrap().is_some());
+        assert!(km.get_document(KB, &semantic).await.unwrap().is_some());
+
+        let rows = crate::db::memory_audit::list_by_user(&pool, USER, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].doc_id, merged);
     }
 
     #[tokio::test]
