@@ -33,6 +33,10 @@ pub struct ConsolidationConfig {
     /// 空闲判定阈值（秒）：距上次活动超过该值才参与本轮整理。
     pub idle_after_secs: u64,
     /// 整理 cron 表达式（默认每 30 分钟）。
+    ///
+    /// **6 字段**（秒 分 时 日 月 周）—— 调度器 `tokio-cron-scheduler`
+    /// 内部 `Cron::with_seconds_required()`，5 字段表达式会被判为
+    /// `ParseSchedule` 而注册失败。
     pub cron_expr: String,
     /// "近期召回"窗口（天）：`last_recalled_at` 距今超过该窗口视为无近期召回。
     pub recall_fresh_days: u64,
@@ -56,7 +60,7 @@ impl Default for ConsolidationConfig {
             max_llm_calls: 20,
             max_users_per_round: 3,
             idle_after_secs: 600,
-            cron_expr: "*/30 * * * *".to_string(),
+            cron_expr: "0 */30 * * * *".to_string(),
             recall_fresh_days: 14,
             audit_retention_days: 90,
             dedup_enforce: false,
@@ -144,7 +148,8 @@ mod tests {
         assert_eq!(c.max_llm_calls, 20);
         assert_eq!(c.max_users_per_round, 3);
         assert_eq!(c.idle_after_secs, 600);
-        assert_eq!(c.cron_expr, "*/30 * * * *");
+        // 6 字段（含秒）：调度器要求 with_seconds_required
+        assert_eq!(c.cron_expr, "0 */30 * * * *");
         assert_eq!(c.recall_fresh_days, 14);
         assert_eq!(c.audit_retention_days, 90);
         // shadow 优先 — 标定报告人工抽检通过前保持 false

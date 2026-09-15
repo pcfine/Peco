@@ -66,6 +66,19 @@ impl Drop for ServerHandle {
 }
 
 impl TestApp {
+    /// 创建全新的 TestApp 实例（自动整理总开关保持默认关闭）。
+    pub async fn new() -> Self {
+        Self::new_with_consolidation(false).await
+    }
+
+    /// 创建自动整理总开关为 `consolidation_enabled` 的 TestApp 实例。
+    ///
+    /// 总开关是构造期快照（生产由 `memory.consolidation.enabled` 决定），
+    /// 开启态只能在此处指定 —— cron 注册与手动触发端点均以它为门。
+    pub async fn new_with_consolidation(consolidation_enabled: bool) -> Self {
+        Self::build(consolidation_enabled).await
+    }
+
     /// 创建全新的 TestApp 实例。
     ///
     /// 步骤：
@@ -74,7 +87,7 @@ impl TestApp {
     /// 3. 创建 CronScheduler + AppState
     /// 4. 构建 Router → 启动 server（随机端口）
     /// 5. 注册测试用户 → 获取 JWT token
-    pub async fn new() -> Self {
+    async fn build(consolidation_enabled: bool) -> Self {
         // ── 1. 创建临时目录 ──────────────────────────────────────────────────
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let data_dir = temp_dir.path().to_path_buf();
@@ -107,7 +120,11 @@ impl TestApp {
             jwt_secret,
             data_dir: data_dir.clone(),
         };
-        let state = Arc::new(AppState::new(&config, pool, cron_scheduler.clone()).await);
+        let state = Arc::new(
+            AppState::new(&config, pool, cron_scheduler.clone())
+                .await
+                .with_consolidation_enabled(consolidation_enabled),
+        );
 
         // ── 5. 构建 Router + 绑定随机端口 ────────────────────────────────────
         let app = build_router(state.clone());

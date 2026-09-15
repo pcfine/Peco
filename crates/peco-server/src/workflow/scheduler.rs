@@ -13,6 +13,8 @@
 // - tokio::sync::Mutex 的 MutexGuard 是 Send 的，可在 .await 间安全传递
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use sqlx::SqlitePool;
@@ -23,20 +25,32 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 // ============================================================================
+// JobHandler — 通用定时任务的执行体
+// ============================================================================
+
+/// 通用定时任务的执行体：调用一次返回一个待执行的 future。
+///
+/// 与 Workflow 调度（[`CronScheduler::add_workflow`] 直接绑定 workflow 执行
+/// 路径）并列，供与 Workflow 无关的周期性任务复用同一个调度器 —— 目前是
+/// Peco 记忆自动整理（见 `crate::peco::memory::cron`）。
+pub type JobHandler = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+// ============================================================================
 // CronScheduler
 // ============================================================================
 
-/// Cron 任务调度器（Workflow 专用）。
+/// Cron 任务调度器。
 ///
 /// # 线程安全
 ///
 /// - `inner: Mutex<JobScheduler>` — tokio::sync::Mutex，保护 shutdown 所需的 &mut 访问
-/// - `job_map: RwLock<HashMap>` — 保护复合键 → job_uuid 映射，支持并发读取
+/// - `job_map: RwLock<HashMap>` — 保护键 → job_uuid 映射，支持并发读取
 ///
-/// # 复合键
+/// # 键
 ///
-/// Job map 使用 `"{user_id}:{workflow_name}"` 作为键，因为 CronScheduler 是
-/// AppState 中的单例，不同用户可能拥有同名 Workflow。
+/// Workflow 任务使用 `"{user_id}:{workflow_name}"` 复合键（CronScheduler 是
+/// AppState 中的单例，不同用户可能拥有同名 Workflow）；通用任务
+/// （[`Self::add_job`]）使用调用方给定的全局唯一名。
 pub struct CronScheduler {
     /// 内部调度器实例（tokio::sync::Mutex，跨 .await 安全）。
     inner: Mutex<JobScheduler>,
@@ -162,6 +176,63 @@ impl CronScheduler {
             .read()
             .await
             .contains_key(&Self::make_key(user_id, workflow_name))
+    }
+
+    // ── 通用任务注册（与 Workflow 三方法并列，共用 job_map）─────────────
+
+    /// 注册一个通用定时任务。
+    ///
+    /// `name` 为全局唯一任务名（无用户维度），重复注册同名任务会在调度器中
+    /// 留下孤儿 job —— 调用方负责幂等（如 `crate::peco::memory::cron::register`
+    /// 只在启动期调用一次）。
+    pub async fn add_job(
+        &self,
+        name: String,
+        cron_expr: String,
+        handler: JobHandler,
+    ) -> Result<Uuid, JobSchedulerError> {
+        let key = name.clone();
+        let name_log = name.clone();
+
+        let job = Job::new_async(cron_expr.as_str(), move |_job_uuid, _sched| handler())?;
+
+        let job_uuid = self.inner.lock().await.add(job).await?;
+
+        self.job_map.write().await.insert(key, job_uuid);
+        tracing::info!(
+            job = %name_log,
+            job_uuid = %job_uuid,
+            cron = %cron_expr,
+            "Cron job registered"
+        );
+
+        Ok(job_uuid)
+    }
+
+    /// 从调度器中移除通用定时任务。
+    pub async fn remove_job(&self, name: &str) -> Result<(), JobSchedulerError> {
+        let job_uuid = {
+            let map = self.job_map.read().await;
+            map.get(name).copied()
+        };
+
+        match job_uuid {
+            Some(uuid) => {
+                self.inner.lock().await.remove(&uuid).await?;
+                self.job_map.write().await.remove(name);
+                tracing::info!(job = %name, job_uuid = %uuid, "Cron job removed");
+                Ok(())
+            }
+            None => {
+                tracing::warn!(job = %name, "Attempted to remove unknown cron job");
+                Ok(())
+            }
+        }
+    }
+
+    /// 检查指定通用任务是否已注册调度。
+    pub async fn contains_job(&self, name: &str) -> bool {
+        self.job_map.read().await.contains_key(name)
     }
 
     /// 启动调度器（在所有 job 注册完成后调用）。

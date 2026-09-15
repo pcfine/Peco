@@ -69,6 +69,9 @@ impl FromRequestParts<Arc<AppState>> for AuthUser {
             return Err(ApiError::Unauthorized("user not found".into()));
         }
 
+        // 5. 记录活动时刻（自动整理的空闲判定输入；总开关关闭时零开销）
+        state.record_activity(&claims.sub);
+
         Ok(AuthUser {
             user_id: claims.sub,
         })

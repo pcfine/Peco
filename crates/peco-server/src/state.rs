@@ -2,8 +2,10 @@
 // AppState — 应用全局共享状态
 // ============================================================================
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use peco_core::config::SystemConfig;
 use sqlx::SqlitePool;
@@ -36,6 +38,16 @@ pub struct AppState {
     // ── Peco 子系统 ──────────────────────────────────────────────────
     /// 活跃 Peco 运行注册表（runner 与 SSE 连接解耦的枢纽）。
     pub peco_runs: Arc<PecoActiveRuns>,
+    /// 自动整理总开关（`memory.consolidation.enabled` 的构造期快照）。
+    ///
+    /// 同时也是活动时间戳的采集开关 —— 关闭时 `record_activity` 直接返回，
+    /// 不写 map（零开销），cron 任务也不注册。
+    pub consolidation_enabled: bool,
+    /// 每用户最近一次认证活动时刻（自动整理的空闲判定输入）。
+    ///
+    /// 进程内内存，不落库：空闲判定是调度优化而非正确性前置，重启后
+    /// 丢失只会让用户晚一轮被整理（保守方向）。只在认证成功后写入。
+    pub last_activity: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl AppState {
@@ -89,6 +101,49 @@ impl AppState {
             workspace_manager,
             cron_scheduler,
             peco_runs: Arc::new(PecoActiveRuns::new()),
+            consolidation_enabled: crate::peco::config::PecoConfig::default()
+                .memory
+                .consolidation
+                .enabled,
+            last_activity: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 覆盖自动整理总开关（灰度开启与测试构造用；启动后不再变更）。
+    pub fn with_consolidation_enabled(mut self, enabled: bool) -> Self {
+        self.consolidation_enabled = enabled;
+        self
+    }
+
+    /// 记录用户的一次认证活动时刻。
+    ///
+    /// 总开关关闭时直接返回（不采集成活时间戳，零开销）。锁中毒
+    /// （前次持锁线程 panic）时放弃本次记录并 warn —— 活动时间戳是调度
+    /// 优化，不是认证的正确性前置，绝不因此阻断请求。
+    pub fn record_activity(&self, user_id: &str) {
+        if !self.consolidation_enabled {
+            return;
+        }
+        match self.last_activity.lock() {
+            Ok(mut map) => {
+                map.insert(user_id.to_string(), Instant::now());
+            }
+            Err(e) => tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "last_activity lock poisoned, activity not recorded"
+            ),
+        }
+    }
+
+    /// 快照活动时间戳表（cron tick 读一次，避免持锁跨 await）。
+    pub fn activity_snapshot(&self) -> HashMap<String, Instant> {
+        match self.last_activity.lock() {
+            Ok(map) => map.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "last_activity lock poisoned, treating as empty");
+                HashMap::new()
+            }
         }
     }
 

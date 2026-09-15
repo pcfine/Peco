@@ -9,7 +9,8 @@
 //   - DELETE /api/peco/session              清除/重置会话
 //   - GET  /api/peco/memory/audit           记忆删除审计（分页）
 //   - POST /api/peco/memory/audit/:id/restore  按审计行回滚删除
-//   - POST /api/peco/memory/consolidate     手动触发一轮记忆自动整理
+//   - POST /api/peco/memory/consolidate     手动触发一轮记忆自动整理（202 受理）
+//   - GET  /api/peco/memory/consolidation/state  查询最近一次整理结果
 //   - GET  /api/peco/memory/consolidation/optin  查询自动整理 opt-in 开关
 //   - PUT  /api/peco/memory/consolidation/optin  写入自动整理 opt-in 开关
 //
@@ -26,7 +27,9 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::stream::Stream;
 use model_provider::InputItem;
@@ -1014,49 +1017,105 @@ pub async fn restore_memory_audit(
 pub enum ConsolidateResponse {
     /// 整理未开启（`memory.consolidation.enabled = false`）。
     Disabled { enabled: bool, message: String },
-    /// 一轮整理的统计。
-    Stats(super::memory::RunStats),
+    /// 已受理，后台整理中。
+    Accepted { status: String, user_id: String },
 }
 
 /// 手动触发一轮记忆自动整理（不经 agent 通道，直接调 ConsolidationWorker）。
 ///
-/// 首版同步执行（batch 200 + ≤20 次 Flash 调用，分钟级；超时风险已知，
-/// 必要时改 202 + 后台 spawn，以 `last_run_stats` 观测）。灰度第一批
-/// 触发方式 — cron 触发与空闲判定另行接入。
+/// 异步受理：一轮整理是分钟级（batch 200 + ≤20 次 Flash 调用），同步等待
+/// 会占住连接并撞上游超时 —— 返回 202 后由后台任务跑完，进度与结果经
+/// `GET /memory/consolidation/state` 观测。触发方式之一 — cron 触发与
+/// 空闲判定见 `super::memory::cron`。
 pub async fn consolidate_now(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ConsolidateResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let memory = super::config::PecoConfig::default().memory;
-    if !memory.consolidation.enabled {
+    if !state.consolidation_enabled {
         return Ok(Json(ConsolidateResponse::Disabled {
             enabled: false,
             message: "自动整理未开启（memory.consolidation.enabled = false）".into(),
-        }));
+        })
+        .into_response());
     }
 
-    let ws = state
-        .workspace_manager
-        .get_synced(&user_id, &state.db)
-        .await?;
-    let km = std::sync::Arc::clone(ws.knowledge_manager());
-    // Flash 档 provider 复用主 Agent 的（与 compaction / 记忆提取同范式）
-    let agent = state.workspace_manager.get_agent(&user_id, "@assistant")?;
+    // 用户主动发起即同意，不读 opt-in 开关（与 cron 通道语义分离）
+    let state_bg = Arc::clone(&state);
+    let user_id_bg = user_id.clone();
+    tokio::spawn(async move {
+        match super::memory::build_worker(&state_bg, &user_id_bg, &memory).await {
+            Ok(worker) => match worker.run_once(&user_id_bg).await {
+                Ok(stats) => info!(
+                    user_id = %user_id_bg,
+                    scanned = stats.scanned,
+                    merged = stats.merged,
+                    dedup_deleted = stats.dedup_deleted,
+                    ttl_deleted = stats.ttl_deleted,
+                    llm_calls = stats.llm_calls,
+                    "Manual consolidation round finished"
+                ),
+                Err(e) => warn!(
+                    user_id = %user_id_bg,
+                    error = %e,
+                    "Manual consolidation round failed"
+                ),
+            },
+            Err(e) => warn!(
+                user_id = %user_id_bg,
+                error = %e,
+                "Failed to assemble consolidation worker for manual trigger"
+            ),
+        }
+    });
 
-    let worker = super::memory::ConsolidationWorker::new(
-        km,
-        state.db.clone(),
-        &memory.kb_name,
-        &memory.model,
-        memory.consolidation.clone(),
-        agent.provider().clone(),
-    );
-    let stats = worker
-        .run_once(&user_id)
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ConsolidateResponse::Accepted {
+            status: "accepted".into(),
+            user_id,
+        }),
+    )
+        .into_response())
+}
+
+// ── Handler: GET /api/peco/memory/consolidation/state ──────────────────────
+
+/// 自动整理观测响应：最近一次运行的时刻与统计。
+#[derive(Debug, Serialize)]
+pub struct ConsolidationStateResponse {
+    /// 最近一次整理的完成时刻（RFC 3339）；从未整理过为 null。
+    pub last_run_at: Option<String>,
+    /// 最近一次整理的统计（落库 JSON）；从未整理过为 null。
+    pub last_run_stats: Option<serde_json::Value>,
+}
+
+/// 查询当前用户的自动整理运行状态（前端观测口）。
+///
+/// 不受总开关门控 —— 关闭后仍需能看到关闭前的最后一次运行结果。
+pub async fn get_consolidation_state(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ConsolidationStateResponse>, ApiError> {
+    let row = crate::db::memory_consolidation_state::get_state(&state.db, &user_id)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(format!("failed to read consolidation state: {e}")))?;
 
-    Ok(Json(ConsolidateResponse::Stats(stats)))
+    let (last_run_at, last_run_stats) = match row {
+        Some(row) => (
+            row.last_run_at,
+            row.last_run_stats.map(|raw| {
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .unwrap_or(serde_json::Value::String(raw))
+            }),
+        ),
+        None => (None, None),
+    };
+
+    Ok(Json(ConsolidationStateResponse {
+        last_run_at,
+        last_run_stats,
+    }))
 }
 
 // ── Handler: GET/PUT /api/peco/memory/consolidation/optin ──────────────────
@@ -1163,7 +1222,8 @@ pub async fn export_session(
 /// - `GET /archives/:id` — 下载归档
 /// - `GET /memory/audit` — 记忆删除审计（分页，仅本人）
 /// - `POST /memory/audit/:id/restore` — 按审计行回滚删除
-/// - `POST /memory/consolidate` — 手动触发一轮自动整理
+/// - `POST /memory/consolidate` — 手动触发一轮自动整理（202 受理，后台执行）
+/// - `GET /memory/consolidation/state` — 查询最近一次整理结果
 /// - `GET /memory/consolidation/optin` — 查询自动整理 opt-in 开关
 /// - `PUT /memory/consolidation/optin` — 写入自动整理 opt-in 开关
 pub fn router() -> Router<Arc<AppState>> {
@@ -1177,6 +1237,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/audit", get(list_memory_audit))
         .route("/memory/audit/{id}/restore", post(restore_memory_audit))
         .route("/memory/consolidate", post(consolidate_now))
+        .route("/memory/consolidation/state", get(get_consolidation_state))
         .route("/memory/consolidation/optin", get(get_memory_optin))
         .route("/memory/consolidation/optin", put(set_memory_optin))
 }

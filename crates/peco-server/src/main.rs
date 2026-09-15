@@ -121,6 +121,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ── 10b. 注册 Peco 记忆自动整理 cron（总开关关闭时为空操作）──────────
+    if let Err(e) = peco_server::peco::memory::cron::register(&state).await {
+        tracing::warn!(error = %e, "Failed to register memory consolidation cron job");
+    }
+
     // ── 11. 启动调度器 ──────────────────────────────────────────────────────
     cron_scheduler
         .start()
