@@ -25,6 +25,26 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 // ============================================================================
+// Cron 表达式归一化
+// ============================================================================
+
+/// 把 5 字段 cron 表达式补成 6 字段（秒域补 `0`）。
+///
+/// `Job::new_async` 内部固定走 `croner` 的 `with_seconds_required()`，5 字段
+/// 表达式一律判为 `ParseSchedule` 错误；而标准 cron 与前端预设写的都是
+/// 「分 时 日 月 周」这种 5 字段形式。归一化在此处补齐秒域，两种写法都能注册。
+///
+/// 规则：按空白切分后恰好 5 个字段 → 前置 `0 `；其余（6 字段、`@daily` 之类的
+/// 别名、空串、明显非法输入）原样返回，交给下游解析报错。对已归一化的结果幂等。
+pub fn normalize_cron_expr(expr: &str) -> String {
+    if expr.split_whitespace().count() == 5 {
+        format!("0 {}", expr.trim())
+    } else {
+        expr.to_string()
+    }
+}
+
+// ============================================================================
 // JobHandler — 通用定时任务的执行体
 // ============================================================================
 
@@ -87,6 +107,9 @@ impl CronScheduler {
         let wf_name_c = workflow_name.clone();
         let user_id_c = user_id.clone();
         let wf_name_log = workflow_name.clone();
+
+        // 5 字段补秒域：job 构造要求 6 字段
+        let cron_expr = normalize_cron_expr(&cron_expr);
 
         let job = Job::new_async(cron_expr.as_str(), move |_job_uuid, _sched| {
             let workflow_name = wf_name_c.clone();
@@ -193,6 +216,9 @@ impl CronScheduler {
     ) -> Result<Uuid, JobSchedulerError> {
         let key = name.clone();
         let name_log = name.clone();
+
+        // 5 字段补秒域：job 构造要求 6 字段
+        let cron_expr = normalize_cron_expr(&cron_expr);
 
         let job = Job::new_async(cron_expr.as_str(), move |_job_uuid, _sched| handler())?;
 
@@ -363,4 +389,53 @@ async fn execute_scheduled_workflow(
         run_id = %run_id,
         "Scheduled workflow execution started"
     );
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 5 字段（分 时 日 月 周）补 `0 ` 变 6 字段；复杂字段不拆解、整体前置。
+    #[test]
+    fn normalize_cron_expr_prepends_seconds_for_five_fields() {
+        assert_eq!(normalize_cron_expr("0 9 * * *"), "0 0 9 * * *");
+        assert_eq!(
+            normalize_cron_expr("*/5 9-17 * * 1-5"),
+            "0 */5 9-17 * * 1-5"
+        );
+        // 前后空白不进入结果
+        assert_eq!(normalize_cron_expr("  0 9 * * *  "), "0 0 9 * * *");
+    }
+
+    /// 带秒的 6 字段（含多域复杂写法）原样返回，不重复补秒。
+    #[test]
+    fn normalize_cron_expr_keeps_six_fields_unchanged() {
+        assert_eq!(normalize_cron_expr("0 0 9 * * *"), "0 0 9 * * *");
+        assert_eq!(
+            normalize_cron_expr("30 */5 9-17 1,15 * 1-5"),
+            "30 */5 9-17 1,15 * 1-5"
+        );
+    }
+
+    /// 幂等：归一化结果再归一化不变（补秒不会累积）。
+    #[test]
+    fn normalize_cron_expr_is_idempotent() {
+        let once = normalize_cron_expr("0 9 * * 1-5");
+        assert_eq!(once, "0 0 9 * * 1-5");
+        assert_eq!(normalize_cron_expr(&once), once);
+    }
+
+    /// 空串、字段数不对、`@daily` 别名一律原样返回，交给下游解析报错。
+    #[test]
+    fn normalize_cron_expr_passes_through_non_five_field_input() {
+        assert_eq!(normalize_cron_expr(""), "");
+        assert_eq!(normalize_cron_expr("   "), "   ");
+        assert_eq!(normalize_cron_expr("0 9 * *"), "0 9 * *");
+        assert_eq!(normalize_cron_expr("0 0 9 * * * 2026"), "0 0 9 * * * 2026");
+        assert_eq!(normalize_cron_expr("@daily"), "@daily");
+    }
 }

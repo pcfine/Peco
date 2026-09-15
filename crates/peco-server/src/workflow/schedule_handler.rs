@@ -14,6 +14,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 use super::schedule::*;
+use super::scheduler::normalize_cron_expr;
 use super::types::SuccessResponse;
 
 /// `GET /api/schedules` — 列出所有调度配置。
@@ -52,8 +53,9 @@ pub async fn create_schedule(
         .load(&body.workflow_name)
         .map_err(|_| ApiError::NotFound(format!("workflow '{}' not found", body.workflow_name)))?;
 
-    // 验证 cron 表达式
-    croner::Cron::new(&body.cron)
+    // 验证 cron 表达式（5 或 6 字段都接受：5 字段由调度器补秒域）
+    croner::Cron::new(&normalize_cron_expr(&body.cron))
+        .with_seconds_optional()
         .parse()
         .map_err(|e| ApiError::BadRequest(format!("invalid cron expression: {e}")))?;
 
@@ -89,9 +91,10 @@ pub async fn create_schedule(
     .await
     .map_err(|e| ApiError::Internal(format!("insert schedule: {e}")))?;
 
-    // 如果启用，注册到调度器
-    if body.enabled {
-        let _ = state
+    // 如果启用，注册到调度器。注册失败必须让调用方感知 —— 否则库里留下一条
+    // 「已启用」却永不触发的调度（本 bug 的原始形态）。
+    if body.enabled
+        && let Err(e) = state
             .cron_scheduler
             .add_workflow(
                 body.workflow_name.clone(),
@@ -101,7 +104,29 @@ pub async fn create_schedule(
                 state.db.clone(),
                 Arc::clone(&state),
             )
-            .await;
+            .await
+    {
+        tracing::warn!(
+            workflow = %body.workflow_name,
+            user_id = %user_id,
+            cron = %body.cron,
+            error = %e,
+            "Failed to register cron job for workflow"
+        );
+        // 回滚刚写入的调度行，保持 DB 与调度器一致
+        if let Err(del_err) =
+            crate::db::workflow_schedules::delete(&state.db, &user_id, &body.workflow_name).await
+        {
+            tracing::warn!(
+                workflow = %body.workflow_name,
+                user_id = %user_id,
+                error = %del_err,
+                "Failed to roll back schedule row after registration failure"
+            );
+        }
+        return Err(ApiError::Internal(format!(
+            "failed to register cron job: {e}"
+        )));
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -125,8 +150,9 @@ pub async fn replace_schedule(
     Path(workflow_name): Path<String>,
     Json(body): Json<ReplaceScheduleRequest>,
 ) -> Result<Json<ScheduleResponse>, ApiError> {
-    // 验证 cron 表达式
-    croner::Cron::new(&body.cron)
+    // 验证 cron 表达式（5 或 6 字段都接受：5 字段由调度器补秒域）
+    croner::Cron::new(&normalize_cron_expr(&body.cron))
+        .with_seconds_optional()
         .parse()
         .map_err(|e| ApiError::BadRequest(format!("invalid cron expression: {e}")))?;
 
@@ -152,8 +178,8 @@ pub async fn replace_schedule(
         .cron_scheduler
         .remove_workflow(&workflow_name, &user_id)
         .await;
-    if body.enabled {
-        let _ = state
+    if body.enabled
+        && let Err(e) = state
             .cron_scheduler
             .add_workflow(
                 workflow_name.clone(),
@@ -163,7 +189,20 @@ pub async fn replace_schedule(
                 state.db.clone(),
                 Arc::clone(&state),
             )
-            .await;
+            .await
+    {
+        // 调度行已更新，此处不回滚（替换无旧值可还原）；下次启动会按库中
+        // 配置重新注册，本次则明确报错让调用方感知
+        tracing::warn!(
+            workflow = %workflow_name,
+            user_id = %user_id,
+            cron = %body.cron,
+            error = %e,
+            "Failed to register cron job for workflow"
+        );
+        return Err(ApiError::Internal(format!(
+            "failed to register cron job: {e}"
+        )));
     }
 
     // 重新读取
@@ -227,8 +266,8 @@ pub async fn update_schedule(
         .cron_scheduler
         .remove_workflow(&workflow_name, &user_id)
         .await;
-    if row.enabled != 0 {
-        let _ = state
+    if row.enabled != 0
+        && let Err(e) = state
             .cron_scheduler
             .add_workflow(
                 workflow_name.clone(),
@@ -238,7 +277,19 @@ pub async fn update_schedule(
                 state.db.clone(),
                 Arc::clone(&state),
             )
-            .await;
+            .await
+    {
+        // 同 replace：调度行已更新，不回滚，明确报错让调用方感知
+        tracing::warn!(
+            workflow = %workflow_name,
+            user_id = %user_id,
+            cron = %row.cron_expr,
+            error = %e,
+            "Failed to register cron job for workflow"
+        );
+        return Err(ApiError::Internal(format!(
+            "failed to register cron job: {e}"
+        )));
     }
 
     Ok(Json(ScheduleResponse {

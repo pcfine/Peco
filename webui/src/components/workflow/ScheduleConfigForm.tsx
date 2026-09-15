@@ -65,7 +65,7 @@ export function ScheduleConfigForm({
         <div className="space-y-1.5">
           <Label className="text-xs flex items-center gap-1">
             Cron 表达式
-            <span title="标准 5 位 cron 表达式：分 时 日 月 周">
+            <span title="支持 5 字段（分 时 日 月 周）或 6 字段（秒 分 时 日 月 周）；5 字段由后端自动补秒（补 0）">
               <HelpCircle className="h-3 w-3 text-muted-foreground" />
             </span>
           </Label>
@@ -73,8 +73,11 @@ export function ScheduleConfigForm({
             className="h-8 text-xs font-mono"
             value={cron}
             onChange={(e) => setCron(e.target.value)}
-            placeholder="0 9 * * 1-5"
+            placeholder="0 9 * * 1-5（5 字段，后端自动补秒）"
           />
+          <p className="text-xs text-muted-foreground">
+            5 字段（分 时 日 月 周）或 6 字段（秒 分 时 日 月 周）均可；5 字段由后端自动补秒。
+          </p>
           <div className="flex flex-wrap gap-1 mt-1">
             {CRON_PRESETS.map((preset) => (
               <button

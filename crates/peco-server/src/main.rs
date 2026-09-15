@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::warn!(
                             workflow = %schedule.workflow_name,
                             user_id = %schedule.user_id,
+                            cron = %schedule.cron_expr,
                             error = %e,
                             "Failed to register scheduled workflow on startup"
                         );
