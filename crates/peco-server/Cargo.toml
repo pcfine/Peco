@@ -8,7 +8,7 @@ description = "Axum web backend for peco — RESTful API + SSE streaming"
 # Internal
 peco-core = { path = "../peco-core" }
 model-provider = { path = "../model-provider" }
-knowledge-base = { path = "../knowledge-base" }
+knowledge-base = { path = "../knowledge-base", features = ["helixdb"] }
 peco-agents = { path = "../peco-agents" }
 
 # Web framework

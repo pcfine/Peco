@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             backend: BackendType::LanceDb,
             storage_path: None,
             default_storage_mode: Default::default(),
+            helix_url: None,
         })
         .await?;
 

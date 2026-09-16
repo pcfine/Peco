@@ -628,10 +628,10 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
         }
     })];
 
-    if let Some(ref f) = query.filters {
-        if let Some(filter_step) = filter_step(Some(f)) {
-            vector_steps.push(filter_step);
-        }
+    if let Some(ref f) = query.filters
+        && let Some(filter_step) = filter_step(Some(f))
+    {
+        vector_steps.push(filter_step);
     }
 
     // 投影命中分块
@@ -655,10 +655,10 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
         }
     })];
 
-    if let Some(ref f) = query.filters {
-        if let Some(filter_step) = filter_step(Some(f)) {
-            text_steps.push(filter_step);
-        }
+    if let Some(ref f) = query.filters
+        && let Some(filter_step) = filter_step(Some(f))
+    {
+        text_steps.push(filter_step);
     }
 
     // 投影命中分块
@@ -823,7 +823,7 @@ mod tests {
         // 应包含 Repeat 步骤（图扩展）
         let has_repeat = vsteps
             .iter()
-            .any(|s| s.as_object().map_or(false, |o| o.contains_key("Repeat")));
+            .any(|s| s.as_object().is_some_and(|o| o.contains_key("Repeat")));
         assert!(has_repeat, "graph_depth > 0 时应包含 Repeat 步骤");
     }
 
@@ -931,8 +931,8 @@ mod tests {
         assert_eq!(arr.len(), 2);
 
         // prop_f64
-        let p = prop_f64(3.14);
-        assert!((p["Value"]["F64"].as_f64().unwrap() - 3.14).abs() < 1e-10);
+        let p = prop_f64(3.5);
+        assert!((p["Value"]["F64"].as_f64().unwrap() - 3.5).abs() < 1e-10);
 
         // prop_i64
         let p = prop_i64(42);
@@ -942,6 +942,7 @@ mod tests {
     #[test]
     fn filter_with_document_ids() {
         let filters = SearchFilters {
+            kb_id: None,
             document_ids: Some(vec!["doc-a".into(), "doc-b".into()]),
             file_types: None,
         };

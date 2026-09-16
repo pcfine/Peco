@@ -547,6 +547,7 @@ async fn run_synthetic(args: &Args) -> Result<(), String> {
             backend: BackendType::InMemory,
             storage_path: None,
             default_storage_mode: Default::default(),
+            helix_url: None,
         })
         .await
         .map_err(|e| format!("创建临时知识库失败: {e}"))?;

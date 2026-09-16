@@ -7,7 +7,7 @@
     "size": 800,
     "overlap": 200
   },
-  "backend": "LanceDb",
+  "backend": "HelixDb",
   "storage_path": null,
   "default_storage_mode": "full"
 }

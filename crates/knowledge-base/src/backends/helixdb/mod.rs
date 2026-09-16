@@ -72,11 +72,9 @@ fn parse_id_value(val: &serde_json::Value) -> Option<String> {
         Some(n.to_string())
     } else if let Some(n) = val.as_i64() {
         Some(n.to_string())
-    } else if let Some(n) = val.as_f64() {
-        // 自增 ID 不会是浮点数，但做保守处理
-        Some(format!("{n}"))
     } else {
-        None
+        // 自增 ID 不会是浮点数，但做保守处理
+        val.as_f64().map(|n| format!("{n}"))
     }
 }
 
@@ -145,9 +143,38 @@ impl HelixDbBackend {
     }
 }
 
-// ── 辅助：EdgeType → HelixDB 边标签映射 ──────────────────────────────────
+// ── 辅助：维度守卫 + EdgeType → HelixDB 边标签映射 ───────────────────────
 
 impl HelixDbBackend {
+    /// 向量维度守卫 —— 在任何 HTTP 请求之前 fail-closed。
+    ///
+    /// HelixDB 的向量索引维度由 schema 声明且建库后固定。喂进长度不符的向量
+    /// 不会报错，只会把索引写坏，或让 ANN 搜索返回看似正常实则错配的结果。
+    /// 因此任何离开本进程的向量都要先核对维度。
+    ///
+    /// `label` 是承载该向量的节点标签（HelixDB 的向量集合即「节点标签 +
+    /// 属性」，对应关系库的表名）。
+    fn ensure_dims(&self, label: &str, vector: &[f32]) -> Result<(), KnowledgeError> {
+        if vector.len() == self.ndims {
+            return Ok(());
+        }
+        Err(KnowledgeError::DimensionMismatch {
+            table_name: label.to_string(),
+            expected: self.ndims,
+            actual: vector.len(),
+        })
+    }
+
+    /// 写路径守卫：空向量表示「本次未提供向量」——非 Full 存储模式
+    /// （`StorageMode::TextOnly` / `MetadataOnly` 等）下 `IngestionPipeline`
+    /// 会显式传入空 embedding，这类调用放行，只有维度不符的实向量才拒绝。
+    fn ensure_write_dims(&self, label: &str, vector: &[f32]) -> Result<(), KnowledgeError> {
+        if vector.is_empty() {
+            return Ok(());
+        }
+        self.ensure_dims(label, vector)
+    }
+
     /// 将 knowledge-base 的 `EdgeType` 映射到 HelixDB 的边标签字符串。
     fn edge_label(&self, et: &EdgeType) -> String {
         match et {
@@ -184,6 +211,12 @@ impl DocumentStore for HelixDbBackend {
             "Storing document to HelixDB"
         );
 
+        // 维度守卫：先于任何 HTTP 请求校验全部 embedding，避免写到一半
+        // 才发现维度不符，留下半截数据。
+        for chunk in &chunks {
+            self.ensure_write_dims(&self.schema.fragment_node_label, &chunk.embedding)?;
+        }
+
         let metadata_json = serde_json::to_string(&doc.metadata).unwrap_or_default();
         // 文档级 embedding：取所有分块 embedding 的平均值
         let doc_embedding = if !chunks.is_empty() {
@@ -201,6 +234,8 @@ impl DocumentStore for HelixDbBackend {
         } else {
             Vec::new()
         };
+
+        self.ensure_write_dims(&self.schema.content_node_label, &doc_embedding)?;
 
         // 1. 创建 Document 节点
         let doc_query =
@@ -239,7 +274,7 @@ impl DocumentStore for HelixDbBackend {
             .map(|item| {
                 let doc_id = item
                     .get("id")
-                    .and_then(|v| parse_id_value(v))
+                    .and_then(parse_id_value)
                     .unwrap_or_else(|| id.to_string());
                 let title = item
                     .get("title")
@@ -346,7 +381,7 @@ impl DocumentStore for HelixDbBackend {
                             .to_string();
                         let document_id = item
                             .get("document_id")
-                            .and_then(|v| parse_id_value(v))
+                            .and_then(parse_id_value)
                             .unwrap_or_else(|| doc_id.to_string());
                         let sequence_index = item
                             .get("sequence_index")
@@ -424,6 +459,10 @@ impl VectorIndex for HelixDbBackend {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<VectorHit>, KnowledgeError> {
+        // 查询向量必须存在且维度精确匹配 —— 空向量在这里不是「未提供」，
+        // 而是调用方的 bug。
+        self.ensure_dims(&self.schema.fragment_node_label, query_vec)?;
+
         let query = queries::vector_search_chunks(&self.schema, query_vec, top_k as u32, filters);
         let response = self.client.execute_read(query).await?;
 
@@ -434,7 +473,7 @@ impl VectorIndex for HelixDbBackend {
                         let chunk_id = parse_id_value(item.get("chunk_id")?)?;
                         let document_id = item
                             .get("document_id")
-                            .and_then(|v| parse_id_value(v))
+                            .and_then(parse_id_value)
                             .unwrap_or_default();
                         let distance = item.get("score").map_or(0.0, parse_distance);
                         let score = distance_to_score(distance);
@@ -452,6 +491,9 @@ impl VectorIndex for HelixDbBackend {
     }
 
     async fn upsert(&self, entries: &[VectorEntry]) -> Result<(), KnowledgeError> {
+        for entry in entries {
+            self.ensure_write_dims(&self.schema.fragment_node_label, &entry.vector)?;
+        }
         for entry in entries {
             let query = queries::update_chunk_embedding(&self.schema, &entry.id, &entry.vector);
             self.client.execute_write(query).await?;
@@ -493,7 +535,7 @@ impl FullTextIndex for HelixDbBackend {
                         let chunk_id = parse_id_value(item.get("chunk_id")?)?;
                         let document_id = item
                             .get("document_id")
-                            .and_then(|v| parse_id_value(v))
+                            .and_then(parse_id_value)
                             .unwrap_or_default();
                         let distance = item.get("score").map_or(0.0, parse_distance);
                         let score = distance_to_score(distance);
@@ -680,10 +722,10 @@ impl GraphStore for HelixDbBackend {
 
         // 检查两端节点是否存在
         let to_query = queries::get_document_by_id(&self.schema, to);
-        if let Ok(resp) = self.client.execute_read(to_query).await {
-            if extract_properties(&resp, "doc").map_or(true, |a| a.is_empty()) {
-                return Ok(None);
-            }
+        if let Ok(resp) = self.client.execute_read(to_query).await
+            && extract_properties(&resp, "doc").is_none_or(|a| a.is_empty())
+        {
+            return Ok(None);
         }
 
         // 从 from 出发做双向 BFS，最大深度 5
@@ -783,6 +825,10 @@ impl CombinedSearch for HelixDbBackend {
             graph_depth = query.graph_expansion_depth,
             "Executing HelixDB combined search"
         );
+
+        // 组合搜索是 `HybridSearchEngine` 的首选路径，同样要在发 HTTP 之前
+        // 守住查询向量维度，否则它会绕过 `VectorIndex::search` 的守卫。
+        self.ensure_dims(&self.schema.fragment_node_label, &query.query_vector)?;
 
         // 1. 构建并发送单次 readBatch
         let batch = queries::combined_search_query(&self.schema, query);
@@ -890,12 +936,8 @@ fn parse_path_results(
 
     for row in rows {
         // 如果行包含 chunk_id → 分块命中行
-        if row
-            .get("chunk_id")
-            .and_then(|v| parse_id_value(v))
-            .is_some()
-        {
-            if let Some(doc_id) = row.get("document_id").and_then(|v| parse_id_value(v)) {
+        if row.get("chunk_id").and_then(parse_id_value).is_some() {
+            if let Some(doc_id) = row.get("document_id").and_then(parse_id_value) {
                 let distance = row.get("score").map_or(0.0, parse_distance);
                 let score = distance_to_score(distance);
                 let entry = doc_scores.entry(doc_id.to_string()).or_insert(0.0);
@@ -905,17 +947,17 @@ fn parse_path_results(
             }
         }
         // 如果行包含 graph_distance → 图扩展文档行
-        else if row.get("graph_distance").is_some() {
-            if let Some(doc_id) = row.get("document_id").and_then(|v| parse_id_value(v)) {
-                let distance = row
-                    .get("graph_distance")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                graph_nodes.push(ParsedGraphNode {
-                    document_id: doc_id.to_string(),
-                    distance,
-                });
-            }
+        else if row.get("graph_distance").is_some()
+            && let Some(doc_id) = row.get("document_id").and_then(parse_id_value)
+        {
+            let distance = row
+                .get("graph_distance")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            graph_nodes.push(ParsedGraphNode {
+                document_id: doc_id.to_string(),
+                distance,
+            });
         }
     }
 
@@ -934,4 +976,189 @@ fn dedup_by_doc_id(items: Vec<(String, f32)>) -> Vec<(String, f32)> {
     let mut result: Vec<_> = map.into_iter().collect();
     result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 测试
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 未监听任何服务的端点 —— 守卫若在 HTTP 之后，这里拿到的会是
+    /// `Internal("HTTP request failed: ...")` 而不是 `DimensionMismatch`，
+    /// 因此该用例同时验证了「守卫先于网络」。
+    const DEAD_ENDPOINT: &str = "http://localhost:19999";
+
+    fn chunk(dims: usize) -> Chunk {
+        Chunk {
+            id: "doc-0001-abcd".into(),
+            document_id: "doc-0001".into(),
+            text: "测试分块".into(),
+            sequence_index: 0,
+            page_number: None,
+            embedding: vec![0.5; dims],
+            metadata: ChunkMetadata::default(),
+        }
+    }
+
+    fn document() -> Document {
+        Document {
+            id: "doc-0001".into(),
+            kb_id: None,
+            title: "测试文档".into(),
+            source_path: "test.txt".into(),
+            content: "测试内容".into(),
+            metadata: DocumentMetadata::default(),
+        }
+    }
+
+    /// 查询向量维度不符时必须在发 HTTP 之前拒绝。
+    #[tokio::test]
+    async fn search_rejects_mismatched_query_dim() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = VectorIndex::search(&backend, &[0.1, 0.2, 0.3], 5, None)
+            .await
+            .expect_err("3 维查询向量不应被 4 维索引接受");
+
+        match err {
+            KnowledgeError::DimensionMismatch {
+                table_name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(table_name, "Chunk");
+                assert_eq!(expected, 4);
+                assert_eq!(actual, 3);
+            }
+            other => panic!("期望 DimensionMismatch，实际为 {other:?}"),
+        }
+    }
+
+    /// 空查询向量不是「未提供向量」而是调用方 bug，同样拒绝。
+    #[tokio::test]
+    async fn search_rejects_empty_query_vec() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = VectorIndex::search(&backend, &[], 5, None)
+            .await
+            .expect_err("空查询向量不应被接受");
+
+        assert!(matches!(
+            err,
+            KnowledgeError::DimensionMismatch { actual: 0, .. }
+        ));
+    }
+
+    /// 组合搜索走的是独立入口，必须同样守住查询向量维度。
+    #[tokio::test]
+    async fn combined_search_rejects_mismatched_query_dim() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = backend
+            .combined_search(&CombinedQuery {
+                query_text: "测试".into(),
+                query_vector: vec![0.1, 0.2],
+                vector_top_k: 5,
+                text_top_k: 5,
+                graph_expansion_depth: 0,
+                graph_edge_types: vec![],
+                fusion: RrfConfig::default(),
+                filters: None,
+            })
+            .await
+            .expect_err("2 维查询向量不应被 4 维索引接受");
+
+        match err {
+            KnowledgeError::DimensionMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!((expected, actual), (4, 2));
+            }
+            other => panic!("期望 DimensionMismatch，实际为 {other:?}"),
+        }
+    }
+
+    /// 摄入写路径上的分块 embedding 维度不符时，在发出任何写请求之前拒绝。
+    #[tokio::test]
+    async fn store_rejects_mismatched_chunk_embedding() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = backend
+            .store(document(), vec![chunk(3)])
+            .await
+            .expect_err("3 维分块 embedding 不应被 4 维索引接受");
+
+        match err {
+            KnowledgeError::DimensionMismatch {
+                table_name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(table_name, "Chunk");
+                assert_eq!((expected, actual), (4, 3));
+            }
+            other => panic!("期望 DimensionMismatch，实际为 {other:?}"),
+        }
+    }
+
+    /// 向量写路径同样 fail-closed。
+    #[tokio::test]
+    async fn upsert_rejects_mismatched_embedding() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = backend
+            .upsert(&[VectorEntry {
+                id: "doc-0001-abcd".into(),
+                document_id: "doc-0001".into(),
+                vector: vec![0.1, 0.2, 0.3, 0.4, 0.5],
+                text: "测试分块".into(),
+            }])
+            .await
+            .expect_err("5 维 embedding 不应被 4 维索引接受");
+
+        match err {
+            KnowledgeError::DimensionMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!((expected, actual), (4, 5));
+            }
+            other => panic!("期望 DimensionMismatch，实际为 {other:?}"),
+        }
+    }
+
+    /// 回归保护：空 embedding 表示「本次未提供向量」（非 Full 存储模式的
+    /// 正常形态），守卫放行 —— 此时失败发生在 HTTP 层而非维度守卫。
+    #[tokio::test]
+    async fn store_allows_absent_embedding() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = backend
+            .store(document(), vec![chunk(0)])
+            .await
+            .expect_err("死端点上的写入必然失败");
+
+        assert!(
+            !matches!(err, KnowledgeError::DimensionMismatch { .. }),
+            "空 embedding 不应触发维度守卫，实际为 {err:?}"
+        );
+    }
+
+    /// 回归保护：维度一致时守卫放行（同样落在 HTTP 层失败）。
+    #[tokio::test]
+    async fn store_allows_matching_embedding() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let err = backend
+            .store(document(), vec![chunk(4)])
+            .await
+            .expect_err("死端点上的写入必然失败");
+
+        assert!(
+            !matches!(err, KnowledgeError::DimensionMismatch { .. }),
+            "维度一致的 embedding 不应触发维度守卫，实际为 {err:?}"
+        );
+    }
 }

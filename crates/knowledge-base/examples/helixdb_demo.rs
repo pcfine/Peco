@@ -27,7 +27,10 @@
 
 use std::sync::Arc;
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+};
+use hf_hub::api::sync::Api;
 use knowledge_base::backends::helixdb::HelixDbBackend;
 use knowledge_base::chunking::make_chunker;
 use knowledge_base::engine::{
@@ -42,25 +45,53 @@ use knowledge_base::types::*;
 // Fastembed 嵌入引擎（中文优化，与 knowledge_demo 共用同一套逻辑）
 // ---------------------------------------------------------------------------
 
+/// `Xenova/bge-base-zh-v1.5` — fastembed 精选清单未收录的中文 base 模型，
+/// 与生产 KB 默认嵌入模型（`FastembedModelType::BGEBaseZHV15`）同源同维度。
+const BGE_BASE_ZH_V15_REPO: &str = "Xenova/bge-base-zh-v1.5";
+
 /// 包装 [`fastembed::TextEmbedding`] 以适配 [`EmbeddingEngine`] trait。
 ///
-/// 使用 `BGELargeZHV15` — BAAI BGE large 中文模型（1024 维向量）。
+/// 使用 `Xenova/bge-base-zh-v1.5` —— BAAI BGE base 中文模型（768 维向量），
+/// 与 `knowledge_base::FastembedEngine` 的 `BGEBaseZHV15` 走同一条
+/// user-defined 加载路径，保证 demo 与生产 KB 维度一致（HelixDB 的向量
+/// 索引维度建库即固定，维度不一致会被后端的维度守卫拒绝）。
 struct FastembedEngine {
     model: Arc<TextEmbedding>,
     ndims: usize,
 }
 
 impl FastembedEngine {
-    fn new(model_name: EmbeddingModel) -> Result<Self, Box<dyn std::error::Error>> {
-        let model = TextEmbedding::try_new(InitOptions::new(model_name))
-            .map_err(|e| format!("failed to init fastembed model: {e}"))?;
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let api = Api::new()?;
+        let repo = api.model(BGE_BASE_ZH_V15_REPO.to_string());
+        let read_file = |name: &str| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            Ok(std::fs::read(repo.get(name)?)?)
+        };
+
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file: read_file("tokenizer.json")?,
+            config_file: read_file("config.json")?,
+            special_tokens_map_file: read_file("special_tokens_map.json")?,
+            tokenizer_config_file: read_file("tokenizer_config.json")?,
+        };
+        let user_defined =
+            UserDefinedEmbeddingModel::new(read_file("onnx/model.onnx")?, tokenizer_files)
+                .with_pooling(Pooling::Cls);
+
+        let model =
+            TextEmbedding::try_new_from_user_defined(user_defined, InitOptionsUserDefined::new())
+                .map_err(|e| format!("failed to init {BGE_BASE_ZH_V15_REPO}: {e}"))?;
 
         let test_embedding = model
             .embed(vec!["test"], None)
             .map_err(|e| format!("failed to get embedding dimension: {e}"))?;
-        let ndims = test_embedding.first().map(|v| v.len()).unwrap_or(1024);
+        let ndims = test_embedding.first().map(|v| v.len()).unwrap_or(768);
 
-        tracing::info!(ndims, "Fastembed engine initialised");
+        tracing::info!(
+            ndims,
+            repo = BGE_BASE_ZH_V15_REPO,
+            "Fastembed engine initialised"
+        );
         Ok(Self {
             model: Arc::new(model),
             ndims,
@@ -138,10 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("HelixDB URL: {}\n", args.helixdb_url);
 
     // ── 连接 HelixDB ──
-    let embedding = Arc::new(
-        FastembedEngine::new(EmbeddingModel::BGELargeZHV15)
-            .expect("Failed to init fastembed model"),
-    );
+    let embedding = Arc::new(FastembedEngine::new().expect("Failed to init fastembed model"));
 
     println!("Connecting to HelixDB...");
     let backend = Arc::new(HelixDbBackend::connect(&args.helixdb_url, embedding.ndims()).await?);

@@ -26,6 +26,7 @@ fn memory_kb_config() -> KbConfig {
         backend: BackendType::InMemory,
         storage_path: None,
         default_storage_mode: Default::default(),
+        helix_url: None,
     }
 }
 

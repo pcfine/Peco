@@ -35,6 +35,7 @@ mod tests {
                 backend: config::BackendType::InMemory,
                 storage_path: None,
                 default_storage_mode: Default::default(),
+                helix_url: None,
             })
             .await
             .unwrap();
@@ -66,6 +67,7 @@ mod tests {
             backend: config::BackendType::InMemory,
             storage_path: None,
             default_storage_mode: Default::default(),
+            helix_url: None,
         }
     }
 

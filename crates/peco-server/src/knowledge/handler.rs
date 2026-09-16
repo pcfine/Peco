@@ -274,6 +274,9 @@ pub async fn create_knowledge_base(
         backend: BackendType::LanceDb,
         storage_path: None,
         default_storage_mode: Default::default(),
+        // REST 建库接口不暴露 HelixDB 端点：该后端只由模板 kb_config.json
+        // 声明。此处置 None，走 PECO_KB_HELIX_URL / 默认值回退。
+        helix_url: None,
     };
 
     km.create_kb(kb_config)

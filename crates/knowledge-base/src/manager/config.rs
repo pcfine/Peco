@@ -32,6 +32,12 @@ pub struct KbConfig {
     /// 默认存储模式（默认为 Full）。
     #[serde(default)]
     pub default_storage_mode: StorageMode,
+    /// 部署级 HelixDB 端点（仅 `BackendType::HelixDb` 使用）。
+    ///
+    /// `None` 或空串时回退：环境变量 `PECO_KB_HELIX_URL` →
+    /// `http://localhost:6970`（见 [`crate::manager::knowledge_base`] 的解析顺序）。
+    #[serde(default)]
+    pub helix_url: Option<String>,
 }
 
 /// 后端类型（可序列化版本）。
@@ -195,5 +201,69 @@ mod tests {
             let back: FastembedModelTypeSerde = model_type.into();
             assert_eq!(serde_json::to_string(&back).unwrap(), expected);
         }
+    }
+
+    /// 既有 kb_config.json（无 `helix_url` 字段）必须继续解析 —
+    /// `#[serde(default)]` 保证旧配置向后兼容。
+    #[test]
+    fn kb_config_without_helix_url_parses() {
+        let json = r#"{
+            "name": "@private_memory",
+            "description": "个人记忆知识库",
+            "embedding_model": "b-g-e-base-z-h-v15",
+            "chunking": {"type": "overlapping-window", "size": 800, "overlap": 200},
+            "backend": "InMemory",
+            "storage_path": null,
+            "default_storage_mode": "full"
+        }"#;
+        let config: KbConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.helix_url, None);
+    }
+
+    /// `"backend": "HelixDb"` 的 kb_config.json 可解析，且 `helix_url`
+    /// 缺省为 `None`（由 build 阶段的环境变量/默认值回退补齐）。
+    #[cfg(feature = "helixdb")]
+    #[test]
+    fn helix_backend_config_parses() {
+        let json = r#"{
+            "name": "@private_memory",
+            "description": "个人记忆知识库",
+            "embedding_model": "b-g-e-base-z-h-v15",
+            "chunking": {"type": "overlapping-window", "size": 800, "overlap": 200},
+            "backend": "HelixDb",
+            "storage_path": null,
+            "default_storage_mode": "full"
+        }"#;
+        let config: KbConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.backend, BackendType::HelixDb);
+        assert_eq!(config.helix_url, None);
+    }
+
+    /// `helix_url` 显式配置时按原值保留并可序列化 roundtrip。
+    #[cfg(feature = "helixdb")]
+    #[test]
+    fn helix_url_roundtrip() {
+        let json = r#"{
+            "name": "@private_memory",
+            "description": "个人记忆知识库",
+            "embedding_model": "b-g-e-base-z-h-v15",
+            "chunking": {"type": "overlapping-window", "size": 800, "overlap": 200},
+            "backend": "HelixDb",
+            "storage_path": null,
+            "default_storage_mode": "full",
+            "helix_url": "http://helix.internal:6970"
+        }"#;
+        let config: KbConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.helix_url.as_deref(),
+            Some("http://helix.internal:6970")
+        );
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let round: KbConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            round.helix_url.as_deref(),
+            Some("http://helix.internal:6970")
+        );
     }
 }

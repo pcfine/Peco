@@ -25,6 +25,62 @@ type BackendComponents = (
     Option<Arc<dyn GraphStore>>,
 );
 
+// HelixDB 端点解析只在 helixdb feature 下被生产代码调用；带上 `test`
+// 让单测在默认 feature 集（不含 helixdb）下也能覆盖解析顺序。
+
+/// HelixDB 端点的环境变量覆盖项。
+#[cfg(any(feature = "helixdb", test))]
+const ENV_KB_HELIX_URL: &str = "PECO_KB_HELIX_URL";
+
+/// HelixDB 端点的最终回退值。
+#[cfg(any(feature = "helixdb", test))]
+const DEFAULT_HELIX_URL: &str = "http://localhost:6970";
+
+/// 解析 HelixDB 端点，回退顺序：显式配置 → `PECO_KB_HELIX_URL` → 默认值。
+///
+/// 空串与纯空白一律视为「未配置」继续回退 —— 畸形值会拼出
+/// `POST /v1/query` 这类无效 URL，与其静默失败不如退到默认端点。
+#[cfg(any(feature = "helixdb", test))]
+pub(crate) fn resolve_helix_url(configured: Option<&str>) -> String {
+    if let Some(url) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        return url.to_string();
+    }
+    match std::env::var(ENV_KB_HELIX_URL) {
+        Ok(url) if !url.trim().is_empty() => url.trim().to_string(),
+        _ => DEFAULT_HELIX_URL.to_string(),
+    }
+}
+
+/// 构建 HelixDB 后端四件套（文档存储 / 向量索引 / 全文索引 / 图存储）。
+///
+/// `HelixDbBackend` 自身实现全部四个 trait，四处共享同一实例。
+/// `init_schema` 幂等，重复打开同一个 KB 安全。
+#[cfg(feature = "helixdb")]
+async fn build_helix_components(
+    config: &KbConfig,
+    ndims: usize,
+) -> Result<BackendComponents, KnowledgeError> {
+    let url = resolve_helix_url(config.helix_url.as_deref());
+    info!(kb = %config.name, %url, ndims, "Connecting to HelixDB backend");
+
+    let be = Arc::new(
+        crate::backends::helixdb::HelixDbBackend::connect_with_schema(
+            &url,
+            ndims,
+            crate::backends::helixdb::HelixSchema::default(),
+        )
+        .await?,
+    );
+    be.init_schema().await?;
+
+    Ok((
+        be.clone() as Arc<dyn DocumentStore>,
+        Some(be.clone() as Arc<dyn VectorIndex>),
+        Some(be.clone() as Arc<dyn FullTextIndex>),
+        Some(be.clone() as Arc<dyn GraphStore>),
+    ))
+}
+
 /// 构建文本型 `Document`（`add_text` / `add_text_with_mode` 共用）。
 ///
 /// `created_at` 记录写入时刻（ISO 8601），供 TTL 判定等下游逻辑使用。
@@ -109,11 +165,7 @@ impl KnowledgeBase {
                     )
                 }
                 #[cfg(feature = "helixdb")]
-                BackendType::HelixDb => {
-                    return Err(KnowledgeError::InvalidInput(
-                        "HelixDB backend must be configured via the advanced API, use HelixDbBackend::connect()".into(),
-                    ));
-                }
+                BackendType::HelixDb => build_helix_components(config, ndims).await?,
             };
 
         #[cfg(not(feature = "lancedb"))]
@@ -129,11 +181,7 @@ impl KnowledgeBase {
                     )
                 }
                 #[cfg(feature = "helixdb")]
-                BackendType::HelixDb => {
-                    return Err(KnowledgeError::InvalidInput(
-                        "HelixDB backend must be configured via the advanced API".into(),
-                    ));
-                }
+                BackendType::HelixDb => build_helix_components(config, ndims).await?,
                 _ => {
                     return Err(KnowledgeError::InvalidInput(
                         "LanceDB feature is not enabled".into(),
@@ -495,5 +543,54 @@ impl KnowledgeBase {
         let from_id = compute_entity_id(from_entity, entity_type);
         let to_id = compute_entity_id(to_entity, entity_type);
         gs.shortest_path(&from_id, &to_id, &[], 10).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `resolve_helix_url` 读写进程级环境变量，用例串行执行避免相互干扰。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 回退顺序：显式配置 → 环境变量 → 默认值；空串与纯空白视为未配置。
+    #[test]
+    fn resolve_helix_url_fallback_order() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // SAFETY: 环境变量是进程级全局状态，此处由 ENV_LOCK 保证
+        // 同一时刻没有其他线程在读它。
+        unsafe { std::env::remove_var(ENV_KB_HELIX_URL) };
+
+        // 1. 无配置、无环境变量 → 默认值
+        assert_eq!(resolve_helix_url(None), DEFAULT_HELIX_URL);
+
+        // 2. 环境变量回退
+        // SAFETY: 同上
+        unsafe { std::env::set_var(ENV_KB_HELIX_URL, "http://env-helix:6970") };
+        assert_eq!(resolve_helix_url(None), "http://env-helix:6970");
+
+        // 3. 显式配置优先于环境变量
+        assert_eq!(
+            resolve_helix_url(Some("http://configured:6969")),
+            "http://configured:6969"
+        );
+
+        // 4. 空串 / 纯空白视为未配置，继续回退到环境变量
+        assert_eq!(resolve_helix_url(Some("")), "http://env-helix:6970");
+        assert_eq!(resolve_helix_url(Some("   ")), "http://env-helix:6970");
+
+        // 5. 环境变量是空串时同样回退到默认值
+        // SAFETY: 同上
+        unsafe { std::env::set_var(ENV_KB_HELIX_URL, "  ") };
+        assert_eq!(resolve_helix_url(None), DEFAULT_HELIX_URL);
+
+        // SAFETY: 同上
+        unsafe { std::env::remove_var(ENV_KB_HELIX_URL) };
     }
 }
