@@ -43,6 +43,15 @@ use client::HelixDbClient;
 use queries::prop_f64;
 pub use types::{HelixIndexSpec, HelixSchema, IndexType};
 
+/// `GraphNode.labels` 为空时的兜底节点标签。
+///
+/// `KnowledgeBase::add_facts` 写入的实体节点用 `"Entity"`，HelixDB 又要求
+/// 每个节点有且只有一个 label，因此这里以它作为缺省值。
+const DEFAULT_NODE_LABEL: &str = "Entity";
+
+/// `EdgeType::Mentions` 对应的边标签 —— 该类型没有 schema 字段。
+const MENTIONS_EDGE: &str = "MENTIONS";
+
 // ── 分数转换 ──────────────────────────────────────────────────────────────
 
 /// 将 HelixDB 的距离值转换为相似度分数。
@@ -91,6 +100,75 @@ fn extract_properties<'r>(response: &'r Value, key: &str) -> Option<&'r Vec<Valu
         .get(key)
         .and_then(|v| v.get("properties"))
         .and_then(|v| v.as_array())
+}
+
+/// 解析 Count 步骤的结果，缺失或形态不符时返回 0。
+fn count_value(response: &Value, key: &str) -> usize {
+    response
+        .get(key)
+        .and_then(|v| v.get("count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize
+}
+
+/// 解析 [`queries::traverse_graph`] 返回的 `traversed` 结果。
+///
+/// `node_id` 现在是 `schema.id_property`（稳定身份）而非内部 `$id`；`name` 回填进
+/// `properties`。`N(start) → Repeat` 会把起点自身也 emit 出来，这里按稳定 id 过滤
+/// 掉 —— 起点不是「遍历到的邻居」。
+///
+/// `via_edge` 一律留空 —— 节点侧遍历拿不到边标签（边标签只在边投影的结果里），
+/// 由调用方在能拿到时回填。`distance` 恒为 0：HelixDB 的遍历不返回 `$distance`，
+/// 直连邻居的跳数由 `adjacent_steps` 以 1 精确给出，更远节点无法得知真实跳数。
+fn parse_traversed_nodes(response: &Value, start_node_id: &str) -> Vec<TraversalStep> {
+    extract_properties(response, "traversed")
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let node_id = parse_id_value(item.get("node_id")?)?;
+                    if node_id == start_node_id {
+                        return None;
+                    }
+                    let labels = item
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|s| vec![s.to_string()])
+                        .unwrap_or_default();
+                    let properties = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|name| HashMap::from([("name".to_string(), name.to_string())]))
+                        .unwrap_or_default();
+
+                    Some(TraversalStep {
+                        node: GraphNode {
+                            id: node_id,
+                            labels,
+                            properties,
+                            distance: 0,
+                        },
+                        via_edge: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把 `GraphStore::traverse` 的边类型入参展开成一组遍历查询计划。
+///
+/// 每个元素是一次遍历：`None` 表示通配（不限标签），`Some(et)` 表示只走该标签。
+///
+/// 空 `edge_types` 是「不限定边类型」而不是「只走几个预定义类型」。这里发**一次
+/// 通配遍历**，而不是枚举固定标签集合：`EdgeType::Custom(predicate)` 的标签就是
+/// 谓词文本本身（`add_facts` 写入的「朋友」「性别」等），取值空间不受控，
+/// 任何枚举都必然漏 —— 漏掉的部分正是 `query_entity_facts` 查不到的根因。
+fn traversal_plan(edge_types: &[EdgeType]) -> Vec<Option<EdgeType>> {
+    if edge_types.is_empty() {
+        vec![None]
+    } else {
+        edge_types.iter().cloned().map(Some).collect()
+    }
 }
 
 // ── 后端结构体 ────────────────────────────────────────────────────────────
@@ -180,10 +258,31 @@ impl HelixDbBackend {
         match et {
             EdgeType::Contains => self.schema.contains_edge.clone(),
             EdgeType::RelatedTo => self.schema.related_edge.clone(),
-            EdgeType::Mentions => "MENTIONS".into(),
+            EdgeType::Mentions => MENTIONS_EDGE.to_string(),
             EdgeType::BelongsTo => self.schema.belongs_to_edge.clone(),
             EdgeType::NextChunk => self.schema.next_fragment_edge.clone(),
             EdgeType::Custom(s) => s.clone(),
+        }
+    }
+
+    /// [`Self::edge_label`] 的逆向映射：把 HelixDB 返回的边标签还原成 `EdgeType`。
+    ///
+    /// 未命中任何固定标签的一律归为 `EdgeType::Custom` —— `add_facts` 写入的
+    /// 关系边就是这样（标签即谓词文本）。
+    fn edge_type_from_label(&self, label: &str) -> EdgeType {
+        let s = &self.schema;
+        if label == s.contains_edge {
+            EdgeType::Contains
+        } else if label == s.related_edge {
+            EdgeType::RelatedTo
+        } else if label == s.next_fragment_edge {
+            EdgeType::NextChunk
+        } else if label == s.belongs_to_edge {
+            EdgeType::BelongsTo
+        } else if label == MENTIONS_EDGE {
+            EdgeType::Mentions
+        } else {
+            EdgeType::Custom(label.to_string())
         }
     }
 
@@ -194,6 +293,126 @@ impl HelixDbBackend {
             TraversalDirection::Incoming => "In",
             TraversalDirection::Both => "Both",
         }
+    }
+
+    /// 不限边类型的遍历（`traverse` 收到空 `edge_types` 时走这里）。
+    ///
+    /// 分两路取数，因为没有任何单条查询能同时给出「多跳」和「边标签」：
+    ///
+    /// 1. [`Self::adjacent_steps`] —— 边流 `EdgeProperties` + 节点流投影双查询，
+    ///    按内部 `$id` 关联，拿回直连边的**真实**标签（`via_edge` 还原成谓词）与
+    ///    邻接点的稳定 id + name；
+    /// 2. [`queries::traverse_graph`] 的通配形态（`{"Out"|"In"|"Both": null}`）——
+    ///    覆盖 `max_depth` 以内的更远节点（稳定 id + name），但拿不到边标签
+    ///    （`Repeat` 不能在边流上续接，`$distance` 也不返回），故 `via_edge` 为空。
+    ///
+    /// 第 1 路排在前，配合 `traverse` 末尾的按 node_id 去重，让同一个邻接点优先
+    /// 保留带标签的那一条。
+    async fn wildcard_steps(
+        &self,
+        start_node: &str,
+        direction: TraversalDirection,
+        max_depth: u32,
+    ) -> Result<Vec<TraversalStep>, KnowledgeError> {
+        let mut steps = self.adjacent_steps(start_node, direction).await?;
+
+        let query = queries::traverse_graph(
+            &self.schema,
+            start_node,
+            None,
+            Self::direction_str(direction),
+            max_depth,
+        );
+        let response = self.client.execute_read(query).await?;
+        steps.extend(parse_traversed_nodes(&response, start_node));
+
+        Ok(steps)
+    }
+
+    /// 起始节点的直连边 → `TraversalStep`，`via_edge` 为边的真实标签。
+    ///
+    /// HelixDB 不允许在边流上做 `Project`，而 `EdgeProperties` 又是终结步骤，所以
+    /// 用 [`queries::adjacent_labeled_nodes`] 的双查询拿「边标签」与「邻接点身份」，
+    /// 再按内部 `$id` 关联：`OutE` 的邻接点是 `$to`（`OutN` 落到目标端点），
+    /// `InE` 的邻接点是 `$from`（`InN` 落到源端点）。`Both` 拆成两次查询 ——
+    /// 单次 `BothE` 无法判断哪一端才是起始节点。
+    async fn adjacent_steps(
+        &self,
+        start_node: &str,
+        direction: TraversalDirection,
+    ) -> Result<Vec<TraversalStep>, KnowledgeError> {
+        let dirs: &[(&str, &str, &str)] = match direction {
+            TraversalDirection::Outgoing => &[("OutE", "OutN", "$to")],
+            TraversalDirection::Incoming => &[("InE", "InN", "$from")],
+            TraversalDirection::Both => &[("OutE", "OutN", "$to"), ("InE", "InN", "$from")],
+        };
+
+        let mut steps = Vec::new();
+        for (edge_step, node_step, neighbor_key) in dirs {
+            let query = queries::adjacent_labeled_nodes(
+                &self.schema,
+                start_node,
+                edge_step,
+                node_step,
+            );
+            let response = self.client.execute_read(query).await?;
+
+            // 邻接点身份表：内部 `$id` → (稳定 id, name)。`nodes` 与 `edges` 覆盖同一批
+            // 直连边，按内部 `$id` 关联，与返回行序无关。
+            let identity: HashMap<String, (String, String)> =
+                extract_properties(&response, "nodes")
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|row| {
+                                let internal = parse_id_value(row.get("internal_id")?)?;
+                                let node_id = parse_id_value(row.get("node_id")?)?;
+                                let name = row
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                Some((internal, (node_id, name)))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+            let rows = extract_properties(&response, "edges")
+                .map(|arr| arr.as_slice())
+                .unwrap_or_default();
+
+            for row in rows {
+                // `$from`/`$to` 是内部自增整数 id；`$label` 是边标签（即谓词文本）。
+                let neighbor = row.get(*neighbor_key).and_then(parse_id_value);
+                let label = row.get("$label").and_then(|v| v.as_str());
+                let (Some(neighbor), Some(label)) = (neighbor, label) else {
+                    continue;
+                };
+
+                // 用内部 `$id` 反查稳定 id 与 name。查不到时退化为内部 id，保证既不
+                // 丢边、也不给错配的标签。
+                let (node_id, name) = identity
+                    .get(&neighbor)
+                    .cloned()
+                    .unwrap_or_else(|| (neighbor.clone(), String::new()));
+                let mut properties = HashMap::new();
+                if !name.is_empty() {
+                    properties.insert("name".to_string(), name);
+                }
+
+                steps.push(TraversalStep {
+                    node: GraphNode {
+                        id: node_id,
+                        labels: Vec::new(),
+                        properties,
+                        distance: 1,
+                    },
+                    via_edge: Some(self.edge_type_from_label(label)),
+                });
+            }
+        }
+
+        Ok(steps)
     }
 }
 
@@ -434,12 +653,7 @@ impl HelixDbBackend {
         let query = queries::count_nodes(&self.schema, label);
         let response = self.client.execute_read(query).await?;
         // Count 步骤返回 {"name": {"count": N}}，不是 {"name": {"properties": [N]}}
-        let count = response
-            .get("count")
-            .and_then(|v| v.get("count"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        Ok(count)
+        Ok(count_value(&response, "count"))
     }
 }
 
@@ -639,6 +853,67 @@ impl GraphStore for HelixDbBackend {
         Ok(())
     }
 
+    /// 插入节点（按 ID 幂等）。
+    ///
+    /// HelixDB 没有 MERGE/upsert 语义，AddN 对同一 ID 重复调用会留下多个
+    /// 同 ID 顶点 —— 之后按 ID 匹配与遍历都会重复计数。因此这里先查后建：
+    /// 已存在的节点直接返回，不重建也不改写属性。
+    async fn upsert_node(&self, node: GraphNode) -> Result<(), KnowledgeError> {
+        if self.node_exists(&node.id).await? {
+            debug!(node_id = %node.id, "Node already exists, skipping insert");
+            return Ok(());
+        }
+
+        let label = node
+            .labels
+            .first()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_NODE_LABEL.to_string());
+        let query = queries::create_node(&self.schema, &label, &node.id, &node.properties);
+        self.client.execute_write(query).await?;
+        debug!(node_id = %node.id, %label, "Node inserted");
+        Ok(())
+    }
+
+    async fn get_node(&self, node_id: &str) -> Result<Option<GraphNode>, KnowledgeError> {
+        let query = queries::get_node_by_id(&self.schema, node_id);
+        let response = self.client.execute_read(query).await?;
+
+        let node = extract_properties(&response, "node")
+            .and_then(|arr| arr.first())
+            .map(|item| {
+                let id = item
+                    .get("id")
+                    .and_then(parse_id_value)
+                    .unwrap_or_else(|| node_id.to_string());
+                let labels = item
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default();
+                let properties = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|name| HashMap::from([("name".to_string(), name.to_string())]))
+                    .unwrap_or_default();
+
+                GraphNode {
+                    id,
+                    labels,
+                    properties,
+                    distance: 0,
+                }
+            });
+
+        Ok(node)
+    }
+
+    async fn node_exists(&self, node_id: &str) -> Result<bool, KnowledgeError> {
+        let query = queries::count_node_by_id(&self.schema, node_id);
+        let response = self.client.execute_read(query).await?;
+        Ok(count_value(&response, "count") > 0)
+    }
+
     async fn traverse(
         &self,
         start_node: &str,
@@ -646,58 +921,36 @@ impl GraphStore for HelixDbBackend {
         direction: TraversalDirection,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        // 空 edge_types 表示匹配所有已知固定边类型，与 MemoryGraphStore /
-        // InMemoryBackend 保持一致。
-        let edge_types: Vec<EdgeType> = if edge_types.is_empty() {
-            vec![
-                EdgeType::RelatedTo,
-                EdgeType::Contains,
-                EdgeType::BelongsTo,
-                EdgeType::NextChunk,
-                EdgeType::Mentions,
-            ]
-        } else {
-            edge_types.to_vec()
-        };
-
         let dir_str = Self::direction_str(direction);
         let mut all_steps: Vec<TraversalStep> = Vec::new();
 
-        // 对每个边类型分别遍历
-        for et in &edge_types {
-            let label = self.edge_label(et);
-            let query =
-                queries::traverse_graph(&self.schema, start_node, &label, dir_str, max_depth);
-            let response = self.client.execute_read(query).await?;
+        // 空 edge_types 表示「不限定边类型」，见 `traversal_plan` 的说明。
+        for plan in traversal_plan(edge_types) {
+            match plan {
+                Some(et) => {
+                    let label = self.edge_label(&et);
+                    let query = queries::traverse_graph(
+                        &self.schema,
+                        start_node,
+                        Some(&label),
+                        dir_str,
+                        max_depth,
+                    );
+                    let response = self.client.execute_read(query).await?;
 
-            let steps = extract_properties(&response, "traversed")
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| {
-                            let node_id = parse_id_value(item.get("node_id")?)?;
-                            let labels = item
-                                .get("label")
-                                .and_then(|v| v.as_str())
-                                .map(|s| vec![s.to_string()])
-                                .unwrap_or_default();
-                            let distance =
-                                item.get("distance").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
-                            Some(TraversalStep {
-                                node: GraphNode {
-                                    id: node_id,
-                                    labels,
-                                    properties: HashMap::new(),
-                                    distance,
-                                },
-                                via_edge: Some(et.clone()),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            all_steps.extend(steps);
+                    let mut steps = parse_traversed_nodes(&response, start_node);
+                    for step in &mut steps {
+                        step.via_edge = Some(et.clone());
+                    }
+                    all_steps.extend(steps);
+                }
+                None => {
+                    all_steps.extend(
+                        self.wildcard_steps(start_node, direction, max_depth)
+                            .await?,
+                    );
+                }
+            }
         }
 
         // 去重（按 node_id）
@@ -711,7 +964,7 @@ impl GraphStore for HelixDbBackend {
         &self,
         from: &str,
         to: &str,
-        _edge_types: &[EdgeType],
+        edge_types: &[EdgeType],
         _max_depth: u32,
     ) -> Result<Option<Vec<TraversalStep>>, KnowledgeError> {
         // HelixDB 当前版本不直接支持 shortestPath 查询步骤。
@@ -720,23 +973,21 @@ impl GraphStore for HelixDbBackend {
         // 可替换为原生查询。
         info!(%from, %to, "Computing shortest path (application-level BFS)");
 
-        // 检查两端节点是否存在
-        let to_query = queries::get_document_by_id(&self.schema, to);
-        if let Ok(resp) = self.client.execute_read(to_query).await
-            && extract_properties(&resp, "doc").is_none_or(|a| a.is_empty())
-        {
+        // 检查终点是否存在。这里必须问「节点」而非「文档」：`to` 是
+        // `compute_entity_id(...)` 的内容哈希实体 id，`get_document_by_id` 按
+        // `id_property` 匹配但不按 label 过滤，拿实体 id 去问会命中实体顶点，
+        // 属于巧合式放行。`node_exists` 才是语义正确的存在性判定。
+        if !self.node_exists(to).await? {
             return Ok(None);
         }
 
-        // 从 from 出发做双向 BFS，最大深度 5
+        // 从 from 出发做双向 BFS，最大深度 5。
+        // `edge_types` 原样透传给 `traverse`：空切片表示不限定边类型（通配），
+        // 否则只走调用方指定的标签。硬编码一个固定标签子集会漏掉
+        // `EdgeType::Custom` 关系边，使两个实体间的路径永远查不到。
         let max_depth = 5u32;
         let from_steps = self
-            .traverse(
-                from,
-                &[EdgeType::RelatedTo, EdgeType::Contains, EdgeType::BelongsTo],
-                TraversalDirection::Both,
-                max_depth,
-            )
+            .traverse(from, edge_types, TraversalDirection::Both, max_depth)
             .await?;
 
         // 在结果中查找 to 节点
@@ -1144,6 +1395,136 @@ mod tests {
             !matches!(err, KnowledgeError::DimensionMismatch { .. }),
             "空 embedding 不应触发维度守卫，实际为 {err:?}"
         );
+    }
+
+    /// ② 空 `edge_types` 必须展开成一次**通配**遍历，而不是枚举固定标签集合。
+    ///
+    /// `add_facts` 写入的边全部是 `EdgeType::Custom(predicate)`，标签即谓词文本
+    /// （「朋友」「性别」…），取值空间不受控。任何固定枚举都必然漏掉它们，
+    /// 这正是 `query_entity_facts` 只写不读的根因。
+    #[test]
+    fn empty_edge_types_plan_is_a_single_wildcard() {
+        let plan = traversal_plan(&[]);
+        assert_eq!(plan, vec![None], "空 edge_types 应展开为一次通配遍历");
+        assert_eq!(plan.len(), 1, "通配只需一次请求，不应逐个枚举标签");
+
+        // 显式指定时不通配，逐个走对应标签
+        let plan = traversal_plan(&[EdgeType::RelatedTo, EdgeType::Custom("朋友".into())]);
+        assert_eq!(
+            plan,
+            vec![
+                Some(EdgeType::RelatedTo),
+                Some(EdgeType::Custom("朋友".into()))
+            ]
+        );
+    }
+
+    /// ② 通配遍历实际发出的方向步骤是 `{"<dir>": null}` —— `null` 才是通配，
+    /// 空串和 `"*"` 都会被当成字面标签从而查不到任何边。
+    #[test]
+    fn wildcard_traversal_emits_null_label() {
+        let schema = HelixSchema::default();
+
+        // 方向步骤嵌在 Repeat 的 traversal 里
+        let direction_step = |q: &serde_json::Value| {
+            q["query"]["queries"][1]["Query"]["steps"][1]["Repeat"]["traversal"]["steps"][0].clone()
+        };
+
+        for dir in ["Out", "In", "Both"] {
+            let q = queries::traverse_graph(&schema, "entity:Entity:abc", None, dir, 2);
+            let step = direction_step(&q);
+            assert_eq!(step, serde_json::json!({ dir: null }));
+            assert_ne!(step, serde_json::json!({ dir: "" }));
+            assert_ne!(step, serde_json::json!({ dir: "*" }));
+        }
+
+        // 显式标签仍是字符串
+        let q = queries::traverse_graph(&schema, "entity:Entity:abc", Some("朋友"), "Out", 2);
+        assert_eq!(direction_step(&q), serde_json::json!({"Out": "朋友"}));
+    }
+
+    /// ② 直连边双查询：边流取 `EdgeProperties`（`$label`/`$to`/`$from`），
+    /// 节点流取 `OutN` 投影（内部 `$id` + 稳定 id + name），两者按内部 `$id`
+    /// 关联。断言三种 query 的结构、通配 `null` 标签与 `EdgeProperties` 终结。
+    #[test]
+    fn adjacent_labeled_nodes_batch_shape() {
+        let schema = HelixSchema::default();
+        let q = queries::adjacent_labeled_nodes(&schema, "entity:Entity:abc", "OutE", "OutN");
+
+        assert_eq!(q["request_type"], "read");
+        let queries_arr = q["query"]["queries"].as_array().unwrap();
+        assert_eq!(queries_arr.len(), 3, "应包含 start/edges/nodes 三条查询");
+
+        // start：按稳定 id 定位起始节点
+        let start_steps = &queries_arr[0]["Query"]["steps"];
+        assert_eq!(
+            start_steps[0],
+            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "entity:Entity:abc"}]}})
+        );
+
+        // edges：边流以 EdgeProperties 终结，拿 $label/$from/$to
+        let edges_steps = &queries_arr[1]["Query"]["steps"];
+        assert_eq!(edges_steps[0], serde_json::json!({"N": {"Var": "start"}}));
+        assert_eq!(edges_steps[1], serde_json::json!({"OutE": null}));
+        assert_eq!(edges_steps[2], serde_json::json!({"EdgeProperties": null}));
+        assert!(
+            !edges_steps
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.get("Project").is_some()),
+            "边流上 Project 会报错，不能出现"
+        );
+
+        // nodes：同一批直连边，投影内部 $id + 稳定 id + name
+        let nodes_steps = &queries_arr[2]["Query"]["steps"];
+        assert_eq!(nodes_steps[0], serde_json::json!({"N": {"Var": "start"}}));
+        assert_eq!(nodes_steps[1], serde_json::json!({"OutE": null}));
+        assert_eq!(nodes_steps[2], serde_json::json!({"OutN": null}));
+        assert_eq!(
+            nodes_steps[3],
+            serde_json::json!({"Project": [
+                {"source": "$id", "alias": "internal_id"},
+                {"source": schema.id_property, "alias": "node_id"},
+                {"source": "name", "alias": "name"}
+            ]})
+        );
+
+        assert_eq!(q["query"]["returns"], serde_json::json!(["edges", "nodes"]));
+    }
+
+    /// ① `GraphStore` 的默认实现是「空操作 / 永远不存在」—— 正是顶点写不进去的
+    /// 原因。真实实现必须真的发请求：在死端点上三种操作都应报错，而不是
+    /// 静默返回 `Ok(())` / `Ok(None)` / `Ok(false)`。
+    #[tokio::test]
+    async fn node_ops_hit_the_backend_instead_of_trait_defaults() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+
+        let node = GraphNode {
+            id: "entity:Entity:abcd1234".into(),
+            labels: vec!["Entity".into()],
+            properties: HashMap::from([("name".to_string(), "小C".to_string())]),
+            distance: 0,
+        };
+
+        let err = backend
+            .upsert_node(node.clone())
+            .await
+            .expect_err("upsert_node 不应静默成功");
+        assert!(
+            !matches!(err, KnowledgeError::DimensionMismatch { .. }),
+            "upsert_node 应在 HTTP 层失败，实际为 {err:?}"
+        );
+
+        backend
+            .get_node(&node.id)
+            .await
+            .expect_err("get_node 不应静默返回 Ok(None)");
+
+        backend
+            .node_exists(&node.id)
+            .await
+            .expect_err("node_exists 不应静默返回 Ok(false)");
     }
 
     /// 回归保护：维度一致时守卫放行（同样落在 HTTP 层失败）。

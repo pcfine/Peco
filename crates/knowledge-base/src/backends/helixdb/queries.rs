@@ -6,6 +6,8 @@
 //! 查询格式参考 HelixDB 文档的 JSON AST 规范（v2 API）：
 //! `POST /v1/query` 接受 `{"request_type": "...", "query": {...}}` 格式。
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use super::types::HelixSchema;
@@ -55,20 +57,22 @@ fn prop_i64(v: i64) -> Value {
 ///
 /// 返回 `[["key", PropertyValue], ...]` 的元组数组。
 fn document_props(doc: &Document, metadata_json: &str, embedding: &[f32]) -> Value {
-    let embedding_val = if embedding.is_empty() {
-        json!({"Value": {"F32Array": []}})
-    } else {
-        prop_f32_array(embedding)
-    };
+    let mut props: Vec<Value> = vec![
+        json!(["id", prop_str(&doc.id)]),
+        json!(["title", prop_str(&doc.title)]),
+        json!(["source_path", prop_str(&doc.source_path)]),
+        json!(["content", prop_str(&doc.content)]),
+        json!(["metadata", prop_str(metadata_json)]),
+    ];
 
-    json!([
-        ["id", prop_str(&doc.id)],
-        ["title", prop_str(&doc.title)],
-        ["source_path", prop_str(&doc.source_path)],
-        ["content", prop_str(&doc.content)],
-        ["metadata", prop_str(metadata_json)],
-        ["embedding", embedding_val],
-    ])
+    // embedding 是可选的 —— 非 Full 存储模式下传入空向量，此时必须整体省略
+    // 该属性。空 F32Array 会被向量索引按 0 维处理并拒绝
+    // （`Invalid vector dimension: expected N, got 0`），而缺失属性只是不入索引。
+    if !embedding.is_empty() {
+        props.push(json!(["embedding", prop_f32_array(embedding)]));
+    }
+
+    Value::Array(props)
 }
 
 /// 构建分块属性数组（v2 AddN `properties` 格式）。
@@ -85,8 +89,14 @@ fn chunk_props(chunk: &Chunk) -> Value {
         json!(["text", prop_str(&chunk.text)]),
         json!(["sequence_index", prop_i64(chunk.sequence_index as i64)]),
         json!(["metadata", prop_str(&metadata.to_string())]),
-        json!(["embedding", prop_f32_array(&chunk.embedding)]),
     ];
+
+    // embedding 是可选的 — 非 Full 存储模式（graph_only / text_only）下传入空
+    // 向量，此时必须整体省略该属性。空 F32Array 会被向量索引按 0 维处理并拒绝
+    // （`Invalid vector dimension: expected N, got 0`），而缺失属性只是不入索引。
+    if !chunk.embedding.is_empty() {
+        props.push(json!(["embedding", prop_f32_array(&chunk.embedding)]));
+    }
 
     // page_number 是可选的 — 只在 Some 时加入
     if let Some(pn) = chunk.page_number {
@@ -166,6 +176,50 @@ pub fn create_chunk_node(schema: &HelixSchema, chunk: &Chunk) -> Value {
                 ], "condition": null}}
             ],
             "returns": ["chunk"]
+        }
+    })
+}
+
+/// 构建节点属性数组（v2 AddN `properties` 格式）。
+///
+/// `id_property` 承载节点 ID；`properties` 中的其余条目原样写入，
+/// 与 `id_property` 同名的键忽略 —— ID 是节点身份，不允许被普通属性覆盖。
+fn node_props(schema: &HelixSchema, node_id: &str, properties: &HashMap<String, String>) -> Value {
+    let mut props: Vec<Value> = vec![json!([schema.id_property, prop_str(node_id)])];
+
+    for (key, value) in properties {
+        if key == &schema.id_property {
+            continue;
+        }
+        props.push(json!([key, prop_str(value)]));
+    }
+
+    Value::Array(props)
+}
+
+/// 创建节点（v2 AddN 对象格式），供 `GraphStore::upsert_node` 使用。
+///
+/// HelixDB 的每个节点只有一个 label（无多标签集），因此 `label` 取
+/// `GraphNode.labels` 的首项。
+pub fn create_node(
+    schema: &HelixSchema,
+    label: &str,
+    node_id: &str,
+    properties: &HashMap<String, String>,
+) -> Value {
+    json!({
+        "request_type": "write",
+        "query": {
+            "queries": [
+                {"Query": {"name": "node", "steps": [
+                    {"AddN": {
+                        "label": label,
+                        "properties": node_props(schema, node_id, properties)
+                    }},
+                    {"Project": [{"source": "$id", "alias": "id"}]}
+                ], "condition": null}}
+            ],
+            "returns": ["node"]
         }
     })
 }
@@ -463,6 +517,10 @@ pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
 }
 
 /// 分页列出文档（v2: NWithLabel → NWhere + $label 等式）。
+///
+/// 投影的 `id` 取 `schema.id_property`（内容哈希）而非 HelixDB 内置 `$id`，
+/// 与 `get_document_by_id` / `delete_document_cascade` 的匹配口径保持一致 ——
+/// 否则列表返回的 ID 无法回传给删除接口。
 pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Value {
     json!({
         "request_type": "read",
@@ -473,7 +531,7 @@ pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Valu
                     {"Skip": offset},
                     {"Limit": limit},
                     {"Project": [
-                        {"source": "$id", "alias": "id"},
+                        {"source": schema.id_property, "alias": "id"},
                         {"source": "title", "alias": "title"},
                         {"source": "source_path", "alias": "source_path"},
                         {"source": "metadata", "alias": "metadata"}
@@ -481,6 +539,48 @@ pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Valu
                 ], "condition": null}}
             ],
             "returns": ["docs"]
+        }
+    })
+}
+
+/// 按 ID 获取节点（v2 投影格式）。
+///
+/// 投影 `id_property` 而非内置 `$id`，与 `upsert_node` 写入的 ID 口径一致。
+/// 仅投影 `name` —— HelixDB 的投影需要显式列名，无法在此投影未知的属性集合。
+pub fn get_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
+    json!({
+        "request_type": "read",
+        "query": {
+            "queries": [
+                {"Query": {"name": "node", "steps": [
+                    {"NWhere": {"Eq": [schema.id_property, {"String": node_id}]}},
+                    {"Limit": 1},
+                    {"Project": [
+                        {"source": schema.id_property, "alias": "id"},
+                        {"source": "$label", "alias": "label"},
+                        {"source": "name", "alias": "name"}
+                    ]}
+                ], "condition": null}}
+            ],
+            "returns": ["node"]
+        }
+    })
+}
+
+/// 按 ID 统计节点数量 —— `node_exists` 的存在性探针。
+///
+/// 用 Count 而非投影，避免为了判断存在而取回节点属性。
+pub fn count_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
+    json!({
+        "request_type": "read",
+        "query": {
+            "queries": [
+                {"Query": {"name": "count", "steps": [
+                    {"NWhere": {"Eq": [schema.id_property, {"String": node_id}]}},
+                    {"Count": null}
+                ], "condition": null}}
+            ],
+            "returns": ["count"]
         }
     })
 }
@@ -501,18 +601,33 @@ pub fn count_nodes(_schema: &HelixSchema, label: &str) -> Value {
     })
 }
 
-/// 图遍历：从起始节点沿指定边类型做 BFS。
+/// 图遍历：从起始节点做 BFS。
+///
+/// `edge_label` 为 `None` 时发出通配遍历（`{"Out": null}` 形态），沿**全部**
+/// 边走出，不管边标签是什么。这是唯一能覆盖 `EdgeType::Custom` 任意谓词标签的
+/// 形式 —— 自定义边的标签由谓词文本决定，枚举不出来。
+///
+/// 注意空串**不是**通配：HelixDB 把 `""` 当作字面标签匹配，只会得到空结果。
+///
+/// 结果投影 `schema.id_property`（稳定身份）而非内置 `$id` —— 否则调用方拿到的
+/// 是内部自增整数，无法与 `compute_entity_id` 的内容哈希对齐。`name` 一并投影，
+/// 供 `query_entity_facts` 展示实体名。HelixDB 的遍历不返回 `$distance`（那是搜索
+/// 命中专用的虚拟字段），跳数由调用方另算。
 pub fn traverse_graph(
     schema: &HelixSchema,
     start_node_id: &str,
-    edge_label: &str,
+    edge_label: Option<&str>,
     direction: &str, // "Out", "In", "Both"
     max_depth: u32,
 ) -> Value {
+    let label = match edge_label {
+        Some(l) => json!(l),
+        None => Value::Null,
+    };
     let dir_step: Value = match direction {
-        "In" => json!({"In": edge_label}),
-        "Both" => json!({"Both": edge_label}),
-        _ => json!({"Out": edge_label}),
+        "In" => json!({"In": label}),
+        "Both" => json!({"Both": label}),
+        _ => json!({"Out": label}),
     };
 
     json!({
@@ -531,13 +646,64 @@ pub fn traverse_graph(
                     }},
                     "Dedup",
                     {"Project": [
-                        {"source": "$id", "alias": "node_id"},
+                        {"source": schema.id_property, "alias": "node_id"},
                         {"source": "$label", "alias": "label"},
-                        {"source": "$distance", "alias": "distance"}
+                        {"source": "name", "alias": "name"}
                     ]}
                 ], "condition": null}}
             ],
             "returns": ["traversed"]
+        }
+    })
+}
+
+/// 起始节点的直连边 + 邻接点身份（把边标签与稳定节点 id 一起取回）。
+///
+/// HelixDB 不允许在边流上做 `Project`（`project() requires node state`），而
+/// `EdgeProperties` 又是终结步骤 —— 没有任何单条查询能同时给出「边标签」和
+/// 「邻接点稳定 id + name」。因此这里在一次 read batch 里发两条查询，各自覆盖
+/// 同一批直连边，再由调用方按内部 `$id` 关联：
+///
+/// 1. `edges` —— `N(start) → {edge_step}(null) → EdgeProperties`，返回每条边的
+///    `$label` 与端点内部 `$id`；
+/// 2. `nodes` —— `N(start) → {edge_step}(null) → {node_step}(null) → Project`，
+///    返回邻接点的内部 `$id` + `schema.id_property`（稳定 id）+ `name`。
+///
+/// 关联键是 `edges` 的端点内部 id（`$to`/`$from`）== `nodes` 的 `internal_id`，
+/// 与返回行序无关，不依赖 HelixDB 的行序稳定性。
+///
+/// `edge_step` 只接受 `"OutE"` / `"InE"`，`node_step` 对应 `"OutN"` / `"InN"`：
+/// 邻接点分别是目标端点（`OutE→OutN`，`$to`）与源端点（`InE→InN`，`$from`）。
+pub fn adjacent_labeled_nodes(
+    schema: &HelixSchema,
+    start_node_id: &str,
+    edge_step: &str,
+    node_step: &str,
+) -> Value {
+    json!({
+        "request_type": "read",
+        "query": {
+            "queries": [
+                {"Query": {"name": "start", "steps": [
+                    {"NWhere": {"Eq": [schema.id_property, {"String": start_node_id}]}}
+                ], "condition": null}},
+                {"Query": {"name": "edges", "steps": [
+                    {"N": {"Var": "start"}},
+                    {edge_step: null},
+                    {"EdgeProperties": null}
+                ], "condition": null}},
+                {"Query": {"name": "nodes", "steps": [
+                    {"N": {"Var": "start"}},
+                    {edge_step: null},
+                    {node_step: null},
+                    {"Project": [
+                        {"source": "$id", "alias": "internal_id"},
+                        {"source": schema.id_property, "alias": "node_id"},
+                        {"source": "name", "alias": "name"}
+                    ]}
+                ], "condition": null}}
+            ],
+            "returns": ["edges", "nodes"]
         }
     })
 }
@@ -730,6 +896,7 @@ fn add_graph_expansion_steps(
 mod tests {
     use super::*;
     use crate::traits::combined_search::RrfConfig;
+    use crate::types::ChunkMetadata;
 
     fn test_schema() -> HelixSchema {
         HelixSchema::default()
@@ -960,6 +1127,180 @@ mod tests {
     #[test]
     fn filter_empty_returns_none() {
         assert!(filter_step(Some(&SearchFilters::default())).is_none());
+    }
+
+    /// ④ 空 embedding（graph_only / text_only 存储模式）必须整体省略该属性 ——
+    /// 写入空 F32Array 会被向量索引按 0 维拒绝。
+    #[test]
+    fn empty_embedding_is_omitted_from_props() {
+        let s = test_schema();
+
+        // 分块：空 embedding → 无 embedding 属性
+        let mut c = Chunk {
+            id: "doc-0001-0000-abcd".into(),
+            document_id: "doc-0001".into(),
+            text: "无向量的分块".into(),
+            sequence_index: 0,
+            page_number: Some(3),
+            embedding: Vec::new(),
+            metadata: ChunkMetadata::default(),
+        };
+        let q = create_chunk_node(&s, &c);
+        let props = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            !props.iter().any(|p| p[0] == "embedding"),
+            "空 embedding 不应写入 embedding 属性，实际 props: {props:?}"
+        );
+        // 其余可选属性不受影响
+        assert!(props.iter().any(|p| p[0] == "page_number"));
+
+        // 分块：非空 embedding → 照常写入
+        c.embedding = vec![0.1, 0.2, 0.3];
+        let q = create_chunk_node(&s, &c);
+        let props = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let emb = props
+            .iter()
+            .find(|p| p[0] == "embedding")
+            .expect("应写入 embedding");
+        assert_eq!(emb[1]["Value"]["F32Array"].as_array().unwrap().len(), 3);
+
+        // 文档：同理
+        let doc = Document {
+            id: "doc-0001".into(),
+            kb_id: None,
+            title: "无向量文档".into(),
+            source_path: "/tmp/test.txt".into(),
+            content: "hello".into(),
+            metadata: Default::default(),
+        };
+        let q = create_document_node(&s, &doc, "{}", &[]);
+        let props = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            !props.iter().any(|p| p[0] == "embedding"),
+            "空 embedding 不应写入 embedding 属性，实际 props: {props:?}"
+        );
+    }
+
+    /// ③ 列表返回的 `id` 必须与 get / delete 的匹配口径一致（`id_property`），
+    /// 否则「列表 → 删除」链路断裂。
+    #[test]
+    fn list_documents_projects_schema_id_property() {
+        let s = test_schema();
+        let q = list_documents(&s, 0, 10);
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+        let project = steps
+            .iter()
+            .find_map(|st| st.as_object().and_then(|o| o.get("Project")))
+            .expect("list_documents 应包含 Project 步骤");
+        assert_eq!(
+            project[0]["source"], "id",
+            "列表应投影 schema.id_property 而非内置 $id"
+        );
+        assert_eq!(project[0]["alias"], "id");
+
+        // 自定义 id_property 时跟随 schema
+        let custom = HelixSchema {
+            id_property: "doc_id".into(),
+            ..HelixSchema::default()
+        };
+        let q = list_documents(&custom, 0, 10);
+        let project = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|st| st.as_object().and_then(|o| o.get("Project")))
+            .unwrap()
+            .clone();
+        assert_eq!(project[0]["source"], "doc_id");
+    }
+
+    /// ① `upsert_node` 的建节点查询：v2 AddN 对象格式、label 显式给出、
+    /// `id_property` 承载节点 ID。
+    #[test]
+    fn create_node_uses_v2_addn_with_id_property() {
+        let s = test_schema();
+        let props = HashMap::from([("name".to_string(), "小C".to_string())]);
+        let q = create_node(&s, "Entity", "entity:Entity:abcd1234", &props);
+        assert_eq!(q["request_type"], "write");
+
+        let addn = &q["query"]["queries"][0]["Query"]["steps"][0]["AddN"];
+        assert!(addn.is_object(), "AddN 应为 v2 对象格式");
+        assert_eq!(addn["label"], "Entity");
+
+        let pairs = addn["properties"].as_array().unwrap();
+        let id_prop = pairs
+            .iter()
+            .find(|p| p[0] == s.id_property)
+            .expect("节点必须写入 id_property");
+        assert_eq!(id_prop[1]["Value"]["String"], "entity:Entity:abcd1234");
+        let name = pairs
+            .iter()
+            .find(|p| p[0] == "name")
+            .expect("节点必须写入 name");
+        assert_eq!(name[1]["Value"]["String"], "小C");
+    }
+
+    /// ① 属性里出现与 `id_property` 同名的键时，不允许覆盖节点身份。
+    #[test]
+    fn create_node_id_property_cannot_be_overridden() {
+        let s = test_schema();
+        let props = HashMap::from([
+            ("id".to_string(), "伪造的-id".to_string()),
+            ("name".to_string(), "小C".to_string()),
+        ]);
+        let q = create_node(&s, "Entity", "entity:Entity:abcd1234", &props);
+        let pairs = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+
+        let id_pairs: Vec<_> = pairs.iter().filter(|p| p[0] == s.id_property).collect();
+        assert_eq!(id_pairs.len(), 1, "id_property 只应出现一次");
+        assert_eq!(id_pairs[0][1]["Value"]["String"], "entity:Entity:abcd1234");
+    }
+
+    /// ① `get_node` / `node_exists` 的读查询按 `id_property` 匹配。
+    #[test]
+    fn get_and_count_node_match_by_id_property() {
+        let s = test_schema();
+
+        let q = get_node_by_id(&s, "entity:Entity:abcd1234");
+        assert_eq!(q["request_type"], "read");
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            steps[0]["NWhere"]["Eq"][0], "id",
+            "应按 id_property 匹配而非内置 $id"
+        );
+        let project = steps
+            .iter()
+            .find_map(|st| st.as_object().and_then(|o| o.get("Project")))
+            .expect("get_node_by_id 应包含 Project 步骤");
+        assert_eq!(project[0]["source"], "id");
+
+        let q = count_node_by_id(&s, "entity:Entity:abcd1234");
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+        assert_eq!(steps[0]["NWhere"]["Eq"][0], "id");
+        assert!(
+            steps
+                .iter()
+                .any(|st| st.as_object().is_some_and(|o| o.contains_key("Count"))),
+            "node_exists 应用 Count 而非投影"
+        );
     }
 
     #[test]
