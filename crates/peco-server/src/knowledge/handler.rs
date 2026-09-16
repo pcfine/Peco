@@ -153,6 +153,31 @@ fn parse_chunk_strategy(s: Option<ChunkStrategyRequest>) -> ChunkingStrategySerd
     }
 }
 
+/// 组装 REST 建库路径的 `KbConfig`。
+///
+/// 后端固定为 HelixDB —— REST 建库默认走 HelixDB 图存储后端（与模板
+/// `kb_config.json` 声明的后端一致）。端点不下发（`helix_url: None`），
+/// 由 KB 连接时按 `PECO_KB_HELIX_URL` → `http://localhost:6970` 回退 ——
+/// 端点因此是**部署级**配置，而非 per-KB 的 REST 入参。`connect()` 惰性
+/// 建 reqwest client，只有 `init_schema()` 才触网。
+fn build_kb_config(
+    name: String,
+    description: String,
+    embedding_model: FastembedModelTypeSerde,
+    chunking: ChunkingStrategySerde,
+) -> KbConfig {
+    KbConfig {
+        name,
+        description,
+        embedding_model,
+        chunking,
+        backend: BackendType::HelixDb,
+        storage_path: None,
+        default_storage_mode: Default::default(),
+        helix_url: None,
+    }
+}
+
 /// 允许上传的 MIME 类型。
 fn is_allowed_mime(mime: &str) -> bool {
     matches!(
@@ -266,18 +291,12 @@ pub async fn create_knowledge_base(
 
     // 在 KnowledgeBaseManager 中创建知识库
     let km = get_user_km(&state, &user_id)?;
-    let kb_config = KbConfig {
-        name: name.clone(),
-        description: req.description.clone(),
+    let kb_config = build_kb_config(
+        name.clone(),
+        req.description.clone(),
         embedding_model,
         chunking,
-        backend: BackendType::LanceDb,
-        storage_path: None,
-        default_storage_mode: Default::default(),
-        // REST 建库接口不暴露 HelixDB 端点：该后端只由模板 kb_config.json
-        // 声明。此处置 None，走 PECO_KB_HELIX_URL / 默认值回退。
-        helix_url: None,
-    };
+    );
 
     km.create_kb(kb_config)
         .await
@@ -287,7 +306,7 @@ pub async fn create_knowledge_base(
         id: kb_id,
         name,
         description: req.description,
-        backend: "LanceDB".to_string(),
+        backend: "HelixDB".to_string(),
         embedding_model: "BGEBaseZHV15".to_string(),
         document_count: 0,
         chunk_count: 0,
@@ -648,4 +667,35 @@ pub async fn delete_document(
     );
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+// ── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REST 建库路径默认走 HelixDB 后端。
+    ///
+    /// 只覆盖纯逻辑：handler 本身依赖 `AppState`（SQLite 池 + 迁移 +
+    /// workspace 目录）与 `AuthUser`，本文件没有现成的测试夹具，搭一套
+    /// 的成本远高于被测决策本身。`build_kb_config` 是 `create_knowledge_base`
+    /// 中唯一决定后端的表达式，覆盖它即覆盖该决策。
+    #[test]
+    fn create_kb_config_defaults_to_helixdb() {
+        let cfg = build_kb_config(
+            "test-kb".to_string(),
+            "desc".to_string(),
+            FastembedModelTypeSerde::BGEBaseZHV15,
+            ChunkingStrategySerde::default(),
+        );
+
+        assert!(matches!(cfg.backend, BackendType::HelixDb));
+        // 端点仍是部署级回退（PECO_KB_HELIX_URL → localhost:6970），不随 REST 入参下发
+        assert!(cfg.helix_url.is_none());
+        // 存储路径由 KB 自行派生，REST 不指定
+        assert!(cfg.storage_path.is_none());
+        assert_eq!(cfg.name, "test-kb");
+        assert_eq!(cfg.description, "desc");
+    }
 }

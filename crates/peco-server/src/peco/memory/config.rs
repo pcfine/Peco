@@ -18,12 +18,12 @@ pub struct ConsolidationConfig {
     pub batch_size: usize,
     /// 聚类阈值（cosine similarity）。
     ///
-    /// 标定值（bge-small-zh-v1.5, 512 维, 2026-09-15, 113 对合成真值集,
+    /// 标定值（bge-base-zh-v1.5, 768 维, 2026-09-15, 113 对合成真值集,
     /// 人工编写待抽检）
     pub min_cluster_cos: f32,
     /// 硬去重阈值（cosine similarity）。
     ///
-    /// 标定值（bge-small-zh-v1.5, 512 维, 2026-09-15, 113 对合成真值集,
+    /// 标定值（bge-base-zh-v1.5, 768 维, 2026-09-15, 113 对合成真值集,
     /// 人工编写待抽检）
     pub dedup_cos: f32,
     /// episodic 过期天数。
@@ -64,8 +64,8 @@ impl Default for ConsolidationConfig {
         Self {
             enabled: false,
             batch_size: 200,
-            min_cluster_cos: 0.77,
-            dedup_cos: 0.92,
+            min_cluster_cos: 0.79,
+            dedup_cos: 0.88,
             episodic_ttl_days: 60,
             max_llm_calls: 20,
             max_users_per_round: 3,
@@ -151,9 +151,9 @@ mod tests {
         // 默认关闭 — 灰度开启，未开启时零开销
         assert!(!c.enabled);
         assert_eq!(c.batch_size, 200);
-        // 0.77 / 0.92 为标定值（113 对合成真值集）
-        assert!((c.min_cluster_cos - 0.77).abs() < f32::EPSILON);
-        assert!((c.dedup_cos - 0.92).abs() < f32::EPSILON);
+        // 0.79 / 0.88 为 bge-base-zh-v1.5 标定值（113 对合成真值集）
+        assert!((c.min_cluster_cos - 0.79).abs() < f32::EPSILON);
+        assert!((c.dedup_cos - 0.88).abs() < f32::EPSILON);
         assert!(c.dedup_cos > c.min_cluster_cos);
         assert_eq!(c.episodic_ttl_days, 60);
         assert_eq!(c.max_llm_calls, 20);

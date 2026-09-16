@@ -85,9 +85,9 @@ const THRESHOLD_FLOOR: f32 = 0.50;
 const THRESHOLD_CEIL: f32 = 0.99;
 const NEGATIVE_SAMPLE_COUNT: usize = 100;
 const EMBED_BATCH: usize = 64;
-/// 聚类预览阈值：与回填后的 min_cluster_cos 标定值保持一致（0.77），
+/// 聚类预览阈值：与回填后的 min_cluster_cos 标定值保持一致（0.79），
 /// 预览才有「放量后真实效果」的参考价值。
-const PREVIEW_CLUSTER_COS: f32 = 0.77;
+const PREVIEW_CLUSTER_COS: f32 = 0.79;
 /// synthetic 模式临时知识库名（用完即删，不落用户 workspace）。
 const SYNTHETIC_KB: &str = "@synthetic_calibration";
 
