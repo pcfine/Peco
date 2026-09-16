@@ -19,12 +19,12 @@ pub struct ConsolidationConfig {
     /// 聚类阈值（cosine similarity）。
     ///
     /// 标定值（bge-small-zh-v1.5, 512 维, 2026-09-15, 113 对合成真值集,
-    /// 人工编写待抽检）— 见 reports/p2-t3-synthetic-calibration.md
+    /// 人工编写待抽检）
     pub min_cluster_cos: f32,
     /// 硬去重阈值（cosine similarity）。
     ///
     /// 标定值（bge-small-zh-v1.5, 512 维, 2026-09-15, 113 对合成真值集,
-    /// 人工编写待抽检）— 见 reports/p2-t3-synthetic-calibration.md
+    /// 人工编写待抽检）
     pub dedup_cos: f32,
     /// episodic 过期天数。
     pub episodic_ttl_days: u64,
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(c.kb_name, "@private_memory");
         assert_eq!(c.model, "deepseek-v4-flash");
         assert_eq!(c.analyze_min_chars, 50);
-        // P5-T1：召回窗口 3 → 5、注入上限 800 → 1000（实测见 reports/）
+        // 召回窗口 3 → 5、注入上限 800 → 1000
         assert_eq!(c.recall_top_k, 5);
         assert_eq!(c.injection_token_cap, 1000);
         assert_eq!(c.recall_half_life_days, 30);
@@ -151,7 +151,7 @@ mod tests {
         // 默认关闭 — 灰度开启，未开启时零开销
         assert!(!c.enabled);
         assert_eq!(c.batch_size, 200);
-        // 0.77 / 0.92 为标定值（113 对合成真值集），见 reports/p2-t3-synthetic-calibration.md
+        // 0.77 / 0.92 为标定值（113 对合成真值集）
         assert!((c.min_cluster_cos - 0.77).abs() < f32::EPSILON);
         assert!((c.dedup_cos - 0.92).abs() < f32::EPSILON);
         assert!(c.dedup_cos > c.min_cluster_cos);

@@ -2,7 +2,7 @@
 // TavilyClient — Tavily Search API（面向 LLM/Agent，需 API key）
 // ============================================================================
 //
-// 关闭 answer / raw_content / images（只搜不读，见设计文档 §3.4）。
+// 关闭 answer / raw_content / images（只搜不读）。
 
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +38,7 @@ impl TavilyClient {
     }
 
     pub async fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>, SearchError> {
-        // Tavily 不支持地区参数（设计文档 §3.3），region 忽略。
+        // Tavily 不支持地区参数，region 忽略。
         let body = TavilyRequest {
             query: query.text.clone(),
             max_results: query.max_results,

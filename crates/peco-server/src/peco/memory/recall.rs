@@ -7,8 +7,7 @@
 // instructions 尾部 [Dynamic Context] 段（同一轮 ReAct 迭代复用缓存）。
 //
 // 已知限制（接受）：注入在 instructions 尾部，内容随 query 变化，
-// 会击穿 provider 前缀缓存 — 迁移到 user 消息前缀注入需改 peco-core
-// 循环，见设计文档。
+// 会击穿 provider 前缀缓存 — 迁移到 user 消息前缀注入需改 peco-core 循环。
 
 use std::sync::Arc;
 

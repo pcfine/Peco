@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // 仅做参数解析、调用 SearchBackend、格式化输出。引擎逻辑在
-// crates/peco-core/src/search/（设计文档 docs/design/web-search-design.md）。
+// crates/peco-core/src/search/。
 // 未配置 [web_search] 时本工具不注册（warn + skip，同 workflow_access 模式）。
 
 use std::future::Future;

@@ -1,7 +1,7 @@
 //! DeepSeek Responses API 适配器。
 //!
 //! 提供 [`DeepSeekResponsesAdapter`]，为 DeepSeek 原生 `/responses` 端点实现
-//! [`ModelProvider`]。请求/响应按设计文档 §9.1 直通映射到中立词汇表
+//! [`ModelProvider`]。请求/响应直通映射到中立词汇表
 //! （[`GenerateRequest`]/[`GenerateResult`]/[`StreamChunk`]）。
 
 use std::collections::{HashMap, HashSet};
@@ -606,7 +606,7 @@ struct PendingResponseToolCall {
 
 /// 处理 Responses 语义 SSE 流，产出中立 [`StreamChunk`]。
 ///
-/// 语义事件 → chunk 映射（§9.1）：
+/// 语义事件 → chunk 映射：
 /// - `output_item.added` → `BlockStart`（按 item 类型）+ 函数调用 `ToolCallDelta{name}`
 /// - `output_text.delta` → `TextDelta`
 /// - `reasoning_text.delta` → `ReasoningDelta`

@@ -6,7 +6,6 @@
 // 在各自模块内完成，对外只暴露 `SearchBackend::search()`。
 // 引擎集合封闭且配置期已知，因此用枚举而非 trait object：
 // match 分发编译期穷尽，免 Box<dyn> / async_trait 开销。
-// 设计文档：docs/design/web-search-design.md
 
 pub mod brave;
 pub mod searxng;
@@ -39,7 +38,7 @@ pub struct SearchQuery {
     pub text: String,
     /// 期望返回条数（缺省 5，clamp 1..=20）。
     pub max_results: usize,
-    /// 地区/语言提示，语义按引擎映射（见设计文档 §3.3）；None 时用引擎默认。
+    /// 地区/语言提示，语义按引擎映射；None 时用引擎默认。
     pub region: Option<String>,
 }
 
@@ -201,7 +200,7 @@ pub(crate) fn request_error(err: reqwest::Error) -> SearchError {
     }
 }
 
-/// 按字符数截断（不感知编码/HTML 语义，见设计文档 §8）。
+/// 按字符数截断（不感知编码/HTML 语义）。
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()

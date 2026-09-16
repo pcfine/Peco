@@ -2,12 +2,12 @@
 // EnvironmentInfo — 环境上下文的收集、清洗与渲染
 // ============================================================================
 //
-// 职责分离（见 docs/design/agent-environment-context.md §4.5）：
+// 职责分离：
 //   - 收集（查 DB、读时钟）发生在构造侧（PecoManager），本模块不做 IO
 //   - sanitize / render 是纯函数，输出对相同输入严格确定
 //     ——这是"稳定前缀"契约在宿主层的对应物
 //
-// 安全（§5.1）：所有进入环境块的插值字段都按不可信处理。
+// 安全：所有进入环境块的插值字段都按不可信处理。
 // username 由用户注册自填，agent_name 在 chat 模式接入后来自
 // 用户自建的 agent.md——渲染前统一清洗。
 
@@ -83,7 +83,7 @@ impl EnvironmentInfo {
     ///
     /// 只陈述事实（路径），不复述工具行为语义——
     /// "省略 cwd 默认在 workspace 根执行"的契约只写在 shell 工具
-    /// description 里，单一真相源（§4.5）。
+    /// description 里，单一真相源。
     pub fn render(&self) -> String {
         let username = sanitize_or(&self.username, SHORT_FIELD_MAX, &self.user_id);
         let workspace_root = sanitize(&self.workspace_root.display().to_string(), PATH_FIELD_MAX);

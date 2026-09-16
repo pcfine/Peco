@@ -221,7 +221,7 @@ fn compose_stable_prefix(system_prompt: &str, environment: Option<&str>) -> Stri
 /// 动态上下文拼在稳定前缀之后属于**过渡形态**：
 /// 它位于消息序列首条，一旦每轮变化会使其后的全部历史
 /// 失去前缀缓存命中。终态方案（动态块前置到本轮 user 消息，
-/// 不写入 Session）见 docs/design/agent-environment-context.md §4.4。
+/// 不写入 Session）。
 fn compose_effective_prompt(stable_prefix: &str, dynamic_context: Option<&str>) -> String {
     match dynamic_context {
         Some(dyn_ctx) => format!("{stable_prefix}\n\n[Dynamic Context]\n{dyn_ctx}"),

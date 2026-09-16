@@ -29,16 +29,16 @@
 //!
 //! # 替代路径：合成标定集（真实库无近重复样本时）
 //! cargo run -p knowledge-base --example calibrate_thresholds -- \
-//!     --mode synthetic --pairs reports/data/synthetic_calibration_pairs.csv \
+//!     --mode synthetic --pairs synthetic_calibration_pairs.csv \
 //!     --out /tmp/t1/annotated_synthetic.json
 //! # 换 base 模型重跑同一合成集（模型名随标注 JSON 透传给报告）：
 //! cargo run -p knowledge-base --example calibrate_thresholds -- \
-//!     --mode synthetic --model base --pairs reports/data/synthetic_calibration_pairs.csv \
+//!     --mode synthetic --model base --pairs synthetic_calibration_pairs.csv \
 //!     --out /tmp/t1/annotated_synthetic_base.json
 //! # 然后复用既有 calibrate 模式出报告：
 //! cargo run -p knowledge-base --example calibrate_thresholds -- \
 //!     --knowledge-dir <任意非空库> --kb @private_memory --mode calibrate \
-//!     --annotated /tmp/t1/annotated_synthetic.json --out reports/p2-t3-synthetic-calibration.md
+//!     --annotated /tmp/t1/annotated_synthetic.json --out report.md
 //! ```
 //!
 //! 三个模式的 `--out` 均可省略，省略时取各自默认值：generate →
@@ -85,8 +85,8 @@ const THRESHOLD_FLOOR: f32 = 0.50;
 const THRESHOLD_CEIL: f32 = 0.99;
 const NEGATIVE_SAMPLE_COUNT: usize = 100;
 const EMBED_BATCH: usize = 64;
-/// 聚类预览阈值：与回填后的 min_cluster_cos 标定值保持一致（0.77，见
-/// reports/p2-t3-synthetic-calibration.md），预览才有「放量后真实效果」的参考价值。
+/// 聚类预览阈值：与回填后的 min_cluster_cos 标定值保持一致（0.77），
+/// 预览才有「放量后真实效果」的参考价值。
 const PREVIEW_CLUSTER_COS: f32 = 0.77;
 /// synthetic 模式临时知识库名（用完即删，不落用户 workspace）。
 const SYNTHETIC_KB: &str = "@synthetic_calibration";

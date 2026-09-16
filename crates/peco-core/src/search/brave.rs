@@ -36,7 +36,7 @@ impl BraveClient {
             ("count", query.max_results.to_string()),
         ];
         if let Some(region) = &query.region {
-            // Brave 的 region 映射为 country 国家码（如 "us"），见设计文档 §3.3。
+            // Brave 的 region 映射为 country 国家码（如 "us"）。
             params.push(("country", region.clone()));
         }
 
