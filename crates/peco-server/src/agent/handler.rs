@@ -408,7 +408,7 @@ pub async fn create(
         });
 
     let supports_images = peco_core::agent::supports_image_input_for(
-        ws.config(),
+        &ws.config(),
         if assemble_params.provider.is_empty() {
             None
         } else {
@@ -481,7 +481,7 @@ pub async fn get(
         .map_err(|e| ApiError::Internal(format!("agent.md parse error: {e}")))?;
 
     let supports_images = peco_core::agent::supports_image_input_for(
-        ws.config(),
+        &ws.config(),
         profile.llm.as_ref().and_then(|l| l.provider.as_deref()),
     );
     let detail = agent_detail_from_profile(&agent_id, &db_row, &profile, &body, supports_images);
@@ -597,7 +597,7 @@ pub async fn update(
         .ok_or_else(|| ApiError::Internal("agent updated but not found".into()))?;
 
     let supports_images = peco_core::agent::supports_image_input_for(
-        ws.config(),
+        &ws.config(),
         if merged.provider.is_empty() {
             None
         } else {

@@ -38,6 +38,8 @@ enum ReloadAction {
     KnowledgeReload,
     /// 重载 MCP 配置: mcpconfig.json
     McpConfig,
+    /// 重载 provider 配置: providers.toml
+    Providers,
     /// 重载单个 Workflow: workflows/{name}/workflow.md
     Workflow(String),
 }
@@ -84,10 +86,20 @@ pub async fn run(
         }
     }
 
-    // 监听根目录下的 mcpconfig.json
-    let mcp_config = workspace_root.join("mcpconfig.json");
-    if mcp_config.exists() {
-        let _ = watcher.watch(&mcp_config, RecursiveMode::NonRecursive);
+    // 监听根目录下的凭据配置文件。直接监听文件能拿到内容修改事件，但文件不
+    // 存在时注册会失败（providers.toml 首次由保存接口创建），因此额外监听根目录
+    // 本身兜底创建/重命名 —— 编辑器的"写临时文件再改名"走后者。根目录下的
+    // 其余条目由 classify_event 忽略。
+    if let Err(e) = watcher.watch(&workspace_root, RecursiveMode::NonRecursive) {
+        warn!(path = %workspace_root.display(), error = %e, "Failed to watch workspace root");
+    }
+    for file in ["mcpconfig.json", "providers.toml"] {
+        let path = workspace_root.join(file);
+        if path.exists()
+            && let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive)
+        {
+            warn!(path = %path.display(), error = %e, "Failed to watch config file");
+        }
     }
 
     info!(workspace = %workspace_root.display(), "File watcher started");
@@ -142,6 +154,14 @@ pub async fn run(
                 }
 
                 for action in &ready {
+                    // 保存接口写完文件会立刻重载并登记哈希；紧随其后的文件事件
+                    // 若再重载一次，只会白白清空刚重建的 Agent 缓存并重建搜索客户端。
+                    if let Some(ref db) = db
+                        && already_applied(db, &user_id, &workspace_root, action).await
+                    {
+                        debug!(action = ?action, "File watcher: config already applied, skipping reload");
+                        continue;
+                    }
                     execute_action(&ws, action).await;
                 }
 
@@ -222,6 +242,9 @@ fn classify_event(workspace_root: &Path, event: &Event) -> Vec<ReloadAction> {
             Some("mcpconfig.json") => {
                 actions.push(ReloadAction::McpConfig);
             }
+            Some("providers.toml") => {
+                actions.push(ReloadAction::Providers);
+            }
             _ => {
                 // 未识别的文件变更，忽略
                 debug!(path = %path.display(), "Unclassified file change, ignoring");
@@ -269,6 +292,15 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
             let count = ws.reload_mcp_config(&fallback);
             debug!(count, "File watcher: MCP config reloaded");
         }
+        ReloadAction::Providers => {
+            debug!("File watcher: reloading provider config");
+            match ws.reload_providers() {
+                Ok(invalidated) => {
+                    debug!(invalidated, "File watcher: provider config reloaded")
+                }
+                Err(e) => warn!(error = %e, "File watcher: provider reload failed"),
+            }
+        }
         ReloadAction::Workflow(name) => {
             debug!(workflow = %name, "File watcher: reloading workflow");
             if let Err(e) = ws.reload_workflow(name) {
@@ -277,6 +309,29 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
             }
         }
     }
+}
+
+/// 该动作对应的模块是否已经处于"磁盘状态 == 已应用状态"。
+///
+/// 只对"整份文件即模块状态"的配置模块（mcp / providers）成立：磁盘哈希与 DB 里
+/// 登记的一致，说明这次变更已经由别的路径应用过了。agents / skills / workflows
+/// 是逐条动作，哈希对不上单条变更，不能据此跳过。
+async fn already_applied(
+    db: &SqlitePool,
+    user_id: &str,
+    workspace_root: &Path,
+    action: &ReloadAction,
+) -> bool {
+    if !matches!(action, ReloadAction::Providers | ReloadAction::McpConfig) {
+        return false;
+    }
+    let on_disk = compute_module_hash_for_action(workspace_root, action);
+    let stored = crate::db::workspace_hashes::get_hashes(db, user_id)
+        .await
+        .unwrap_or_default();
+    stored
+        .get(action_to_module(action))
+        .is_some_and(|h| *h == on_disk)
 }
 
 /// 文件变更后同步 DB：更新模块哈希 + agent 索引双向同步。
@@ -309,6 +364,7 @@ fn action_to_module(action: &ReloadAction) -> &'static str {
         ReloadAction::Skill(_) | ReloadAction::SkillRemoved(_) => "skills",
         ReloadAction::Workflow(_) => "workflows",
         ReloadAction::McpConfig => "mcp",
+        ReloadAction::Providers => "providers",
         ReloadAction::KnowledgeSync(_) | ReloadAction::KnowledgeReload => "knowledge",
     }
 }
@@ -324,6 +380,7 @@ fn compute_module_hash_for_action(workspace_root: &Path, action: &ReloadAction) 
             hash::compute_workflows_hash(&workspace_root.join("workflows"))
         }
         ReloadAction::McpConfig => hash::compute_mcp_hash(workspace_root),
+        ReloadAction::Providers => hash::compute_providers_hash(workspace_root),
         // Knowledge 模块暂不纳入 workspace 哈希体系（有独立的 file_hashes.json）
         ReloadAction::KnowledgeSync(_) | ReloadAction::KnowledgeReload => hash::empty_hash(),
     }

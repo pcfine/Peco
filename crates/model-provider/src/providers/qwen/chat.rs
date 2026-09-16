@@ -29,7 +29,7 @@ use crate::{GenerateStream, ModelProvider, ProviderError, ToolCall, ToolDefiniti
 // ============================================================================
 
 /// DashScope OpenAI 兼容模式的基础 URL（chat completions 挂在其 `v1` 路径下）。
-const QWEN_API_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const QWEN_API_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 /// Qwen API 客户端，实现 [`ModelProvider`]。
 ///

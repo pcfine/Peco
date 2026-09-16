@@ -25,7 +25,7 @@ use crate::streaming::pipeline::normalize_tool_call_arguments;
 use crate::streaming::sse::{SseEvent, StreamingEventSource};
 use crate::{GenerateStream, ModelProvider, ProviderError, Usage};
 
-const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
+use super::chat::DEEPSEEK_API_BASE_URL;
 
 // ============================================================================
 // 客户端

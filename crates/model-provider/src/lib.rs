@@ -52,13 +52,16 @@ use async_trait::async_trait;
 
 pub use error::ProviderError;
 pub use generate_stream::GenerateStream;
-pub use providers::deepseek::{DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter};
+pub use providers::deepseek::{
+    DEEPSEEK_API_BASE_URL, DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter,
+};
 pub use providers::openai::{
-    OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI, OpenAiChatCompletionsAdapter,
-    OpenAiResponsesAdapter,
+    OPENAI_API_BASE_URL, OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI,
+    OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter,
 };
 pub use providers::qwen::{
-    QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter, QwenResponsesAdapter,
+    QWEN_API_BASE_URL, QWEN_FLASH, QWEN_MAX, QWEN_PLUS, Qwen, QwenChatCompletionsAdapter,
+    QwenResponsesAdapter,
 };
 pub use response::{
     BlockAssembler, BlockType, Content, ContentBlock, ContentPart, FinishReason, GenerateRequest,

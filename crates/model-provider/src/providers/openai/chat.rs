@@ -30,7 +30,8 @@ use crate::{GenerateStream, ModelProvider, ProviderError, ToolCall, ToolDefiniti
 // ============================================================================
 
 /// OpenAI API 的基础 URL（chat completions 与原生 responses 端点都挂在 `v1` 路径下）。
-pub(crate) const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
+/// OpenAI 原生 API 基址（chat 与 responses 共用；兼容网关经 `base_url` 覆盖）。
+pub const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// 思考模式下生成预算的建议下限提示（推理 token 计入输出预算：chat 为
 /// `max_completion_tokens`，responses 为 `max_output_tokens`；预算过小会导致可见

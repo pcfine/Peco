@@ -5,6 +5,7 @@ mod chat;
 mod responses;
 
 pub use chat::{
-    OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI, OpenAiChatCompletionsAdapter,
+    OPENAI_API_BASE_URL, OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI,
+    OpenAiChatCompletionsAdapter,
 };
 pub use responses::OpenAiResponsesAdapter;

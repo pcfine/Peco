@@ -25,7 +25,8 @@ use crate::{GenerateStream, ModelProvider, ProviderError, ToolCall, ToolDefiniti
 // DeepSeek 客户端
 // ============================================================================
 
-const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
+/// DeepSeek 原生 API 基址（chat 与 responses 共用）。
+pub const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 
 /// DeepSeek API 客户端，实现 [`ModelProvider`]。
 ///

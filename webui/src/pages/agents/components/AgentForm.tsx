@@ -688,7 +688,10 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
               value={bgColor || DEFAULT_BG_COLOR}
               onChange={(e) => setValue("background_color", e.target.value)}
             />
-            <Input {...register("background_color")} placeholder={DEFAULT_BG_COLOR} />
+            <Input
+              {...register("background_color")}
+              placeholder={DEFAULT_BG_COLOR}
+            />
             <Button
               type="button"
               variant="outline"

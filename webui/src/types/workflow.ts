@@ -71,7 +71,8 @@ export interface ExecutionSummary {
   runId: string;
   workflowName: string;
   triggerType: "manual" | "scheduled";
-  status: "running" | "paused" | "completed" | "failed" | "cancelled" | "timed_out";
+  status:
+    "running" | "paused" | "completed" | "failed" | "cancelled" | "timed_out";
   totalSteps: number;
   stepsCompleted: number;
   stepsFailed: number;

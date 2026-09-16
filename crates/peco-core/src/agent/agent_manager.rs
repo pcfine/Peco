@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tracing::{debug, info, warn};
@@ -53,7 +54,15 @@ pub struct AgentManager {
     /// 用于 shell 默认 cwd 与 show_workspace root（经 ToolDependencies 注入）。
     workspace_root: PathBuf,
     user_id: String,
-    user_config: UserConfig,
+    /// 用户级 provider 配置快照（可被 [`reload_providers`](Self::reload_providers) 整体替换）。
+    /// 已构建的 Agent 内嵌 `Arc<dyn ModelProvider>`，因此替换后必须同时失效 Tier-2 缓存。
+    user_config: RwLock<UserConfig>,
+    /// provider 配置的版本号，每次 [`reload_providers`](Self::reload_providers) 自增。
+    ///
+    /// 构建 Agent 需要读配置（无锁、可能耗时），构建完成再写缓存 —— 两步之间
+    /// 配置可能已被替换。加载路径据此判断自己读到的配置是否仍然有效：
+    /// 版本号变了就不写缓存，避免"旧凭据 Agent 住进刚清空的缓存"。
+    config_generation: AtomicU64,
     /// MCP 配置的共享持有者（与 `user_config.mcp` 解耦，支持独立热重载）。
     mcp_config: Arc<McpConfigStore>,
     skill_registry: Arc<SkillRegister>,
@@ -70,9 +79,9 @@ pub struct AgentManager {
     /// None（默认）= 删除工具运行时拒绝（fail-closed）。
     memory_audit: RwLock<Option<Arc<dyn MemoryAuditAccess>>>,
     /// web 搜索后端（来自 providers.toml 的 `[web_search]` 段）。
-    /// 构造期建一次（reqwest 连接池与 `${ENV_VAR}` 解析只做一次）；
-    /// None 表示未配置或配置无效，web_search 工具随之 skip。
-    web_search: Option<Arc<SearchBackend>>,
+    /// 建一次（reqwest 连接池与 `${ENV_VAR}` 解析只做一次）并随 provider
+    /// 重载一并重建；None 表示未配置或配置无效，web_search 工具随之 skip。
+    web_search: RwLock<Option<Arc<SearchBackend>>>,
 }
 
 impl AgentManager {
@@ -94,6 +103,9 @@ impl AgentManager {
             .parent()
             .expect("agents_dir must live under the workspace root")
             .to_path_buf();
+        // 构造期建一次搜索后端（连接池 + env var 解析只做一次）
+        let web_search =
+            SearchBackend::from_config_opt(user_config.providers.web_search.as_ref()).map(Arc::new);
         Self {
             agents_dir,
             workspace_root,
@@ -106,10 +118,9 @@ impl AgentManager {
             workflow_access: RwLock::new(None),
             mcp_access: RwLock::new(None),
             memory_audit: RwLock::new(None),
-            // 构造期建一次搜索后端（连接池 + env var 解析只做一次）
-            web_search: SearchBackend::from_config_opt(user_config.providers.web_search.as_ref())
-                .map(Arc::new),
-            user_config,
+            web_search: RwLock::new(web_search),
+            user_config: RwLock::new(user_config),
+            config_generation: AtomicU64::new(0),
         }
     }
 
@@ -216,6 +227,9 @@ impl AgentManager {
             }
         }
 
+        // 构建前记下配置版本：构建过程中 provider 配置可能被替换，那样构建出来的
+        // Agent 内嵌的是旧凭据，写进缓存就成了"改了 key 却不生效"的长期驻留。
+        let generation = self.config_generation.load(Ordering::Acquire);
         let agent = Arc::new(self.load_from_file(name, self.build_deps())?);
 
         {
@@ -223,10 +237,15 @@ impl AgentManager {
                 .cache
                 .write()
                 .map_err(|e| AgentError::Config(format!("agent cache lock poisoned: {e}")))?;
-            cache.insert(name.to_string(), agent.clone());
+            if self.config_generation.load(Ordering::Acquire) == generation {
+                cache.insert(name.to_string(), agent.clone());
+                info!(agent = %name, "Agent loaded and cached");
+            } else {
+                // 配置已换代：本次结果按需返回但不驻留，下次调用自然重建
+                info!(agent = %name, "Provider config changed during load, skipping cache write");
+            }
         }
 
-        info!(agent = %name, "Agent loaded and cached");
         Ok(agent)
     }
 
@@ -249,7 +268,7 @@ impl AgentManager {
                 path.display()
             )));
         }
-        let mut effective_config = self.user_config.clone();
+        let mut effective_config = self.user_config.read().unwrap().clone();
         effective_config.mcp = self.mcp_config.get();
         Agent::from_file(&path, &effective_config, &deps)
     }
@@ -271,7 +290,7 @@ impl AgentManager {
             mcp_access: self.mcp_access.read().unwrap().clone(),
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
-            web_search: self.web_search.clone(),
+            web_search: self.web_search.read().unwrap().clone(),
             memory_audit: self.memory_audit.read().unwrap().clone(),
         }
     }
@@ -283,7 +302,7 @@ impl AgentManager {
     ///
     /// `AmAgentAccess` 在构造时获得 MCP 配置快照，保持"已构造 Agent 不受热更新影响"的语义。
     fn build_deps_direct(&self) -> ToolDependencies {
-        let mut config = self.user_config.clone();
+        let mut config = self.user_config.read().unwrap().clone();
         config.mcp = self.mcp_config.get();
         let workflow_access = self.workflow_access.read().unwrap().clone();
         let mcp_access = self.mcp_access.read().unwrap().clone();
@@ -298,7 +317,7 @@ impl AgentManager {
                 knowledge_manager: self.knowledge_manager.clone(),
                 workflow_access: workflow_access.clone(),
                 mcp_access: mcp_access.clone(),
-                web_search: self.web_search.clone(),
+                web_search: self.web_search.read().unwrap().clone(),
                 memory_audit: memory_audit.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
@@ -313,7 +332,7 @@ impl AgentManager {
             mcp_access,
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
-            web_search: self.web_search.clone(),
+            web_search: self.web_search.read().unwrap().clone(),
             memory_audit,
         }
     }
@@ -354,6 +373,41 @@ impl AgentManager {
     /// 已缓存的 Agent 实例保持原有 MCP 连接。
     pub fn reload_mcp_config(&self, system_mcp: &McpConfig) -> usize {
         self.mcp_config.reload(&self.workspace_root, system_mcp)
+    }
+
+    /// 替换 provider 配置并失效所有已缓存 Agent，返回失效数量。
+    ///
+    /// 与 MCP 热重载不同，provider 是 Agent 实例**内嵌**的凭据
+    /// （`Arc<dyn ModelProvider>` 在构建期解析 api_key / base_url / 适配器），
+    /// 只换快照不失效缓存等于没改 —— 改完 api_key 仍会用旧凭据发请求。
+    /// 因此这里一并清空 Tier-2 缓存 + 重建 web_search 后端。
+    pub fn reload_providers(&self, user_config: UserConfig) -> usize {
+        let web_search =
+            SearchBackend::from_config_opt(user_config.providers.web_search.as_ref()).map(Arc::new);
+
+        // 顺序：先换配置 → 再自增版本 → 最后清缓存。
+        // 清缓存只能清掉"已经住进来"的旧实例；正在构建、尚未写缓存的加载路径
+        // 靠版本号拦下（见 `load_cached`）—— 二者缺一都会漏掉一类旧凭据实例。
+        *self.user_config.write().unwrap() = user_config;
+        *self.web_search.write().unwrap() = web_search;
+        self.config_generation.fetch_add(1, Ordering::AcqRel);
+
+        let invalidated = match self.cache.write() {
+            Ok(mut cache) => {
+                let n = cache.len();
+                cache.clear();
+                n
+            }
+            Err(e) => {
+                warn!(error = %e, "Agent cache lock poisoned, providers reloaded without cache invalidation");
+                0
+            }
+        };
+        info!(
+            invalidated,
+            "Provider config reloaded, cached agents invalidated"
+        );
+        invalidated
     }
 
     /// 刷新单个 Agent 的缓存（Tier-2 失效 + Tier-1 元数据更新）。

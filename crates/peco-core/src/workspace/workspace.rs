@@ -3,7 +3,7 @@
 // ============================================================================
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::agent::AgentManager;
 use crate::config::{McpConfig, SystemConfig, UserConfig};
@@ -60,7 +60,11 @@ fn agent_template_version(content: &str) -> u32 {
 pub struct WorkSpace {
     user_id: String,
     root: PathBuf,
-    config: UserConfig,
+    /// 系统级配置快照 — 用户 providers.toml 与之深递归合并。
+    /// 进程内不变，但需保留以支持 [`WorkSpace::reload_providers`] 重新合并。
+    system_config: SystemConfig,
+    /// 当前生效的用户配置（providers + mcp），可被热重载整体替换。
+    config: RwLock<UserConfig>,
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
     agent_manager: Arc<AgentManager>,
@@ -129,7 +133,8 @@ impl WorkSpace {
         Ok(Self {
             user_id,
             root,
-            config,
+            system_config: system_config.clone(),
+            config: RwLock::new(config),
             skill_registry,
             knowledge_manager,
             agent_manager,
@@ -145,8 +150,12 @@ impl WorkSpace {
     pub fn root(&self) -> &Path {
         &self.root
     }
-    pub fn config(&self) -> &UserConfig {
-        &self.config
+    /// 返回当前生效的用户配置快照。
+    ///
+    /// providers 可被 [`reload_providers`](Self::reload_providers) 整体替换，
+    /// 故返回克隆而非引用。
+    pub fn config(&self) -> UserConfig {
+        self.config.read().unwrap().clone()
     }
     pub fn skill_registry(&self) -> &Arc<SkillRegister> {
         &self.skill_registry
@@ -211,6 +220,22 @@ impl WorkSpace {
     /// 下次 [`AgentManager::load_cached`] 调用将重新解析 agent.md。
     pub fn reload_agent(&self, name: &str) {
         self.agent_manager.refresh_one(name);
+    }
+
+    /// 重新加载 provider 配置（重新读盘 + 与系统配置深递归合并）。
+    ///
+    /// `providers.toml` 不属于任何单例管理器，故先在 workspace 层完成合并，
+    /// 再把结果推给 [`AgentManager`]（它按 provider 快照构建 Agent）。
+    /// 返回被失效的已缓存 Agent 数量 — 这些 Agent 下次加载时会用新 provider 重建。
+    ///
+    /// 与 [`reload_mcp_config`](Self::reload_mcp_config) 的差别：MCP 只影响
+    /// 后续新加载的 Agent，provider 是**已建实例内的凭据**，必须主动失效缓存，
+    /// 否则改完 api_key 仍走旧凭据。
+    pub fn reload_providers(&self) -> Result<usize, crate::config::ConfigError> {
+        let new_config = UserConfig::load(&self.system_config, &self.root)?;
+        let invalidated = self.agent_manager.reload_providers(new_config.clone());
+        *self.config.write().unwrap() = new_config;
+        Ok(invalidated)
     }
 
     /// 重新扫描所有 Agent（刷新 Tier-1 元数据）。
@@ -735,5 +760,75 @@ mod tests {
         let agents_dir = installed_agent_dir(tmp.path());
         assert!(agents_dir.join("agent.md").exists());
         assert!(!agents_dir.join("agent.md.bak.0").exists());
+    }
+
+    /// 写出 providers.toml，其中 deepseek 的 api_key 为字面量 `key`。
+    fn write_providers(root: &std::path::Path, key: &str) {
+        let dir = root.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("providers.toml");
+        let content = format!(
+            "default_provider = \"deepseek\"\n\n[providers.deepseek]\ntype = \"deepseek\"\napi_key = \"{key}\"\nbase_url = \"https://api.deepseek.com\"\n\n[providers.deepseek.default]\nmodel = \"deepseek-v4-flash\"\n"
+        );
+        std::fs::write(&path, content).unwrap();
+    }
+
+    /// 修改 api_key 后 `reload_providers()` 必须让已缓存 Agent 重建 —— 这正是
+    /// WebUI 保存后"密钥改了却不生效"的修复点：Agent 内嵌 provider 实例，
+    /// 只换配置快照而不失效缓存等于没改。
+    #[tokio::test]
+    async fn reload_providers_invalidates_cached_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_providers(tmp.path(), "sk-old");
+        let ws = make_workspace(tmp.path());
+
+        let agents_dir = installed_agent_dir(tmp.path());
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("agent.md"), md(None, "# 对话体")).unwrap();
+
+        let ws = Arc::new(ws);
+        let before = ws.agent_manager().load_cached("@demo").unwrap();
+        assert_eq!(
+            ws.config()
+                .provider_entry(Some("deepseek"))
+                .and_then(|e| e.api_key.clone())
+                .as_deref(),
+            Some("sk-old")
+        );
+
+        write_providers(tmp.path(), "sk-new");
+        let invalidated = ws.reload_providers().unwrap();
+
+        // 缓存被清空 + 生效配置已更新
+        assert_eq!(invalidated, 1, "已缓存 Agent 应被全部失效");
+        assert_eq!(
+            ws.config()
+                .provider_entry(Some("deepseek"))
+                .and_then(|e| e.api_key.clone())
+                .as_deref(),
+            Some("sk-new")
+        );
+
+        // 重新加载拿到的是新构建的 provider 实例（旧实例不会被就地修改）
+        let after = ws.agent_manager().load_cached("@demo").unwrap();
+        assert!(
+            !Arc::ptr_eq(before.provider(), after.provider()),
+            "provider 实例应随配置重载而重建"
+        );
+    }
+
+    /// 没有已缓存 Agent 时重载同样安全（返回 0），且不破坏后续加载。
+    #[tokio::test]
+    async fn reload_providers_with_empty_cache_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_providers(tmp.path(), "sk-old");
+        let ws = make_workspace(tmp.path());
+
+        assert_eq!(ws.reload_providers().unwrap(), 0);
+        assert_eq!(
+            ws.config().default_provider_name(),
+            "deepseek",
+            "重载后仍能与系统配置正确合并"
+        );
     }
 }

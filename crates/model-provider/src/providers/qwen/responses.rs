@@ -33,8 +33,7 @@ use crate::streaming::pipeline::normalize_tool_call_arguments;
 use crate::streaming::sse::{SseEvent, StreamingEventSource};
 use crate::{GenerateStream, ModelProvider, ProviderError, Usage};
 
-/// DashScope OpenAI 兼容模式的基础 URL（chat 与 responses 共用该前缀）。
-const QWEN_API_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+use super::chat::QWEN_API_BASE_URL;
 
 /// Responses `max_output_tokens` 的下限（低于该值网关返回 400）。
 const QWEN_MIN_OUTPUT_TOKENS: u32 = 16;
