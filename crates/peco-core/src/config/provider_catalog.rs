@@ -8,9 +8,7 @@
 //
 // 消费方：配置 UI（表单默认值）与连接测试端点。
 
-use model_provider::providers::deepseek::{
-    DEEPSEEK_API_BASE_URL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO,
-};
+use model_provider::providers::deepseek::{DEEPSEEK_API_BASE_URL, DEEPSEEK_V4_FLASH};
 use model_provider::providers::openai::{
     OPENAI_API_BASE_URL, OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI,
 };
@@ -43,7 +41,7 @@ pub const PROVIDER_TYPES: &[ProviderTypeMeta] = &[
         display_name: "DeepSeek",
         default_base_url: DEEPSEEK_API_BASE_URL,
         api_modes: &["responses", "chat"],
-        suggested_models: &[DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO],
+        suggested_models: &[DEEPSEEK_V4_FLASH],
         default_model: DEEPSEEK_V4_FLASH,
     },
     ProviderTypeMeta {

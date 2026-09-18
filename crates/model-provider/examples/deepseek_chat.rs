@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use model_provider::providers::deepseek::DEEPSEEK_V4_PRO;
+use model_provider::providers::deepseek::DEEPSEEK_V4_FLASH;
 use model_provider::{
     BlockAssembler, ContentBlock, DeepSeek, GenerateRequest, GenerateResult, GenerateStream,
     InputItem, ModelProvider, ProviderError, Role, StreamChunk,
@@ -32,7 +32,7 @@ fn request(
     tools: Vec<model_provider::ToolDefinition>,
 ) -> GenerateRequest {
     GenerateRequest {
-        model: DEEPSEEK_V4_PRO.to_string(),
+        model: DEEPSEEK_V4_FLASH.to_string(),
         instructions: Some(instructions.to_string()),
         input: vec![Arc::new(InputItem::Message {
             role: Role::User,

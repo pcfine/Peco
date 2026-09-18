@@ -4,7 +4,7 @@ agent:
   description: "编码助手 — 代码生成、审查、重构、调试"
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-pro"
+  model: "deepseek-v4-flash"
   temperature: 0.3
   stream: true
   reasoning_effort: "high"

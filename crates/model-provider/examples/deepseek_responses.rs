@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use model_provider::providers::deepseek::DEEPSEEK_V4_PRO;
+use model_provider::providers::deepseek::DEEPSEEK_V4_FLASH;
 use model_provider::{
     BlockAssembler, ContentBlock, DeepSeek, DeepSeekResponsesAdapter, GenerateRequest, InputItem,
     ModelProvider, Role, StreamChunk,
@@ -122,7 +122,7 @@ async fn run_stream(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let model = std::env::var("MODEL").unwrap_or_else(|_| DEEPSEEK_V4_PRO.to_string());
+    let model = std::env::var("MODEL").unwrap_or_else(|_| DEEPSEEK_V4_FLASH.to_string());
 
     // 1. responses 适配器
     let responses = DeepSeekResponsesAdapter::from_env()?;

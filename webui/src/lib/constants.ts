@@ -1,6 +1,5 @@
 export const MODELS = [
   { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash" },
-  { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
   { value: "deepseek-v4", label: "DeepSeek V4" },
 ] as const;
 
