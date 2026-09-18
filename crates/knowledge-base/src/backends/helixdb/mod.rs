@@ -111,48 +111,62 @@ fn count_value(response: &Value, key: &str) -> usize {
         .unwrap_or(0) as usize
 }
 
-/// 解析 [`queries::traverse_graph`] 返回的 `traversed` 结果。
+/// 解析 [`queries::traverse_graph`] 返回的分层结果（`d1`..`dN`）。
 ///
-/// `node_id` 现在是 `schema.id_property`（稳定身份）而非内部 `$id`；`name` 回填进
-/// `properties`。`N(start) → Repeat` 会把起点自身也 emit 出来，这里按稳定 id 过滤
-/// 掉 —— 起点不是「遍历到的邻居」。
+/// `node_id` 是 `schema.id_property`（稳定身份）而非内部 `$id`；`name` 回填进
+/// `properties`。`N(start) → Repeat` 会把起点自身也 emit 出来，这里按稳定 id 过滤掉。
 ///
-/// `via_edge` 一律留空 —— 节点侧遍历拿不到边标签（边标签只在边投影的结果里），
-/// 由调用方在能拿到时回填。`distance` 恒为 0：HelixDB 的遍历不返回 `$distance`，
-/// 直连邻居的跳数由 `adjacent_steps` 以 1 精确给出，更远节点无法得知真实跳数。
-fn parse_traversed_nodes(response: &Value, start_node_id: &str) -> Vec<TraversalStep> {
-    extract_properties(response, "traversed")
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let node_id = parse_id_value(item.get("node_id")?)?;
-                    if node_id == start_node_id {
-                        return None;
-                    }
-                    let labels = item
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .map(|s| vec![s.to_string()])
-                        .unwrap_or_default();
-                    let properties = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(|name| HashMap::from([("name".to_string(), name.to_string())]))
-                        .unwrap_or_default();
+/// `via_edge` 一律留空 —— 节点侧遍历拿不到边标签，由调用方在能拿到时回填。
+///
+/// 层从浅到深扫描，`seen` 保留首次出现 —— 也就是最小跳数：深层里的重复节点不会
+/// 覆盖浅层给出的更小距离。某层缺失时跳过，不影响其余层。
+fn parse_traversed_nodes(
+    response: &Value,
+    start_node_id: &str,
+    max_depth: u32,
+) -> Vec<TraversalStep> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut steps: Vec<TraversalStep> = Vec::new();
 
-                    Some(TraversalStep {
-                        node: GraphNode {
-                            id: node_id,
-                            labels,
-                            properties,
-                            distance: 0,
-                        },
-                        via_edge: None,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    for depth in 1..=max_depth {
+        let Some(items) = extract_properties(response, &queries::depth_query_name(depth)) else {
+            continue;
+        };
+        for item in items {
+            let Some(node_id) = item.get("node_id").and_then(parse_id_value) else {
+                continue;
+            };
+            if node_id == start_node_id {
+                continue;
+            }
+            if !seen.insert(node_id.clone()) {
+                continue;
+            }
+
+            let labels = item
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default();
+            let properties = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| HashMap::from([("name".to_string(), name.to_string())]))
+                .unwrap_or_default();
+
+            steps.push(TraversalStep {
+                node: GraphNode {
+                    id: node_id,
+                    labels,
+                    properties,
+                    distance: depth,
+                },
+                via_edge: None,
+            });
+        }
+    }
+
+    steps
 }
 
 /// 把 `GraphStore::traverse` 的边类型入参展开成一组遍历查询计划。
@@ -314,6 +328,12 @@ impl HelixDbBackend {
         direction: TraversalDirection,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
+        // `max_depth == 0` 表示不遍历：直连边本身也算一跳，且分层查询会退化成
+        // 空 batch（HelixDB 不接受空 queries），故直接返回空。
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut steps = self.adjacent_steps(start_node, direction).await?;
 
         let query = queries::traverse_graph(
@@ -324,7 +344,7 @@ impl HelixDbBackend {
             max_depth,
         );
         let response = self.client.execute_read(query).await?;
-        steps.extend(parse_traversed_nodes(&response, start_node));
+        steps.extend(parse_traversed_nodes(&response, start_node, max_depth));
 
         Ok(steps)
     }
@@ -921,6 +941,12 @@ impl GraphStore for HelixDbBackend {
         direction: TraversalDirection,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
+        // 见 `wildcard_steps` 的说明：0 跳即不遍历；上限见 `MAX_TRAVERSAL_DEPTH`。
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+        let max_depth = max_depth.min(MAX_TRAVERSAL_DEPTH);
+
         let dir_str = Self::direction_str(direction);
         let mut all_steps: Vec<TraversalStep> = Vec::new();
 
@@ -938,7 +964,7 @@ impl GraphStore for HelixDbBackend {
                     );
                     let response = self.client.execute_read(query).await?;
 
-                    let mut steps = parse_traversed_nodes(&response, start_node);
+                    let mut steps = parse_traversed_nodes(&response, start_node, max_depth);
                     for step in &mut steps {
                         step.via_edge = Some(et.clone());
                     }
@@ -1425,9 +1451,9 @@ mod tests {
     fn wildcard_traversal_emits_null_label() {
         let schema = HelixSchema::default();
 
-        // 方向步骤嵌在 Repeat 的 traversal 里
+        // 方向步骤嵌在每条层查询的 Repeat.traversal 里（queries[0] 即 d1 层）
         let direction_step = |q: &serde_json::Value| {
-            q["query"]["queries"][1]["Query"]["steps"][1]["Repeat"]["traversal"]["steps"][0].clone()
+            q["query"]["queries"][0]["Query"]["steps"][1]["Repeat"]["traversal"]["steps"][0].clone()
         };
 
         for dir in ["Out", "In", "Both"] {
@@ -1441,6 +1467,67 @@ mod tests {
         // 显式标签仍是字符串
         let q = queries::traverse_graph(&schema, "entity:Entity:abc", Some("朋友"), "Out", 2);
         assert_eq!(direction_step(&q), serde_json::json!({"Out": "朋友"}));
+    }
+
+    /// ⑦ 分层遍历：`returns` 为 `d1..dN`，第 k 条子查询的 `max_depth` 恰为 k，
+    /// 起点内联在每条查询里（不再单发 `start` 查询）。
+    #[test]
+    fn traverse_graph_is_layered_by_depth() {
+        let schema = HelixSchema::default();
+        let q = queries::traverse_graph(&schema, "entity:Entity:abc", None, "Both", 3);
+
+        assert_eq!(q["request_type"], "read");
+        assert_eq!(q["query"]["returns"], serde_json::json!(["d1", "d2", "d3"]));
+
+        let queries = q["query"]["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 3, "层数 = max_depth");
+        for (idx, depth) in (1..=3u32).enumerate() {
+            let query = &queries[idx];
+            assert_eq!(query["Query"]["name"], queries::depth_query_name(depth));
+            assert_eq!(
+                query["Query"]["steps"][0],
+                serde_json::json!({"NWhere": {"Eq": ["id", {"String": "entity:Entity:abc"}]}})
+            );
+            assert_eq!(query["Query"]["steps"][1]["Repeat"]["max_depth"], depth);
+        }
+    }
+
+    /// ⑦ 跳数由层号推出：第 k 层的节点 distance 为 k，起点自身不入结果，
+    /// 跨层重复只保留最小跳数。
+    #[test]
+    fn distance_comes_from_the_layer_index() {
+        let response = serde_json::json!({
+            "d1": {"properties": [
+                {"node_id": "entity:Entity:start", "name": "小C"},
+                {"node_id": "entity:Entity:chen", "name": "chen"}
+            ]},
+            "d2": {"properties": [
+                {"node_id": "entity:Entity:start", "name": "小C"},
+                {"node_id": "entity:Entity:chen", "name": "chen"},
+                {"node_id": "entity:Entity:beauty", "name": "美女"}
+            ]}
+        });
+
+        let steps = parse_traversed_nodes(&response, "entity:Entity:start", 2);
+        let by_id: HashMap<_, _> = steps.iter().map(|s| (s.node.id.as_str(), s)).collect();
+
+        assert_eq!(steps.len(), 2, "起点不入结果 + 跨层重复只留一次");
+        assert_eq!(by_id["entity:Entity:chen"].node.distance, 1);
+        assert_eq!(by_id["entity:Entity:beauty"].node.distance, 2);
+        assert_eq!(by_id["entity:Entity:beauty"].node.properties["name"], "美女");
+        assert!(!by_id.contains_key("entity:Entity:start"));
+    }
+
+    /// ⑦ 缺层不致命：某一层没返回时跳过该层，其余层照常给出结果。
+    #[test]
+    fn missing_layer_is_skipped() {
+        let response = serde_json::json!({
+            "d1": {"properties": [{"node_id": "entity:Entity:chen", "name": "chen"}]}
+        });
+
+        let steps = parse_traversed_nodes(&response, "entity:Entity:start", 3);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].node.distance, 1);
     }
 
     /// ② 直连边双查询：边流取 `EdgeProperties`（`$label`/`$to`/`$from`），

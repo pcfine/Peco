@@ -184,6 +184,12 @@ impl Fact {
     }
 }
 
+/// 图遍历深度的上限。
+///
+/// `max_depth` 是 LLM 可控入参（`query_entity_facts` 工具）。HelixDB 的分层遍历
+/// 按它 `with_capacity` 并逐层发子查询，超大值会导致巨量分配或海量子查询。
+pub const MAX_TRAVERSAL_DEPTH: u32 = 5;
+
 /// 计算确定性实体节点 ID。
 ///
 /// 格式：`entity:{entity_type}:{sha256(normalized_name)[:8]}`

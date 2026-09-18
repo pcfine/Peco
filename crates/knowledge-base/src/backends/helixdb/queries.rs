@@ -601,7 +601,7 @@ pub fn count_nodes(_schema: &HelixSchema, label: &str) -> Value {
     })
 }
 
-/// 图遍历：从起始节点做 BFS。
+/// 图遍历：从起始节点做 BFS，**按跳数分层**返回（`d1`..`dN`）。
 ///
 /// `edge_label` 为 `None` 时发出通配遍历（`{"Out": null}` 形态），沿**全部**
 /// 边走出，不管边标签是什么。这是唯一能覆盖 `EdgeType::Custom` 任意谓词标签的
@@ -611,8 +611,18 @@ pub fn count_nodes(_schema: &HelixSchema, label: &str) -> Value {
 ///
 /// 结果投影 `schema.id_property`（稳定身份）而非内置 `$id` —— 否则调用方拿到的
 /// 是内部自增整数，无法与 `compute_entity_id` 的内容哈希对齐。`name` 一并投影，
-/// 供 `query_entity_facts` 展示实体名。HelixDB 的遍历不返回 `$distance`（那是搜索
-/// 命中专用的虚拟字段），跳数由调用方另算。
+/// 供 `query_entity_facts` 展示实体名。
+///
+/// ## 为什么分层
+///
+/// HelixDB 的 `$distance` 是**搜索命中专用**的虚拟字段，遍历结果不返回它；
+/// `Path` / `SimplePath` 也只回扁平 id 列表，拿不到逐跳结构。因此精确跳数只能在
+/// 客户端推：第 k 层 = `max_depth = k` 的累积遍历结果，节点**首次出现的层号**就是
+/// 它到起点的最短跳数。所有层装在**同一个 read batch** 里，不增加 HTTP 往返次数，
+/// 代价是同批 N 条子查询（N = `max_depth`，实际通常 2~3）。
+///
+/// 起点内联在每条层查询里（不再单发 `start` 查询）；`emit: "All"` 会把起点自己
+/// 也放进每一层，由解析侧按 `start_node_id` 过滤。
 pub fn traverse_graph(
     schema: &HelixSchema,
     start_node_id: &str,
@@ -630,31 +640,39 @@ pub fn traverse_graph(
         _ => json!({"Out": label}),
     };
 
+    let mut queries = Vec::with_capacity(max_depth as usize);
+    let mut returns = Vec::with_capacity(max_depth as usize);
+    for depth in 1..=max_depth {
+        let name = depth_query_name(depth);
+        returns.push(name.clone());
+        queries.push(json!({"Query": {"name": name, "steps": [
+            {"NWhere": {"Eq": [schema.id_property, {"String": start_node_id}]}},
+            {"Repeat": {
+                "traversal": {"steps": [dir_step.clone()]},
+                "max_depth": depth,
+                "emit": "All"
+            }},
+            "Dedup",
+            {"Project": [
+                {"source": schema.id_property, "alias": "node_id"},
+                {"source": "$label", "alias": "label"},
+                {"source": "name", "alias": "name"}
+            ]}
+        ], "condition": null}}));
+    }
+
     json!({
         "request_type": "read",
-        "query": {
-            "queries": [
-                {"Query": {"name": "start", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": start_node_id}]}}
-                ], "condition": null}},
-                {"Query": {"name": "traversed", "steps": [
-                    {"N": {"Var": "start"}},
-                    {"Repeat": {
-                        "traversal": {"steps": [dir_step]},
-                        "max_depth": max_depth,
-                        "emit": "All"
-                    }},
-                    "Dedup",
-                    {"Project": [
-                        {"source": schema.id_property, "alias": "node_id"},
-                        {"source": "$label", "alias": "label"},
-                        {"source": "name", "alias": "name"}
-                    ]}
-                ], "condition": null}}
-            ],
-            "returns": ["traversed"]
-        }
+        "query": {"queries": queries, "returns": returns}
     })
+}
+
+/// 分层遍历查询的返回键名：第 `depth` 层叫 `d{depth}`（`d1`、`d2`……）。
+///
+/// 构造侧（[`traverse_graph`]）与解析侧（后端 `parse_traversed_nodes`）共用同一
+/// 函数，避免两处字面量各自漂移。
+pub fn depth_query_name(depth: u32) -> String {
+    format!("d{depth}")
 }
 
 /// 起始节点的直连边 + 邻接点身份（把边标签与稳定节点 id 一起取回）。
@@ -1314,5 +1332,27 @@ mod tests {
             first.contains_key("NWhere"),
             "count_nodes 应使用 NWhere 而非 NWithLabel"
         );
+    }
+
+    /// ⑦ 分层遍历批次形状：`returns` 为 `d1..dN`，第 k 条的 `max_depth` 恰为 k。
+    #[test]
+    fn traverse_graph_is_layered_by_depth() {
+        let s = HelixSchema::default();
+        let q = traverse_graph(&s, "entity:Entity:abc", None, "Both", 3);
+
+        assert_eq!(q["request_type"], "read");
+        assert_eq!(q["query"]["returns"], json!(["d1", "d2", "d3"]));
+
+        let queries = q["query"]["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 3, "层数 = max_depth");
+        for (idx, depth) in (1..=3u32).enumerate() {
+            let query = &queries[idx];
+            assert_eq!(query["Query"]["name"], depth_query_name(depth));
+            assert_eq!(
+                query["Query"]["steps"][0],
+                json!({"NWhere": {"Eq": ["id", {"String": "entity:Entity:abc"}]}})
+            );
+            assert_eq!(query["Query"]["steps"][1]["Repeat"]["max_depth"], depth);
+        }
     }
 }

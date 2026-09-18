@@ -148,6 +148,36 @@ async fn e2e_add_facts_query_entity_facts_and_relation_path() {
         "通配遍历不应把起点自身计入结果"
     );
 
+    // ⑦ 直连邻居的跳数必须恰为 1（而不是降级值 0）。只对 5 个已知直连邻居断言：
+    // HelixDB 无 per-KB 隔离且实例跨运行保留，全称断言会被上一轮留下的两跳节点打挂。
+    for expected in ["chen", "男", "30", "美女", "春天的爱情故事"] {
+        let step = steps
+            .iter()
+            .find(|s| s.node.properties.get("name").map(String::as_str) == Some(expected))
+            .unwrap_or_else(|| panic!("直连邻居 {expected:?} 应出现在结果里"));
+        assert_eq!(
+            step.node.distance, 1,
+            "直连邻居 {expected:?} 距离应为 1，实际 {}",
+            step.node.distance
+        );
+    }
+
+    // ⑦ 两跳节点的距离应为 2 —— 由「节点首次出现在第几层」推出，不是降级值。
+    // HelixDB 的 `$distance` 只在搜索命中上可用，遍历路径拿不到，因此这里验证
+    // 分层遍历（d1..dN）的层号确实换成了精确跳数。
+    kb.add_facts(&[Fact::new("chen", "朋友", "老王", 1.0)], false)
+        .await
+        .expect("写入两跳事实失败");
+    let steps = kb
+        .query_entity_facts("小C", 2)
+        .await
+        .expect("query_entity_facts 失败");
+    let two_hop = steps
+        .iter()
+        .find(|s| s.node.properties.get("name").map(String::as_str) == Some("老王"))
+        .expect("两跳实体「老王」应出现在结果里");
+    assert_eq!(two_hop.node.distance, 2, "两跳节点距离应为 2");
+
     // ── query_relation_path（⑤ 的关键回归：恒 None 才是 bug）──
     let path = kb
         .query_relation_path("小C", "chen")

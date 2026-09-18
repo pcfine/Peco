@@ -762,11 +762,14 @@ impl ToolDyn for QueryEntityFacts {
 
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
 
+            // `max_depth` 直通遍历的分配与查询次数，必须夹紧（见 MAX_TRAVERSAL_DEPTH）。
+            let max_depth = parsed.max_depth.min(knowledge_base::MAX_TRAVERSAL_DEPTH);
+
             let km = self.access.knowledge_manager();
             km.ensure_loaded().await.map_err(string_err)?;
 
             let steps = km
-                .query_entity_facts(&parsed.kb_name, &parsed.entity_name, parsed.max_depth)
+                .query_entity_facts(&parsed.kb_name, &parsed.entity_name, max_depth)
                 .await
                 .map_err(string_err)?;
 
