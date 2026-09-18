@@ -9,3 +9,5 @@ dist/
 **/knowledge/**/*.lance/
 **/knowledge/**/file_hashes.json
 docs/
+reports/
+helix/

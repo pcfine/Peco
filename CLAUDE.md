@@ -134,7 +134,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - `McpClientHandler`：实现 `rmcp::ClientHandler`，自动同步工具列表变更（list_changed → 移除所有受管工具 → 重新列出 → 重新注册）。
 - MCP 配置存储在 `~/.peco/mcp_config.json`（或 `$PECO_CONFIG_DIR/mcp_config.json`），通过 `McpConfig::load()` 加载。
 
-**Peco 永续会话：滚动压缩 + 记忆双路径**（详见 `docs/context-design.md`）：
+**Peco 永续会话：滚动压缩 + 记忆双路径** ：
 
 - **滚动压缩**（[crates/peco-core/src/agent/compaction.rs](crates/peco-core/src/agent/compaction.rs)）：`CompactionPolicy::maybe_compact()` 在 turn 边界（looper Done 分支）估算 pinned + committed token，超过 `compaction_trigger_tokens` 时用 Flash 模型递归合并旧摘要与被驱逐轮次为结构化摘要（四段固定模板），`Session::compact()` 物理驱逐最旧轮次并重编号 turn_index，摘要作为 `pinned_summary`（System 消息）钉在上下文最前。失败非致命，仅记日志。
 - **单一截断点**：全部裁剪决策在 `PecoContextFilter`（[crates/peco-server/src/peco/filter.rs](crates/peco-server/src/peco/filter.rs)）一处完成 — pinned 层（System/摘要）→ Verbatim 层（按 token 预算从最新往回整轮选择）→ 当前轮（完整保留）。`ContextStrategy` 保持 `FullHistory` 直通。
