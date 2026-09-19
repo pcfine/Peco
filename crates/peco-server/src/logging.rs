@@ -22,10 +22,14 @@
 //!
 //! # 默认过滤器
 //!
-//! `model_provider` 必须显式列出：它不以 `peco` 开头，没有自己的 directive 时会落到
-//! EnvFilter 的 ERROR 默认级别，而该 crate 只发 warn/debug —— 于是 LLM 调用层的
-//! 所有异常（非 2xx、SSE 重连、丢弃工具调用）都会静默。
-//! 排查 LLM 问题：`RUST_LOG=model_provider=debug`，看完整请求体用 `=trace`。
+//! 本项目 crate 一律开 `debug`（见 [`DEFAULT_FILTER`]）：`peco` 前缀覆盖
+//! peco-server / peco-core / peco-cli / peco-agents / peco-derive 及其全部子模块。
+//! `model_provider` 与 `knowledge_base` 不以 `peco` 开头，**必须显式列出** ——
+//! EnvFilter 在没有匹配 directive 时取 `LevelFilter::OFF`（不是某个默认级别），
+//! 于是这两个 crate 的 warn/debug（LLM 截断/重连、检索降级、图后端回退）会整体静默。
+//! 未列出的第三方依赖保持关闭，避免 tokio/hyper/sqlx 的噪声淹没日志；tower_http
+//! 单独提到 `info` 是因为它的请求日志在排查 4xx/5xx 时有用。
+//! 看完整请求体/响应体原文用 `RUST_LOG=model_provider=trace`（含用户对话内容，谨慎）。
 //! 日志时间戳用本机时区；offset 后缀让时间戳自描述，便于与 UTC 落库时间戳对账。
 
 use std::fs::{File, OpenOptions};
@@ -46,7 +50,11 @@ use crate::config::resolve_data_dir;
 const TIMER_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f%:z";
 
 /// 无 `RUST_LOG` 时的默认过滤器。
-const DEFAULT_FILTER: &str = "peco=info,model_provider=info,tower_http=info";
+///
+/// 本项目 crate 全部 `debug`，未列出的第三方目标关闭。新增自有 crate 时若其名字不以
+/// `peco` 开头，必须补进这条 directive —— EnvFilter 对无匹配 directive 的目标取
+/// `LevelFilter::OFF`，漏写即等于把该模块的日志全部丢掉。
+const DEFAULT_FILTER: &str = "peco=debug,model_provider=debug,knowledge_base=debug,tower_http=info";
 
 const LOG_FILE_NAME: &str = "peco-server.log";
 const DEFAULT_MAX_SIZE_MB: u64 = 10;

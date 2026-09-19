@@ -250,7 +250,7 @@ fn build_request_body(
         warn!(
             target: "model_provider::deepseek",
             images = images_dropped,
-            "deepseek 不支持图片输入，已剥离图片部件（保留文本）"
+            "deepseek does not support image input; image parts stripped (text kept)"
         );
     }
     let mut messages: Vec<WireMessage> = Vec::new();
@@ -440,14 +440,14 @@ impl ModelProvider for DeepSeek {
                     .unwrap_or(0),
                 body_bytes = body.len(),
                 stream = false,
-                "发送 chat 生成请求"
+                "sending chat generate request"
             );
             // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
             tracing::trace!(
                 target: "model_provider::deepseek",
                 request_id = %request_id,
                 body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-                "chat 请求体全文"
+                "chat request body (full)"
             );
 
             let response = self
@@ -474,7 +474,7 @@ impl ModelProvider for DeepSeek {
                     status = status.as_u16(),
                     latency_ms,
                     body = %body_str,
-                    "DeepSeek API 返回错误状态"
+                    "deepseek API returned error status"
                 );
                 return Err(ProviderError::Api {
                     status: status.as_u16(),
@@ -486,7 +486,7 @@ impl ModelProvider for DeepSeek {
                 target: "model_provider::deepseek",
                 request_id = %request_id,
                 body = %String::from_utf8_lossy(&response_body),
-                "chat 响应体全文"
+                "chat response body (full)"
             );
 
             let api_response: DeepSeekResponse = serde_json::from_slice(&response_body)?;
@@ -506,7 +506,7 @@ impl ModelProvider for DeepSeek {
                 input_tokens = result.usage.input_tokens,
                 output_tokens = result.usage.output_tokens,
                 total_tokens = result.usage.total_tokens,
-                "chat 生成完成"
+                "chat generate done"
             );
             Ok(result)
         }
@@ -546,13 +546,13 @@ impl ModelProvider for DeepSeek {
                 .unwrap_or(0),
             body_bytes = body.len(),
             stream = true,
-            "发送 chat 流式生成请求"
+            "sending chat streaming generate request"
         );
         tracing::trace!(
             target: "model_provider::deepseek",
             request_id = %request_id,
             body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-            "chat 流式请求体全文"
+            "chat streaming request body (full)"
         );
 
         let span = tracing::info_span!(
@@ -615,13 +615,13 @@ impl DeepSeek {
             if has_json_schema {
                 tracing::debug!(
                     target: "model_provider::deepseek",
-                    "chat 适配器不支持 text.format=json_schema，忽略"
+                    "chat adapter does not support text.format=json_schema; ignoring"
                 );
             }
             if has_developer {
                 tracing::debug!(
                     target: "model_provider::deepseek",
-                    "chat 适配器不支持 Developer role，降级为 system"
+                    "chat adapter does not support Developer role; downgraded to system"
                 );
             }
         }

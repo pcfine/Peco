@@ -97,7 +97,7 @@ impl SessionPersister for SqliteSessionPersister {
                         tracing::warn!(
                             session_id = %session_id,
                             error = %e,
-                            "会话快照反序列化失败（可能是旧格式/损坏数据），无法恢复历史会话"
+                            "failed to deserialize session snapshot (old format or corrupt); cannot restore history"
                         );
                         PersistError::Serialization(e)
                     })?;

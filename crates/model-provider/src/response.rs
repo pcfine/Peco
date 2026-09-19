@@ -468,7 +468,7 @@ impl BlockAssembler {
                 open_indices = ?self.open.keys().collect::<Vec<_>>(),
                 open_types = ?self.open.values().collect::<Vec<_>>(),
                 blocks = self.blocks.len(),
-                "流结束时仍有未闭合的内容块，状态降级为 Incomplete"
+                "stream ended with unclosed content blocks; status downgraded to Incomplete"
             );
             status = ResponseStatus::Incomplete;
         }

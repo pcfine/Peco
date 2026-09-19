@@ -201,14 +201,14 @@ fn input_items_to_responses_values(items: &[Arc<InputItem>]) -> Vec<Value> {
         debug!(
             target: "model_provider::openai",
             dropped_reasoning_items = dropped_reasoning,
-            "历史中的思考内容不回传，已丢弃"
+            "historical reasoning not sent back; dropped"
         );
     }
     if dropped_role_images > 0 {
         warn!(
             target: "model_provider::openai",
             images = dropped_role_images,
-            "system/assistant 消息中的图片部件不参与传输，已丢弃（保留文本）"
+            "image parts in system/assistant messages not transmitted; dropped (text kept)"
         );
     }
 
@@ -345,7 +345,7 @@ fn build_responses_request_body(
         // 无工具时 tool_choice 无意义，发送可能被网关拒绝，省略。
         debug!(
             target: "model_provider::openai",
-            "请求无 tools，忽略 tool_choice"
+            "no tools in request; ignoring tool_choice"
         );
     }
 
@@ -364,7 +364,7 @@ fn build_responses_request_body(
             target: "model_provider::openai",
             max_output_tokens = budget,
             suggested_min = OPENAI_REASONING_MIN_BUDGET,
-            "推理生效时 max_output_tokens 低于建议下限，可见输出可能被推理挤占；保留原值不改写"
+            "max_output_tokens below recommended floor with reasoning on; value kept as-is"
         );
     }
     if let Some(t) = request.temperature {
@@ -661,6 +661,7 @@ fn process_responses_sse_stream(
         let mut started: HashSet<usize> = HashSet::new();
         let mut usage: Option<Usage> = None;
         let mut finish_reason: Option<FinishReason> = None;
+        let mut incomplete_reason: Option<String> = None;
         let mut terminated_with_error = false;
 
         // ── 诊断计数器 ──
@@ -698,7 +699,7 @@ fn process_responses_sse_stream(
                         reasoning_bytes = reasoning_bytes_total,
                         tool_call_count,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "responses SSE 流传输错误，中止"
+                        "responses SSE stream transport error; aborting"
                     );
                     yield Err(provider_err);
                     break;
@@ -723,7 +724,7 @@ fn process_responses_sse_stream(
                         error = %e,
                         event_count,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "解析 responses SSE 事件失败，中止"
+                        "failed to parse responses SSE event; aborting"
                     );
                     yield Err(ProviderError::Stream(format!("解析 responses SSE 事件失败: {e}")));
                     break;
@@ -905,20 +906,25 @@ fn process_responses_sse_stream(
                         finish_reason = Some(FinishReason::Stop);
                     } else {
                         // 从 incomplete_details.reason 区分截断 / 内容过滤等原因。
+                        // 该字段可能整体缺失（上游未提供），此时保持 `None` 并在下方
+                        // 显式记为「未提供」—— 静默降级会让「未知原因」看起来像「截断」。
                         let reason = event
                             .get("response")
                             .and_then(|r| r.get("incomplete_details"))
                             .and_then(|d| d.get("reason"))
                             .and_then(Value::as_str);
-                        if let Some(r) = reason
-                            && r != "max_output_tokens"
-                        {
-                            warn!(
-                                target: "model_provider::openai",
-                                reason = r,
-                                "responses 流以非 max_output_tokens 原因不完整结束"
-                            );
-                        }
+                        let (input_tokens, output_tokens) =
+                            usage.as_ref().map_or((0, 0), |u| (u.input_tokens, u.output_tokens));
+                        warn!(
+                            target: "model_provider::openai",
+                            request_id = %request_id,
+                            model = %model,
+                            reason = reason.unwrap_or("<missing>"),
+                            input_tokens,
+                            output_tokens,
+                            "responses stream ended incomplete (truncated)"
+                        );
+                        incomplete_reason = Some(reason.unwrap_or("<missing>").to_string());
                         finish_reason = Some(match reason {
                             Some("content_filter") => FinishReason::Error,
                             _ => FinishReason::MaxTokens,
@@ -947,7 +953,7 @@ fn process_responses_sse_stream(
                         reasoning_bytes = reasoning_bytes_total,
                         tool_call_count,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "responses API 返回 failed"
+                        "responses API returned failed"
                     );
                     terminated_with_error = true;
                     yield Err(ProviderError::Api { status: 500, body });
@@ -958,7 +964,7 @@ fn process_responses_sse_stream(
                     let body = event
                         .get("message")
                         .and_then(Value::as_str)
-                        .unwrap_or("responses API 返回 error 事件（无错误详情）")
+                        .unwrap_or("responses API returned error event (no details)")
                         .to_string();
                     warn!(
                         target: "model_provider::openai",
@@ -970,7 +976,7 @@ fn process_responses_sse_stream(
                         reasoning_bytes = reasoning_bytes_total,
                         tool_call_count,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "responses API 返回 error 事件"
+                        "responses API returned error event"
                     );
                     terminated_with_error = true;
                     yield Err(ProviderError::Api { status: 500, body });
@@ -1060,6 +1066,7 @@ fn process_responses_sse_stream(
             reasoning_bytes = reasoning_bytes_total,
             tool_call_count,
             finish_reason = %reason.as_str(),
+            incomplete_reason = incomplete_reason.as_deref().unwrap_or("-"),
             input_tokens = usage.input_tokens,
             output_tokens = usage.output_tokens,
             total_tokens = usage.total_tokens,
@@ -1070,7 +1077,7 @@ fn process_responses_sse_stream(
             ttfc_ms = first_chunk_at
                 .map(|t| t.duration_since(started_at).as_millis() as u64)
                 .unwrap_or(0),
-            "responses SSE 流式处理结束"
+            "responses SSE stream finished"
         );
         // 去重后的类型集合可能较长，只在 trace 输出。
         if !unknown_event_types.is_empty() || !unknown_item_types.is_empty() {
@@ -1079,7 +1086,7 @@ fn process_responses_sse_stream(
                 request_id = %request_id,
                 unknown_event_types = ?unknown_event_types,
                 unknown_item_types = ?unknown_item_types,
-                "responses 流中出现未处理的事件/item 类型"
+                "unhandled event/item types in responses stream"
             );
         }
 
@@ -1142,14 +1149,14 @@ impl ModelProvider for OpenAiResponsesAdapter {
                     .unwrap_or(0),
                 body_bytes = body.len(),
                 stream = false,
-                "发送 responses 生成请求"
+                "sending responses generate request"
             );
             // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
             trace!(
                 target: "model_provider::openai",
                 request_id = %request_id,
                 body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-                "responses 请求体全文"
+                "responses request body (full)"
             );
 
             let response = self
@@ -1176,7 +1183,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                     status = status.as_u16(),
                     latency_ms,
                     body = %body_str,
-                    "OpenAI responses API 返回错误状态"
+                    "openai responses API returned error status"
                 );
                 return Err(ProviderError::Api {
                     status: status.as_u16(),
@@ -1188,7 +1195,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 target: "model_provider::openai",
                 request_id = %request_id,
                 body = %String::from_utf8_lossy(&response_body),
-                "responses 响应体全文"
+                "responses response body (full)"
             );
 
             let api_response: ResponsesResponse = serde_json::from_slice(&response_body)?;
@@ -1224,7 +1231,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 total_tokens = usage.total_tokens,
-                "responses 生成完成"
+                "responses generate done"
             );
 
             Ok(GenerateResult {
@@ -1268,13 +1275,13 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 .unwrap_or(0),
             body_bytes = body.len(),
             stream = true,
-            "发送 responses 流式生成请求"
+            "sending responses streaming generate request"
         );
         trace!(
             target: "model_provider::openai",
             request_id = %request_id,
             body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-            "responses 流式请求体全文"
+            "responses streaming request body (full)"
         );
 
         let span = tracing::info_span!(

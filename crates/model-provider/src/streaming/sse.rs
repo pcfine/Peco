@@ -521,7 +521,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                         error = %provider_err,
                                         attempt = 1,
                                         delay_ms = delay.as_millis() as u64,
-                                        "SSE 连接失败，安排重试"
+                                        "SSE connect failed; scheduling retry"
                                     );
                                     let retry_delay = futures_timer::Delay::new(delay);
                                     this.state.set(SseState::WaitingToRetry {
@@ -534,7 +534,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                         target: "model_provider::streaming",
                                         url = %this.url,
                                         error = %provider_err,
-                                        "SSE 连接失败，重试策略放弃，关闭事件源"
+                                        "SSE connect failed; retry policy gave up, closing event source"
                                     );
                                     this.state.set(SseState::Closed);
                                 }
@@ -569,7 +569,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                         error = %provider_err,
                                         attempt = last_retry.0 + 1,
                                         delay_ms = delay.as_millis() as u64,
-                                        "SSE 重连失败，继续重试"
+                                        "SSE reconnect failed; retrying"
                                     );
                                     let retry_delay = futures_timer::Delay::new(delay);
                                     this.state.set(SseState::WaitingToRetry {
@@ -583,7 +583,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                         url = %this.url,
                                         error = %provider_err,
                                         attempts = last_retry.0,
-                                        "SSE 重连失败，重试策略放弃，关闭事件源"
+                                        "SSE reconnect failed; retry policy gave up, closing event source"
                                     );
                                     this.state.set(SseState::Closed);
                                 }
@@ -608,7 +608,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                 target: "model_provider::streaming",
                                 url = %this.url,
                                 error = %err,
-                                "SSE 响应校验失败（非 200 或 content-type 不符），不重试"
+                                "SSE response validation failed (non-200 or bad content-type); not retrying"
                             );
                             this.state.set(SseState::Closed);
                             return Poll::Ready(Some(Err(err)));
@@ -640,7 +640,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                         url = %this.url,
                                         error = %provider_err,
                                         delay_ms = delay.as_millis() as u64,
-                                        "已建立的 SSE 流传输中断，安排重连"
+                                        "established SSE stream interrupted; scheduling reconnect"
                                     );
                                     let retry_delay = futures_timer::Delay::new(delay);
                                     this.state.set(SseState::WaitingToRetry {
@@ -654,7 +654,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                         url = %this.url,
                                         error = %provider_err,
                                         skipped_parse_errors = *this.skipped_parse_errors,
-                                        "SSE 流传输中断，重试策略放弃，关闭事件源"
+                                        "SSE stream interrupted; retry policy gave up, closing event source"
                                     );
                                     this.state.set(SseState::Closed);
                                 }
@@ -675,7 +675,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                     target: "model_provider::streaming",
                                     url = %this.url,
                                     skipped_parse_errors = *this.skipped_parse_errors,
-                                    "SSE 流结束，但期间跳过了畸形事件"
+                                    "SSE stream ended after skipping malformed events"
                                 );
                             }
                             this.state.set(SseState::Closed);
@@ -698,7 +698,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                 url = %this.url,
                                 attempt = current_retry.0,
                                 last_event_id = this.last_event_id.as_deref().unwrap_or("-"),
-                                "开始 SSE 重连"
+                                "starting SSE reconnect"
                             );
                             let response_future = create_response_future(
                                 this.client,

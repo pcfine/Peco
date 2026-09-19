@@ -369,12 +369,8 @@ impl HelixDbBackend {
 
         let mut steps = Vec::new();
         for (edge_step, node_step, neighbor_key) in dirs {
-            let query = queries::adjacent_labeled_nodes(
-                &self.schema,
-                start_node,
-                edge_step,
-                node_step,
-            );
+            let query =
+                queries::adjacent_labeled_nodes(&self.schema, start_node, edge_step, node_step);
             let response = self.client.execute_read(query).await?;
 
             // 邻接点身份表：内部 `$id` → (稳定 id, name)。`nodes` 与 `edges` 覆盖同一批
@@ -1514,7 +1510,10 @@ mod tests {
         assert_eq!(steps.len(), 2, "起点不入结果 + 跨层重复只留一次");
         assert_eq!(by_id["entity:Entity:chen"].node.distance, 1);
         assert_eq!(by_id["entity:Entity:beauty"].node.distance, 2);
-        assert_eq!(by_id["entity:Entity:beauty"].node.properties["name"], "美女");
+        assert_eq!(
+            by_id["entity:Entity:beauty"].node.properties["name"],
+            "美女"
+        );
         assert!(!by_id.contains_key("entity:Entity:start"));
     }
 

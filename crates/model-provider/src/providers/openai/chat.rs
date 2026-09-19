@@ -280,7 +280,7 @@ fn build_request_body(
         warn!(
             target: "model_provider::openai",
             images = tool_images_dropped,
-            "chat 协议的 tool 消息不承载图片，工具输出中的图片部件已剥离（保留文本）"
+            "chat tool messages cannot carry images; image parts in tool output stripped (text kept)"
         );
     }
     let mut messages: Vec<WireMessage> = Vec::new();
@@ -314,7 +314,7 @@ fn build_request_body(
             target: "model_provider::openai",
             max_completion_tokens = budget,
             suggested_min = OPENAI_REASONING_MIN_BUDGET,
-            "推理生效时 max_completion_tokens 低于建议下限，可见输出可能被推理挤占；保留原值不改写"
+            "max_completion_tokens below recommended floor with reasoning on; value kept as-is"
         );
     }
 
@@ -523,14 +523,14 @@ impl ModelProvider for OpenAI {
                     .unwrap_or(0),
                 body_bytes = body.len(),
                 stream = false,
-                "发送 chat 生成请求"
+                "sending chat generate request"
             );
             // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
             trace!(
                 target: "model_provider::openai",
                 request_id = %request_id,
                 body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-                "chat 请求体全文"
+                "chat request body (full)"
             );
 
             let response = self
@@ -557,7 +557,7 @@ impl ModelProvider for OpenAI {
                     status = status.as_u16(),
                     latency_ms,
                     body = %body_str,
-                    "OpenAI API 返回错误状态"
+                    "openai API returned error status"
                 );
                 return Err(ProviderError::Api {
                     status: status.as_u16(),
@@ -569,7 +569,7 @@ impl ModelProvider for OpenAI {
                 target: "model_provider::openai",
                 request_id = %request_id,
                 body = %String::from_utf8_lossy(&response_body),
-                "chat 响应体全文"
+                "chat response body (full)"
             );
 
             let api_response: OpenAiResponse = serde_json::from_slice(&response_body)?;
@@ -589,7 +589,7 @@ impl ModelProvider for OpenAI {
                 input_tokens = result.usage.input_tokens,
                 output_tokens = result.usage.output_tokens,
                 total_tokens = result.usage.total_tokens,
-                "chat 生成完成"
+                "chat generate done"
             );
             Ok(result)
         }
@@ -629,14 +629,14 @@ impl ModelProvider for OpenAI {
                 .unwrap_or(0),
             body_bytes = body.len(),
             stream = true,
-            "发送 chat 流式生成请求"
+            "sending chat streaming generate request"
         );
         // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
         trace!(
             target: "model_provider::openai",
             request_id = %request_id,
             body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-            "chat 流式请求体全文"
+            "chat streaming request body (full)"
         );
 
         let span = tracing::info_span!(
@@ -689,7 +689,7 @@ impl OpenAI {
         } else if has_developer {
             debug!(
                 target: "model_provider::openai",
-                "chat 适配器不支持 Developer role，降级为 system"
+                "chat adapter does not support Developer role; downgraded to system"
             );
         }
         Ok(())

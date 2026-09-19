@@ -393,7 +393,7 @@ pub async fn stream_chat(
             tracing::warn!(
                 conversation_id = %conv_id,
                 error = %e,
-                "会话快照加载失败，创建新会话（历史会话丢失）"
+                "failed to load session snapshot; starting a new session (history lost)"
             );
             (
                 Box::new(Session::new(conv_id.clone(), conv.title.clone())),

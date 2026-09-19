@@ -32,10 +32,10 @@
 use std::collections::HashSet;
 
 use knowledge_base::compute_entity_id;
+use knowledge_base::manager::KnowledgeBaseManager;
 use knowledge_base::manager::config::{
     BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
 };
-use knowledge_base::manager::KnowledgeBaseManager;
 use knowledge_base::traits::EdgeType;
 use knowledge_base::types::{Fact, StorageMode};
 
@@ -91,10 +91,7 @@ async fn e2e_add_facts_query_entity_facts_and_relation_path() {
         Fact::new("小C", "喜欢", "美女", 1.0),
         Fact::new("小C", "作者", "春天的爱情故事", 1.0),
     ];
-    let stored = kb
-        .add_facts(&facts, false)
-        .await
-        .expect("add_facts 失败");
+    let stored = kb.add_facts(&facts, false).await.expect("add_facts 失败");
     assert_eq!(stored.len(), 5, "5 条事实应全部写入");
 
     // ── query_entity_facts ──

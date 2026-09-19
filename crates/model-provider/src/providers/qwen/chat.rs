@@ -266,7 +266,7 @@ fn build_request_body(
         warn!(
             target: "model_provider::qwen",
             images = tool_images_dropped,
-            "chat 协议的 tool 消息不承载图片，工具输出中的图片部件已剥离（保留文本）"
+            "chat tool messages cannot carry images; image parts in tool output stripped (text kept)"
         );
     }
     let mut messages: Vec<WireMessage> = Vec::new();
@@ -285,7 +285,7 @@ fn build_request_body(
             debug!(
                 target: "model_provider::qwen",
                 tools = request.tools.len(),
-                "Qwen 流式请求不携带 tools（tools 与 stream=True 不可并用），忽略"
+                "qwen streaming requests cannot carry tools (tools and stream=True conflict); ignoring"
             );
         }
         Vec::new()
@@ -312,7 +312,7 @@ fn build_request_body(
             target: "model_provider::qwen",
             max_tokens,
             limit = QWEN_THINKING_MAX_TOKENS,
-            "思考模式下 max_tokens 超过上限 32768，可能被网关拒绝；保留原值不改写"
+            "max_tokens above 32768 cap in thinking mode, gateway may reject; value kept as-is"
         );
     }
 
@@ -349,7 +349,7 @@ fn reasoning_config_to_enable_thinking(reasoning: Option<&ReasoningConfig>) -> O
     if config.effort.is_some() {
         debug!(
             target: "model_provider::qwen",
-            "Qwen 不支持 reasoning effort 力度配置，忽略"
+            "qwen does not support reasoning effort; ignoring"
         );
     }
     Some(config.enabled)
@@ -475,14 +475,14 @@ impl ModelProvider for Qwen {
                     .unwrap_or(0),
                 body_bytes = body.len(),
                 stream = false,
-                "发送 chat 生成请求"
+                "sending chat generate request"
             );
             // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
             trace!(
                 target: "model_provider::qwen",
                 request_id = %request_id,
                 body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-                "chat 请求体全文"
+                "chat request body (full)"
             );
 
             let response = self
@@ -509,7 +509,7 @@ impl ModelProvider for Qwen {
                     status = status.as_u16(),
                     latency_ms,
                     body = %body_str,
-                    "Qwen API 返回错误状态"
+                    "qwen API returned error status"
                 );
                 return Err(ProviderError::Api {
                     status: status.as_u16(),
@@ -521,7 +521,7 @@ impl ModelProvider for Qwen {
                 target: "model_provider::qwen",
                 request_id = %request_id,
                 body = %String::from_utf8_lossy(&response_body),
-                "chat 响应体全文"
+                "chat response body (full)"
             );
 
             let api_response: QwenResponse = serde_json::from_slice(&response_body)?;
@@ -541,7 +541,7 @@ impl ModelProvider for Qwen {
                 input_tokens = result.usage.input_tokens,
                 output_tokens = result.usage.output_tokens,
                 total_tokens = result.usage.total_tokens,
-                "chat 生成完成"
+                "chat generate done"
             );
             Ok(result)
         }
@@ -581,14 +581,14 @@ impl ModelProvider for Qwen {
                 .unwrap_or(0),
             body_bytes = body.len(),
             stream = true,
-            "发送 chat 流式生成请求"
+            "sending chat streaming generate request"
         );
         // 含用户对话原文，仅 trace 级别输出。`body` 随后被 move 进请求，故在此之前取。
         trace!(
             target: "model_provider::qwen",
             request_id = %request_id,
             body = %logging::truncate_data_uris(&String::from_utf8_lossy(&body)),
-            "chat 流式请求体全文"
+            "chat streaming request body (full)"
         );
 
         let span = tracing::info_span!(
@@ -651,13 +651,13 @@ impl Qwen {
             if has_json_schema {
                 debug!(
                     target: "model_provider::qwen",
-                    "chat 适配器不支持 text.format=json_schema，忽略"
+                    "chat adapter does not support text.format=json_schema; ignoring"
                 );
             }
             if has_developer {
                 debug!(
                     target: "model_provider::qwen",
-                    "chat 适配器不支持 Developer role，降级为 system"
+                    "chat adapter does not support Developer role; downgraded to system"
                 );
             }
         }

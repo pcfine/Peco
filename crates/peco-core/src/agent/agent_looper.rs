@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use model_provider::{
-    BlockAssembler, Content, ContentBlock, GenerateResult, GenerateStream, InputItem,
+    BlockAssembler, Content, ContentBlock, FinishReason, GenerateResult, GenerateStream, InputItem,
     ResponseStatus, Role, StreamChunk, ToolCall, Usage,
 };
 
@@ -227,6 +227,25 @@ fn compose_effective_prompt(stable_prefix: &str, dynamic_context: Option<&str>) 
         Some(dyn_ctx) => format!("{stable_prefix}\n\n[Dynamic Context]\n{dyn_ctx}"),
         None => stable_prefix.to_string(),
     }
+}
+
+/// 汇总已收敛块的类型（保持首现顺序、去重），供失败日志单行呈现。
+///
+/// 只打类型不打内容：块的正文可能包含用户数据，日志层不应落原文。
+fn block_kinds_of(blocks: &[ContentBlock]) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    for block in blocks {
+        let kind = match block {
+            ContentBlock::Text { .. } => "text",
+            ContentBlock::Reasoning { .. } => "reasoning",
+            ContentBlock::ToolCall { .. } => "tool_call",
+            _ => "other",
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
 }
 
 // ============================================================================
@@ -733,6 +752,10 @@ pub struct AgentLooper {
     active_stream: Option<GenerateStream>,
     /// streaming 模式：中立块组装器（跨 chunk 持久）
     stream_assembler: BlockAssembler,
+    /// streaming 模式：本次请求收到的 [`StreamChunk::Finish`] 原因。
+    /// `BlockAssembler` 只保留收敛后的 status，归因（是截断还是上游异常）要靠原始原因，
+    /// 故单独留存供失败日志使用；`None` = 流结束但从未收到 `Finish`。
+    last_finish_reason: Option<FinishReason>,
     /// 活跃的 tool 执行任务集（增量执行模式：Spawn → Poll → 完成）
     active_tool_tasks: Option<tokio::task::JoinSet<(usize, ToolCallResult)>>,
     /// 最近一次请求的估算上下文 token（响应到达后与实际 usage 对照）。
@@ -788,6 +811,7 @@ impl AgentLooper {
             persister,
             active_stream: None,
             stream_assembler: BlockAssembler::new(),
+            last_finish_reason: None,
             active_tool_tasks: None,
             last_request_estimated_tokens: None,
         }
@@ -1444,12 +1468,24 @@ impl AgentLooper {
 
             ReActState::Failed => {
                 // Failed = 异常终止，若未设置原因则使用 Other 兜底
+                let reason = self
+                    .failure_reason
+                    .take()
+                    .unwrap_or(TurnFailureReason::Other("failed".into()));
+                let partial_text = std::mem::take(&mut self.react_ctx.assistant_text);
+
+                // 回滚是**破坏性**的：整个 turn 的 staging（含已完成的工具调用与结果）
+                // 全部丢弃且不落盘。日志必须给出丢弃规模，否则「这轮白跑了」无从判断。
+                warn!(
+                    turn,
+                    reason = ?reason,
+                    discarded_staging_messages = self.session.staging_messages().len(),
+                    partial_text_len = partial_text.len(),
+                    "Turn failed; rolling back and discarding all staging content of this turn"
+                );
                 let outcome = TurnOutcome::Failed {
-                    reason: self
-                        .failure_reason
-                        .take()
-                        .unwrap_or(TurnFailureReason::Other("failed".into())),
-                    partial_text: std::mem::take(&mut self.react_ctx.assistant_text),
+                    reason,
+                    partial_text,
                 };
 
                 // 回滚当前 turn
@@ -1637,6 +1673,7 @@ impl AgentLooper {
                 Ok(stream) => {
                     self.active_stream = Some(stream);
                     self.stream_assembler = BlockAssembler::new();
+                    self.last_finish_reason = None;
                     self.react_state = ReActState::Streaming;
                 }
                 Err(e) => {
@@ -1847,7 +1884,8 @@ impl AgentLooper {
                         self.session.add_usage(usage);
                     }
 
-                    StreamChunk::Finish { .. } => {
+                    StreamChunk::Finish { reason } => {
+                        self.last_finish_reason = Some(reason);
                         self.finish_stream().await;
                     }
                 }
@@ -1862,6 +1900,12 @@ impl AgentLooper {
 
             None => {
                 // Stream ended without Finish event — 收敛 assembler，按成功处理。
+                // 这里没有 Finish 可依，收敛结果完全取决于块是否闭合，属于异常路径，
+                // 必须留下痕迹：否则「流被上游掐断」与「正常结束」在日志里长得一样。
+                debug!(
+                    turn,
+                    "Model stream ended without a Finish chunk; converging on assembler state"
+                );
                 self.finish_stream().await;
             }
         }
@@ -1874,7 +1918,8 @@ impl AgentLooper {
     async fn finish_stream(&mut self) {
         self.active_stream = None;
         let assembler = std::mem::take(&mut self.stream_assembler);
-        let (blocks, _usage, status, error) = assembler.finish();
+        let (blocks, usage, status, error) = assembler.finish();
+        let finish_reason = self.last_finish_reason.take();
 
         // 回填 InputItem 到 session staging，并更新 assistant_text / assistant_reasoning
         // （失败分支也先回填，使 Failed 结果携带 partial_text）。
@@ -1888,12 +1933,20 @@ impl AgentLooper {
                 }
                 _ => "model response failed".to_string(),
             });
+            // 归因字段必须齐全：status 只说「非正常结束」，finish_reason 才区分
+            // 截断（max_tokens）与上游异常（aborted/error）；output_tokens 用来判断
+            // 截断是否真的顶到了输出上限；block_kinds 说明收到的到底是哪些块。
             error!(
                 turn = self.session.turn_index(),
                 ?status,
+                finish_reason = finish_reason.map_or("-", |r| r.as_str()),
                 message = %msg,
                 blocks = blocks.len(),
+                block_kinds = ?block_kinds_of(&blocks),
                 text_len = self.react_ctx.assistant_text.len(),
+                reasoning_len = self.react_ctx.assistant_reasoning.len(),
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
                 "Model stream ended with non-completed status"
             );
             self.failure_reason = Some(TurnFailureReason::Other(msg));

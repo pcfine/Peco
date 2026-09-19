@@ -128,7 +128,7 @@ pub(crate) fn provider_error_from_sse_data(data: &str) -> Option<ProviderError> 
         tracing::warn!(
             target: "model_provider::streaming",
             %message,
-            "提供商返回了流式错误事件"
+            "provider returned a streaming error event"
         );
     }
     Some(ProviderError::Api {
@@ -203,7 +203,7 @@ pub(crate) fn into_tool_call(pending: &PendingToolCall) -> Option<ToolCall> {
         tracing::debug!(
             target: "model_provider::streaming",
             tool_name = %pending.name,
-            "丢弃不完整的工具调用：缺少 id"
+            "dropping incomplete tool call: missing id"
         );
         return None;
     }
@@ -211,7 +211,7 @@ pub(crate) fn into_tool_call(pending: &PendingToolCall) -> Option<ToolCall> {
         tracing::debug!(
             target: "model_provider::streaming",
             tool_id = %pending.id,
-            "丢弃不完整的工具调用：缺少 name"
+            "dropping incomplete tool call: missing name"
         );
         return None;
     }
@@ -334,7 +334,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                         reasoning_bytes = reasoning_bytes_total,
                         tool_call_count,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "SSE 流传输错误，中止"
+                        "SSE stream transport error; aborting"
                     );
                     yield Err(provider_err);
                     break;
@@ -359,7 +359,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                     reasoning_bytes = reasoning_bytes_total,
                     tool_call_count,
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "SSE 流内错误载荷，中止"
+                    "error payload inside SSE stream; aborting"
                 );
                 yield Err(error);
                 break;
@@ -381,7 +381,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                         error = %err,
                         event_count,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
-                        "SSE chunk 规范化失败，中止"
+                        "failed to normalize SSE chunk; aborting"
                     );
                     yield Err(err);
                     break;
@@ -453,7 +453,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                         old_name = %existing.name,
                         new_id = tc.id.as_deref().unwrap_or("-"),
                         new_name = tc.name.as_deref().unwrap_or("-"),
-                        "淘汰同索引上的旧工具调用"
+                        "evicting previous tool call at the same index"
                     );
                     if let Some(block) = pending_to_content_block(existing) {
                         yield Ok(StreamChunk::BlockEnd {
@@ -521,7 +521,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                             index = tc.index,
                             old_id = %entry.id,
                             new_id = %id,
-                            "同索引工具调用 id 变更，清空已累积参数"
+                            "tool call id changed at same index; accumulated arguments reset"
                         );
                         if let Some(block) = pending_to_content_block(entry) {
                             yield Ok(StreamChunk::BlockEnd {
@@ -544,7 +544,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                             index = tc.index,
                             old_name = %entry.name,
                             new_name = %name,
-                            "同索引工具调用 name 变更，清空已累积参数"
+                            "tool call name changed at same index; accumulated arguments reset"
                         );
                         if let Some(block) = pending_to_content_block(entry) {
                             yield Ok(StreamChunk::BlockEnd {
@@ -624,7 +624,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
                     request_id = %request_id,
                     indices = ?dropped,
                     count = dropped.len(),
-                    "MaxTokens 截断，丢弃未闭合的工具调用"
+                    "MaxTokens truncation; dropping unclosed tool calls"
                 );
             }
         } else {
@@ -684,7 +684,7 @@ pub(crate) fn process_normalized_sse_stream_chunks<P: StreamingProfile + 'static
             ttfc_ms = first_chunk_at
                 .map(|t| t.duration_since(started_at).as_millis() as u64)
                 .unwrap_or(0),
-            "SSE 流式处理结束（中立 chunk）"
+            "SSE stream finished (neutral chunks)"
         );
 
         yield Ok(StreamChunk::Usage { usage });

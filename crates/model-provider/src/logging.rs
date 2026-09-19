@@ -328,7 +328,7 @@ mod tests {
 
         // ── 请求摘要（debug）：结构计数必须逐项落地 ──
         assert!(
-            logs.contains("发送 chat 生成请求"),
+            logs.contains("sending chat generate request"),
             "缺少请求摘要：\n{logs}"
         );
         assert!(
@@ -352,7 +352,7 @@ mod tests {
 
         // ── 全量请求体（trace）：排 400 时的核心依据 ──
         assert!(
-            logs.contains("chat 请求体全文"),
+            logs.contains("chat request body (full)"),
             "缺少 trace 级请求体：\n{logs}"
         );
         assert!(
@@ -362,7 +362,7 @@ mod tests {
 
         // ── 错误路径（warn）：status / latency / 厂商 request-id ──
         assert!(
-            logs.contains("DeepSeek API 返回错误状态"),
+            logs.contains("deepseek API returned error status"),
             "缺少非 2xx warn：\n{logs}"
         );
         assert!(logs.contains("status=401"), "warn 缺少 status：\n{logs}");
@@ -409,7 +409,7 @@ mod tests {
             "缺少 model：\n{logs}"
         );
         assert!(
-            !logs.contains("chat 请求体全文"),
+            !logs.contains("chat request body (full)"),
             "debug 级别泄漏了全量请求体：\n{logs}"
         );
         assert!(!logs.contains(SECRET_API_KEY), "API key 泄漏：\n{logs}");
