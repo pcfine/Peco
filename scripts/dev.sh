@@ -66,17 +66,12 @@ if $BACKEND; then
     log_info "Docs : http://localhost:9227/docs"
 
     # 启用 debug 日志：tracing_subscriber 通过 RUST_LOG 读取过滤级别。
-    # 默认打开本项目 crate 的 debug 日志（含 AgentLooper 状态变化），依赖保持 info。
-    export RUST_LOG="${RUST_LOG:-peco_core=debug,peco_server=debug,tower_http=info}"
+    export RUST_LOG="${RUST_LOG:-peco=debug,model_provider=debug,knowledge_base=debug,tower_http=info}"
     log_info "RUST_LOG=$RUST_LOG"
 
-    # 排查 LLM 调用（model-provider）时追加 model_provider 的日志：
-    #   RUST_LOG="...,model_provider=debug" bash scripts/dev.sh
-    #     → 打印每次请求/响应摘要（input_items 计数、tokens、latency、SSE 流终止统计等）。
+    # 需要看完整请求体/响应体原文时（含用户对话内容，谨慎）：
     #   RUST_LOG="...,model_provider=trace" bash scripts/dev.sh
-    #     → 在 debug 基础上再打印完整请求体/响应体原文（含用户对话内容，谨慎使用）。
-    # 注意：model_provider 不以 `peco` 开头，不会命中上面的默认 directive；不显式列出
-    # 时它会落到 EnvFilter 的 ERROR 默认级别，于是该层 warn/debug 全部静默。
+    # 需要安静下来时直接覆盖 RUST_LOG=peco=info,tower_http=warn。
 
     cargo run -p peco-server &
     BACKEND_PID=$!
