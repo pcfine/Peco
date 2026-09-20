@@ -32,7 +32,7 @@ use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
-use crate::session::{AnnotatedMessage, MessageSource, Session, SessionState};
+use crate::session::{AnnotatedMessage, MessageSource, Session, SessionSnapshot, SessionState};
 use crate::utils::intercom::{Listener, Speaker, make_async_intercom_pair};
 use tracing::{debug, error, info, warn};
 
@@ -153,7 +153,11 @@ pub struct LooperConfig {
     pub dynamic_context: Option<Arc<dyn DynamicContext>>,
     /// 上下文构建策略。
     pub context_strategy: super::context::ContextStrategy,
-    /// 失败时是否持久化（Phase 3 使用）。
+    /// 失败时是否把冻结的中断轮落盘。
+    ///
+    /// **冻结无条件发生（内存），落盘由此开关门控。** 这样 CLI 与 server 的
+    /// 事件流行为一致 —— `TurnComplete` 负载不因配置而异。
+    /// CLI 走 `NullSessionPersister`，置 `false` 即无副作用；server 置 `true`。
     pub persist_on_failure: bool,
     /// 可选的消息过滤器：在上下文构建完成、system prompt 注入后，
     /// 对最终发送给 LLM 的消息列表进行转换。
@@ -451,10 +455,11 @@ pub enum UserMsg {
 /// h.wait().await;               // 等待完成并获取结果
 /// ```
 ///
-/// Looper 后台任务 handle 的类型别名。
-/// 包装 `JoinHandle`，当所有引用被 drop 时自动 abort 任务。
+/// Looper 后台任务 handle。
 ///
-/// 内部使用 `Arc` 共享所有权。仅最后一个 clone 被 drop 时调用 `abort()`。
+/// 内部使用 `Arc` 共享所有权。最后一个 clone 被 drop 时**只设置 cancel_flag**，
+/// 让 looper 在下一个循环迭代里自行收尾退出 —— 不 abort。
+/// abort 会跳过失败收尾（冻结 + 落盘），把中断轮丢掉。
 /// `try_lock` 保证与 `wait()` 方法无竞态。
 struct OwnedTask {
     inner: SharedModelTask,
@@ -879,6 +884,40 @@ impl AgentLooper {
         let _ = self.event_speaker.try_send(event);
     }
 
+    /// 贪婪排空 `JoinSet` 中已完成 task 的结果，返回捞回的条数。非阻塞。
+    ///
+    /// 关联函数（非方法）— 只碰 `JoinSet` 与 `pending_tool_calls`，可完全绕开
+    /// looper 单测。`try_join_next` 返回 `None` 表示「当前没有已完成的 task」，
+    /// **不等于** JoinSet 已空。
+    ///
+    /// `Some(Err(_))` 只 warn 不 break：一个 task panic 不应吞掉兄弟 task 的成果。
+    ///
+    /// 与 `join_next().await` 排空的区别：`abort()` 是**请求**，task 在下一个
+    /// await 点才停；若工具内有同步阻塞（`std::process::Command` 而非
+    /// `tokio::process`），await 排空会等它跑完 —— 正是用户最不想要的。
+    /// `abort_all()` + drop 是正确取舍：长同步工具可能仍跑完，这是接受的行为。
+    fn drain_finished_join_results(
+        joinset: &mut tokio::task::JoinSet<(usize, ToolCallResult)>,
+        pending: &mut [PendingToolCall],
+    ) -> usize {
+        let mut drained = 0;
+        loop {
+            match joinset.try_join_next() {
+                Some(Ok((idx, tr))) => {
+                    pending[idx].result = Some(tr);
+                    drained += 1;
+                }
+                // 已 abort / panic 的 task：warn 后继续。
+                // 绝不能 break —— 会漏掉队列里后面那些已经跑完的兄弟 task。
+                Some(Err(e)) => {
+                    warn!(error = %e, "Tool task ended abnormally during drain");
+                }
+                None => break,
+            }
+        }
+        drained
+    }
+
     /// 异步发送关键事件，保证送达。
     /// 适用于生命周期终结事件（TurnComplete、Shutdown 等），
     /// 确保消费者不会遗漏。
@@ -1126,10 +1165,39 @@ impl AgentLooper {
         let run_start = Instant::now();
 
         loop {
+            // ── 消费 react_step 挂起的失败收尾 ────────────────────────────
+            // 必须在取消/超时检查**之前** —— 否则 failure_reason 已被 take，
+            // 取消分支会用 Cancelled 覆盖真实原因（如 HookAbort）。
+            if matches!(self.react_state, ReActState::Failed) {
+                // 兜底：非取消类失败若未设原因则记 Other
+                let reason = self
+                    .failure_reason
+                    .take()
+                    .unwrap_or(TurnFailureReason::Other("failed".into()));
+                let cancelled = self.is_cancelled();
+                // drain_pending 由 !is_cancelled() 推导：用户按了停就不续接排队输入
+                if self.finalize_failure(reason, !cancelled).await {
+                    // 续接了 pending，保留「失败后自动续接」行为
+                    continue;
+                }
+                if cancelled {
+                    // 取消标志常驻，回到循环顶部会立刻再次命中取消检查 → 自旋。
+                    // 收尾已完成，此处直接退出。
+                    break;
+                }
+                // 非取消失败：收尾已把 session 置回 `Idle`、内层状态机带回 `Done`，
+                // 回到循环顶部停靠等下一句输入 —— 与正常完成后的停靠行为一致。
+                continue;
+            }
+
             // ── 检查取消 ──────────────────────────────────────────────────
             if self.is_cancelled() {
-                self.react_state = ReActState::Failed;
-                self.failure_reason = Some(TurnFailureReason::Cancelled);
+                if self
+                    .finalize_failure(TurnFailureReason::Cancelled, false)
+                    .await
+                {
+                    continue;
+                }
                 break;
             }
 
@@ -1137,8 +1205,12 @@ impl AgentLooper {
             if let Some(total_timeout) = self.config.total_timeout {
                 let base = self.run_start_time.unwrap_or(run_start);
                 if base.elapsed() > total_timeout {
-                    self.failure_reason = Some(TurnFailureReason::TotalTimeout);
-                    self.react_state = ReActState::Failed;
+                    if self
+                        .finalize_failure(TurnFailureReason::TotalTimeout, false)
+                        .await
+                    {
+                        continue;
+                    }
                     break;
                 }
             }
@@ -1467,77 +1539,14 @@ impl AgentLooper {
             }
 
             ReActState::Failed => {
-                // Failed = 异常终止，若未设置原因则使用 Other 兜底
-                let reason = self
-                    .failure_reason
-                    .take()
-                    .unwrap_or(TurnFailureReason::Other("failed".into()));
-                let partial_text = std::mem::take(&mut self.react_ctx.assistant_text);
-
-                // 回滚是**破坏性**的：整个 turn 的 staging（含已完成的工具调用与结果）
-                // 全部丢弃且不落盘。日志必须给出丢弃规模，否则「这轮白跑了」无从判断。
-                warn!(
-                    turn,
-                    reason = ?reason,
-                    discarded_staging_messages = self.session.staging_messages().len(),
-                    partial_text_len = partial_text.len(),
-                    "Turn failed; rolling back and discarding all staging content of this turn"
-                );
-                let outcome = TurnOutcome::Failed {
-                    reason,
-                    partial_text,
-                };
-
-                // 回滚当前 turn
-                if let Err(e) = self.session.rollback_turn(false) {
-                    error!(error = %e, "Failed to rollback turn");
-                }
-
-                // Emit TurnComplete + hook
-                let usage = self.session.total_usage();
-                Self::emit_event_guaranteed(
-                    &self.event_speaker,
-                    LooperEvent::TurnComplete {
-                        turn_index: turn,
-                        outcome: outcome.clone(),
-                        usage: usage.clone(),
-                    },
-                )
-                .await;
-                Self::invoke_on_turn_complete(
-                    &self.config.hooks,
-                    turn,
-                    outcome.failure_reason(),
-                    &usage,
-                    &self.session,
-                )
-                .await;
-
-                // 检查是否有 pending 输入自动续接
-                match self.session.dequeue_and_start_turn() {
-                    Ok(true) => {
-                        // ★ 新对话轮次：重置 ReAct 循环计数
-                        self.react_loop_iteration = 0;
-                        self.react_state = ReActState::PreparingRequest;
-                        self.turn_start = Some(Instant::now());
-                    }
-                    Ok(false) => {
-                        // rollback_turn 已设置 Idle，无需 set_state
-                        let old_outer = self.outer_state;
-                        self.outer_state = OuterState::Idle;
-                        self.emit_outer_state_change(old_outer, self.outer_state);
-                        Self::invoke_on_outer_state_change(
-                            &self.config.hooks,
-                            old_outer,
-                            self.outer_state,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to dequeue pending input");
-                        self.react_state = ReActState::Failed;
-                    }
-                }
+                // 纯同步 no-op。收尾交给 `run()` 循环顶部 —— 那里不在 `select!` 内，
+                // 且 `run()` 的 task 从不被 abort，收尾两段（冻结 + 落盘）都能跑完。
+                //
+                // 在此处 await 会丢掉异步尾巴：`select!`（`biased`，用户输入优先）
+                // 在用户侧任一分支胜出时都会 drop 掉本 future，而本设计里异步尾巴
+                // 不只是事件 —— 还有 `snapshot` / `save`，丢了就是「冻结进了
+                // committed 却没落盘」。
+                return;
             }
 
             ReActState::AwaitingModel => {
@@ -1565,6 +1574,7 @@ impl AgentLooper {
     async fn prepare_and_send_request(&mut self, turn: usize) {
         // 1. 检查取消
         if self.is_cancelled() {
+            self.failure_reason = Some(TurnFailureReason::Cancelled);
             self.react_state = ReActState::Failed;
             return;
         }
@@ -2053,6 +2063,7 @@ impl AgentLooper {
         if self.active_tool_tasks.is_none() {
             // 进入 spawn 前检查取消
             if self.is_cancelled() {
+                self.failure_reason = Some(TurnFailureReason::Cancelled);
                 self.react_state = ReActState::Failed;
                 return;
             }
@@ -2166,9 +2177,19 @@ impl AgentLooper {
         // ── Poll 阶段：active_tool_tasks 为 Some ────────────────────────
         // 每次轮询前检查取消
         if self.is_cancelled() {
+            // 先捞回已完成的 task（try_join_next 非阻塞），再 abort 在途的 ——
+            // 这是本设计里唯一「连内存都留不住」的窗口。
             if let Some(mut joinset) = self.active_tool_tasks.take() {
+                let drained = Self::drain_finished_join_results(
+                    &mut joinset,
+                    &mut self.react_ctx.pending_tool_calls,
+                );
+                if drained > 0 {
+                    debug!(drained, "Salvaged completed tool results before abort");
+                }
                 joinset.abort_all();
             }
+            self.failure_reason = Some(TurnFailureReason::Cancelled);
             self.react_state = ReActState::Failed;
             return;
         }
@@ -2282,21 +2303,20 @@ impl AgentLooper {
         }
     }
 
+    /// 把 `pending_tool_calls` 中 `result: Some` 的项写入 staging。**只写不清理**。
+    ///
+    /// 写入与清理彻底分开：`finalize_tool_execution` 写完还要清 looper 状态，
+    /// 而失败收尾（[`plan_failure`]，走同一个自由函数 `stage_tool_results`）
+    /// 一个字段都不该清 —— 它还要从 `assistant_text` 取 partial_text。
+    /// 用一个 `clear: bool` 表达不了这组差异，硬塞会变成三个 bool，且调用点写错
+    /// 就会静默清空状态。
+    fn stage_completed_tool_results(&mut self) {
+        stage_tool_results(&mut self.session, &self.react_ctx.pending_tool_calls);
+    }
+
     /// 所有 tool 执行完毕后的收尾：批量写入 staging，切换状态。
     async fn finalize_tool_execution(&mut self) {
-        for ptc in &self.react_ctx.pending_tool_calls {
-            if let Some(ref result) = ptc.result {
-                let _ = self.session.stage_item(
-                    MessageSource::ToolExecution {
-                        tool_name: ptc.call.function.name.clone(),
-                    },
-                    InputItem::FunctionCallOutput {
-                        call_id: ptc.call.id.clone(),
-                        output: result.result.clone(),
-                    },
-                );
-            }
-        }
+        self.stage_completed_tool_results();
 
         // 清理本轮 tool 数据，进入下一轮
         self.react_ctx.pending_tool_calls.clear();
@@ -2316,6 +2336,241 @@ impl AgentLooper {
     fn build_model_response(&self, usage: Usage, turns: usize) -> ModelResponse {
         ModelResponse { usage, turns }
     }
+
+    // ── 失败收尾 ──────────────────────────────────────────────────────────
+
+    /// 统一的 turn 失败收尾：冻结在途轮 → 落盘 → 发事件 → 续接 pending。
+    ///
+    /// 返回 `true` 表示续接了排队输入（调用方应 `continue`）。
+    async fn finalize_failure(&mut self, reason: TurnFailureReason, drain_pending: bool) -> bool {
+        match plan_failure(
+            &mut self.session,
+            &mut self.react_ctx,
+            self.config.persist_on_failure,
+            reason,
+            drain_pending,
+        ) {
+            Some(plan) => self.finalize_failure_async(plan).await,
+            None => false,
+        }
+    }
+
+    /// 消费 [`FinalizePlan`] 的异步段：事件 → hook → 落盘 → 回写原因 → 续接。
+    ///
+    /// 变更（冻结 + 快照）已在 [`plan_failure`] 内同步完成，此处只做 I/O 与编排。
+    async fn finalize_failure_async(&mut self, plan: FinalizePlan) -> bool {
+        warn!(
+            turn = plan.turn,
+            reason = ?plan.reason,
+            discarded_staging_messages = plan.discarded_staging_messages,
+            partial_text_len = plan.partial_text_len,
+            "Turn interrupted; staging frozen into committed history"
+        );
+
+        // 事件照发 —— 冻结失败只跳过落盘，不跳过 TurnComplete。
+        // 「这轮失败了」这个消息不能让用户看不到。
+        let usage = self.session.total_usage();
+        Self::emit_event_guaranteed(
+            &self.event_speaker,
+            LooperEvent::TurnComplete {
+                turn_index: plan.turn,
+                outcome: plan.outcome.clone(),
+                usage: usage.clone(),
+            },
+        )
+        .await;
+        Self::invoke_on_turn_complete(
+            &self.config.hooks,
+            plan.turn,
+            plan.outcome.failure_reason(),
+            &usage,
+            &self.session,
+        )
+        .await;
+
+        // 落盘门控：冻结无条件发生（内存），持久化由 persist_on_failure 决定
+        if let Some(snapshot) = plan.snapshot
+            && let Err(e) = self
+                .persister
+                .save(
+                    &snapshot,
+                    self.session.id(),
+                    self.session.description(),
+                    self.session.created_at(),
+                )
+                .await
+        {
+            error!(error = %e, "Failed to persist session after turn failure");
+        }
+
+        // ★ 回写失败原因：`take()` 之后 run() 末尾的 shutdown_reason 会退化成
+        //   "done"，Shutdown 事件丢失失败原因。这次回写是刻意的，不是冗余赋值。
+        self.failure_reason = Some(plan.reason.clone());
+
+        if plan.drain_pending {
+            match self.session.dequeue_and_start_turn() {
+                Ok(true) => {
+                    // ★ 新对话轮次：重置 ReAct 循环计数
+                    self.react_loop_iteration = 0;
+                    self.react_state = ReActState::PreparingRequest;
+                    self.turn_start = Some(Instant::now());
+                    // ★ 上一轮的失败原因不得跨轮存活：新一轮若不经过
+                    //   `handle_user_query`（那条路径会清），会在正常跑到 `Done` 时
+                    //   撞上 `debug_assert!(failure_reason.is_none())`。
+                    self.failure_reason = None;
+                    return true;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    error!(error = %e, "Failed to dequeue pending input");
+                }
+            }
+        }
+
+        // interrupt_turn / rollback_turn 已把 session 置回 Idle。
+        // 内层也回到 `Done`（无在途工作）—— 留着 `Failed` 会让循环顶部反复命中。
+        self.react_state = ReActState::Done;
+        let old_outer = self.outer_state;
+        self.outer_state = OuterState::Idle;
+        self.emit_outer_state_change(old_outer, self.outer_state);
+        Self::invoke_on_outer_state_change(&self.config.hooks, old_outer, self.outer_state).await;
+        false
+    }
+}
+
+// ============================================================================
+// 失败收尾（自由函数 — 可用真实 Session 直接单测，无需 Agent / provider）
+// ============================================================================
+
+/// 失败收尾的同步产物。
+#[derive(Debug)]
+struct FinalizePlan {
+    /// 冻结前的 turn 编号。必须在 `interrupt_turn` **之前**取 ——
+    /// 之后取则 `TurnComplete` 报的编号比 committed 轮数大 1，前端与历史对不上。
+    turn: usize,
+    outcome: TurnOutcome,
+    /// 供 `Shutdown` 回写。
+    reason: TurnFailureReason,
+    /// 冻结前的部分文本长度。**必须在这里存一份** —— `partial_text` 已经
+    /// 移进 `outcome`，而 `TurnOutcome::text()` 对 `Failed` 恒返回 `None`，
+    /// 从 outcome 反查长度会恒得 0。与冻结前的 `discarded_staging_messages` 并列，
+    /// 让日志能回答「这轮白跑了多少」。
+    partial_text_len: usize,
+    /// 落盘产物，`persist_on_failure` 门控。
+    /// `false` 时冻结照常（内存）但不产出快照（CLI 路径，`NullSessionPersister`）。
+    snapshot: Option<SessionSnapshot>,
+    /// 冻结前 staging 中的消息数（合成 Output 与中断说明尚未追加）。
+    discarded_staging_messages: usize,
+    /// 是否续接排队输入。由 `!is_cancelled()` 单点推导 —— 用户按了停就不自动跑下一条。
+    drain_pending: bool,
+}
+
+/// 把 `pending_tool_calls` 中 `result: Some` 的项写入 session 的 staging。只写不清理。
+fn stage_tool_results(session: &mut Session, pending: &[PendingToolCall]) {
+    for ptc in pending {
+        if let Some(ref result) = ptc.result {
+            let _ = session.stage_item(
+                MessageSource::ToolExecution {
+                    tool_name: ptc.call.function.name.clone(),
+                },
+                InputItem::FunctionCallOutput {
+                    call_id: ptc.call.id.clone(),
+                    output: result.result.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// 失败原因 → 写进 committed 历史的人类可读文案。
+///
+/// **不可泄漏 `Debug` 格式**：产物会进入模型上下文，`HookAbort("x")` 原样进去
+/// 就是 `HookAbort("x")` 而非 `x`。
+fn failure_label(reason: &TurnFailureReason) -> String {
+    match reason {
+        TurnFailureReason::Cancelled => "cancelled by user".to_string(),
+        TurnFailureReason::TotalTimeout => "total run timeout".to_string(),
+        TurnFailureReason::PerTurnTimeout => "per-turn timeout".to_string(),
+        TurnFailureReason::MaxTurnsExceeded => "max turns exceeded".to_string(),
+        TurnFailureReason::HookAbort(detail) => format!("aborted by hook: {detail}"),
+        TurnFailureReason::Other(detail) => format!("failed: {detail}"),
+    }
+}
+
+/// 无 await，全部 session 变更在此完成。
+///
+/// **不变量：本函数全程禁止 `.await`。** 正因为是纯同步，「冻结」对取消免疫 ——
+/// 若 `run()` 被 abort，最多丢事件与落盘，绝不会出现「落了盘但 committed 里
+/// 没有这一轮」。严防后人往这段塞 `.await`。
+///
+/// 步骤顺序：① 守卫 → ② 取标量 → ③ 冲刷已完成的工具结果 → ④ 冻结
+/// → ⑤ 快照 → ⑥ 清状态。③ 在 ④ 之前是硬要求：捞回来的工具结果必须和
+/// 这一轮一起进 committed，且 `stage_item` 只在 `Active` 下可用（④ 之后就 `Idle` 了）。
+///
+/// 返回 `None` 表示无在途轮可收尾 —— 挡的是「取消发生在 `Idle`」（根本没有在途轮，
+/// 例如 looper 正空转等输入时用户点了停止）时发出语义为空的 `TurnComplete`。
+fn plan_failure(
+    session: &mut Session,
+    ctx: &mut ReActContext,
+    persist: bool,
+    reason: TurnFailureReason,
+    drain_pending: bool,
+) -> Option<FinalizePlan> {
+    // ① 无在途轮守卫
+    if session.state() == SessionState::Idle && session.staging_messages().is_empty() {
+        return None;
+    }
+
+    // ② 取标量 —— 必须在所有变更之前
+    let turn = session.turn_index(); // interrupt_turn 后会 +1
+    let partial_text = std::mem::take(&mut ctx.assistant_text);
+    let partial_text_len = partial_text.len();
+    let discarded_staging_messages = session.staging_messages().len(); // ③ 冲刷后会变
+
+    // ③ 冲刷 poll 阶段已捞回的工具结果（只写不清理；见 `stage_tool_results`）。
+    //    必须在 ④ 之前 —— 这些结果是「这一轮已完成的成果」，要和本轮一起冻结。
+    stage_tool_results(session, &ctx.pending_tool_calls);
+
+    // ④ 冻结在途轮（内部补齐悬空 tool_call 并追加中断说明）
+    let label = failure_label(&reason);
+    let token = match session.interrupt_turn(&label) {
+        Ok(token) => Some(token),
+        Err(e) => {
+            error!(error = %e, "Failed to interrupt turn; falling back to rollback");
+            // rollback 无 state 守卫，必回 Idle
+            if let Err(e) = session.rollback_turn(false) {
+                error!(error = %e, "Failed to rollback turn");
+            }
+            None
+        }
+    };
+
+    // ⑤ token 之后才 snapshot —— 顺序不可颠倒，否则快照里没有这一轮
+    let snapshot = match (&token, persist) {
+        (Some(t), true) => Some(session.snapshot(t)),
+        _ => None,
+    };
+
+    // ⑥ 清 ctx —— pending_tool_calls 必须清，否则 drain_pending 时下一轮的
+    //    execute_tools_step 会把上一轮取消掉的 tool 重跑一遍（to_spawn 只 filter
+    //    result.is_none()），正是本设计明确禁止的重放副作用。
+    ctx.pending_tool_calls.clear();
+    ctx.assistant_text.clear();
+    ctx.assistant_reasoning.clear();
+    ctx.batch_response = None;
+
+    Some(FinalizePlan {
+        turn,
+        outcome: TurnOutcome::Failed {
+            reason: reason.clone(),
+            partial_text,
+        },
+        reason,
+        partial_text_len,
+        snapshot,
+        discarded_staging_messages,
+        drain_pending,
+    })
 }
 
 // ============================================================================
@@ -2325,6 +2580,7 @@ impl AgentLooper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     // ── LooperConfig tests ────────────────────────────────────────────
 
@@ -2418,6 +2674,507 @@ mod tests {
         };
         assert!(ptc.result.is_some());
         assert!(!ptc.result.unwrap().is_error);
+    }
+
+    // ── drain_finished_join_results tests ──────────────────────────────
+
+    /// 构造 `pending` 槽位（`call` 与 `result` 均占位，索引与 spawn 时的 idx 对齐）。
+    fn pending_slots(n: usize) -> Vec<PendingToolCall> {
+        (0..n)
+            .map(|i| PendingToolCall {
+                call: Arc::new(ToolCall::new(format!("c{i}"), "t", "{}")),
+                result: None,
+            })
+            .collect()
+    }
+
+    fn tool_result(idx: usize) -> (usize, ToolCallResult) {
+        let call = Arc::new(ToolCall::new(format!("c{idx}"), "t", "{}"));
+        (
+            idx,
+            ToolCallResult {
+                call,
+                result: Content::Text(format!("r{idx}")),
+                is_error: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_drain_collects_all_finished_tasks() {
+        let mut joinset: tokio::task::JoinSet<(usize, ToolCallResult)> =
+            tokio::task::JoinSet::new();
+        joinset.spawn(async { tool_result(0) });
+        joinset.spawn(async { tool_result(1) });
+        // 永不完成 —— 必须不被伪造结果
+        joinset.spawn(async {
+            std::future::pending::<()>().await;
+            tool_result(2)
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut pending = pending_slots(3);
+        let n = AgentLooper::drain_finished_join_results(&mut joinset, &mut pending);
+
+        assert_eq!(n, 2);
+        assert!(pending[0].result.is_some());
+        assert!(pending[1].result.is_some());
+        assert!(pending[2].result.is_none(), "在途 task 不得被伪造结果");
+    }
+
+    #[tokio::test]
+    async fn test_drain_survives_panicking_sibling() {
+        // 回归锚：`while let Some(Ok(..))` 写法会让 panic 的 task 提前终止排空，
+        // 排在它后面的正常 task 成果被吞掉。
+        let mut joinset: tokio::task::JoinSet<(usize, ToolCallResult)> =
+            tokio::task::JoinSet::new();
+        joinset.spawn(async { panic!("boom") });
+        joinset.spawn(async { tool_result(1) });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut pending = pending_slots(2);
+        let n = AgentLooper::drain_finished_join_results(&mut joinset, &mut pending);
+
+        assert_eq!(n, 1, "panic 的兄弟 task 不得吞掉正常 task 的成果");
+        assert!(pending[0].result.is_none(), "panic 的 task 不应有结果");
+        assert!(pending[1].result.is_some(), "正常 task 的成果必须被捞回");
+    }
+
+    // ── plan_failure tests（零脚手架：真实 Session，无 Agent / provider）──
+
+    fn plan_session() -> Session {
+        Session::new("plan-test".to_string(), "d".to_string())
+    }
+
+    fn plan_ctx_with_text(text: &str) -> ReActContext {
+        ReActContext {
+            assistant_text: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_plan_failure_freezes_dangling_tool_call() {
+        let mut session = plan_session();
+        session.start_turn("do it".into()).unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "t1".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            )
+            .unwrap();
+
+        let mut ctx = plan_ctx_with_text("partial");
+        let turn_before = session.turn_index();
+
+        let plan = plan_failure(
+            &mut session,
+            &mut ctx,
+            true,
+            TurnFailureReason::Cancelled,
+            false,
+        )
+        .expect("in-flight turn must produce a plan");
+
+        // turn 必须等于冻结**前**的 index（interrupt_turn 后会 +1）
+        assert_eq!(plan.turn, turn_before);
+        assert_eq!(session.turn_index(), turn_before + 1);
+        assert_eq!(session.committed_turns().len(), 1);
+        assert!(plan.snapshot.is_some(), "persist=true 必须产出快照");
+        assert_eq!(plan.partial_text_len, "partial".len());
+        // 冻结的轮里必须有合成的 Output，否则历史对 provider 非法
+        let turn = &session.committed_turns()[0];
+        assert!(turn.iter().any(|am| matches!(
+            am.message.as_ref(),
+            InputItem::FunctionCallOutput { call_id, .. } if call_id == "c1"
+        )));
+        // partial_text 被取走，looper 状态被清
+        assert!(ctx.assistant_text.is_empty());
+        assert!(ctx.pending_tool_calls.is_empty());
+    }
+
+    /// C2 的 drain 捞回的结果必须由 `plan_failure` 写进 staging，随本轮一起冻结 ——
+    /// 这是「取消时已完成的工具成果不丢」的最后一环。
+    #[test]
+    fn test_plan_failure_stages_salvaged_tool_results() {
+        let mut session = plan_session();
+        session.start_turn("do it".into()).unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "t1".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            )
+            .unwrap();
+
+        let call = Arc::new(ToolCall::new("c1", "t1", "{}"));
+        let mut ctx = ReActContext {
+            pending_tool_calls: vec![PendingToolCall {
+                call: Arc::clone(&call),
+                result: Some(ToolCallResult {
+                    call,
+                    result: Content::Text("salvaged".to_string()),
+                    is_error: false,
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let plan = plan_failure(
+            &mut session,
+            &mut ctx,
+            true,
+            TurnFailureReason::Cancelled,
+            false,
+        )
+        .expect("有在途轮");
+
+        // 计数取的是冲刷**前**的 staging 规模（悬空的 FunctionCall 计 1 条）
+        assert_eq!(plan.discarded_staging_messages, 1);
+
+        let turn = &session.committed_turns()[0];
+        assert!(
+            turn.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::FunctionCallOutput { call_id, output }
+                    if call_id == "c1" && matches!(output, Content::Text(t) if t == "salvaged")
+            )),
+            "捞回的工具结果必须随本轮冻进 committed"
+        );
+        assert!(ctx.pending_tool_calls.is_empty(), "ctx 必须清空，防重放");
+    }
+
+    #[test]
+    fn test_plan_failure_only_user_input_degenerates() {
+        let mut session = plan_session();
+        session.start_turn("hi".into()).unwrap();
+        let mut ctx = ReActContext::default();
+
+        let plan = plan_failure(
+            &mut session,
+            &mut ctx,
+            true,
+            TurnFailureReason::Cancelled,
+            false,
+        )
+        .expect("Active with only user_input still has a turn to close");
+
+        assert_eq!(plan.turn, 0);
+        assert!(session.committed_turns().is_empty(), "退化路径=rollback");
+        assert_eq!(session.turn_index(), 0, "退化路径不自增");
+        assert_eq!(session.state(), SessionState::Idle);
+    }
+
+    #[test]
+    fn test_plan_failure_returns_none_on_idle() {
+        // 无在途轮 → 不发语义为空的 TurnComplete
+        let mut session = plan_session();
+        let mut ctx = ReActContext::default();
+
+        assert!(
+            plan_failure(
+                &mut session,
+                &mut ctx,
+                true,
+                TurnFailureReason::Cancelled,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_plan_failure_persist_false_skips_snapshot_only() {
+        let mut session = plan_session();
+        session.start_turn("q".into()).unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "t1".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            )
+            .unwrap();
+        let mut ctx = ReActContext::default();
+
+        let plan = plan_failure(
+            &mut session,
+            &mut ctx,
+            false,
+            TurnFailureReason::TotalTimeout,
+            false,
+        )
+        .unwrap();
+
+        // CLI 路径：冻结照常（内存），只是不落盘 —— committed 有这一轮、快照为空
+        assert!(plan.snapshot.is_none());
+        assert_eq!(session.committed_turns().len(), 1);
+    }
+
+    #[test]
+    fn test_failure_label_covers_all_variants_without_debug_leak() {
+        let variants = [
+            TurnFailureReason::Cancelled,
+            TurnFailureReason::TotalTimeout,
+            TurnFailureReason::PerTurnTimeout,
+            TurnFailureReason::MaxTurnsExceeded,
+            TurnFailureReason::HookAbort("hook says no".to_string()),
+            TurnFailureReason::Other("boom".to_string()),
+        ];
+        for reason in &variants {
+            let label = failure_label(reason);
+            assert!(!label.is_empty(), "{reason:?} produced an empty label");
+            // Debug 泄漏会把 `HookAbort("x")` 原样送进模型上下文
+            assert!(
+                !label.contains("Some("),
+                "{reason:?} leaked Debug formatting into {label:?}"
+            );
+        }
+    }
+
+    // ── looper 级收尾测试 ──────────────────────────────────────────────
+
+    /// 计数 persister —— `NullSessionPersister` 是 no-op，看不出有没有被调用。
+    #[derive(Default)]
+    struct CountingPersister {
+        saves: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::persistence::SessionPersister for CountingPersister {
+        async fn save(
+            &self,
+            _snapshot: &SessionSnapshot,
+            _session_id: &str,
+            _description: &str,
+            _created_at: u64,
+        ) -> Result<crate::persistence::PersistResult, crate::persistence::PersistError> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::persistence::PersistResult {
+                bytes_written: 0,
+                path: std::path::PathBuf::new(),
+            })
+        }
+        async fn load(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<(SessionSnapshot, crate::SessionMeta)>, crate::persistence::PersistError>
+        {
+            Ok(None)
+        }
+        async fn delete(&self, _session_id: &str) -> Result<(), crate::persistence::PersistError> {
+            Ok(())
+        }
+        async fn list(&self) -> Result<Vec<crate::SessionMeta>, crate::persistence::PersistError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 失败路径永不触达模型 —— 所有方法 `unimplemented!()`。
+    struct PanicProvider;
+
+    #[async_trait::async_trait]
+    impl model_provider::ModelProvider for PanicProvider {
+        fn name(&self) -> &str {
+            "panic-provider"
+        }
+        async fn generate_full(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateResult, model_provider::ProviderError> {
+            unimplemented!("failure path must not reach the model")
+        }
+        async fn generate_stream(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateStream, model_provider::ProviderError> {
+            unimplemented!("failure path must not reach the model")
+        }
+    }
+
+    /// 失败收尾测试的 looper 及其通道端点。
+    ///
+    /// 端点都是字段而非返回值的一部分，因为**必须保活**：
+    /// `user_speaker` 一 drop，`run()` 就认为输入 channel 已关闭而提前退出；
+    /// `events` 一 drop，`emit_event_guaranteed` 送不出去。
+    struct FailureHarness {
+        looper: AgentLooper,
+        /// 只作为「输入 channel 未关闭」的保活句柄存在，本身从不被读。
+        _user_speaker: Speaker<UserMsg>,
+        /// `run()` 取所有权，故用 `Option` 让调用点能把它移出去。
+        user_listener: Option<Listener<UserMsg>>,
+        events: Listener<LooperEvent>,
+        persister: Arc<CountingPersister>,
+    }
+
+    /// 构造失败收尾测试用的 looper：`PanicProvider` + 计数 persister
+    /// （失败路径永不触达模型），会话预置一个悬空 `FunctionCall`，
+    /// 使收尾走冻结路径而非退化 rollback。
+    fn failure_looper_harness(
+        cancel: bool,
+        persist_on_failure: bool,
+        pending_input: bool,
+    ) -> FailureHarness {
+        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let agent = Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::new(PanicProvider),
+            crate::agent::ModelConfigBuilder::new().build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        ));
+
+        let mut session = Session::new("s1".to_string(), "d".to_string());
+        session.start_turn("q".into()).unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::FunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "t1".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            )
+            .unwrap();
+        if pending_input {
+            session.enqueue_pending("queued".into());
+        }
+
+        let (looper_side, caller_side) = make_async_intercom_pair::<LooperEvent, UserMsg>(64);
+        let (event_speaker, user_listener) = looper_side.split();
+        let (user_speaker, event_listener) = caller_side.split();
+
+        let persister = Arc::new(CountingPersister::default());
+        let looper = AgentLooper::new(
+            agent,
+            Box::new(session),
+            event_speaker,
+            Arc::new(AtomicBool::new(cancel)),
+            Arc::new(AtomicBool::new(false)),
+            LooperConfig {
+                persist_on_failure,
+                ..Default::default()
+            },
+            Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        );
+
+        FailureHarness {
+            looper,
+            _user_speaker: user_speaker,
+            user_listener: Some(user_listener),
+            events: event_listener,
+            persister,
+        }
+    }
+
+    impl FailureHarness {
+        /// 数一数收到过几次 `TurnComplete`。
+        fn turn_completes(&mut self) -> usize {
+            let mut n = 0;
+            while let Ok(ev) = self.events.try_recv() {
+                if matches!(ev, LooperEvent::TurnComplete { .. }) {
+                    n += 1;
+                }
+            }
+            n
+        }
+    }
+
+    /// 驱动 run() 直到取消收尾完成，返回 (TurnComplete 次数, committed 轮数, 落盘次数)。
+    async fn drive_cancelled_looper(persist_on_failure: bool) -> (usize, usize, usize) {
+        let mut h = failure_looper_harness(true, persist_on_failure, false);
+        let listener = h.user_listener.take().expect("harness 持有 listener");
+        let _ = h.looper.run(listener).await;
+
+        (
+            h.turn_completes(),
+            h.looper.session().committed_turns().len(),
+            h.persister.saves.load(Ordering::SeqCst),
+        )
+    }
+
+    /// 失败后自动续接排队输入时，上一轮的失败原因不得跨轮存活 ——
+    /// 续接的那一轮若正常跑到 `Done`，会撞上 `debug_assert!(failure_reason.is_none())`。
+    #[tokio::test]
+    async fn test_auto_continue_clears_failure_reason() {
+        let mut h = failure_looper_harness(false, true, true);
+
+        let continued = h
+            .looper
+            .finalize_failure(TurnFailureReason::HookAbort("hooked".into()), true)
+            .await;
+        assert!(continued, "队列里有输入时必须续接");
+        assert!(
+            h.looper.failure_reason.is_none(),
+            "续接后必须清空 failure_reason；现状={:?}",
+            h.looper.failure_reason
+        );
+
+        // 续接的那一轮正常跑完 —— Done 分支的 debug_assert 不得触发
+        h.looper.react_state = ReActState::Done;
+        h.looper.react_step().await;
+        assert_eq!(h.looper.session().committed_turns().len(), 2);
+    }
+
+    /// 非取消类失败收尾后应停靠回 `Idle` 等下一句输入，而不是终止整个 run()。
+    #[tokio::test]
+    async fn test_non_cancel_failure_docks_at_idle() {
+        let mut h = failure_looper_harness(false, true, false);
+        // 模拟 react_step 已挂起的失败（如 hook abort / max turns）
+        h.looper.react_state = ReActState::Failed;
+        h.looper.failure_reason = Some(TurnFailureReason::HookAbort("boom".into()));
+
+        let listener = h.user_listener.take().expect("harness 持有 listener");
+        let res = tokio::time::timeout(Duration::from_millis(300), h.looper.run(listener)).await;
+        assert!(
+            res.is_err(),
+            "失败收尾后应停靠等输入，而不是 break 退出 run()"
+        );
+
+        assert_eq!(
+            h.looper.session().committed_turns().len(),
+            1,
+            "非取消失败同样要冻结在途轮"
+        );
+        assert!(matches!(h.looper.outer_state(), OuterState::Idle));
+        assert_eq!(h.turn_completes(), 1, "冻结必须恰好发一次 TurnComplete");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_freezes_turn_and_emits_turn_complete_once() {
+        let (turn_completes, committed, _) = drive_cancelled_looper(true).await;
+        assert_eq!(turn_completes, 1, "取消收尾必须恰好发一次 TurnComplete");
+        assert_eq!(committed, 1, "中断轮必须冻结进 committed");
+    }
+
+    #[tokio::test]
+    async fn test_persist_on_failure_gates_save() {
+        let (_, committed_on, saves_on) = drive_cancelled_looper(true).await;
+        assert_eq!(committed_on, 1);
+        assert_eq!(saves_on, 1, "persist_on_failure=true 必须落盘一次");
+
+        let (_, committed_off, saves_off) = drive_cancelled_looper(false).await;
+        assert_eq!(committed_off, 1, "冻结无条件发生（内存）");
+        assert_eq!(saves_off, 0, "persist_on_failure=false 不得落盘");
     }
 
     // ── State enum tests ───────────────────────────────────────────────

@@ -64,6 +64,15 @@ pub enum MessageSource {
         /// 注入原因
         reason: String,
     },
+    /// 中断轮标记（该轮因中断被保留，非正常完成）。
+    ///
+    /// 由 [`Session::interrupt_turn`](super::Session::interrupt_turn) 挂在追加的
+    /// 中断说明与合成的工具输出上。消费方据此识别「这一轮没跑完就入库了」，
+    /// 不必去猜文案特征串。
+    InterruptedTurn {
+        /// 中断原因（人类可读，来自 `TurnFailureReason` 的文案化形式）
+        reason: String,
+    },
 }
 
 // ============================================================================

@@ -19,6 +19,15 @@ use super::types::{
     unix_timestamp_ms, unix_timestamp_secs,
 };
 
+/// 悬空 tool_call 的合成结果文案。
+///
+/// **行为契约，不是 UI 文案**：该串会写进 committed 历史并发送给模型。
+/// 错误语义只能由文案承载 —— [`InputItem::FunctionCallOutput`] 协议层
+/// 没有 `is_error` 位（`ToolCallResult.is_error` 只喂事件与 hook，上线时被丢弃），
+/// 所以必须带 `[interrupted]` 前缀；写成中性文案会被模型当作正常工具输出继续推理。
+pub(crate) const INTERRUPTED_TOOL_OUTPUT: &str =
+    "[interrupted] tool execution was interrupted before completion";
+
 /// 会话实体。
 ///
 /// # 并发模型
@@ -265,19 +274,137 @@ impl Session {
             });
         }
 
+        let id = self.push_staged(source, item);
+        Ok(id)
+    }
+
+    /// staging 追加，不走 [`Self::stage_item`] 的 `Active` 守卫。
+    ///
+    /// 供 `interrupt_turn` 的补齐项使用：那些项不是模型产出，
+    /// `can_stage_message()`（只认 `Active`）对它们没有语义，
+    /// 而补齐必须能在 `Cancelling` / `Interrupted` 下发生。
+    fn push_staged(&mut self, source: MessageSource, item: InputItem) -> MessageId {
         let id = self.allocate_message_id();
-        let am = AnnotatedMessage {
+        let am = self.make_annotated(id, source, item);
+        self.staging.push(am);
+        self.touch();
+        id
+    }
+
+    /// 构造一条归属当前 turn 的 [`AnnotatedMessage`]。
+    ///
+    /// `stage_item` 与 `push_staged` 共用，避免 `timestamp_ms` /
+    /// `estimated_tokens` 在两处漂移。
+    fn make_annotated(
+        &self,
+        id: MessageId,
+        source: MessageSource,
+        item: InputItem,
+    ) -> AnnotatedMessage {
+        AnnotatedMessage {
             id,
             turn_index: self.turn_index,
             message: Arc::new(item),
             timestamp_ms: unix_timestamp_ms(),
             estimated_tokens: None,
             source,
-        };
+        }
+    }
 
-        self.staging.push(am);
+    /// 为 staging 中悬空的 `FunctionCall` 合成配对 `FunctionCallOutput`，
+    /// 返回合成条数。按 `called` 原序追加。
+    ///
+    /// 补齐是强制的：provider 要求每条 `tool_calls` 都有配对结果，
+    /// 否则下一次请求直接 400 —— 保留半轮而不补齐等于把会话弄坏。
+    ///
+    /// `reason` 是中断原因（人类可读），挂进 `MessageSource`。合成项的
+    /// **输出文案**恒定是 [`INTERRUPTED_TOOL_OUTPUT`]（模型面向契约），
+    /// 但来源标记带真实原因 —— 这样消费方不必分辨「取哪一条 `InterruptedTurn`」。
+    fn patch_dangling_tool_calls(&mut self, reason: &str) -> usize {
+        let mut called: Vec<String> = Vec::new();
+        let mut answered: Vec<String> = Vec::new();
+        for am in self.staging.messages_ref() {
+            match am.message.as_ref() {
+                InputItem::FunctionCall { call_id, .. } => called.push(call_id.clone()),
+                InputItem::FunctionCallOutput { call_id, .. } => answered.push(call_id.clone()),
+                _ => {}
+            }
+        }
+
+        let dangling: Vec<String> = called
+            .into_iter()
+            .filter(|id| !answered.contains(id))
+            .collect();
+
+        for call_id in &dangling {
+            self.push_staged(
+                MessageSource::InterruptedTurn {
+                    reason: reason.to_string(),
+                },
+                InputItem::FunctionCallOutput {
+                    call_id: call_id.clone(),
+                    output: INTERRUPTED_TOOL_OUTPUT.into(),
+                },
+            );
+        }
+        dangling.len()
+    }
+
+    /// 追加一条中断说明，让这一轮对模型自解释，而不是以悬空工具结果收尾。
+    ///
+    /// **必须先于调用方产出任何 `FunctionCallOutput` 之外的 assistant 文本**
+    /// —— 补齐与说明顺序颠倒会产出「`tool_calls` 后紧跟 assistant」的非法历史。
+    fn push_interrupt_notice(&mut self, reason: &str) {
+        self.push_staged(
+            MessageSource::InterruptedTurn {
+                reason: reason.to_string(),
+            },
+            InputItem::Message {
+                role: Role::Assistant,
+                content: format!(
+                    "[interrupted] this turn was interrupted before completion: {reason}"
+                )
+                .into(),
+            },
+        );
+    }
+
+    /// 中断在途轮：有可保留产物则冻结进 committed，否则等同 rollback。
+    ///
+    /// 与 [`Self::commit_turn`] / [`Self::rollback_turn`] 并列的第三个 turn 边界
+    /// 出口。冻结路径做两件补齐（补齐悬空 tool_call → 追加中断说明），
+    /// 保证产出的历史对 provider 合法。两种情况下 state 均回到 `Idle`。
+    ///
+    /// `Idle` 上调用返回 `Err`（staging 必空，调用方应显式 `rollback_turn`）。
+    pub fn interrupt_turn(&mut self, reason: &str) -> Result<TurnBoundaryToken, SessionError> {
+        // 与 commit/rollback 不同，这里认 `Cancelling` / `Interrupted`：
+        // 补齐项要能在收尾态写入（见 `push_staged`）。
+        if !matches!(
+            self.state,
+            SessionState::Active | SessionState::Cancelling | SessionState::Interrupted
+        ) {
+            return Err(SessionError::InvalidStateTransition {
+                current_state: self.state,
+                action: "interrupt_turn".to_string(),
+            });
+        }
+
+        if self.staging.messages_ref().is_empty() {
+            // 退化路径：只有 user_input，没有可保留的模型产物
+            return self.rollback_turn(false);
+        }
+
+        // ★ 补齐必须先于说明。顺序颠倒会产出「assistant(tool_calls) → assistant(text)
+        //   → tool」，即 tool_calls 后紧跟 assistant 而非 tool → 400。
+        self.patch_dangling_tool_calls(reason);
+        self.push_interrupt_notice(reason);
+
+        let turn_messages = self.staging.take_all();
+        self.committed.push_turn(turn_messages);
+        self.turn_index += 1;
+        self.state = SessionState::Idle;
         self.touch();
-        Ok(id)
+        Ok(TurnBoundaryToken(()))
     }
 
     /// 提交当前 turn（Active → Idle）。
@@ -488,7 +615,9 @@ impl Session {
     /// 取消当前 turn（Active → Cancelling）。
     ///
     /// 若已在 Cancelling 状态，无操作并返回 Ok。
-    /// Cancelling 状态下由 AgentLooper 调用 `rollback_turn()` 完成清理。
+    ///
+    /// 收尾由 [`Self::interrupt_turn`] 或 [`Self::rollback_turn`] 完成 ——
+    /// 二者都接受 `Cancelling` 作为入口状态。
     pub fn cancel(&mut self) -> Result<(), SessionError> {
         match self.state {
             SessionState::Active => {
@@ -577,6 +706,40 @@ mod tests {
         Session::new("test-id".to_string(), "test session".to_string())
     }
 
+    /// 模拟 chat 协议的 tool_call ↔ tool_result 配对校验。
+    ///
+    /// - `FunctionCall` 入栈
+    /// - `FunctionCallOutput` 必须匹配栈内项（否则错序 / 无主结果）
+    /// - 非空栈期间不得出现 assistant `Message`（`tool_calls` 后必须紧跟 tool）
+    /// - 末尾栈必须为空（无悬空调用）
+    ///
+    /// 把「对 provider 合法」从「我按文档写了」变成机器可验。
+    #[allow(dead_code)]
+    fn assert_wire_valid(items: &[InputItem]) {
+        let mut stack: Vec<String> = Vec::new();
+        for item in items {
+            match item {
+                InputItem::FunctionCall { call_id, .. } => stack.push(call_id.clone()),
+                InputItem::FunctionCallOutput { call_id, .. } => {
+                    let pos = stack.iter().rposition(|c| c == call_id);
+                    assert!(
+                        pos.is_some(),
+                        "FunctionCallOutput for {call_id} without a matching FunctionCall"
+                    );
+                    stack.remove(pos.unwrap());
+                }
+                InputItem::Message {
+                    role: Role::Assistant,
+                    ..
+                } => assert!(
+                    stack.is_empty(),
+                    "assistant Message while tool results still pending: {stack:?}"
+                ),
+                _ => {}
+            }
+        }
+        assert!(stack.is_empty(), "dangling tool calls at end: {stack:?}");
+    }
     #[test]
     fn test_new_session_is_idle() {
         let s = make_session();
@@ -1037,6 +1200,207 @@ mod tests {
         let mut s = make_session();
         s.set_description("new desc".to_string());
         assert_eq!(s.description(), "new desc");
+    }
+
+    // ── interrupt_turn ─────────────────────────────────────────────────
+
+    /// 从一条 `InterruptedTurn` 消息取出中断原因。
+    fn interrupted_reason(am: &AnnotatedMessage) -> Option<&str> {
+        match &am.source {
+            MessageSource::InterruptedTurn { reason } => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_interrupt_turn_patches_dangling_tool_calls() {
+        // ① 悬空 c2：补齐必须按 called 原序，且插在中断说明之前
+        let mut s = make_session();
+        s.start_turn("do two things".into()).unwrap();
+        // 轮首 preamble —— 顺序即线上顺序，故必须排在 FunctionCall 之前
+        let partial = assistant("working on it");
+        s.stage_item(MessageSource::ModelGeneration, partial.clone())
+            .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+            .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c2", "t2"))
+            .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "t1".to_string(),
+            },
+            tool("c1", "done 1"),
+        )
+        .unwrap();
+
+        s.interrupt_turn("cancelled").unwrap();
+
+        assert_eq!(s.state(), SessionState::Idle);
+        assert_eq!(s.turn_index(), 1);
+        assert_eq!(s.committed_turns().len(), 1);
+
+        let turn = &s.committed_turns()[0];
+        let items: Vec<&InputItem> = turn.iter().map(|am| am.message.as_ref()).collect();
+
+        // 顺序锚：user, partial, FC c1, FC c2, Output c1, Output c2(合成), notice
+        assert_eq!(items.len(), 7);
+        assert_eq!(items[0], &user("do two things"));
+        assert_eq!(items[1], &partial);
+        assert_eq!(items[2], &function_call("c1", "t1"));
+        assert_eq!(items[3], &function_call("c2", "t2"));
+        assert_eq!(items[4], &tool("c1", "done 1"));
+        assert_eq!(items[5], &tool("c2", INTERRUPTED_TOOL_OUTPUT));
+        assert!(matches!(
+            items[6],
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        ));
+        assert_eq!(
+            interrupted_reason(&turn[6]),
+            Some("cancelled"),
+            "中断说明必须带 InterruptedTurn 标记"
+        );
+        // 合成项也带**真实原因**（不是工具输出文案）—— 消费方取任意一条
+        // InterruptedTurn 都能拿到人话原因
+        assert_eq!(interrupted_reason(&turn[5]), Some("cancelled"));
+
+        // 每个 call_id 恰好应答一次
+        for call_id in ["c1", "c2"] {
+            let answers = turn
+                .iter()
+                .filter(|am| {
+                    matches!(
+                        am.message.as_ref(),
+                        InputItem::FunctionCallOutput { call_id: c, .. } if c == call_id
+                    )
+                })
+                .count();
+            assert_eq!(answers, 1, "{call_id} must be answered exactly once");
+        }
+
+        // 末条是 assistant 的 notice（不是悬空工具结果）
+        assert!(matches!(
+            turn.last().unwrap().message.as_ref(),
+            InputItem::Message {
+                role: Role::Assistant,
+                ..
+            }
+        ));
+
+        assert_wire_valid(&items.into_iter().cloned().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_interrupt_turn_degenerates_to_rollback() {
+        // ② staging 只有 user_input → 无可保留产物，等同 rollback（不自增 turn_index）
+        let mut s = make_session();
+        s.start_turn("just a question".into()).unwrap();
+
+        s.interrupt_turn("cancelled").unwrap();
+
+        assert_eq!(s.state(), SessionState::Idle);
+        assert!(s.committed_turns().is_empty());
+        assert_eq!(s.turn_index(), 0);
+        assert!(s.staging_user_input().is_none());
+    }
+
+    #[test]
+    fn test_interrupt_turn_complete_tool_roundtrip_adds_no_output() {
+        // ③ 完整往返：不新增 Output，只追加 InterruptedTurn 标记
+        let mut s = make_session();
+        s.start_turn("weather?".into()).unwrap();
+        s.stage_item(
+            MessageSource::ModelGeneration,
+            function_call("c1", "get_weather"),
+        )
+        .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "get_weather".to_string(),
+            },
+            tool("c1", "sunny"),
+        )
+        .unwrap();
+
+        s.interrupt_turn("cancelled").unwrap();
+
+        let turn = &s.committed_turns()[0];
+        let outputs = turn
+            .iter()
+            .filter(|am| matches!(am.message.as_ref(), InputItem::FunctionCallOutput { .. }))
+            .count();
+        assert_eq!(outputs, 1, "完整往返不应新增合成 Output");
+        assert!(matches!(
+            turn[2].message.as_ref(),
+            InputItem::FunctionCallOutput { call_id, .. } if call_id == "c1"
+        ));
+        assert!(turn.iter().any(|am| interrupted_reason(am).is_some()));
+    }
+
+    #[test]
+    fn test_interrupt_turn_twice_on_idle_is_err() {
+        // ④ Idle 上再次调用 → Err，且不产生第二个 turn
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+            .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "t1".to_string(),
+            },
+            tool("c1", "r"),
+        )
+        .unwrap();
+        s.interrupt_turn("cancelled").unwrap();
+
+        let turns_before = s.committed_turns().len();
+        let index_before = s.turn_index();
+
+        let err = s.interrupt_turn("again").unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::InvalidStateTransition { action, .. } if action == "interrupt_turn"
+        ));
+        assert_eq!(s.committed_turns().len(), turns_before);
+        assert_eq!(s.turn_index(), index_before);
+    }
+
+    #[test]
+    fn test_interrupt_turn_survives_snapshot_roundtrip() {
+        // ⑤ 快照往返：serde 新变体 + from_snapshot 规范化一次性覆盖
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+            .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "t1".to_string(),
+            },
+            tool("c1", "r"),
+        )
+        .unwrap();
+        let token = s.interrupt_turn("hook abort").unwrap();
+        let snap = s.snapshot(&token);
+
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let restored =
+            Session::from_snapshot(s.id().to_string(), "d".to_string(), s.created_at(), back);
+
+        assert_eq!(restored.turn_index(), 1);
+        let turn = &restored.committed_turns()[0];
+        assert_eq!(
+            interrupted_reason(turn.last().unwrap()),
+            Some("hook abort"),
+            "快照往返后 InterruptedTurn 标记必须原样重建"
+        );
+        assert_eq!(
+            &turn[2].message.as_ref().clone(),
+            &tool("c1", "r"),
+            "非合成项内容不变"
+        );
     }
 
     #[test]
