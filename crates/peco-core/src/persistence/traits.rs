@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
+use crate::persistence::inflight::InflightCheckpoint;
 use crate::session::{SessionMeta, SessionSnapshot};
 
 // ============================================================================
@@ -78,6 +79,29 @@ pub trait SessionPersister: Send + Sync {
 
     /// 列出全部会话元数据，按更新时间降序。
     async fn list(&self) -> Result<Vec<SessionMeta>, PersistError>;
+
+    // ── 在途轮检查点（崩溃恢复，可选能力）────────────────────────────────
+    //
+    // 三个方法都给了 no-op 默认实现：不提供崩溃恢复的后端（文件、空实现、
+    // 测试替身）无需改动，`load_inflight` 恒 `None` 即「永不水化」。
+
+    /// 写入在途轮检查点（同一会话覆盖式，只保留最新一份）。
+    async fn save_inflight(&self, _checkpoint: &InflightCheckpoint) -> Result<(), PersistError> {
+        Ok(())
+    }
+
+    /// 读取会话的在途轮检查点，无则 `Ok(None)`。
+    async fn load_inflight(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<InflightCheckpoint>, PersistError> {
+        Ok(None)
+    }
+
+    /// 清除在途轮检查点。幂等 —— 无对应行同样返回 `Ok`。
+    async fn delete_inflight(&self, _session_id: &str) -> Result<(), PersistError> {
+        Ok(())
+    }
 }
 
 // ============================================================================

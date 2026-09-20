@@ -46,6 +46,8 @@ export interface ChatMessage {
   isError?: boolean;
   /** 系统通知消息（如 SSE `context_compacted`），以居中分隔样式渲染 */
   isNotice?: boolean;
+  /** 分隔条图标（notice 消息可选），缺省为归档语义的 📦 */
+  noticeIcon?: string;
   /** 归档摘要正文（notice 消息可选）— hover 分隔条时展示 */
   summary?: string;
 }
@@ -592,7 +594,9 @@ function ChatBubble({ message }: { message: ChatMessage }) {
     return (
       <div className="group relative flex items-center gap-3 py-1 text-xs text-muted-foreground">
         <div className="bg-border h-px flex-1" />
-        <span className="whitespace-nowrap">📦 {message.content}</span>
+        <span className="whitespace-nowrap">
+          {message.noticeIcon ?? "📦"} {message.content}
+        </span>
         <div className="bg-border h-px flex-1" />
         {message.summary && (
           // hover 归档分隔条展示摘要正文
@@ -852,8 +856,8 @@ function handleSSEEvent(
 // ── Snapshot to Messages ───────────────────────────────────────────────────
 
 export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
-  return turns.flatMap((turn) =>
-    turn.messages.map((md: MessageData): ChatMessage => {
+  return turns.flatMap((turn) => {
+    const restored = turn.messages.map((md: MessageData): ChatMessage => {
       if (md.role === "user") {
         return {
           role: "user",
@@ -876,6 +880,20 @@ export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
         toolCalls: md.tool_calls?.map((tc) => ({ ...tc, result: undefined })),
         reasoning: md.reasoning_content,
       };
-    }),
-  );
+    });
+
+    // 中断轮（取消/超时/失败后冻结入史）在两轮之间补一条居中横幅，
+    // 在该轮消息之前 —— 与 compaction 归档分隔条同一渲染路径。
+    if (!turn.interrupted) return restored;
+    return [
+      {
+        role: "assistant" as const,
+        content: `本轮被中断（${turn.interrupted_reason ?? "原因未知"}）`,
+        turnIndex: turn.turn_index,
+        isNotice: true,
+        noticeIcon: "⏹",
+      },
+      ...restored,
+    ];
+  });
 }

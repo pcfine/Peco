@@ -101,4 +101,35 @@ describe("snapshotToMessages", () => {
     const messages = snapshotToMessages(turns);
     expect(messages[0].images).toBeUndefined();
   });
+
+  it("prepends an interrupted banner for frozen turns", () => {
+    const turns: TurnData[] = [
+      {
+        turn_index: 0,
+        interrupted: true,
+        interrupted_reason: "cancelled",
+        messages: [
+          { role: "user", content: "跑个长任务", timestamp_ms: 1 },
+          { role: "assistant", content: "进行中…", timestamp_ms: 2 },
+        ],
+      },
+    ];
+    const messages = snapshotToMessages(turns);
+    // 横幅在该轮消息之前，且复用 isNotice 居中分隔样式。
+    expect(messages[0].isNotice).toBe(true);
+    expect(messages[0].noticeIcon).toBe("⏹");
+    expect(messages[0].content).toContain("cancelled");
+    expect(messages[0].turnIndex).toBe(0);
+    expect(messages.slice(1).map((m) => m.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("adds no banner for normally completed turns", () => {
+    const turns: TurnData[] = [
+      {
+        turn_index: 0,
+        messages: [{ role: "user", content: "你好", timestamp_ms: 1 }],
+      },
+    ];
+    expect(snapshotToMessages(turns).every((m) => !m.isNotice)).toBe(true);
+  });
 });

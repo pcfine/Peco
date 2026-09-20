@@ -25,8 +25,8 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::db::{agents, conversations, messages};
 use crate::error::ApiError;
-use crate::session_dto::group_input_items;
-use crate::session_store::SqliteSessionPersister;
+use crate::session_dto::{ItemView, group_input_items, turn_interrupted_reason};
+use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
 
 use super::conversation::auto_archive_oldest_if_needed;
@@ -262,9 +262,10 @@ pub async fn delete_conversation(
     // 删除关联消息
     messages::delete_by_conversation(&state.db, &conv_id).await?;
 
-    // 删除会话快照
+    // 删除会话快照与在途轮检查点（后者不删会在会话 ID 复用时被水化错位）
     let persister = SqliteSessionPersister::new(state.db.clone());
     let _ = persister.delete(&conv_id).await;
+    let _ = persister.delete_inflight(&conv_id).await;
 
     // 删除对话记录
     conversations::delete(&state.db, &conv_id).await?;
@@ -359,12 +360,11 @@ pub async fn stream_chat(
 
     // ── 3. 加载或创建 Session ────────────────────────────────────────────
     let persister = SqliteSessionPersister::new(state.db.clone());
-    let (session, is_first_turn): (Box<Session>, bool) = match persister.load(&conv_id).await {
+    let mut session: Box<Session> = match persister.load(&conv_id).await {
         Ok(Some((snapshot, _meta))) => {
-            let existing_turns = snapshot.committed_turns.len();
             tracing::info!(
                 conversation_id = %conv_id,
-                turns = existing_turns,
+                turns = snapshot.committed_turns.len(),
                 "Session restored from snapshot"
             );
             let created_at = snapshot
@@ -378,16 +378,12 @@ pub async fn stream_chat(
                         .map(|d| d.as_secs())
                         .unwrap_or(0)
                 });
-            let is_first = existing_turns == 0;
-            (
-                Box::new(Session::from_snapshot(
-                    conv_id.clone(),
-                    conv.title.clone(),
-                    created_at,
-                    snapshot,
-                )),
-                is_first,
-            )
+            Box::new(Session::from_snapshot(
+                conv_id.clone(),
+                conv.title.clone(),
+                created_at,
+                snapshot,
+            ))
         }
         Err(e) => {
             tracing::warn!(
@@ -395,19 +391,20 @@ pub async fn stream_chat(
                 error = %e,
                 "failed to load session snapshot; starting a new session (history lost)"
             );
-            (
-                Box::new(Session::new(conv_id.clone(), conv.title.clone())),
-                true,
-            )
+            Box::new(Session::new(conv_id.clone(), conv.title.clone()))
         }
         Ok(None) => {
             tracing::info!(conversation_id = %conv_id, "Creating new session");
-            (
-                Box::new(Session::new(conv_id.clone(), conv.title.clone())),
-                true,
-            )
+            Box::new(Session::new(conv_id.clone(), conv.title.clone()))
         }
     };
+
+    // ── 3b. 崩溃恢复：冻结上次进程留下的在途轮 ────────────────────────────
+    hydrate_inflight_turn(&persister, &mut session).await;
+
+    // 「首轮」据水化**之后**的历史判定 —— 水化刚冻结的轮次同样是历史，
+    // 否则新一轮消息会去覆盖一个已有内容的会话标题。
+    let is_first_turn = session.committed_turns().is_empty();
 
     // ── 4. 创建 SSE channel ──────────────────────────────────────────────
     let (sse_tx, sse_rx) = mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(256);
@@ -666,6 +663,11 @@ pub struct SessionSnapshotResponse {
 pub struct TurnData {
     pub turn_index: usize,
     pub messages: Vec<MessageData>,
+    /// 本轮是否因中断被冻结入史（非正常完成）。
+    pub interrupted: bool,
+    /// 中断原因（人类可读），仅中断轮序列化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -714,38 +716,41 @@ pub async fn get_session_snapshot(
                 .committed_turns
                 .iter()
                 .enumerate()
-                .map(|(i, msgs): (usize, &Vec<_>)| TurnData {
-                    turn_index: i,
-                    messages: {
-                        let items: Vec<InputItem> =
-                            msgs.iter().map(|am| (*am.message).clone()).collect();
-                        let timestamps: Vec<u64> = msgs.iter().map(|am| am.timestamp_ms).collect();
-                        group_input_items(&items, &timestamps)
-                            .into_iter()
-                            .map(|msg| MessageData {
-                                role: msg.role.to_string(),
-                                content: msg.content,
-                                images: msg.images,
-                                tool_calls: if msg.tool_calls.is_empty() {
-                                    None
-                                } else {
-                                    Some(
-                                        msg.tool_calls
-                                            .into_iter()
-                                            .map(|tc| ToolCallData {
-                                                id: tc.id,
-                                                name: tc.function.name,
-                                                arguments: tc.function.arguments,
-                                            })
-                                            .collect(),
-                                    )
-                                },
-                                reasoning_content: msg.reasoning_content,
-                                tool_call_id: msg.tool_call_id,
-                                timestamp_ms: msg.timestamp_ms,
-                            })
-                            .collect()
-                    },
+                .map(|(i, msgs): (usize, &Vec<_>)| {
+                    // 两字段同源，杜绝「有原因却 interrupted=false」的自相矛盾态。
+                    let interrupted_reason = turn_interrupted_reason(msgs);
+                    TurnData {
+                        turn_index: i,
+                        interrupted: interrupted_reason.is_some(),
+                        interrupted_reason,
+                        messages: {
+                            group_input_items(&ItemView::from_turn(msgs))
+                                .into_iter()
+                                .map(|msg| MessageData {
+                                    role: msg.role.to_string(),
+                                    content: msg.content,
+                                    images: msg.images,
+                                    tool_calls: if msg.tool_calls.is_empty() {
+                                        None
+                                    } else {
+                                        Some(
+                                            msg.tool_calls
+                                                .into_iter()
+                                                .map(|tc| ToolCallData {
+                                                    id: tc.id,
+                                                    name: tc.function.name,
+                                                    arguments: tc.function.arguments,
+                                                })
+                                                .collect(),
+                                        )
+                                    },
+                                    reasoning_content: msg.reasoning_content,
+                                    tool_call_id: msg.tool_call_id,
+                                    timestamp_ms: msg.timestamp_ms,
+                                })
+                                .collect()
+                        },
+                    }
                 })
                 .collect();
 
@@ -882,9 +887,11 @@ fn conversation_turns_markdown(
     let mut md = String::new();
     if let Some((snap, _meta)) = snapshot_opt {
         for turn in &snap.committed_turns {
-            let items: Vec<InputItem> = turn.iter().map(|am| (*am.message).clone()).collect();
-            let timestamps: Vec<u64> = turn.iter().map(|am| am.timestamp_ms).collect();
-            for msg in group_input_items(&items, &timestamps) {
+            // 导出正文与 UI 保持一致：中断轮先给一行横幅，再照常渲染其产物。
+            if let Some(reason) = turn_interrupted_reason(turn) {
+                md.push_str(&format!("\n> ⏹ 本轮被中断（{reason}）\n"));
+            }
+            for msg in group_input_items(&ItemView::from_turn(turn)) {
                 match msg.role {
                     "user" => {
                         if let Some(content) = msg.content {

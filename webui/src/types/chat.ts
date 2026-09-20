@@ -136,8 +136,8 @@ export interface SessionSnapshotResponse {
   conversation_id: string;
   turns: TurnData[];
   total_usage: UsageData;
-  /** 是否有进行中的任务（前端据此重新附着到任务流） */
-  is_running: boolean;
+  /** 是否有进行中的任务（前端据此重新附着到任务流）。chat 侧无 run 注册表，不返回该字段 */
+  is_running?: boolean;
   /** 钉扎的历史摘要（compaction 产物，无压缩历史时缺省） */
   pinned_summary?: string;
   /** 上下文指标（会话不存在时缺省） */
@@ -147,6 +147,10 @@ export interface SessionSnapshotResponse {
 export interface TurnData {
   turn_index: number;
   messages: MessageData[];
+  /** 本轮因中断被冻结入史（取消/超时/失败），非正常完成 */
+  interrupted?: boolean;
+  /** 中断原因（人类可读），仅 interrupted 为真时存在 */
+  interrupted_reason?: string;
 }
 
 export interface MessageData {

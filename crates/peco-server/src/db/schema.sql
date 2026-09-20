@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 在途轮检查点（崩溃恢复 — 一批工具刚落地时写入，收尾时删除）
+--
+-- 不并进 session_snapshots：那张表是 O(历史长度) 全量序列化，
+-- 每批工具写一次 = 成本随总历史 × 工具批次数增长。
+CREATE TABLE IF NOT EXISTS conversation_inflight_turns (
+    conversation_id TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    turn_index      INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Token 用量日志表
 CREATE TABLE IF NOT EXISTS usage_logs (
     id TEXT PRIMARY KEY,

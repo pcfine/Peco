@@ -7,7 +7,9 @@
 
 pub mod file;
 pub(crate) mod format;
+pub mod inflight;
 pub mod traits;
 
 pub use file::FileSessionPersister;
+pub use inflight::{INFLIGHT_CRASH_REASON, InflightCheckpoint};
 pub use traits::{NullSessionPersister, PersistError, PersistResult, SessionPersister};

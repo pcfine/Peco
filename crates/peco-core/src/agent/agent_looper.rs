@@ -32,6 +32,7 @@ use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
+use crate::persistence::{INFLIGHT_CRASH_REASON, InflightCheckpoint};
 use crate::session::{AnnotatedMessage, MessageSource, Session, SessionSnapshot, SessionState};
 use crate::utils::intercom::{Listener, Speaker, make_async_intercom_pair};
 use tracing::{debug, error, info, warn};
@@ -1463,6 +1464,8 @@ impl AgentLooper {
                 {
                     error!(error = %e, "Failed to persist session after turn commit");
                 }
+                // ★ 本轮已入史，在途检查点作废（早于压缩：压缩只改 committed 内容）。
+                self.clear_inflight_checkpoint().await;
 
                 // ★ 上下文滚动压缩：turn 边界（提交并持久化后、pending 续接前）。
                 //   非致命：摘要模型失败只记日志，不影响会话继续。
@@ -2314,9 +2317,39 @@ impl AgentLooper {
         stage_tool_results(&mut self.session, &self.react_ctx.pending_tool_calls);
     }
 
+    /// 落一次在途轮检查点（staging 全量）。
+    ///
+    /// 取 `&mut self` 而非 `&self`：两个方法都要跨越 `await`，而共享借用
+    /// 跨越 await 要求 `AgentLooper: Sync` —— 它持有非 Sync 的流。
+    async fn persist_inflight_checkpoint(&mut self) {
+        let checkpoint = InflightCheckpoint {
+            session_id: self.session.id().to_string(),
+            turn_index: self.session.turn_index(),
+            reason: INFLIGHT_CRASH_REASON.to_string(),
+            staged: self.session.staging_all(),
+        };
+        if let Err(e) = self.persister.save_inflight(&checkpoint).await {
+            warn!(error = %e, "Failed to persist inflight turn checkpoint");
+        }
+    }
+
+    /// 清除在途轮检查点（turn 已收尾，检查点不再有意义）。
+    ///
+    /// 幂等且不致命：残留行会被水化侧的轮次编号守卫判为陈旧后丢弃。
+    async fn clear_inflight_checkpoint(&mut self) {
+        if let Err(e) = self.persister.delete_inflight(self.session.id()).await {
+            warn!(error = %e, "Failed to clear inflight turn checkpoint");
+        }
+    }
+
     /// 所有 tool 执行完毕后的收尾：批量写入 staging，切换状态。
     async fn finalize_tool_execution(&mut self) {
         self.stage_completed_tool_results();
+
+        // ★ 在途轮检查点：一批工具刚落地的时刻 —— 副作用已经发生，
+        //   此刻进程若在后续模型调用中崩溃，这批结果靠它进历史。
+        //   写入失败只 warn：检查点是尽力而为，不该影响正常路径。
+        self.persist_inflight_checkpoint().await;
 
         // 清理本轮 tool 数据，进入下一轮
         self.react_ctx.pending_tool_calls.clear();
@@ -2402,6 +2435,9 @@ impl AgentLooper {
         {
             error!(error = %e, "Failed to persist session after turn failure");
         }
+        // ★ 冻结已落进 committed，在途检查点作废（与落盘门控无关：
+        //   门控关掉的是快照，检查点留着会在下次冷启动被判为陈旧）。
+        self.clear_inflight_checkpoint().await;
 
         // ★ 回写失败原因：`take()` 之后 run() 末尾的 shutdown_reason 会退化成
         //   "done"，Shutdown 事件丢失失败原因。这次回写是刻意的，不是冗余赋值。

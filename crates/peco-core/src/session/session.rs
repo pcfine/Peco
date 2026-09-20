@@ -226,6 +226,14 @@ impl Session {
         self.staging.user_input_ref()
     }
 
+    /// staging 全部消息的克隆（user_input 在前）。
+    ///
+    /// [`StagingBuffer::take_all`](super::buffer::StagingBuffer) 的无副作用版本，
+    /// 顺序与之一致 —— 检查点按此约定落盘，水化时按同一约定还原。
+    pub fn staging_all(&self) -> Vec<AnnotatedMessage> {
+        self.staging.iter_all().cloned().collect()
+    }
+
     /// 展示用消息的引用迭代器（UI 渲染 — 仅 User query + Assistant 最终回复）。
     pub fn display_message_refs(&self) -> impl Iterator<Item = &AnnotatedMessage> {
         self.committed.iter_all().filter(|am| am.is_displayable())
@@ -405,6 +413,61 @@ impl Session {
         self.state = SessionState::Idle;
         self.touch();
         Ok(TurnBoundaryToken(()))
+    }
+
+    /// 把在途轮检查点的消息灌回 staging 并置为 `Active`，返回灌入条数。
+    ///
+    /// 冷启动恢复路径：[`Self::from_snapshot`] 恒产出 `Idle` + 空 staging，
+    /// 检查点里那些已落地但未 commit 的消息因此无法经常规 staging 接口复原
+    /// （`stage_item` 只认 `Active`）。调用方灌入后应立即 [`Self::interrupt_turn`]
+    /// 完成补齐与冻结 —— 这是让「崩溃前已完成的工具结果」进入历史的唯一路径。
+    ///
+    /// `staged` 按 [`Self::staging_all`] 的约定排布（首条是 user_input）。
+    /// 空切片不做任何变更（返回 `Ok(0)`），非 `Idle` 状态返回 `Err`。
+    pub fn hydrate_inflight(
+        &mut self,
+        staged: Vec<AnnotatedMessage>,
+    ) -> Result<usize, SessionError> {
+        if self.state != SessionState::Idle {
+            return Err(SessionError::InvalidStateTransition {
+                current_state: self.state,
+                action: "hydrate_inflight".to_string(),
+            });
+        }
+        if staged.is_empty() {
+            return Ok(0);
+        }
+
+        let count = staged.len();
+        let mut iter = staged.into_iter();
+        // 首条按约定是 user_input，但类型上无法保证 —— 不是就整条按普通消息
+        // 入 staging，不必为一个损坏的检查点 panic。
+        let first = iter.next().expect("count > 0");
+        if matches!(
+            first.message.as_ref(),
+            InputItem::Message {
+                role: Role::User,
+                ..
+            }
+        ) {
+            self.staging.set_user_input(first);
+        } else {
+            self.staging.push(first);
+        }
+        for am in iter {
+            self.staging.push(am);
+        }
+
+        // 恢复的消息带着崩溃进程的消息 ID，必须让计数器越过它们，
+        // 否则后续 `stage_item` 会分配出重复 ID。
+        let max_id = self.staging.iter_all().map(|am| am.id.0).max();
+        if let Some(max_id) = max_id {
+            self.next_message_id = self.next_message_id.max(max_id + 1);
+        }
+
+        self.state = SessionState::Active;
+        self.touch();
+        Ok(count)
     }
 
     /// 提交当前 turn（Active → Idle）。
@@ -1401,6 +1464,130 @@ mod tests {
             &tool("c1", "r"),
             "非合成项内容不变"
         );
+    }
+
+    // ── hydrate_inflight ───────────────────────────────────────────────
+
+    /// 造一份检查点内容：`[user, FC c1, Output c1]`，与 `staging_all()` 同序。
+    fn checkpoint_messages() -> Vec<AnnotatedMessage> {
+        let mut s = make_session();
+        s.start_turn("跑个长任务".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+            .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "t1".to_string(),
+            },
+            tool("c1", "done 1"),
+        )
+        .unwrap();
+        s.staging_all()
+    }
+
+    #[test]
+    fn test_hydrate_inflight_then_freeze() {
+        // 冷启动路径：from_snapshot 恒 Idle + 空 staging，检查点靠 hydrate 复原
+        let mut s = Session::from_snapshot(
+            "test-id".to_string(),
+            "d".to_string(),
+            1,
+            SessionSnapshot {
+                committed_turns: Vec::new(),
+                turn_index: 0,
+                total_usage: Usage::default(),
+                next_message_id: 0,
+                pending_inputs: Vec::new(),
+                pinned_summary: None,
+            },
+        );
+        assert!(s.is_idle());
+
+        let staged = checkpoint_messages();
+        assert_eq!(s.hydrate_inflight(staged).unwrap(), 3);
+        assert_eq!(s.state(), SessionState::Active);
+        assert_eq!(
+            s.staging_user_input().map(|am| am.message.as_ref()),
+            Some(&user("跑个长任务"))
+        );
+        assert_eq!(s.staging_messages().len(), 2);
+
+        let _token = s.interrupt_turn("crashed").unwrap();
+        assert_eq!(s.state(), SessionState::Idle);
+        assert_eq!(s.turn_index(), 1);
+
+        let turn = &s.committed_turns()[0];
+        let items: Vec<&InputItem> = turn.iter().map(|am| am.message.as_ref()).collect();
+        // user, FC c1, Output c1, notice
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[1], &function_call("c1", "t1"));
+        assert_eq!(items[2], &tool("c1", "done 1"));
+        assert_eq!(interrupted_reason(turn.last().unwrap()), Some("crashed"));
+        assert_wire_valid(&items.into_iter().cloned().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_hydrate_inflight_patches_dangling_call() {
+        // 检查点停在「工具还没回来」的时刻：水化后冻结必须补齐悬空调用
+        let mut s = make_session();
+        let staged = {
+            let mut src = make_session();
+            src.start_turn("q".into()).unwrap();
+            src.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+                .unwrap();
+            src.staging_all()
+        };
+
+        s.hydrate_inflight(staged).unwrap();
+        s.interrupt_turn("crashed").unwrap();
+
+        let turn = &s.committed_turns()[0];
+        let items: Vec<InputItem> = turn.iter().map(|am| am.message.as_ref().clone()).collect();
+        assert_wire_valid(&items);
+        assert_eq!(items[2], tool("c1", INTERRUPTED_TOOL_OUTPUT));
+    }
+
+    #[test]
+    fn test_hydrate_inflight_advances_message_id() {
+        // 恢复的消息带着崩溃进程的消息 ID — 计数器必须越过它们，
+        // 否则后续 stage_item 会分配出重复 ID。
+        let mut s = make_session();
+        let staged = checkpoint_messages(); // id 0..2
+        s.hydrate_inflight(staged).unwrap();
+
+        let id = s
+            .stage_item(MessageSource::ModelGeneration, assistant("继续"))
+            .unwrap();
+        let ids: Vec<u64> = s.staging_all().iter().map(|am| am.id.0).collect();
+        assert!(
+            !ids[..ids.len() - 1].contains(&id.0),
+            "新分配的消息 ID 与恢复的 ID 冲突: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_hydrate_inflight_empty_and_non_idle() {
+        let mut s = make_session();
+        assert_eq!(s.hydrate_inflight(Vec::new()).unwrap(), 0);
+        assert!(s.is_idle(), "空检查点不得改变状态");
+
+        // 非 Idle 拒绝：与 from_snapshot 的「恒 Idle」前提绑定
+        s.start_turn("q".into()).unwrap();
+        assert!(s.hydrate_inflight(checkpoint_messages()).is_err());
+    }
+
+    #[test]
+    fn test_hydrate_inflight_tolerates_non_user_first() {
+        // 首条不是 user 消息（检查点损坏）——按普通消息入 staging，不 panic
+        let mut s = make_session();
+        let staged = vec![AnnotatedMessage::new(
+            MessageId(7),
+            0,
+            assistant("孤儿回复"),
+            MessageSource::ModelGeneration,
+        )];
+        assert_eq!(s.hydrate_inflight(staged).unwrap(), 1);
+        assert!(s.staging_user_input().is_none());
+        assert_eq!(s.staging_messages().len(), 1);
     }
 
     #[test]

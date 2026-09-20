@@ -45,8 +45,8 @@ use crate::auth::AuthUser;
 use crate::chat::sse::{ChatSseEvent, UsageData, map_looper_event};
 use crate::error::ApiError;
 use crate::peco::active::{CancelWaitResult, ControlCommand, RunGuard, RunRegistration};
-use crate::session_dto::group_input_items;
-use crate::session_store::SqliteSessionPersister;
+use crate::session_dto::{ItemView, group_input_items, turn_interrupted_reason};
+use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
 
 use super::filter::PecoContextFilter;
@@ -120,6 +120,11 @@ pub struct MessageData {
 pub struct TurnData {
     pub turn_index: usize,
     pub messages: Vec<MessageData>,
+    /// 本轮是否因中断被冻结入史（非正常完成）。
+    pub interrupted: bool,
+    /// 中断原因（人类可读），仅中断轮序列化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_reason: Option<String>,
 }
 
 /// 单条压缩记录（时间线条目）。
@@ -265,7 +270,7 @@ async fn load_or_new_session(
 ) -> Result<Box<Session>, ApiError> {
     let session_id = private_session_id(user_id);
     let persister = SqliteSessionPersister::new(state.db.clone());
-    let session: Box<Session> = match persister.load(&session_id).await {
+    let mut session: Box<Session> = match persister.load(&session_id).await {
         Ok(Some((snapshot, _meta))) => {
             info!(
                 user_id = %user_id,
@@ -303,6 +308,10 @@ async fn load_or_new_session(
             Box::new(Session::new(session_id.clone(), SESSION_TITLE.to_string()))
         }
     };
+
+    // 崩溃恢复：冻结上次进程留下的在途轮（无检查点时零开销）。
+    hydrate_inflight_turn(&persister, &mut session).await;
+
     Ok(session)
 }
 
@@ -540,38 +549,41 @@ pub async fn get_session_snapshot(
                 .committed_turns
                 .iter()
                 .enumerate()
-                .map(|(i, msgs): (usize, &Vec<_>)| TurnData {
-                    turn_index: i,
-                    messages: {
-                        let items: Vec<InputItem> =
-                            msgs.iter().map(|am| (*am.message).clone()).collect();
-                        let timestamps: Vec<u64> = msgs.iter().map(|am| am.timestamp_ms).collect();
-                        group_input_items(&items, &timestamps)
-                            .into_iter()
-                            .map(|msg| MessageData {
-                                role: msg.role.to_string(),
-                                content: msg.content,
-                                images: msg.images,
-                                tool_calls: if msg.tool_calls.is_empty() {
-                                    None
-                                } else {
-                                    Some(
-                                        msg.tool_calls
-                                            .into_iter()
-                                            .map(|tc| ToolCallData {
-                                                id: tc.id,
-                                                name: tc.function.name,
-                                                arguments: tc.function.arguments,
-                                            })
-                                            .collect(),
-                                    )
-                                },
-                                reasoning_content: msg.reasoning_content,
-                                tool_call_id: msg.tool_call_id,
-                                timestamp_ms: msg.timestamp_ms,
-                            })
-                            .collect()
-                    },
+                .map(|(i, msgs): (usize, &Vec<_>)| {
+                    // 两字段同源，杜绝「有原因却 interrupted=false」的自相矛盾态。
+                    let interrupted_reason = turn_interrupted_reason(msgs);
+                    TurnData {
+                        turn_index: i,
+                        interrupted: interrupted_reason.is_some(),
+                        interrupted_reason,
+                        messages: {
+                            group_input_items(&ItemView::from_turn(msgs))
+                                .into_iter()
+                                .map(|msg| MessageData {
+                                    role: msg.role.to_string(),
+                                    content: msg.content,
+                                    images: msg.images,
+                                    tool_calls: if msg.tool_calls.is_empty() {
+                                        None
+                                    } else {
+                                        Some(
+                                            msg.tool_calls
+                                                .into_iter()
+                                                .map(|tc| ToolCallData {
+                                                    id: tc.id,
+                                                    name: tc.function.name,
+                                                    arguments: tc.function.arguments,
+                                                })
+                                                .collect(),
+                                        )
+                                    },
+                                    reasoning_content: msg.reasoning_content,
+                                    tool_call_id: msg.tool_call_id,
+                                    timestamp_ms: msg.timestamp_ms,
+                                })
+                                .collect()
+                        },
+                    }
                 })
                 .collect();
 
@@ -695,16 +707,27 @@ pub async fn clear_session(
             if runs
                 .wait_until_absent(&uid, Duration::from_secs(2 * 60 * 60))
                 .await
-                && let Err(e) = SqliteSessionPersister::new(db).delete(&sid).await
             {
-                warn!(user_id = %uid, error = %e, "Follow-up snapshot delete after late run exit failed");
+                let persister = SqliteSessionPersister::new(db);
+                if let Err(e) = persister.delete(&sid).await {
+                    warn!(user_id = %uid, error = %e, "Follow-up snapshot delete after late run exit failed");
+                }
+                let _ = persister.delete_inflight(&sid).await;
             }
         });
     }
 
     let persister = SqliteSessionPersister::new(state.db.clone());
 
-    // ── 1. 清理压缩日志（先于快照删除 — 失败时快照未动，可安全重试）──────
+    // ── 1. 清理在途轮检查点 ─────────────────────────────────────────────
+    // 检查点不是历史（从不归档），必须随快照一并清除 —— peco 的 session_id
+    // 由 user_id 派生、清空后复用，残留行会被水化进新会话。
+    // 放在最前：后面有「会话本就为空」的提前返回，不能漏。
+    if let Err(e) = persister.delete_inflight(&session_id).await {
+        warn!(session_id = %session_id, error = %e, "Failed to clear inflight turn checkpoint");
+    }
+
+    // ── 1b. 清理压缩日志（先于快照删除 — 失败时快照未动，可安全重试）─────
     // conversation_id 清空重置后复用，日志必须随会话生命周期回收，
     // 否则新会话的指标被旧会话污染。
     crate::db::compaction_log::delete_by_conversation(&state.db, &user_id, &session_id)
