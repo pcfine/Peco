@@ -18,6 +18,7 @@
 // request_reclaim 唤醒 runner 复查（覆盖「Idle 停靠之后订阅者才消失」）。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,12 +34,30 @@ pub enum ControlCommand {
     Cancel,
 }
 
+/// `enqueue_query` 的结果。
+///
+/// 区分「无 run」与「控制通道满」是必要的：前者要求调用方改走新建路径，
+/// 后者只是瞬时背压，误判会让调用方白建一个 run。
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// 已投递到 runner 的控制通道。
+    Enqueued,
+    /// 该用户无 run，或 runner 正在退出（通道已关闭）—— 消息原样退回，未半投递。
+    NoRun,
+    /// 控制通道已满（待处理消息积压）。
+    Backpressure,
+}
+
 /// 注册表条目：runner 之外的所有交互都经由这份句柄。
 struct ActiveEntry {
     control_tx: mpsc::Sender<ControlCommand>,
     event_tx: broadcast::Sender<LooperEvent>,
     /// 桥接任务退出时 notify，runner 醒来复查是否可回收。
     reclaim_notify: Arc<Notify>,
+    /// 是否有轮次在途（区别于「run 已注册」）。
+    ///
+    /// 由 runner 在 `OuterStateChange` 时更新，读侧无需取锁。
+    turn_in_flight: Arc<AtomicBool>,
 }
 
 /// runner 退出 / 构建失败 / panic unwind 时自清理注册表的守卫。
@@ -100,6 +119,9 @@ impl PecoActiveRuns {
     ///
     /// 在耗时的 PecoManager 构建**之前**调用，构建期间其他连接可附着
     /// （条目已存在）；构建失败直接 drop 返回值即完成清理。
+    ///
+    /// `turn_in_flight` 初始置 true：抢注只发生在携带消息的新建路径上，
+    /// 「已注册」即意味着即将开跑 —— 覆盖构建窗口内附着方的判定。
     pub fn try_register(&self, user_id: &str) -> Option<RunRegistration> {
         let mut map = self.inner.lock().unwrap();
         if map.contains_key(user_id) {
@@ -114,6 +136,7 @@ impl PecoActiveRuns {
                 control_tx: control_tx.clone(),
                 event_tx: event_tx.clone(),
                 reclaim_notify: Arc::clone(&reclaim_notify),
+                turn_in_flight: Arc::new(AtomicBool::new(true)),
             },
         );
         Some(RunRegistration {
@@ -135,15 +158,18 @@ impl PecoActiveRuns {
 
     /// 向活跃 run 排队一条用户消息。
     ///
-    /// 返回 false 表示无 run 或控制通道已满 — 调用方应改走新建路径。
-    pub fn enqueue_query(&self, user_id: &str, text: String) -> bool {
+    /// 退出码见 [`EnqueueOutcome`]：`NoRun` 与否决式失败都要求调用方改走
+    /// 新建路径，`Backpressure` 则是瞬时积压。
+    pub fn enqueue_query(&self, user_id: &str, text: String) -> EnqueueOutcome {
         let map = self.inner.lock().unwrap();
-        match map.get(user_id) {
-            Some(entry) => entry
-                .control_tx
-                .try_send(ControlCommand::Query(text))
-                .is_ok(),
-            None => false,
+        let Some(entry) = map.get(user_id) else {
+            return EnqueueOutcome::NoRun;
+        };
+        match entry.control_tx.try_send(ControlCommand::Query(text)) {
+            Ok(()) => EnqueueOutcome::Enqueued,
+            // Full 把消息原样退回，Closed 说明 runner 正在退出 —— 都不算投递成功。
+            Err(mpsc::error::TrySendError::Full(_)) => EnqueueOutcome::Backpressure,
+            Err(mpsc::error::TrySendError::Closed(_)) => EnqueueOutcome::NoRun,
         }
     }
 
@@ -209,8 +235,28 @@ impl PecoActiveRuns {
     }
 
     /// 该用户是否有活跃 run。
+    ///
+    /// 注意这是「已注册」而非「有轮次在跑」：停靠在 Idle 等下一句输入的
+    /// run 同样为 true。判断是否需要附着/补占位请用 [`Self::turn_in_flight`]。
     pub fn is_running(&self, user_id: &str) -> bool {
         self.inner.lock().unwrap().contains_key(user_id)
+    }
+
+    /// 该用户是否有轮次在途（runner 上报，无 run 时为 false）。
+    pub fn turn_in_flight(&self, user_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(user_id)
+            .is_some_and(|entry| entry.turn_in_flight.load(Ordering::Relaxed))
+    }
+
+    /// 由 runner 在 `OuterStateChange` 时上报轮次在途状态；无 run 时为 no-op。
+    pub fn set_turn_in_flight(&self, user_id: &str, in_flight: bool) {
+        let map = self.inner.lock().unwrap();
+        if let Some(entry) = map.get(user_id) {
+            entry.turn_in_flight.store(in_flight, Ordering::Relaxed);
+        }
     }
 }
 
@@ -266,11 +312,15 @@ mod tests {
         let registry = PecoActiveRuns::new();
         let mut reg = registry.try_register("u1").expect("register");
 
-        assert!(
-            !registry.enqueue_query("u2", "hi".into()),
+        assert_eq!(
+            registry.enqueue_query("u2", "hi".into()),
+            EnqueueOutcome::NoRun,
             "无 run 入队失败"
         );
-        assert!(registry.enqueue_query("u1", "hi".into()));
+        assert_eq!(
+            registry.enqueue_query("u1", "hi".into()),
+            EnqueueOutcome::Enqueued
+        );
         assert!(registry.cancel("u1"));
         assert!(!registry.cancel("u2"), "无 run 取消失败");
 
@@ -282,6 +332,43 @@ mod tests {
             reg.control_rx.recv().await,
             Some(ControlCommand::Cancel)
         ));
+    }
+
+    #[tokio::test]
+    async fn enqueue_reports_backpressure_not_missing_run() {
+        let registry = PecoActiveRuns::new();
+        let _reg = registry.try_register("u1").expect("register");
+
+        // 不排空 control_rx：灌满容量为 32 的通道，第 33 条必须是背压而非「无 run」
+        for _ in 0..32 {
+            assert_eq!(
+                registry.enqueue_query("u1", "x".into()),
+                EnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            registry.enqueue_query("u1", "x".into()),
+            EnqueueOutcome::Backpressure,
+            "满队列不能误报成无 run"
+        );
+    }
+
+    #[test]
+    fn turn_in_flight_tracks_registration_and_runner_reports() {
+        let registry = PecoActiveRuns::new();
+        assert!(!registry.turn_in_flight("u1"), "无 run 时无在途轮次");
+
+        let reg = registry.try_register("u1").expect("register");
+        assert!(registry.turn_in_flight("u1"), "抢注即为即将开跑");
+
+        registry.set_turn_in_flight("u1", false);
+        assert!(!registry.turn_in_flight("u1"), "runner 上报轮次结束");
+
+        registry.set_turn_in_flight("ghost", true); // 无 run：no-op 不 panic
+        assert!(!registry.turn_in_flight("ghost"));
+
+        drop(reg);
+        assert!(!registry.turn_in_flight("u1"), "条目移除后回落为 false");
     }
 
     #[tokio::test]

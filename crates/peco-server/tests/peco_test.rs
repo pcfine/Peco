@@ -470,6 +470,186 @@ async fn test_stream_attaches_and_enqueues_into_active_run() {
     assert_eq!(text, "hello");
 }
 
+// ── POST /api/peco/stream/query（常驻连接复用，不新开 SSE） ────────────────
+
+#[tokio::test]
+async fn test_query_endpoint_enqueues_into_active_run() {
+    let app = TestApp::new().await;
+    let mut registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    let resp = app
+        .post("/api/peco/stream/query")
+        .json(&serde_json::json!({ "message": "  第二条消息  " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    let cmd = tokio::time::timeout(Duration::from_secs(2), registration.control_rx.recv())
+        .await
+        .expect("消息应在超时前排入控制通道")
+        .expect("控制通道不应关闭");
+    let peco_server::peco::active::ControlCommand::Query(text) = cmd else {
+        panic!("应为 Query 命令，实际 {cmd:?}");
+    };
+    assert_eq!(text, "第二条消息", "入队前应 trim");
+}
+
+#[tokio::test]
+async fn test_query_without_run_is_404() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/peco/stream/query")
+        .json(&serde_json::json!({ "message": "hello" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_query_rejects_blank_message() {
+    let app = TestApp::new().await;
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    for payload in ["", "   ", "\n\t "] {
+        let resp = app
+            .post("/api/peco/stream/query")
+            .json(&serde_json::json!({ "message": payload }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "空/纯空白消息应拒绝：{payload:?}");
+    }
+
+    // 缺字段 / 非法 JSON 同样 400（JsonRejection 归一化）
+    let resp = app
+        .post("/api/peco/stream/query")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// 控制通道积压必须报 409（背压）而不是 404（无 run）—— 后者会让调用方
+/// 白建一个 run，且掩盖真实的积压状态。
+#[tokio::test]
+async fn test_query_reports_backpressure_not_missing_run() {
+    let app = TestApp::new().await;
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    // 不排空 control_rx：灌满容量 32 的通道
+    let mut last_status = 0;
+    for _ in 0..33 {
+        let resp = app
+            .post("/api/peco/stream/query")
+            .json(&serde_json::json!({ "message": "x" }))
+            .send()
+            .await
+            .unwrap();
+        last_status = resp.status().as_u16();
+    }
+    assert_eq!(last_status, 409, "第 33 条应为背压 409");
+}
+
+#[tokio::test]
+async fn test_query_is_user_scoped() {
+    let app = TestApp::new().await;
+    let (_uid2, token2) = app.register_user2().await;
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    let resp = app
+        .post_as("/api/peco/stream/query", &token2)
+        .json(&serde_json::json!({ "message": "hello" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "不得投递到他人的 run");
+}
+
+/// 常驻连接下「附着 + POST 投递」的组合：消息只能到一次。
+#[tokio::test]
+async fn test_attach_then_query_delivers_exactly_once() {
+    let app = TestApp::new().await;
+    let mut registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    // 纯附着：不携带 message，只订阅事件流
+    let resp = app.get("/api/peco/stream").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = app
+        .post("/api/peco/stream/query")
+        .json(&serde_json::json!({ "message": "second" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let cmd = tokio::time::timeout(Duration::from_secs(2), registration.control_rx.recv())
+        .await
+        .expect("消息应在超时前送达")
+        .expect("控制通道不应关闭");
+    assert!(matches!(
+        cmd,
+        peco_server::peco::active::ControlCommand::Query(ref t) if t == "second"
+    ));
+
+    // 不得重复投递
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), registration.control_rx.recv())
+            .await
+            .is_err(),
+        "同一条消息不应投递两次"
+    );
+}
+
+#[tokio::test]
+async fn test_snapshot_reports_turn_in_flight() {
+    let app = TestApp::new().await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_running"], false);
+    assert_eq!(body["turn_in_flight"], false);
+
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    // 抢注即为即将开跑
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_running"], true);
+    assert_eq!(body["turn_in_flight"], true);
+
+    // runner 上报停靠（Idle）：run 仍在，但无轮次在途
+    app.state.peco_runs.set_turn_in_flight(&app.user_id, false);
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_running"], true);
+    assert_eq!(body["turn_in_flight"], false);
+}
+
 /// 完整流测试：需要 DEEPSEEK_API_KEY（与 chat 端的 SSE 测试同门槛）。
 /// 覆盖 发起 → 断开 → is_running → 重新附着 → cancel 的端到端链路。
 #[tokio::test]

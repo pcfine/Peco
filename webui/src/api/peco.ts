@@ -33,6 +33,16 @@ export function pecoAttachUrl(): string {
   return `${SSE_BASE}/stream`;
 }
 
+/**
+ * 向已注册的 run 排队一条消息（复用已持有的 SSE 连接，不新开连接）。
+ *
+ * 无活跃 run 时抛 404 —— 调用方应改走 `pecoStreamUrl` 的引导路径
+ * （附着到已有 run 或新建，语义自洽）；控制通道积压时抛 409。
+ */
+export async function queryPecoStream(message: string): Promise<void> {
+  await api.post(`${PATH}/stream/query`, { message });
+}
+
 /** 取消当前用户进行中的任务（无任务时服务端返回 404）。 */
 export async function cancelPecoStream(): Promise<{
   success: boolean;

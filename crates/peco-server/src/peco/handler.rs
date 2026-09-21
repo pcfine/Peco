@@ -4,6 +4,7 @@
 //
 // 提供：
 //   - GET  /api/peco/stream?message=xxx   SSE 流式对话（无 message 时为纯附着模式）
+//   - POST /api/peco/stream/query         向已注册的 run 排队消息（不新开连接）
 //   - POST /api/peco/stream/cancel        取消进行中的任务
 //   - GET  /api/peco/session               会话快照
 //   - DELETE /api/peco/session              清除/重置会话
@@ -44,7 +45,9 @@ use tracing::{info, warn};
 use crate::auth::AuthUser;
 use crate::chat::sse::{ChatSseEvent, UsageData, map_looper_event};
 use crate::error::ApiError;
-use crate::peco::active::{CancelWaitResult, ControlCommand, RunGuard, RunRegistration};
+use crate::peco::active::{
+    CancelWaitResult, ControlCommand, EnqueueOutcome, RunGuard, RunRegistration,
+};
 use crate::session_dto::{ItemView, group_input_items, turn_interrupted_reason};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
@@ -163,8 +166,13 @@ pub struct SessionSnapshotResponse {
     pub conversation_id: String,
     pub turns: Vec<TurnData>,
     pub total_usage: UsageData,
-    /// 是否有进行中的任务（前端据此重新附着到任务流）。
+    /// 是否有活跃 run（含停靠在 Idle 等下一句输入的 run）。
     pub is_running: bool,
+    /// 是否有轮次在途 —— 前端据此决定是否附着并补占位气泡。
+    ///
+    /// 与 `is_running` 的区别只在停靠态：run 已注册但当前无轮次在跑时
+    /// 该字段为 false，前端不应附着（否则会挂出一条永不填充的空占位）。
+    pub turn_in_flight: bool,
     /// 钉扎的历史摘要（compaction 产物）。无压缩历史时缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_summary: Option<String>,
@@ -217,21 +225,30 @@ pub async fn stream_chat(
     for _ in 0..3 {
         // ── 尝试附着到已有 run ─────────────────────────────────────────
         if let Some(rx) = state.peco_runs.subscribe(&user_id) {
-            let mut delivered = true;
-            if let Some(text) = &message {
+            match message
+                .as_ref()
                 // 先 subscribe 再 enqueue：持有一个 receiver 后 run 不可能被
                 // 回收（try_reclaim 要求订阅者数为 0），消息必然送达。
-                delivered = state.peco_runs.enqueue_query(&user_id, text.clone());
+                .map(|text| state.peco_runs.enqueue_query(&user_id, text.clone()))
+            {
+                // 纯附着，或消息已入队 → 桥接事件流
+                None | Some(EnqueueOutcome::Enqueued) => {
+                    return Ok(bridge_sse_response(Arc::clone(&state), user_id.clone(), rx));
+                }
+                Some(EnqueueOutcome::Backpressure) => {
+                    return Err(ApiError::Conflict(
+                        "peco control queue full（待处理消息积压）".into(),
+                    ));
+                }
+                // 订阅到的是正在收尾的 run：等它退出后重试（新建或附着到新 run）
+                Some(EnqueueOutcome::NoRun) => {
+                    state
+                        .peco_runs
+                        .wait_until_absent(&user_id, RUN_EXIT_WAIT)
+                        .await;
+                    continue;
+                }
             }
-            if delivered {
-                return Ok(bridge_sse_response(Arc::clone(&state), user_id.clone(), rx));
-            }
-            // 订阅到的是正在收尾的 run：等它退出后重试（新建或附着到新 run）
-            state
-                .peco_runs
-                .wait_until_absent(&user_id, RUN_EXIT_WAIT)
-                .await;
-            continue;
         }
 
         // ── 无 run：新建需要 message ───────────────────────────────────
@@ -401,6 +418,8 @@ async fn runner_loop(
                 Some(ev) => {
                     if let LooperEvent::OuterStateChange { to, .. } = &ev {
                         looper_idle = matches!(to, OuterState::Idle);
+                        // 停靠态 = 无轮次在途；附着方据此判断要不要补占位气泡
+                        runs.set_turn_in_flight(&user_id, !looper_idle);
                     }
                     // 无订阅者时广播失败是常态（Err 忽略）
                     let _ = event_tx.send(ev.clone());
@@ -513,6 +532,44 @@ pub async fn cancel_stream(
         success: true,
         message: Some("cancellation requested".to_string()),
     }))
+}
+
+/// `POST /api/peco/stream/query` 的请求体。
+#[derive(Debug, Deserialize)]
+pub struct QueryRequest {
+    pub message: String,
+}
+
+/// POST /api/peco/stream/query — 向已注册的 run 排队一条用户消息。
+///
+/// 客户端常驻一条 SSE 连接后，后续消息经本端点投递，不再新开连接
+/// （新连接会让同一批 broadcast 事件被重复消费）。无 run 时 404，
+/// 调用方应改走 `GET /stream?message=`（附着或新建，语义自洽）。
+pub async fn query_stream(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<QueryRequest>, JsonRejection>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    // 显式归一：缺字段 / 类型不符 / 非法 JSON / Content-Type 缺失一律 400
+    let Json(req) = body.map_err(|e| ApiError::BadRequest(format!("请求体不合法：{e}")))?;
+    let text = req.message.trim().to_string();
+    if text.is_empty() {
+        return Err(ApiError::BadRequest("message is required".into()));
+    }
+
+    match state.peco_runs.enqueue_query(&user_id, text) {
+        EnqueueOutcome::Enqueued => {
+            info!(user_id = %user_id, "Peco query enqueued into active run");
+            Ok(Json(SuccessResponse {
+                success: true,
+                message: None,
+            }))
+        }
+        EnqueueOutcome::NoRun => Err(ApiError::NotFound("no active peco run".into())),
+        EnqueueOutcome::Backpressure => Err(ApiError::Conflict(
+            "peco control queue full（待处理消息积压）".into(),
+        )),
+    }
 }
 
 // ── Handler: GET /api/peco/session ──────────────────────────────────────
@@ -647,6 +704,7 @@ pub async fn get_session_snapshot(
         turns,
         total_usage: usage,
         is_running: state.peco_runs.is_running(&user_id),
+        turn_in_flight: state.peco_runs.turn_in_flight(&user_id),
         pinned_summary,
         context_metrics,
     }))
@@ -1237,6 +1295,7 @@ pub async fn export_session(
 ///
 /// 注册到 `/api/peco`：
 /// - `GET /stream` — SSE 流式对话（无 message 时为纯附着模式）
+/// - `POST /stream/query` — 向已注册的 run 排队一条消息（不新开连接）
 /// - `POST /stream/cancel` — 取消进行中的任务
 /// - `GET /session` — 获取会话快照
 /// - `DELETE /session` — 清除会话（默认先归档，`?archive=false` 硬删除）
@@ -1252,6 +1311,7 @@ pub async fn export_session(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
+        .route("/stream/query", post(query_stream))
         .route("/stream/cancel", post(cancel_stream))
         .route("/session", get(get_session_snapshot).delete(clear_session))
         .route("/session/export", get(export_session))
