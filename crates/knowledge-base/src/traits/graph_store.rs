@@ -89,7 +89,56 @@ pub trait GraphStore: Send + Sync {
     async fn add_edges(&self, edges: &[KnowledgeEdge]) -> Result<(), KnowledgeError>;
 
     /// 移除与某个节点相连的所有边。
+    ///
+    /// **契约不完整，调用方不得依赖其字面语义**（三个后端的实现互不相同）：
+    /// - HelixDB 后端是**显式空操作** —— 图侧清理由 `DocumentStore::delete` 的
+    ///   `delete_document_cascade` 承担；
+    /// - 内存后端只清理**以 `node_id` 为端点**的边，分块级边（`NEXT_CHUNK` 等）
+    ///   不在清理范围内，会留下悬空边。
+    ///
+    /// 需要「确实删掉两个实体之间的边」时用 [`Self::remove_edges_between`]。
     async fn remove_node_edges(&self, node_id: &str) -> Result<(), KnowledgeError>;
+
+    /// 读取两个实体之间指定谓词的边（供存在性检查与审计快照）。
+    ///
+    /// `edge_type` 为 `None` 时匹配**两个方向**上的全部边；为 `Some` 时只匹配
+    /// `source_id → target_id` 一个方向，且按 `edge_type` 精确匹配（谓词无任何
+    /// 规范化，大小写敏感）。
+    ///
+    /// 返回的 `KnowledgeEdge` 必须携带真实 `weight`。
+    async fn edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<Vec<KnowledgeEdge>, KnowledgeError>;
+
+    /// 删除两个实体之间指定谓词的边，返回**删除前观测到的匹配边数**。
+    ///
+    /// **方向**：只删 `source_id → target_id`（有向），不删反向边 —— 与内存后端
+    /// 的 `retain` 语义一致；`edge_type` 为 `None` 时两个方向都删。
+    ///
+    /// **返回值是下界，不是精确删除数**：HelixDB 不报告删除条数（`DropEdgeLabeled`
+    /// 后的 `Count` 数的是流经的源节点数，边不存在时仍返回 1），因此这里取「删前
+    /// 读到的条数」。后置条件是「返回后 `(source, target, edge_type)` 已无匹配边」，
+    /// 但「读-删」之间存在并发窗口（后台记忆提取会并发写同一个图），实际删除数可能
+    /// 多于返回值。调用方不得把它当作精确删除数做账。
+    ///
+    /// `Ok(0)` 表示没有匹配的边。
+    async fn remove_edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<usize, KnowledgeError>;
+
+    /// 删除单个节点，返回**删除前观测到的关联边数**。
+    ///
+    /// `cascade == false` 且该节点仍有边时返回 `KnowledgeError::InvalidInput`；
+    /// 为空才继续删除。`cascade == true` 时删除节点并级联带走其双向全部关联边。
+    ///
+    /// 返回值同样是下界，理由见 [`Self::remove_edges_between`]。
+    async fn remove_node(&self, node_id: &str, cascade: bool) -> Result<usize, KnowledgeError>;
 
     /// 从起始节点沿指定边类型进行 BFS 遍历。
     async fn traverse(

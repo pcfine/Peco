@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+use super::{edge_matches_between, remove_node_from_memory};
 use crate::error::KnowledgeError;
 use crate::traits::graph_store::*;
 
@@ -64,6 +65,41 @@ impl GraphStore for MemoryGraphStore {
         let mut e = self.edges.write().await;
         e.retain(|edge| edge.source_id != nid && edge.target_id != nid);
         Ok(())
+    }
+
+    async fn edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<Vec<KnowledgeEdge>, KnowledgeError> {
+        let edges = self.edges.read().await;
+        Ok(edges
+            .iter()
+            .filter(|e| edge_matches_between(e, source_id, target_id, edge_type))
+            .cloned()
+            .collect())
+    }
+
+    async fn remove_edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<usize, KnowledgeError> {
+        let mut e = self.edges.write().await;
+        let before = e.len();
+        e.retain(|edge| !edge_matches_between(edge, source_id, target_id, edge_type));
+        Ok(before - e.len())
+    }
+
+    async fn remove_node(&self, node_id: &str, cascade: bool) -> Result<usize, KnowledgeError> {
+        let removed_edges = {
+            let mut e = self.edges.write().await;
+            remove_node_from_memory(&mut e, node_id, cascade)?
+        };
+        self.nodes.write().await.remove(node_id);
+        Ok(removed_edges)
     }
 
     async fn traverse(
@@ -352,5 +388,201 @@ mod tests {
         .unwrap();
 
         assert_eq!(gs.edge_count().await, 1);
+    }
+
+    // ── 边/节点删除原语 ──────────────────────────────────────────────────
+
+    fn edge(source: &str, target: &str, label: &str, weight: f32) -> KnowledgeEdge {
+        KnowledgeEdge {
+            source_id: source.into(),
+            target_id: target.into(),
+            edge_type: EdgeType::Custom(label.into()),
+            weight,
+            properties: HashMap::new(),
+        }
+    }
+
+    async fn seeded() -> MemoryGraphStore {
+        let gs = MemoryGraphStore::new();
+        gs.add_edges(&[
+            edge("A", "B", "朋友", 0.9),
+            edge("B", "A", "反向朋友", 0.5),
+            edge("A", "C", "朋友", 0.4),
+        ])
+        .await
+        .unwrap();
+        gs
+    }
+
+    /// 有向命中：只删 `source → target`，反向边完好。
+    #[tokio::test]
+    async fn remove_edges_between_is_directed() {
+        let gs = seeded().await;
+        let t = EdgeType::Custom("朋友".into());
+
+        let matched = gs.edges_between("A", "B", Some(&t)).await.unwrap();
+        assert_eq!(matched.len(), 1, "只有 A→B 这一条");
+        assert!(
+            (matched[0].weight - 0.9).abs() < f32::EPSILON,
+            "带真实 weight"
+        );
+
+        assert_eq!(
+            gs.remove_edges_between("A", "B", Some(&t)).await.unwrap(),
+            1
+        );
+        assert_eq!(gs.edge_count().await, 2, "B→A 与 A→C 都应存活");
+        assert!(
+            gs.edges_between("A", "B", Some(&t))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 谓词不匹配时不删（谓词是全匹配，无规范化）。
+    #[tokio::test]
+    async fn remove_edges_between_matches_predicate_exactly() {
+        let gs = seeded().await;
+        let wrong = EdgeType::Custom("同事".into());
+
+        assert_eq!(
+            gs.remove_edges_between("A", "B", Some(&wrong))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(gs.edge_count().await, 3);
+    }
+
+    /// `edge_type: None` 双向匹配：正反两条一起删。
+    #[tokio::test]
+    async fn remove_edges_between_wildcard_covers_both_directions() {
+        let gs = seeded().await;
+
+        assert_eq!(gs.remove_edges_between("A", "B", None).await.unwrap(), 2);
+        assert_eq!(gs.edge_count().await, 1, "只剩 A→C");
+        assert!(gs.edges_between("A", "B", None).await.unwrap().is_empty());
+    }
+
+    /// 并行边全删，计数如实（内存后端 `add_edges` 只做 extend，不去重）。
+    #[tokio::test]
+    async fn remove_edges_between_counts_parallel_edges() {
+        let gs = MemoryGraphStore::new();
+        gs.add_edges(&[
+            edge("A", "B", "朋友", 0.9),
+            edge("A", "B", "朋友", 0.8),
+            edge("A", "B", "朋友", 0.7),
+        ])
+        .await
+        .unwrap();
+
+        let t = EdgeType::Custom("朋友".into());
+        assert_eq!(
+            gs.remove_edges_between("A", "B", Some(&t)).await.unwrap(),
+            3
+        );
+        assert_eq!(gs.edge_count().await, 0);
+    }
+
+    /// 无匹配返回 0（不是错误）。
+    #[tokio::test]
+    async fn remove_edges_between_no_match_returns_zero() {
+        let gs = seeded().await;
+        let t = EdgeType::Custom("朋友".into());
+
+        assert_eq!(
+            gs.remove_edges_between("C", "A", Some(&t)).await.unwrap(),
+            0
+        );
+        assert_eq!(gs.edge_count().await, 3);
+    }
+
+    /// `cascade: false` 且有残留边 → `InvalidInput`，且**什么都没删**。
+    #[tokio::test]
+    async fn remove_node_without_cascade_is_rejected_when_edges_remain() {
+        let gs = seeded().await;
+        gs.upsert_node(GraphNode {
+            id: "A".into(),
+            labels: vec!["Entity".into()],
+            properties: HashMap::new(),
+            distance: 0,
+        })
+        .await
+        .unwrap();
+
+        let err = gs.remove_node("A", false).await.unwrap_err();
+        assert!(matches!(err, KnowledgeError::InvalidInput(_)), "{err:?}");
+        assert_eq!(gs.edge_count().await, 3, "拒绝时不得动边");
+        assert!(
+            gs.get_node("A").await.unwrap().is_some(),
+            "拒绝时不得动节点"
+        );
+    }
+
+    /// `cascade: true` → 边与节点俱删，返回删掉的边数。
+    #[tokio::test]
+    async fn remove_node_with_cascade_deletes_edges_and_node() {
+        let gs = seeded().await;
+        gs.upsert_node(GraphNode {
+            id: "A".into(),
+            labels: vec!["Entity".into()],
+            properties: HashMap::new(),
+            distance: 0,
+        })
+        .await
+        .unwrap();
+
+        // A 关联三条：A→B、B→A（反向）、A→C
+        assert_eq!(gs.remove_node("A", true).await.unwrap(), 3);
+        assert_eq!(gs.edge_count().await, 0);
+        assert!(gs.get_node("A").await.unwrap().is_none());
+    }
+
+    /// 无边节点 `cascade: false` 直接删掉，返回 0。
+    #[tokio::test]
+    async fn remove_node_without_edges_succeeds_without_cascade() {
+        let gs = MemoryGraphStore::new();
+        gs.upsert_node(GraphNode {
+            id: "Lonely".into(),
+            labels: vec!["Entity".into()],
+            properties: HashMap::new(),
+            distance: 0,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(gs.remove_node("Lonely", false).await.unwrap(), 0);
+        assert!(gs.get_node("Lonely").await.unwrap().is_none());
+    }
+
+    /// 孤儿行为回归：删边后对端实体节点仍然存活（删一条事实不该带走实体）。
+    #[tokio::test]
+    async fn removing_an_edge_leaves_the_peer_node_alive() {
+        let gs = seeded().await;
+        for id in ["A", "B", "C"] {
+            gs.upsert_node(GraphNode {
+                id: id.into(),
+                labels: vec!["Entity".into()],
+                properties: HashMap::new(),
+                distance: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        let t = EdgeType::Custom("朋友".into());
+        gs.remove_edges_between("A", "C", Some(&t)).await.unwrap();
+
+        assert!(gs.get_node("C").await.unwrap().is_some(), "C 应存活");
+        // 且 C 不再作为 A 的邻居出现（遍历结果里没有它）
+        let steps = gs
+            .traverse("A", &[], TraversalDirection::Outgoing, 1)
+            .await
+            .unwrap();
+        assert!(
+            !steps.iter().any(|s| s.node.id == "C"),
+            "C 不应再是 A 的邻居"
+        );
     }
 }

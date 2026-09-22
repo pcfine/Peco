@@ -24,8 +24,9 @@ pub use deps::{
 };
 pub use fetch::Fetch;
 pub use knowledge_tools::{
-    AddFactsToKnowledgeBase, AddToKnowledgeBase, DeleteKbDocument, DeleteKbDocuments,
-    GetKnowledgeBaseDocs, ListKnowledgeBases, QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
+    AddFactsToKnowledgeBase, AddToKnowledgeBase, DeleteEntity, DeleteEntityFact, DeleteEntityFacts,
+    DeleteKbDocument, DeleteKbDocuments, GetKnowledgeBaseDocs, ListKnowledgeBases,
+    QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
 pub use shell::{ShellExec, ShellTool};

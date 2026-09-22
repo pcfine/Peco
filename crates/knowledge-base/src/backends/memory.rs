@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+use super::{edge_matches_between, remove_node_from_memory};
 use crate::error::KnowledgeError;
 use crate::traits::*;
 use crate::types::*;
@@ -325,6 +326,41 @@ impl GraphStore for InMemoryBackend {
         let mut e = self.edges.write().await;
         e.retain(|edge| edge.source_id != nid && edge.target_id != nid);
         Ok(())
+    }
+
+    async fn edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<Vec<KnowledgeEdge>, KnowledgeError> {
+        let edges = self.edges.read().await;
+        Ok(edges
+            .iter()
+            .filter(|e| edge_matches_between(e, source_id, target_id, edge_type))
+            .cloned()
+            .collect())
+    }
+
+    async fn remove_edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<usize, KnowledgeError> {
+        let mut e = self.edges.write().await;
+        let before = e.len();
+        e.retain(|edge| !edge_matches_between(edge, source_id, target_id, edge_type));
+        Ok(before - e.len())
+    }
+
+    async fn remove_node(&self, node_id: &str, cascade: bool) -> Result<usize, KnowledgeError> {
+        let removed_edges = {
+            let mut e = self.edges.write().await;
+            remove_node_from_memory(&mut e, node_id, cascade)?
+        };
+        self.nodes.write().await.remove(node_id);
+        Ok(removed_edges)
     }
 
     async fn traverse(
@@ -885,5 +921,95 @@ mod tests {
         // 不相关的查询
         let results = FullTextIndex::search(&be, "苹果", 5, None).await.unwrap();
         assert!(results.is_empty(), "不相关的中文查询应返回空");
+    }
+
+    // ── 边/节点删除原语 ──────────────────────────────────────────────────
+    //
+    // `InMemoryBackend` 与 `MemoryGraphStore` 共用 `backends::mod` 里的匹配谓词与
+    // 节点删除实现，此处覆盖「接线接对了」：后端自己的 `edges` / `nodes` 字段确实
+    // 被读写，而不是走了某个空实现。
+
+    fn fact_edge(source: &str, target: &str, label: &str) -> KnowledgeEdge {
+        KnowledgeEdge {
+            source_id: source.into(),
+            target_id: target.into(),
+            edge_type: EdgeType::Custom(label.into()),
+            weight: 0.95,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_edges_between_deletes_only_the_matching_direction() {
+        let be = InMemoryBackend::new();
+        be.add_edges(&[
+            fact_edge("小C", "chen", "朋友"),
+            fact_edge("chen", "小C", "反向"),
+        ])
+        .await
+        .unwrap();
+
+        let t = EdgeType::Custom("朋友".into());
+        assert_eq!(
+            be.edges_between("小C", "chen", Some(&t))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            be.remove_edges_between("小C", "chen", Some(&t))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            be.edges_between("小C", "chen", Some(&t))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            be.edges_between("chen", "小C", None).await.unwrap().len(),
+            1,
+            "反向边应存活"
+        );
+    }
+
+    #[tokio::test]
+    async fn edges_between_reports_real_weight() {
+        let be = InMemoryBackend::new();
+        be.add_edge(fact_edge("A", "B", "朋友")).await.unwrap();
+
+        let t = EdgeType::Custom("朋友".into());
+        let found = be.edges_between("A", "B", Some(&t)).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert!((found[0].weight - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn remove_node_respects_cascade() {
+        let be = InMemoryBackend::new();
+        be.add_edges(&[fact_edge("A", "B", "朋友"), fact_edge("C", "A", "同事")])
+            .await
+            .unwrap();
+        be.upsert_node(GraphNode {
+            id: "A".into(),
+            labels: vec!["Entity".into()],
+            properties: HashMap::new(),
+            distance: 0,
+        })
+        .await
+        .unwrap();
+
+        let err = be.remove_node("A", false).await.unwrap_err();
+        assert!(matches!(err, KnowledgeError::InvalidInput(_)), "{err:?}");
+        assert!(be.get_node("A").await.unwrap().is_some());
+
+        // 双向各一条 → 2
+        assert_eq!(be.remove_node("A", true).await.unwrap(), 2);
+        assert!(be.get_node("A").await.unwrap().is_none());
+        assert!(be.edges_between("A", "B", None).await.unwrap().is_empty());
+        assert!(be.edges_between("C", "A", None).await.unwrap().is_empty());
     }
 }

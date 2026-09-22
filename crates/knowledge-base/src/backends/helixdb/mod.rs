@@ -284,20 +284,7 @@ impl HelixDbBackend {
     /// 未命中任何固定标签的一律归为 `EdgeType::Custom` —— `add_facts` 写入的
     /// 关系边就是这样（标签即谓词文本）。
     fn edge_type_from_label(&self, label: &str) -> EdgeType {
-        let s = &self.schema;
-        if label == s.contains_edge {
-            EdgeType::Contains
-        } else if label == s.related_edge {
-            EdgeType::RelatedTo
-        } else if label == s.next_fragment_edge {
-            EdgeType::NextChunk
-        } else if label == s.belongs_to_edge {
-            EdgeType::BelongsTo
-        } else if label == MENTIONS_EDGE {
-            EdgeType::Mentions
-        } else {
-            EdgeType::Custom(label.to_string())
-        }
+        edge_type_for_label(&self.schema, label)
     }
 
     /// 将 TraversalDirection 映射为 HelixDB 方向字符串。
@@ -347,6 +334,25 @@ impl HelixDbBackend {
         steps.extend(parse_traversed_nodes(&response, start_node, max_depth));
 
         Ok(steps)
+    }
+
+    /// 统计某个节点**双向**关联的全部边数（不限标签）。
+    ///
+    /// 走 `OutE` + `InE` 两次通配读，各数一次边流行数 —— 与
+    /// [`Self::adjacent_steps`] 的 `dirs` 表同口径。用于 `remove_node` 的
+    /// 「有边则拒绝级联」判定与级联删除数的取数（`Drop` 的响应 `count` 恒为 0，
+    /// 拿不到任何回执）。
+    async fn count_incident_edges(&self, node_id: &str) -> Result<usize, KnowledgeError> {
+        let mut total = 0;
+        for (edge_step, node_step) in [("OutE", "OutN"), ("InE", "InN")] {
+            let query =
+                queries::edges_between_nodes(&self.schema, node_id, edge_step, node_step, None);
+            let response = self.client.execute_read(query).await?;
+            total += extract_properties(&response, "edges")
+                .map(|rows| rows.len())
+                .unwrap_or(0);
+        }
+        Ok(total)
     }
 
     /// 起始节点的直连边 → `TraversalStep`，`via_edge` 为边的真实标签。
@@ -863,10 +869,121 @@ impl GraphStore for HelixDbBackend {
     }
 
     async fn remove_node_edges(&self, node_id: &str) -> Result<(), KnowledgeError> {
-        // HelixDB 删除节点时自动级联删除关联边。
-        // 如果只需要删边而不删节点，需要单独处理。
+        // 刻意的空操作：HelixDB 删除节点时自动级联删除关联边，而「只删边不删节点」
+        // 的语义由 `remove_edges_between` 承担（它有可判定的返回值，本方法没有）。
+        // 文档删除链路的图侧清理由 `delete_document_cascade` 兜底，不依赖这里。
         let _ = node_id;
         Ok(())
+    }
+
+    async fn edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<Vec<KnowledgeEdge>, KnowledgeError> {
+        // `Some(t)` 只查一个方向（有向），`None` 查两个方向。方向与关联键的组合
+        // 照抄 `adjacent_steps`：`OutE` 的对端是 `$to`、`InE` 的对端是 `$from`。
+        let dirs: &[(&str, &str, &str)] = if edge_type.is_some() {
+            &[("OutE", "OutN", "$to")]
+        } else {
+            &[("OutE", "OutN", "$to"), ("InE", "InN", "$from")]
+        };
+
+        let label = edge_type.map(|et| self.edge_label(et));
+        let mut found = Vec::new();
+
+        for (edge_step, node_step, neighbor_key) in dirs {
+            let query = queries::edges_between_nodes(
+                &self.schema,
+                source_id,
+                edge_step,
+                node_step,
+                label.as_deref(),
+            );
+            let response = self.client.execute_read(query).await?;
+            found.extend(collect_edges_to_target(
+                &self.schema,
+                &response,
+                source_id,
+                target_id,
+                neighbor_key,
+                label.as_deref(),
+            ));
+        }
+
+        Ok(found)
+    }
+
+    async fn remove_edges_between(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        edge_type: Option<&EdgeType>,
+    ) -> Result<usize, KnowledgeError> {
+        // 「先读后删」：HelixDB 不报告删除条数，读到的就是删掉的（无并发时）。
+        // 返回值是下界 —— 见 trait 文档。
+        let matched = self.edges_between(source_id, target_id, edge_type).await?;
+        if matched.is_empty() {
+            return Ok(0);
+        }
+
+        // `DropEdgeLabeled` 要求具体标签，无法通配：`None` 分支先按读到的标签去重，
+        // 再逐标签删；每个标签都要发**两个方向**，否则反向边会残留。
+        let labels: Vec<String> = if let Some(et) = edge_type {
+            vec![self.edge_label(et)]
+        } else {
+            let mut seen: Vec<String> = Vec::new();
+            for edge in &matched {
+                let label = self.edge_label(&edge.edge_type);
+                if !seen.contains(&label) {
+                    seen.push(label);
+                }
+            }
+            seen
+        };
+
+        for label in &labels {
+            self.client
+                .execute_write(queries::drop_edge_between(
+                    &self.schema,
+                    source_id,
+                    target_id,
+                    label,
+                ))
+                .await?;
+            if edge_type.is_none() {
+                // 反向：同一条无向语义的删除，端点对调。
+                self.client
+                    .execute_write(queries::drop_edge_between(
+                        &self.schema,
+                        target_id,
+                        source_id,
+                        label,
+                    ))
+                    .await?;
+            }
+        }
+
+        Ok(matched.len())
+    }
+
+    async fn remove_node(&self, node_id: &str, cascade: bool) -> Result<usize, KnowledgeError> {
+        // 删节点前必须先数清关联边：HelixDB 的 `Drop` 响应 `count` 恒为 0，
+        // 级联删了几条边没有任何回执。
+        let attached = self.count_incident_edges(node_id).await?;
+
+        if attached > 0 && !cascade {
+            return Err(KnowledgeError::InvalidInput(format!(
+                "Node '{node_id}' still has {attached} edges; pass cascade=true to delete it together with them"
+            )));
+        }
+
+        self.client
+            .execute_write(queries::remove_node_by_id(&self.schema, node_id))
+            .await?;
+
+        Ok(attached)
     }
 
     /// 插入节点（按 ID 幂等）。
@@ -1235,6 +1352,97 @@ fn parse_path_results(
     }
 
     (doc_scores, graph_nodes)
+}
+
+/// 从 [`queries::edges_between_nodes`] 的读响应里取出「另一端点恰好是 `target_id`」
+/// 的边，并还原成 `KnowledgeEdge`。
+///
+/// 关联键与 [`HelixDbBackend::adjacent_steps`] 一致：`edges` 行的端点内部 `$id`
+/// （`$to` / `$from`）== `nodes` 行的 `internal_id`。**不依赖行序**，也不依赖
+/// `Project` 能否作用在边流上。
+///
+/// `neighbor_key` 决定这条边在库里原本的朝向：`"$to"` 表示 `start_id → target_id`，
+/// `"$from"` 表示 `target_id → start_id`。返回的 `KnowledgeEdge` 如实携带该朝向，
+/// 不因查询方向而反转。
+fn collect_edges_to_target(
+    schema: &HelixSchema,
+    response: &Value,
+    start_id: &str,
+    target_id: &str,
+    neighbor_key: &str,
+    edge_label: Option<&str>,
+) -> Vec<KnowledgeEdge> {
+    let outgoing = neighbor_key == "$to";
+
+    // 邻接点身份表：内部 `$id` → 稳定 id
+    let identity: HashMap<String, String> = extract_properties(response, "nodes")
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|row| {
+                    let internal = parse_id_value(row.get("internal_id")?)?;
+                    let node_id = parse_id_value(row.get("node_id")?)?;
+                    Some((internal, node_id))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rows = extract_properties(response, "edges")
+        .map(|arr| arr.as_slice())
+        .unwrap_or_default();
+
+    rows.iter()
+        .filter_map(|row| {
+            let neighbor = row.get(neighbor_key).and_then(parse_id_value)?;
+            let label = row.get("$label").and_then(|v| v.as_str())?;
+            // **标签必须在调用方侧再滤一遍**：实测确认 `OutE: "<label>"` 在本版
+            // HelixDB 上不按标签过滤边流 —— 同一对端点间的「朋友」「年龄」两条边
+            // 会一起返回（`Query` 的 `nodes` 分支因为节点去重看不出来，只有
+            // `edges` 分支暴露）。少了这道过滤，`read_fact` 会把别的谓词当成目标
+            // 事实读回来，`delete_fact` 的「先读计数」也会跟着虚高。
+            if edge_label.is_some_and(|want| want != label) {
+                return None;
+            }
+            // 对端稳定 id 认不出来（身份表缺行）时跳过 —— 宁可少报一条边，
+            // 也不把边错配到别的实体上。
+            if identity.get(&neighbor)? != target_id {
+                return None;
+            }
+            let (source_id, target_id) = if outgoing {
+                (start_id.to_string(), target_id.to_string())
+            } else {
+                (target_id.to_string(), start_id.to_string())
+            };
+
+            Some(KnowledgeEdge {
+                source_id,
+                target_id,
+                edge_type: edge_type_for_label(schema, label),
+                weight: row.get("weight").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                properties: HashMap::new(),
+            })
+        })
+        .collect()
+}
+
+/// 把 HelixDB 返回的边标签还原成 `EdgeType`（自由函数形态，供非方法上下文使用）。
+///
+/// 与 [`HelixDbBackend::edge_type_from_label`] 是同一份口径 —— 后者直接委托到这里，
+/// 避免 schema 标签在两处各写一遍后漂移。
+fn edge_type_for_label(schema: &HelixSchema, label: &str) -> EdgeType {
+    if label == schema.contains_edge {
+        EdgeType::Contains
+    } else if label == schema.related_edge {
+        EdgeType::RelatedTo
+    } else if label == schema.next_fragment_edge {
+        EdgeType::NextChunk
+    } else if label == schema.belongs_to_edge {
+        EdgeType::BelongsTo
+    } else if label == MENTIONS_EDGE {
+        EdgeType::Mentions
+    } else {
+        EdgeType::Custom(label.to_string())
+    }
 }
 
 /// 按 document_id 去重，保留每个 doc_id 的最高分数。
@@ -1627,5 +1835,327 @@ mod tests {
             !matches!(err, KnowledgeError::DimensionMismatch { .. }),
             "维度一致的 embedding 不应触发维度守卫，实际为 {err:?}"
         );
+    }
+
+    // ── 身份投影口径：跨 API 边界的 id 必须是 id_property，不是内部 $id ──────
+    //
+    // 断言的靶子是**项目投影的来源字段**（`source`），不是别名：别名可以撞名，
+    // 来源字段才是「这个 id 是谁」的唯一证据。
+
+    /// 取某条 query 的最后一个 `Project` 步骤里某个 alias 对应的 `source`。
+    fn projected_source(q: &serde_json::Value, query_name: &str, alias: &str) -> String {
+        let queries = q["query"]["queries"].as_array().unwrap();
+        let query = queries
+            .iter()
+            .find(|c| c["Query"]["name"] == query_name)
+            .unwrap_or_else(|| panic!("查询 '{query_name}' 不存在"));
+        let steps = query["Query"]["steps"].as_array().unwrap();
+        let project = steps
+            .iter()
+            .rev()
+            .find_map(|s| s.get("Project"))
+            .expect("应存在 Project 步骤");
+        project
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["alias"] == alias)
+            .unwrap_or_else(|| panic!("投影 '{alias}' 不存在"))["source"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `get_document_by_id` 的 `id` 必须是内容哈希（`id_property`）。
+    /// 投影成内部 `$id` 会让读回来的 `Document.id` 无法回传给删除接口。
+    #[test]
+    fn get_document_by_id_projects_stable_id() {
+        let schema = HelixSchema::default();
+        let q = queries::get_document_by_id(&schema, "doc-hash-1");
+
+        let source = projected_source(&q, "doc", "id");
+        assert_eq!(source, schema.id_property);
+        assert_ne!(source, "$id", "内部自增 id 不得跨 API 边界");
+    }
+
+    /// `get_document_chunks` 的 `chunk_id` 必须是内容哈希（`id_property`）——
+    /// 调用方把它交给 `delete_chunk_by_id`，而后者按 `id_property` 匹配。
+    #[test]
+    fn get_document_chunks_projects_stable_chunk_id() {
+        let schema = HelixSchema::default();
+        let q = queries::get_document_chunks(&schema, "doc-hash-1");
+
+        let source = projected_source(&q, "chunks", "chunk_id");
+        assert_eq!(source, schema.id_property);
+        assert_ne!(source, "$id");
+    }
+
+    /// 图扩展路径的 `document_id` 必须是内容哈希：它经 `SearchResult.document_id`
+    /// 流到工具面，再被 `get_document_by_id` / `delete_document_cascade` 取用。
+    #[test]
+    fn graph_expansion_projects_stable_document_id() {
+        let schema = HelixSchema::default();
+
+        let combined = queries::combined_search_query(
+            &schema,
+            &crate::traits::combined_search::CombinedQuery {
+                query_text: "q".into(),
+                query_vector: vec![0.1, 0.2],
+                vector_top_k: 5,
+                text_top_k: 5,
+                graph_expansion_depth: 1,
+                graph_edge_types: vec![],
+                fusion: crate::traits::combined_search::RrfConfig::default(),
+                filters: None,
+            },
+        );
+        for path in ["vector_path", "text_path"] {
+            let source = projected_source(&combined, path, "document_id");
+            assert_eq!(source, schema.id_property, "{path} 的 document_id 口径");
+        }
+
+        let expanded = queries::expand_from_chunks(&schema, &["7".into()], &["rel".into()], 1);
+        let source = projected_source(&expanded, "expanded", "document_id");
+        assert_eq!(source, schema.id_property);
+    }
+
+    // ── 图删除查询形状 ──────────────────────────────────────────────────────
+    //
+    // 这些断言把「哪些写法在 HelixDB 上会 400 / 静默失效」固化成测试，
+    // 防止后续有人把已验证的形状「简化」成不可用的形式。
+
+    /// `edges_between` 的读形状：`start` / `edges` / `nodes` 三查询，
+    /// 标签进 `{edge_step: label}` 位置（`None` 时通配 `null`），
+    /// 节点流投影内部 `$id`（join 键）+ 稳定 id（筛选用）。
+    #[test]
+    fn edges_between_nodes_shape() {
+        let schema = HelixSchema::default();
+
+        let q =
+            queries::edges_between_nodes(&schema, "entity:Entity:a", "OutE", "OutN", Some("朋友"));
+        let queries_arr = q["query"]["queries"].as_array().unwrap();
+        assert_eq!(queries_arr.len(), 3);
+        assert_eq!(
+            queries_arr[1]["Query"]["steps"][1],
+            serde_json::json!({"OutE": "朋友"})
+        );
+        assert_eq!(
+            queries_arr[2]["Query"]["steps"][2],
+            serde_json::json!({"OutN": null})
+        );
+        assert_eq!(
+            queries_arr[2]["Query"]["steps"][3],
+            serde_json::json!({"Project": [
+                {"source": "$id", "alias": "internal_id"},
+                {"source": schema.id_property, "alias": "node_id"},
+                {"source": "name", "alias": "name"}
+            ]}),
+            "join 键是内部 $id，筛选键才是稳定 id"
+        );
+
+        // `None` → 通配 null（与 adjacent_steps 同形状）
+        let wild = queries::edges_between_nodes(&schema, "entity:Entity:a", "OutE", "OutN", None);
+        assert_eq!(
+            wild["query"]["queries"][1]["Query"]["steps"][1],
+            serde_json::json!({"OutE": null})
+        );
+    }
+
+    /// `adjacent_labeled_nodes` 与 `edges_between_nodes(None)` 必须产出**逐字节相同**
+    /// 的请求 —— 两者共用同一份形状实现，防止将来只改一处造成口径分叉。
+    #[test]
+    fn adjacent_and_edges_between_share_one_shape() {
+        let schema = HelixSchema::default();
+        assert_eq!(
+            queries::adjacent_labeled_nodes(&schema, "n1", "OutE", "OutN"),
+            queries::edges_between_nodes(&schema, "n1", "OutE", "OutN", None)
+        );
+    }
+
+    /// `DropEdgeLabeled` 的 payload 必须是 `{"label":…,"to":{"Var":…}}` 枚举包装。
+    /// 回归报告实测的证伪表：裸值 400、`to` 不能是 `All`、不能作源步骤。
+    #[test]
+    fn drop_edge_between_shape() {
+        let schema = HelixSchema::default();
+        let q = queries::drop_edge_between(&schema, "entity:Entity:a", "entity:Entity:b", "朋友");
+
+        assert_eq!(q["request_type"], "write");
+        let queries_arr = q["query"]["queries"].as_array().unwrap();
+        assert_eq!(queries_arr.len(), 3, "s / t / d 三条");
+
+        let d_steps = queries_arr[2]["Query"]["steps"].as_array().unwrap();
+        assert_eq!(
+            d_steps[0],
+            serde_json::json!({"N": {"Var": "s"}}),
+            "DropEdgeLabeled 不能作源步骤 —— 前面必须先是 N(Var)"
+        );
+        let payload = &d_steps[1]["DropEdgeLabeled"];
+        assert_eq!(payload["label"], "朋友");
+        assert_eq!(
+            payload["to"],
+            serde_json::json!({"Var": "t"}),
+            "to 必须是节点引用枚举，裸值会 400"
+        );
+        assert!(payload["to"].is_object(), "to 不得为裸字符串/整数");
+    }
+
+    /// 两个端点都按稳定 `id_property` 选中（与 `compute_entity_id` 直接对接），
+    /// 且比较值是**裸** `{"String":…}` —— 用 `prop_str` 的 `{"Value":{…}}`
+    /// 包装会让 HelixDB 报 `unknown variant Value`。
+    #[test]
+    fn drop_edge_between_selects_endpoints_by_stable_id() {
+        let schema = HelixSchema::default();
+        let q = queries::drop_edge_between(&schema, "src-stable", "tgt-stable", "朋友");
+        let queries_arr = q["query"]["queries"].as_array().unwrap();
+
+        assert_eq!(
+            queries_arr[0]["Query"]["steps"][0],
+            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "src-stable"}]}})
+        );
+        assert_eq!(
+            queries_arr[1]["Query"]["steps"][0],
+            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "tgt-stable"}]}})
+        );
+    }
+
+    /// `remove_node` 的形状：`NWhere(id) → Drop → Count`。
+    /// `Drop` 自动级联双向边，因此**不**需要先删边。
+    #[test]
+    fn remove_node_shape() {
+        let schema = HelixSchema::default();
+        let q = queries::remove_node_by_id(&schema, "entity:Entity:a");
+
+        assert_eq!(q["request_type"], "write");
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            steps[0],
+            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "entity:Entity:a"}]}})
+        );
+        assert_eq!(steps[1], serde_json::json!({"Drop": null}));
+        assert_eq!(steps[2], serde_json::json!({"Count": null}));
+    }
+
+    /// `collect_edges_to_target` 按「`edges.$to` == `nodes.internal_id`」关联，
+    /// 只留下稳定 id 等于目标的边，并如实携带朝向与 weight。
+    #[test]
+    fn collect_edges_joins_on_internal_id_and_filters_by_stable_id() {
+        let schema = HelixSchema::default();
+        // edges: 内部 8 →(朋友)→ 内部 9；内部 8 →(同事)→ 内部 10
+        // nodes: 内部 9 == 稳定 id "chen"；内部 10 == 稳定 id "bob"
+        let response = serde_json::json!({
+            "edges": {"properties": [
+                {"$label": "朋友", "$id": 6, "$from": 8, "$to": 9, "weight": 0.95},
+                {"$label": "同事", "$id": 7, "$from": 8, "$to": 10, "weight": 0.5}
+            ]},
+            "nodes": {"properties": [
+                {"internal_id": 9, "node_id": "chen", "name": "chen"},
+                {"internal_id": 10, "node_id": "bob", "name": "bob"}
+            ]}
+        });
+
+        let found = collect_edges_to_target(&schema, &response, "小C", "chen", "$to", None);
+        assert_eq!(found.len(), 1, "只有指向 chen 的那条");
+        assert_eq!(found[0].source_id, "小C");
+        assert_eq!(found[0].target_id, "chen");
+        assert_eq!(found[0].edge_type, EdgeType::Custom("朋友".into()));
+        assert!((found[0].weight - 0.95).abs() < 1e-6);
+
+        // 反向（InE，关联键 $from）：carol →(喜欢)→ 内部 11
+        let reverse = serde_json::json!({
+            "edges": {"properties": [
+                {"$label": "喜欢", "$id": 9, "$from": 11, "$to": 8, "weight": 0.9}
+            ]},
+            "nodes": {"properties": [
+                {"internal_id": 11, "node_id": "carol", "name": "carol"}
+            ]}
+        });
+        let found = collect_edges_to_target(&schema, &reverse, "小C", "carol", "$from", None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].source_id, "carol",
+            "朝向如实还原，不因查询方向反转"
+        );
+        assert_eq!(found[0].target_id, "小C");
+    }
+
+    /// **实测回归**：`OutE: "<label>"` 在本版 HelixDB 上不按标签过滤边流 ——
+    /// 同一对端点间的多条不同标签边会一起返回。调用方必须按 `edge_label` 再滤一遍，
+    /// 否则 `read_fact(subject, predicate, object)` 会把别的谓词当成目标事实读回来。
+    #[test]
+    fn collect_edges_filters_by_label_in_caller_side() {
+        let schema = HelixSchema::default();
+        // 同一对端点（内部 8 → 内部 9）之间两条不同标签的边 —— 正是
+        // `OutE: "朋友"` 实际会一起返回的形态。
+        let response = serde_json::json!({
+            "edges": {"properties": [
+                {"$label": "朋友", "$id": 6, "$from": 8, "$to": 9, "weight": 0.9},
+                {"$label": "年龄", "$id": 7, "$from": 8, "$to": 9, "weight": 0.8}
+            ]},
+            "nodes": {"properties": [
+                {"internal_id": 9, "node_id": "chen", "name": "chen"}
+            ]}
+        });
+
+        let found = collect_edges_to_target(&schema, &response, "小C", "chen", "$to", Some("朋友"));
+        assert_eq!(found.len(), 1, "只应留下「朋友」那条");
+        assert_eq!(found[0].edge_type, EdgeType::Custom("朋友".into()));
+
+        // 通配（None）不做标签过滤：两条都留下
+        let all = collect_edges_to_target(&schema, &response, "小C", "chen", "$to", None);
+        assert_eq!(all.len(), 2, "通配形态应如实返回全部标签的边");
+    }
+
+    /// 身份表缺行时宁可少报，也不把边错配到别的实体上。
+    #[test]
+    fn collect_edges_skips_rows_without_identity() {
+        let schema = HelixSchema::default();
+        let response = serde_json::json!({
+            "edges": {"properties": [
+                {"$label": "朋友", "$id": 6, "$from": 8, "$to": 9, "weight": 0.95}
+            ]},
+            "nodes": {"properties": []}
+        });
+
+        assert!(collect_edges_to_target(&schema, &response, "小C", "chen", "$to", None).is_empty());
+    }
+
+    /// `edge_type_for_label` 与 `HelixDbBackend::edge_type_from_label` 同口径 ——
+    /// 自由函数版是被 `collect_edges_to_target` 使用的那个，漂移会让
+    /// `remove_edges_between` 重算标签时删错边。
+    #[tokio::test]
+    async fn label_mapping_is_shared_between_free_and_method_forms() {
+        let backend = HelixDbBackend::connect(DEAD_ENDPOINT, 4).await.unwrap();
+        let schema = HelixSchema::default();
+
+        for label in [
+            schema.contains_edge.as_str(),
+            schema.related_edge.as_str(),
+            schema.next_fragment_edge.as_str(),
+            schema.belongs_to_edge.as_str(),
+            "MENTIONS",
+            "朋友",
+        ] {
+            assert_eq!(
+                backend.edge_type_from_label(label),
+                edge_type_for_label(&schema, label),
+                "标签 '{label}' 的两处映射必须一致"
+            );
+        }
+    }
+
+    /// 反向保护：搜索命中行的 `chunk_id` **必须**保持内部 `$id`。
+    /// 它供 `GraphStore::expand` 做 `N: {"Ids": [...]}` 定位，而 `Ids` 只认内部
+    /// 自增 id —— 改成内容哈希会被 `expand_from_chunks` 静默丢弃，图扩展整条失效。
+    #[test]
+    fn search_hit_chunk_id_stays_internal() {
+        let schema = HelixSchema::default();
+
+        let vec_q = queries::vector_search_chunks(&schema, &[0.1, 0.2], 5, None);
+        assert_eq!(projected_source(&vec_q, "results", "chunk_id"), "$id");
+
+        let txt_q = queries::text_search_chunks(&schema, "q", 5, None);
+        assert_eq!(projected_source(&txt_q, "results", "chunk_id"), "$id");
     }
 }

@@ -138,6 +138,10 @@ fn filter_step(filters: Option<&SearchFilters>) -> Option<Value> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// 创建 Document 节点（v2 AddN 对象格式）。
+///
+/// 写响应投影的内部 `$id` 目前**无人消费**（`HelixDbBackend::store` 丢弃写入
+/// 返回值，节点身份一律由调用方传入的 `Document.id` 决定）。保留原样，不做
+/// 语义改写 —— 改它需要先确认没有外部观察者依赖该响应。
 pub fn create_document_node(
     schema: &HelixSchema,
     doc: &Document,
@@ -162,6 +166,8 @@ pub fn create_document_node(
 }
 
 /// 创建 Chunk 节点（v2 AddN 对象格式）。
+///
+/// 同 [`create_document_node`]：写响应的 `$id` 投影无人消费，保留原样。
 pub fn create_chunk_node(schema: &HelixSchema, chunk: &Chunk) -> Value {
     json!({
         "request_type": "write",
@@ -201,6 +207,8 @@ fn node_props(schema: &HelixSchema, node_id: &str, properties: &HashMap<String, 
 ///
 /// HelixDB 的每个节点只有一个 label（无多标签集），因此 `label` 取
 /// `GraphNode.labels` 的首项。
+///
+/// 写响应的 `$id` 投影同样无人消费（`upsert_node` 丢弃写入返回值），保留原样。
 pub fn create_node(
     schema: &HelixSchema,
     label: &str,
@@ -419,6 +427,10 @@ fn build_vector_search_steps(
         steps.push(filter_step);
     }
 
+    // `chunk_id` 这里是**内部** `$id`，刻意不取 `id_property`：它只在引擎内部
+    // 流转，交给 `GraphStore::expand` 做 `N: {"Ids": [...]}` 定位，而 `Ids` 只
+    // 认内部自增 id（内容哈希串会被 `expand_from_chunks` 解析时丢弃）。
+    // `document_id` 则是分块节点上的属性，本来就是内容哈希口径。
     steps.push(json!({"Project": [
         {"source": "$id", "alias": "chunk_id"},
         {"source": "document_id", "alias": "document_id"},
@@ -449,6 +461,7 @@ pub fn text_search_chunks(
         steps.push(filter_step);
     }
 
+    // `chunk_id` 同为内部 `$id`，理由见 `build_vector_search_steps`。
     steps.push(json!({"Project": [
         {"source": "$id", "alias": "chunk_id"},
         {"source": "document_id", "alias": "document_id"},
@@ -468,6 +481,10 @@ pub fn text_search_chunks(
 }
 
 /// 按 ID 获取文档。
+///
+/// 投影的 `id` 取 `schema.id_property`（内容哈希）而非内置 `$id`，与
+/// `delete_document_cascade` / `delete_chunk_by_id` 的匹配口径保持一致 ——
+/// 否则读回来的 `Document.id` 是内部自增整数，回传给删除接口必然 `NotFound`。
 pub fn get_document_by_id(schema: &HelixSchema, doc_id: &str) -> Value {
     json!({
         "request_type": "read",
@@ -476,7 +493,7 @@ pub fn get_document_by_id(schema: &HelixSchema, doc_id: &str) -> Value {
                 {"Query": {"name": "doc", "steps": [
                     {"NWhere": {"Eq": [schema.id_property, {"String": doc_id}]}},
                     {"Project": [
-                        {"source": "$id", "alias": "id"},
+                        {"source": schema.id_property, "alias": "id"},
                         {"source": "title", "alias": "title"},
                         {"source": "source_path", "alias": "source_path"},
                         {"source": schema.content_text_property, "alias": "content"},
@@ -490,6 +507,15 @@ pub fn get_document_by_id(schema: &HelixSchema, doc_id: &str) -> Value {
 }
 
 /// 获取文档的所有分块。
+///
+/// 投影的 `chunk_id` 取 `schema.id_property`（内容哈希）而非内置 `$id`。
+/// 调用方（`IngestionPipeline::delete_document`）把这些 id 原样交给
+/// `delete_chunk_by_id`，后者按 `id_property` 匹配 —— 投影内部 `$id` 会让
+/// 向量/全文条目的清理静默落空。
+///
+/// 注意不要与 `vector_search_chunks` / `text_search_chunks` 的 `chunk_id` 混淆：
+/// 那两处的 id 供 `GraphStore::expand` 做 `N: {"Ids": [...]}` 定位，**必须**
+/// 是内部 `$id`。
 pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
     json!({
         "request_type": "read",
@@ -503,7 +529,7 @@ pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
                     {"Out": schema.contains_edge},
                     {"OrderBy": ["sequence_index", "Asc"]},
                     {"Project": [
-                        {"source": "$id", "alias": "chunk_id"},
+                        {"source": schema.id_property, "alias": "chunk_id"},
                         {"source": schema.fragment_text_property, "alias": "text"},
                         {"source": "document_id", "alias": "document_id"},
                         {"source": "sequence_index", "alias": "sequence_index"},
@@ -698,6 +724,43 @@ pub fn adjacent_labeled_nodes(
     edge_step: &str,
     node_step: &str,
 ) -> Value {
+    labeled_edge_batch(schema, start_node_id, edge_step, node_step, None)
+}
+
+/// [`adjacent_labeled_nodes`] 的通用形态：可选边标签的「边流 + 节点流」双查询。
+///
+/// `edge_label` 为 `None` 时走通配（`{edge_step: null}`），覆盖全部标签；
+/// 为 `Some(l)` 时只取该标签的边。**标签是精确字符串匹配，无任何规范化** ——
+/// 谓词边（`EdgeType::Custom`）的标签就是谓词原文，大小写敏感。
+///
+/// 供 `GraphStore::edges_between` 做存在性检查：调用方按
+/// 「`edges.$to`/`$from` == `nodes.internal_id`」关联两个查询，再按
+/// `nodes.node_id`（稳定身份）筛选出目标对端。
+pub fn edges_between_nodes(
+    schema: &HelixSchema,
+    start_node_id: &str,
+    edge_step: &str,
+    node_step: &str,
+    edge_label: Option<&str>,
+) -> Value {
+    labeled_edge_batch(schema, start_node_id, edge_step, node_step, edge_label)
+}
+
+/// 构建「起点 → 邻接边 + 邻接点身份」的双查询（v2 read batch）。
+///
+/// 形状与 [`adjacent_labeled_nodes`] 的历史实现逐字节一致，两者共用一份，
+/// 避免新增构造器时把已验证的查询形状抄歪。
+fn labeled_edge_batch(
+    schema: &HelixSchema,
+    start_node_id: &str,
+    edge_step: &str,
+    node_step: &str,
+    edge_label: Option<&str>,
+) -> Value {
+    let label = match edge_label {
+        Some(l) => json!(l),
+        None => Value::Null,
+    };
     json!({
         "request_type": "read",
         "query": {
@@ -707,12 +770,12 @@ pub fn adjacent_labeled_nodes(
                 ], "condition": null}},
                 {"Query": {"name": "edges", "steps": [
                     {"N": {"Var": "start"}},
-                    {edge_step: null},
+                    {edge_step: label.clone()},
                     {"EdgeProperties": null}
                 ], "condition": null}},
                 {"Query": {"name": "nodes", "steps": [
                     {"N": {"Var": "start"}},
-                    {edge_step: null},
+                    {edge_step: label},
                     {node_step: null},
                     {"Project": [
                         {"source": "$id", "alias": "internal_id"},
@@ -722,6 +785,75 @@ pub fn adjacent_labeled_nodes(
                 ], "condition": null}}
             ],
             "returns": ["edges", "nodes"]
+        }
+    })
+}
+
+// ── 图删除 ────────────────────────────────────────────────────────────────
+
+/// 删除 `from_id` 沿 `label` 指向 `to_id` 的一条边（同一标签的并行边**全部**删除）。
+///
+/// 这是 HelixDB 上唯一「单轮往返、且无需预先知道任何内部 id」的删边形式：
+/// `s` / `t` 都由 `NWhere` 按稳定内容哈希 id 选中，与 `compute_entity_id` 直接对接。
+///
+/// ## 为什么不用写响应的 `Count`
+///
+/// `DropEdgeLabeled` 作用在**节点状态**上 —— 它从流经的节点上摘掉匹配的边，再把
+/// **节点**继续往下传。因此其后的 `Count` 数的是**流经的源节点数**（源存在 = 1，
+/// 源不存在 = 0），与删除的边数完全无关；边已不存在时重放同一请求仍返回 1。
+/// 删除数只能由调用方「删前先读」得出。
+///
+/// ## 方向性
+///
+/// 只匹配**出边**（`OutE` 语义）。删反向边必须把 `from_id` / `to_id` 对调再发一次。
+///
+/// ## payload 形状
+///
+/// `DropEdgeLabeled` 的 `to` 必须是 `{"Var": ...}` 节点引用枚举，裸值会 400；
+/// 且它**不能**作为源步骤（`Invalid source step`），前面必须先是 `N(Var)`。
+/// 目标不存在时是静默 no-op（不会退化成通配误删）。
+pub fn drop_edge_between(schema: &HelixSchema, from_id: &str, to_id: &str, label: &str) -> Value {
+    json!({
+        "request_type": "write",
+        "query": {
+            "queries": [
+                {"Query": {"name": "s", "steps": [
+                    {"NWhere": {"Eq": [schema.id_property, {"String": from_id}]}}
+                ], "condition": null}},
+                {"Query": {"name": "t", "steps": [
+                    {"NWhere": {"Eq": [schema.id_property, {"String": to_id}]}}
+                ], "condition": null}},
+                {"Query": {"name": "d", "steps": [
+                    {"N": {"Var": "s"}},
+                    {"DropEdgeLabeled": {"label": label, "to": {"Var": "t"}}},
+                    {"Count": null}
+                ], "condition": null}}
+            ],
+            "returns": ["d"]
+        }
+    })
+}
+
+/// 删除单个节点（`NWhere(id) → Drop`）。
+///
+/// HelixDB 的 `Drop` **自动级联删除该节点双向的全部关联边**，无需先删边；响应
+/// `count` 恒为 `0`（节点被删后流为空），因此删除数同样只能由调用方「删前先读」
+/// 得出 —— 见 [`drop_edge_between`] 的论证。
+///
+/// `NWhere` 命中同 id 的多个重复顶点时会**全部**删除（`AddN` 无 MERGE 语义，
+/// 同 id 多顶点是已知现象）。
+pub fn remove_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
+    json!({
+        "request_type": "write",
+        "query": {
+            "queries": [
+                {"Query": {"name": "d", "steps": [
+                    {"NWhere": {"Eq": [schema.id_property, {"String": node_id}]}},
+                    {"Drop": null},
+                    {"Count": null}
+                ], "condition": null}}
+            ],
+            "returns": ["d"]
         }
     })
 }
@@ -767,8 +899,12 @@ pub fn expand_from_chunks(
         steps.push(json!({"Dedup": null}));
     }
 
+    // 投影的 `document_id` 取 `schema.id_property`（内容哈希）而非内置 `$id`：
+    // 该字段会经 `SearchResult.document_id` 流到工具面，再被 `get_document_by_id`
+    // / `delete_document_cascade` 按 `id_property` 匹配。投影内部 `$id` 会让
+    // 「搜索命中 → 删除」这条链路报 `Document not found: '<内部自增 id>'`。
     steps.push(json!({"Project": [
-        {"source": "$id", "alias": "document_id"},
+        {"source": schema.id_property, "alias": "document_id"},
         {"source": "title", "alias": "title"},
         {"source": "source_path", "alias": "source_path"},
         {"source": schema.content_text_property, "alias": "content"},
@@ -818,7 +954,8 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
         vector_steps.push(filter_step);
     }
 
-    // 投影命中分块
+    // 投影命中分块（`chunk_id` 仅作「这一行是命中行」的判别位，取内部 `$id`
+    // 与本路径其余分块 id 口径一致）
     vector_steps.push(json!({"Project": [
         {"source": "$id", "alias": "chunk_id"},
         {"source": "document_id", "alias": "document_id"},
@@ -845,7 +982,7 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
         text_steps.push(filter_step);
     }
 
-    // 投影命中分块
+    // 投影命中分块（同上，`chunk_id` 仅作判别位）
     text_steps.push(json!({"Project": [
         {"source": "$id", "alias": "chunk_id"},
         {"source": "document_id", "alias": "document_id"},
@@ -896,9 +1033,12 @@ fn add_graph_expansion_steps(
         steps.push(json!({"Dedup": null}));
     }
 
-    // 投影文档字段（包含 graph_distance 用于区分图扩展结果）
+    // 投影文档字段（包含 graph_distance 用于区分图扩展结果）。
+    // `document_id` 同样取 `schema.id_property`：与命中行（chunk 行投影的
+    // `document_id` 属性）口径一致，才能在与命中行一起进 RRF 融合、再被
+    // `get_document_by_id` 取回时不落空。
     steps.push(json!({"Project": [
-        {"source": "$id", "alias": "document_id"},
+        {"source": schema.id_property, "alias": "document_id"},
         {"source": "title", "alias": "title"},
         {"source": schema.content_text_property, "alias": "content"},
         {"source": "source_path", "alias": "source_path"},

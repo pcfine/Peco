@@ -17,6 +17,13 @@ use crate::types::*;
 
 use super::config::{BackendType, KbConfig};
 
+/// 事实类实体的 `entity_type` —— 写入（`add_facts`）与查询、删除必须同口径。
+///
+/// `compute_entity_id(name, entity_type)` 是 sha256 截断，`entity_type` 只是哈希
+/// 的一个输入，**口径一旦漂移，删除会静默失效**（HelixDB 删不存在的节点/边一律是
+/// HTTP 200 的 no-op）。因此全文件只此一处字面量。
+const ENTITY_TYPE: &str = "Entity";
+
 /// 存储后端组件：(文档存储, 向量索引, 全文索引, 图存储)
 type BackendComponents = (
     Arc<dyn DocumentStore>,
@@ -376,14 +383,14 @@ impl KnowledgeBase {
                 continue;
             }
 
-            let subject_id = compute_entity_id(&fact.subject, "Entity");
-            let object_id = compute_entity_id(&fact.object, "Entity");
+            let subject_id = compute_entity_id(&fact.subject, ENTITY_TYPE);
+            let object_id = compute_entity_id(&fact.object, ENTITY_TYPE);
 
             // 确保实体节点存在
             if !gs.node_exists(&subject_id).await.unwrap_or(false) {
                 gs.upsert_node(GraphNode {
                     id: subject_id.clone(),
-                    labels: vec!["Entity".into()],
+                    labels: vec![ENTITY_TYPE.into()],
                     properties: {
                         let mut props = HashMap::new();
                         props.insert("name".into(), fact.subject.clone());
@@ -396,7 +403,7 @@ impl KnowledgeBase {
             if !gs.node_exists(&object_id).await.unwrap_or(false) {
                 gs.upsert_node(GraphNode {
                     id: object_id.clone(),
-                    labels: vec!["Entity".into()],
+                    labels: vec![ENTITY_TYPE.into()],
                     properties: {
                         let mut props = HashMap::new();
                         props.insert("name".into(), fact.object.clone());
@@ -497,7 +504,7 @@ impl KnowledgeBase {
         entity_name: &str,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        self.query_entity_facts_with_type(entity_name, "Entity", max_depth)
+        self.query_entity_facts_with_type(entity_name, ENTITY_TYPE, max_depth)
             .await
     }
 
@@ -525,7 +532,7 @@ impl KnowledgeBase {
         from_entity: &str,
         to_entity: &str,
     ) -> Result<Option<Vec<TraversalStep>>, KnowledgeError> {
-        self.query_relation_path_with_type(from_entity, to_entity, "Entity")
+        self.query_relation_path_with_type(from_entity, to_entity, ENTITY_TYPE)
             .await
     }
 
@@ -543,6 +550,124 @@ impl KnowledgeBase {
         let from_id = compute_entity_id(from_entity, entity_type);
         let to_id = compute_entity_id(to_entity, entity_type);
         gs.shortest_path(&from_id, &to_id, &[], 10).await
+    }
+
+    // ==================== 图谱删除 ====================
+
+    /// 读取一条结构化事实的当前状态（供存在性检查 / 审计快照）。
+    ///
+    /// 命中多条时全部返回（图上 `(subject, predicate, object)` **不唯一**，
+    /// 见 [`Self::delete_fact`] 的说明）。
+    pub async fn read_fact(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Vec<KnowledgeEdge>, KnowledgeError> {
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
+
+        let subject_id = compute_entity_id(subject, ENTITY_TYPE);
+        let object_id = compute_entity_id(object, ENTITY_TYPE);
+        let edge_type = EdgeType::Custom(predicate.to_string());
+
+        gs.edges_between(&subject_id, &object_id, Some(&edge_type))
+            .await
+    }
+
+    /// 删除一条结构化事实（subject →predicate→ object），返回实际删除的边数。
+    ///
+    /// **有向**：只删 `subject → object`，不删反向边。
+    ///
+    /// 返回值是**删除前观测到的匹配边数**（下界），不是精确删除数 —— HelixDB
+    /// 不报告删除条数，且「读-删」之间存在并发窗口。详见 `GraphStore` trait 文档。
+    ///
+    /// **并行边**：`add_facts` 的去重只在**单次调用内**生效，重复调用会累积同一
+    /// 三元组的多条边。本方法删掉**全部**匹配边，因此返回值可能 > 1 —— 由调用方
+    /// 如实报告，让上层能察觉异常。
+    pub async fn delete_fact(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<usize, KnowledgeError> {
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
+
+        let subject_id = compute_entity_id(subject, ENTITY_TYPE);
+        let object_id = compute_entity_id(object, ENTITY_TYPE);
+        let edge_type = EdgeType::Custom(predicate.to_string());
+
+        gs.remove_edges_between(&subject_id, &object_id, Some(&edge_type))
+            .await
+    }
+
+    /// 读取一个实体节点的当前状态，返回 `(实体 id, 节点, 双向关联边)`。
+    ///
+    /// 供级联删除前的审计快照使用 —— `remove_node` 之后这些信息不可恢复，
+    /// 必须先读后删。节点不存在时返回 `(id, None, 边)`（边可能仍在：删边不删点
+    /// 会留下孤儿节点，反向亦然）。
+    ///
+    /// `entity_id` 由本方法一并返回，是为了把 `compute_entity_id` 的调用**收敛在
+    /// manager 内部**（与 `add_facts` 同源）——工具层不得自行计算，否则口径漂移
+    /// 的表现是静默 no-op 而非报错。
+    ///
+    /// 关联边的收集方式：先用 1 跳双向遍历拿到邻居 id，再对每个邻居调一次
+    /// [`GraphStore::edges_between`]（`edge_type: None` 为该方法的双向通配形态）。
+    /// 之所以绕这一圈，是因为 `GraphStore` 没有「列出节点全部入射边」的原语，
+    /// 而 `TraversalStep` 只带 `via_edge` 标签、不带 `weight` —— 而 `weight`
+    /// 正是回滚重放（`add_facts`）必需的字段。
+    ///
+    /// 代价是 `1 + n` 次查询（`n` = 度数）。实体度数在事实图里是个位数，
+    /// 可接受；此方法只用于级联删除前的单次快照。
+    pub async fn read_entity(
+        &self,
+        entity_name: &str,
+    ) -> Result<(String, Option<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
+
+        let entity_id = compute_entity_id(entity_name, ENTITY_TYPE);
+        let node = gs.get_node(&entity_id).await?;
+
+        let steps = gs
+            .traverse(&entity_id, &[], TraversalDirection::Both, 1)
+            .await?;
+
+        let mut edges: Vec<KnowledgeEdge> = Vec::new();
+        for step in steps {
+            // 起始节点自身（`via_edge` 为空）不是邻居。
+            if step.via_edge.is_none() || step.node.id == entity_id {
+                continue;
+            }
+            edges.extend(gs.edges_between(&entity_id, &step.node.id, None).await?);
+        }
+
+        Ok((entity_id, node, edges))
+    }
+
+    /// 删除一个实体节点，返回 `(被删除的边数, 被删除的节点数)`。
+    ///
+    /// `cascade == false` 且该实体仍有残留边时返回 [`KnowledgeError::InvalidInput`]；
+    /// `cascade == true` 时连同双向全部关联边一起删除。
+    ///
+    /// **孤儿语义**：删边不删端点是正确行为（同一实体常被多条事实共享），因此
+    /// 本方法只管「删实体」这一个动作，不做任何孤儿回收。
+    pub async fn delete_entity(
+        &self,
+        entity_name: &str,
+        cascade: bool,
+    ) -> Result<(usize, usize), KnowledgeError> {
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
+
+        let entity_id = compute_entity_id(entity_name, ENTITY_TYPE);
+        let removed_edges = gs.remove_node(&entity_id, cascade).await?;
+        Ok((removed_edges, 1))
     }
 }
 

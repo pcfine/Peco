@@ -796,6 +796,413 @@ impl ToolDyn for QueryEntityFacts {
 }
 
 // ============================================================================
+// 图删除 — DeleteEntityFact / DeleteEntityFacts / DeleteEntity
+// ============================================================================
+//
+// 与文档删除的关键差异：**`ppa_profile` 硬守卫在图上无法复刻**。写路径丢弃
+// 边属性（`Fact::new` 不设 `source`，`HelixDbBackend::add_edges` 只写 `weight`），
+// 图上读不到来源标签，因此无法判断一条事实边是否属于偏好类记忆。图删除的保护
+// 完全由**审计 + 回滚**承担，调用方不得以为它与文档删除受同等保护。
+//
+// 另一个差异：删除的**存在性判定必须由工具层「先读后删」完成**。HelixDB 的
+// 写响应不报告删除条数（`DropEdgeLabeled` 后的 `Count` 数的是流经的源节点数），
+// 且删除不存在的边是静默 no-op（HTTP 200）—— 不看前置读就没有任何信号。
+
+/// 图事实在 `memory_audit.source` 上的显式标记。
+///
+/// 图上无真实来源可填（见本节开头），因此用固定标签把图事实与 `ppa_*` 文档
+/// 区分开 —— 回滚重放按这个字段分流（事实走 `add_facts`，文档走文档重建）。
+const GRAPH_FACT_SOURCE: &str = "graph_fact";
+
+/// 事实边的审计快照 —— 写进 `MemoryAuditEntry::content`。
+///
+/// 回滚 = 按 `weight` 逐条重放 `add_facts`，因此必须存**真实 weight**：
+/// 三元组本身已经是 `doc_id` / `title` 的内容，再存一遍无法还原置信度。
+fn fact_snapshot_json(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    edges: &[knowledge_base::KnowledgeEdge],
+) -> serde_json::Value {
+    json!({
+        "subject": subject,
+        "predicate": predicate,
+        "object": object,
+        "edges": edges
+            .iter()
+            .map(|e| {
+                json!({
+                    "source_id": e.source_id,
+                    "target_id": e.target_id,
+                    "weight": e.weight,
+                    "properties": e.properties,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// 实体级联删除的审计快照 —— 写进 `MemoryAuditEntry::content`。
+///
+/// 级联删除要重建的远不止一条边，因此快照必须包含删除前的完整状况：
+/// 节点属性 + **两个方向**的全部关联边。`edges[]` 里每条边都带 `weight`，
+/// 回滚按 `(source_id 对应的实体名, via 标签, target_id)` 逐条重放。
+fn entity_snapshot_json(
+    entity_name: &str,
+    entity_id: &str,
+    node: &Option<knowledge_base::GraphNode>,
+    edges: &[knowledge_base::KnowledgeEdge],
+) -> serde_json::Value {
+    json!({
+        "entity_name": entity_name,
+        "entity_id": entity_id,
+        "node": node.as_ref().map(|n| json!({
+            "labels": n.labels,
+            "properties": n.properties,
+        })),
+        "edges": edges
+            .iter()
+            .map(|e| {
+                json!({
+                    "source_id": e.source_id,
+                    "target_id": e.target_id,
+                    "predicate": e.edge_type.as_label(),
+                    "weight": e.weight,
+                    "properties": e.properties,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+// ----------------------------------------------------------------------------
+// DeleteEntityFact
+// ----------------------------------------------------------------------------
+
+pub struct DeleteEntityFact {
+    access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
+    memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+}
+
+impl DeleteEntityFact {
+    pub fn new(
+        access: Arc<dyn KnowledgeAccess>,
+        allowed_kbs: Vec<String>,
+        memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+            memory_audit,
+        }
+    }
+}
+
+impl ToolDyn for DeleteEntityFact {
+    fn name(&self) -> String {
+        "delete_entity_fact".to_string()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "delete_entity_fact".to_string(),
+            description: "Delete a single fact (subject →predicate→ object) from the knowledge \
+                          graph. The three arguments are exactly the fields returned by \
+                          query_entity_facts: subject = the queried entity, predicate = via_edge, \
+                          object = the neighbour's name. An audit record with a restorable \
+                          snapshot is written before deletion. Deleting a fact that does not \
+                          exist is an error, not a silent success."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
+                    "subject": { "type": "string", "description": "Subject entity name (e.g. 'user', 'Alice')" },
+                    "predicate": { "type": "string", "description": "Predicate / relation type (e.g. 'prefers', 'works_for')" },
+                    "object": { "type": "string", "description": "Object entity name" }
+                },
+                "required": ["kb_name", "subject", "predicate", "object"]
+            }),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Args {
+                kb_name: String,
+                subject: String,
+                predicate: String,
+                object: String,
+            }
+
+            let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+            let audit = require_audit(&self.memory_audit)?;
+
+            let (audit_id, deleted_edges) = delete_fact_one(
+                &self.access,
+                audit,
+                &parsed.kb_name,
+                &parsed.subject,
+                &parsed.predicate,
+                &parsed.object,
+            )
+            .await?;
+
+            serde_json::to_string_pretty(&json!({
+                "kb_name": parsed.kb_name,
+                "subject": parsed.subject,
+                "predicate": parsed.predicate,
+                "object": parsed.object,
+                "audit_id": audit_id,
+                "deleted_edges": deleted_edges,
+            }))
+            .map_err(string_err)
+            .map(Content::Text)
+        })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DeleteEntityFacts
+// ----------------------------------------------------------------------------
+
+/// 批量删除的单个事实条目。
+#[derive(Deserialize)]
+struct FactArg {
+    subject: String,
+    predicate: String,
+    object: String,
+}
+
+pub struct DeleteEntityFacts {
+    access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
+    memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+}
+
+impl DeleteEntityFacts {
+    pub fn new(
+        access: Arc<dyn KnowledgeAccess>,
+        allowed_kbs: Vec<String>,
+        memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+            memory_audit,
+        }
+    }
+}
+
+impl ToolDyn for DeleteEntityFacts {
+    fn name(&self) -> String {
+        "delete_entity_facts".to_string()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "delete_entity_facts".to_string(),
+            description: format!(
+                "Delete multiple facts from the knowledge graph in one call (up to {MAX_BATCH_DELETIONS} \
+                 per call). Each entry is a (subject, predicate, object) triple in the same shape as \
+                 add_facts_to_knowledge_base. An audit record is written per fact before deletion. \
+                 A single failure does not roll back the others; the result reports deleted and \
+                 failed entries separately."
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
+                    "facts": {
+                        "type": "array",
+                        "maxItems": MAX_BATCH_DELETIONS,
+                        "description": "List of facts to delete",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "subject": { "type": "string" },
+                                "predicate": { "type": "string" },
+                                "object": { "type": "string" }
+                            },
+                            "required": ["subject", "predicate", "object"]
+                        }
+                    }
+                },
+                "required": ["kb_name", "facts"]
+            }),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Args {
+                kb_name: String,
+                facts: Vec<FactArg>,
+            }
+
+            let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            if parsed.facts.len() > MAX_BATCH_DELETIONS {
+                return Err(string_err(format!(
+                    "Batch deletion accepts at most {} facts per call, got {}. Split into multiple calls.",
+                    MAX_BATCH_DELETIONS,
+                    parsed.facts.len()
+                )));
+            }
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+            let audit = require_audit(&self.memory_audit)?;
+
+            // 逐条独立编排：单条失败不影响其余条目（各自的审计行已收口），
+            // 全部结束后把已删与未删明细一起交还调用方。
+            let mut deleted = Vec::new();
+            let mut failed = Vec::new();
+            for fact in &parsed.facts {
+                match delete_fact_one(
+                    &self.access,
+                    audit,
+                    &parsed.kb_name,
+                    &fact.subject,
+                    &fact.predicate,
+                    &fact.object,
+                )
+                .await
+                {
+                    Ok((audit_id, deleted_edges)) => deleted.push(json!({
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "object": fact.object,
+                        "audit_id": audit_id,
+                        "deleted_edges": deleted_edges,
+                    })),
+                    Err(e) => failed.push(json!({
+                        "subject": fact.subject,
+                        "predicate": fact.predicate,
+                        "object": fact.object,
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+
+            let summary = json!({
+                "kb_name": parsed.kb_name,
+                "deleted": deleted,
+                "failed": failed,
+            });
+            if failed.is_empty() {
+                serde_json::to_string_pretty(&summary)
+                    .map_err(string_err)
+                    .map(Content::Text)
+            } else {
+                Err(string_err(summary))
+            }
+        })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DeleteEntity
+// ----------------------------------------------------------------------------
+
+pub struct DeleteEntity {
+    access: Arc<dyn KnowledgeAccess>,
+    allowed_kbs: Vec<String>,
+    memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+}
+
+impl DeleteEntity {
+    pub fn new(
+        access: Arc<dyn KnowledgeAccess>,
+        allowed_kbs: Vec<String>,
+        memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> Self {
+        Self {
+            access,
+            allowed_kbs,
+            memory_audit,
+        }
+    }
+}
+
+impl ToolDyn for DeleteEntity {
+    fn name(&self) -> String {
+        "delete_entity".to_string()
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "delete_entity".to_string(),
+            description: "Delete an entity node from the knowledge graph, optionally cascading \
+                          all its relations. Deletion is refused while relations remain unless \
+                          cascade is explicitly set to true — use delete_entity_fact for \
+                          'forget one relation', and reserve cascade for 'forget the entity \
+                          entirely'. An audit record with a full restore snapshot (node + both \
+                          directions of edges) is written before deletion."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
+                    "entity_name": { "type": "string", "description": "Entity name (e.g. 'user', 'Alice')" },
+                    "cascade": {
+                        "type": "boolean",
+                        "description": "Must be true to delete an entity that still has relations. Default false."
+                    }
+                },
+                "required": ["kb_name", "entity_name"]
+            }),
+        }
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Args {
+                kb_name: String,
+                entity_name: String,
+                #[serde(default)]
+                cascade: bool,
+            }
+
+            let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
+            let audit = require_audit(&self.memory_audit)?;
+
+            let outcome = delete_entity_one(
+                &self.access,
+                audit,
+                &parsed.kb_name,
+                &parsed.entity_name,
+                parsed.cascade,
+            )
+            .await?;
+
+            serde_json::to_string_pretty(&json!({
+                "kb_name": parsed.kb_name,
+                "entity_name": parsed.entity_name,
+                "entity_id": outcome.entity_id,
+                "audit_id": outcome.audit_id,
+                "removed_edges": outcome.removed_edges,
+                "removed_nodes": outcome.removed_nodes,
+            }))
+            .map_err(string_err)
+            .map(Content::Text)
+        })
+    }
+}
+
+// ============================================================================
 // 删除编排（DeleteKbDocument / DeleteKbDocuments 共用）
 // ============================================================================
 
@@ -902,6 +1309,173 @@ async fn delete_one(
                 title: doc.title,
                 audit_id,
                 removed_chunks: report.removed_chunks,
+            })
+        }
+        Err(e) => {
+            if let Err(cancel_err) = audit.mark_cancelled(audit_id).await {
+                warn!(audit_id, error = %cancel_err, "Failed to mark audit row cancelled; a pending row may remain");
+            }
+            Err(string_err(e))
+        }
+    }
+}
+
+/// 单条事实删除编排（outbox：pending → done / cancelled），返回
+/// `(audit_id, deleted_edges)`。
+///
+/// 顺序严格对齐 [`delete_one`]，唯一的结构性差异是**第 2 步的「先读」不可省略**：
+/// 文档删除可以用「返回 `None`」判存在，图删除却必须显式读一次 —— HelixDB 删不
+/// 存在的边是静默 no-op（HTTP 200、无错误、无信号），不看前置读就没有任何办法
+/// 区分「删掉了」与「本来就没有」。
+///
+/// 因此「事实不存在」是**错误**而非幂等成功：报错是模型发现「我把 subject 拼错了」
+/// 的唯一信号（`compute_entity_id` 会 trim + 小写，`小C` 与 `小c` 算出的 id 相同，
+/// 但 `小 C` 不同），静默成功会让模型以为清理完成。
+async fn delete_fact_one(
+    access: &Arc<dyn KnowledgeAccess>,
+    audit: &Arc<dyn MemoryAuditAccess>,
+    kb_name: &str,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+) -> Result<(i64, usize), ToolError> {
+    let km = access.knowledge_manager();
+    km.ensure_loaded().await.map_err(string_err)?;
+
+    // 先读 — 既做存在性判定，也拿到审计需要的边快照（含真实 weight）。
+    let edges = km
+        .read_fact(kb_name, subject, predicate, object)
+        .await
+        .map_err(string_err)?;
+    if edges.is_empty() {
+        return Err(string_err(format!(
+            "Fact not found: '{subject}' -[{predicate}]-> '{object}' (knowledge base '{kb_name}')"
+        )));
+    }
+
+    let audit_id = audit
+        .record_pending(MemoryAuditEntry {
+            user_id: access.user_id().to_string(),
+            kb_name: kb_name.to_string(),
+            // 复用既有确定性 id 算法，不新造格式。
+            doc_id: knowledge_base::Fact::compute_id(subject, predicate, object),
+            title: format!("{subject} -[{predicate}]-> {object}"),
+            content: fact_snapshot_json(subject, predicate, object, &edges).to_string(),
+            source: GRAPH_FACT_SOURCE.to_string(),
+            reason: AGENT_DELETE_REASON.to_string(),
+            deleted_by: AGENT_DELETED_BY.to_string(),
+            deleted_at: now_iso8601(),
+        })
+        .await
+        .map_err(string_err)?;
+
+    match km.delete_fact(kb_name, subject, predicate, object).await {
+        Ok(deleted_edges) => {
+            if let Err(e) = audit.mark_done(audit_id).await {
+                warn!(
+                    audit_id,
+                    error = %e,
+                    "Failed to mark audit row done; a pending row remains (snapshot retained for manual restore)"
+                );
+            }
+            info!(
+                kb = %kb_name,
+                predicate = %predicate,
+                deleted_edges,
+                audit_id,
+                "Fact deleted via tool"
+            );
+            Ok((audit_id, deleted_edges))
+        }
+        Err(e) => {
+            if let Err(cancel_err) = audit.mark_cancelled(audit_id).await {
+                warn!(audit_id, error = %cancel_err, "Failed to mark audit row cancelled; a pending row may remain");
+            }
+            Err(string_err(e))
+        }
+    }
+}
+
+/// 实体级联删除的收口结果（outbox 已迁移为 done）。
+struct EntityDeleteOutcome {
+    entity_id: String,
+    audit_id: i64,
+    removed_edges: usize,
+    removed_nodes: usize,
+}
+
+/// 实体删除编排（outbox：pending → done / cancelled）。
+///
+/// 比 [`delete_fact_one`] 多一道 `cascade` 门，且这道门必须在**写审计之前**：
+/// 拒绝时什么都没删，不该留下任何审计行。「有残留边却不带 `cascade`」是最容易
+/// 发生的误操作（模型想「忘掉小C的年龄」，却升级成「忘掉小C」），因此拒绝信息
+/// 要明确给出边数并把 `cascade: true` 的路指出来。
+async fn delete_entity_one(
+    access: &Arc<dyn KnowledgeAccess>,
+    audit: &Arc<dyn MemoryAuditAccess>,
+    kb_name: &str,
+    entity_name: &str,
+    cascade: bool,
+) -> Result<EntityDeleteOutcome, ToolError> {
+    let km = access.knowledge_manager();
+    km.ensure_loaded().await.map_err(string_err)?;
+
+    let (entity_id, node, edges) = km
+        .read_entity(kb_name, entity_name)
+        .await
+        .map_err(string_err)?;
+
+    if node.is_none() && edges.is_empty() {
+        return Err(string_err(format!(
+            "Entity not found: '{entity_name}' (knowledge base '{kb_name}')"
+        )));
+    }
+
+    if !cascade && !edges.is_empty() {
+        return Err(string_err(format!(
+            "Deletion rejected: entity '{entity_name}' still has {} relation(s). \
+             Use delete_entity_fact to remove a single relation, or pass cascade: true \
+             to delete the entity together with all its relations.",
+            edges.len()
+        )));
+    }
+
+    let audit_id = audit
+        .record_pending(MemoryAuditEntry {
+            user_id: access.user_id().to_string(),
+            kb_name: kb_name.to_string(),
+            doc_id: entity_id.clone(),
+            title: format!("entity:{entity_name}"),
+            content: entity_snapshot_json(entity_name, &entity_id, &node, &edges).to_string(),
+            source: GRAPH_FACT_SOURCE.to_string(),
+            reason: AGENT_DELETE_REASON.to_string(),
+            deleted_by: AGENT_DELETED_BY.to_string(),
+            deleted_at: now_iso8601(),
+        })
+        .await
+        .map_err(string_err)?;
+
+    match km.delete_entity(kb_name, entity_name, cascade).await {
+        Ok((removed_edges, removed_nodes)) => {
+            if let Err(e) = audit.mark_done(audit_id).await {
+                warn!(
+                    audit_id,
+                    error = %e,
+                    "Failed to mark audit row done; a pending row remains (snapshot retained for manual restore)"
+                );
+            }
+            info!(
+                kb = %kb_name,
+                removed_edges,
+                removed_nodes,
+                audit_id,
+                "Entity deleted via tool"
+            );
+            Ok(EntityDeleteOutcome {
+                entity_id,
+                audit_id,
+                removed_edges,
+                removed_nodes,
             })
         }
         Err(e) => {
@@ -1159,20 +1733,26 @@ mod tests {
         })
     }
 
-    /// Spy 审计 — 记录 outbox 事件顺序；可选在 pending 落库后立即删掉该文档，
-    /// 模拟「审计写入后文档被并发删除」，覆盖 pending → cancelled 分支。
+    /// Spy 审计 — 记录 outbox 事件顺序与完整审计行；可选在 pending 落库后立刻
+    /// 破坏后续删除的前置条件，覆盖 pending → cancelled 分支。
     struct SpyAudit {
         log: Mutex<Vec<String>>,
+        entries: Mutex<Vec<MemoryAuditEntry>>,
         next_id: AtomicI64,
         concurrent_delete: Option<(Arc<KnowledgeManager>, String)>,
+        vanished_kb: Option<(Arc<KnowledgeManager>, String)>,
+        fail_mark_done: bool,
     }
 
     impl SpyAudit {
         fn new() -> Self {
             Self {
                 log: Mutex::new(Vec::new()),
+                entries: Mutex::new(Vec::new()),
                 next_id: AtomicI64::new(0),
                 concurrent_delete: None,
+                vanished_kb: None,
+                fail_mark_done: false,
             }
         }
 
@@ -1181,8 +1761,28 @@ mod tests {
             self
         }
 
+        /// pending 落库后立刻删掉整个知识库 — 后续删除必然失败。
+        ///
+        /// 事实删除没有等价的「并发删掉这条事实」注入点：图删除对不存在的边是
+        /// 静默 no-op（返回 0 而非报错），拿它注入只会得到一个「成功」的空删。
+        /// 因此改用「后端不可用」这类**真实错误**来触发 cancelled 分支。
+        fn with_vanished_kb(mut self, km: Arc<KnowledgeManager>, kb_name: &str) -> Self {
+            self.vanished_kb = Some((km, kb_name.to_string()));
+            self
+        }
+
+        /// `mark_done` 恒返回错误 — 覆盖「删除已成功、收口失败」的降级路径。
+        fn failing_mark_done(mut self) -> Self {
+            self.fail_mark_done = true;
+            self
+        }
+
         fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
+        }
+
+        fn entries(&self) -> Vec<MemoryAuditEntry> {
+            self.entries.lock().unwrap().clone()
         }
     }
 
@@ -1193,16 +1793,23 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("pending:{}", entry.doc_id));
+            self.entries.lock().unwrap().push(entry.clone());
             if let Some((km, kb)) = &self.concurrent_delete {
                 km.delete_document(kb, &entry.doc_id)
                     .await
                     .map_err(|e| e.to_string())?;
+            }
+            if let Some((km, kb)) = &self.vanished_kb {
+                km.delete_kb(kb).await.map_err(|e| e.to_string())?;
             }
             Ok(self.next_id.fetch_add(1, Ordering::SeqCst) + 1)
         }
 
         async fn mark_done(&self, id: i64) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("done:{id}"));
+            if self.fail_mark_done {
+                return Err("audit storage went away".to_string());
+            }
             Ok(())
         }
 
@@ -1419,6 +2026,405 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Access denied"), "{err}");
         assert!(km.get_document(KB, &doc.id).await.unwrap().is_some());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 图删除工具（delete_entity_fact / delete_entity_facts / delete_entity）
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn fact_tool(
+        km: &Arc<KnowledgeManager>,
+        audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> DeleteEntityFact {
+        DeleteEntityFact::new(access_of(km), vec![KB.to_string()], audit)
+    }
+
+    fn facts_tool(
+        km: &Arc<KnowledgeManager>,
+        audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> DeleteEntityFacts {
+        DeleteEntityFacts::new(access_of(km), vec![KB.to_string()], audit)
+    }
+
+    fn entity_tool(
+        km: &Arc<KnowledgeManager>,
+        audit: Option<Arc<dyn MemoryAuditAccess>>,
+    ) -> DeleteEntity {
+        DeleteEntity::new(access_of(km), vec![KB.to_string()], audit)
+    }
+
+    /// 写入一组事实，返回管理器的持有句柄（TempDir 由调用方保活）。
+    async fn seed_facts(
+        facts: &[(&str, &str, &str, f32)],
+    ) -> (tempfile::TempDir, Arc<KnowledgeManager>) {
+        let (tmp, km) = make_km().await;
+        let facts: Vec<knowledge_base::Fact> = facts
+            .iter()
+            .map(|(s, p, o, w)| knowledge_base::Fact::new(*s, *p, *o, *w))
+            .collect();
+        km.add_facts_to_kb(KB, &facts, false).await.unwrap();
+        (tmp, km)
+    }
+
+    /// outbox 顺序必须是 `pending → done`，且删除真实生效。
+    #[tokio::test]
+    async fn delete_entity_fact_writes_outbox_pending_then_done() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = fact_tool(&km, Some(spy.clone()));
+
+        let out = tool
+            .call(
+                json!({ "kb_name": KB, "subject": "小C", "predicate": "朋友", "object": "chen" })
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["deleted_edges"], 1);
+        assert_eq!(body["audit_id"], 1);
+
+        // doc_id 复用 Fact 的确定性 id 算法
+        assert_eq!(
+            spy.log(),
+            vec![
+                format!(
+                    "pending:{}",
+                    knowledge_base::Fact::compute_id("小C", "朋友", "chen")
+                ),
+                "done:1".to_string()
+            ]
+        );
+
+        // 审计行是可回滚的：source 为图事实标记，content 带真实 weight
+        let entry = &spy.entries()[0];
+        assert_eq!(entry.source, "graph_fact");
+        assert_eq!(entry.title, "小C -[朋友]-> chen");
+        let snapshot: serde_json::Value = serde_json::from_str(&entry.content).unwrap();
+        assert_eq!(snapshot["subject"], "小C");
+        assert!((snapshot["edges"][0]["weight"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+
+        assert!(
+            km.read_fact(KB, "小C", "朋友", "chen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 事实不存在 ⇒ 报错且**不产生审计行**（对齐文档删除的同类处理）。
+    #[tokio::test]
+    async fn delete_entity_fact_missing_fact_rejected_without_audit_row() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = fact_tool(&km, Some(spy.clone()));
+
+        // 谓词不匹配 → 图上无此边（谓词是全匹配，无规范化）
+        let err = tool
+            .call(
+                json!({ "kb_name": KB, "subject": "小C", "predicate": "同事", "object": "chen" })
+                    .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Fact not found"), "{err}");
+        assert!(spy.log().is_empty(), "不存在的事实不得产生审计行");
+
+        // 原事实没被误删
+        assert_eq!(
+            km.read_fact(KB, "小C", "朋友", "chen").await.unwrap().len(),
+            1
+        );
+    }
+
+    /// 删除失败 ⇒ pending 必须收口为 cancelled，不得留下假成功记录。
+    #[tokio::test]
+    async fn delete_entity_fact_failure_after_pending_marks_cancelled() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+        let spy = Arc::new(SpyAudit::new().with_vanished_kb(Arc::clone(&km), KB));
+        let tool = fact_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(
+                json!({ "kb_name": KB, "subject": "小C", "predicate": "朋友", "object": "chen" })
+                    .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found") || err.to_string().contains("Not found"),
+            "后端错误应透传: {err}"
+        );
+
+        let log = spy.log();
+        assert_eq!(log.len(), 2, "应为 pending + cancelled: {log:?}");
+        assert!(log[0].starts_with("pending:"), "{log:?}");
+        assert_eq!(log[1], "cancelled:1");
+    }
+
+    /// `mark_done` 失败只降级为 warn — 删除已是既成事实，向调用方报错会得到假失败。
+    #[tokio::test]
+    async fn delete_entity_fact_mark_done_failure_still_reports_success() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+        let spy = Arc::new(SpyAudit::new().failing_mark_done());
+        let tool = fact_tool(&km, Some(spy.clone()));
+
+        let out = tool
+            .call(
+                json!({ "kb_name": KB, "subject": "小C", "predicate": "朋友", "object": "chen" })
+                    .to_string(),
+            )
+            .await
+            .expect("mark_done 失败不得让工具失败");
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        assert!(text.contains("\"deleted_edges\": 1"), "{text}");
+        assert!(
+            km.read_fact(KB, "小C", "朋友", "chen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 空 allowed_kbs（= 无权访问任何 KB）时工具在 IO 前拒绝，不写审计。
+    #[tokio::test]
+    async fn graph_delete_tools_reject_kb_outside_allowlist() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+        let spy = Arc::new(SpyAudit::new());
+
+        let fact = DeleteEntityFact::new(access_of(&km), vec![], Some(spy.clone()));
+        let err = fact
+            .call(
+                json!({ "kb_name": KB, "subject": "小C", "predicate": "朋友", "object": "chen" })
+                    .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Access denied"), "{err}");
+
+        let entity = DeleteEntity::new(access_of(&km), vec![], Some(spy.clone()));
+        let err = entity
+            .call(json!({ "kb_name": KB, "entity_name": "小C" }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Access denied"), "{err}");
+
+        assert!(spy.log().is_empty());
+        assert_eq!(
+            km.read_fact(KB, "小C", "朋友", "chen").await.unwrap().len(),
+            1
+        );
+    }
+
+    /// 审计存储不可用 ⇒ 三个工具全部 fail-closed 拒绝，且不产生任何副作用。
+    #[tokio::test]
+    async fn graph_delete_tools_fail_closed_without_audit_storage() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+
+        let fact_err = fact_tool(&km, None)
+            .call(
+                json!({ "kb_name": KB, "subject": "小C", "predicate": "朋友", "object": "chen" })
+                    .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(fact_err.to_string().contains("audit"), "{fact_err}");
+
+        let facts_err = facts_tool(&km, None)
+            .call(
+                json!({ "kb_name": KB, "facts": [
+                    { "subject": "小C", "predicate": "朋友", "object": "chen" }
+                ] })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(facts_err.to_string().contains("audit"), "{facts_err}");
+
+        let entity_err = entity_tool(&km, None)
+            .call(json!({ "kb_name": KB, "entity_name": "小C", "cascade": true }).to_string())
+            .await
+            .unwrap_err();
+        assert!(entity_err.to_string().contains("audit"), "{entity_err}");
+
+        // fail-closed：图保持原样
+        assert_eq!(
+            km.read_fact(KB, "小C", "朋友", "chen").await.unwrap().len(),
+            1
+        );
+    }
+
+    /// 批量上限：schema 是给模型的提示，运行时断言才是真正的门。
+    #[tokio::test]
+    async fn delete_entity_facts_over_limit_rejected() {
+        let (_tmp, km) = make_km().await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = facts_tool(&km, Some(spy.clone()));
+
+        let facts: Vec<serde_json::Value> = (0..51)
+            .map(|i| json!({ "subject": format!("s{i}"), "predicate": "p", "object": "o" }))
+            .collect();
+        let err = tool
+            .call(json!({ "kb_name": KB, "facts": facts }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("50"), "{err}");
+        assert!(spy.log().is_empty(), "超限请求不得产生审计行");
+    }
+
+    /// 批量部分失败：成功条目已收口 done，汇总 Err 同时含 deleted 与 failed 明细。
+    #[tokio::test]
+    async fn delete_entity_facts_partial_failure_reports_both_sides() {
+        let (_tmp, km) =
+            seed_facts(&[("小C", "朋友", "chen", 0.95), ("小C", "年龄", "30", 0.9)]).await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = facts_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(
+                json!({ "kb_name": KB, "facts": [
+                    { "subject": "小C", "predicate": "朋友", "object": "chen" },
+                    { "subject": "小C", "predicate": "同事", "object": "chen" }
+                ] })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("\"deleted\"")
+                && text.contains("chen")
+                && text.contains("Fact not found"),
+            "汇总应同时包含已删与失败明细: {text}"
+        );
+
+        // 成功条目已删且收口 done；失败条目（事实不存在）不产生审计行
+        assert!(
+            km.read_fact(KB, "小C", "朋友", "chen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            spy.log(),
+            vec![
+                format!(
+                    "pending:{}",
+                    knowledge_base::Fact::compute_id("小C", "朋友", "chen")
+                ),
+                "done:1".to_string()
+            ]
+        );
+
+        // 未在本次请求中的事实不受影响
+        assert_eq!(
+            km.read_fact(KB, "小C", "年龄", "30").await.unwrap().len(),
+            1
+        );
+    }
+
+    /// `cascade: false` 且实体仍有边 ⇒ 拒绝，且**在写审计之前**就拒绝。
+    #[tokio::test]
+    async fn delete_entity_without_cascade_rejected_before_audit() {
+        let (_tmp, km) =
+            seed_facts(&[("小C", "朋友", "chen", 0.95), ("小C", "年龄", "30", 0.9)]).await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = entity_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "entity_name": "小C" }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cascade"), "{err}");
+        assert!(spy.log().is_empty(), "拒绝时不得写审计行");
+
+        // 什么都没动
+        assert_eq!(
+            km.read_fact(KB, "小C", "朋友", "chen").await.unwrap().len(),
+            1
+        );
+        let (_, node, _) = km.read_entity(KB, "小C").await.unwrap();
+        assert!(node.is_some());
+    }
+
+    /// `cascade: true` ⇒ 边与节点俱删，审计快照含节点属性与双向边。
+    #[tokio::test]
+    async fn delete_entity_with_cascade_writes_restorable_snapshot() {
+        let (_tmp, km) = seed_facts(&[
+            ("小C", "朋友", "chen", 0.95),
+            ("小C", "年龄", "30", 0.9),
+            // 反向边：chen 也指向 小C —— 级联必须双向都带走
+            ("chen", "同事", "小C", 0.5),
+        ])
+        .await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = entity_tool(&km, Some(spy.clone()));
+
+        let out = tool
+            .call(json!({ "kb_name": KB, "entity_name": "小C", "cascade": true }).to_string())
+            .await
+            .unwrap();
+        let Content::Text(text) = out else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["removed_nodes"], 1);
+        assert_eq!(body["removed_edges"], 3, "两条出边 + 一条入边: {text}");
+        assert!(
+            body["entity_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("entity:Entity:"),
+            "{text}"
+        );
+
+        // 审计行落的是实体 id，快照里节点属性与三条边都在
+        let entry = &spy.entries()[0];
+        assert_eq!(entry.doc_id, body["entity_id"].as_str().unwrap());
+        assert_eq!(entry.source, "graph_fact");
+        let snapshot: serde_json::Value = serde_json::from_str(&entry.content).unwrap();
+        assert_eq!(snapshot["node"]["properties"]["name"], "小C");
+        assert_eq!(snapshot["edges"].as_array().unwrap().len(), 3);
+
+        assert_eq!(spy.log().len(), 2);
+        assert_eq!(spy.log()[1], "done:1");
+
+        // 边全没了，节点也没了；对端实体存活（孤儿语义）
+        assert!(
+            km.read_fact(KB, "小C", "朋友", "chen")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            km.read_fact(KB, "小C", "年龄", "30")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (_, chen_node, chen_edges) = km.read_entity(KB, "chen").await.unwrap();
+        assert!(chen_node.is_some(), "对端实体应存活");
+        assert!(chen_edges.is_empty(), "对端的入射边已被级联带走");
+    }
+
+    /// 实体不存在 ⇒ `Entity not found`，不写审计行。
+    #[tokio::test]
+    async fn delete_entity_missing_entity_rejected_without_audit_row() {
+        let (_tmp, km) = seed_facts(&[("小C", "朋友", "chen", 0.95)]).await;
+        let spy = Arc::new(SpyAudit::new());
+        let tool = entity_tool(&km, Some(spy.clone()));
+
+        let err = tool
+            .call(json!({ "kb_name": KB, "entity_name": "查无此人", "cascade": true }).to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Entity not found"), "{err}");
+        assert!(spy.log().is_empty());
     }
 
     fn docs_tool(km: &Arc<KnowledgeManager>) -> GetKnowledgeBaseDocs {

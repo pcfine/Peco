@@ -12,11 +12,12 @@ use serde_json::json;
 
 use crate::tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, Content, DefaultToolsExecutor, DelegateSubAgent,
-    DeleteAgent, DeleteKbDocument, DeleteKbDocuments, DeleteMcpServer, DeleteSkill, Fetch,
-    GetKnowledgeBaseDocs, ListKnowledgeBases, ListMcpServers, ListSkills, QueryEntityFacts,
-    ReadAgent, ReadSkill, RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSkill,
-    SearchKnowledge, ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn,
-    ToolError, ToolExecutor, WebSearchTool,
+    DeleteAgent, DeleteEntity, DeleteEntityFact, DeleteEntityFacts, DeleteKbDocument,
+    DeleteKbDocuments, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs,
+    ListKnowledgeBases, ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill,
+    RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellTool,
+    ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError, ToolExecutor,
+    WebSearchTool,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -56,6 +57,9 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "query_entity_facts",
     "delete_kb_document",
     "delete_kb_documents",
+    "delete_entity_fact",
+    "delete_entity_facts",
+    "delete_entity",
     "web_search",
 ];
 
@@ -209,6 +213,21 @@ impl ToolRegister {
                     deps.memory_audit.clone(),
                 ))),
                 "delete_kb_documents" => Some(Box::new(DeleteKbDocuments::new(
+                    deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
+                    deps.memory_audit.clone(),
+                ))),
+                "delete_entity_fact" => Some(Box::new(DeleteEntityFact::new(
+                    deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
+                    deps.memory_audit.clone(),
+                ))),
+                "delete_entity_facts" => Some(Box::new(DeleteEntityFacts::new(
+                    deps.knowledge_access.clone(),
+                    deps.allowed_kbs.clone(),
+                    deps.memory_audit.clone(),
+                ))),
+                "delete_entity" => Some(Box::new(DeleteEntity::new(
                     deps.knowledge_access.clone(),
                     deps.allowed_kbs.clone(),
                     deps.memory_audit.clone(),
@@ -485,6 +504,9 @@ mod tests {
         // 删除工具不在跳过清单：审计缺失是运行时门（fail-closed），不是注册门
         assert!(names.contains(&"delete_kb_document".to_string()));
         assert!(names.contains(&"delete_kb_documents".to_string()));
+        assert!(names.contains(&"delete_entity_fact".to_string()));
+        assert!(names.contains(&"delete_entity_facts".to_string()));
+        assert!(names.contains(&"delete_entity".to_string()));
     }
 
     /// 注入 NoopMemoryAudit（测试中显式放行删除的方式）不改变任何工具的

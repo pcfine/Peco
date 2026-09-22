@@ -444,6 +444,123 @@ impl KnowledgeManager {
         Ok(kb.query_entity_facts(entity_name, max_depth).await?)
     }
 
+    /// 读取一条结构化事实的当前状态（供删除前存在性检查 / 审计快照）。
+    ///
+    /// 命中多条时全部返回 —— 图上 `(subject, predicate, object)` 不唯一
+    /// （并行边），详见 [`knowledge_base::KnowledgeBase::read_fact`]。
+    pub async fn read_fact(
+        &self,
+        kb_name: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Vec<knowledge_base::KnowledgeEdge>, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.read_fact(subject, predicate, object).await?)
+    }
+
+    /// 删除一条结构化事实，返回删除前观测到的匹配边数（下界）。
+    ///
+    /// 实体 id 口径由 `KnowledgeBase` 内部统一走
+    /// `compute_entity_id(name, "Entity")`，与 `add_facts` 同源，
+    /// 调用方不得自行计算。
+    pub async fn delete_fact(
+        &self,
+        kb_name: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<usize, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        let removed = kb.delete_fact(subject, predicate, object).await?;
+        info!(
+            kb = %kb_name,
+            subject = %subject,
+            predicate = %predicate,
+            object = %object,
+            removed_edges = removed,
+            "Fact deleted from knowledge base"
+        );
+        Ok(removed)
+    }
+
+    /// 读取一个实体节点的当前状态，返回 `(实体 id, 节点, 双向关联边)`。
+    ///
+    /// 供级联删除前的审计快照使用；节点不存在时返回 `(id, None, 边)`。
+    pub async fn read_entity(
+        &self,
+        kb_name: &str,
+        entity_name: &str,
+    ) -> Result<
+        (
+            String,
+            Option<knowledge_base::GraphNode>,
+            Vec<knowledge_base::KnowledgeEdge>,
+        ),
+        KnowledgeModuleError,
+    > {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.read_entity(entity_name).await?)
+    }
+
+    /// 删除一个实体节点，返回 `(被删除的边数, 被删除的节点数)`。
+    ///
+    /// `cascade == false` 且实体仍有残留边时返回
+    /// [`KnowledgeError::InvalidInput`](knowledge_base::KnowledgeError::InvalidInput)。
+    pub async fn delete_entity(
+        &self,
+        kb_name: &str,
+        entity_name: &str,
+        cascade: bool,
+    ) -> Result<(usize, usize), KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        let counts = kb.delete_entity(entity_name, cascade).await?;
+        info!(
+            kb = %kb_name,
+            entity = %entity_name,
+            cascade,
+            removed_edges = counts.0,
+            "Entity deleted from knowledge graph"
+        );
+        Ok(counts)
+    }
+
     // ── 同步 ────────────────────────────────────────────────────────────────
 
     /// 同步指定知识库：扫描 docs/ 目录，对比文件哈希，执行增量更新。

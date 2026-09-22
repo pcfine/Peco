@@ -8,6 +8,51 @@ pub mod lancedb;
 pub mod helixdb;
 
 use crate::error::KnowledgeError;
+use crate::traits::graph_store::{EdgeType, KnowledgeEdge};
+
+/// `edges_between` / `remove_edges_between` 的共享匹配谓词（内存后端使用）。
+///
+/// 语义与 `GraphStore` trait 文档一致，两个内存后端共用一份，避免口径漂移：
+/// - `edge_type == Some(t)`：**有向**匹配 `source → target` 且边类型精确相等
+///   （谓词无任何规范化，大小写敏感）；
+/// - `edge_type == None`：**双向**匹配，只要两端点相同即可，不看方向。
+pub(crate) fn edge_matches_between(
+    edge: &KnowledgeEdge,
+    source_id: &str,
+    target_id: &str,
+    edge_type: Option<&EdgeType>,
+) -> bool {
+    match edge_type {
+        Some(t) => {
+            edge.source_id == source_id && edge.target_id == target_id && &edge.edge_type == t
+        }
+        None => {
+            (edge.source_id == source_id && edge.target_id == target_id)
+                || (edge.source_id == target_id && edge.target_id == source_id)
+        }
+    }
+}
+
+/// `remove_node` 的共享实现（内存后端使用）：返回删除前观测到的关联边数。
+///
+/// `cascade == false` 且仍有边时返回 [`KnowledgeError::InvalidInput`]。
+pub(crate) fn remove_node_from_memory(
+    edges: &mut Vec<KnowledgeEdge>,
+    node_id: &str,
+    cascade: bool,
+) -> Result<usize, KnowledgeError> {
+    let attached = edges
+        .iter()
+        .filter(|e| e.source_id == node_id || e.target_id == node_id)
+        .count();
+    if attached > 0 && !cascade {
+        return Err(KnowledgeError::InvalidInput(format!(
+            "Node '{node_id}' still has {attached} edges; pass cascade=true to delete it together with them"
+        )));
+    }
+    edges.retain(|e| e.source_id != node_id && e.target_id != node_id);
+    Ok(attached)
+}
 
 /// 聚合逐条删除索引条目的结果：任一失败即报错，全部成功才返回 `Ok(())`。
 ///
