@@ -10,8 +10,30 @@ use std::time::Duration;
 
 use peco_core::agent::hooks::LooperHook;
 use peco_core::agent::{CompactionPolicy, DynamicContext, LooperConfig, MessageFilter};
+use tracing::warn;
 
 use super::memory::MemoryConfig;
+
+/// 读一个 `u32` 环境变量，缺失时取默认值，写错时告警后取默认值。
+///
+/// 解析失败不静默吞：值写错却「看起来生效了」是最难查的一类配置问题。
+fn env_u32(name: &str, default: u32) -> u32 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse() {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(
+                    variable = name,
+                    value = %raw,
+                    default,
+                    "Invalid numeric env var; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 /// Peco 对话配置。
 #[derive(Clone)]
@@ -43,6 +65,17 @@ pub struct PecoConfig {
     pub summarizer_model: String,
     /// 记忆双路径配置（写路径提取 hook + 读路径召回）。
     pub memory: MemoryConfig,
+    /// 截断重试次数上限（`0` = 关闭）。见 `LooperConfig::truncation_retry_limit`。
+    ///
+    /// 环境变量 `PECO_TRUNCATION_RETRY_LIMIT` 可覆盖。
+    pub truncation_retry_limit: u32,
+    /// 截断重试的输出预算下限（token）。
+    /// 见 `LooperConfig::truncation_retry_min_budget`。
+    ///
+    /// **模型真实上限低于该值时，重试请求会被网关拒（400）** —— 那时把本值
+    /// 调到模型的上限之内，或直接把 `truncation_retry_limit` 置 0。
+    /// 环境变量 `PECO_TRUNCATION_RETRY_MIN_BUDGET` 可覆盖。
+    pub truncation_retry_min_budget: u32,
 
     // ── 以下由 PecoManager 构造期填充 ──────────────────────
     /// 上下文滚动压缩策略。由 `PecoManager` 基于主 Agent 的 provider 构建。
@@ -70,6 +103,8 @@ impl Default for PecoConfig {
             compaction_keep_recent_tokens: 96_000,
             summarizer_model: "deepseek-v4-flash".to_string(),
             memory: MemoryConfig::default(),
+            truncation_retry_limit: env_u32("PECO_TRUNCATION_RETRY_LIMIT", 1),
+            truncation_retry_min_budget: env_u32("PECO_TRUNCATION_RETRY_MIN_BUDGET", 32_768),
             compaction: None,
             environment: None,
             dynamic_context: None,
@@ -91,6 +126,8 @@ impl PecoConfig {
             hooks: self.hooks.clone(),
             message_filter: Some(message_filter),
             compaction: self.compaction.clone(),
+            truncation_retry_limit: self.truncation_retry_limit,
+            truncation_retry_min_budget: self.truncation_retry_min_budget,
             ..LooperConfig::default()
         }
     }

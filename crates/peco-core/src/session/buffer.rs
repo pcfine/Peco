@@ -194,6 +194,20 @@ impl StagingBuffer {
         self.user_input = None;
         self.messages.clear();
     }
+
+    /// 截断到 `len` 条已暂存消息：丢弃下标 ≥ `len` 的项，返回实际丢弃条数。
+    ///
+    /// **从不触碰 `user_input`** —— 回退锚点永远在 user_input 之后，
+    /// 用户输入不属于任何一次模型调用。
+    /// `len >= 当前条数` 时为 no-op（返回 0）。
+    pub fn truncate_messages(&mut self, len: usize) -> usize {
+        if len >= self.messages.len() {
+            return 0;
+        }
+        let dropped = self.messages.len() - len;
+        self.messages.truncate(len);
+        dropped
+    }
 }
 
 // ============================================================================
@@ -397,6 +411,67 @@ mod tests {
         ));
         sb.clear();
         assert!(sb.is_empty());
+    }
+
+    #[test]
+    fn test_staging_truncate_messages_drops_tail() {
+        let mut sb = StagingBuffer::new();
+        for i in 0..3 {
+            sb.push(AnnotatedMessage::new(
+                MessageId(i),
+                0,
+                assistant(format!("m{i}")),
+                MessageSource::ModelGeneration,
+            ));
+        }
+
+        assert_eq!(sb.truncate_messages(1), 2);
+        assert_eq!(sb.messages_ref().len(), 1);
+        // 保留的是最前面那条
+        assert!(matches!(
+            sb.messages_ref()[0].message.as_ref(),
+            InputItem::Message { content, .. } if content.text_view() == "m0"
+        ));
+    }
+
+    #[test]
+    fn test_staging_truncate_messages_keeps_user_input() {
+        let mut sb = StagingBuffer::new();
+        sb.set_user_input(AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            user("q"),
+            MessageSource::UserInput,
+        ));
+        for i in 1..3 {
+            sb.push(AnnotatedMessage::new(
+                MessageId(i),
+                0,
+                assistant(format!("m{i}")),
+                MessageSource::ModelGeneration,
+            ));
+        }
+
+        assert_eq!(sb.truncate_messages(0), 2);
+        assert!(sb.messages_ref().is_empty());
+        assert!(sb.user_input_ref().is_some());
+        assert_eq!(sb.len(), 1);
+    }
+
+    #[test]
+    fn test_staging_truncate_messages_noop_when_len_ge() {
+        let mut sb = StagingBuffer::new();
+        sb.push(AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            assistant("a"),
+            MessageSource::ModelGeneration,
+        ));
+
+        assert_eq!(sb.truncate_messages(99), 0);
+        assert_eq!(sb.messages_ref().len(), 1);
+        // 幂等：再截一次同样长度仍是 no-op
+        assert_eq!(sb.truncate_messages(1), 0);
     }
 
     #[test]

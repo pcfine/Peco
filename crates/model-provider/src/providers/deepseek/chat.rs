@@ -9,7 +9,9 @@ use serde_json::Value;
 use tracing::{Instrument, warn};
 
 use crate::logging;
-use crate::providers::chat_common::{WireMessage, input_items_to_wire_messages, strip_image_parts};
+use crate::providers::chat_common::{
+    WireMessage, chat_finish_reason_to_neutral, input_items_to_wire_messages, strip_image_parts,
+};
 use crate::response::{
     ContentBlock, GenerateRequest, GenerateResult, InputItem, ReasoningConfig, ReasoningEffort,
     ResponseError, ResponseStatus, Role, TextFormat,
@@ -354,6 +356,7 @@ fn chat_response_to_generate_result(
 
     let finish_reason = choice.finish_reason;
     let status = finish_reason_to_status(finish_reason.as_deref());
+    let neutral_finish_reason = chat_finish_reason_to_neutral(finish_reason.as_deref());
 
     let mut output = Vec::new();
     if let Some(content) = choice.message.content {
@@ -386,6 +389,7 @@ fn chat_response_to_generate_result(
         output,
         usage: api_response.usage.map(convert_usage).unwrap_or_default(),
         status,
+        finish_reason: neutral_finish_reason,
         error,
     })
 }

@@ -167,7 +167,7 @@ impl SimpleAgentLooper {
             let response = if let Some(ref executor) = self.tool_executor_override {
                 let tools = executor.definitions();
                 self.agent
-                    .generate_with_tools(self.messages.clone(), instructions, tools)
+                    .generate_with_tools(self.messages.clone(), instructions, tools, None)
                     .await?
             } else {
                 self.agent.generate_full(self.messages.clone()).await?

@@ -307,6 +307,15 @@ pub struct GenerateResult {
     pub output: Vec<ContentBlock>,
     pub usage: Usage,
     pub status: ResponseStatus,
+    /// 结束原因，与流式路径的 `StreamChunk::Finish` 同一份事实。
+    ///
+    /// [`ResponseStatus`] 只有三格，多个结束原因会挤进同一格 —— 最典型的是
+    /// `Incomplete` 既收「输出预算顶满」也收「内容被过滤」。引擎侧要靠本字段
+    /// 区分「抬预算能救」与「救了也没用」，否则只能对整个 `Incomplete` 一律重试，
+    /// 为内容过滤白烧一次模型调用。
+    ///
+    /// `None` = 上游未提供该信息，不臆测。
+    pub finish_reason: Option<FinishReason>,
     pub error: Option<ResponseError>,
 }
 

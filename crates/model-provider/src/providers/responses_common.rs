@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use crate::response::{ContentBlock, FinishReason};
+use crate::response::{ContentBlock, FinishReason, ResponseStatus};
 
 /// 正在累积的 Responses 工具调用。
 ///
@@ -19,6 +19,37 @@ pub(crate) struct PendingResponseToolCall {
     pub(crate) call_id: String,
     pub(crate) name: String,
     pub(crate) arguments: String,
+}
+
+/// 把 Responses 的 `incomplete_details.reason` 映射为中立 [`FinishReason`]。
+///
+/// **仅在状态为 `incomplete` 时调用。** 与流式路径同一份判断：`content_filter`
+/// 是内容过滤，其余（含 reason 整体缺失）都按输出预算顶满处理 —— 静默降级成
+/// 「未知」会让引擎侧对真截断放弃重试。
+///
+/// 三个 Responses 适配器必须共用本函数：判定分歧会让同一份上游行为在不同
+/// provider 下走不同的恢复路径。
+pub(crate) fn incomplete_reason_to_finish_reason(reason: Option<&str>) -> FinishReason {
+    match reason {
+        Some("content_filter") => FinishReason::Error,
+        _ => FinishReason::MaxTokens,
+    }
+}
+
+/// 非流式 Responses 响应的结束原因。
+///
+/// `Completed` 一律记 [`FinishReason::Stop`]：与流式路径对 `response.completed`
+/// 的处理一致，不为了区分 `stop` / `tool_calls` 去翻 output（引擎侧只看是否
+/// `MaxTokens`）。`Failed` 记 [`FinishReason::Error`]。
+pub(crate) fn non_stream_finish_reason(
+    status: ResponseStatus,
+    incomplete_reason: Option<&str>,
+) -> Option<FinishReason> {
+    match status {
+        ResponseStatus::Completed => Some(FinishReason::Stop),
+        ResponseStatus::Incomplete => Some(incomplete_reason_to_finish_reason(incomplete_reason)),
+        ResponseStatus::Failed => Some(FinishReason::Error),
+    }
 }
 
 /// 流结束时收尾未闭合的工具调用，产出按 `output_index` 升序排列的完整块。

@@ -13,7 +13,27 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::ProviderError;
-use crate::response::{Content, ContentPart, ImageDetail, InputItem, Role};
+use crate::response::{Content, ContentPart, FinishReason, ImageDetail, InputItem, Role};
+
+/// 把 chat 协议的 `finish_reason` 字符串映射为中立 [`FinishReason`]。
+///
+/// 与各家 `finish_reason_to_status` 是同一份事实，但保留得更细：`length` 与
+/// `content_filter` 在 [`ResponseStatus`](crate::response::ResponseStatus) 里
+/// 一个落 `Incomplete`、一个落 `Failed`，而引擎侧只关心「抬预算能不能救」。
+///
+/// 未知取值按 [`FinishReason::Error`] 处理 —— 与 `finish_reason_to_status` 的
+/// `_ => Failed` 同一判断，不把没见过的值当成截断。`None` 保持未知：chat 协议
+/// 允许上游省略该字段，那时状态已被判为 `Completed`，臆测成截断没有意义。
+pub(crate) fn chat_finish_reason_to_neutral(reason: Option<&str>) -> Option<FinishReason> {
+    match reason {
+        Some("stop") => Some(FinishReason::Stop),
+        Some("tool_calls") | Some("function_call") => Some(FinishReason::ToolCalls),
+        Some("length") | Some("max_tokens") => Some(FinishReason::MaxTokens),
+        Some("content_filter") => Some(FinishReason::Error),
+        Some(_) => Some(FinishReason::Error),
+        None => None,
+    }
+}
 
 /// chat completions 传输层消息（仅用于请求体序列化，crate 内部使用）。
 ///

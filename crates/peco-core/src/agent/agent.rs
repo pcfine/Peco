@@ -305,11 +305,17 @@ impl Agent {
     /// 构造中立 [`GenerateRequest`]。
     ///
     /// `instructions` 承载 system prompt（含动态上下文），`input` 为历史 [`InputItem`]。
+    ///
+    /// `max_output_tokens` 为**本次请求的一次性覆盖**：`None` = 沿用
+    /// [`ModelConfig::max_tokens`]（其自身为 `None` 时交由 provider 服务端默认）。
+    /// 用于截断重试时抬高输出预算 —— 推理 token 与可见输出共用这一个预算，
+    /// 预算不足时推理会把可见输出挤没（见 `AgentLooper::finish_stream` 的失败日志字段）。
     fn build_generate_request(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
         tools: Vec<ToolDefinition>,
+        max_output_tokens: Option<u32>,
     ) -> GenerateRequest {
         GenerateRequest {
             model: self.model_config.model_name.clone().unwrap_or_default(),
@@ -319,7 +325,7 @@ impl Agent {
             tool_choice: Some(ToolChoice::Auto),
             temperature: self.model_config.temperature.map(|t| t as f64),
             top_p: None,
-            max_output_tokens: self.model_config.max_tokens,
+            max_output_tokens: max_output_tokens.or(self.model_config.max_tokens),
             reasoning: reasoning_effort_to_config(self.model_config.reasoning_effort.as_deref()),
             text: None,
             additional_params: None,
@@ -336,18 +342,21 @@ impl Agent {
     ) -> Result<GenerateResult, AgentError> {
         let tools = self.tool_executor.definitions();
         let instructions = Some(self.system_prompt());
-        let request = self.build_generate_request(input, instructions, tools);
+        let request = self.build_generate_request(input, instructions, tools, None);
         Ok(self.model.generate_full(&request).await?)
     }
 
     /// 发送流式生成请求。
+    ///
+    /// `max_output_tokens` 为本次请求的一次性覆盖（`None` = 用 `ModelConfig` 的值）。
     pub(crate) async fn generate_stream(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
+        max_output_tokens: Option<u32>,
     ) -> Result<GenerateStream, AgentError> {
         let tools = self.tool_executor.definitions();
-        let request = self.build_generate_request(input, instructions, tools);
+        let request = self.build_generate_request(input, instructions, tools, max_output_tokens);
         Ok(self.model.generate_stream(&request).await?)
     }
 
@@ -355,13 +364,16 @@ impl Agent {
     ///
     /// 由 `SimpleAgentLooper` 在 tool_executor_override 场景下使用，
     /// 允许调用方提供自定义 tool 列表（如包含 `__submit_output__`）。
+    ///
+    /// `max_output_tokens` 为本次请求的一次性覆盖（`None` = 用 `ModelConfig` 的值）。
     pub(crate) async fn generate_with_tools(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
         tools: Vec<ToolDefinition>,
+        max_output_tokens: Option<u32>,
     ) -> Result<GenerateResult, AgentError> {
-        let request = self.build_generate_request(input, instructions, tools);
+        let request = self.build_generate_request(input, instructions, tools, max_output_tokens);
         Ok(self.model.generate_full(&request).await?)
     }
 }

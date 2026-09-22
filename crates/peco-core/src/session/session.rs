@@ -377,6 +377,28 @@ impl Session {
         );
     }
 
+    /// 把收尾时的部分文本补进 staging，供 [`Self::interrupt_turn`] 冻结。
+    ///
+    /// 截断重试会先回退掉上一次尝试的产物；若此后收尾失败，staging 只剩
+    /// `user_input`，[`Self::interrupt_turn`] 便退化成 `rollback_turn` ——
+    /// 整轮（含用户提问）从历史里消失，反而比不重试更差。补一条 assistant
+    /// 消息把那一轮救回来，使其与「没有重试、直接截断收尾」的历史形态一致。
+    ///
+    /// **只在 staging 无可保留产物时调用**：否则文本已以原始形态在 staging 里，
+    /// 再补一条就是重复。
+    ///
+    /// 不走 [`Self::stage_item`] 的 `Active` 守卫 —— 收尾态（`Cancelling` /
+    /// `Interrupted`）也要能补，与 `push_interrupt_notice` 同理。
+    pub fn stage_salvage(&mut self, text: String) {
+        self.push_staged(
+            MessageSource::ModelGeneration,
+            InputItem::Message {
+                role: Role::Assistant,
+                content: text.into(),
+            },
+        );
+    }
+
     /// 中断在途轮：有可保留产物则冻结进 committed，否则等同 rollback。
     ///
     /// 与 [`Self::commit_turn`] / [`Self::rollback_turn`] 并列的第三个 turn 边界
@@ -518,6 +540,56 @@ impl Session {
         self.state = SessionState::Idle;
         self.touch();
         Ok(TurnBoundaryToken(()))
+    }
+
+    /// 当前 staging 的回退锚点：已暂存消息条数（**不含** `user_input`）。
+    ///
+    /// 与 [`Self::truncate_staging`] 成对使用：在**发起模型请求之前**取锚点，
+    /// 请求产出被回填后若判定需要丢弃（截断重试），用该锚点回退。
+    ///
+    /// 返回下标而非令牌：无状态，锚点由调用方自己保管 —— 这样 `Session`
+    /// 不必为 commit / rollback / interrupt / compact / hydrate 逐个维护失效逻辑。
+    pub fn staging_checkpoint(&self) -> usize {
+        self.staging.messages_ref().len()
+    }
+
+    /// 把 staging 回退到 `checkpoint`：丢弃下标 ≥ `checkpoint` 的已暂存消息。
+    ///
+    /// 返回实际丢弃的条数。
+    ///
+    /// # 守卫
+    /// - 非 `Active` 状态返回 [`SessionError::InvalidStateTransition`]。只有 `Active`
+    ///   下 staging 才在增长（见 [`Self::stage_item`] 的 `can_stage_message()`）；
+    ///   在收尾态回退会改掉已经发给用户的 `TurnComplete` 内容。
+    /// - `checkpoint` 大于当前条数返回 [`SessionError::StagingCheckpointOutOfBounds`]。
+    ///   越界说明锚点与当前 staging 不是同一生命周期，必须显式失败 ——
+    ///   静默饱和会掩盖状态错乱。
+    ///
+    /// # `next_message_id` 不回退
+    /// 消息 ID 只需唯一，单调性是白拿的更强保证。回退会让新消息复用已经流出
+    /// （`LooperEvent`、`InflightCheckpoint`）的 ID。`hydrate_inflight` 同样
+    /// 只前进不回退，本条与它一致。
+    pub fn truncate_staging(&mut self, checkpoint: usize) -> Result<usize, SessionError> {
+        if !self.state.can_stage_message() {
+            return Err(SessionError::InvalidStateTransition {
+                current_state: self.state,
+                action: "truncate_staging".to_string(),
+            });
+        }
+
+        let current = self.staging.messages_ref().len();
+        if checkpoint > current {
+            return Err(SessionError::StagingCheckpointOutOfBounds {
+                requested: checkpoint,
+                current,
+            });
+        }
+
+        let dropped = self.staging.truncate_messages(checkpoint);
+        if dropped > 0 {
+            self.touch();
+        }
+        Ok(dropped)
     }
 
     /// 回滚到指定 turn，丢弃该 turn 之后的所有已 committed turn。
@@ -1428,6 +1500,120 @@ mod tests {
         ));
         assert_eq!(s.committed_turns().len(), turns_before);
         assert_eq!(s.turn_index(), index_before);
+    }
+
+    // ── staging 回退锚点（截断重试用）──────────────────────────────────
+
+    #[test]
+    fn test_staging_checkpoint_roundtrip() {
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("a1"))
+            .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("a2"))
+            .unwrap();
+
+        // 锚点在发请求前取：此刻 staging 里是「上一批落地结果」
+        let cp = s.staging_checkpoint();
+        assert_eq!(cp, 2);
+
+        // 本次模型调用的产出追加在后面
+        s.stage_item(MessageSource::ModelGeneration, assistant("truncated-1"))
+            .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("truncated-2"))
+            .unwrap();
+        assert_eq!(s.staging_checkpoint(), 4);
+
+        // 回退到锚点：丢弃的正是本次调用的两条
+        assert_eq!(s.truncate_staging(cp).unwrap(), 2);
+        assert_eq!(s.staging_checkpoint(), cp);
+        assert_eq!(s.state(), SessionState::Active);
+        // user_input 不受影响，本轮仍在进行
+        assert!(s.staging_user_input().is_some());
+    }
+
+    #[test]
+    fn test_truncate_staging_when_idle_fails() {
+        let mut s = make_session();
+        let err = s.truncate_staging(0).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::InvalidStateTransition { action, .. } if action == "truncate_staging"
+        ));
+    }
+
+    #[test]
+    fn test_truncate_staging_out_of_bounds_errors() {
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("a"))
+            .unwrap();
+
+        // 锚点大于当前条数 → 显式失败，不静默饱和
+        let err = s.truncate_staging(99).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::StagingCheckpointOutOfBounds {
+                requested: 99,
+                current: 1,
+            }
+        ));
+        // 失败不动 staging
+        assert_eq!(s.staging_checkpoint(), 1);
+    }
+
+    #[test]
+    fn test_truncate_staging_does_not_rewind_next_message_id() {
+        // 显式契约：回退只丢消息，不回退 ID 计数器 ——
+        // 复用已流出（LooperEvent / InflightCheckpoint）的 ID 会让它们指向两条消息。
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        let first = s
+            .stage_item(MessageSource::ModelGeneration, assistant("a1"))
+            .unwrap();
+
+        let cp = s.staging_checkpoint();
+        let discarded = s
+            .stage_item(MessageSource::ModelGeneration, assistant("discarded"))
+            .unwrap();
+        s.truncate_staging(cp).unwrap();
+
+        let after = s
+            .stage_item(MessageSource::ModelGeneration, assistant("a2"))
+            .unwrap();
+        assert!(after.0 > discarded.0, "回退后新 ID 必须仍单调递增");
+        assert!(discarded.0 > first.0);
+    }
+
+    #[test]
+    fn test_truncate_staging_excluded_from_snapshot() {
+        // 被回退的消息不进历史：commit 后的 committed 与快照往返都不含它们。
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("kept"))
+            .unwrap();
+
+        let cp = s.staging_checkpoint();
+        s.stage_item(MessageSource::ModelGeneration, assistant("dropped"))
+            .unwrap();
+        s.truncate_staging(cp).unwrap();
+
+        let token = s.commit_turn().unwrap();
+        let snap = s.snapshot(&token);
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert!(!json.contains("dropped"), "被回退的消息不应出现在快照中");
+        let restored =
+            Session::from_snapshot(s.id().to_string(), "d".to_string(), s.created_at(), back);
+        assert_eq!(restored.committed_turns().len(), 1);
+        assert!(
+            restored
+                .committed_turns()
+                .iter()
+                .flatten()
+                .any(|am| matches!(am.message.as_ref(), InputItem::Message { content, .. } if content.text_view() == "kept"))
+        );
     }
 
     #[test]

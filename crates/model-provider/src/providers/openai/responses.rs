@@ -26,7 +26,9 @@ use tracing::{Instrument, debug, trace, warn};
 
 use super::chat::{OPENAI_API_BASE_URL, OPENAI_REASONING_MIN_BUDGET};
 use crate::logging;
-use crate::providers::responses_common::{PendingResponseToolCall, flush_unclosed_tool_calls};
+use crate::providers::responses_common::{
+    PendingResponseToolCall, flush_unclosed_tool_calls, non_stream_finish_reason,
+};
 use crate::response::{
     BlockType, Content, ContentBlock, ContentPart, FinishReason, GenerateRequest, GenerateResult,
     InputItem, ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk,
@@ -1226,6 +1228,13 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 output,
                 usage,
                 status: response_status,
+                finish_reason: non_stream_finish_reason(
+                    response_status,
+                    api_response
+                        .incomplete_details
+                        .as_ref()
+                        .and_then(|d| d.reason.as_deref()),
+                ),
                 error,
             })
         }

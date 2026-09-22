@@ -48,4 +48,17 @@ pub enum SessionError {
         /// 有效范围上限
         max: usize,
     },
+
+    /// staging 回退锚点越界（锚点大于当前 staging 条数）。
+    ///
+    /// 只在 [`Session::truncate_staging`](crate::session::Session::truncate_staging)
+    /// 中出现：锚点与当前 staging 不属于同一生命周期（中途 commit / rollback 过）时
+    /// 显式失败，而不是静默饱和 —— 饱和会掩盖状态错乱。
+    #[error("staging checkpoint out of bounds: requested {requested}, current {current}")]
+    StagingCheckpointOutOfBounds {
+        /// 请求的回退锚点
+        requested: usize,
+        /// 当前 staging 条数
+        current: usize,
+    },
 }

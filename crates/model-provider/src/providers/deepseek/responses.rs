@@ -16,7 +16,9 @@ use tracing::{Instrument, warn};
 
 use crate::logging;
 use crate::providers::chat_common::strip_image_parts;
-use crate::providers::responses_common::{PendingResponseToolCall, flush_unclosed_tool_calls};
+use crate::providers::responses_common::{
+    PendingResponseToolCall, flush_unclosed_tool_calls, non_stream_finish_reason,
+};
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, TextConfig,
@@ -469,6 +471,8 @@ struct ResponsesResponse {
     #[serde(default)]
     error: Option<ResponsesError>,
     #[serde(default)]
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default)]
     usage: Option<ResponsesUsage>,
 }
 
@@ -478,6 +482,13 @@ struct ResponsesError {
     code: Option<String>,
     #[serde(default)]
     message: Option<String>,
+}
+
+/// `status == "incomplete"` 时的原因（`max_output_tokens` / `content_filter` …）。
+#[derive(Deserialize)]
+struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1158,6 +1169,13 @@ impl ModelProvider for DeepSeekResponsesAdapter {
                 output,
                 usage,
                 status: response_status,
+                finish_reason: non_stream_finish_reason(
+                    response_status,
+                    api_response
+                        .incomplete_details
+                        .as_ref()
+                        .and_then(|d| d.reason.as_deref()),
+                ),
                 error,
             })
         }
