@@ -2395,7 +2395,7 @@ impl AgentLooper {
         warn!(
             turn = plan.turn,
             reason = ?plan.reason,
-            discarded_staging_messages = plan.discarded_staging_messages,
+            frozen_staging_messages = plan.frozen_staging_messages,
             partial_text_len = plan.partial_text_len,
             "Turn interrupted; staging frozen into committed history"
         );
@@ -2487,16 +2487,14 @@ struct FinalizePlan {
     outcome: TurnOutcome,
     /// 供 `Shutdown` 回写。
     reason: TurnFailureReason,
-    /// 冻结前的部分文本长度。**必须在这里存一份** —— `partial_text` 已经
-    /// 移进 `outcome`，而 `TurnOutcome::text()` 对 `Failed` 恒返回 `None`，
-    /// 从 outcome 反查长度会恒得 0。与冻结前的 `discarded_staging_messages` 并列，
-    /// 让日志能回答「这轮白跑了多少」。
+    /// 冻结前的部分文本长度
+    /// 与冻结前的 `frozen_staging_messages` 并列， 让日志能回答「这轮白跑了多少」
     partial_text_len: usize,
     /// 落盘产物，`persist_on_failure` 门控。
     /// `false` 时冻结照常（内存）但不产出快照（CLI 路径，`NullSessionPersister`）。
     snapshot: Option<SessionSnapshot>,
     /// 冻结前 staging 中的消息数（合成 Output 与中断说明尚未追加）。
-    discarded_staging_messages: usize,
+    frozen_staging_messages: usize,
     /// 是否续接排队输入。由 `!is_cancelled()` 单点推导 —— 用户按了停就不自动跑下一条。
     drain_pending: bool,
 }
@@ -2561,7 +2559,7 @@ fn plan_failure(
     let turn = session.turn_index(); // interrupt_turn 后会 +1
     let partial_text = std::mem::take(&mut ctx.assistant_text);
     let partial_text_len = partial_text.len();
-    let discarded_staging_messages = session.staging_messages().len(); // ③ 冲刷后会变
+    let frozen_staging_messages = session.staging_messages().len(); // ③ 冲刷后会变
 
     // ③ 冲刷 poll 阶段已捞回的工具结果（只写不清理；见 `stage_tool_results`）。
     //    必须在 ④ 之前 —— 这些结果是「这一轮已完成的成果」，要和本轮一起冻结。
@@ -2604,7 +2602,7 @@ fn plan_failure(
         reason,
         partial_text_len,
         snapshot,
-        discarded_staging_messages,
+        frozen_staging_messages,
         drain_pending,
     })
 }
@@ -2875,7 +2873,7 @@ mod tests {
         .expect("有在途轮");
 
         // 计数取的是冲刷**前**的 staging 规模（悬空的 FunctionCall 计 1 条）
-        assert_eq!(plan.discarded_staging_messages, 1);
+        assert_eq!(plan.frozen_staging_messages, 1);
 
         let turn = &session.committed_turns()[0];
         assert!(

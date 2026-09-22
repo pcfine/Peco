@@ -16,6 +16,7 @@ use tracing::{Instrument, warn};
 
 use crate::logging;
 use crate::providers::chat_common::strip_image_parts;
+use crate::providers::responses_common::{PendingResponseToolCall, flush_unclosed_tool_calls};
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, TextConfig,
@@ -597,13 +598,6 @@ fn parse_usage_from_response(resp: &Value) -> Option<Usage> {
 // 流式处理
 // ============================================================================
 
-/// 正在累积的 Responses 工具调用。
-struct PendingResponseToolCall {
-    call_id: String,
-    name: String,
-    arguments: String,
-}
-
 /// 处理 Responses 语义 SSE 流，产出中立 [`StreamChunk`]。
 ///
 /// 语义事件 → chunk 映射：
@@ -960,17 +954,10 @@ fn process_responses_sse_stream(
                 yield Ok(StreamChunk::BlockEnd { index: idx, block: ContentBlock::Reasoning { text: reasoning } });
             }
         }
-        for (idx, tc) in tool_calls.drain() {
-            if !tc.call_id.is_empty() && !tc.name.is_empty() {
-                let mut args = tc.arguments;
-                if args.is_empty() || args.trim() == "null" {
-                    args = "{}".to_string();
-                }
-                yield Ok(StreamChunk::BlockEnd {
-                    index: idx,
-                    block: ContentBlock::ToolCall { call_id: tc.call_id, name: tc.name, arguments: args },
-                });
-            }
+        for (index, block) in
+            flush_unclosed_tool_calls(&request_id, tool_calls, finish_reason)
+        {
+            yield Ok(StreamChunk::BlockEnd { index, block });
         }
 
         let usage = usage.unwrap_or_default();

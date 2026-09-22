@@ -25,6 +25,7 @@ use tracing::{Instrument, debug, trace, warn};
 
 use crate::logging;
 use crate::providers::chat_common::strip_image_parts;
+use crate::providers::responses_common::{PendingResponseToolCall, flush_unclosed_tool_calls};
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ReasoningConfig, ReasoningEffort, ResponseError, ResponseStatus, Role, StreamChunk, ToolChoice,
@@ -665,13 +666,6 @@ fn parse_usage_from_response(resp: &Value) -> Option<Usage> {
 // 流式处理
 // ============================================================================
 
-/// 正在累积的 Responses 工具调用。
-struct PendingResponseToolCall {
-    call_id: String,
-    name: String,
-    arguments: String,
-}
-
 /// 处理 Responses 语义 SSE 流，产出中立 [`StreamChunk`]。
 ///
 /// 事件 → chunk 映射（与 DeepSeek 骨架一致，事件名相同）：
@@ -1049,17 +1043,10 @@ fn process_responses_sse_stream(
                 yield Ok(StreamChunk::BlockEnd { index: idx, block: ContentBlock::Reasoning { text: reasoning } });
             }
         }
-        for (idx, tc) in tool_calls.drain() {
-            if !tc.call_id.is_empty() && !tc.name.is_empty() {
-                let mut args = tc.arguments;
-                if args.is_empty() || args.trim() == "null" {
-                    args = "{}".to_string();
-                }
-                yield Ok(StreamChunk::BlockEnd {
-                    index: idx,
-                    block: ContentBlock::ToolCall { call_id: tc.call_id, name: tc.name, arguments: args },
-                });
-            }
+        for (index, block) in
+            flush_unclosed_tool_calls(&request_id, tool_calls, finish_reason)
+        {
+            yield Ok(StreamChunk::BlockEnd { index, block });
         }
 
         let usage = usage.unwrap_or_default();
@@ -2253,6 +2240,49 @@ mod tests {
                 Ok(StreamChunk::Finish { reason: FinishReason::MaxTokens }),
             ] if text == "部分"
         ));
+    }
+
+    /// 截断切断的**工具调用**不得由安全网补齐成完整块：arguments 是被截断的
+    /// 半截 JSON，补齐会让畸形 FunctionCall 进会话历史并被回传给下一轮请求。
+    /// 只留一个悬挂的 `BlockStart`，由 `Finish{MaxTokens}` 收敛为 Incomplete。
+    #[tokio::test]
+    async fn test_stream_incomplete_drops_unclosed_tool_call() {
+        let base = spawn_sse_server(sse_events(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"save_agent","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"name\":\"@reviewer\",\"prompt\":\"你是一个"}"#,
+            r#"{"type":"response.incomplete","response":{"id":"r5","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":4096,"total_tokens":4101}}}"#,
+        ]))
+        .await;
+        let client = QwenResponsesAdapter::new("sk-test-key")
+            .unwrap()
+            .with_base_url(base);
+        let chunks = collect_stream(&client, &make_request()).await;
+
+        assert!(matches!(
+            &chunks[..],
+            [
+                Ok(StreamChunk::BlockStart {
+                    block_type: BlockType::ToolCall,
+                    ..
+                }),
+                Ok(StreamChunk::ToolCallDelta { .. }),
+                Ok(StreamChunk::ToolCallDelta { .. }),
+                Ok(StreamChunk::Usage { .. }),
+                Ok(StreamChunk::Finish {
+                    reason: FinishReason::MaxTokens
+                }),
+            ]
+        ));
+        assert!(
+            !chunks.iter().any(|c| matches!(
+                c,
+                Ok(StreamChunk::BlockEnd {
+                    block: ContentBlock::ToolCall { .. },
+                    ..
+                })
+            )),
+            "截断的工具调用不得产出 ToolCall 块"
+        );
     }
 
     /// 百炼内置工具事件与 item（web_search_call/code_interpreter_call/mcp_call）

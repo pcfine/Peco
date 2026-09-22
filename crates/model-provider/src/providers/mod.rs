@@ -4,6 +4,7 @@
 //! 新增厂商时在此处添加对应子模块即可。
 
 mod chat_common;
+mod responses_common;
 
 pub mod deepseek;
 pub mod openai;
