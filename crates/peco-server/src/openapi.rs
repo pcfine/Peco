@@ -24,8 +24,9 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
             ```\n\n\
             ## SSE 流式对话\n\
             `GET /api/conversations/:id/stream?message=xxx`\n\
-            事件类型：`text_delta`, `tool_call_start`, `tool_result`, \
-            `agent_call_start`, `agent_call_end`, `turn_complete`, `done`, `error`",
+            事件类型：`text_delta`, `reasoning_delta`, `tool_call_start`, \
+            `tool_result`, `agent_call_start`, `agent_call_end`, `turn_complete`, \
+            `context_compacted`, `truncation_retry`, `usage`, `done`, `error`",
         contact(name = "peco", url = "https://github.com/pcfine/peco"),
     ),
     servers((url = "http://localhost:9227", description = "本地开发服务器")),

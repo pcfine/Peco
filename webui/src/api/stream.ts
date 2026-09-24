@@ -16,6 +16,7 @@ import type {
   DoneData,
   UsageEventData,
   ContextCompactedData,
+  TruncationRetryData,
   ErrorData,
 } from "@/types/chat";
 
@@ -100,6 +101,8 @@ export function toChatSseEvent(parsed: ParsedSSEEvent): ChatSseEvent | null {
       return { event, data: data as unknown as UsageEventData };
     case "context_compacted":
       return { event, data: data as unknown as ContextCompactedData };
+    case "truncation_retry":
+      return { event, data: data as unknown as TruncationRetryData };
     case "error":
       return { event, data: data as unknown as ErrorData };
     default:

@@ -443,6 +443,32 @@ pub enum LooperEvent {
         estimated_tokens_after: usize,
     },
 
+    /// 本次模型尝试因输出被截断而作废，正在以更大的输出预算重试。
+    ///
+    /// **纯通知，不含撤销语义**：接收方不删除任何已下发的增量。该尝试的产出
+    /// 已由 [`Self::begin_truncation_retry`] 从 Session staging 中回退，因此它
+    /// 只存在于「实时视图」里，不存在于任何权威历史中 —— 这正是本事件要
+    /// 解释的事实。前端重载后从快照恢复，残句与通知一并消失。
+    ///
+    /// 四个数字用来让提示自解释（为什么重试、第几次），不含用户内容。
+    TruncationRetry {
+        turn_index: usize,
+        /// 第几次重试（1-based）
+        attempt: u32,
+        /// 本轮重试上限（0 = 关闭，此时不会发出本事件）
+        limit: u32,
+        /// 截断那次的输出 token 数
+        output_tokens: u32,
+        /// 抬升后的输出预算
+        retry_budget: u32,
+        /// 该次尝试已下发的正文增量。
+        ///
+        /// **仅供落库侧对齐**（`chat` 模块的 `messages` 表累加器按后缀剥离），
+        /// **不向客户端下发** —— `map_looper_event` 刻意过滤掉它。实时视图
+        /// 保留这段残句是本设计的取舍，见 `docs/design/truncation-retry-notice.md`。
+        discarded_text: String,
+    },
+
     /// Looper 即将退出 `run()` 方法。
     Shutdown {
         reason: String,
@@ -1739,7 +1765,13 @@ impl AgentLooper {
     /// 落盘的 `InflightCheckpoint` 在同一口径上，且取锚点时常无其他 staging 写入，
     /// 即 `锚点 == 检查点条数`。被丢弃的消息从不属于检查点，落盘的检查点依然
     /// 精确；反而若在此重写，会把已落地的工具结果从检查点抹掉。
-    fn begin_truncation_retry(
+    ///
+    /// # 为什么发 [`LooperEvent::TruncationRetry`] 而不回退传输层
+    /// 已下发的增量留在实时视图里，由一条通知解释它们为什么不属于最终答案。
+    /// 用 `emit_event_guaranteed` 而非 `try_send`：丢一条通知 = 画面上多出一段
+    /// 无法解释的残句、本特性整个没发生（同 [`LooperEvent::ContextCompacted`]
+    /// 的处置）。
+    async fn begin_truncation_retry(
         &mut self,
         turn: usize,
         output_tokens: u32,
@@ -1760,8 +1792,11 @@ impl AgentLooper {
         };
 
         // 残片留作兜底（见字段文档），然后清干净本次调用的全部累积量。
-        self.truncation_salvage = Some(std::mem::take(&mut self.react_ctx.assistant_text));
-        self.react_ctx.assistant_reasoning.clear();
+        // 正文比推理多留一份：它同时是通知载荷（落库侧按后缀剥离用）。
+        let salvaged_text = std::mem::take(&mut self.react_ctx.assistant_text);
+        let salvaged_reasoning = std::mem::take(&mut self.react_ctx.assistant_reasoning);
+        let had_output = !salvaged_text.is_empty() || !salvaged_reasoning.is_empty();
+        self.truncation_salvage = Some(salvaged_text.clone());
         self.react_ctx.pending_tool_calls.clear();
         self.react_ctx.batch_response = None;
 
@@ -1778,6 +1813,27 @@ impl AgentLooper {
             retry_budget = self.retry_output_budget(),
             "Model output truncated at max_tokens; retrying with a larger output budget"
         );
+
+        // 通知必须在状态置回 `PreparingRequest` **之后**发：同一 Speaker FIFO
+        // 保证它早于重试尝试的第一条 TextDelta，前端插的横幅因此落在残句与
+        // 新正文之间。`discarded_text` 取自上面那一手 `take`，是唯一真相源。
+        //
+        // 零产出（截断且什么都没吐）不发：没有需要解释的残句，发出去只会让
+        // 前端插一条无上下文的横幅。
+        if had_output {
+            Self::emit_event_guaranteed(
+                &self.event_speaker,
+                LooperEvent::TruncationRetry {
+                    turn_index: turn,
+                    attempt: self.truncation_retries_used as u32,
+                    limit: self.config.truncation_retry_limit,
+                    output_tokens,
+                    retry_budget: self.retry_output_budget(),
+                    discarded_text: salvaged_text,
+                },
+            )
+            .await;
+        }
         true
     }
 
@@ -1791,8 +1847,22 @@ impl AgentLooper {
     /// 都拿得到它，收尾既带文本也仍能冻结整轮。
     ///
     /// 无残片时**不触碰该字段**：非重试路径的行为逐字节不变。
+    ///
+    /// # 只填空
+    /// `react_ctx.assistant_text` 非空说明**重试之后的那次尝试**自己已经吐过
+    /// 文本（那是用户此刻在画面上看到的内容），此时残片是陈旧的，覆盖它就
+    /// 等于把「这一次」的 partial_text 换成「上一次」的。这条路径真实存在：
+    /// 重试尝试成功进入 `ExecutingTools` 后 `finalize_tool_execution` 会清空
+    /// `assistant_text`，此后同轮任何一次失败都会走到这里。而
+    /// `partial_text` 喂给 [`plan_failure`] 的补条（`Session::stage_salvage`），
+    /// 喂错了文本，冻结进历史的整轮内容就是错的。
+    ///
+    /// 只填空同时给残片补上了缺失的清除点：重试成功的路径不经过
+    /// [`Self::finalize_failure`]，残片本会一直留到本轮结束。
     fn restore_truncation_salvage(&mut self) {
-        if let Some(salvage) = self.truncation_salvage.take() {
+        if let Some(salvage) = self.truncation_salvage.take()
+            && self.react_ctx.assistant_text.is_empty()
+        {
             self.react_ctx.assistant_text = salvage;
         }
     }
@@ -2011,7 +2081,9 @@ impl AgentLooper {
             //   上游未提供该信息时为 `None` —— 不臆测，不重试。
             if response.status == ResponseStatus::Incomplete
                 && matches!(response.finish_reason, Some(FinishReason::MaxTokens))
-                && self.begin_truncation_retry(turn, response.usage.output_tokens, checkpoint)
+                && self
+                    .begin_truncation_retry(turn, response.usage.output_tokens, checkpoint)
+                    .await
             {
                 return;
             }
@@ -2211,11 +2283,13 @@ impl AgentLooper {
             //   导致的状态降级同样不是 `MaxTokens`，也救不回来。
             if status == ResponseStatus::Incomplete
                 && matches!(finish_reason, Some(FinishReason::MaxTokens))
-                && self.begin_truncation_retry(
-                    self.session.turn_index(),
-                    usage.output_tokens,
-                    checkpoint,
-                )
+                && self
+                    .begin_truncation_retry(
+                        self.session.turn_index(),
+                        usage.output_tokens,
+                        checkpoint,
+                    )
+                    .await
             {
                 return;
             }
@@ -2636,6 +2710,12 @@ impl AgentLooper {
         self.react_ctx.assistant_text.clear();
         self.react_ctx.assistant_reasoning.clear();
         self.react_ctx.batch_response = None;
+        // 截断重试的残片到此作废：能走到这里说明**重试之后那次尝试**已经成功
+        // 并产出了工具调用，残片要兜底的那个场景已经过去了。不清的话它会一直
+        // 留到本轮结束，而本轮任何一次「什么都没吐出来」的失败（请求发不出去）
+        // 都会因 `assistant_text` 恰好为空而被它顶上 —— 收尾拿到的
+        // `partial_text` 于是是上一次尝试的文本（CLI 会把它再打印一遍）。
+        self.truncation_salvage = None;
         self.react_state = ReActState::PreparingRequest;
     }
 
@@ -3689,6 +3769,55 @@ mod tests {
             }
             out
         }
+
+        /// 原样排空事件通道 —— 需要断言事件**顺序**（如通知早于重试的增量）时用。
+        ///
+        /// 与 [`Self::turn_outcomes`] 互斥：两者都在消费同一个 listener，
+        /// 先 drain 的拿走全部。
+        fn drain_events(&mut self) -> Vec<LooperEvent> {
+            let mut out = Vec::new();
+            while let Ok(ev) = self.events.try_recv() {
+                out.push(ev);
+            }
+            out
+        }
+    }
+
+    /// 取出 `events` 里全部 `TruncationRetry` 通知，连同它们在序列中的下标。
+    fn truncation_notices(events: &[LooperEvent]) -> Vec<(usize, u32, u32, u32, u32, String)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ev)| match ev {
+                LooperEvent::TruncationRetry {
+                    attempt,
+                    limit,
+                    output_tokens,
+                    retry_budget,
+                    discarded_text,
+                    ..
+                } => Some((
+                    i,
+                    *attempt,
+                    *limit,
+                    *output_tokens,
+                    *retry_budget,
+                    discarded_text.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `events` 里全部 `TextDelta` 原文首尾相接 —— 即客户端此刻累积到的内容。
+    fn streamed_text(events: &[LooperEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                LooperEvent::TextDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// 构造截断重试测试用的 looper：流式 provider + 指定的重试配置。
@@ -4110,6 +4239,207 @@ mod tests {
         drive_query(&mut h).await;
 
         assert_eq!(h.provider.budgets().len(), 1, "原因未知时不得重试");
+    }
+
+    #[tokio::test]
+    async fn test_truncation_retry_emits_notice_before_retried_text() {
+        let mut h = retry_harness(
+            vec![truncated("part"), completed("done")],
+            LooperConfig {
+                truncation_retry_limit: 1,
+                truncation_retry_min_budget: 32_768,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+        let events = h.drain_events();
+
+        // ── 通知本身：恰好一条，四个数字取自实际请求 ──
+        let notices = truncation_notices(&events);
+        assert_eq!(notices.len(), 1, "limit=1 恰好一条通知");
+        let (notice_at, attempt, limit, output_tokens, retry_budget, discarded) = &notices[0];
+        assert_eq!(*attempt, 1);
+        assert_eq!(*limit, 1);
+        assert_eq!(*output_tokens, 4096, "截断那次的输出 token 数");
+        assert_eq!(*retry_budget, 32_768, "抬升后的预算");
+        assert_eq!(discarded, "part", "载荷是被丢弃那次尝试的正文");
+
+        // ── 顺序：通知必须早于重试尝试的第一条增量 ──
+        // 前端据此把横幅插在残句与新正文之间；晚于增量就会插到答案下面。
+        let second_delta_at = events
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| matches!(ev, LooperEvent::TextDelta { .. }))
+            .nth(1)
+            .map(|(i, _)| i)
+            .expect("重试尝试必须发出第二条 TextDelta");
+        assert!(
+            *notice_at < second_delta_at,
+            "通知（下标 {notice_at}）必须早于重试的增量（下标 {second_delta_at}）"
+        );
+
+        // ── 落库侧的剥离不变量 ──
+        // 通知到来这一刻，累加器必然**以载荷结尾** —— 该次尝试的增量是最后
+        // 追加进累加器的内容，之后到通知之间不可能再有别的 delta（之间只隔
+        // 一个 Finish / Usage 块）。落库侧按后缀剥离依赖的正是这条。
+        //
+        // 注意残句在**最终**画面里是前缀（后面还跟着重试的正文），所以剥离
+        // 只能发生在通知这一刻，不能等到轮次结束再对着最终文本做。
+        let up_to_notice = streamed_text(&events[..*notice_at]);
+        assert_eq!(up_to_notice, "part");
+        assert!(
+            up_to_notice.ends_with(discarded.as_str()),
+            "剥离不变量：通知到达时累加器以载荷结尾"
+        );
+
+        // ── 取舍的显式记录：客户端拿到的增量串是「残句 + 新正文」──
+        // 本设计**不**在传输层删除已下发的增量，靠通知解释这段残句。
+        // 断言最终串，避免将来有人「顺手」在 core 侧把残句吞掉而测试仍全绿。
+        assert_eq!(streamed_text(&events), "partdone");
+    }
+
+    #[tokio::test]
+    async fn test_truncation_retry_notice_carries_reasoning_only_attempt() {
+        // 正文为空、只有推理被吐出来的那次尝试同样要通知：画面上确实多了一段
+        // 属于已作废尝试的推理内容。载荷正文为空，落库侧剥离是空操作。
+        let mut h = retry_harness(
+            vec![
+                Script::Chunks(vec![
+                    StreamChunk::BlockStart {
+                        index: 0,
+                        block_type: model_provider::BlockType::Reasoning,
+                    },
+                    StreamChunk::ReasoningDelta {
+                        index: 0,
+                        delta: "想想".to_string(),
+                    },
+                    StreamChunk::BlockEnd {
+                        index: 0,
+                        block: ContentBlock::Reasoning {
+                            text: "想想".to_string(),
+                        },
+                    },
+                    StreamChunk::Finish {
+                        reason: FinishReason::MaxTokens,
+                    },
+                ]),
+                completed("done"),
+            ],
+            LooperConfig {
+                truncation_retry_limit: 1,
+                truncation_retry_min_budget: 32_768,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+        let events = h.drain_events();
+
+        let notices = truncation_notices(&events);
+        assert_eq!(notices.len(), 1, "只有推理产出也要通知");
+        assert_eq!(notices[0].5, "", "载荷正文为空");
+    }
+
+    #[tokio::test]
+    async fn test_truncation_retry_notice_absent_on_zero_output() {
+        // 截断但什么都没吐：没有需要解释的残句，发出去只会让前端插一条
+        // 无上下文的横幅。重试本身照常进行。
+        let mut h = retry_harness(
+            vec![truncated(""), completed("done")],
+            LooperConfig {
+                truncation_retry_limit: 1,
+                truncation_retry_min_budget: 32_768,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+        let events = h.drain_events();
+
+        assert!(truncation_notices(&events).is_empty(), "零产出不得发通知");
+        assert_eq!(
+            h.provider.budgets().len(),
+            2,
+            "零产出仍要重试 —— 不发通知只是不发通知"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_truncation_retry_emits_notice() {
+        // 批量路径不发 delta，客户端没有残句可解释；通知照发（事件陈述的是
+        // 「本次尝试作废」这个事实），落库侧的载荷是该次尝试的整段文本。
+        let mut h = batch_retry_harness(
+            vec![
+                batch_response(
+                    "part",
+                    4096,
+                    model_provider::ResponseStatus::Incomplete,
+                    Some(FinishReason::MaxTokens),
+                ),
+                batch_response(
+                    "done",
+                    20,
+                    model_provider::ResponseStatus::Completed,
+                    Some(FinishReason::Stop),
+                ),
+            ],
+            LooperConfig {
+                truncation_retry_limit: 1,
+                truncation_retry_min_budget: 32_768,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+        let events = h.drain_events();
+
+        let notices = truncation_notices(&events);
+        assert_eq!(notices.len(), 1, "批量路径同样发通知");
+        assert_eq!(notices[0].5, "part", "载荷是整段文本，供落库侧剥离");
+        assert!(
+            streamed_text(&events).is_empty(),
+            "批量路径本就不发 delta，客户端无残句"
+        );
+    }
+
+    #[test]
+    fn test_restore_truncation_salvage_only_fills_empty() {
+        // 当前尝试自己吐过文本时残片是陈旧的，覆盖它会把 partial_text
+        // 换成上一次尝试的内容 —— 而 partial_text 会经 plan_failure 的
+        // 补条冻结进历史。
+        let mut h = retry_harness(vec![], LooperConfig::default());
+        h.looper.truncation_salvage = Some("stale".to_string());
+        h.looper.react_ctx.assistant_text = "current".to_string();
+
+        h.looper.restore_truncation_salvage();
+
+        assert_eq!(h.looper.react_ctx.assistant_text, "current");
+        assert!(
+            h.looper.truncation_salvage.is_none(),
+            "残片即便不被采用也必须被消费掉，否则会留到下一次收尾"
+        );
+
+        // 当前尝试没吐过文本（重试请求发不出去那条路径）→ 照常归还
+        h.looper.react_ctx.assistant_text.clear();
+        h.looper.truncation_salvage = Some("stale".to_string());
+        h.looper.restore_truncation_salvage();
+        assert_eq!(h.looper.react_ctx.assistant_text, "stale");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_tool_execution_drops_stale_salvage() {
+        // 重试之后那次尝试成功产出工具调用 → 残片要兜底的场景已过去。
+        // 不清的话本轮后续任何一次「什么都没吐出来」的失败都会把它顶上。
+        let mut h = retry_harness(vec![], LooperConfig::default());
+        h.looper.truncation_salvage = Some("stale".to_string());
+
+        h.looper.finalize_tool_execution().await;
+
+        assert!(
+            h.looper.truncation_salvage.is_none(),
+            "进入下一轮 ReAct 迭代时残片必须作废"
+        );
     }
 
     #[test]

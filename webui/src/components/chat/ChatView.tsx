@@ -805,6 +805,26 @@ export function reduceStreamEvent(
           summary: event.data.summary,
         },
       ];
+    case "truncation_retry": {
+      // 本次尝试的输出被截断并回退，实时视图里留下的残句由这条横幅解释。
+      // 不删除已收到的增量 —— 权威内容由 Session 快照保证，重载即收敛。
+      //
+      // 横幅插在末条 assistant **之前**，不是追加到末尾：上面四个 delta
+      // 分支都以「末条 assistant」为目标，追加会让重试的增量全落进横幅里。
+      const last = messages[messages.length - 1];
+      if (last?.role !== "assistant") return messages;
+      return [
+        ...messages.slice(0, -1),
+        {
+          role: "assistant" as const,
+          content: `输出被截断，正在以更大的输出预算重试（${event.data.attempt}/${event.data.limit}）`,
+          turnIndex: 0,
+          isNotice: true,
+          noticeIcon: "🔁",
+        },
+        last,
+      ];
+    }
     case "error":
       // 后端失败轮次（模型错误、超时、取消等）以警示气泡展示错误信息
       return [

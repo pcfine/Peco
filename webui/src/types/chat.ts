@@ -36,6 +36,7 @@ export type ChatSseEvent =
   | { event: "done"; data: DoneData }
   | { event: "usage"; data: UsageEventData }
   | { event: "context_compacted"; data: ContextCompactedData }
+  | { event: "truncation_retry"; data: TruncationRetryData }
   | { event: "error"; data: ErrorData };
 
 export interface TextDeltaData {
@@ -106,6 +107,20 @@ export interface ErrorData {
 export interface ContextCompactedData {
   evicted_turns: number;
   summary: string;
+  conversation_id: string;
+}
+
+/**
+ * 本轮模型输出被截断，正在以更大的输出预算重试。
+ *
+ * 纯通知：前端**不**删除任何已收到的 `text_delta`，只在当前轮气泡之前插一条
+ * 居中横幅解释那段残句。被作废那次的产出已从 Session 回退，重载后随快照消失。
+ */
+export interface TruncationRetryData {
+  attempt: number;
+  limit: number;
+  output_tokens: number;
+  retry_budget: number;
   conversation_id: string;
 }
 

@@ -277,7 +277,7 @@ curl -N "http://localhost:9227/api/conversations/{conv_id}/stream?message=你好
 | `GET` | `/api/conversations/:id/stream?message=` | **SSE 流式对话** |
 | `GET` | `/api/conversations/:id/session` | 获取完整 Session 快照 |
 
-**SSE 事件类型（9 种）：**
+**SSE 事件类型（12 种）：**
 
 | 事件 | 说明 |
 |------|------|
@@ -288,8 +288,16 @@ curl -N "http://localhost:9227/api/conversations/{conv_id}/stream?message=你好
 | `agent_call_start` | 子 Agent 调用开始（委托/并行编排） |
 | `agent_call_end` | 子 Agent 调用结束 |
 | `turn_complete` | 本轮对话完成（含 token 用量） |
+| `context_compacted` | 上下文滚动压缩完成（更早的轮次已归档为摘要） |
+| `truncation_retry` | 本轮输出被截断，正在以更大的输出预算重试（纯通知） |
+| `usage` | 上下文用量快照（每次模型调用后下发） |
 | `done` | 流结束 |
 | `error` | 错误信息 |
+
+`truncation_retry` 不带撤销语义：前端**不**删除已收到的 `text_delta`，只在当前轮
+气泡之前插一条居中横幅解释那段残句。被作废那次的产出已从 `Session` 回退，因此
+只存在于实时视图里 —— 页面重载从快照恢复后，残句与横幅一并消失。终端同理
+（`peco-cli` 打一行提示，保留残句），因为终端本就撤不回已打印的字符。
 
 ### Agent 管理
 
@@ -529,6 +537,8 @@ Client                     Axum Handler                  Background Task
   |<── SSE: text_delta ────────|<─── LooperEvent::TextDelta ───|
   |<── SSE: tool_call_start ───|<─── LooperEvent::ToolCall ────|
   |<── SSE: tool_result ───────|<─── LooperEvent::ToolResult ──|
+  |<── SSE: truncation_retry ──|<─── LooperEvent::TruncationRetry
+  |                             |      （纯通知：截断重试，不撤回已发增量）
   |<── SSE: turn_complete ─────|<─── LooperEvent::TurnComplete |
   |<── SSE: done ──────────────|<─── LooperEvent::Shutdown ────|
   |                             |                              |

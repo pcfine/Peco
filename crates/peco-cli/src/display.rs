@@ -349,6 +349,25 @@ impl Renderer for ConsoleRenderer {
                 writeln!(self.term)?;
             }
 
+            // ── 截断重试 ──
+            // 终端只追加，撤不回已打印的残句，管道重定向下更无法重绘 ——
+            // 与网页端同一条路线：保留残句，用一行提示说明它不属于最终答案。
+            // 重试的正文紧接着继续输出。
+            LooperEvent::TruncationRetry {
+                attempt,
+                limit,
+                output_tokens,
+                retry_budget,
+                ..
+            } => {
+                self.transition_to(StreamMode::Idle)?;
+                self.write_segment(&Segment::new(
+                    SegmentRole::Info,
+                    Self::truncation_retry_notice(*attempt, *limit, *output_tokens, *retry_budget),
+                ))?;
+                writeln!(self.term)?;
+            }
+
             // ── Shutdown ──
             LooperEvent::Shutdown {
                 reason,
@@ -380,6 +399,25 @@ impl Renderer for ConsoleRenderer {
         self.transition_to(StreamMode::Idle)?;
         self.write_segment(&Segment::new(SegmentRole::Error, error))?;
         writeln!(self.term)
+    }
+}
+
+impl ConsoleRenderer {
+    /// 截断重试提示文案。
+    ///
+    /// 抽成关联函数只为可测：渲染路径直接写 stdout，测试没法断言输出。
+    /// 两个 token 数让提示自解释（为什么重试、抬到多少），`attempt/limit`
+    /// 回答「第几次、还有没有下次」。
+    pub fn truncation_retry_notice(
+        attempt: u32,
+        limit: u32,
+        output_tokens: u32,
+        retry_budget: u32,
+    ) -> String {
+        format!(
+            "[输出被截断（{output_tokens} tokens），正在以更大的预算 {retry_budget} \
+             重试（{attempt}/{limit}）]"
+        )
     }
 }
 
@@ -497,6 +535,16 @@ mod tests {
         r.mode = StreamMode::InText;
         r.transition_to(StreamMode::Idle).unwrap();
         assert_eq!(r.mode, StreamMode::Idle);
+    }
+
+    // ── 截断重试提示 ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_truncation_retry_notice_is_self_explanatory() {
+        let msg = ConsoleRenderer::truncation_retry_notice(1, 2, 4096, 32_768);
+        assert!(msg.contains("4096"), "要说明截断在多少 token：{msg}");
+        assert!(msg.contains("32768"), "要说明抬到了多少：{msg}");
+        assert!(msg.contains("1/2"), "要说明第几次、有没有下次：{msg}");
     }
 
     // ── truncate ───────────────────────────────────────────────────────────

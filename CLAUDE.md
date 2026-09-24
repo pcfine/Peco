@@ -183,7 +183,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 
 **Chat/SSE**（[crates/peco-server/src/chat/](crates/peco-server/src/chat/)）：
 - `GET /api/conversations/:id/stream` — SSE 端点。创建 `AgentLooper`，在 tokio 任务中启动它，并将 `LooperEvent` 桥接到 SSE 事件流。
-- SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`error`、`done`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`ReactStateChange` 被过滤掉，不发送给客户端。）
+- SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`error`、`done`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`ReactStateChange` 被过滤掉，不发送给客户端；`TruncationRetry` 的 `discarded_text` 字段同样不下发 —— 它只服务 `chat` 模块落库累加器的后缀剥离。）
+- `truncation_retry` 是**纯通知**，不含撤销语义：截断重试回退的是 `Session`（staging）而非传输层，前端不删除已收到的增量，只在当前轮气泡**之前**插一条居中横幅解释残句；重载从快照恢复后残句与横幅一并消失。CLI 同路线（打一行提示，保留残句）。
 - 子 Agent 调用（`delegate_sub_agent` / `run_parallel_sub_agents`）通过按 tool_call_id 映射的 `SubAgentInfo` 注册表追踪，生成 `agent_call_start`/`agent_call_end` SSE 事件供前端可视化。
 - `GET /api/conversations/:id/session` — 返回完整 `SessionSnapshot`，包含工具调用和推理内容。
 
@@ -228,7 +229,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **页面**：`chat/`、`agents/`、`knowledge/`、`tasks/`、`auth/`、`settings/`。
 - **Stores**（Zustand）：`authStore.ts`（持久化到 localStorage，JWT + 用户信息）、`sidebarStore.ts`（仅在内存中，折叠状态）。
 - **API 层**（[webui/src/api/](webui/src/api/)）：`client.ts`（axios 实例，带 JWT 拦截器 — 附加 Bearer token，处理 401 自动登出和 429 限流提示）、`stream.ts`（SSE 解析器使用 eventsource-stream），以及领域特定模块（`agents.ts`、`conversations.ts`、`knowledge.ts`、`tasks.ts`）。
-- **SSE 流式**：使用原生 `fetch()` + `ReadableStream` reader（而非 EventSource）实现实时 token 流式传输，支持 `AbortController`。解析 9 种 SSE 事件类型（`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`done`、`error`），并响应式更新消息状态 — 追加文本增量、在可折叠的 `<details>` 中显示推理、将工具调用渲染为卡片、以嵌套消息气泡追踪子 Agent 委托。
+- **SSE 流式**：使用原生 `fetch()` + `ReadableStream` reader（而非 EventSource）实现实时 token 流式传输，支持 `AbortController`。解析 12 种 SSE 事件类型（`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`done`、`error`），并响应式更新消息状态 — 追加文本增量、在可折叠的 `<details>` 中显示推理、将工具调用渲染为卡片、以嵌套消息气泡追踪子 Agent 委托。
+- `reduceStreamEvent`（[ChatView.tsx](webui/src/components/chat/ChatView.tsx)）是 ChatView 与 peco store 共用的唯一 reducer。四个 delta 分支都以「末条 assistant」为目标，因此 `truncation_retry` 的横幅插在末条**之前**而非追加到末尾 —— 追加会让重试的增量全落进横幅里。
 - [ChatDetailPage](webui/src/pages/chat/ChatDetailPage.tsx) 是最复杂的页面：挂载时加载 Session 快照，管理 SSE 流生命周期，处理工具调用和子 Agent 可视化。
 - **组件**：shadcn/ui（Radix 原语）+ Tailwind CSS v4。表单使用 `react-hook-form` + `zod` 验证。Markdown 渲染通过 `react-markdown` + `remark-gfm` + `rehype-highlight`。
 - **路由**：`react-router-dom` v7，带 `ProtectedRoute` 包装器，检查 JWT token 并在挂载时自动获取用户信息。

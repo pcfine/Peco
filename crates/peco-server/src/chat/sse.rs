@@ -123,6 +123,24 @@ pub enum ChatSseEvent {
         summary: String,
         conversation_id: String,
     },
+
+    /// 本轮模型输出被截断，正在以更大的输出预算重试。
+    ///
+    /// **纯通知**：前端不删除任何已收到的 `text_delta`，只在当前轮的气泡
+    /// **之前**插一条居中横幅解释这段残句。该次尝试的产出已从 Session
+    /// staging 回退，因此只存在于实时视图里，重载后随快照一并消失。
+    #[serde(rename = "truncation_retry")]
+    TruncationRetry {
+        /// 第几次重试（1-based）
+        attempt: u32,
+        /// 本轮重试上限
+        limit: u32,
+        /// 截断那次的输出 token 数
+        output_tokens: u32,
+        /// 抬升后的输出预算
+        retry_budget: u32,
+        conversation_id: String,
+    },
 }
 
 /// Token 用量数据（精简版，供前端展示）。
@@ -157,9 +175,30 @@ impl ChatSseEvent {
             ChatSseEvent::Done { .. } => "done",
             ChatSseEvent::Usage { .. } => "usage",
             ChatSseEvent::ContextCompacted { .. } => "context_compacted",
+            ChatSseEvent::TruncationRetry { .. } => "truncation_retry",
         };
         Ok(Event::default().event(event_name).data(data))
     }
+}
+
+/// 按后缀剥离：仅当 `target` 确实以 `suffix` 结尾时才移除。
+///
+/// 供 `chat` 模块的落库累加器对齐 [`LooperEvent::TruncationRetry`] 用 ——
+/// 被作废那次的正文已经进了累加器，但它不属于最终答案。不匹配时是**无操作**：
+///
+/// - 批量路径根本不发增量，载荷是整段文本，累加器里没有对应内容；
+/// - 通知若因任何原因迟到或重复，重复剥离会把第二段正确文本也切掉。
+///
+/// # 不变量（调用方依赖）
+/// 通知到达这一刻，累加器必然以载荷结尾：该次尝试的增量是最后追加进累加器的
+/// 内容，之后到通知之间只隔一个 `Finish` / `Usage` 块，不可能再有增量。
+/// 剥离因此必须**就地发生在通知上**，不能攒到轮次结束再对着最终文本做 ——
+/// 那时残句已经变成前缀（后面还跟着重试的正文）。
+pub fn strip_suffix(target: &mut String, suffix: &str) {
+    if suffix.is_empty() || !target.ends_with(suffix) {
+        return;
+    }
+    target.truncate(target.len() - suffix.len());
 }
 
 // ── 子 Agent 事件关联类型 ───────────────────────────────────────────────────────
@@ -353,6 +392,22 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
+        // 通知里刻意**不带** `discarded_text`：它只为落库侧对齐服务，下发
+        // 会让「前端不删已发增量」这条约定多出一个诱人的误用口子。
+        LooperEvent::TruncationRetry {
+            attempt,
+            limit,
+            output_tokens,
+            retry_budget,
+            ..
+        } => Some(ChatSseEvent::TruncationRetry {
+            attempt,
+            limit,
+            output_tokens,
+            retry_budget,
+            conversation_id: cid,
+        }),
+
         // 以下事件不产生面向客户端的 SSE 事件
         LooperEvent::ToolCallDelta { .. }
         | LooperEvent::ReactStateChange { .. }
@@ -404,6 +459,70 @@ mod tests {
             panic!("failed outcome must map to ChatSseEvent::Error, got {event:?}");
         };
         assert!(message.contains("Insufficient Balance"));
+    }
+
+    #[test]
+    fn truncation_retry_maps_without_discarded_text() {
+        let event = map_looper_event(
+            LooperEvent::TruncationRetry {
+                turn_index: 3,
+                attempt: 1,
+                limit: 2,
+                output_tokens: 4096,
+                retry_budget: 32_768,
+                discarded_text: "part".to_string(),
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::TruncationRetry {
+            attempt,
+            limit,
+            output_tokens,
+            retry_budget,
+            ..
+        }) = &event
+        else {
+            panic!("必须映射为 ChatSseEvent::TruncationRetry，实际 {event:?}");
+        };
+        assert_eq!((*attempt, *limit), (1, 2));
+        assert_eq!((*output_tokens, *retry_budget), (4096, 32_768));
+
+        // 下发形态：事件名 + 载荷字段。正文不得出现在线上 —— 前端拿了只会
+        // 在「不删已发增量」的约定上多一个诱人的误用口子。
+        let json = serde_json::to_value(event.unwrap()).unwrap();
+        assert_eq!(json["event"], "truncation_retry");
+        assert_eq!(json["data"]["attempt"], 1);
+        assert_eq!(json["data"]["retry_budget"], 32_768);
+        assert!(
+            json["data"].get("discarded_text").is_none(),
+            "正文载荷不得下发，实际 {json}"
+        );
+    }
+
+    #[test]
+    fn strip_suffix_removes_only_matching_suffix() {
+        let mut acc = "prepart".to_string();
+        strip_suffix(&mut acc, "part");
+        assert_eq!(acc, "pre");
+
+        // 不匹配 → 无操作（批量路径的整段文本、迟到的重复通知）
+        let mut acc = "done".to_string();
+        strip_suffix(&mut acc, "part");
+        assert_eq!(acc, "done");
+
+        // 空载荷 → 无操作
+        let mut acc = "done".to_string();
+        strip_suffix(&mut acc, "");
+        assert_eq!(acc, "done");
+
+        // 中文按字节切不越界
+        let mut acc = "前言残句".to_string();
+        strip_suffix(&mut acc, "残句");
+        assert_eq!(acc, "前言");
+
+        // 重复剥离是幂等的：第二次不再匹配
+        strip_suffix(&mut acc, "残句");
+        assert_eq!(acc, "前言");
     }
 
     #[test]

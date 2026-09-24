@@ -211,6 +211,35 @@ describe("pecoChatStore 常驻连接", () => {
     });
   });
 
+  it("截断重试在占位气泡之前插横幅，重试的增量仍落进气泡", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+
+    await usePecoChatStore.getState().sendMessage("问", "test-token");
+    s.push(
+      frame("text_delta", { content: "part", conversation_id: "c" }),
+      frame("truncation_retry", {
+        attempt: 1,
+        limit: 1,
+        output_tokens: 4096,
+        retry_budget: 32768,
+        conversation_id: "c",
+      }),
+      frame("text_delta", { content: "done", conversation_id: "c" }),
+    );
+
+    await vi.waitFor(() => {
+      const msgs = usePecoChatStore.getState().messages;
+      expect(msgs.at(-1)?.content).toBe("partdone");
+    });
+
+    const msgs = usePecoChatStore.getState().messages;
+    const notice = msgs.find((m) => m.isNotice);
+    expect(notice?.content).toContain("1/1");
+    // 横幅不在末尾 —— 末尾留给重试后继续生长的回答气泡
+    expect(msgs.at(-1)?.isNotice).toBeUndefined();
+  });
+
   it("终态事件后迟到的增量被门控丢弃", async () => {
     const s = controllableStream();
     global.fetch = vi.fn(() => Promise.resolve(s.response));

@@ -32,7 +32,7 @@ use crate::state::AppState;
 use super::conversation::auto_archive_oldest_if_needed;
 use super::sse::{
     ChatSseEvent, SubAgentInfo, UsageData, extract_sub_agent_result, map_looper_event,
-    parse_sub_agent_infos,
+    parse_sub_agent_infos, strip_suffix,
 };
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
@@ -607,6 +607,23 @@ pub async fn stream_chat(
                     }
                     assistant_text.clear();
 
+                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
+                        && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
+                    }
+                }
+
+                // ── 截断重试 ─────────────────────────────────────────────
+                // 就地剥离被作废那次的正文 —— 它不属于最终答案，不该进
+                // `messages` 表。前端侧不删自己已收到的增量，只把这条事件当
+                // 通知看：落库内容对齐最终答案、SSE 内容对齐用户一路看到的
+                // 东西，两者在这里分道。
+                Some(event @ LooperEvent::TruncationRetry { .. }) => {
+                    if let LooperEvent::TruncationRetry { discarded_text, .. } = &event {
+                        strip_suffix(&mut assistant_text, discarded_text);
+                    }
                     if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
                         && let Ok(ev) = sse_ev.to_sse_event()
                         && sse_tx.send(Ok(ev)).await.is_err()

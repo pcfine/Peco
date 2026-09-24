@@ -63,6 +63,92 @@ describe("reduceStreamEvent tool_result", () => {
   });
 });
 
+describe("reduceStreamEvent truncation_retry", () => {
+  const RETRY = {
+    event: "truncation_retry" as const,
+    data: {
+      attempt: 1,
+      limit: 1,
+      output_tokens: 4096,
+      retry_budget: 32768,
+      conversation_id: "c1",
+    },
+  };
+
+  /** 残句已在画面上的那一轮：user + 正在生长的 assistant 气泡。 */
+  function midTurn(): ChatMessage[] {
+    return [
+      { role: "user", content: "写一篇长文", turnIndex: 0 },
+      { role: "assistant", content: "part", turnIndex: 0 },
+    ];
+  }
+
+  it("inserts a notice before the trailing assistant bubble, keeping the residue", () => {
+    const updated = reduceStreamEvent(RETRY, midTurn());
+
+    expect(updated).toHaveLength(3);
+    // 横幅在气泡之前 —— 残句在横幅之上，重试的正文在横幅之下继续生长
+    expect(updated[1].isNotice).toBe(true);
+    expect(updated[1].noticeIcon).toBe("🔁");
+    expect(updated[1].content).toContain("1/1");
+    // 已收到的增量不得删除
+    expect(updated[2].role).toBe("assistant");
+    expect(updated[2].content).toBe("part");
+    expect(updated[2].isNotice).toBeUndefined();
+  });
+
+  it("keeps appending deltas to the answer bubble, not the notice", () => {
+    // 本设计最关键的回归判据：横幅成为末条就会吞掉重试的所有增量。
+    const afterNotice = reduceStreamEvent(RETRY, midTurn());
+    const afterDelta = reduceStreamEvent(
+      { event: "text_delta", data: { content: "done", conversation_id: "c1" } },
+      afterNotice,
+    );
+
+    expect(afterDelta).toHaveLength(3);
+    expect(afterDelta[1].isNotice).toBe(true);
+    expect(afterDelta[1].content).not.toContain("done");
+    expect(afterDelta[2].content).toBe("partdone");
+  });
+
+  it("leaves reasoning deltas on the answer bubble too", () => {
+    const afterNotice = reduceStreamEvent(RETRY, midTurn());
+    const afterDelta = reduceStreamEvent(
+      {
+        event: "reasoning_delta",
+        data: { content: "想想", conversation_id: "c1" },
+      },
+      afterNotice,
+    );
+
+    expect(afterDelta[1].isNotice).toBe(true);
+    expect(afterDelta[2].reasoning).toBe("想想");
+  });
+
+  it("stacks one notice per retry, in order", () => {
+    const once = reduceStreamEvent(RETRY, midTurn());
+    const twice = reduceStreamEvent(
+      { ...RETRY, data: { ...RETRY.data, attempt: 2, limit: 2 } },
+      once,
+    );
+
+    expect(twice.map((m) => m.isNotice === true)).toEqual([
+      false,
+      true,
+      true,
+      false,
+    ]);
+    expect(twice[3].content).toBe("part");
+  });
+
+  it("returns the same array when there is no trailing assistant bubble", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: "你好", turnIndex: 0 },
+    ];
+    expect(reduceStreamEvent(RETRY, messages)).toBe(messages);
+  });
+});
+
 describe("snapshotToMessages", () => {
   const DATA_URI = "data:image/png;base64,AAAA";
 
