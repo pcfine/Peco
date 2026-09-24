@@ -27,7 +27,8 @@ use tracing::{Instrument, debug, trace, warn};
 use super::chat::{OPENAI_API_BASE_URL, OPENAI_REASONING_MIN_BUDGET};
 use crate::logging;
 use crate::providers::responses_common::{
-    PendingResponseToolCall, flush_unclosed_tool_calls, non_stream_finish_reason,
+    PendingResponseToolCall, flush_unclosed_tool_calls, incomplete_reason_to_finish_reason,
+    non_stream_finish_reason,
 };
 use crate::response::{
     BlockType, Content, ContentBlock, ContentPart, FinishReason, GenerateRequest, GenerateResult,
@@ -921,10 +922,7 @@ fn process_responses_sse_stream(
                             "responses stream ended incomplete (truncated)"
                         );
                         incomplete_reason = Some(reason.unwrap_or("<missing>").to_string());
-                        finish_reason = Some(match reason {
-                            Some("content_filter") => FinishReason::Error,
-                            _ => FinishReason::MaxTokens,
-                        });
+                        finish_reason = Some(incomplete_reason_to_finish_reason(reason));
                     }
                     // `completed`/`incomplete` 是语义流终止事件：立即收敛，避免依赖
                     // SSE EOF（服务端保活或重连会导致挂起直到外层超时）。截断时
@@ -2155,7 +2153,7 @@ mod tests {
         ));
     }
 
-    /// 内容过滤导致的 incomplete → `Finish::Error`，而非 MaxTokens。
+    /// 内容过滤导致的 incomplete → `Finish::ContentFilter`，而非 MaxTokens。
     #[tokio::test]
     async fn test_stream_incomplete_content_filter_maps_to_error() {
         let base = spawn_sse_server(sse_events(&[
@@ -2172,7 +2170,7 @@ mod tests {
         assert!(matches!(
             chunks.last(),
             Some(Ok(StreamChunk::Finish {
-                reason: FinishReason::Error
+                reason: FinishReason::ContentFilter
             }))
         ));
     }

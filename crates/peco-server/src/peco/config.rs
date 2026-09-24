@@ -18,6 +18,16 @@ use super::memory::MemoryConfig;
 ///
 /// 解析失败不静默吞：值写错却「看起来生效了」是最难查的一类配置问题。
 fn env_u32(name: &str, default: u32) -> u32 {
+    env_parse(name, default)
+}
+
+/// 读一个 `u64` 环境变量，语义同 [`env_u32`]。
+fn env_u64(name: &str, default: u64) -> u64 {
+    env_parse(name, default)
+}
+
+/// [`env_u32`] / [`env_u64`] 的共用实现。
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
         Ok(raw) => match raw.trim().parse() {
             Ok(value) => value,
@@ -25,7 +35,6 @@ fn env_u32(name: &str, default: u32) -> u32 {
                 warn!(
                     variable = name,
                     value = %raw,
-                    default,
                     "Invalid numeric env var; using default"
                 );
                 default
@@ -76,6 +85,17 @@ pub struct PecoConfig {
     /// 调到模型的上限之内，或直接把 `truncation_retry_limit` 置 0。
     /// 环境变量 `PECO_TRUNCATION_RETRY_MIN_BUDGET` 可覆盖。
     pub truncation_retry_min_budget: u32,
+    /// 瞬时故障重发次数上限（`0` = 关闭）。
+    /// 见 `LooperConfig::transient_retry_limit`。
+    ///
+    /// 环境变量 `PECO_TRANSIENT_RETRY_LIMIT` 可覆盖。
+    pub transient_retry_limit: u32,
+    /// 瞬时重发退避起始延迟（毫秒）。
+    /// 环境变量 `PECO_TRANSIENT_RETRY_BASE_DELAY_MS` 可覆盖。
+    pub transient_retry_base_delay_ms: u64,
+    /// 瞬时重发退避延迟上限（毫秒）。
+    /// 环境变量 `PECO_TRANSIENT_RETRY_MAX_DELAY_MS` 可覆盖。
+    pub transient_retry_max_delay_ms: u64,
 
     // ── 以下由 PecoManager 构造期填充 ──────────────────────
     /// 上下文滚动压缩策略。由 `PecoManager` 基于主 Agent 的 provider 构建。
@@ -105,6 +125,9 @@ impl Default for PecoConfig {
             memory: MemoryConfig::default(),
             truncation_retry_limit: env_u32("PECO_TRUNCATION_RETRY_LIMIT", 1),
             truncation_retry_min_budget: env_u32("PECO_TRUNCATION_RETRY_MIN_BUDGET", 32_768),
+            transient_retry_limit: env_u32("PECO_TRANSIENT_RETRY_LIMIT", 2),
+            transient_retry_base_delay_ms: env_u64("PECO_TRANSIENT_RETRY_BASE_DELAY_MS", 500),
+            transient_retry_max_delay_ms: env_u64("PECO_TRANSIENT_RETRY_MAX_DELAY_MS", 5_000),
             compaction: None,
             environment: None,
             dynamic_context: None,
@@ -128,6 +151,9 @@ impl PecoConfig {
             compaction: self.compaction.clone(),
             truncation_retry_limit: self.truncation_retry_limit,
             truncation_retry_min_budget: self.truncation_retry_min_budget,
+            transient_retry_limit: self.transient_retry_limit,
+            transient_retry_base_delay_ms: self.transient_retry_base_delay_ms,
+            transient_retry_max_delay_ms: self.transient_retry_max_delay_ms,
             ..LooperConfig::default()
         }
     }

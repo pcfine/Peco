@@ -29,7 +29,7 @@ pub(crate) fn chat_finish_reason_to_neutral(reason: Option<&str>) -> Option<Fini
         Some("stop") => Some(FinishReason::Stop),
         Some("tool_calls") | Some("function_call") => Some(FinishReason::ToolCalls),
         Some("length") | Some("max_tokens") => Some(FinishReason::MaxTokens),
-        Some("content_filter") => Some(FinishReason::Error),
+        Some("content_filter") => Some(FinishReason::ContentFilter),
         Some(_) => Some(FinishReason::Error),
         None => None,
     }

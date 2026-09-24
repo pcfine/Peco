@@ -21,17 +21,15 @@ pub(crate) struct PendingResponseToolCall {
     pub(crate) arguments: String,
 }
 
-/// 把 Responses 的 `incomplete_details.reason` 映射为中立 [`FinishReason`]。
+/// 把 Responses API 的 `incomplete_details.reason` 映射为中立 [`FinishReason`]。
 ///
-/// **仅在状态为 `incomplete` 时调用。** 与流式路径同一份判断：`content_filter`
-/// 是内容过滤，其余（含 reason 整体缺失）都按输出预算顶满处理 —— 静默降级成
-/// 「未知」会让引擎侧对真截断放弃重试。
-///
-/// 三个 Responses 适配器必须共用本函数：判定分歧会让同一份上游行为在不同
-/// provider 下走不同的恢复路径。
+/// **仅在状态为 `incomplete` 时调用。** `content_filter` 单列，其余（含缺失、
+/// 新增枚举、兼容网关自由文本）按截断兜底：误判成截断只白跑一次抬预算重试，
+/// 误判成「未知」则真截断直接判死整轮。
+/// 无论如何尝试一次不算太坏
 pub(crate) fn incomplete_reason_to_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
-        Some("content_filter") => FinishReason::Error,
+        Some("content_filter") => FinishReason::ContentFilter,
         _ => FinishReason::MaxTokens,
     }
 }

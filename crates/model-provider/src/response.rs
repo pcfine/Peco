@@ -230,6 +230,9 @@ pub enum FinishReason {
     ToolCalls,
     MaxTokens,
     Aborted,
+    /// 输出被内容过滤拦截。归 [`ResponseStatus::Failed`]，但与 [`Self::Error`]
+    /// 分开 — 上层要区分「救不回来的过滤」与「一般上游异常」。
+    ContentFilter,
     Error,
 }
 
@@ -241,6 +244,7 @@ impl FinishReason {
             FinishReason::ToolCalls => "tool_calls",
             FinishReason::MaxTokens => "max_tokens",
             FinishReason::Aborted => "aborted",
+            FinishReason::ContentFilter => "content_filter",
             FinishReason::Error => "error",
         }
     }
@@ -445,7 +449,7 @@ impl BlockAssembler {
                 FinishReason::MaxTokens => {
                     self.status = ResponseStatus::Incomplete;
                 }
-                FinishReason::Aborted | FinishReason::Error => {
+                FinishReason::Aborted | FinishReason::Error | FinishReason::ContentFilter => {
                     self.status = ResponseStatus::Failed;
                     self.error = Some(ResponseError {
                         code: None,

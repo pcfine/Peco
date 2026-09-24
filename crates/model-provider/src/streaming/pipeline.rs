@@ -262,9 +262,9 @@ fn finish_reason_to_finish(reason: Option<&str>) -> FinishReason {
         Some("content_filter") => {
             tracing::warn!(
                 wire_finish_reason = reason.unwrap(),
-                "Provider finished with content_filter, mapped to Error"
+                "Provider finished with content_filter"
             );
-            FinishReason::Error
+            FinishReason::ContentFilter
         }
         None => FinishReason::Stop,
         Some(other) => {

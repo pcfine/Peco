@@ -806,18 +806,24 @@ export function reduceStreamEvent(
         },
       ];
     case "truncation_retry": {
-      // 本次尝试的输出被截断并回退，实时视图里留下的残句由这条横幅解释。
+      // 本次尝试已作废并回退，实时视图里留下的残句由这条横幅解释。
       // 不删除已收到的增量 —— 权威内容由 Session 快照保证，重载即收敛。
       //
       // 横幅插在末条 assistant **之前**，不是追加到末尾：上面四个 delta
       // 分支都以「末条 assistant」为目标，追加会让重试的增量全落进横幅里。
+      //
+      // reason 区分两种重发：truncated（截断抬预算）与 transient
+      //（限流/网络/5xx 退避重发）；缺省按截断展示（兼容旧后端）。
       const last = messages[messages.length - 1];
       if (last?.role !== "assistant") return messages;
+      const isTransient = event.data.reason === "transient";
       return [
         ...messages.slice(0, -1),
         {
           role: "assistant" as const,
-          content: `输出被截断，正在以更大的输出预算重试（${event.data.attempt}/${event.data.limit}）`,
+          content: isTransient
+            ? `连接中断，正在重试（${event.data.attempt}/${event.data.limit}）`
+            : `输出被截断，正在以更大的输出预算重试（${event.data.attempt}/${event.data.limit}）`,
           turnIndex: 0,
           isNotice: true,
           noticeIcon: "🔁",

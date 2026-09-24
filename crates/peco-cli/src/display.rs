@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 
 use console::{Term, style};
-use peco_core::agent::{LooperEvent, TurnOutcome};
+use peco_core::agent::{LooperEvent, RetryNoticeReason, TurnOutcome};
 
 use crate::config::CliConfig;
 
@@ -358,13 +358,20 @@ impl Renderer for ConsoleRenderer {
                 limit,
                 output_tokens,
                 retry_budget,
+                reason,
                 ..
             } => {
                 self.transition_to(StreamMode::Idle)?;
-                self.write_segment(&Segment::new(
-                    SegmentRole::Info,
-                    Self::truncation_retry_notice(*attempt, *limit, *output_tokens, *retry_budget),
-                ))?;
+                let notice = match reason {
+                    RetryNoticeReason::Transient => Self::transient_retry_notice(*attempt, *limit),
+                    _ => Self::truncation_retry_notice(
+                        *attempt,
+                        *limit,
+                        *output_tokens,
+                        *retry_budget,
+                    ),
+                };
+                self.write_segment(&Segment::new(SegmentRole::Info, notice))?;
                 writeln!(self.term)?;
             }
 
@@ -418,6 +425,11 @@ impl ConsoleRenderer {
             "[输出被截断（{output_tokens} tokens），正在以更大的预算 {retry_budget} \
              重试（{attempt}/{limit}）]"
         )
+    }
+
+    /// 瞬时故障重发提示文案（限流/网络中断/上游 5xx）。
+    pub fn transient_retry_notice(attempt: u32, limit: u32) -> String {
+        format!("[连接中断，正在重试（{attempt}/{limit}）]")
     }
 }
 
@@ -545,6 +557,13 @@ mod tests {
         assert!(msg.contains("4096"), "要说明截断在多少 token：{msg}");
         assert!(msg.contains("32768"), "要说明抬到了多少：{msg}");
         assert!(msg.contains("1/2"), "要说明第几次、有没有下次：{msg}");
+    }
+
+    #[test]
+    fn test_transient_retry_notice_is_self_explanatory() {
+        let msg = ConsoleRenderer::transient_retry_notice(2, 3);
+        assert!(msg.contains("连接中断"), "要说明发生了什么：{msg}");
+        assert!(msg.contains("2/3"), "要说明第几次、有没有下次：{msg}");
     }
 
     // ── truncate ───────────────────────────────────────────────────────────

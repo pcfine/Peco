@@ -17,7 +17,8 @@ use tracing::{Instrument, warn};
 use crate::logging;
 use crate::providers::chat_common::strip_image_parts;
 use crate::providers::responses_common::{
-    PendingResponseToolCall, flush_unclosed_tool_calls, non_stream_finish_reason,
+    PendingResponseToolCall, flush_unclosed_tool_calls, incomplete_reason_to_finish_reason,
+    non_stream_finish_reason,
 };
 use crate::response::{
     BlockType, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
@@ -896,10 +897,7 @@ fn process_responses_sse_stream(
                             "responses stream ended incomplete (truncated)"
                         );
                         incomplete_reason = Some(reason.unwrap_or("<missing>").to_string());
-                        finish_reason = Some(match reason {
-                            Some("content_filter") => FinishReason::Error,
-                            _ => FinishReason::MaxTokens,
-                        });
+                        finish_reason = Some(incomplete_reason_to_finish_reason(reason));
                     }
                     // `completed`/`incomplete` 是语义流终止事件：立即收敛，避免依赖
                     // SSE EOF（服务端保活或重连会导致挂起直到外层超时）。

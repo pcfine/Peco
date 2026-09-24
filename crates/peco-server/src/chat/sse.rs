@@ -4,7 +4,9 @@
 
 use axum::response::sse::Event;
 use model_provider::Usage;
-use peco_core::agent::{LooperEvent, TurnFailureReason, TurnOutcome, strip_summary_wrapper};
+use peco_core::agent::{
+    LooperEvent, RetryNoticeReason, TurnFailureReason, TurnOutcome, strip_summary_wrapper,
+};
 use serde::Serialize;
 
 /// SSE 事件类型（发给前端）。
@@ -124,21 +126,26 @@ pub enum ChatSseEvent {
         conversation_id: String,
     },
 
-    /// 本轮模型输出被截断，正在以更大的输出预算重试。
+    /// 本轮模型尝试已作废，正在重试。
     ///
     /// **纯通知**：前端不删除任何已收到的 `text_delta`，只在当前轮的气泡
     /// **之前**插一条居中横幅解释这段残句。该次尝试的产出已从 Session
     /// staging 回退，因此只存在于实时视图里，重载后随快照一并消失。
+    ///
+    /// `reason` 区分两种重发：`truncated`（截断抬预算）与 `transient`
+    ///（限流/网络/5xx 退避重发）。wire 名保持 `truncation_retry` 兼容。
     #[serde(rename = "truncation_retry")]
     TruncationRetry {
-        /// 第几次重试（1-based）
+        /// 第几次重试（1-based），各 reason 独立计数
         attempt: u32,
-        /// 本轮重试上限
+        /// 本轮对应 reason 的重试上限
         limit: u32,
-        /// 截断那次的输出 token 数
+        /// 截断那次的输出 token 数（transient 重发为 0）
         output_tokens: u32,
-        /// 抬升后的输出预算
+        /// 抬升后的输出预算（transient 重发为当前生效预算）
         retry_budget: u32,
+        /// 重发原因：`truncated` | `transient`
+        reason: String,
         conversation_id: String,
     },
 }
@@ -292,6 +299,10 @@ pub fn extract_sub_agent_result(tool_result: &str, info: &SubAgentInfo, tool_nam
 }
 
 /// 将 `TurnFailureReason` 格式化为面向用户的消息（随 `error` SSE 事件发送）。
+///
+/// 模型类失败（限流/网络/鉴权/额度/上下文/过滤）是「中文分类前缀 + 原始
+/// provider msg」— 分类给用户一句话结论，原始 msg 保留诊断细节，
+/// 不因分类而丢失上游信息。
 fn format_failure_message(reason: &TurnFailureReason, partial_text: &str) -> String {
     let reason_msg = match reason {
         TurnFailureReason::Cancelled => "对话已被取消".to_string(),
@@ -299,6 +310,22 @@ fn format_failure_message(reason: &TurnFailureReason, partial_text: &str) -> Str
         TurnFailureReason::PerTurnTimeout => "本轮响应超时".to_string(),
         TurnFailureReason::MaxTurnsExceeded => "已达到最大轮数限制".to_string(),
         TurnFailureReason::HookAbort(msg) => format!("响应已被中断: {msg}"),
+        TurnFailureReason::RateLimited { attempts, message } => {
+            let retries = attempts.saturating_sub(1);
+            format!("触发限流，已重试 {retries} 次：{message}")
+        }
+        TurnFailureReason::ModelUnavailable { attempts, message } => {
+            let retries = attempts.saturating_sub(1);
+            format!("模型服务暂时不可用，已重试 {retries} 次：{message}")
+        }
+        TurnFailureReason::AuthError { message } => format!("API Key 无效或无权限：{message}"),
+        TurnFailureReason::QuotaExhausted { message } => format!("额度已耗尽：{message}"),
+        TurnFailureReason::ContextOverflow { message } => {
+            format!("内容超出上下文窗口：{message}")
+        }
+        TurnFailureReason::ContentFiltered { message } => {
+            format!("输出被内容过滤拦截：{message}")
+        }
         TurnFailureReason::Other(msg) => msg.clone(),
         // TurnFailureReason 是 #[non_exhaustive]，为未来新增的失败原因兜底
         _ => "对话异常终止".to_string(),
@@ -399,12 +426,20 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             limit,
             output_tokens,
             retry_budget,
+            reason,
             ..
         } => Some(ChatSseEvent::TruncationRetry {
             attempt,
             limit,
             output_tokens,
             retry_budget,
+            reason: match reason {
+                RetryNoticeReason::Transient => "transient",
+                // Truncated 与未来新增变体都按截断展示（旧前端不认识新值时
+                // 仍能落在默认横幅上）
+                _ => "truncated",
+            }
+            .to_string(),
             conversation_id: cid,
         }),
 
@@ -471,6 +506,7 @@ mod tests {
                 output_tokens: 4096,
                 retry_budget: 32_768,
                 discarded_text: "part".to_string(),
+                reason: RetryNoticeReason::Truncated,
             },
             "conv-1",
         );
@@ -479,6 +515,7 @@ mod tests {
             limit,
             output_tokens,
             retry_budget,
+            reason,
             ..
         }) = &event
         else {
@@ -486,6 +523,7 @@ mod tests {
         };
         assert_eq!((*attempt, *limit), (1, 2));
         assert_eq!((*output_tokens, *retry_budget), (4096, 32_768));
+        assert_eq!(reason, "truncated");
 
         // 下发形态：事件名 + 载荷字段。正文不得出现在线上 —— 前端拿了只会
         // 在「不删已发增量」的约定上多一个诱人的误用口子。
@@ -493,10 +531,77 @@ mod tests {
         assert_eq!(json["event"], "truncation_retry");
         assert_eq!(json["data"]["attempt"], 1);
         assert_eq!(json["data"]["retry_budget"], 32_768);
+        assert_eq!(json["data"]["reason"], "truncated");
         assert!(
             json["data"].get("discarded_text").is_none(),
             "正文载荷不得下发，实际 {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn transient_retry_maps_reason_transient() {
+        let event = map_looper_event(
+            LooperEvent::TruncationRetry {
+                turn_index: 0,
+                attempt: 1,
+                limit: 2,
+                output_tokens: 0,
+                retry_budget: 0,
+                discarded_text: "半个答案".to_string(),
+                reason: RetryNoticeReason::Transient,
+            },
+            "conv-1",
+        );
+        let json = serde_json::to_value(event.unwrap()).unwrap();
+        assert_eq!(json["data"]["reason"], "transient");
+    }
+
+    #[test]
+    fn typed_failure_reasons_format_chinese_prefix_with_original_message() {
+        // 分类前缀给结论，原始 msg 保留诊断 —— 两者都不能缺。
+        let cases = vec![
+            (
+                TurnFailureReason::RateLimited {
+                    attempts: 3,
+                    message: "Rate limit reached".to_string(),
+                },
+                "触发限流，已重试 2 次：Rate limit reached",
+            ),
+            (
+                TurnFailureReason::AuthError {
+                    message: "Invalid API key".to_string(),
+                },
+                "API Key 无效或无权限：Invalid API key",
+            ),
+            (
+                TurnFailureReason::QuotaExhausted {
+                    message: "insufficient quota".to_string(),
+                },
+                "额度已耗尽：insufficient quota",
+            ),
+            (
+                TurnFailureReason::ContextOverflow {
+                    message: "context_length_exceeded".to_string(),
+                },
+                "内容超出上下文窗口：context_length_exceeded",
+            ),
+            (
+                TurnFailureReason::ContentFiltered {
+                    message: "content_filter".to_string(),
+                },
+                "输出被内容过滤拦截：content_filter",
+            ),
+            (
+                TurnFailureReason::ModelUnavailable {
+                    attempts: 1,
+                    message: "connection reset".to_string(),
+                },
+                "模型服务暂时不可用，已重试 0 次：connection reset",
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(format_failure_message(&reason, ""), expected);
+        }
     }
 
     #[test]

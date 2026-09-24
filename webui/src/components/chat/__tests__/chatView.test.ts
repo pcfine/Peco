@@ -141,6 +141,26 @@ describe("reduceStreamEvent truncation_retry", () => {
     expect(twice[3].content).toBe("part");
   });
 
+  it("renders transient reason with connection wording, keeping residue", () => {
+    const transient = {
+      ...RETRY,
+      data: { ...RETRY.data, reason: "transient" },
+    };
+    const updated = reduceStreamEvent(transient, midTurn());
+
+    expect(updated[1].isNotice).toBe(true);
+    expect(updated[1].content).toContain("连接中断");
+    expect(updated[1].content).toContain("1/1");
+    expect(updated[1].content).not.toContain("截断");
+    // 残句照旧保留
+    expect(updated[2].content).toBe("part");
+  });
+
+  it("defaults to truncation wording when reason is absent (old backend)", () => {
+    const updated = reduceStreamEvent(RETRY, midTurn());
+    expect(updated[1].content).toContain("输出被截断");
+  });
+
   it("returns the same array when there is no trailing assistant bubble", () => {
     const messages: ChatMessage[] = [
       { role: "user", content: "你好", turnIndex: 0 },

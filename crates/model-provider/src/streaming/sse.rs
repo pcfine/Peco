@@ -8,25 +8,29 @@
 //! ## 架构
 //!
 //! 六状态机，转移如下（`重试 →` 表示由 [`RetryPolicy`] 决定：允许则 `WaitingToRetry`，
-//! 耗尽则 `Closed`）：
+//! 否则产出最后一次错误并进入 `Closed`）：
 //!
 //! ```text
 //! Connecting          收到响应              → ValidatingResponse
-//!                     连接失败              → 重试 →
+//!                     连接失败              → 重试 → / 放弃（产出 ProviderError）
 //! Reconnecting        收到响应              → ValidatingResponse
-//!                     连接失败              → 重试 →
+//!                     连接失败              → 重试 → / 放弃（产出 ProviderError）
 //! ValidatingResponse  200 + event-stream    → Open（产出 SseEvent::Open）
-//!                     非 200 / 内容类型不符  → Closed（产出 ProviderError）
+//!                     非 200 / 内容类型不符  → 瞬时类重试 → / 永久类放弃（产出 ProviderError）
 //! Open                收到 message          → Open（产出 SseEvent::Message）
 //!                     解析 / UTF-8 错误      → Open（跳过该事件）
-//!                     传输错误              → 重试 →
+//!                     传输错误              → 放弃（产出 ProviderError，由 looper 整轮重发）
 //!                     流正常结束            → Closed
 //! WaitingToRetry      延迟结束              → Reconnecting
 //! Closed              —                     → 终止，不再产出任何事件
 //! ```
 //!
-//! 注意非 200 响应**不重试**：`ValidatingResponse` 读取错误体后直接进入 `Closed` 并产出
-//! [`ProviderError::Api`]。重试只针对连接失败与已建立连接后的传输错误。
+//! 重试预算（`max_retries`）在连接失败与校验失败之间**共享**：计数经
+//! `Reconnecting → ValidatingResponse` 的 `prior_retry` 穿透，不因进入校验而重置。
+//!
+//! 非 200 响应按 [`ProviderError::classify`] 分类处置：瞬时类（429/5xx）走退避重试，
+//! 永久类（401/400/额度…）立即产出 [`ProviderError`]。已建立流的传输中断不透明重连
+//! （LLM SSE 不支持 Last-Event-Id 恢复，重连 = 全新生成），直接上抛给 looper。
 
 use std::{
     future::Future,
@@ -72,7 +76,10 @@ pub trait RetryPolicy: Send {
 /// - 起始延迟：300 毫秒
 /// - 退避因子：每次 2×
 /// - 上限：5 秒
-/// - 无限次重试
+/// - 最多 5 次
+///
+/// 所有内置策略都做**分类门控**：`error.is_transient()` 为 false
+/// （401/400/额度/过滤等永久类）时直接返回 `None`，不浪费重试窗口。
 pub struct ExponentialBackoff {
     pub start: Duration,
     pub factor: f64,
@@ -105,9 +112,13 @@ impl Default for ExponentialBackoff {
 impl RetryPolicy for ExponentialBackoff {
     fn retry(
         &self,
-        _error: &ProviderError,
+        error: &ProviderError,
         last_retry: Option<(usize, Duration)>,
     ) -> Option<Duration> {
+        // 分类门控：永久类（401/400/额度/过滤…）立即放弃，只有瞬时类走退避。
+        if !error.is_transient() {
+            return None;
+        }
         let (_retry_num, delay) = match last_retry {
             Some((num, last_delay)) => {
                 // 检查最大重试次数
@@ -155,9 +166,13 @@ pub struct Constant {
 impl RetryPolicy for Constant {
     fn retry(
         &self,
-        _error: &ProviderError,
+        error: &ProviderError,
         last_retry: Option<(usize, Duration)>,
     ) -> Option<Duration> {
+        // 分类门控与 ExponentialBackoff 同语义。
+        if !error.is_transient() {
+            return None;
+        }
         let retry_num = last_retry.map(|(n, _)| n).unwrap_or(0);
         if let Some(max) = self.max_retries
             && retry_num >= max
@@ -187,13 +202,16 @@ impl RetryPolicy for Never {
     fn set_reconnection_time(&mut self, _duration: Duration) {}
 }
 
-/// 默认重试策略：指数退避，起始 300 毫秒，每次加倍，
-/// 上限 5 秒，无限次重试。
+/// 默认重试策略：指数退避，起始 300 毫秒，每次加倍，上限 5 秒，**最多 5 次**。
+///
+/// 有限次数是刻意的：短暂网络抖动在传输层自愈（约 9 秒窗口），持续故障必须
+/// 上抛给 looper —— 那里有带回退的整轮重发与类型化失败报错。无限重试会把
+/// 错误永远挡在传输层，上层永远见不到它。
 pub const DEFAULT_RETRY: ExponentialBackoff = ExponentialBackoff::new(
     Duration::from_millis(300),
     2.0,
     Some(Duration::from_secs(5)),
-    None,
+    Some(5),
 );
 
 // ============================================================================
@@ -335,9 +353,15 @@ pin_project! {
             current_retry: (usize, Duration),
         },
         /// 校验已收到的响应（含读取非 200 错误体）后进入 Open 或失败。
+        ///
+        /// `prior_retry` 是进入校验前已发生的重试（`Reconnecting` 携带；`Connecting`
+        /// 首连为 `None`）。校验失败与连接失败共用同一份重试预算 —— 丢掉它，
+        /// `max_retries` 在校验路径上永不生效，持续 429/503 会无限重发。
         ValidatingResponse {
             #[pin]
             check_future: CheckResponseFuture,
+            // 见变体文档：校验失败的重试在此基础上累积，不可重置。
+            prior_retry: Option<(usize, Duration)>,
         },
         /// 在传输错误后重新连接。
         Reconnecting {
@@ -508,6 +532,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                 check_sse_response(response, *this.allow_missing_content_type);
                             this.state.set(SseState::ValidatingResponse {
                                 check_future: Box::pin(check_future),
+                                prior_retry: None,
                             });
                             continue;
                         }
@@ -530,13 +555,18 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                     });
                                 }
                                 None => {
+                                    // 放弃必须带最后一次错误离开：静默 Closed → EOF 会被
+                                    // pipeline 当成正常结束，产出 Finish{Stop} —— 一个
+                                    // 「成功的空回复」。上抛后 pipeline 走 terminated_with_error，
+                                    // looper 才能分类、退避重发。
                                     tracing::warn!(
                                         target: "model_provider::streaming",
                                         url = %this.url,
                                         error = %provider_err,
-                                        "SSE connect failed; retry policy gave up, closing event source"
+                                        "SSE connect failed; retry policy gave up; surfacing error"
                                     );
                                     this.state.set(SseState::Closed);
+                                    return Poll::Ready(Some(Err(provider_err)));
                                 }
                             }
                         }
@@ -556,6 +586,9 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                 check_sse_response(response, *this.allow_missing_content_type);
                             this.state.set(SseState::ValidatingResponse {
                                 check_future: Box::pin(check_future),
+                                // 带上重试计数：校验失败与连接失败共用同一份预算，
+                                // 在这里丢弃会让 max_retries 永不生效（见状态定义注释）。
+                                prior_retry: Some(last_retry),
                             });
                             continue;
                         }
@@ -578,14 +611,16 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                     });
                                 }
                                 None => {
+                                    // 同 Connecting：放弃必须上抛最后一次错误，不能静默 EOF。
                                     tracing::warn!(
                                         target: "model_provider::streaming",
                                         url = %this.url,
                                         error = %provider_err,
                                         attempts = last_retry.0,
-                                        "SSE reconnect failed; retry policy gave up, closing event source"
+                                        "SSE reconnect failed; retry policy gave up; surfacing error"
                                     );
                                     this.state.set(SseState::Closed);
+                                    return Poll::Ready(Some(Err(provider_err)));
                                 }
                             }
                         }
@@ -593,7 +628,14 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                 }
 
                 // ---- 校验响应（含读取非 200 错误体）----
-                SseStateProjection::ValidatingResponse { check_future } => {
+                SseStateProjection::ValidatingResponse {
+                    check_future,
+                    prior_retry,
+                } => {
+                    // 进入校验前已发生的重试次数/延迟（首连为 None）。校验失败的
+                    // 重试必须在此基础上累积，否则每次失败都重置为「第 1 次」，
+                    // max_retries 永不生效，持续瞬时错误无限循环。
+                    let prior_retry = *prior_retry;
                     match check_future.poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(response)) => {
@@ -602,16 +644,43 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                             return Poll::Ready(Some(Ok(SseEvent::Open)));
                         }
                         Poll::Ready(Err(err)) => {
-                            // 非 200 与 content-type 不符都走这里。此前只作为 Err 返回，
-                            // 上层 pipeline 直接 yield 出去，没有任何一层记录过。
-                            tracing::warn!(
-                                target: "model_provider::streaming",
-                                url = %this.url,
-                                error = %err,
-                                "SSE response validation failed (non-200 or bad content-type); not retrying"
-                            );
-                            this.state.set(SseState::Closed);
-                            return Poll::Ready(Some(Err(err)));
+                            // 非 200 与 content-type 不符都走这里。由策略按错误分类决定：
+                            // 瞬时类（429/5xx）退避重试，永久类（401/400/额度…）立即失败。
+                            let kind = err.classify().kind;
+                            match this.retry_policy.retry(&err, prior_retry) {
+                                Some(delay) => {
+                                    let attempt = prior_retry.map_or(1, |(n, _)| n + 1);
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %err,
+                                        kind = kind.as_str(),
+                                        attempt,
+                                        delay_ms = delay.as_millis() as u64,
+                                        "SSE response validation failed with transient error; scheduling retry"
+                                    );
+                                    let retry_delay = futures_timer::Delay::new(delay);
+                                    this.state.set(SseState::WaitingToRetry {
+                                        retry_delay,
+                                        current_retry: (attempt, delay),
+                                    });
+                                    continue;
+                                }
+                                None => {
+                                    // 永久类分类即放弃，瞬时类则为预算耗尽 —— 两者都
+                                    // 上抛，让 looper 分类报错/整轮重发。
+                                    tracing::warn!(
+                                        target: "model_provider::streaming",
+                                        url = %this.url,
+                                        error = %err,
+                                        kind = kind.as_str(),
+                                        prior_attempts = prior_retry.map(|(n, _)| n).unwrap_or(0),
+                                        "SSE response validation failed; retry policy gave up; surfacing error"
+                                    );
+                                    this.state.set(SseState::Closed);
+                                    return Poll::Ready(Some(Err(err)));
+                                }
+                            }
                         }
                     }
                 }
@@ -632,33 +701,20 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                             return Poll::Ready(Some(Ok(SseEvent::Message(event))));
                         }
                         Poll::Ready(Some(Err(EventStreamError::Transport(err)))) => {
+                            // established-stream 中断**不透明重连**：LLM provider 的
+                            // SSE 不支持 Last-Event-Id 恢复（无 id: 字段，重连 = 重新
+                            // POST = 全新生成 → 增量重复拼接）。中断上抛给 looper，
+                            // 由它回退 staging 后整轮重发 —— 那才是去重安全的重试点。
                             let provider_err = ProviderError::Stream(err.to_string());
-                            match this.retry_policy.retry(&provider_err, None) {
-                                Some(delay) => {
-                                    tracing::warn!(
-                                        target: "model_provider::streaming",
-                                        url = %this.url,
-                                        error = %provider_err,
-                                        delay_ms = delay.as_millis() as u64,
-                                        "established SSE stream interrupted; scheduling reconnect"
-                                    );
-                                    let retry_delay = futures_timer::Delay::new(delay);
-                                    this.state.set(SseState::WaitingToRetry {
-                                        retry_delay,
-                                        current_retry: (1, delay),
-                                    });
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        target: "model_provider::streaming",
-                                        url = %this.url,
-                                        error = %provider_err,
-                                        skipped_parse_errors = *this.skipped_parse_errors,
-                                        "SSE stream interrupted; retry policy gave up, closing event source"
-                                    );
-                                    this.state.set(SseState::Closed);
-                                }
-                            }
+                            tracing::warn!(
+                                target: "model_provider::streaming",
+                                url = %this.url,
+                                error = %provider_err,
+                                skipped_parse_errors = *this.skipped_parse_errors,
+                                "established SSE stream interrupted; surfacing to caller"
+                            );
+                            this.state.set(SseState::Closed);
+                            return Poll::Ready(Some(Err(provider_err)));
                         }
                         // 解析器和 UTF-8 错误是可恢复的 — 跳过并继续处理流。
                         Poll::Ready(Some(Err(
@@ -763,9 +819,9 @@ mod tests {
         let policy = DEFAULT_RETRY;
         let err = ProviderError::Stream("test".into());
 
-        // 已达到 5 秒上限
+        // 第 4 次重试（在 max_retries=5 窗口内）：延迟已到 5 秒上限
         let delay = policy
-            .retry(&err, Some((10, Duration::from_secs(5))))
+            .retry(&err, Some((4, Duration::from_secs(5))))
             .unwrap();
         assert_eq!(delay, Duration::from_secs(5));
     }
@@ -814,6 +870,54 @@ mod tests {
     }
 
     #[test]
+    fn test_permanent_error_not_retried() {
+        // 分类门控：401/400 等永久类即刻放弃，不进退避窗口。
+        let policy = DEFAULT_RETRY;
+        let auth = ProviderError::Api {
+            status: 401,
+            body: "invalid api key".into(),
+        };
+        assert!(policy.retry(&auth, None).is_none());
+
+        let bad_request = ProviderError::Api {
+            status: 400,
+            body: "bad request".into(),
+        };
+        assert!(policy.retry(&bad_request, None).is_none());
+    }
+
+    #[test]
+    fn test_transient_error_retried() {
+        let policy = DEFAULT_RETRY;
+        let rate = ProviderError::Api {
+            status: 429,
+            body: "rate limited".into(),
+        };
+        assert_eq!(policy.retry(&rate, None), Some(Duration::from_millis(300)));
+
+        let server = ProviderError::Api {
+            status: 503,
+            body: "unavailable".into(),
+        };
+        assert!(policy.retry(&server, None).is_some());
+    }
+
+    #[test]
+    fn test_default_retry_exhausts_after_five() {
+        let policy = DEFAULT_RETRY;
+        let err = ProviderError::Stream("connection reset".into());
+        // 前 5 次放行，第 6 次（last_retry.0 == 5）拒绝
+        let mut last: Option<(usize, Duration)> = None;
+        for i in 1..=5 {
+            let delay = policy
+                .retry(&err, last)
+                .unwrap_or_else(|| panic!("attempt {i} should be allowed"));
+            last = Some((i, delay));
+        }
+        assert!(policy.retry(&err, last).is_none(), "5 次后必须耗尽");
+    }
+
+    #[test]
     fn test_set_reconnection_time_updates_max() {
         let mut policy = ExponentialBackoff::new(
             Duration::from_millis(100),
@@ -825,5 +929,102 @@ mod tests {
         policy.set_reconnection_time(Duration::from_secs(10));
         // max_duration 应至少提高到 10 秒
         assert!(policy.max_duration.unwrap() >= Duration::from_secs(10));
+    }
+
+    /// 小预算快退避策略：10ms 起步、最多 2 次重试，让耗尽路径在毫秒级完成。
+    fn fast_policy() -> ExponentialBackoff {
+        ExponentialBackoff::new(
+            Duration::from_millis(10),
+            2.0,
+            Some(Duration::from_millis(50)),
+            Some(2),
+        )
+    }
+
+    /// 回归：校验失败（429）的重试计数必须经 `Reconnecting → ValidatingResponse`
+    /// 穿透。修复前每轮都以 `retry(&err, None)` 重新计数，`max_retries` 永不
+    /// 生效，持续 429 以固定间隔无限重发。
+    #[tokio::test]
+    async fn test_validation_retry_exhausts_and_surfaces_error() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+
+        // 永远回 429 的极简 HTTP 服务。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":{"type":"rate_limit","message":"rate limited"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                use tokio::io::AsyncWriteExt;
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let mut source = StreamingEventSource::with_retry_policy(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1/responses"),
+            br#"{"model":"test"}"#.to_vec(),
+            "Bearer test".into(),
+            fast_policy(),
+        );
+
+        // 修复前此调用永不返回（每 10ms 重新校验一次）——超时即为回归。
+        let first = tokio::time::timeout(Duration::from_secs(2), source.next())
+            .await
+            .expect("validation retry never exhausted: infinite loop")
+            .expect("retry exhaustion must not end as clean EOF");
+        match first {
+            Err(ProviderError::Api { status: 429, .. }) => {}
+            other => panic!("expected surfaced 429, got {other:?}"),
+        }
+
+        // 初始连接 + 2 次重试 = 3 次命中；计数未被重置（重置则远超 3 次）。
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        server.abort();
+    }
+
+    /// 回归：连接重试耗尽必须上抛最后一次错误。修复前给弃只置 `Closed`，
+    /// 流以干净 EOF 结束，pipeline 产出 `Finish{Stop}` —— 空回复被判成功。
+    #[tokio::test]
+    async fn test_connect_retry_exhaustion_surfaces_error_not_eof() {
+        // 先占一个端口再释放：随后的连接一律 connection refused。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut source = StreamingEventSource::with_retry_policy(
+            reqwest::Client::new(),
+            format!("http://{addr}/v1/responses"),
+            br#"{"model":"test"}"#.to_vec(),
+            "Bearer test".into(),
+            fast_policy(),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(2), source.next())
+            .await
+            .expect("connect retry never exhausted: infinite loop")
+            .expect(
+                "retry exhaustion must not look like a clean EOF (would finish as empty success)",
+            );
+        assert!(
+            first.is_err(),
+            "expected surfaced transport error, got {first:?}"
+        );
     }
 }

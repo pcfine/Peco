@@ -50,7 +50,7 @@ mod types;
 
 use async_trait::async_trait;
 
-pub use error::ProviderError;
+pub use error::{ApiErrorKind, ClassifiedError, ProviderError, classify_api_error};
 pub use generate_stream::GenerateStream;
 pub use providers::deepseek::{
     DEEPSEEK_API_BASE_URL, DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter,

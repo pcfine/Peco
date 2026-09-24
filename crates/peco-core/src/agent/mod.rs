@@ -18,7 +18,7 @@ pub use agent_config::{
 };
 pub use agent_looper::{
     AgentLooper, LooperConfig, LooperEvent, LooperHandle, OuterState, ReActState,
-    TurnFailureReason, TurnOutcome, UserMsg,
+    RetryNoticeReason, TurnFailureReason, TurnOutcome, UserMsg,
 };
 pub use agent_manager::AgentManager;
 pub use agent_manager::AgentMeta;

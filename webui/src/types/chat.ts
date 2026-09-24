@@ -121,6 +121,8 @@ export interface TruncationRetryData {
   limit: number;
   output_tokens: number;
   retry_budget: number;
+  /** 重发原因：truncated（截断抬预算）| transient（限流/网络/5xx 退避重发）。可选以兼容旧后端。 */
+  reason?: string;
   conversation_id: string;
 }
 

@@ -88,6 +88,10 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - 动态上下文组装：系统提示词每轮重新注入，工具结果追加其后。`DynamicContext` trait 支持在每次新用户查询时注入 RAG 增强内容；同一轮的 ReAct 迭代复用缓存上下文。
 - **上下文策略**：`FullHistory`（默认）、`SlidingWindow { max_turns }`、`TokenBudget { max_tokens, summarize_overflow }` 或 `Custom(Arc<dyn ContextFilter>)`。通过 `LooperConfig` 为每个 looper 选择。
 - `LooperEvent` 枚举（19 个变体）通过异步 intercom 通道（`Speaker`/`Listener` 对）流动，覆盖文本增量、推理增量、工具调用生命周期、状态转换、轮次边界和关闭。
+- **模型错误分类与重发**：模型故障统一经 `model_failure_reason`（按 `ProviderError::classify()` 映射）转成类型化 `TurnFailureReason`（`RateLimited`/`ModelUnavailable`/`AuthError`/`QuotaExhausted`/`ContextOverflow`/`ContentFiltered`，均携带 provider 原始 msg）。两种重发机制正交：
+  - **截断重发**（`begin_truncation_retry`）：`Incomplete + MaxTokens` → 回退 staging、抬输出预算重发，`truncation_retry_limit` 默认 1；
+  - **瞬时重发**（`begin_transient_retry`）：分类为瞬时类（限流/网络/5xx）或流被掐断（`Incomplete + finish_reason=None`）→ 回退 staging、指数退避后原样重发，`transient_retry_limit` 默认 2（`PECO_TRANSIENT_RETRY_*` 环境变量可调）；退避在 `prepare_and_send_request` 入口以可取消切片 sleep 等待，不阻塞取消。
+  两者共享 `rollback_attempt` 骨架（staging 回退 → 残片入 salvage → 清运行态 → 发 `TruncationRetry` 通知），各自独立计数，均消耗 `react_loop_iteration` 额度。
 - `LooperHook` trait：8 个拦截点（`on_before_request`、`on_after_response`、`on_text_delta`、`on_before_tool`、`on_after_tool`、`on_turn_complete`、`on_react_state_change`、`on_outer_state_change`）。内置钩子：`ToolAllowlistHook`、`TokenBudgetHook`。
 
 **SimpleAgentLooper**（[crates/peco-core/src/agent/simple_looper.rs](crates/peco-core/src/agent/simple_looper.rs)）：
@@ -184,7 +188,8 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 **Chat/SSE**（[crates/peco-server/src/chat/](crates/peco-server/src/chat/)）：
 - `GET /api/conversations/:id/stream` — SSE 端点。创建 `AgentLooper`，在 tokio 任务中启动它，并将 `LooperEvent` 桥接到 SSE 事件流。
 - SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`error`、`done`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`ReactStateChange` 被过滤掉，不发送给客户端；`TruncationRetry` 的 `discarded_text` 字段同样不下发 —— 它只服务 `chat` 模块落库累加器的后缀剥离。）
-- `truncation_retry` 是**纯通知**，不含撤销语义：截断重试回退的是 `Session`（staging）而非传输层，前端不删除已收到的增量，只在当前轮气泡**之前**插一条居中横幅解释残句；重载从快照恢复后残句与横幅一并消失。CLI 同路线（打一行提示，保留残句）。
+- `truncation_retry` 是**纯通知**，不含撤销语义：重发回退的是 `Session`（staging）而非传输层，前端不删除已收到的增量，只在当前轮气泡**之前**插一条居中横幅解释残句；重载从快照恢复后残句与横幅一并消失。CLI 同路线（打一行提示，保留残句）。`reason` 字段区分两种重发：`truncated`（截断抬预算）与 `transient`（限流/网络/5xx 退避重发），缺省按截断展示以兼容旧后端。
+- 失败轮的 `error` 事件文案由 `format_failure_message` 生成：类型化失败原因（限流/网络/鉴权/额度/上下文/过滤）输出「中文分类前缀 + provider 原始 msg」，分类给结论、原文保留诊断。
 - 子 Agent 调用（`delegate_sub_agent` / `run_parallel_sub_agents`）通过按 tool_call_id 映射的 `SubAgentInfo` 注册表追踪，生成 `agent_call_start`/`agent_call_end` SSE 事件供前端可视化。
 - `GET /api/conversations/:id/session` — 返回完整 `SessionSnapshot`，包含工具调用和推理内容。
 
@@ -207,10 +212,15 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **Responses 适配器**：`DeepSeekResponsesAdapter`（原生 `/responses`，端点剥离 `/v1`）与 `QwenResponsesAdapter`（百炼 OpenAI 兼容 `/responses`，端点**保留** `/v1`；reasoning 输出为 `summary` 摘要形态并按原形态回传；`function_call_output` 必须紧跟对应 `function_call` 的逐对排布；`store` 显式置 `false`）。`OpenAiResponsesAdapter`（OpenAI 原生 `/responses`，端点保留 `/v1`；`store` 显式置 `false`、顶层 `instructions` 直传、`Role::Developer` 原生直传、reasoning `{effort, summary:"auto"}` 与 chat 同名档位、历史 `Reasoning` 项不回传、非流式块序归一为 Reasoning→Text→ToolCall）。请求/响应经中立词汇表（`GenerateRequest`/`GenerateResult`/`StreamChunk`）直通映射，差异细节见 `docs/design/qwen-responses-design.md` 与 `docs/research/qwen-responses-research.md`。
 - Provider 配置位于 `providers.toml`（相对于 agent.md 文件或从标准位置解析）。
 
+**错误分类**（[crates/model-provider/src/error.rs](crates/model-provider/src/error.rs)）：
+- `ProviderError::classify() -> ClassifiedError { kind, message, code }` — 惰性语义分类，12 处 `Api { status, body }` 构造点零改动。`ApiErrorKind`：`RateLimited`/`Network`/`Server`（瞬时，`is_transient()` 为 true）| `Auth`/`NotFound`/`ContextOverflow`/`QuotaExhausted`/`ContentFiltered`/`InvalidRequest`/`Unknown`（永久）。
+- `classify_api_error(status, body)` 判定顺序**先 body 后 status** — 流内错误 payload 用伪造 status 500，真实语义只在 body 里：① 解析 OpenAI 兼容 `error.{code,type,message}` 关键词匹配；② status 兜底；③ 非 JSON body 文本关键词兜底。`ClassifiedError.message` 携带原始 body 摘要（截断 500 字符），分类不吞原文。
+- `FinishReason::ContentFilter` 独立于 `Error` — 内容过滤与一般上游异常在 looper 侧必须分得开（前者类型化报错且明确不重试）。
+
 **SSE 流式管道**（[crates/model-provider/src/streaming/pipeline.rs](crates/model-provider/src/streaming/pipeline.rs)）：
 - 与 provider 无关的设计：`process_normalized_sse_stream_chunks()` 是一个共享状态机，消费原始 SSE 数据帧，经 `StreamingProfile` 将 provider 特定的块规范化为 `NormalizedChunk` 并生成 `StreamChunk`。
 - 添加新 provider（如 groq）只需实现 `StreamingProfile` 和 `ModelProvider` — SSE 解析、重连和工具调用累积逻辑可复用。
-- `StreamingEventSource<R>`（[sse.rs](crates/model-provider/src/streaming/sse.rs)）：一个 5 状态 SSE 流（`Connecting → Open → WaitingToRetry → Reconnecting → Closed`），带有 `Last-Event-Id` 追踪和可插拔的 `RetryPolicy`（默认指数退避：起始 300ms，2x 倍数，5s 上限）。
+- `StreamingEventSource<R>`（[sse.rs](crates/model-provider/src/streaming/sse.rs)）：一个 5 状态 SSE 流（`Connecting → Open → WaitingToRetry → Reconnecting → Closed`），带有 `Last-Event-Id` 追踪和可插拔的 `RetryPolicy`（默认指数退避：起始 300ms，2x 倍数，5s 上限，**最多 5 次**）。所有内置策略做**分类门控**（`error.is_transient()` 为 false 立即放弃）；非 200 校验失败（`ValidatingResponse`）同样咨询策略 — 429/5xx 退避重试、401/400 立即失败。**established-stream 中断不透明重连**（LLM SSE 不支持 `Last-Event-Id` 恢复，重连 = 全新生成 → 增量重复），直接上抛给 looper 做带回退的整轮重发。
 - DeepSeek 思考/推理：`ChatRequest.reasoning_effort` 映射到 DeepSeek 的 `thinking` 字段（`"disabled"` / `{"type": "enabled", "effort": "<value>"}`）。未设置时默认：`{"type": "enabled", "effort": "high"}`。
 
 ### knowledge-base：RAG 引擎
