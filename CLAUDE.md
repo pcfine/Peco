@@ -353,6 +353,14 @@ steps:
 
 6. **错误处理**：`AgentError` 覆盖完整生命周期（IO、YAML 解析、缺失字段、环境变量、配置、工具执行、超过最大轮次、协议违规）。`?` 运算符可在各处使用，因为它为常见错误类型实现了 `From`。
 
+## 日志约定
+
+- **message 一律用简约英文**：`"SSE connect failed; scheduling retry"`、`"dropping incomplete tool call: missing id"`。日志是要被 grep 的运维数据，中英混排无法整体扫描。短句、分号分隔从句、不加句号。
+- **注释仍用中文**，错误文案（`ProviderError` / `assert!` / `panic!` 的消息）也不改 —— 本规则只覆盖日志宏的 message 字面量。
+- **宏用短名**：文件顶部 `use tracing::{info, warn};`，调用处写 `info!` / `warn!`，不写 `tracing::info!` 全路径。
+- **打类型不打正文**：日志字段不落用户内容（对话原文、块正文），只记计数、类型、长度、id。
+- **默认级别 debug**：项目自有 crate 全量 `debug`，见 [logging.rs](crates/peco-server/src/logging.rs) 的 `DEFAULT_FILTER` 与 [dev.sh](scripts/dev.sh)。`model_provider` / `knowledge_base` 不以 `peco` 开头，EnvFilter 对无匹配 directive 的目标取 `LevelFilter::OFF` —— 新增自有 crate 时漏写 directive 等于把该模块日志整体丢掉。
+
 ## Rust Edition 与工具链
 
 - Rust edition **2024**（在 workspace `Cargo.toml` 中设置）
