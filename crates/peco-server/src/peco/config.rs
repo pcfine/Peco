@@ -10,39 +10,8 @@ use std::time::Duration;
 
 use peco_core::agent::hooks::LooperHook;
 use peco_core::agent::{CompactionPolicy, DynamicContext, LooperConfig, MessageFilter};
-use tracing::warn;
 
 use super::memory::MemoryConfig;
-
-/// 读一个 `u32` 环境变量，缺失时取默认值，写错时告警后取默认值。
-///
-/// 解析失败不静默吞：值写错却「看起来生效了」是最难查的一类配置问题。
-fn env_u32(name: &str, default: u32) -> u32 {
-    env_parse(name, default)
-}
-
-/// 读一个 `u64` 环境变量，语义同 [`env_u32`]。
-fn env_u64(name: &str, default: u64) -> u64 {
-    env_parse(name, default)
-}
-
-/// [`env_u32`] / [`env_u64`] 的共用实现。
-fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
-    match std::env::var(name) {
-        Ok(raw) => match raw.trim().parse() {
-            Ok(value) => value,
-            Err(_) => {
-                warn!(
-                    variable = name,
-                    value = %raw,
-                    "Invalid numeric env var; using default"
-                );
-                default
-            }
-        },
-        Err(_) => default,
-    }
-}
 
 /// Peco 对话配置。
 #[derive(Clone)]
@@ -74,28 +43,23 @@ pub struct PecoConfig {
     pub summarizer_model: String,
     /// 记忆双路径配置（写路径提取 hook + 读路径召回）。
     pub memory: MemoryConfig,
-    /// 截断重试次数上限（`0` = 关闭）。见 `LooperConfig::truncation_retry_limit`。
+    /// 统一重发上限（`0` = 关闭）。见 `LooperConfig::retry_limit`。
     ///
-    /// 环境变量 `PECO_TRUNCATION_RETRY_LIMIT` 可覆盖。
-    pub truncation_retry_limit: u32,
-    /// 截断重试的输出预算下限（token）。
-    /// 见 `LooperConfig::truncation_retry_min_budget`。
+    /// 默认值经 `LooperConfig::from_env()` 读取（env `PECO_RETRY_LIMIT`）。
+    pub retry_limit: u32,
+    /// 截断重发的输出预算抬升目标（token）。
+    /// 见 `LooperConfig::retry_output_budget`。
     ///
-    /// **模型真实上限低于该值时，重试请求会被网关拒（400）** —— 那时把本值
-    /// 调到模型的上限之内，或直接把 `truncation_retry_limit` 置 0。
-    /// 环境变量 `PECO_TRUNCATION_RETRY_MIN_BUDGET` 可覆盖。
-    pub truncation_retry_min_budget: u32,
-    /// 瞬时故障重发次数上限（`0` = 关闭）。
-    /// 见 `LooperConfig::transient_retry_limit`。
-    ///
-    /// 环境变量 `PECO_TRANSIENT_RETRY_LIMIT` 可覆盖。
-    pub transient_retry_limit: u32,
-    /// 瞬时重发退避起始延迟（毫秒）。
-    /// 环境变量 `PECO_TRANSIENT_RETRY_BASE_DELAY_MS` 可覆盖。
-    pub transient_retry_base_delay_ms: u64,
-    /// 瞬时重发退避延迟上限（毫秒）。
-    /// 环境变量 `PECO_TRANSIENT_RETRY_MAX_DELAY_MS` 可覆盖。
-    pub transient_retry_max_delay_ms: u64,
+    /// **模型真实上限低于该值时，抬升后的重试请求会被网关拒（400）** —— 那时
+    /// 把本值调到模型的上限之内，或直接把 `retry_limit` 置 0。
+    /// 默认值经 `LooperConfig::from_env()` 读取（env `PECO_RETRY_OUTPUT_BUDGET`）。
+    pub retry_output_budget: u32,
+    /// 重发退避起始延迟（毫秒）。
+    /// 默认值经 `LooperConfig::from_env()` 读取（env `PECO_RETRY_BASE_DELAY_MS`）。
+    pub retry_base_delay_ms: u64,
+    /// 重发退避延迟上限（毫秒）。
+    /// 默认值经 `LooperConfig::from_env()` 读取（env `PECO_RETRY_MAX_DELAY_MS`）。
+    pub retry_max_delay_ms: u64,
 
     // ── 以下由 PecoManager 构造期填充 ──────────────────────
     /// 上下文滚动压缩策略。由 `PecoManager` 基于主 Agent 的 provider 构建。
@@ -114,6 +78,8 @@ pub struct PecoConfig {
 
 impl Default for PecoConfig {
     fn default() -> Self {
+        // 重试四字段的默认值委托 from_env —— env 读取单点在 peco-core。
+        let retry = LooperConfig::from_env();
         Self {
             event_buffer: 256,
             per_turn_timeout_secs: 7200,
@@ -123,11 +89,10 @@ impl Default for PecoConfig {
             compaction_keep_recent_tokens: 96_000,
             summarizer_model: "deepseek-v4-flash".to_string(),
             memory: MemoryConfig::default(),
-            truncation_retry_limit: env_u32("PECO_TRUNCATION_RETRY_LIMIT", 1),
-            truncation_retry_min_budget: env_u32("PECO_TRUNCATION_RETRY_MIN_BUDGET", 32_768),
-            transient_retry_limit: env_u32("PECO_TRANSIENT_RETRY_LIMIT", 2),
-            transient_retry_base_delay_ms: env_u64("PECO_TRANSIENT_RETRY_BASE_DELAY_MS", 500),
-            transient_retry_max_delay_ms: env_u64("PECO_TRANSIENT_RETRY_MAX_DELAY_MS", 5_000),
+            retry_limit: retry.retry_limit,
+            retry_output_budget: retry.retry_output_budget,
+            retry_base_delay_ms: retry.retry_base_delay_ms,
+            retry_max_delay_ms: retry.retry_max_delay_ms,
             compaction: None,
             environment: None,
             dynamic_context: None,
@@ -138,6 +103,9 @@ impl Default for PecoConfig {
 
 impl PecoConfig {
     /// 从 PecoConfig 构建 LooperConfig。
+    ///
+    /// 重试四字段以 `self` 为可覆盖项显式转发（缺省来源即
+    /// [`LooperConfig::from_env`]），其余字段同样以 `from_env()` 为底。
     pub fn to_looper_config(&self, message_filter: Arc<dyn MessageFilter>) -> LooperConfig {
         LooperConfig {
             event_buffer: self.event_buffer,
@@ -149,12 +117,11 @@ impl PecoConfig {
             hooks: self.hooks.clone(),
             message_filter: Some(message_filter),
             compaction: self.compaction.clone(),
-            truncation_retry_limit: self.truncation_retry_limit,
-            truncation_retry_min_budget: self.truncation_retry_min_budget,
-            transient_retry_limit: self.transient_retry_limit,
-            transient_retry_base_delay_ms: self.transient_retry_base_delay_ms,
-            transient_retry_max_delay_ms: self.transient_retry_max_delay_ms,
-            ..LooperConfig::default()
+            retry_limit: self.retry_limit,
+            retry_output_budget: self.retry_output_budget,
+            retry_base_delay_ms: self.retry_base_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            ..LooperConfig::from_env()
         }
     }
 }

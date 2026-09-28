@@ -425,7 +425,7 @@ pub async fn stream_chat(
             per_turn_timeout: Some(Duration::from_secs(7200)),
             total_timeout: Some(Duration::from_secs(7200)),
             persist_on_failure: true,
-            ..LooperConfig::default()
+            ..LooperConfig::from_env()
         };
 
         let handle = AgentLooper::spawn(agent, session, config, persister.clone());

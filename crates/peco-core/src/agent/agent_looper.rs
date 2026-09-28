@@ -176,48 +176,32 @@ pub struct LooperConfig {
     /// 物理驱逐最旧轮次并以结构化摘要钉扎。压缩是非致命的 — 失败仅记录日志。
     /// 默认为 `None`（不压缩）。
     pub compaction: Option<Arc<super::compaction::CompactionPolicy>>,
-    /// 截断重试：单个用户轮内允许的重试次数上限。`0` = 关闭。
+    /// 统一重发上限：单个用户轮内所有原因合计的重发次数。`0` = 关闭。
+    /// 触发原因 `RetryCause`：截断（抬输出预算重发）与瞬时故障
+    /// （限流/网络/5xx/流被掐断，退避后原样重发），共用单计数。
     ///
-    /// 触发条件是「模型输出顶到 `max_output_tokens` 被截断」
-    /// （`FinishReason::MaxTokens` / `ResponseStatus::Incomplete`）——
-    /// 推理 token 与可见输出共用这一个预算，预算不足时推理会把可见输出挤没。
+    /// 每次重发消耗一次 `react_loop_iteration`（即 `max_turns` 预算），
+    /// 与本上限双重有界 ⇒ 无死循环。默认 3。
+    /// env `PECO_RETRY_LIMIT` 可覆盖（[`Self::from_env`]）。
+    pub retry_limit: u32,
+    /// 截断重发的输出预算抬升目标，同时是抬升上限（headroom 判据与粘性
+    /// 覆盖共用这一个参数）。判据：当前生效预算 < 本值 ⇒ 抬到本值；
+    /// 抬过一次后粘性覆盖到轮末（`budget_raised`），生效预算恒 ≥ 本值，
+    /// 第二次截断重试被拦死。
     ///
-    /// 每次重试都是一次真实的模型调用，**消耗 `react_loop_iteration`
-    /// （即 `max_turns` 预算）**，因此上限不需要很大就能收敛。
-    /// 默认为 1：截断是确定性的预算问题，抬一次就够；抬了还截断说明
-    /// 配置的预算本身不合适，继续重试只是烧钱。
-    pub truncation_retry_limit: u32,
-    /// 截断重试时的输出预算**下限**（token）。实际取
-    /// `max(ModelConfig::max_tokens, 该值)` —— 取 max 而非直接替换，
-    /// 免得给已配了大预算的 agent 降配额。
-    ///
-    /// 默认 32_768，与 provider 侧对思考模式的既有上限常量同量级
-    /// （见 `QWEN_THINKING_MAX_TOKENS`）。事故现场的量级是「预算 4096、
-    /// 推理 13375 字符、可见输出 491 字符」，32K 给推理留足空间。
-    ///
-    /// **这是安全网，不是 `max_tokens` 的替代品。** 正经修法是给 `agent.md`
-    /// 的 `llm:` 显式写 `max_tokens`；本字段只保证「忘了写」或被服务端默认值
-    /// 卡住时，一轮对话不会整轮判死。
-    ///
-    /// 若模型真实输出上限低于该值，重试请求会被网关拒（400）—— 那时把本值
-    /// 调低即可。该失败不劣于现状，见 `begin_truncation_retry` 的残片兜底。
-    pub truncation_retry_min_budget: u32,
-    /// 瞬时故障重发：单个用户轮内允许的重发次数上限。`0` = 关闭。
-    ///
-    /// 触发条件是 [`ProviderError::classify`](model_provider::ProviderError)
-    /// 判定为瞬时类的失败 — 限流、网络中断、上游 5xx。与截断重试正交：
-    /// 截断重发抬预算，瞬时重发原样重发（只退避等待）。
-    ///
-    /// 每次重发同样消耗 `react_loop_iteration`，两个上限都有界 ⇒ 无死循环。
-    /// 默认 2：配合指数退避（500ms → 1s），瞬时抖动两次内基本自愈；
-    /// 持续故障更快上抛给用户看到类型化报错。
-    pub transient_retry_limit: u32,
-    /// 瞬时重发的退避起始延迟（毫秒）。第 n 次重发延迟 =
-    /// `base * 2^(n-1)`，截断到 [`Self::transient_retry_max_delay_ms`]。
-    /// 默认 500。
-    pub transient_retry_base_delay_ms: u64,
-    /// 瞬时重发的退避延迟上限（毫秒）。默认 5000。
-    pub transient_retry_max_delay_ms: u64,
+    /// 默认 32_768。**这是安全网，不是 `max_tokens` 的替代品**：正经修法
+    /// 是给 `agent.md` 的 `llm:` 显式写 `max_tokens`。模型真实输出上限低于
+    /// 本值时，抬升后的重试请求会被网关 400 拒 —— 调低本值，或
+    /// `PECO_RETRY_LIMIT=0` 关闭重试。env `PECO_RETRY_OUTPUT_BUDGET` 可覆盖。
+    pub retry_output_budget: u32,
+    /// 重发的退避起始延迟（毫秒）。第 n 次重发延迟 =
+    /// `base * 2^(n-1)`，截断到 [`Self::retry_max_delay_ms`]。
+    /// 所有原因（含截断）统一走退避。默认 500。
+    /// env `PECO_RETRY_BASE_DELAY_MS` 可覆盖。
+    pub retry_base_delay_ms: u64,
+    /// 重发的退避延迟上限（毫秒）。默认 5000。
+    /// env `PECO_RETRY_MAX_DELAY_MS` 可覆盖。
+    pub retry_max_delay_ms: u64,
 }
 
 impl Default for LooperConfig {
@@ -233,12 +217,57 @@ impl Default for LooperConfig {
             persist_on_failure: false,
             message_filter: None,
             compaction: None,
-            truncation_retry_limit: 1,
-            truncation_retry_min_budget: 32_768,
-            transient_retry_limit: 2,
-            transient_retry_base_delay_ms: 500,
-            transient_retry_max_delay_ms: 5_000,
+            retry_limit: 3,
+            retry_output_budget: 32_768,
+            retry_base_delay_ms: 500,
+            retry_max_delay_ms: 5_000,
         }
+    }
+}
+
+impl LooperConfig {
+    /// 从环境变量读取重试配置，其余字段取 [`Self::default`]。
+    ///
+    /// 四个 env（与字段一一对应，旧 `PECO_TRUNCATION_RETRY_*` /
+    /// `PECO_TRANSIENT_RETRY_*` 名称已废弃、不兼容读取）：
+    ///
+    /// | 变量 | 默认 |
+    /// |------|------|
+    /// | `PECO_RETRY_LIMIT` | 3 |
+    /// | `PECO_RETRY_OUTPUT_BUDGET` | 32768 |
+    /// | `PECO_RETRY_BASE_DELAY_MS` | 500 |
+    /// | `PECO_RETRY_MAX_DELAY_MS` | 5000 |
+    ///
+    /// Peco / chat / CLI 三个构造点统一经本方法读取。
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            retry_limit: env_parse("PECO_RETRY_LIMIT", default.retry_limit),
+            retry_output_budget: env_parse("PECO_RETRY_OUTPUT_BUDGET", default.retry_output_budget),
+            retry_base_delay_ms: env_parse("PECO_RETRY_BASE_DELAY_MS", default.retry_base_delay_ms),
+            retry_max_delay_ms: env_parse("PECO_RETRY_MAX_DELAY_MS", default.retry_max_delay_ms),
+            ..default
+        }
+    }
+}
+
+/// 读一个数值环境变量：缺失取默认值，写错告警后取默认值。
+///
+/// 解析失败不静默吞 —— 值写错却「看起来生效了」是最难查的配置问题。
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse() {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(
+                    variable = name,
+                    value = %raw,
+                    "Invalid numeric env var; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
     }
 }
 
@@ -500,18 +529,17 @@ pub enum LooperEvent {
     /// 本次模型尝试已作废，正在重试。
     ///
     /// **纯通知，不含撤销语义**：接收方不删除任何已下发的增量。该尝试的产出
-    /// 已由 [`Self::begin_truncation_retry`] / [`Self::begin_transient_retry`]
-    /// 从 Session staging 中回退，因此它只存在于「实时视图」里，不存在于任何
-    /// 权威历史中 —— 这正是本事件要解释的事实。前端重载后从快照恢复，
-    /// 残句与通知一并消失。
+    /// 已由 `AgentLooper::begin_retry` 从 Session staging 中回退，因此它只存在于
+    /// 「实时视图」里，不存在于任何权威历史中 —— 这正是本事件要解释的事实。
+    /// 前端重载后从快照恢复，残句与通知一并消失。
     ///
     /// wire 名保持 `truncation_retry`（历史兼容），`reason` 区分两种重发：
     /// 截断（抬预算）与瞬时故障（退避原样重发）。
     TruncationRetry {
         turn_index: usize,
-        /// 第几次重试（1-based）— 各 reason 独立计数
+        /// 第几次重试（1-based）— 全部原因共用单计数
         attempt: u32,
-        /// 本轮对应 reason 的重试上限（0 = 关闭，此时不会发出本事件）
+        /// 本轮的重试上限（0 = 关闭，此时不会发出本事件）
         limit: u32,
         /// 截断那次的输出 token 数（瞬时重发传 0）
         output_tokens: u32,
@@ -520,8 +548,7 @@ pub enum LooperEvent {
         /// 该次尝试已下发的正文增量。
         ///
         /// **仅供落库侧对齐**（`chat` 模块的 `messages` 表累加器按后缀剥离），
-        /// **不向客户端下发** —— `map_looper_event` 刻意过滤掉它。实时视图
-        /// 保留这段残句是本设计的取舍，见 `docs/design/truncation-retry-notice.md`。
+        /// **不向客户端下发** —— `map_looper_event` 刻意过滤掉它。
         discarded_text: String,
         /// 重发原因：截断（抬预算）还是瞬时故障（退避重发）
         reason: RetryNoticeReason,
@@ -543,6 +570,43 @@ pub enum RetryNoticeReason {
     Truncated,
     /// 瞬时故障（限流/网络/5xx），退避后原样重发
     Transient,
+}
+
+/// 重发原因 —— 决定是否抬预算、通知 reason 与日志字段。
+///
+/// 两种原因共享同一骨架（守卫 → 回退 → 计数 → 退避 → 通知，见
+/// [`AgentLooper::begin_retry`]），差异只是入参级别的数据：
+/// 截断抬输出预算且需要 headroom 判据，瞬时原样重发。
+#[derive(Debug, Clone, Copy)]
+enum RetryCause {
+    /// 输出顶到 `max_tokens` 被截断（`Incomplete + FinishReason::MaxTokens`）。
+    Truncated {
+        /// 触发截断那次响应的输出 token 数（进通知载荷）
+        output_tokens: u32,
+    },
+    /// 瞬时故障：限流 / 网络 / 上游 5xx / 流被掐断。
+    Transient {
+        /// 故障类别的日志字段（`rate_limited` / `network` / `server` / `stream_cut`）
+        trigger: &'static str,
+    },
+}
+
+impl RetryCause {
+    /// 通知载荷里的输出 token 数：截断取实际值，瞬时无意义传 0。
+    fn notice_output_tokens(&self) -> u32 {
+        match self {
+            Self::Truncated { output_tokens } => *output_tokens,
+            Self::Transient { .. } => 0,
+        }
+    }
+
+    /// 通知载荷里的重发原因（wire 枚举 [`RetryNoticeReason`] 不变）。
+    fn notice_reason(&self) -> RetryNoticeReason {
+        match self {
+            Self::Truncated { .. } => RetryNoticeReason::Truncated,
+            Self::Transient { .. } => RetryNoticeReason::Transient,
+        }
+    }
 }
 
 // ============================================================================
@@ -829,7 +893,7 @@ pub struct AgentLooper {
     stable_prefix: String,
 
     /// 当前 turn 缓存的动态上下文字符串。
-    /// 在 [`prepare_and_send_request`] 检测到新 query 时更新，
+    /// 在 [`Self::prepare_and_send_request`] 检测到新 query 时更新，
     /// 同一 turn 内多次 ReAct 迭代复用该值。
     dynamic_context: Option<String>,
 
@@ -901,29 +965,24 @@ pub struct AgentLooper {
     /// 估算器单点在 [`super::context`]。
     last_request_estimated_tokens: Option<usize>,
 
-    // ── 截断重试（纯运行时状态，不落盘）──
-    /// 本用户轮内已用掉的截断重试次数。
+    // ── 统一重试（纯运行时状态，不落盘）──
+    /// 本用户轮内已用掉的重发次数（全部 [`RetryCause`] 合计，单计数单上限）。
     ///
     /// 与 `react_loop_iteration` **同生命周期**（单个用户轮），因此凡是要重置
     /// 前者的地方都必须重置后者 —— 见 [`Self::reset_turn_counters`]。
-    truncation_retries_used: usize,
-    /// 被回退掉的那次截断尝试的 `assistant_text`。
+    retries_used: usize,
+    /// 本轮是否抬过输出预算（粘性布尔，只由截断重发置位）。
     ///
-    /// 兜底用：重试请求**本身**发不出去时（如抬高的预算超过模型真实上限被
-    /// 400 拒），[`Self::finalize_failure`] 把它还给 `react_ctx`，让收尾仍能
-    /// 带上 `partial_text`，并由 [`plan_failure`] 补进 staging 保住整轮 ——
-    /// 「最坏情况不劣于不重试」由此成立。重试的产出落进 staging 后即作废。
-    truncation_salvage: Option<String>,
-
-    // ── 瞬时故障重发（纯运行时状态，不落盘）──
-    /// 本用户轮内已用掉的瞬时重发次数。与 `truncation_retries_used`
-    /// 同生命周期、同重置点（[`Self::reset_turn_counters`]），但**独立计数** —
-    /// 两种重试的约束与动作不同（抬预算 vs 退避原样重发），合并计数会让
-    /// 一次限流重发挤掉唯一的截断重试额度。
-    transient_retries_used: u32,
+    /// 必须是独立布尔而非 `retries_used > 0`：瞬时重发递增同一个计数，
+    /// 但绝不能抬预算（抬了可能超出模型真实上限 → 400，且改变了原样重发
+    /// 的语义）。随 `reset_turn_counters` 清零，粘性不出轮 —— 本轮抬过一次
+    /// 后，后续 ReAct 迭代继续用抬高的预算，否则 tool 调用之后的下一次
+    /// 迭代可能以同样的方式再截断一次。
+    budget_raised: bool,
     /// 下次重发的退避截止时刻。`None` = 无需等待。
-    /// 由 [`Self::begin_transient_retry`] 设置，在 [`Self::prepare_and_send_request`]
-    /// 入口以可取消的切片 sleep 等待 —— 等待贴在请求发出前，回退与通知立即发生。
+    /// 由 [`Self::begin_retry`] 设置（截断重发同样走退避），在
+    /// [`Self::prepare_and_send_request`] 入口以可取消的切片 sleep 等待 ——
+    /// 等待贴在请求发出前，回退与通知立即发生。
     /// 等待**只读不清**（见 [`Self::wait_retry_backoff`]）：`react_step` future
     /// 被 select drop 后重入仍能继续等剩余时间。
     retry_deadline: Option<Instant>,
@@ -981,9 +1040,8 @@ impl AgentLooper {
             last_finish_reason: None,
             active_tool_tasks: None,
             last_request_estimated_tokens: None,
-            truncation_retries_used: 0,
-            truncation_salvage: None,
-            transient_retries_used: 0,
+            retries_used: 0,
+            budget_raised: false,
             retry_deadline: None,
         }
     }
@@ -1736,21 +1794,19 @@ impl AgentLooper {
         }
     }
 
-    // ── 截断重试 ────────────────────────────────────────────────────────
+    // ── 统一重试 ────────────────────────────────────────────────────────
 
     /// 新一轮对话开始时重置「本用户轮」的运行时状态。
     ///
-    /// `react_loop_iteration`、`truncation_retries_used`、`truncation_salvage`
-    /// 与 `dynamic_context_resolved` 的生命周期都恰好是一个用户轮 —— 抽成方法
-    /// 就是为了让这条不变量无法被单独违反。
-    ///
-    /// 残片尤其不能跨轮：它只是给本轮收尾兜底的，留着会让下一轮的失败卡片
-    /// 显示上一轮的文本。
+    /// `react_loop_iteration`、`retries_used`、`budget_raised`、
+    /// `retry_deadline` 与 `dynamic_context_resolved` 的生命周期都恰好是
+    /// 一个用户轮 —— 抽成方法就是为了让这条不变量无法被单独违反。
+    /// `budget_raised` 尤其不能跨轮：粘性一旦泄漏，下一轮的截断重试会
+    /// 被第 4 条判据误拦（生效预算看似已抬过）。
     fn reset_turn_counters(&mut self) {
         self.react_loop_iteration = 0;
-        self.truncation_retries_used = 0;
-        self.truncation_salvage = None;
-        self.transient_retries_used = 0;
+        self.retries_used = 0;
+        self.budget_raised = false;
         self.retry_deadline = None;
         self.dynamic_context_resolved = false;
     }
@@ -1763,35 +1819,45 @@ impl AgentLooper {
         self.react_loop_iteration as u32
     }
 
-    /// 本次截断是否应该重试。纯判定，无副作用。
-    fn can_retry_truncation(&self) -> bool {
-        // 1. 次数上限（0 = 关闭）
-        if self.truncation_retries_used >= self.config.truncation_retry_limit as usize {
+    /// 本次重发是否应该发生。纯判定，无副作用，两种原因共用，判据顺序固定。
+    ///
+    /// 1. 次数上限（[`LooperConfig::retry_limit`]，`0` = 关闭）——
+    ///    全部原因共用单计数，先查 limit 再查 headroom：headroom 判据
+    ///    只会拒绝、不能放行。
+    /// 2. 用户按了停止 —— 不再发起新的模型调用。
+    /// 3. 轮数预算：重发要重新走 `prepare_and_send_request`，会消耗一次
+    ///    `react_loop_iteration`。没有下一次调用额度时不重发 —— 否则状态机
+    ///    刚被置回 `PreparingRequest` 就撞上 `MaxTurnsExceeded`，把「截断」
+    ///    或「限流」这个真实原因换成「超出轮数」，诊断信息反而变差。
+    /// 4. **仅截断**需要抬得动预算：抬不动（当前生效预算已 ≥
+    ///    `retry_output_budget`）⇒ 重发与上一次逐字节相同，必然同样截断，
+    ///    白烧一次调用。比的是**当前生效**预算而非配置值 —— 抬过一次后
+    ///    再比配置值会误放行第二次注定失败的重试。未配置 `max_tokens` 时
+    ///    按 0 计（provider 服务端默认远低于抬升目标），不会误判。
+    ///
+    /// 截断因此不需要独立限额：`budget_raised` 粘性到轮末，抬到
+    /// `retry_output_budget` 后生效预算恒 ≥ 该值，第 4 条恒假。
+    fn can_retry(&self, cause: &RetryCause) -> bool {
+        if self.retries_used >= self.config.retry_limit as usize {
             return false;
         }
-        // 2. 用户按了停止 —— 不再发起新的模型调用
         if self.is_cancelled() {
             return false;
         }
-        // 3. 轮数预算：重试要重新走 `prepare_and_send_request`，会消耗一次
-        //    `react_loop_iteration`。没有下一次调用额度时不重试 —— 否则状态机
-        //    刚被置回 `PreparingRequest` 就撞上 `MaxTurnsExceeded`，把「截断」
-        //    这个真实原因换成「超出轮数」，诊断信息反而变差。
         if self.react_loop_iteration >= self.max_turns {
             return false;
         }
-        // 4. 抬不动预算 = 重试请求与上一次逐字节相同，必然同样截断，白烧一次调用。
-        //    比的是**当前生效**的预算而非配置值：重试过一次后生效预算已是抬高值，
-        //    再比配置值会得出「还抬得动」，把 `truncation_retry_limit >= 2` 的
-        //    第二次重试放行成一次注定失败的调用。
-        //    未配置 `max_tokens` 时按 0 计：此时走 provider 服务端默认值
-        //    （DeepSeek 约 4096），远低于任何合理的重试下限，取 0 不会误判。
-        self.effective_output_budget() < self.retry_output_budget()
+        if matches!(cause, RetryCause::Truncated { .. })
+            && self.effective_output_budget() >= self.config.retry_output_budget
+        {
+            return false;
+        }
+        true
     }
 
     /// 本次请求实际会用的输出预算。把「一次性覆盖 → 配置值 → 未设」归一成一个数。
     ///
-    /// 未设时按 0 计 —— 仅用于比较（见 [`Self::can_retry_truncation`] 第 4 条），
+    /// 未设时按 0 计 —— 仅用于比较（见 [`Self::can_retry`] 第 4 条），
     /// 不用于发请求：发请求时 `None` 表示交给 provider 服务端默认值。
     fn effective_output_budget(&self) -> u32 {
         self.max_output_tokens_override()
@@ -1799,121 +1865,128 @@ impl AgentLooper {
             .unwrap_or(0)
     }
 
-    /// 重试请求要用的输出预算：`max(现预算, 配置下限)`。
-    ///
-    /// 取 `max` 而非直接取配置值：配置是**下限**，已配了更大预算的 agent
-    /// 不该因为一次截断重试被降配额。
-    fn retry_output_budget(&self) -> u32 {
-        self.agent
-            .model_config()
-            .max_tokens
-            .unwrap_or(0)
-            .max(self.config.truncation_retry_min_budget)
-    }
-
     /// 本 looper 当前生效的输出预算覆盖值（`None` = 沿用 `ModelConfig::max_tokens`）。
     ///
-    /// **粘性**：本轮发生过截断重试后，后续 ReAct 迭代继续用抬高的预算。
-    /// 否则 tool 调用之后的下一次迭代可能以同样的方式再截断一次，
-    /// 把刚省下的那次调用又浪费掉。计数器随新用户轮次归零，粘性不出轮。
+    /// **粘性**：本轮发生过截断重试（`budget_raised` 置位）后，后续 ReAct
+    /// 迭代继续用抬高的预算。否则 tool 调用之后的下一次迭代可能以同样的
+    /// 方式再截断一次，把刚省下的那次调用又浪费掉。随 [`Self::reset_turn_counters`]
+    /// 归零，粘性不出轮。瞬时重发不置位本标志 —— 它原样重发，抬预算可能
+    /// 超出模型真实上限（网关 400）。
     fn max_output_tokens_override(&self) -> Option<u32> {
-        (self.truncation_retries_used > 0).then(|| self.retry_output_budget())
+        self.budget_raised
+            .then_some(self.config.retry_output_budget)
     }
 
-    /// 截断重试：回退 staging 到本次请求前的锚点，清运行态，打回 `PreparingRequest`。
+    /// 单一重发入口（截断与瞬时共用）。回退 staging 到本次请求前的锚点，
+    /// 计数，设退避截止时刻，打回 `PreparingRequest`。
     ///
-    /// 返回 `false` 表示不重试 —— 调用方走既有失败路径，零行为回归。
+    /// 返回 `false` 表示不重发 —— 调用方走既有失败路径。
     /// 返回 `true` 时内层状态机已置回 [`ReActState::PreparingRequest`]，
-    /// 下一次 `react_step()` 会重新走 [`Self::prepare_and_send_request`]，
-    /// 以抬高的输出预算重发同一个请求。
+    /// 下一次 `react_step()` 会重新走 [`Self::prepare_and_send_request`]。
     ///
     /// # 为什么必须回退 staging
-    /// 两条非完成路径都是「先 [`Self::stage_output_blocks`] 再判状态」，截断的块
-    /// 已经写进 staging。不回退就重发，两次尝试的 assistant 块会叠在一起，直接
-    /// 违反 provider 线格式不变量（有 tool 结果待配对期间不得出现 assistant
-    /// Message）。回退到请求前的下标，语义上等价于「这次模型调用从未发生」——
-    /// 回退后 staging 的结尾与发请求前逐字节相同，而那个状态本身是合法的
-    /// （它来自上一次成功步骤）。
+    /// 两条非完成路径都是「先 [`Self::stage_output_blocks`] 再判状态」，被
+    /// 丢弃的块已经写进 staging。不回退就重发，两次尝试的 assistant 块会
+    /// 叠在一起，直接违反 provider 线格式不变量（有 tool 结果待配对期间
+    /// 不得出现 assistant Message）。回退到请求前的下标，语义上等价于
+    /// 「这次模型调用从未发生」—— 回退后 staging 的结尾与发请求前逐字节
+    /// 相同，而那个状态本身是合法的（它来自上一次成功步骤）。
     ///
     /// # 为什么不会死循环、为什么不吞掉轮数预算
-    /// 重试要重新走 `prepare_and_send_request`，因此**消耗一次
-    /// `react_loop_iteration`**：重试是一次真实的模型调用，不占额度会让
-    /// `max_turns` 失去意义。次数另受 [`LooperConfig::truncation_retry_limit`]
-    /// 约束，两个上限都有界 ⇒ 不可能死循环。
+    /// 重发要重新走 `prepare_and_send_request`，因此**消耗一次
+    /// `react_loop_iteration`**：重发是一次真实的模型调用，不占额度会让
+    /// `max_turns` 失去意义。次数另受 [`LooperConfig::retry_limit`] 约束，
+    /// 两个上限都有界 ⇒ 不可能死循环。
     ///
     /// # 不设 `failure_reason`
-    /// 本路径是**恢复**不是失败。故意不碰 `failure_reason`：重试最终跑到
+    /// 本路径是**恢复**不是失败。故意不碰 `failure_reason`：重发最终跑到
     /// `Done` 时会撞上 `Done` 分支的 `debug_assert!(failure_reason.is_none())`。
     ///
     /// # 锚点由调用方在收敛点就地取
     /// `checkpoint` 是**本次模型请求发出前** staging 的条数，由
-    /// [`Self::finish_stream`] / [`Self::resolve_batch_response`] 在
-    /// [`Self::stage_output_blocks`] 之前就地读取。它不存成字段：从
-    /// `PreparingRequest` 到收敛点之间没有任何 staging 写入（chunk 处理只发事件、
-    /// 写 `react_ctx`、记账 usage），因此收敛点的长度必然等于发请求前的长度 ——
-    /// 存字段反而多一条「必须在每条路径上写对」的人工不变量。
+    /// [`Self::finish_stream`] / [`Self::resolve_batch_response`] /
+    /// 各 Err 站点在 [`Self::stage_output_blocks`] 之前就地读取。它不存成
+    /// 字段：从 `PreparingRequest` 到收敛点之间没有任何 staging 写入
+    /// （chunk 处理只发事件、写 `react_ctx`、记账 usage），因此收敛点的
+    /// 长度必然等于发请求前的长度 —— 存字段反而多一条「必须在每条路径上
+    /// 写对」的人工不变量。
     ///
     /// # 不刷新在途检查点
-    /// 锚点即 `Session::staging_checkpoint()`，与 [`Self::stage_tool_results`]
-    /// 落盘的 `InflightCheckpoint` 在同一口径上，且取锚点时常无其他 staging 写入，
-    /// 即 `锚点 == 检查点条数`。被丢弃的消息从不属于检查点，落盘的检查点依然
-    /// 精确；反而若在此重写，会把已落地的工具结果从检查点抹掉。
+    /// 锚点即 `Session::staging_checkpoint()`，与 [`stage_tool_results`]
+    /// 落盘的 `InflightCheckpoint` 在同一口径上，且取锚点时常无其他 staging
+    /// 写入，即 `锚点 == 检查点条数`。被丢弃的消息从不属于检查点，落盘的
+    /// 检查点依然精确；反而若在此重写，会把已落地的工具结果从检查点抹掉。
+    ///
+    /// # 退避 deadline 只读不清
+    /// 退避不在本函数内 sleep —— 只记 `retry_deadline`，由
+    /// [`Self::prepare_and_send_request`] 在下次请求发出前经
+    /// [`Self::wait_retry_backoff`] 以可取消的切片 sleep 等待（回退与通知
+    /// 立即发生，取消检查天然衔接入口守卫）。deadline 只读不 `take()`，
+    /// 理由见 [`Self::wait_retry_backoff`]。
     ///
     /// # 为什么发 [`LooperEvent::TruncationRetry`] 而不回退传输层
     /// 已下发的增量留在实时视图里，由一条通知解释它们为什么不属于最终答案。
-    /// 用 `emit_event_guaranteed` 而非 `try_send`：丢一条通知 = 画面上多出一段
-    /// 无法解释的残句、本特性整个没发生（同 [`LooperEvent::ContextCompacted`]
-    /// 的处置）。
-    async fn begin_truncation_retry(
-        &mut self,
-        turn: usize,
-        output_tokens: u32,
-        checkpoint: usize,
-    ) -> bool {
-        if !self.can_retry_truncation() {
+    /// 用 `emit_event_guaranteed` 而非 `try_send`：丢一条通知 = 画面上多出
+    /// 一段无法解释的残句、本特性整个没发生（同
+    /// [`LooperEvent::ContextCompacted`] 的处置）。
+    async fn begin_retry(&mut self, cause: RetryCause, turn: usize, checkpoint: usize) -> bool {
+        if !self.can_retry(&cause) {
             return false;
         }
 
-        let (dropped, salvaged_text, had_output) = match self.rollback_attempt(checkpoint) {
+        let (dropped, discarded_text, had_output) = match self.rollback_attempt(checkpoint) {
             Some(r) => r,
-            None => {
-                warn!(turn, "Truncation retry skipped: staging rollback failed");
-                return false;
-            }
+            None => return false,
         };
 
-        self.truncation_retries_used += 1;
-        self.react_state = ReActState::PreparingRequest;
+        self.retries_used += 1;
+        self.budget_raised |= matches!(cause, RetryCause::Truncated { .. });
 
+        // 统一指数退避：base * 2^(n-1)，截断到上限。截断重发也等 ——
+        // 少一条分支，代价是一次 500ms 起的等待，相对一次完整模型调用可忽略。
+        let delay_ms = self
+            .config
+            .retry_base_delay_ms
+            .saturating_mul(1u64 << (self.retries_used - 1).min(16))
+            .min(self.config.retry_max_delay_ms);
+        self.retry_deadline = Some(Instant::now() + Duration::from_millis(delay_ms));
+
+        self.react_state = ReActState::PreparingRequest;
+        // `trigger` 是故障类别的日志字段，显式取一次进 warn（Debug 派生
+        // 不计入 dead_code 分析，只写 `cause = ?cause` 会让字段被判为未读）。
+        let trigger = match cause {
+            RetryCause::Transient { trigger } => trigger,
+            RetryCause::Truncated { .. } => "max_tokens",
+        };
         warn!(
             turn,
+            cause = ?cause,
+            trigger,
             dropped_staging_messages = dropped,
-            retry = self.truncation_retries_used,
-            limit = self.config.truncation_retry_limit,
-            output_tokens_at_truncation = output_tokens,
-            configured_budget = self.agent.model_config().max_tokens,
-            retry_budget = self.retry_output_budget(),
-            "Model output truncated at max_tokens; retrying with a larger output budget"
+            attempt = self.retries_used,
+            limit = self.config.retry_limit,
+            delay_ms,
+            "Retry scheduled"
         );
 
         // 通知必须在状态置回 `PreparingRequest` **之后**发：同一 Speaker FIFO
-        // 保证它早于重试尝试的第一条 TextDelta，前端插的横幅因此落在残句与
+        // 保证它早于重发尝试的第一条 TextDelta，前端插的横幅因此落在残句与
         // 新正文之间。`discarded_text` 取自 `rollback_attempt` 的 `take`，
-        // 是唯一真相源。
+        // 是唯一真相源（丢弃指令，非保存）。
         //
-        // 零产出（截断且什么都没吐）不发：没有需要解释的残句，发出去只会让
-        // 前端插一条无上下文的横幅。
+        // 零产出（什么都没吐就故障了）不发：没有需要解释的残句，发出去只会
+        // 让前端插一条无上下文的横幅。
         if had_output {
             Self::emit_event_guaranteed(
                 &self.event_speaker,
                 LooperEvent::TruncationRetry {
                     turn_index: turn,
-                    attempt: self.truncation_retries_used as u32,
-                    limit: self.config.truncation_retry_limit,
-                    output_tokens,
-                    retry_budget: self.retry_output_budget(),
-                    discarded_text: salvaged_text,
-                    reason: RetryNoticeReason::Truncated,
+                    attempt: self.retries_used as u32,
+                    limit: self.config.retry_limit,
+                    output_tokens: cause.notice_output_tokens(),
+                    retry_budget: self.effective_output_budget(),
+                    discarded_text,
+                    reason: cause.notice_reason(),
                 },
             )
             .await;
@@ -1921,20 +1994,49 @@ impl AgentLooper {
         true
     }
 
-    /// 回退本次模型尝试的公共骨架：staging 回退到锚点 + 清运行态 + 残片入 salvage。
+    /// 统一的模型故障出口。返回 `true` = 已安排重发（调用方直接 `return`）；
+    /// 返回 `false` = 已写入 `failure_reason`，调用方置 `ReActState::Failed`。
     ///
-    /// 截断重发与瞬时重发共用。返回 `(staging 回退条数, 残片正文, 是否有产出)`；
-    /// staging 回退失败（状态非 Active / 锚点越界）返回 `None` —— 此时 staging
-    /// 未被改动，调用方走既有失败路径，与无此特性完全一致。
+    /// 只收 `&ProviderError`：三处站点的错误类型不同（两处请求是 `AgentError`、
+    /// 流中 Err 是 `ProviderError` 直出），非 Provider 分支留在请求站点，
+    /// 不进本函数。
     ///
-    /// 残片入 [`Self::truncation_salvage`] 作为失败收尾兜底（字段名沿用，
-    /// 语义为「最近一次**非空**的被回退正文」）；正文比推理多留一份，
-    /// 它同时是通知载荷（落库侧按后缀剥离用）。
+    /// 分类只做一次（`classify()` 在此调用，`ClassifiedError` 按值传给
+    /// [`model_failure_reason`]）—— 门控与失败原因共用同一份分类结果。
+    async fn fail_or_retry(
+        &mut self,
+        e: &model_provider::ProviderError,
+        turn: usize,
+        checkpoint: usize,
+    ) -> bool {
+        let classified = e.classify();
+        if classified.kind.is_transient()
+            && self
+                .begin_retry(
+                    RetryCause::Transient {
+                        trigger: classified.kind.as_str(),
+                    },
+                    turn,
+                    checkpoint,
+                )
+                .await
+        {
+            return true;
+        }
+        self.failure_reason = Some(model_failure_reason(classified, self.total_attempts()));
+        false
+    }
+
+    /// 回退本次模型尝试的公共骨架：staging 回退到锚点 + 清运行态。
     ///
-    /// 空残片不覆写：连续两次回退（如截断重发后、重发尚未收到响应又遇瞬时
-    /// 故障）时，第二次零产出若把 `Some("")` 写进去，最终失败 restore 还回
-    /// 空串 —— 截断那次的残句凭空消失，反而劣于不重试。新残片非空则照常
-    /// 覆写：更新鲜的正文才是用户此刻在画面上看到的内容。
+    /// 全部重发原因共用（[`Self::begin_retry`]）。返回
+    /// `(staging 回退条数, 丢弃的正文, 是否有产出)`；staging 回退失败
+    /// （状态非 Active / 锚点越界）返回 `None` —— 此时 staging 未被改动，
+    /// 调用方走既有失败路径，与无此特性完全一致。
+    ///
+    /// 被回退的正文**只丢弃，不归还**：它作为 `discarded_text` 随
+    /// `TruncationRetry` 事件即发即弃（落库侧按后缀剥离用），不写入任何
+    /// 字段 —— 失败收尾的历史由 [`plan_failure`] 的存活桩兜底。
     fn rollback_attempt(&mut self, checkpoint: usize) -> Option<(usize, String, bool)> {
         let dropped = match self.session.truncate_staging(checkpoint) {
             Ok(d) => d,
@@ -1944,108 +2046,13 @@ impl AgentLooper {
             }
         };
 
-        let salvaged_text = std::mem::take(&mut self.react_ctx.assistant_text);
-        let salvaged_reasoning = std::mem::take(&mut self.react_ctx.assistant_reasoning);
-        let had_output = !salvaged_text.is_empty() || !salvaged_reasoning.is_empty();
-        if !salvaged_text.is_empty() {
-            self.truncation_salvage = Some(salvaged_text.clone());
-        }
+        let discarded_text = std::mem::take(&mut self.react_ctx.assistant_text);
+        let discarded_reasoning = std::mem::take(&mut self.react_ctx.assistant_reasoning);
+        let had_output = !discarded_text.is_empty() || !discarded_reasoning.is_empty();
         self.react_ctx.pending_tool_calls.clear();
         self.react_ctx.batch_response = None;
 
-        Some((dropped, salvaged_text, had_output))
-    }
-
-    /// 本次瞬时故障是否应该重发。纯判定，无副作用。
-    ///
-    /// 与 [`Self::can_retry_truncation`] 的差别：没有「预算抬得动」条件
-    /// （瞬时重发不抬预算，原样重发），次数走独立的
-    /// [`LooperConfig::transient_retry_limit`] 计数。
-    fn can_retry_transient(&self) -> bool {
-        // 1. 次数上限（0 = 关闭）
-        if self.transient_retries_used >= self.config.transient_retry_limit {
-            return false;
-        }
-        // 2. 用户按了停止 —— 不再发起新的模型调用
-        if self.is_cancelled() {
-            return false;
-        }
-        // 3. 轮数预算：与截断重试同理，重发会撞 `MaxTurnsExceeded`
-        //    把真实故障原因换成「超出轮数」，诊断信息反而变差。
-        if self.react_loop_iteration >= self.max_turns {
-            return false;
-        }
-        true
-    }
-
-    /// 瞬时故障重发：回退 staging 到本次请求前的锚点，清运行态，设退避截止时刻，
-    /// 打回 `PreparingRequest`。
-    ///
-    /// 与 [`Self::begin_truncation_retry`] 共用 [`Self::rollback_attempt`] 骨架，
-    /// 差别在于：不抬输出预算（原样重发）、独立计数、多一步退避等待 ——
-    /// 等待不在此处做，而是记 `retry_deadline`，由
-    /// [`Self::prepare_and_send_request`] 在下次请求发出前以可取消的切片
-    /// sleep 等待（回退与通知立即发生，取消检查天然衔接入口守卫）。
-    ///
-    /// `trigger` 是故障类别的日志字段（`rate_limited` / `network` / `server`）。
-    /// 返回 `true` 时内层状态机已置回 [`ReActState::PreparingRequest`]。
-    async fn begin_transient_retry(
-        &mut self,
-        turn: usize,
-        checkpoint: usize,
-        trigger: &'static str,
-    ) -> bool {
-        if !self.can_retry_transient() {
-            return false;
-        }
-
-        let (dropped, salvaged_text, had_output) = match self.rollback_attempt(checkpoint) {
-            Some(r) => r,
-            None => return false,
-        };
-
-        self.transient_retries_used += 1;
-        self.react_state = ReActState::PreparingRequest;
-
-        // 指数退避：base * 2^(n-1)，截断到上限。
-        let delay_ms = self
-            .config
-            .transient_retry_base_delay_ms
-            .saturating_mul(1u64 << (self.transient_retries_used - 1).min(16))
-            .min(self.config.transient_retry_max_delay_ms);
-        self.retry_deadline = Some(Instant::now() + Duration::from_millis(delay_ms));
-
-        warn!(
-            turn,
-            trigger,
-            dropped_staging_messages = dropped,
-            attempt = self.transient_retries_used,
-            limit = self.config.transient_retry_limit,
-            delay_ms,
-            "Transient model failure; scheduling retry"
-        );
-
-        // 通知语义与截断重发一致（见 `begin_truncation_retry`）。
-        // 瞬时重发不抬预算，`output_tokens` 无意义传 0，`retry_budget`
-        // 传当前生效预算供展示。
-        if had_output {
-            Self::emit_event_guaranteed(
-                &self.event_speaker,
-                LooperEvent::TruncationRetry {
-                    turn_index: turn,
-                    attempt: self.transient_retries_used,
-                    limit: self.config.transient_retry_limit,
-                    output_tokens: 0,
-                    retry_budget: self
-                        .max_output_tokens_override()
-                        .unwrap_or_else(|| self.agent.model_config().max_tokens.unwrap_or(0)),
-                    discarded_text: salvaged_text,
-                    reason: RetryNoticeReason::Transient,
-                },
-            )
-            .await;
-        }
-        true
+        Some((dropped, discarded_text, had_output))
     }
 
     /// 退避等待：等到 `retry_deadline`（若有）。可取消 — 每 ~200ms 切片
@@ -2056,7 +2063,7 @@ impl AgentLooper {
     /// 的 `react_step` future。取走 deadline 会把它带进 future 栈帧，drop 即
     /// 丢失，重建后零退避立即重发 —— 退避对「等待期间用户发过消息」失效。
     /// 留在 `self` 上则被 drop 后重入本函数继续等**剩余**时间（幂等）。
-    /// 过期 deadline 循环条件天然为假；下次 [`Self::begin_transient_retry`]
+    /// 过期 deadline 循环条件天然为假；下次 [`Self::begin_retry`]
     /// 覆写、[`Self::reset_turn_counters`] 清零，无需在此清除。
     async fn wait_retry_backoff(&mut self) {
         let Some(deadline) = self.retry_deadline else {
@@ -2069,36 +2076,6 @@ impl AgentLooper {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let slice = remaining.min(Duration::from_millis(200));
             tokio::time::sleep(slice).await;
-        }
-    }
-
-    /// 把上一次截断留下的残片还给 `react_ctx`。由 [`Self::finalize_failure`]
-    /// 在收尾漏斗顶部调用 —— 那里是唯一的归还点。
-    ///
-    /// 不回还的代价：staging 已被 [`Self::begin_truncation_retry`] 回退掉，
-    /// `react_ctx.assistant_text` 又被清空，`TurnOutcome::Failed.partial_text`
-    /// 于是变空 —— 最坏情况反而**劣于**不重试。还给 `react_ctx` 之后，
-    /// [`plan_failure`] 的 partial_text 与 [`Session::stage_salvage`] 的补条
-    /// 都拿得到它，收尾既带文本也仍能冻结整轮。
-    ///
-    /// 无残片时**不触碰该字段**：非重试路径的行为逐字节不变。
-    ///
-    /// # 只填空
-    /// `react_ctx.assistant_text` 非空说明**重试之后的那次尝试**自己已经吐过
-    /// 文本（那是用户此刻在画面上看到的内容），此时残片是陈旧的，覆盖它就
-    /// 等于把「这一次」的 partial_text 换成「上一次」的。这条路径真实存在：
-    /// 重试尝试成功进入 `ExecutingTools` 后 `finalize_tool_execution` 会清空
-    /// `assistant_text`，此后同轮任何一次失败都会走到这里。而
-    /// `partial_text` 喂给 [`plan_failure`] 的补条（`Session::stage_salvage`），
-    /// 喂错了文本，冻结进历史的整轮内容就是错的。
-    ///
-    /// 只填空同时给残片补上了缺失的清除点：重试成功的路径不经过
-    /// [`Self::finalize_failure`]，残片本会一直留到本轮结束。
-    fn restore_truncation_salvage(&mut self) {
-        if let Some(salvage) = self.truncation_salvage.take()
-            && self.react_ctx.assistant_text.is_empty()
-        {
-            self.react_ctx.assistant_text = salvage;
         }
     }
 
@@ -2231,8 +2208,6 @@ impl AgentLooper {
                     self.active_stream = Some(stream);
                     self.stream_assembler = BlockAssembler::new();
                     self.last_finish_reason = None;
-                    // 重试请求已成功发出，上一轮残片作废。
-                    self.truncation_salvage = None;
                     self.react_state = ReActState::Streaming;
                 }
                 Err(e) => {
@@ -2241,19 +2216,12 @@ impl AgentLooper {
                     // 永久类（Auth/额度/上下文溢出…）→ 类型化失败原因。
                     // 此处 staging 未被本次尝试写入（阶段不变量），锚点即当前长度。
                     if let AgentError::Provider(pe) = &e {
-                        let classified = pe.classify();
-                        if classified.kind.is_transient()
-                            && self
-                                .begin_transient_retry(
-                                    turn,
-                                    self.session.staging_checkpoint(),
-                                    classified.kind.as_str(),
-                                )
-                                .await
+                        if self
+                            .fail_or_retry(pe, turn, self.session.staging_checkpoint())
+                            .await
                         {
                             return;
                         }
-                        self.failure_reason = Some(model_failure_reason(pe, self.total_attempts()));
                     } else {
                         self.failure_reason = Some(TurnFailureReason::Other(format!(
                             "Streaming request failed: {e}"
@@ -2273,27 +2241,18 @@ impl AgentLooper {
             {
                 Ok(response) => {
                     self.react_ctx.batch_response = Some(response);
-                    // 重试请求已成功发出，上一轮残片作废。
-                    self.truncation_salvage = None;
                     self.react_state = ReActState::ResolvingResponse;
                 }
                 Err(e) => {
                     error!(error = %e, "Batch generate request failed");
                     // 同流式路径：瞬时类退避重发，永久类类型化失败。
                     if let AgentError::Provider(pe) = &e {
-                        let classified = pe.classify();
-                        if classified.kind.is_transient()
-                            && self
-                                .begin_transient_retry(
-                                    turn,
-                                    self.session.staging_checkpoint(),
-                                    classified.kind.as_str(),
-                                )
-                                .await
+                        if self
+                            .fail_or_retry(pe, turn, self.session.staging_checkpoint())
+                            .await
                         {
                             return;
                         }
-                        self.failure_reason = Some(model_failure_reason(pe, self.total_attempts()));
                     } else {
                         self.failure_reason = Some(TurnFailureReason::Other(format!(
                             "Generate request failed: {e}"
@@ -2357,7 +2316,13 @@ impl AgentLooper {
             if response.status == ResponseStatus::Incomplete
                 && matches!(response.finish_reason, Some(FinishReason::MaxTokens))
                 && self
-                    .begin_truncation_retry(turn, response.usage.output_tokens, checkpoint)
+                    .begin_retry(
+                        RetryCause::Truncated {
+                            output_tokens: response.usage.output_tokens,
+                        },
+                        turn,
+                        checkpoint,
+                    )
                     .await
             {
                 return;
@@ -2524,20 +2489,13 @@ impl AgentLooper {
                 // 流式路径的主分类 choke point：HTTP 非 200（校验阶段 yield Err）、
                 // 流内 error payload、established-stream 传输中断都从这里进来。
                 // 瞬时类回退 staging 后退避重发（chunk 不碰 staging，锚点即当前长度；
-                // react_ctx 里的增量由 rollback_attempt 残片化）；永久类类型化失败。
-                let classified = e.classify();
-                if classified.kind.is_transient()
-                    && self
-                        .begin_transient_retry(
-                            turn,
-                            self.session.staging_checkpoint(),
-                            classified.kind.as_str(),
-                        )
-                        .await
+                // react_ctx 里的增量随回退被丢弃）；永久类类型化失败。
+                if self
+                    .fail_or_retry(&e, turn, self.session.staging_checkpoint())
+                    .await
                 {
                     return;
                 }
-                self.failure_reason = Some(model_failure_reason(&e, self.total_attempts()));
                 self.react_state = ReActState::Failed;
             }
 
@@ -2583,9 +2541,11 @@ impl AgentLooper {
             if status == ResponseStatus::Incomplete
                 && matches!(finish_reason, Some(FinishReason::MaxTokens))
                 && self
-                    .begin_truncation_retry(
+                    .begin_retry(
+                        RetryCause::Truncated {
+                            output_tokens: usage.output_tokens,
+                        },
                         self.session.turn_index(),
-                        usage.output_tokens,
                         checkpoint,
                     )
                     .await
@@ -2600,7 +2560,13 @@ impl AgentLooper {
             if status == ResponseStatus::Incomplete
                 && finish_reason.is_none()
                 && self
-                    .begin_transient_retry(self.session.turn_index(), checkpoint, "stream_cut")
+                    .begin_retry(
+                        RetryCause::Transient {
+                            trigger: "stream_cut",
+                        },
+                        self.session.turn_index(),
+                        checkpoint,
+                    )
                     .await
             {
                 return;
@@ -3035,12 +3001,6 @@ impl AgentLooper {
         self.react_ctx.assistant_text.clear();
         self.react_ctx.assistant_reasoning.clear();
         self.react_ctx.batch_response = None;
-        // 截断重试的残片到此作废：能走到这里说明**重试之后那次尝试**已经成功
-        // 并产出了工具调用，残片要兜底的那个场景已经过去了。不清的话它会一直
-        // 留到本轮结束，而本轮任何一次「什么都没吐出来」的失败（请求发不出去）
-        // 都会因 `assistant_text` 恰好为空而被它顶上 —— 收尾拿到的
-        // `partial_text` 于是是上一次尝试的文本（CLI 会把它再打印一遍）。
-        self.truncation_salvage = None;
         self.react_state = ReActState::PreparingRequest;
     }
 
@@ -3061,17 +3021,15 @@ impl AgentLooper {
     ///
     /// 返回 `true` 表示续接了排队输入（调用方应 `continue`）。
     async fn finalize_failure(&mut self, reason: TurnFailureReason, drain_pending: bool) -> bool {
-        // ★ 残片的唯一归还点。截断重试把上一次尝试的文本移进了 salvage，此后
-        //   任何一条失败路径（请求发不出去、流中途出错、取消、超时、hook 中止）
-        //   都要把它还给 `react_ctx`，否则 `plan_failure` 取到的 partial_text 为空。
-        //   挂在收尾漏斗上而不是各 Err 分支，是为了让后续新增的失败路径不会漏掉。
-        self.restore_truncation_salvage();
+        // `retry_happened` 决定 `plan_failure` 是否补存活桩：只有「回退已发生、
+        // 新尝试零产出」才需要桩 —— 那正是回退把 staging 清空留下的洞。
         match plan_failure(
             &mut self.session,
             &mut self.react_ctx,
             self.config.persist_on_failure,
             reason,
             drain_pending,
+            self.retries_used > 0,
         ) {
             Some(plan) => self.finalize_failure_async(plan).await,
             None => false,
@@ -3256,18 +3214,21 @@ fn label_msg(message: &str) -> String {
     message.chars().take(FAILURE_LABEL_MSG_MAX).collect()
 }
 
-/// 把已分类的 [`ProviderError`] 映射为类型化失败原因。
+/// 把已分类的 [`model_provider::ClassifiedError`] 映射为类型化失败原因。
 ///
+/// 分类在调用方（[`AgentLooper::fail_or_retry`]）只做一次，本函数按值取走。
 /// `attempts` = 实际发起的尝试总数（含触发失败的那次），仅瞬时类变体使用。
 /// `ClassifiedError.message` 原样带进变体 — 分类不吞原文，SSE error 文案
 /// 与 session 中断标签都靠它保留 provider 诊断信息。
 ///
 /// `AgentError` 的非 Provider 变体（Io/Config/MaxTurns…）不走本函数，
 /// 由各自调用点直接构造原因。
-fn model_failure_reason(err: &model_provider::ProviderError, attempts: u32) -> TurnFailureReason {
+fn model_failure_reason(
+    classified: model_provider::ClassifiedError,
+    attempts: u32,
+) -> TurnFailureReason {
     use model_provider::ApiErrorKind;
 
-    let classified = err.classify();
     let message = classified.message;
     match classified.kind {
         ApiErrorKind::RateLimited => TurnFailureReason::RateLimited { attempts, message },
@@ -3289,11 +3250,12 @@ fn model_failure_reason(err: &model_provider::ProviderError, attempts: u32) -> T
 /// 若 `run()` 被 abort，最多丢事件与落盘，绝不会出现「落了盘但 committed 里
 /// 没有这一轮」。严防后人往这段塞 `.await`。
 ///
-/// 步骤顺序：① 守卫 → ② 取标量 → ③ 补回被重试回退的部分文本 → ④ 冲刷已完成
-/// 的工具结果 → ⑤ 冻结 → ⑥ 快照 → ⑦ 清状态。③ 在 ⑤ 之前是硬要求：
-/// 它决定 `interrupt_turn` 是冻结还是退化成 `rollback_turn`。④ 在 ⑤ 之前
-/// 同样是硬要求：捞回来的工具结果必须和这一轮一起进 committed，且 `stage_item`
-/// 只在 `Active` 下可用（⑤ 之后就 `Idle` 了）。
+/// 步骤顺序：① 守卫 → ② 取标量 → ③ 补轮次存活桩（新尝试的部分文本，
+/// 或重发后的固定桩）→ ④ 冲刷已完成的工具结果 → ⑤ 冻结 → ⑥ 快照 →
+/// ⑦ 清状态。③ 在 ⑤ 之前是硬要求：它决定 `interrupt_turn` 是冻结还是
+/// 退化成 `rollback_turn`。④ 在 ⑤ 之前同样是硬要求：捞回来的工具结果
+/// 必须和这一轮一起进 committed，且 `stage_item` 只在 `Active` 下可用
+/// （⑤ 之后就 `Idle` 了）。
 ///
 /// 返回 `None` 表示无在途轮可收尾 —— 挡的是「取消发生在 `Idle`」（根本没有在途轮，
 /// 例如 looper 正空转等输入时用户点了停止）时发出语义为空的 `TurnComplete`。
@@ -3303,6 +3265,7 @@ fn plan_failure(
     persist: bool,
     reason: TurnFailureReason,
     drain_pending: bool,
+    retry_happened: bool,
 ) -> Option<FinalizePlan> {
     // ① 无在途轮守卫
     if session.state() == SessionState::Idle && session.staging_messages().is_empty() {
@@ -3314,12 +3277,19 @@ fn plan_failure(
     let partial_text = std::mem::take(&mut ctx.assistant_text);
     let partial_text_len = partial_text.len();
 
-    // ③ 补回被截断重试回退掉的部分文本。回退后 staging 只剩 `user_input`，
+    // ③ 补回轮次存活桩。重发回退后 staging 只剩 `user_input`，
     //    `interrupt_turn` 会因此退化成 `rollback_turn`，这一轮（含用户提问）
-    //    整轮丢失 —— 比不重试还差。补一条 assistant 消息让冻结路径照常成立；
-    //    没有残片（非重试路径）时是 no-op，行为逐字节不变。
-    if session.staging_messages().is_empty() && !partial_text.is_empty() {
-        session.stage_salvage(partial_text.clone());
+    //    整轮丢失 —— 比不重试还差。补一条 assistant 消息让冻结路径照常成立：
+    //    新尝试自己吐过文本 → 用它的 partial_text（既有路径）；
+    //    新尝试零产出 → 补固定文案桩（仅在发生过重发时，非重试路径逐字节不变）。
+    //    被回退的截断文本**不进历史** —— 实时视图的残句由 TruncationRetry
+    //    通知解释，重载后随快照消失。
+    if session.staging_messages().is_empty() {
+        if !partial_text.is_empty() {
+            session.stage_salvage(partial_text.clone());
+        } else if retry_happened {
+            session.stage_salvage("[response discarded after retry]".into());
+        }
     }
 
     let frozen_staging_messages = session.staging_messages().len(); // ④ 冲刷后会变
@@ -3389,8 +3359,10 @@ mod tests {
         assert!(config.total_timeout.is_none());
         assert!(config.hooks.is_empty());
         assert!(config.environment.is_none());
-        assert_eq!(config.truncation_retry_limit, 1);
-        assert_eq!(config.truncation_retry_min_budget, 32_768);
+        assert_eq!(config.retry_limit, 3);
+        assert_eq!(config.retry_output_budget, 32_768);
+        assert_eq!(config.retry_base_delay_ms, 500);
+        assert_eq!(config.retry_max_delay_ms, 5_000);
     }
 
     // ── prompt 组装纯函数 tests ────────────────────────────────────────
@@ -3578,6 +3550,7 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+            false,
         )
         .expect("in-flight turn must produce a plan");
 
@@ -3634,6 +3607,7 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+            false,
         )
         .expect("有在途轮");
 
@@ -3664,6 +3638,7 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+            false,
         )
         .expect("Active with only user_input still has a turn to close");
 
@@ -3685,6 +3660,7 @@ mod tests {
                 &mut ctx,
                 true,
                 TurnFailureReason::Cancelled,
+                false,
                 false,
             )
             .is_none()
@@ -3712,6 +3688,7 @@ mod tests {
             &mut ctx,
             false,
             TurnFailureReason::TotalTimeout,
+            false,
             false,
         )
         .unwrap();
@@ -3994,7 +3971,7 @@ mod tests {
         assert_eq!(deserialized, ReActState::PreparingRequest);
     }
 
-    // ── 截断重试 ────────────────────────────────────────────────────────
+    // ── 统一重试 ────────────────────────────────────────────────────────
 
     /// 一次模型调用的脚本：吐一串 chunk、直接给一个非流式响应，或者直接失败。
     enum Script {
@@ -4309,8 +4286,8 @@ mod tests {
         let mut h = retry_harness(
             vec![truncated("part"), completed("done")],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4343,8 +4320,8 @@ mod tests {
         let mut h = retry_harness(
             vec![truncated("first"), truncated("second")],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4373,8 +4350,8 @@ mod tests {
         let mut h = retry_harness(
             vec![truncated("part")],
             LooperConfig {
-                truncation_retry_limit: 0,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 0,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4394,8 +4371,8 @@ mod tests {
         let mut h = retry_harness_with_budget(
             vec![truncated("part")],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
             Some(40_000),
@@ -4420,8 +4397,8 @@ mod tests {
         let mut h = retry_harness(
             vec![text_chunks("cut", 100, FinishReason::Aborted)],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4436,11 +4413,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_truncation_retry_salvages_partial_text_on_request_error() {
+    async fn test_truncation_retry_request_error_discards_text_and_keeps_turn() {
         // 抬高的预算若超过模型真实上限，重试请求本身会失败（400）。
-        // 此时 staging 已被回退为空，若不归还残片，partial_text 会丢光；
-        // 不补回 staging，interrupt_turn 还会退化成 rollback，整轮进不了历史。
-        // 本用例钉住「不劣于现状」的完整含义。
+        // 被回退的截断文本**只丢弃不归还**：partial_text 为空、
+        // 历史里不得再出现它；但轮次必须照常冻结（存活桩兜底），否则
+        // interrupt_turn 退化成 rollback，用户提问连同整轮一起从历史消失。
+        // 桩的具体形态由 `retry_then_failure_freezes_turn_with_stub` 钉住，
+        // 本用例钉住「丢弃」这一半。
         let mut h = retry_harness(
             vec![
                 truncated("salvaged"),
@@ -4450,8 +4429,10 @@ mod tests {
                 }),
             ],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
+                retry_base_delay_ms: 1,
+                retry_max_delay_ms: 2,
                 ..Default::default()
             },
         );
@@ -4460,22 +4441,24 @@ mod tests {
 
         assert_eq!(h.provider.budgets(), vec![None, Some(32_768)]);
         let outcomes = h.turn_outcomes();
+        assert_eq!(outcomes.len(), 1, "必须恰好收尾一次");
         match &outcomes[0] {
             TurnOutcome::Failed { partial_text, .. } => {
-                assert_eq!(partial_text, "salvaged", "重试请求失败时必须归还截断残片");
+                assert_eq!(
+                    partial_text, "",
+                    "被回退的截断文本不得作为 partial_text 归还"
+                );
             }
             other => panic!("应收敛为 Failed，实际 {other:?}"),
         }
         assert!(h.looper.session().is_idle(), "收尾后必须回到 Idle");
-        // 回退掉的唯一产物必须补回 staging，否则 interrupt_turn 退化成 rollback，
-        // 这一轮连用户提问一起从历史里消失。
         assert_eq!(
             h.committed_turns(),
             1,
             "重试失败仍须冻结整轮，不得退化成 rollback"
         );
         assert!(
-            h.looper
+            !h.looper
                 .session()
                 .committed_turns()
                 .iter()
@@ -4484,7 +4467,7 @@ mod tests {
                     am.message.as_ref(),
                     InputItem::Message { content, .. } if content.text_view() == "salvaged"
                 )),
-            "冻结进历史的轮次里必须留下截断那次的文本"
+            "被丢弃的截断文本不得进历史"
         );
     }
 
@@ -4495,13 +4478,17 @@ mod tests {
         let mut h = retry_harness(
             vec![],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
         h.looper.react_loop_iteration = h.looper.max_turns;
-        assert!(!h.looper.can_retry_truncation(), "无轮数余量必须不重试");
+        assert!(
+            !h.looper
+                .can_retry(&RetryCause::Truncated { output_tokens: 1 }),
+            "无轮数余量必须不重试"
+        );
     }
 
     #[test]
@@ -4511,14 +4498,14 @@ mod tests {
         let mut h = retry_harness(
             vec![],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
         assert_eq!(h.looper.max_output_tokens_override(), None);
 
-        h.looper.truncation_retries_used = 1;
+        h.looper.budget_raised = true;
         assert_eq!(h.looper.max_output_tokens_override(), Some(32_768));
 
         // 计数器随新用户轮归零，粘性不出轮
@@ -4534,21 +4521,26 @@ mod tests {
         let mut h = retry_harness_with_budget(
             vec![],
             LooperConfig {
-                truncation_retry_limit: 3,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 3,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
             Some(4096),
         );
 
+        let cause = RetryCause::Truncated { output_tokens: 1 };
+        assert!(h.looper.can_retry(&cause), "首次：4096 < 32768，抬得动");
+
+        // 单靠次数不抬预算（瞬时重发也走同一计数）—— 抬预算的是独立布尔。
+        h.looper.retries_used = 1;
         assert!(
-            h.looper.can_retry_truncation(),
-            "首次：4096 < 32768，抬得动"
+            h.looper.can_retry(&cause),
+            "只耗过瞬时额度、预算未抬时仍抬得动"
         );
 
-        h.looper.truncation_retries_used = 1;
+        h.looper.budget_raised = true;
         assert!(
-            !h.looper.can_retry_truncation(),
+            !h.looper.can_retry(&cause),
             "生效预算已是 32768，再重试只会发出同样的请求"
         );
     }
@@ -4556,8 +4548,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_truncation_retry_resends_with_raised_budget() {
         let retry_cfg = LooperConfig {
-            truncation_retry_limit: 1,
-            truncation_retry_min_budget: 32_768,
+            retry_limit: 1,
+            retry_output_budget: 32_768,
             ..Default::default()
         };
         let mut h = batch_retry_harness(
@@ -4600,8 +4592,8 @@ mod tests {
                 Some(FinishReason::Error),
             )],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4626,8 +4618,8 @@ mod tests {
                 None,
             )],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4642,8 +4634,8 @@ mod tests {
         let mut h = retry_harness(
             vec![truncated("part"), completed("done")],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4723,8 +4715,8 @@ mod tests {
                 completed("done"),
             ],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4744,8 +4736,8 @@ mod tests {
         let mut h = retry_harness(
             vec![truncated(""), completed("done")],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4781,8 +4773,8 @@ mod tests {
                 ),
             ],
             LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
+                retry_limit: 1,
+                retry_output_budget: 32_768,
                 ..Default::default()
             },
         );
@@ -4797,101 +4789,6 @@ mod tests {
             streamed_text(&events).is_empty(),
             "批量路径本就不发 delta，客户端无残句"
         );
-    }
-
-    #[test]
-    fn test_restore_truncation_salvage_only_fills_empty() {
-        // 当前尝试自己吐过文本时残片是陈旧的，覆盖它会把 partial_text
-        // 换成上一次尝试的内容 —— 而 partial_text 会经 plan_failure 的
-        // 补条冻结进历史。
-        let mut h = retry_harness(vec![], LooperConfig::default());
-        h.looper.truncation_salvage = Some("stale".to_string());
-        h.looper.react_ctx.assistant_text = "current".to_string();
-
-        h.looper.restore_truncation_salvage();
-
-        assert_eq!(h.looper.react_ctx.assistant_text, "current");
-        assert!(
-            h.looper.truncation_salvage.is_none(),
-            "残片即便不被采用也必须被消费掉，否则会留到下一次收尾"
-        );
-
-        // 当前尝试没吐过文本（重试请求发不出去那条路径）→ 照常归还
-        h.looper.react_ctx.assistant_text.clear();
-        h.looper.truncation_salvage = Some("stale".to_string());
-        h.looper.restore_truncation_salvage();
-        assert_eq!(h.looper.react_ctx.assistant_text, "stale");
-    }
-
-    #[tokio::test]
-    async fn test_finalize_tool_execution_drops_stale_salvage() {
-        // 重试之后那次尝试成功产出工具调用 → 残片要兜底的场景已过去。
-        // 不清的话本轮后续任何一次「什么都没吐出来」的失败都会把它顶上。
-        let mut h = retry_harness(vec![], LooperConfig::default());
-        h.looper.truncation_salvage = Some("stale".to_string());
-
-        h.looper.finalize_tool_execution().await;
-
-        assert!(
-            h.looper.truncation_salvage.is_none(),
-            "进入下一轮 ReAct 迭代时残片必须作废"
-        );
-    }
-
-    #[test]
-    fn test_reset_turn_counters_clears_salvage() {
-        // 残片只在给本轮收尾兜底时有意义。跨轮存活会让下一轮的失败卡片
-        // 显示上一轮的文本 —— 归还点（finalize_failure）之外的出口（本轮
-        // 未走收尾漏斗就结束）也必须在换轮时被清干净。
-        let mut h = retry_harness(vec![], LooperConfig::default());
-        h.looper.truncation_salvage = Some("stale".to_string());
-
-        h.looper.reset_turn_counters();
-
-        assert!(
-            h.looper.truncation_salvage.is_none(),
-            "残片不得跨用户轮存活"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_empty_rollback_preserves_earlier_salvage() {
-        // 截断重发存下残片后，重发在收到响应前又遇瞬时故障（本次零产出）：
-        // 第二次回退不得把残片覆写成空串，最终失败时 partial_text 必须还回
-        // 截断那次的内容。
-        let mut h = retry_harness(
-            vec![
-                truncated("part"),
-                Script::Fail(api_err(429, r#"{"error":{"message":"rate limited"}}"#)),
-                Script::Fail(api_err(429, r#"{"error":{"message":"rate limited"}}"#)),
-            ],
-            LooperConfig {
-                truncation_retry_limit: 1,
-                truncation_retry_min_budget: 32_768,
-                transient_retry_limit: 1,
-                transient_retry_base_delay_ms: 1,
-                transient_retry_max_delay_ms: 2,
-                ..Default::default()
-            },
-        );
-
-        drive_query(&mut h).await;
-
-        let outcomes = h.turn_outcomes();
-        assert_eq!(outcomes.len(), 1, "必须恰好收尾一次");
-        match &outcomes[0] {
-            TurnOutcome::Failed {
-                reason,
-                partial_text,
-            } => {
-                assert!(
-                    matches!(reason, TurnFailureReason::RateLimited { .. }),
-                    "429 耗尽应收敛为 RateLimited，实际 {reason:?}"
-                );
-                assert_eq!(partial_text, "part", "零产出的瞬时回退不得摧毁截断残片");
-            }
-            other => panic!("期望 Failed，实际 {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -4925,9 +4822,9 @@ mod tests {
     /// 瞬时重发测试用的快退避配置（避免测试真的等 500ms+）。
     fn fast_transient_config(limit: u32) -> LooperConfig {
         LooperConfig {
-            transient_retry_limit: limit,
-            transient_retry_base_delay_ms: 1,
-            transient_retry_max_delay_ms: 2,
+            retry_limit: limit,
+            retry_base_delay_ms: 1,
+            retry_max_delay_ms: 2,
             ..Default::default()
         }
     }
@@ -4941,7 +4838,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_rate_limited_retries_then_fails_with_typed_reason() {
-        // 429 是瞬时类：重发 transient_retry_limit 次后放弃，
+        // 429 是瞬时类：重发 retry_limit 次后放弃，
         // 失败原因是类型化的 RateLimited，且保留 provider 原始 body。
         let body = r#"{"error":{"message":"Rate limit reached for deepseek-v4","code":"rate_limit_exceeded"}}"#;
         let mut h = batch_retry_harness(
@@ -5212,10 +5109,10 @@ mod tests {
                 Script::Fail(api_err(503, "service unavailable")),
             ],
             LooperConfig {
-                transient_retry_limit: 2,
+                retry_limit: 2,
                 // 大退避：给取消留出窗口
-                transient_retry_base_delay_ms: 60_000,
-                transient_retry_max_delay_ms: 60_000,
+                retry_base_delay_ms: 60_000,
+                retry_max_delay_ms: 60_000,
                 ..Default::default()
             },
         );
@@ -5319,7 +5216,7 @@ mod tests {
             (api_err(400, "context_length_exceeded"), is_overflow),
         ];
         for (err, pred) in cases {
-            let reason = model_failure_reason(&err, 1);
+            let reason = model_failure_reason(err.classify(), 1);
             assert!(
                 pred(&reason),
                 "{:?} 映射错误 → {reason:?}",
@@ -5330,5 +5227,320 @@ mod tests {
         // is_transient 与映射一致：只有瞬时类进重发
         assert!(ApiErrorKind::RateLimited.is_transient());
         assert!(!ApiErrorKind::QuotaExhausted.is_transient());
+    }
+
+    // ── 统一重试：新增用例 ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn transient_retry_does_not_raise_budget() {
+        // 瞬时重发原样重发：不置 `budget_raised`，下一次请求的输出预算逐位不变。
+        // 抬预算可能超出模型真实上限（网关 400），且违背「原样重发」语义。
+        let mut h = batch_retry_harness(
+            vec![
+                Script::Fail(api_err(429, r#"{"error":{"message":"rate limited"}}"#)),
+                batch_response(
+                    "done",
+                    20,
+                    model_provider::ResponseStatus::Completed,
+                    Some(FinishReason::Stop),
+                ),
+            ],
+            fast_transient_config(3),
+        );
+
+        drive_query(&mut h).await;
+
+        assert_eq!(h.provider.budgets().len(), 2, "瞬时重发一次");
+        assert_eq!(
+            h.provider.budgets()[1],
+            h.provider.budgets()[0],
+            "重发请求的输出预算必须与首次逐位相同"
+        );
+        assert!(
+            !h.looper.budget_raised,
+            "瞬时重发不得置位抬预算标志（即便它递增同一计数）"
+        );
+        assert_eq!(h.looper.max_output_tokens_override(), None);
+        assert!(matches!(
+            h.turn_outcomes().as_slice(),
+            [TurnOutcome::Success { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn mixed_causes_share_one_limit() {
+        // 单计数单上限：截断 1 次 + 瞬时 2 次合计用尽 retry_limit=3，
+        // 第 4 次重发被拒，收敛为类型化失败（不再是「还有一次瞬时额度」）。
+        let body = r#"{"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#;
+        let mut h = retry_harness(
+            vec![
+                truncated("part"),
+                Script::Fail(api_err(429, body)),
+                Script::Fail(api_err(429, body)),
+                Script::Fail(api_err(429, body)),
+            ],
+            LooperConfig {
+                retry_limit: 3,
+                retry_output_budget: 32_768,
+                retry_base_delay_ms: 1,
+                retry_max_delay_ms: 2,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+
+        assert_eq!(
+            h.provider.budgets().len(),
+            4,
+            "首次 + 3 次重发（截断 1 + 瞬时 2）= 4 次请求"
+        );
+        assert_eq!(h.looper.retries_used, 3, "单计数恰好耗尽 retry_limit");
+        match &h.turn_outcomes()[..] {
+            [TurnOutcome::Failed { reason, .. }] => match reason {
+                TurnFailureReason::RateLimited { attempts, .. } => {
+                    assert_eq!(*attempts, 4, "attempts = 实际发起的总请求数");
+                }
+                other => panic!("额度耗尽应收敛为 RateLimited，实际 {other:?}"),
+            },
+            other => panic!("期望单次 Failed，实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_then_failure_freezes_turn_with_stub() {
+        // 截断重试已回退 staging、新尝试零产出即失败 —— 若不补存活桩，
+        // interrupt_turn 见空 staging 退化 rollback，用户提问连同整轮从历史消失。
+        let mut h = retry_harness(
+            vec![
+                truncated("salvaged"),
+                Script::Fail(api_err(
+                    400,
+                    r#"{"error":{"message":"max_output_tokens too large"}}"#,
+                )),
+            ],
+            LooperConfig {
+                retry_limit: 1,
+                retry_output_budget: 32_768,
+                retry_base_delay_ms: 1,
+                retry_max_delay_ms: 2,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+
+        match &h.turn_outcomes()[..] {
+            [TurnOutcome::Failed { partial_text, .. }] => {
+                assert_eq!(partial_text, "", "被回退的截断文本不得归还给失败卡片");
+            }
+            other => panic!("期望单次 Failed，实际 {other:?}"),
+        }
+        assert!(h.looper.session().is_idle(), "收尾后必须回到 Idle");
+        assert_eq!(
+            h.committed_turns(),
+            1,
+            "整轮必须冻结进历史，不得退化成 rollback"
+        );
+        let committed: Vec<_> = h
+            .looper
+            .session()
+            .committed_turns()
+            .iter()
+            .flatten()
+            .collect();
+        assert!(
+            committed.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::Message { content, .. }
+                    if content.text_view() == "[response discarded after retry]"
+            )),
+            "零产出的重发失败必须留下存活桩"
+        );
+        assert!(
+            !committed.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::Message { content, .. } if content.text_view() == "salvaged"
+            )),
+            "被丢弃的截断文本不得进历史"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_failure_without_retry_keeps_old_degradation() {
+        // 桩按 `retry_happened` 门控 —— 首请求 401、零重试时不冻结、不补桩，
+        // 轮次照旧退化消失。
+        let mut h = batch_retry_harness(
+            vec![Script::Fail(api_err(
+                401,
+                r#"{"error":{"message":"Invalid API key"}}"#,
+            ))],
+            fast_transient_config(3),
+        );
+
+        drive_query(&mut h).await;
+
+        assert_eq!(h.provider.budgets().len(), 1, "永久类零重发");
+        assert_eq!(h.looper.retries_used, 0, "未发生任何重发");
+        match &h.turn_outcomes()[..] {
+            [TurnOutcome::Failed { partial_text, .. }] => {
+                assert_eq!(partial_text, "", "零产出失败的 partial_text 依旧为空");
+            }
+            other => panic!("期望单次 Failed，实际 {other:?}"),
+        }
+        assert!(
+            h.committed_turns() == 0 && h.looper.session().turn_index() == 0,
+            "无重试的普通失败照旧退化（不冻结、不补桩），实际 committed={}, turn={}",
+            h.committed_turns(),
+            h.looper.session().turn_index()
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_not_emitted_when_partial_exists() {
+        // 重试后的新尝试自己吐过文本 → 走既有 partial_text 补条，
+        // 存活桩不得叠加（历史里恰好一份新产出，且无桩文案）。
+        let mut h = retry_harness(
+            vec![
+                truncated("first"),
+                Script::ChunksWithErr(vec![
+                    Ok(StreamChunk::BlockStart {
+                        index: 0,
+                        block_type: model_provider::BlockType::Text,
+                    }),
+                    Ok(StreamChunk::TextDelta {
+                        index: 0,
+                        delta: "second".to_string(),
+                    }),
+                    Err(api_err(400, "bad request")),
+                ]),
+            ],
+            LooperConfig {
+                retry_limit: 1,
+                retry_output_budget: 32_768,
+                retry_base_delay_ms: 1,
+                retry_max_delay_ms: 2,
+                ..Default::default()
+            },
+        );
+
+        drive_query(&mut h).await;
+
+        match &h.turn_outcomes()[..] {
+            [TurnOutcome::Failed { partial_text, .. }] => {
+                assert_eq!(partial_text, "second", "partial_text 必须是新尝试的产出");
+            }
+            other => panic!("期望单次 Failed，实际 {other:?}"),
+        }
+        assert_eq!(h.committed_turns(), 1, "整轮照常冻结");
+        let committed: Vec<_> = h
+            .looper
+            .session()
+            .committed_turns()
+            .iter()
+            .flatten()
+            .collect();
+        let second_hits = committed
+            .iter()
+            .filter(|am| {
+                matches!(
+                    am.message.as_ref(),
+                    InputItem::Message { content, .. } if content.text_view() == "second"
+                )
+            })
+            .count();
+        assert_eq!(second_hits, 1, "新产出只补一条，不得出双份");
+        assert!(
+            !committed.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::Message { content, .. }
+                    if content.text_view() == "[response discarded after retry]"
+            )),
+            "partial_text 非空时不得再补存活桩"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_output_budget_headroom_guard() {
+        // `retry_output_budget` 既是抬升目标也是上限。
+        // 配置 8000 < 8192 → 抬到 8192 重发；配置 8192 ≥ 8192 → headroom
+        // 判据拒绝（重发与上次逐字节相同，白烧一次调用）。
+        let cfg = |budget: u32| LooperConfig {
+            retry_limit: 1,
+            retry_output_budget: budget,
+            retry_base_delay_ms: 1,
+            retry_max_delay_ms: 2,
+            ..Default::default()
+        };
+
+        let mut raised = retry_harness_with_budget(
+            vec![truncated("part"), completed("done")],
+            cfg(8_192),
+            Some(8_000),
+        );
+        drive_query(&mut raised).await;
+        assert_eq!(
+            raised.provider.budgets(),
+            vec![Some(8_000), Some(8_192)],
+            "配置低于抬升目标时必须抬到目标值重发"
+        );
+        assert!(matches!(
+            raised.turn_outcomes().as_slice(),
+            [TurnOutcome::Success { .. }]
+        ));
+
+        let mut no_headroom =
+            retry_harness_with_budget(vec![truncated("part")], cfg(8_192), Some(8_192));
+        drive_query(&mut no_headroom).await;
+        assert_eq!(
+            no_headroom.provider.budgets(),
+            vec![Some(8_192)],
+            "配置已达抬升目标则不得重发"
+        );
+        assert!(matches!(
+            no_headroom.turn_outcomes().as_slice(),
+            [TurnOutcome::Failed { .. }]
+        ));
+    }
+
+    #[test]
+    fn from_env_reads_all_retry_fields() {
+        // env 是进程级的：本用例内设后清，避免污染其他并行测试。
+        // edition 2024 下 set_var / remove_var 为 unsafe。
+        const NAMES: [&str; 4] = [
+            "PECO_RETRY_LIMIT",
+            "PECO_RETRY_OUTPUT_BUDGET",
+            "PECO_RETRY_BASE_DELAY_MS",
+            "PECO_RETRY_MAX_DELAY_MS",
+        ];
+        unsafe {
+            for name in NAMES {
+                std::env::remove_var(name);
+            }
+        }
+
+        let defaults = LooperConfig::from_env();
+        assert_eq!(defaults.retry_limit, 3);
+        assert_eq!(defaults.retry_output_budget, 32_768);
+        assert_eq!(defaults.retry_base_delay_ms, 500);
+        assert_eq!(defaults.retry_max_delay_ms, 5_000);
+
+        unsafe {
+            std::env::set_var("PECO_RETRY_LIMIT", "7");
+            std::env::set_var("PECO_RETRY_OUTPUT_BUDGET", "8192");
+            std::env::set_var("PECO_RETRY_BASE_DELAY_MS", "25");
+            std::env::set_var("PECO_RETRY_MAX_DELAY_MS", "1500");
+        }
+        let parsed = LooperConfig::from_env();
+        assert_eq!(parsed.retry_limit, 7);
+        assert_eq!(parsed.retry_output_budget, 8_192);
+        assert_eq!(parsed.retry_base_delay_ms, 25);
+        assert_eq!(parsed.retry_max_delay_ms, 1_500);
+
+        unsafe {
+            for name in NAMES {
+                std::env::remove_var(name);
+            }
+        }
     }
 }

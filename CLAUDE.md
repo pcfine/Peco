@@ -88,10 +88,14 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - 动态上下文组装：系统提示词每轮重新注入，工具结果追加其后。`DynamicContext` trait 支持在每次新用户查询时注入 RAG 增强内容；同一轮的 ReAct 迭代复用缓存上下文。
 - **上下文策略**：`FullHistory`（默认）、`SlidingWindow { max_turns }`、`TokenBudget { max_tokens, summarize_overflow }` 或 `Custom(Arc<dyn ContextFilter>)`。通过 `LooperConfig` 为每个 looper 选择。
 - `LooperEvent` 枚举（19 个变体）通过异步 intercom 通道（`Speaker`/`Listener` 对）流动，覆盖文本增量、推理增量、工具调用生命周期、状态转换、轮次边界和关闭。
-- **模型错误分类与重发**：模型故障统一经 `model_failure_reason`（按 `ProviderError::classify()` 映射）转成类型化 `TurnFailureReason`（`RateLimited`/`ModelUnavailable`/`AuthError`/`QuotaExhausted`/`ContextOverflow`/`ContentFiltered`，均携带 provider 原始 msg）。两种重发机制正交：
-  - **截断重发**（`begin_truncation_retry`）：`Incomplete + MaxTokens` → 回退 staging、抬输出预算重发，`truncation_retry_limit` 默认 1；
-  - **瞬时重发**（`begin_transient_retry`）：分类为瞬时类（限流/网络/5xx）或流被掐断（`Incomplete + finish_reason=None`）→ 回退 staging、指数退避后原样重发，`transient_retry_limit` 默认 2（`PECO_TRANSIENT_RETRY_*` 环境变量可调）；退避在 `prepare_and_send_request` 入口以可取消切片 sleep 等待，不阻塞取消。
-  两者共享 `rollback_attempt` 骨架（staging 回退 → 残片入 salvage → 清运行态 → 发 `TruncationRetry` 通知），各自独立计数，均消耗 `react_loop_iteration` 额度。
+- **模型错误分类与统一重发**：模型故障统一经 `model_failure_reason`（按 `ProviderError::classify()` 映射）转成类型化 `TurnFailureReason`（`RateLimited`/`ModelUnavailable`/`AuthError`/`QuotaExhausted`/`ContextOverflow`/`ContentFiltered`，均携带 provider 原始 msg）。故障出口 `fail_or_retry` 收敛三处 Err 站点：**只 classify 一次**，瞬时类进重发，否则写入 `failure_reason`。
+  - **单一重发入口 `begin_retry(RetryCause)`**：截断（`Truncated { output_tokens }`，触发条件 `Incomplete + MaxTokens`）与瞬时（`Transient { trigger }`，限流/网络/5xx，或流被掐断 `Incomplete + finish_reason=None`）共用一条路径 —— 守卫 `can_retry` → 回退 staging 到请求前锚点 → 计数 → 设定退避 deadline → 通知。两者**语义差异只是入参**：截断额外抬输出预算，其余（退避、通知、回退）完全一致。
+  - **单计数单上限**：`retry_limit` 默认 3（旧「截断 1 + 瞬时 2」的合计天花板），`PECO_RETRY_LIMIT` 可调，`0` = 关闭。**截断不需要独立限额** —— `budget_raised` 粘性到轮末，抬到 `retry_output_budget` 后 headroom 判据恒假，第二次截断重试被 `can_retry` 拦死。
+  - **`budget_raised` 必须是独立布尔**而非 `retries_used > 0`：瞬时重发递增同一计数但绝不能抬预算（抬了可能超出模型真实上限 → 网关 400，且违背「原样重发」语义）。随 `reset_turn_counters` 清零，粘性不出轮。
+  - **抬升目标 = 抬升上限**：`retry_output_budget` 默认 32_768，同时是 headroom 判据与粘性覆盖的唯一参数（旧 `max(配置值, min_budget)` 形式已化简删除）。**模型真实输出上限低于该值时截断重试会被网关 400 拒** —— 调低该值到模型上限之内，或 `PECO_RETRY_LIMIT=0` 关闭重试。
+  - **统一退避**：`base * 2^(n-1)` 截断到上限，`retry_base_delay_ms` 默认 500 / `retry_max_delay_ms` 默认 5000，截断重发同样走退避。退避在 `prepare_and_send_request` 入口以可取消切片 sleep 等待（只读 deadline 不 `take()`，见 `wait_retry_backoff`），不阻塞取消。
+  - **残片只丢弃不归还**：被回退的截断文本不进历史（`rollback_attempt` 的 `discarded_text` 是发给前端/落库的**丢弃指令**，随 `TruncationRetry` 事件即发即弃）。但 `plan_failure` 保留了**轮次存活桩** —— 重试后失败且新尝试零产出时补一条 `[response discarded after retry]` 的 assistant 消息，否则 `interrupt_turn` 见 staging 为空会退化成 `rollback_turn`，用户提问整轮从历史消失。
+  - 四个 env 的读取**下沉到 `LooperConfig::from_env()`**（`PECO_RETRY_LIMIT` / `PECO_RETRY_OUTPUT_BUDGET` / `PECO_RETRY_BASE_DELAY_MS` / `PECO_RETRY_MAX_DELAY_MS`），`PecoConfig`、`chat/handler.rs`、`peco-cli` 三个构造点统一委托 —— 旧版本里后两者无视 env 是既有 bug。
 - `LooperHook` trait：8 个拦截点（`on_before_request`、`on_after_response`、`on_text_delta`、`on_before_tool`、`on_after_tool`、`on_turn_complete`、`on_react_state_change`、`on_outer_state_change`）。内置钩子：`ToolAllowlistHook`、`TokenBudgetHook`。
 
 **SimpleAgentLooper**（[crates/peco-core/src/agent/simple_looper.rs](crates/peco-core/src/agent/simple_looper.rs)）：

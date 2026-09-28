@@ -61,8 +61,8 @@ impl CliConfig {
         })
     }
 
-    /// 转换为 `LooperConfig`。
+    /// 转换为 `LooperConfig`（重试字段经 `PECO_RETRY_*` 环境变量可覆盖）。
     pub fn to_looper_config(&self) -> LooperConfig {
-        LooperConfig::default()
+        LooperConfig::from_env()
     }
 }
