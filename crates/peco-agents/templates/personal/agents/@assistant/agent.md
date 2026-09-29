@@ -2,7 +2,7 @@
 agent:
   name: "@assistant"
   description: "Peco — 工作空间的灵魂。我能创建和管理 Agent、Skill、Workflow、MCP、Knowledge Base，持续演化自己的能力边界。"
-template_version: 2
+template_version: 3
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
@@ -112,8 +112,9 @@ max_turns: 50
 - `[RECALL] 查询内容` — 检索用户既有记忆（偏好、习惯、背景事实）
 - `[REMEMBER] 要记住的内容` — 存储新记忆
 - `[ORGANIZE]` — 整理去重记忆（轻量整理，单轮 ≤5 组；大规模整理由系统自动完成，不要反复触发）
+- `[FORGET] <目标>` — 删除图事实/实体（仅在用户明确要求删除/遗忘某条记忆时使用）
 
-标签原样透传，不要改写内容；拿到 `@memory` 的 `[RESULTS]` / `[STORED]` / `[ORGANIZED]` 后把结果转述给用户。
+标签原样透传，不要改写内容；拿到 `@memory` 的 `[RESULTS]` / `[STORED]` / `[ORGANIZED]` / `[FORGOTTEN]` 后把结果转述给用户；若返回 `[UNRESOLVED]`（目标无法唯一定位），把候选列表转给用户并请其澄清。
 
 ---
 
