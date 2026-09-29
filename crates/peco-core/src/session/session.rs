@@ -695,6 +695,25 @@ impl Session {
             .push_back(PendingInput::with_priority(content, priority));
     }
 
+    /// 弹出队首输入（`Interrupt` 优先），不启动 turn。
+    ///
+    /// looper 恢复暂停时用它取出排队消息再走 `handle_user_query`，
+    /// 复用完整的 turn 启动簿记（状态迁移 + 事件）。
+    fn pop_pending_input(&mut self) -> Option<PendingInput> {
+        // 优先处理 Interrupt：从队列中找到第一个 Interrupt 并移除
+        let interrupt_idx = self
+            .pending
+            .iter()
+            .position(|input| input.priority == InputPriority::Interrupt);
+
+        if let Some(idx) = interrupt_idx {
+            // Safety: idx is guaranteed valid by position()
+            self.pending.remove(idx)
+        } else {
+            self.pending.pop_front()
+        }
+    }
+
     /// 从 pending 队列取出下一个输入并启动新 turn。
     ///
     /// 优先处理 `Interrupt` 优先级输入（从前往后扫描，取第一个 Interrupt）。
@@ -702,21 +721,7 @@ impl Session {
     /// 返回 `Ok(true)` 表示成功启动新 turn，
     /// `Ok(false)` 表示队列为空。
     pub fn dequeue_and_start_turn(&mut self) -> Result<bool, SessionError> {
-        // 优先处理 Interrupt：从队列中找到第一个 Interrupt 并移除
-        let interrupt_idx = self
-            .pending
-            .iter()
-            .position(|input| input.priority == InputPriority::Interrupt);
-
-        let input = if let Some(idx) = interrupt_idx {
-            // Safety: idx is guaranteed valid by position(); remove(idx) returns Option<T>
-            // for OOB safety
-            self.pending.remove(idx)
-        } else {
-            self.pending.pop_front()
-        };
-
-        let input = match input {
+        let input = match self.pop_pending_input() {
             Some(i) => i,
             None => return Ok(false),
         };
@@ -729,6 +734,13 @@ impl Session {
                 Err(e)
             }
         }
+    }
+
+    /// 弹出队首排队输入（`Interrupt` 优先），只出队不启动 turn。
+    ///
+    /// 队列为空返回 `None`。
+    pub fn pop_pending(&mut self) -> Option<Content> {
+        self.pop_pending_input().map(|input| input.content)
     }
 
     /// 是否有排队中的输入。

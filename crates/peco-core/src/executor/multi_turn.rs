@@ -81,27 +81,27 @@ impl MultiTurnExecutor {
         None
     }
 
-    /// 取消当前执行（透传到 LooperHandle）。
+    /// 取消当前执行（透传到 LooperHandle）。looper 未创建或已退出时为 no-op。
     pub async fn cancel(&self) {
         let guard = self.handle.lock().await;
         if let Some(ref h) = *guard {
-            h.cancel();
+            let _ = h.cancel().await;
         }
     }
 
-    /// 暂停 looper。
+    /// 暂停 looper。looper 未创建或已退出时为 no-op。
     pub async fn pause(&self) {
         let guard = self.handle.lock().await;
         if let Some(ref h) = *guard {
-            h.pause();
+            let _ = h.pause().await;
         }
     }
 
-    /// 恢复 looper。
+    /// 恢复 looper。looper 未创建或已退出时为 no-op。
     pub async fn resume(&self) {
         let guard = self.handle.lock().await;
         if let Some(ref h) = *guard {
-            h.resume();
+            let _ = h.resume().await;
         }
     }
 

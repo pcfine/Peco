@@ -50,7 +50,7 @@ pub enum OuterState {
     ProcessingUserInput,
     /// 内层 ReAct 循环运行中
     RunningInnerLoop,
-    /// 已暂停（通过 [`LooperHandle::pause`] 触发），等待 [`LooperHandle::resume`]
+    /// 已暂停（收到 [`UserMsg::Pause`]），等待 [`UserMsg::Resume`] 解除
     Paused,
 }
 
@@ -614,11 +614,21 @@ impl RetryCause {
 // ============================================================================
 
 /// 用户输入消息
+///
+/// 暂停/恢复/取消与查询同走 `user_listener` 一条通道：FIFO 全序保证
+/// 「先发的 query、后到的 pause」交错语义确定，且消息本身即可唤醒
+/// 阻塞在 `recv()` 上的 looper（flag 做不到）。
 #[derive(Debug, Clone)]
 pub enum UserMsg {
     /// 用户查询（纯文本或文本 + 图片部件混排）
     Query(Content),
-    /// 关闭请求
+    /// 请求暂停：looper 进入 `Paused`，挂起 ReAct 循环
+    Pause,
+    /// 请求恢复：解除 `Paused`，回到暂停前的外层状态
+    Resume,
+    /// 请求取消：在途轮冻结进历史后退出（收尾复用循环顶的取消分支）
+    Cancel,
+    /// 关闭请求（在途轮直接丢弃，不记账）
     Shutdown,
 }
 
@@ -637,8 +647,8 @@ pub enum UserMsg {
 ///
 /// h.send_query("...").await;   // 发送用户输入
 /// h.recv_event().await;         // 接收文本/tool/状态事件
-/// h.cancel();                   // 请求取消
-/// h.pause(); / h.resume();      // 控制流程
+/// h.cancel().await;             // 请求取消（走 user channel）
+/// h.pause().await; / h.resume().await;  // 暂停 / 继续（走 user channel）
 /// h.wait().await;               // 等待完成并获取结果
 /// ```
 ///
@@ -705,7 +715,8 @@ pub struct LooperHandle {
     event_listener: Arc<tokio::sync::Mutex<Listener<LooperEvent>>>,
     /// 取消标志
     cancel_flag: Arc<AtomicBool>,
-    /// 暂停标志
+    /// 暂停状态镜像（looper 进出 Paused 时写入，仅供 `is_paused()` 查询；
+    /// 暂停控制本身走 [`UserMsg::Pause`] / [`UserMsg::Resume`]）
     pause_flag: Arc<AtomicBool>,
     /// looper 后台任务 handle（最后 drop 时自动 abort）
     task_handle: OwnedTask,
@@ -738,27 +749,38 @@ impl LooperHandle {
 
     // ── 控制 ──────────────────────────────────────────────────────────────
 
-    /// 请求取消当前执行。
+    /// 请求取消：向 looper 发送 [`UserMsg::Cancel`]。
     ///
-    /// - 正在进行的模型调用不会被中断（取决于 provider），但不会再发起新调用
-    /// - 正在执行的 tool 会被 abort
-    /// - pending 队列中的消息会保留
-    /// - looper 状态变为 Failed，failure_reason = TurnFailureReason::Cancelled
-    pub fn cancel(&self) {
-        self.cancel_flag.store(true, Ordering::Release);
+    /// - 消息本身唤醒停靠 select 或暂停中阻塞在 `recv()` 上的 looper
+    ///   （裸 flag 置位叫不醒 —— 与 pause/resume 同走 user channel）
+    /// - 收尾统一走循环顶取消分支：在途轮冻结进历史（`TurnComplete` +
+    ///   `Failed{Cancelled}`，落盘由 `persist_on_failure` 门控），pending
+    ///   队列保留但不续接
+    /// - 消息抢占 select 会丢弃在途 `react_step` future —— 与查询消息
+    ///   中断同一机制，模型请求随 future 丢弃而中止
+    /// - 返回 `Err` 表示 looper 已结束（channel 关闭）
+    ///
+    /// 与 [`Self::shutdown`] 不重复：cancel 记账（半成品冻结进历史），
+    /// shutdown 即弃（staging 直接丢弃）。
+    pub async fn cancel(&self) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
+        self.user_speaker.send(UserMsg::Cancel).await
     }
 
-    /// 请求暂停。looper 在下一轮 `react_step()` 调度前挂起。
+    /// 请求暂停：向 looper 发送 [`UserMsg::Pause`]。
     ///
-    /// 暂停期间仍可通过 `send_query` 将消息放入 pending 队列。
-    /// 调用 `resume()` 恢复执行。
-    pub fn pause(&self) {
-        self.pause_flag.store(true, Ordering::Release);
+    /// 暂停在 looper 消费到该消息时生效（与 `send_query` 同通道 FIFO，
+    /// 交错语义确定）；暂停期间 `send_query` 的消息进入 pending 队列，
+    /// 恢复时若 looper 停靠在 Idle 会立即续接。调用 [`Self::resume`] 恢复。
+    /// 返回 `Err` 表示 looper 已结束（channel 关闭）。
+    pub async fn pause(&self) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
+        self.user_speaker.send(UserMsg::Pause).await
     }
 
-    /// 恢复暂停的 looper。
-    pub fn resume(&self) {
-        self.pause_flag.store(false, Ordering::Release);
+    /// 请求恢复：向 looper 发送 [`UserMsg::Resume`]，解除 `Paused` 并
+    /// 回到暂停前的外层状态。消息本身唤醒阻塞在 `recv()` 上的 looper。
+    /// 幂等 —— 未暂停时收到会被忽略。
+    pub async fn resume(&self) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
+        self.user_speaker.send(UserMsg::Resume).await
     }
 
     /// 优雅关闭：发送 Shutdown 信号，等待 looper 自然退出。
@@ -792,12 +814,18 @@ impl LooperHandle {
 
     // ── 状态查询 ──────────────────────────────────────────────────────────
 
-    /// 取消标志是否已触发。
+    /// 取消是否已生效。
+    ///
+    /// 标志由 looper 在消费 [`UserMsg::Cancel`] 时写入（`cancel().await`
+    /// 返回后、looper 实际消费消息前仍为 `false`）；drop 安全网也直接写入。
     pub fn is_cancelled(&self) -> bool {
         self.cancel_flag.load(Ordering::Acquire)
     }
 
-    /// 暂停标志是否已触发。
+    /// looper 是否处于 `Paused` 状态。
+    ///
+    /// 这是 looper 在状态迁移时写入的镜像 —— `pause().await` 返回后、
+    /// looper 实际消费消息前仍为 `false`。
     pub fn is_paused(&self) -> bool {
         self.pause_flag.load(Ordering::Acquire)
     }
@@ -808,16 +836,6 @@ impl LooperHandle {
             Ok(guard) => guard.as_ref().is_some_and(|h| !h.is_finished()),
             Err(_) => false,
         }
-    }
-
-    /// 获取取消标志的克隆（用于跨线程共享）。
-    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel_flag)
-    }
-
-    /// 获取暂停标志的克隆（用于跨线程共享）。
-    pub fn pause_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.pause_flag)
     }
 
     // ── 结果等待 ──────────────────────────────────────────────────────────
@@ -878,7 +896,7 @@ impl Clone for LooperHandle {
 /// let (looper_side, caller_side) = make_async_intercom_pair::<LooperEvent, UserMsg>(256);
 /// let (event_speaker, user_listener) = looper_side.split();
 /// let looper = AgentLooper::new(
-///     agent, session, event_speaker, cancel_flag, pause_flag, config,
+///     agent, session, event_speaker, config, persister,
 /// );
 /// let result = looper.run(user_listener).await?;
 /// ```
@@ -941,10 +959,11 @@ pub struct AgentLooper {
     // ── 事件输出 ──
     event_speaker: Speaker<LooperEvent>,
 
-    // ── 取消控制 ──
+    // ── 取消状态（内部自建；控制入口是 UserMsg::Cancel，本标志供
+    //    循环顶/react_step 内部检查点读取，drop 安全网与消息路径写入）──
     cancel_flag: Arc<AtomicBool>,
 
-    // ── 暂停控制 ──
+    // ── 暂停状态镜像（内部自建，looper 写入；控制入口是 UserMsg::Pause/Resume）──
     pause_flag: Arc<AtomicBool>,
 
     // ── 持久化 ──
@@ -998,15 +1017,16 @@ impl AgentLooper {
     /// - `agent` — 已组装的 Agent 实例
     /// - `session` — 对话会话（含历史消息）
     /// - `event_speaker` — 事件广播通道
-    /// - `cancel_flag` — 取消标志（外部设置 true 时终止循环）
-    /// - `pause_flag` — 暂停标志（外部设置 true 时挂起循环）
     /// - `config` — looper 配置（超时、hook 链等）
+    ///
+    /// 取消/暂停标志在内部创建 —— 控制入口是 `UserMsg::{Cancel,Pause,Resume}`
+    /// （走 user channel），标志只是 looper 写、外部读的状态
+    /// （`spawn()` 取共享克隆给 handle 供 `is_cancelled()`/`is_paused()` 查询
+    /// 与 drop 安全网使用）。
     pub fn new(
         agent: Arc<Agent>,
         session: Box<Session>,
         event_speaker: Speaker<LooperEvent>,
-        cancel_flag: Arc<AtomicBool>,
-        pause_flag: Arc<AtomicBool>,
         config: LooperConfig,
         persister: Arc<dyn crate::persistence::SessionPersister>,
     ) -> Self {
@@ -1032,8 +1052,8 @@ impl AgentLooper {
             react_loop_iteration: 0,
             pre_pause_state: None,
             event_speaker,
-            cancel_flag,
-            pause_flag,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            pause_flag: Arc::new(AtomicBool::new(false)),
             persister,
             active_stream: None,
             stream_assembler: BlockAssembler::new(),
@@ -1048,30 +1068,24 @@ impl AgentLooper {
 
     /// 一键创建 AgentLooper 并返回 `LooperHandle`。
     ///
-    /// 一次性完成：cancel_flag、pause_flag、intercom 创建拆分、spawn 后台任务。
-    /// 外部只需操作返回的 `LooperHandle`。
+    /// 一次性完成：intercom 创建拆分、spawn 后台任务。标志由 `new()`
+    /// 内部创建，此处取共享克隆给 handle（`is_cancelled()`/`is_paused()`
+    /// 查询 + drop 安全网）。外部只需操作返回的 `LooperHandle`。
     pub fn spawn(
         agent: Arc<Agent>,
         session: Box<Session>,
         config: LooperConfig,
         persister: Arc<dyn crate::persistence::SessionPersister>,
     ) -> LooperHandle {
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let pause_flag = Arc::new(AtomicBool::new(false));
         let (looper_side, caller_side) =
             make_async_intercom_pair::<LooperEvent, UserMsg>(config.event_buffer);
         let (event_speaker, user_listener) = looper_side.split();
         let (user_speaker, event_listener) = caller_side.split();
 
-        let mut looper = AgentLooper::new(
-            agent,
-            session,
-            event_speaker,
-            cancel_flag.clone(),
-            pause_flag.clone(),
-            config,
-            persister,
-        );
+        let mut looper = AgentLooper::new(agent, session, event_speaker, config, persister);
+        // 同一实例的共享克隆：looper 写、handle 读（查询 + OwnedTask drop 安全网）
+        let cancel_flag = Arc::clone(&looper.cancel_flag);
+        let pause_flag = Arc::clone(&looper.pause_flag);
 
         let agent_name = looper.agent.config().agent.name.clone();
         let session_id = looper.session.id().to_owned();
@@ -1362,8 +1376,10 @@ impl AgentLooper {
 
     /// 执行 agent run 循环。
     ///
-    /// 外层通过 `user_listener` 接收 `UserMsg`；
-    /// 内部执行 ReAct 状态机直至 Done / Failed / 超过 max_turns / 取消 / 超时。
+    /// 外层通过 `user_listener` 接收 `UserMsg`（查询 / 暂停 / 恢复 / 取消 /
+    /// 关闭，同通道 FIFO 全序）；内部执行 ReAct 状态机直至 Done / Failed /
+    /// 超过 max_turns / 取消 / 超时。暂停期间循环阻塞在 `recv()` 上 ——
+    /// 恢复、取消、排队输入、关闭都靠消息本身唤醒。
     ///
     /// 当 input channel 关闭后（所有 `Speaker` 被 drop），`run()` 不会立即退出，
     /// 而是等待内层 ReAct 循环自然完成后再退出。这确保 `drop(user_speaker)` 后
@@ -1422,6 +1438,10 @@ impl AgentLooper {
                 {
                     continue;
                 }
+                // 无在途轮时 finalize 不回写原因 —— 补记 Cancelled，
+                // 保证 shutdown_reason 反映真实退出原因而非 "done" 或
+                // 上一轮残留。消息路径与 drop 安全网共用此出口。
+                self.failure_reason = Some(TurnFailureReason::Cancelled);
                 break;
             }
 
@@ -1439,24 +1459,40 @@ impl AgentLooper {
                 }
             }
 
-            // ── 暂停时只接收用户输入 ──────────────────────────────────────
-            if self.pause_flag.load(Ordering::Acquire) {
-                // ★ 进入 Paused 状态（仅首次，避免重复 emit）
-                if !matches!(self.outer_state, OuterState::Paused) {
-                    let old = self.outer_state;
-                    self.pre_pause_state = Some(old);
-                    self.outer_state = OuterState::Paused;
-                    self.emit_outer_state_change(old, OuterState::Paused);
-                }
-
+            // ── 暂停时只接收控制消息（阻塞 recv —— Resume 消息即唤醒）──────
+            // 进入 Paused 由主 select 的 `UserMsg::Pause` 分支完成；此处只挂起。
+            if matches!(self.outer_state, OuterState::Paused) {
                 if input_closed {
                     break;
                 }
                 match user_listener.recv().await {
+                    Some(UserMsg::Resume) => {
+                        // ★ 从 Paused 恢复到暂停前的状态
+                        let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
+                        self.outer_state = prev;
+                        self.pause_flag.store(false, Ordering::Release);
+                        self.emit_outer_state_change(OuterState::Paused, prev);
+
+                        // 暂停期间排队的输入：停靠 Idle 时立即续接（轮次进行中
+                        // 的排队项仍走 turn 结束时的 dequeue，避免打乱 FIFO）
+                        if matches!(self.session.state(), SessionState::Idle)
+                            && let Some(content) = self.session.pop_pending()
+                        {
+                            self.handle_user_query(content).await?;
+                        }
+                    }
                     Some(UserMsg::Query(content)) => {
                         // 暂停期间收到的输入放入 pending 队列
                         info!("Message queued (looper paused). Will process after resume.");
                         self.session.enqueue_pending(content);
+                    }
+                    Some(UserMsg::Pause) => {
+                        // 已处于 Paused — 幂等忽略
+                    }
+                    Some(UserMsg::Cancel) => {
+                        // 消息负责唤醒阻塞的 recv，flag 负责状态；收尾
+                        // 统一交给循环顶的取消分支（finalize → break）
+                        self.cancel_flag.store(true, Ordering::Release);
                     }
                     Some(UserMsg::Shutdown) => break,
                     None => {
@@ -1464,13 +1500,6 @@ impl AgentLooper {
                     }
                 }
                 continue;
-            }
-
-            // ★ 从 Paused 恢复（pause_flag 变为 false）
-            if matches!(self.outer_state, OuterState::Paused) {
-                let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
-                self.outer_state = prev;
-                self.emit_outer_state_change(OuterState::Paused, prev);
             }
 
             // ── channel closed ────────────────────────────────────────────
@@ -1493,6 +1522,22 @@ impl AgentLooper {
                     match maybe_msg {
                         Some(UserMsg::Query(content)) => {
                             self.handle_user_query(content).await?;
+                        }
+                        Some(UserMsg::Pause) => {
+                            // ★ 进入 Paused：记录暂停前状态，挂起循环
+                            let old = self.outer_state;
+                            self.pre_pause_state = Some(old);
+                            self.outer_state = OuterState::Paused;
+                            self.pause_flag.store(true, Ordering::Release);
+                            self.emit_outer_state_change(old, OuterState::Paused);
+                        }
+                        Some(UserMsg::Resume) => {
+                            // 未处于 Paused — 幂等忽略
+                        }
+                        Some(UserMsg::Cancel) => {
+                            // 消息负责唤醒（Idle 停靠时 select 只有 recv 分支
+                            // 激活，flag 叫不醒）；收尾走循环顶取消分支
+                            self.cancel_flag.store(true, Ordering::Release);
                         }
                         Some(UserMsg::Shutdown) => {
                             break;
@@ -1517,6 +1562,9 @@ impl AgentLooper {
             let t = self.session.turn_index();
             (u, t)
         };
+
+        // 暂停中退出（Shutdown/input_closed）时复位镜像，避免 is_paused() 残留 true
+        self.pause_flag.store(false, Ordering::Release);
 
         // Emit Shutdown 事件
         let shutdown_reason = self
@@ -3844,14 +3892,14 @@ mod tests {
             agent,
             Box::new(session),
             event_speaker,
-            Arc::new(AtomicBool::new(cancel)),
-            Arc::new(AtomicBool::new(false)),
             LooperConfig {
                 persist_on_failure,
                 ..Default::default()
             },
             Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
         );
+        // 直写内部标志模拟「run() 启动前已请求取消」（测试同模块访问私有字段）
+        looper.cancel_flag.store(cancel, Ordering::Release);
 
         FailureHarness {
             looper,
@@ -4247,16 +4295,15 @@ mod tests {
         let (event_speaker, user_listener) = looper_side.split();
         let (user_speaker, event_listener) = caller_side.split();
 
-        let cancel_flag = Arc::new(AtomicBool::new(false));
         let looper = AgentLooper::new(
             agent,
             Box::new(session),
             event_speaker,
-            Arc::clone(&cancel_flag),
-            Arc::new(AtomicBool::new(false)),
             config,
             Arc::new(crate::persistence::NullSessionPersister),
         );
+        // 测试用：取共享克隆，退避等待期间直写触发取消（走 flag 内部检查点）
+        let cancel_flag = Arc::clone(&looper.cancel_flag);
 
         RetryHarness {
             looper,
@@ -4279,6 +4326,215 @@ mod tests {
             .await
             .expect("looper 侧仍在监听");
         let _ = tokio::time::timeout(Duration::from_secs(5), h.looper.run(listener)).await;
+    }
+
+    // ── 暂停/恢复（UserMsg 带内控制）tests ────────────────────────────────
+
+    /// spawn 一个脚本化 provider 的 looper 及其句柄 —— 暂停/恢复走
+    /// [`LooperHandle`]，与生产路径同构。
+    fn spawn_scripted_looper(scripts: Vec<Script>) -> (LooperHandle, Arc<ScriptedStreamProvider>) {
+        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let provider = Arc::new(ScriptedStreamProvider::new(scripts));
+        let agent = Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::clone(&provider) as Arc<dyn model_provider::ModelProvider>,
+            crate::agent::ModelConfigBuilder::new().stream(true).build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        ));
+        let session = Session::new("s1".to_string(), "d".to_string());
+        let handle = AgentLooper::spawn(
+            agent,
+            Box::new(session),
+            LooperConfig::default(),
+            Arc::new(crate::persistence::NullSessionPersister),
+        );
+        (handle, provider)
+    }
+
+    /// 收事件直到外层状态到达 `target`（5s 超时即失败）。
+    async fn recv_until_state(h: &LooperHandle, target: OuterState) {
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::OuterStateChange { to, .. }) if to == target => break,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before reaching {target:?}"),
+                }
+            }
+        })
+        .await;
+        res.expect("timed out waiting for outer state");
+    }
+
+    /// 收事件直到拿到一个成功的 `TurnComplete`。
+    async fn recv_until_turn_complete(h: &LooperHandle) -> TurnOutcome {
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::TurnComplete { outcome, .. }) => break outcome,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before TurnComplete"),
+                }
+            }
+        })
+        .await;
+        res.expect("timed out waiting for TurnComplete")
+    }
+
+    /// 暂停后不带任何 query 的裸 Resume 必须能解除暂停 —— 暂停/恢复都走
+    /// `user_listener`，Resume 消息本身唤醒阻塞在 `recv()` 上的 looper。
+    #[tokio::test]
+    async fn test_bare_resume_unpauses_looper() {
+        let (h, _provider) = spawn_scripted_looper(vec![completed("ok")]);
+
+        h.pause().await.expect("looper alive");
+        recv_until_state(&h, OuterState::Paused).await;
+        assert!(h.is_paused(), "进入 Paused 后镜像必须为 true");
+
+        // 关键：不发任何 query，仅靠 Resume 解除暂停
+        h.resume().await.expect("looper alive");
+        recv_until_state(&h, OuterState::Idle).await;
+        assert!(!h.is_paused(), "恢复后镜像必须回 false");
+
+        // 恢复后仍能正常处理输入
+        h.send_query("hi".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok"),
+            other => panic!("恢复后应正常完成，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 暂停期间的 query 只入 pending 队列、不触达模型；Resume 后按 FIFO
+    /// 顺序执行（先入队的 q1 先跑）。
+    #[tokio::test]
+    async fn test_paused_queries_run_after_resume_in_order() {
+        let (h, provider) = spawn_scripted_looper(vec![completed("r1"), completed("r2")]);
+
+        h.pause().await.expect("looper alive");
+        recv_until_state(&h, OuterState::Paused).await;
+
+        h.send_query("q1".into()).await.expect("looper alive");
+        h.send_query("q2".into()).await.expect("looper alive");
+        // 队列消费是本地 channel，50ms 足够；此时若暂停门控失效，
+        // 模型调用早已发生、budgets 非空
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            provider.budgets().is_empty(),
+            "暂停期间的输入只入队，不得发起模型调用"
+        );
+
+        h.resume().await.expect("looper alive");
+
+        let mut outcomes = Vec::new();
+        let mut turn_starts = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while outcomes.len() < 2 {
+                match h.recv_event().await {
+                    Some(LooperEvent::TurnComplete { outcome, .. }) => outcomes.push(outcome),
+                    Some(LooperEvent::TurnStart { user_input, .. }) => turn_starts.push(user_input),
+                    Some(_) => continue,
+                    None => panic!("event channel closed before both turns completed"),
+                }
+            }
+        })
+        .await
+        .expect("Resume 后两轮都必须完成");
+
+        // 第一轮的 TurnStart 钉住先跑的是 q1；第二轮走 turn 完成后的
+        // pending 续接（不发 TurnStart），两轮合计恰好两次模型调用。
+        assert_eq!(turn_starts, vec!["q1".to_string()], "必须先跑先入队的 q1");
+        assert_eq!(provider.budgets().len(), 2, "两轮各恰好一次模型调用");
+        match &outcomes[0] {
+            TurnOutcome::Success { text } => assert_eq!(text, "r1"),
+            other => panic!("第一轮应成功，实际 {other:?}"),
+        }
+        match &outcomes[1] {
+            TurnOutcome::Success { text } => assert_eq!(text, "r2"),
+            other => panic!("第二轮应成功，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 空闲停靠时 select 只有 `recv` 分支激活 —— 裸 flag 叫不醒，Cancel
+    /// 必须是消息，且无在途轮时 shutdown_reason 要反映 Cancelled 而非 "done"。
+    #[tokio::test]
+    async fn test_cancel_wakes_docked_looper() {
+        let (h, _provider) = spawn_scripted_looper(vec![]);
+
+        // 等 looper 进入停靠（首帧 OuterStateChange 不发，Idle 为初始态；
+        // 停靠本身无事件，用短暂等待确保已挂在 select 的 recv 上）
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 关键：不发任何 query，仅靠 Cancel 消息唤醒并退出
+        h.cancel().await.expect("looper alive");
+
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before Shutdown"),
+                }
+            }
+        })
+        .await;
+        let reason = res.expect("停靠时 cancel 必须能唤醒 select 并退出");
+        assert!(
+            reason.contains("Cancelled"),
+            "无在途轮的取消退出 reason 应为 Cancelled，实际 {reason}"
+        );
+        assert!(h.is_cancelled(), "消费 Cancel 后镜像必须为 true");
+
+        // run() 已退出，wait 应立即返回
+        let final_res = tokio::time::timeout(Duration::from_secs(5), h.wait()).await;
+        assert!(
+            final_res.is_ok_and(|r| r.is_ok()),
+            "cancel 退出后 wait() 应正常返回"
+        );
+    }
+
+    /// 暂停分支阻塞在 `recv()` 上 —— 裸 flag 同样叫不醒，Cancel 消息
+    /// 必须穿透暂停并走循环顶的取消收尾退出。
+    #[tokio::test]
+    async fn test_cancel_wakes_paused_looper() {
+        let (h, _provider) = spawn_scripted_looper(vec![]);
+
+        h.pause().await.expect("looper alive");
+        recv_until_state(&h, OuterState::Paused).await;
+        assert!(h.is_paused(), "进入 Paused 后镜像必须为 true");
+
+        // 关键：暂停中不发 Resume、不发 query，仅靠 Cancel 退出
+        h.cancel().await.expect("looper alive");
+
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before Shutdown"),
+                }
+            }
+        })
+        .await;
+        let reason = res.expect("暂停中 cancel 必须穿透 recv 阻塞并退出");
+        assert!(
+            reason.contains("Cancelled"),
+            "暂停中的取消退出 reason 应为 Cancelled，实际 {reason}"
+        );
+        assert!(h.is_cancelled());
+        assert!(!h.is_paused(), "退出时暂停镜像必须已复位");
     }
 
     #[tokio::test]

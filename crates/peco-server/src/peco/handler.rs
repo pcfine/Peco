@@ -439,7 +439,11 @@ async fn runner_loop(
                         warn!(user_id = %user_id, error = %e, "Failed to enqueue user query");
                     }
                 }
-                Some(ControlCommand::Cancel) => handle.cancel(),
+                Some(ControlCommand::Cancel) => {
+                    if let Err(e) = handle.cancel().await {
+                        warn!(user_id = %user_id, error = %e, "Failed to deliver cancel");
+                    }
+                }
                 None => break,
             },
             _ = reclaim_notify.notified() => {

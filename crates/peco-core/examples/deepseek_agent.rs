@@ -19,7 +19,6 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use peco_core::agent::{Agent, AgentError, AgentLooper, LooperConfig, LooperEvent, UserMsg};
 use peco_core::config::{SystemConfig, UserConfig};
@@ -201,9 +200,6 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
     let (event_speaker, user_listener) = looper_side.split();
     let (user_speaker, mut event_listener) = caller_side.split();
 
-    // Cancellation flag
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let pause_flag = Arc::new(AtomicBool::new(false));
     let config = LooperConfig::default();
 
     let persister = Arc::new(
@@ -211,15 +207,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
             .await
             .unwrap(),
     );
-    let mut looper = AgentLooper::new(
-        agent,
-        session,
-        event_speaker,
-        cancel_flag.clone(),
-        pause_flag,
-        config,
-        persister,
-    );
+    let mut looper = AgentLooper::new(agent, session, event_speaker, config, persister);
 
     // ── 6. Run the Agent in a background task ─────────────────────────────
     let prompt = "用一句话介绍 Rust 编程语言的核心优势".to_string();
