@@ -1011,8 +1011,10 @@ pub struct RestoreMemoryResponse {
     pub restored_at: String,
 }
 
-/// 按审计行回滚一条记忆删除：重放 `add_text`（doc_id 为内容哈希前缀，幂等复原），
-/// 成功后回填 restored_at / restored_doc_id。
+/// 按审计行回滚一条记忆删除，成功后回填 restored_at / restored_doc_id：
+/// - `source == "graph_fact"`（图事实删除）→ 解析边快照，`read_fact` 存在性门后
+///   重放 `add_facts`（事实仍在则跳过，不产生并行边）；实体级联行与损坏快照 409 拒绝。
+/// - 其余（文档删除）→ 重放 `add_text`（doc_id 为内容哈希前缀，幂等复原）。
 ///
 /// 他人审计行与不存在的行一律 404 — 不泄露记录的存在性。
 pub async fn restore_memory_audit(
@@ -1041,34 +1043,79 @@ pub async fn restore_memory_audit(
         )));
     }
 
-    // 3. 重放写入（内容哈希幂等 → doc_id 复原）
+    // 3. 分流：graph_fact 行先做纯校验（零副作用），其余走文档重建。
+    //    图行不得进 add_text 路径 —— 把快照 JSON 当文档灌进 KB 是污染（假失败 + 垃圾文档）。
+    let graph_fact = if row.source == "graph_fact" {
+        Some(parse_graph_fact_snapshot(id, &row.doc_id, &row.content)?)
+    } else {
+        None
+    };
+    let is_graph_fact = graph_fact.is_some();
+
+    // 4. 重放写入
     let ws = state
         .workspace_manager
         .get_synced(&user_id, &state.db)
         .await?;
-    let doc = ws
-        .knowledge_manager()
-        .add_text_to_kb(&row.kb_name, &row.title, &row.content, &row.source)
-        .await
-        .map_err(|e| match &e {
-            KnowledgeModuleError::NotFound(name) => {
-                ApiError::NotFound(format!("知识库 '{name}' 不存在，无法回滚审计行 #{id}"))
-            }
-            other => ApiError::Internal(format!("failed to replay add_text: {other}")),
-        })?;
+    let restored_doc_id = if let Some((subject, predicate, object, weight)) = graph_fact {
+        // 存在性门：事实已在（并发重建 / 人工重放 / 删↔回滚循环）→ 跳过重放，
+        // 每次 restore 对图的净效果 ∈ {0, 1 条边}，杜绝并行边累积。
+        let existing = ws
+            .knowledge_manager()
+            .read_fact(&row.kb_name, &subject, &predicate, &object)
+            .await
+            .map_err(|e| match &e {
+                KnowledgeModuleError::NotFound(name) => {
+                    ApiError::NotFound(format!("知识库 '{name}' 不存在，无法回滚审计行 #{id}"))
+                }
+                other => ApiError::Internal(format!("failed to read fact: {other}")),
+            })?;
+        if existing.is_empty() {
+            ws.knowledge_manager()
+                .add_facts_to_kb(
+                    &row.kb_name,
+                    &[knowledge_base::Fact::new(
+                        subject, predicate, object, weight,
+                    )],
+                    true,
+                )
+                .await
+                .map_err(|e| match &e {
+                    KnowledgeModuleError::NotFound(name) => {
+                        ApiError::NotFound(format!("知识库 '{name}' 不存在，无法回滚审计行 #{id}"))
+                    }
+                    other => ApiError::Internal(format!("failed to replay add_facts: {other}")),
+                })?;
+        }
+        // doc_id 由校验步骤 5 保证与快照三元组一致（fact:xxx），直接复原
+        row.doc_id.clone()
+    } else {
+        let doc = ws
+            .knowledge_manager()
+            .add_text_to_kb(&row.kb_name, &row.title, &row.content, &row.source)
+            .await
+            .map_err(|e| match &e {
+                KnowledgeModuleError::NotFound(name) => {
+                    ApiError::NotFound(format!("知识库 '{name}' 不存在，无法回滚审计行 #{id}"))
+                }
+                other => ApiError::Internal(format!("failed to replay add_text: {other}")),
+            })?;
 
-    if doc.id != row.doc_id {
-        return Err(ApiError::Conflict(format!(
-            "回滚后的文档 id '{}' 与审计行 doc_id '{}' 不一致（内容应逐字节一致）",
-            doc.id, row.doc_id
-        )));
-    }
+        if doc.id != row.doc_id {
+            return Err(ApiError::Conflict(format!(
+                "回滚后的文档 id '{}' 与审计行 doc_id '{}' 不一致（内容应逐字节一致）",
+                doc.id, row.doc_id
+            )));
+        }
+        doc.id
+    };
 
-    // 4. 回填 restored_at / restored_doc_id
+    // 5. 回填 restored_at / restored_doc_id
     let restored_at = chrono::Utc::now().to_rfc3339();
-    let updated = crate::db::memory_audit::mark_restored(&state.db, id, &restored_at, &doc.id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to mark audit restored: {e}")))?;
+    let updated =
+        crate::db::memory_audit::mark_restored(&state.db, id, &restored_at, &restored_doc_id)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to mark audit restored: {e}")))?;
     if updated == 0 {
         return Err(ApiError::Conflict(format!(
             "审计行 #{id} 状态已变化，本次回滚未记录"
@@ -1078,16 +1125,85 @@ pub async fn restore_memory_audit(
     tracing::info!(
         user_id = %user_id,
         audit_id = id,
-        doc_id = %doc.id,
+        doc_id = %restored_doc_id,
         kb = %row.kb_name,
+        graph = is_graph_fact,
         "Memory deletion restored from audit"
     );
 
     Ok(Json(RestoreMemoryResponse {
         success: true,
-        doc_id: doc.id,
+        doc_id: restored_doc_id,
         restored_at,
     }))
+}
+
+/// 解析 `source == "graph_fact"` 审计行的边快照，返回可重放的三元组与 weight。
+///
+/// 全部校验先于任何 KB 写入 —— 拒绝路径零副作用（409），审计原文原样保留可人工重放。
+/// 写方 `fact_snapshot_json` 恒产出所需字段（读到空边的删除会先报错、根本不写行），
+/// 因此严格校验不会误伤合法行；doc_id 一致性是廉价的防篡改断言。
+fn parse_graph_fact_snapshot(
+    id: i64,
+    doc_id: &str,
+    content: &str,
+) -> Result<(String, String, String, f32), ApiError> {
+    // 1. 实体级联行只拒绝不重放：快照的边只存端点哈希 id、无对端名称，
+    //    重放需要 id→name 解析（改 peco-core）或改写快照格式（历史行不兼容）。
+    if doc_id.starts_with("entity:") {
+        return Err(ApiError::Conflict(format!(
+            "审计行 #{id} 是图实体级联删除，暂不支持自动回滚（快照仅存对端实体 id，无法解析名称）；审计原文保留，可人工重放"
+        )));
+    }
+
+    let v: serde_json::Value = serde_json::from_str(content).map_err(|_| {
+        ApiError::Conflict(format!(
+            "审计行 #{id} 的 graph_fact 快照损坏：content 不是合法 JSON"
+        ))
+    })?;
+    let obj = v.as_object().ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "审计行 #{id} 的 graph_fact 快照损坏：content 不是 JSON object"
+        ))
+    })?;
+
+    // 2-3. 三元组字段齐全
+    let get_str = |k: &str| -> Result<String, ApiError> {
+        obj.get(k)
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ApiError::Conflict(format!(
+                    "审计行 #{id} 的 graph_fact 快照损坏：缺字符串字段 '{k}'"
+                ))
+            })
+    };
+    let subject = get_str("subject")?;
+    let predicate = get_str("predicate")?;
+    let object = get_str("object")?;
+
+    // 4. 可重放的 weight（快照恒含非空 edges[]，首条边的 weight 即重放置信度）
+    let weight = obj
+        .get("edges")
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("weight"))
+        .and_then(|w| w.as_f64())
+        .ok_or_else(|| {
+            ApiError::Conflict(format!(
+                "审计行 #{id} 的 graph_fact 快照损坏：缺可重放的 edges[0].weight"
+            ))
+        })? as f32;
+
+    // 5. doc_id 与三元组一致（Fact::compute_id 与删除工具写入时同源）
+    let expected = knowledge_base::Fact::compute_id(&subject, &predicate, &object);
+    if expected != doc_id {
+        return Err(ApiError::Conflict(format!(
+            "审计行 #{id} 快照与 doc_id 不一致（快照三元组算得 '{expected}'，行内为 '{doc_id}'）"
+        )));
+    }
+
+    Ok((subject, predicate, object, weight))
 }
 
 // ── Handler: POST /api/peco/memory/consolidate ─────────────────────────────
