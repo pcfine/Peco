@@ -106,7 +106,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - 状态机：`Idle → Active → Commit/Rollback/Cancel`。还有 `Cancelling` 和 `Interrupted` 中间状态。
 - 双层消息缓冲区：`CommittedBuffer`（已持久化的轮次，`Vec<Vec<AnnotatedMessage>>`）+ `StagingBuffer`（当前轮次的在途消息）。
 - `TurnBoundaryToken` — 一个零大小证明令牌，仅由 `commit_turn()` 和 `rollback_turn()` 返回。`snapshot()` 需要此令牌，提供编译期保证：快照仅在轮次边界发生，永不在轮次中间。
-- `PendingInput` 队列处理活跃轮次期间的并发用户输入：`Interrupt` 优先级输入先于 `Normal` 优先级出队。
+- `PendingInput` 队列处理活跃轮次期间的并发用户输入：轮结束时整个队列一次排空，经 `merge_contents()` 合并为一条 user 消息启动新轮（单条原样、多条每条前置 `---` 标记行、图片部件保留），交由大模型自行判断如何处理。
 - 消息以 `Arc<Message>` 包裹在 `AnnotatedMessage` 中（含 id、turn_index、timestamp、source、estimated_tokens），实现零拷贝上下文构建。
 - 持久化是外部的：`SessionPersister` trait（基于文件的 `FileSessionPersister` 或 `NullSessionPersister`）。Looper 在轮次边界调用 `persister.save()`。在 peco-server 中，Session 快照也通过 `SqliteSessionPersister` 持久化到 SQLite。
 

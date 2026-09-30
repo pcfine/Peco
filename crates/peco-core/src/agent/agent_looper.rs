@@ -1473,10 +1473,10 @@ impl AgentLooper {
                         self.pause_flag.store(false, Ordering::Release);
                         self.emit_outer_state_change(OuterState::Paused, prev);
 
-                        // 暂停期间排队的输入：停靠 Idle 时立即续接（轮次进行中
-                        // 的排队项仍走 turn 结束时的 dequeue，避免打乱 FIFO）
+                        // 暂停期间排队的输入：停靠 Idle 时立即一次排空合并续接
+                        // （轮次进行中的排队项仍走 turn 结束时的 dequeue）
                         if matches!(self.session.state(), SessionState::Idle)
-                            && let Some(content) = self.session.pop_pending()
+                            && let Some(content) = self.session.take_pending_all()
                         {
                             self.handle_user_query(content).await?;
                         }
@@ -1785,7 +1785,8 @@ impl AgentLooper {
                     }
                 }
 
-                // 检查是否有 pending 输入自动续接
+                // 检查是否有 pending 输入自动续接 —— 一次排空全部排队输入，
+                // 合并为一条消息启动新轮
                 match self.session.dequeue_and_start_turn() {
                     Ok(true) => {
                         // ★ 新对话轮次：重置 ReAct 循环计数
@@ -3140,6 +3141,7 @@ impl AgentLooper {
         self.failure_reason = Some(plan.reason.clone());
 
         if plan.drain_pending {
+            // 排空全部排队输入（合并为一条）启动续接轮
             match self.session.dequeue_and_start_turn() {
                 Ok(true) => {
                     // ★ 新对话轮次：重置 ReAct 循环计数
@@ -3938,9 +3940,12 @@ mod tests {
 
     /// 失败后自动续接排队输入时，上一轮的失败原因不得跨轮存活 ——
     /// 续接的那一轮若正常跑到 `Done`，会撞上 `debug_assert!(failure_reason.is_none())`。
+    /// 同时验证：多条排队输入被一次排空、合并进续接轮。
     #[tokio::test]
     async fn test_auto_continue_clears_failure_reason() {
         let mut h = failure_looper_harness(false, true, true);
+        // harness 已入队 "queued"，再补一条 —— 续接时必须一次消化两条
+        h.looper.session.enqueue_pending("second".into());
 
         let continued = h
             .looper
@@ -3952,11 +3957,27 @@ mod tests {
             "续接后必须清空 failure_reason；现状={:?}",
             h.looper.failure_reason
         );
+        assert!(
+            !h.looper.session().has_pending(),
+            "续接轮必须一次排空全部排队输入"
+        );
 
         // 续接的那一轮正常跑完 —— Done 分支的 debug_assert 不得触发
         h.looper.react_state = ReActState::Done;
         h.looper.react_step().await;
         assert_eq!(h.looper.session().committed_turns().len(), 2);
+
+        // 续接轮的 user 消息是两条排队输入的合并形态
+        let continued_turn = &h.looper.session().committed_turns()[1];
+        assert!(
+            matches!(
+                continued_turn[0].message.as_ref(),
+                InputItem::Message { content, .. }
+                    if content.text_view() == "---\nqueued\n---\nsecond"
+            ),
+            "续接轮 user 消息应为合并文本；实际={:?}",
+            continued_turn[0].message
+        );
     }
 
     /// 非取消类失败收尾后应停靠回 `Idle` 等下一句输入，而不是终止整个 run()。
@@ -4410,58 +4431,6 @@ mod tests {
         match recv_until_turn_complete(&h).await {
             TurnOutcome::Success { text } => assert_eq!(text, "ok"),
             other => panic!("恢复后应正常完成，实际 {other:?}"),
-        }
-
-        h.shutdown().await.expect("clean shutdown");
-    }
-
-    /// 暂停期间的 query 只入 pending 队列、不触达模型；Resume 后按 FIFO
-    /// 顺序执行（先入队的 q1 先跑）。
-    #[tokio::test]
-    async fn test_paused_queries_run_after_resume_in_order() {
-        let (h, provider) = spawn_scripted_looper(vec![completed("r1"), completed("r2")]);
-
-        h.pause().await.expect("looper alive");
-        recv_until_state(&h, OuterState::Paused).await;
-
-        h.send_query("q1".into()).await.expect("looper alive");
-        h.send_query("q2".into()).await.expect("looper alive");
-        // 队列消费是本地 channel，50ms 足够；此时若暂停门控失效，
-        // 模型调用早已发生、budgets 非空
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            provider.budgets().is_empty(),
-            "暂停期间的输入只入队，不得发起模型调用"
-        );
-
-        h.resume().await.expect("looper alive");
-
-        let mut outcomes = Vec::new();
-        let mut turn_starts = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while outcomes.len() < 2 {
-                match h.recv_event().await {
-                    Some(LooperEvent::TurnComplete { outcome, .. }) => outcomes.push(outcome),
-                    Some(LooperEvent::TurnStart { user_input, .. }) => turn_starts.push(user_input),
-                    Some(_) => continue,
-                    None => panic!("event channel closed before both turns completed"),
-                }
-            }
-        })
-        .await
-        .expect("Resume 后两轮都必须完成");
-
-        // 第一轮的 TurnStart 钉住先跑的是 q1；第二轮走 turn 完成后的
-        // pending 续接（不发 TurnStart），两轮合计恰好两次模型调用。
-        assert_eq!(turn_starts, vec!["q1".to_string()], "必须先跑先入队的 q1");
-        assert_eq!(provider.budgets().len(), 2, "两轮各恰好一次模型调用");
-        match &outcomes[0] {
-            TurnOutcome::Success { text } => assert_eq!(text, "r1"),
-            other => panic!("第一轮应成功，实际 {other:?}"),
-        }
-        match &outcomes[1] {
-            TurnOutcome::Success { text } => assert_eq!(text, "r2"),
-            other => panic!("第二轮应成功，实际 {other:?}"),
         }
 
         h.shutdown().await.expect("clean shutdown");

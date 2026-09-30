@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use model_provider::{Content, InputItem, Role};
+use model_provider::{Content, ContentPart, InputItem, Role};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -209,23 +209,11 @@ impl SessionState {
 // PendingInput
 // ============================================================================
 
-/// 输入优先级。
-///
-/// 当 pending 队列中存在多个输入时，高优先级输入优先处理。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum InputPriority {
-    /// 普通用户输入（默认）
-    Normal = 0,
-    /// 高优先级中断（如用户说 "stop"、"cancel"），优先于 Normal 处理
-    Interrupt = 1,
-}
-
 /// 排队中的用户输入。
 ///
 /// 当 session 处于 Active 状态时收到的用户消息不直接写入 staging，
-/// 而是放入 pending 队列。当前 turn 完成后自动取出并开始新 turn。
-///
-/// 高优先级输入（`InputPriority::Interrupt`）优先于普通输入处理。
+/// 而是放入 pending 队列。当前 turn 完成后整个队列被排空、合并为一条
+/// user 消息启动新 turn（见 [`merge_contents`]）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInput {
     /// 用户输入内容（纯文本或文本 + 图片部件混排）。
@@ -235,28 +223,60 @@ pub struct PendingInput {
     pub content: Content,
     /// 到达时间（Unix 毫秒）
     pub arrived_at_ms: u64,
-    /// 优先级（默认 Normal）
-    pub priority: InputPriority,
 }
 
 impl PendingInput {
-    /// 创建新的排队输入（默认 Normal 优先级）。
+    /// 创建新的排队输入。
     pub fn new(content: Content) -> Self {
         Self {
             content,
             arrived_at_ms: unix_timestamp_ms(),
-            priority: InputPriority::Normal,
         }
+    }
+}
+
+/// 把多条排队输入合并为一条 Content，作为单条 user 消息交给大模型自行判断。
+///
+/// - 单条原样返回（纯文本 / 带图均与合并前一致）。
+/// - 多条时每条前置一行 `---` 标记再拼接，让模型能分辨独立输入的边界。
+/// - 图片部件不丢：任一条含图片时整体转 `Parts`，文本与图片部件按原顺序
+///   穿插，分隔标记以 `Text` 部件插入。
+pub fn merge_contents(items: Vec<Content>) -> Content {
+    debug_assert!(!items.is_empty(), "merge_contents called with empty input");
+    if items.len() == 1 {
+        return items.into_iter().next().unwrap();
     }
 
-    /// 创建指定优先级的排队输入。
-    pub fn with_priority(content: Content, priority: InputPriority) -> Self {
-        Self {
-            content,
-            arrived_at_ms: unix_timestamp_ms(),
-            priority,
+    let has_image = items.iter().any(|c| c.image_count() > 0);
+    if !has_image {
+        // 全纯文本：字符串拼接，每条前置 --- 标记行
+        let mut out = String::new();
+        for item in items {
+            out.push_str("---\n");
+            out.push_str(&item.text_view());
+            out.push('\n');
+        }
+        out.pop(); // 去掉末尾换行
+        return Content::Text(out);
+    }
+
+    // 含图片：部件形态拼接，图片原顺序保留
+    let mut parts: Vec<ContentPart> = Vec::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            parts.push(ContentPart::Text {
+                text: "\n".to_string(),
+            });
+        }
+        parts.push(ContentPart::Text {
+            text: "---".to_string(),
+        });
+        match item {
+            Content::Text(t) => parts.push(ContentPart::Text { text: t }),
+            Content::Parts(mut ps) => parts.append(&mut ps),
         }
     }
+    Content::Parts(parts)
 }
 
 // ============================================================================

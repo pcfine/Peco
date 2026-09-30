@@ -15,7 +15,7 @@ use super::buffer::{CommittedBuffer, StagingBuffer};
 use super::error::SessionError;
 use super::snapshot::{SessionSnapshot, TurnBoundaryToken};
 use super::types::{
-    AnnotatedMessage, InputPriority, MessageId, MessageSource, PendingInput, SessionState,
+    AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, merge_contents,
     unix_timestamp_ms, unix_timestamp_secs,
 };
 
@@ -684,63 +684,48 @@ impl Session {
 
     // ── Pending 队列（&mut self）──────────────────────────────────────
 
-    /// 将用户输入加入 pending 队列（默认 Normal 优先级）。
+    /// 将用户输入加入 pending 队列。
     pub fn enqueue_pending(&mut self, content: Content) {
         self.pending.push_back(PendingInput::new(content));
     }
 
-    /// 将指定优先级的用户输入加入 pending 队列。
-    pub fn enqueue_pending_with_priority(&mut self, content: Content, priority: InputPriority) {
-        self.pending
-            .push_back(PendingInput::with_priority(content, priority));
-    }
-
-    /// 弹出队首输入（`Interrupt` 优先），不启动 turn。
+    /// 排空整个 pending 队列（FIFO），合并为一条 Content，不启动 turn。
     ///
     /// looper 恢复暂停时用它取出排队消息再走 `handle_user_query`，
     /// 复用完整的 turn 启动簿记（状态迁移 + 事件）。
-    fn pop_pending_input(&mut self) -> Option<PendingInput> {
-        // 优先处理 Interrupt：从队列中找到第一个 Interrupt 并移除
-        let interrupt_idx = self
-            .pending
-            .iter()
-            .position(|input| input.priority == InputPriority::Interrupt);
-
-        if let Some(idx) = interrupt_idx {
-            // Safety: idx is guaranteed valid by position()
-            self.pending.remove(idx)
-        } else {
-            self.pending.pop_front()
+    /// 队列为空返回 `None`。
+    pub fn take_pending_all(&mut self) -> Option<Content> {
+        if self.pending.is_empty() {
+            return None;
         }
+        let items: Vec<Content> = self.pending.drain(..).map(|i| i.content).collect();
+        Some(merge_contents(items))
     }
 
-    /// 从 pending 队列取出下一个输入并启动新 turn。
+    /// 排空整个 pending 队列，合并为一条消息，启动新 turn。
     ///
-    /// 优先处理 `Interrupt` 优先级输入（从前往后扫描，取第一个 Interrupt）。
-    /// 若 `start_turn` 失败，输入重新放入队列头部（保证不丢失）。
+    /// 一次消化全部排队输入（而非逐条），合并语义见 [`merge_contents`]。
+    /// 若 `start_turn` 失败，整批输入按原序放回队列头部（保证不丢不乱序）。
     /// 返回 `Ok(true)` 表示成功启动新 turn，
     /// `Ok(false)` 表示队列为空。
     pub fn dequeue_and_start_turn(&mut self) -> Result<bool, SessionError> {
-        let input = match self.pop_pending_input() {
-            Some(i) => i,
-            None => return Ok(false),
-        };
+        if self.pending.is_empty() {
+            return Ok(false);
+        }
 
-        match self.start_turn(input.content.clone()) {
+        let batch: Vec<PendingInput> = self.pending.drain(..).collect();
+        let merged = merge_contents(batch.iter().map(|i| i.content.clone()).collect());
+
+        match self.start_turn(merged) {
             Ok(()) => Ok(true),
             Err(e) => {
-                // 失败时将输入重新放入队列头部
-                self.pending.push_front(input);
+                // 失败时整批按原序放回队列头部
+                for input in batch.into_iter().rev() {
+                    self.pending.push_front(input);
+                }
                 Err(e)
             }
         }
-    }
-
-    /// 弹出队首排队输入（`Interrupt` 优先），只出队不启动 turn。
-    ///
-    /// 队列为空返回 `None`。
-    pub fn pop_pending(&mut self) -> Option<Content> {
-        self.pop_pending_input().map(|input| input.content)
     }
 
     /// 是否有排队中的输入。
@@ -1085,11 +1070,13 @@ mod tests {
             .unwrap();
         let _token = s.commit_turn().unwrap();
 
-        // Dequeue should start new turn
+        // 一次排空全部排队输入，启动合并后的新轮
         let result = s.dequeue_and_start_turn().unwrap();
         assert!(result);
         assert_eq!(s.state(), SessionState::Active);
-        assert!(s.has_pending()); // one more
+        assert!(!s.has_pending());
+        let ui = s.staging_user_input().unwrap();
+        assert_eq!(ui.message.as_ref(), &user("---\nq2\n---\nq3"));
     }
 
     #[test]
@@ -1789,28 +1776,111 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_interrupt_priority() {
+    fn test_dequeue_drains_all_pending() {
         let mut s = make_session();
 
-        // Enqueue normal input, then interrupt input
         s.enqueue_pending("normal".into());
-        s.enqueue_pending_with_priority("interrupt".into(), InputPriority::Interrupt);
+        s.enqueue_pending("interrupt".into());
         s.enqueue_pending("later".into());
 
-        // Dequeue — should get interrupt first
+        // 一次排空全部排队输入，合并为一条 user 消息
         let result = s.dequeue_and_start_turn().unwrap();
         assert!(result);
-        // The user input in staging should be the interrupt
-        let ui = s.staging_user_input().unwrap();
-        assert_eq!(ui.message.as_ref(), &user("interrupt"));
+        assert!(!s.has_pending());
 
-        // Commit
-        let _ = s.commit_turn().unwrap();
-
-        // Next should be "normal" (enqueued first, before "later")
-        let result = s.dequeue_and_start_turn().unwrap();
-        assert!(result);
         let ui = s.staging_user_input().unwrap();
-        assert_eq!(ui.message.as_ref(), &user("normal"));
+        assert_eq!(
+            ui.message.as_ref(),
+            &user("---\nnormal\n---\ninterrupt\n---\nlater")
+        );
+    }
+
+    #[test]
+    fn test_dequeue_single_pending_is_identity() {
+        // 单条排队输入原样出队，不加任何分隔标记
+        let mut s = make_session();
+        s.enqueue_pending("only one".into());
+
+        s.dequeue_and_start_turn().unwrap();
+        let ui = s.staging_user_input().unwrap();
+        assert_eq!(ui.message.as_ref(), &user("only one"));
+    }
+
+    #[test]
+    fn test_dequeue_merge_preserves_images() {
+        // 多条合并时图片部件不丢，分隔标记以 Text 部件插入
+        let with_image = Content::Parts(vec![
+            ContentPart::Text {
+                text: "看这张图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/cat.png".to_string(),
+                detail: None,
+            },
+        ]);
+        let mut s = make_session();
+        s.start_turn("q1".into()).unwrap();
+        s.enqueue_pending(with_image);
+        s.enqueue_pending("q2".into());
+        s.commit_turn().unwrap();
+
+        s.dequeue_and_start_turn().unwrap();
+        let ui = s.staging_user_input().unwrap();
+        match ui.message.as_ref() {
+            InputItem::Message { role, content } => {
+                assert_eq!(*role, Role::User);
+                match content {
+                    Content::Parts(parts) => {
+                        assert!(
+                            parts.iter().any(|p| matches!(p, ContentPart::Image { .. })),
+                            "图片部件必须保留"
+                        );
+                        let texts: Vec<&str> = parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(texts[0], "---");
+                        assert_eq!(texts[1], "看这张图");
+                        assert!(texts.contains(&"---"));
+                        assert!(texts.contains(&"q2"));
+                    }
+                    _ => panic!("含图合并必须是 Parts 形态"),
+                }
+            }
+            _ => panic!("expected user message"),
+        }
+    }
+
+    #[test]
+    fn test_dequeue_start_turn_failure_requeues_batch_in_order() {
+        // start_turn 失败（非 Idle）时整批按原序回队
+        let mut s = make_session();
+        s.start_turn("active".into()).unwrap(); // 使 session 进入 Active
+        s.enqueue_pending("q1".into());
+        s.enqueue_pending("q2".into());
+
+        assert!(s.dequeue_and_start_turn().is_err());
+        assert!(s.has_pending());
+
+        // 回到 Idle 后出队，顺序仍是 q1 → q2
+        let _ = s.rollback_turn(false).unwrap();
+        s.dequeue_and_start_turn().unwrap();
+        let ui = s.staging_user_input().unwrap();
+        assert_eq!(ui.message.as_ref(), &user("---\nq1\n---\nq2"));
+    }
+
+    #[test]
+    fn test_take_pending_all_empty_returns_none() {
+        let mut s = make_session();
+        assert!(s.take_pending_all().is_none());
+
+        s.enqueue_pending("a".into());
+        s.enqueue_pending("b".into());
+        let merged = s.take_pending_all().unwrap();
+        assert_eq!(merged, Content::Text("---\na\n---\nb".to_string()));
+        assert!(!s.has_pending());
     }
 }
