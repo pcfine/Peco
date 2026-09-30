@@ -241,8 +241,20 @@ impl Session {
 
     // ── Turn 生命周期（&mut self，状态机守卫）─────────────────────────
 
-    /// 开始新 turn（仅 Idle 状态）。
+    /// 开始新 turn（仅 Idle 状态），用户消息来源标记为 [`MessageSource::UserInput`]。
     pub fn start_turn(&mut self, user_text: Content) -> Result<(), SessionError> {
+        self.start_turn_with_source(user_text, MessageSource::UserInput)
+    }
+
+    /// 开始新 turn，用户消息携带指定 [`MessageSource`]（仅 Idle 状态）。
+    ///
+    /// pending 批量合并续接走 [`MessageSource::MergedPending`]（展示层
+    /// 据此剥离 `---` 标记）；直接用户输入走 [`MessageSource::UserInput`]。
+    pub fn start_turn_with_source(
+        &mut self,
+        user_text: Content,
+        source: MessageSource,
+    ) -> Result<(), SessionError> {
         if !self.state.can_start_turn() {
             return Err(SessionError::InvalidStateTransition {
                 current_state: self.state,
@@ -260,7 +272,7 @@ impl Session {
             }),
             timestamp_ms: unix_timestamp_ms(),
             estimated_tokens: None,
-            source: MessageSource::UserInput,
+            source,
         };
 
         self.staging.set_user_input(am);
@@ -704,8 +716,8 @@ impl Session {
 
     /// 排空整个 pending 队列，合并为一条消息，启动新 turn。
     ///
-    /// 一次消化全部排队输入（而非逐条），合并语义见 [`merge_contents`]。
-    /// 若 `start_turn` 失败，整批输入按原序放回队列头部（保证不丢不乱序）。
+    /// 一次消化全部排队输入（而非逐条），合并语义见 [`merge_contents`]；
+    /// 出队的消息标记 [`MessageSource::MergedPending`]。
     /// 返回 `Ok(true)` 表示成功启动新 turn，
     /// `Ok(false)` 表示队列为空。
     pub fn dequeue_and_start_turn(&mut self) -> Result<bool, SessionError> {
@@ -713,19 +725,24 @@ impl Session {
             return Ok(false);
         }
 
-        let batch: Vec<PendingInput> = self.pending.drain(..).collect();
-        let merged = merge_contents(batch.iter().map(|i| i.content.clone()).collect());
-
-        match self.start_turn(merged) {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                // 失败时整批按原序放回队列头部
-                for input in batch.into_iter().rev() {
-                    self.pending.push_front(input);
-                }
-                Err(e)
-            }
+        // start_turn 唯一失败点是状态守卫 —— 前置检查，失败时队列原封
+        // 不动（旧「整批回队」语义由前置检查天然满足，且省掉整批 clone：
+        // 排队图片是 base64 data URI，深克隆代价随队列线性增长）。
+        if !self.state.can_start_turn() {
+            return Err(SessionError::InvalidStateTransition {
+                current_state: self.state,
+                action: "start_turn".to_string(),
+            });
         }
+
+        let batch: Vec<PendingInput> = self.pending.drain(..).collect();
+        let merged = merge_contents(batch.into_iter().map(|i| i.content).collect());
+
+        // 前置检查后不可达（其间无状态变更）；万一未来 start_turn 增加
+        // 新失败点，这里只报错不回队 —— 合并态已无法还原为原序批次，
+        // 新增失败点时应同步在此补回队策略。
+        self.start_turn_with_source(merged, MessageSource::MergedPending)
+            .map(|()| true)
     }
 
     /// 是否有排队中的输入。
@@ -1808,7 +1825,8 @@ mod tests {
 
     #[test]
     fn test_dequeue_merge_preserves_images() {
-        // 多条合并时图片部件不丢，分隔标记以 Text 部件插入
+        // 多条合并时图片部件不丢，分隔标记以 Text 部件插入，
+        // 且相邻文本部件裸拼接（wire 形态）与纯文本分支逐字一致
         let with_image = Content::Parts(vec![
             ContentPart::Text {
                 text: "看这张图".to_string(),
@@ -1842,16 +1860,67 @@ mod tests {
                                 _ => None,
                             })
                             .collect();
-                        assert_eq!(texts[0], "---");
-                        assert_eq!(texts[1], "看这张图");
-                        assert!(texts.contains(&"---"));
-                        assert!(texts.contains(&"q2"));
+                        assert_eq!(
+                            texts,
+                            vec!["---\n", "看这张图", "\n", "---\n", "q2"],
+                            "标记部件自带换行、条目间补 \n 部件"
+                        );
+                        // wire 形态：相邻 Text 部件直传拼接（chat_common 无分隔）
+                        let wire: String = parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                ContentPart::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(
+                            wire, "---\n看这张图\n---\nq2",
+                            "含图分支 wire 文本必须与纯文本分支一致"
+                        );
                     }
                     _ => panic!("含图合并必须是 Parts 形态"),
                 }
             }
             _ => panic!("expected user message"),
         }
+    }
+
+    #[test]
+    fn test_dequeue_marks_merged_source() {
+        // 批量合并出队的 user 消息标记 MergedPending（展示层据此剥离标记）；
+        // 直发 start_turn 保持 UserInput
+        let mut s = make_session();
+        s.enqueue_pending("q1".into());
+        s.enqueue_pending("q2".into());
+        s.dequeue_and_start_turn().unwrap();
+        let ui = s.staging_user_input().unwrap();
+        assert_eq!(ui.source, MessageSource::MergedPending);
+
+        let mut s2 = make_session();
+        s2.start_turn("direct".into()).unwrap();
+        let ui2 = s2.staging_user_input().unwrap();
+        assert_eq!(ui2.source, MessageSource::UserInput);
+    }
+
+    #[test]
+    fn test_strip_merge_markers() {
+        use crate::session::types::strip_merge_markers;
+
+        // 纯文本合并形态：标记行删除、其余原样
+        assert_eq!(
+            strip_merge_markers(&Content::Text("---\nA\n---\nB".into())),
+            "A\nB"
+        );
+        // 含图 text_view 形态（标记间多空行）：折叠 + trim 归一
+        assert_eq!(
+            strip_merge_markers(&Content::Text("---\n\n看这张图\n\n\n---\n\nq2".into())),
+            "看这张图\nq2"
+        );
+        // 消息内部的空行段落保留（最多一个连续空行）
+        assert_eq!(
+            strip_merge_markers(&Content::Text("---\np1\n\np2\n---\nB".into())),
+            "p1\n\np2\nB"
+        );
     }
 
     #[test]

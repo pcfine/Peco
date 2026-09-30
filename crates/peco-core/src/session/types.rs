@@ -73,6 +73,13 @@ pub enum MessageSource {
         /// 中断原因（人类可读，来自 `TurnFailureReason` 的文案化形式）
         reason: String,
     },
+    /// pending 队列批量合并出的用户消息。
+    ///
+    /// 由 [`merge_contents`] 拼接（含 `---` 分隔标记，模型侧原样保留）；
+    /// 展示层据此调用 [`strip_merge_markers`] 剥离标记后再渲染 ——
+    /// 与 `InterruptedTurn` 同理：按来源识别，不猜文案特征串。
+    /// 旧快照无此值，反序列化天然兼容。
+    MergedPending,
 }
 
 // ============================================================================
@@ -239,6 +246,9 @@ impl PendingInput {
 ///
 /// - 单条原样返回（纯文本 / 带图均与合并前一致）。
 /// - 多条时每条前置一行 `---` 标记再拼接，让模型能分辨独立输入的边界。
+///   **纯文本分支与含图分支产出的 wire 文本一致**（`---\nA\n---\nB`：
+///   chat 序列化将相邻文本部件直传拼接，标记部件自带换行、条目间补 `\n`）；
+///   含图形态经 `text_view()` 会多出空行，展示层由 [`strip_merge_markers`] 归一。
 /// - 图片部件不丢：任一条含图片时整体转 `Parts`，文本与图片部件按原顺序
 ///   穿插，分隔标记以 `Text` 部件插入。
 pub fn merge_contents(items: Vec<Content>) -> Content {
@@ -260,23 +270,68 @@ pub fn merge_contents(items: Vec<Content>) -> Content {
         return Content::Text(out);
     }
 
-    // 含图片：部件形态拼接，图片原顺序保留
+    // 含图片：部件形态拼接，图片原顺序保留。
+    // 标记部件自带 "\n"、条目间补 "\n" 部件 —— wire 侧相邻文本部件
+    // 直传拼接后与纯文本分支逐字一致（见 doc）。
     let mut parts: Vec<ContentPart> = Vec::new();
+    let last = items.len() - 1;
     for (i, item) in items.into_iter().enumerate() {
-        if i > 0 {
-            parts.push(ContentPart::Text {
-                text: "\n".to_string(),
-            });
-        }
         parts.push(ContentPart::Text {
-            text: "---".to_string(),
+            text: "---\n".to_string(),
         });
         match item {
             Content::Text(t) => parts.push(ContentPart::Text { text: t }),
             Content::Parts(mut ps) => parts.append(&mut ps),
         }
+        if i < last {
+            parts.push(ContentPart::Text {
+                text: "\n".to_string(),
+            });
+        }
     }
     Content::Parts(parts)
+}
+
+/// 剥离 [`merge_contents`] 的 `---` 分隔标记 —— 仅用于
+/// [`MessageSource::MergedPending`] 的内容（其余来源不得调用，否则会
+/// 误删用户自己输入的 `---` 行）。
+///
+/// 按标记行切段、去掉每段首尾的接缝空行（`text_view()` 在标记部件附近
+/// 产生），段内空行保留（消息自身的段落），段间以单个换行拼接。
+/// 纯文本合并形态 `---\nA\n---\nB` → `A\nB`；含图 `text_view()` 形态
+/// （标记间多空行）同样归一为 `A\nB`。
+pub fn strip_merge_markers(content: &Content) -> String {
+    let text = content.text_view();
+    let mut segments: Vec<Vec<&str>> = vec![Vec::new()];
+    for line in text.lines() {
+        if line.trim() == "---" {
+            segments.push(Vec::new());
+            continue;
+        }
+        segments
+            .last_mut()
+            .expect("segments starts non-empty")
+            .push(line);
+    }
+
+    let trimmed: Vec<String> = segments
+        .iter()
+        .filter_map(|seg| {
+            let mut s = seg.as_slice();
+            while s.first().is_some_and(|l| l.trim().is_empty()) {
+                s = &s[1..];
+            }
+            while s.last().is_some_and(|l| l.trim().is_empty()) {
+                s = &s[..s.len() - 1];
+            }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.join("\n"))
+            }
+        })
+        .collect();
+    trimmed.join("\n")
 }
 
 // ============================================================================

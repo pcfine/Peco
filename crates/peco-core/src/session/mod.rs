@@ -25,4 +25,6 @@ pub use error::SessionError;
 pub use metadata::SessionMeta;
 pub use session::Session;
 pub use snapshot::{SessionSnapshot, TurnBoundaryToken};
-pub use types::{AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState};
+pub use types::{
+    AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, strip_merge_markers,
+};

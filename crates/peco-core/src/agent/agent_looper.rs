@@ -618,6 +618,10 @@ impl RetryCause {
 /// 暂停/恢复/取消与查询同走 `user_listener` 一条通道：FIFO 全序保证
 /// 「先发的 query、后到的 pause」交错语义确定，且消息本身即可唤醒
 /// 阻塞在 `recv()` 上的 looper（flag 做不到）。
+///
+/// 消息在**步进边界**消费：`react_step()` 在途时不抢占、不丢弃 future ——
+/// `run()` 循环顶先非阻塞排空通道，再推进一步（流式粒度=单 chunk、
+/// 工具=≤200ms 轮询、batch=整段生成）。
 #[derive(Debug, Clone)]
 pub enum UserMsg {
     /// 用户查询（纯文本或文本 + 图片部件混排）
@@ -751,13 +755,14 @@ impl LooperHandle {
 
     /// 请求取消：向 looper 发送 [`UserMsg::Cancel`]。
     ///
-    /// - 消息本身唤醒停靠 select 或暂停中阻塞在 `recv()` 上的 looper
+    /// - 消息本身唤醒停靠或暂停中阻塞在 `recv()` 上的 looper
     ///   （裸 flag 置位叫不醒 —— 与 pause/resume 同走 user channel）
     /// - 收尾统一走循环顶取消分支：在途轮冻结进历史（`TurnComplete` +
     ///   `Failed{Cancelled}`，落盘由 `persist_on_failure` 门控），pending
     ///   队列保留但不续接
-    /// - 消息抢占 select 会丢弃在途 `react_step` future —— 与查询消息
-    ///   中断同一机制，模型请求随 future 丢弃而中止
+    /// - 消息在步进边界消费，**不丢弃**在途 `react_step` future —— 当前
+    ///   步进完成后才收尾（流式=单 chunk、工具=≤200ms 轮询、batch=整段
+    ///   生成）；Done 分支的 commit→save 窗口因此完整跑完，不会丢轮
     /// - 返回 `Err` 表示 looper 已结束（channel 关闭）
     ///
     /// 与 [`Self::shutdown`] 不重复：cancel 记账（半成品冻结进历史），
@@ -768,9 +773,9 @@ impl LooperHandle {
 
     /// 请求暂停：向 looper 发送 [`UserMsg::Pause`]。
     ///
-    /// 暂停在 looper 消费到该消息时生效（与 `send_query` 同通道 FIFO，
-    /// 交错语义确定）；暂停期间 `send_query` 的消息进入 pending 队列，
-    /// 恢复时若 looper 停靠在 Idle 会立即续接。调用 [`Self::resume`] 恢复。
+    /// 暂停在当前步进完成后生效（与 `send_query` 同通道 FIFO，交错语义
+    /// 确定）；暂停期间 `send_query` 的消息进入 pending 队列，恢复时若
+    /// looper 停靠在 Idle 会立即续接。调用 [`Self::resume`] 恢复。
     /// 返回 `Err` 表示 looper 已结束（channel 关闭）。
     pub async fn pause(&self) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
         self.user_speaker.send(UserMsg::Pause).await
@@ -1376,10 +1381,13 @@ impl AgentLooper {
 
     /// 执行 agent run 循环。
     ///
-    /// 外层通过 `user_listener` 接收 `UserMsg`（查询 / 暂停 / 恢复 / 取消 /
-    /// 关闭，同通道 FIFO 全序）；内部执行 ReAct 状态机直至 Done / Failed /
-    /// 超过 max_turns / 取消 / 超时。暂停期间循环阻塞在 `recv()` 上 ——
-    /// 恢复、取消、排队输入、关闭都靠消息本身唤醒。
+    /// 控制流不使用 `select!` 抢占：每轮先以 `try_recv` 非阻塞排空
+    /// `user_listener`（查询 / 暂停 / 恢复 / 取消 / 关闭，同通道 FIFO 全序），
+    /// 再做失败/取消/超时收尾检查，然后推进一步 `react_step()`（仅
+    /// `RunningInnerLoop`）或阻塞 `recv()` 停靠等输入。控制消息因此在
+    /// **步进边界**生效 —— 在途 future 永不被消息丢弃（commit→save、
+    /// prepare 重发、工具 poll 回收等异步尾巴完整跑完）；停靠与暂停期间
+    /// 靠消息本身唤醒阻塞的 `recv()`。
     ///
     /// 当 input channel 关闭后（所有 `Speaker` 被 drop），`run()` 不会立即退出，
     /// 而是等待内层 ReAct 循环自然完成后再退出。这确保 `drop(user_speaker)` 后
@@ -1405,6 +1413,18 @@ impl AgentLooper {
         let run_start = Instant::now();
 
         loop {
+            // ── 非阻塞排空控制消息（必须先于失败/取消检查）────────────────
+            // drain-first 保证 cancel_flag 在 Failed 收尾的 drain_pending
+            // 判定（!is_cancelled）前可见 —— 用户按停后不再启动幽灵续接轮；
+            // cancel 恰在 finalize 的 await 期间到达的更窄窗口与 6d4deac
+            // 行为一致（既有），不另修。
+            if self
+                .drain_control(&mut user_listener, &mut input_closed)
+                .await?
+            {
+                break; // Shutdown
+            }
+
             // ── 消费 react_step 挂起的失败收尾 ────────────────────────────
             // 必须在取消/超时检查**之前** —— 否则 failure_reason 已被 take，
             // 取消分支会用 Cancelled 覆盖真实原因（如 HookAbort）。
@@ -1455,51 +1475,38 @@ impl AgentLooper {
                     {
                         continue;
                     }
+                    // 与取消分支对称：无在途轮时 finalize 不回写原因 ——
+                    // 补记 TotalTimeout，否则 shutdown_reason 误报 "done"
+                    // 或上一轮残留原因。
+                    self.failure_reason = Some(TurnFailureReason::TotalTimeout);
                     break;
                 }
             }
 
             // ── 暂停时只接收控制消息（阻塞 recv —— Resume 消息即唤醒）──────
-            // 进入 Paused 由主 select 的 `UserMsg::Pause` 分支完成；此处只挂起。
+            // 进入 Paused 由 `handle_control_msg` 的 `UserMsg::Pause` 分支完成；
+            // 此处只挂起。通道关闭时先还原暂停前状态，**落穿**到下方
+            // input_closed 分支按常规收尾 —— 在途轮继续跑完，不再静默丢轮。
             if matches!(self.outer_state, OuterState::Paused) {
                 if input_closed {
-                    break;
-                }
-                match user_listener.recv().await {
-                    Some(UserMsg::Resume) => {
-                        // ★ 从 Paused 恢复到暂停前的状态
-                        let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
-                        self.outer_state = prev;
-                        self.pause_flag.store(false, Ordering::Release);
-                        self.emit_outer_state_change(OuterState::Paused, prev);
-
-                        // 暂停期间排队的输入：停靠 Idle 时立即一次排空合并续接
-                        // （轮次进行中的排队项仍走 turn 结束时的 dequeue）
-                        if matches!(self.session.state(), SessionState::Idle)
-                            && let Some(content) = self.session.take_pending_all()
-                        {
-                            self.handle_user_query(content).await?;
+                    let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
+                    self.outer_state = prev;
+                    self.pause_flag.store(false, Ordering::Release);
+                    self.emit_outer_state_change(OuterState::Paused, prev);
+                    // 落穿到 input_closed 分支
+                } else {
+                    match user_listener.recv().await {
+                        Some(msg) => {
+                            if self.handle_control_msg(msg).await? {
+                                break;
+                            }
+                        }
+                        None => {
+                            input_closed = true;
                         }
                     }
-                    Some(UserMsg::Query(content)) => {
-                        // 暂停期间收到的输入放入 pending 队列
-                        info!("Message queued (looper paused). Will process after resume.");
-                        self.session.enqueue_pending(content);
-                    }
-                    Some(UserMsg::Pause) => {
-                        // 已处于 Paused — 幂等忽略
-                    }
-                    Some(UserMsg::Cancel) => {
-                        // 消息负责唤醒阻塞的 recv，flag 负责状态；收尾
-                        // 统一交给循环顶的取消分支（finalize → break）
-                        self.cancel_flag.store(true, Ordering::Release);
-                    }
-                    Some(UserMsg::Shutdown) => break,
-                    None => {
-                        input_closed = true;
-                    }
+                    continue;
                 }
-                continue;
             }
 
             // ── channel closed ────────────────────────────────────────────
@@ -1513,44 +1520,25 @@ impl AgentLooper {
                 continue;
             }
 
-            // ── 主 select ─────────────────────────────────────────────────
-            tokio::select! {
-                biased;
-
-                // 用户输入优先
-                maybe_msg = user_listener.recv() => {
-                    match maybe_msg {
-                        Some(UserMsg::Query(content)) => {
-                            self.handle_user_query(content).await?;
-                        }
-                        Some(UserMsg::Pause) => {
-                            // ★ 进入 Paused：记录暂停前状态，挂起循环
-                            let old = self.outer_state;
-                            self.pre_pause_state = Some(old);
-                            self.outer_state = OuterState::Paused;
-                            self.pause_flag.store(true, Ordering::Release);
-                            self.emit_outer_state_change(old, OuterState::Paused);
-                        }
-                        Some(UserMsg::Resume) => {
-                            // 未处于 Paused — 幂等忽略
-                        }
-                        Some(UserMsg::Cancel) => {
-                            // 消息负责唤醒（Idle 停靠时 select 只有 recv 分支
-                            // 激活，flag 叫不醒）；收尾走循环顶取消分支
-                            self.cancel_flag.store(true, Ordering::Release);
-                        }
-                        Some(UserMsg::Shutdown) => {
+            // ── 分派：步进或停靠（无 select —— 消息不抢占在途 future）────
+            // 控制消息只在循环顶/阻塞 recv 处消费，react_step 在途时
+            // 永不被丢弃：commit→save、prepare 重发、工具 poll 回收等
+            // 异步尾巴完整跑完。
+            if matches!(self.outer_state, OuterState::RunningInnerLoop) {
+                self.react_step().await;
+            } else {
+                // Idle 停靠：阻塞等输入，消息本身即唤醒（flag 叫不醒 recv）
+                match user_listener.recv().await {
+                    Some(msg) => {
+                        if self.handle_control_msg(msg).await? {
                             break;
                         }
-                        None => {
-                            // Channel closed — 标记并继续，让 react loop 自然完成
-                            input_closed = true;
-                        }
+                    }
+                    None => {
+                        // Channel closed — 标记并继续，让 react loop 自然完成
+                        input_closed = true;
                     }
                 }
-
-                // 内层 ReAct 状态机步进（仅在 RunningInnerLoop 时激活）
-                _ = self.react_step(), if matches!(self.outer_state, OuterState::RunningInnerLoop) => {}
             }
 
             // NOTE: Idle 状态表示等待下一个用户输入，
@@ -1595,17 +1583,115 @@ impl AgentLooper {
         Ok(self.build_model_response(usage, turns))
     }
 
+    // ── 控制消息处理 ──────────────────────────────────────────────────────
+
+    /// 非阻塞排空 `user_listener` 中积压的控制消息。
+    ///
+    /// `run()` 循环顶调用，**先于**失败/取消检查 —— 保证 `cancel_flag`
+    /// 在 Failed 收尾的 `drain_pending` 判定（`!is_cancelled`）前可见。
+    /// 返回 `Ok(true)` 表示收到 Shutdown，调用方应退出 `run()`。
+    async fn drain_control(
+        &mut self,
+        user_listener: &mut Listener<UserMsg>,
+        input_closed: &mut bool,
+    ) -> Result<bool, AgentError> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        loop {
+            match user_listener.try_recv() {
+                Ok(msg) => {
+                    if self.handle_control_msg(msg).await? {
+                        return Ok(true);
+                    }
+                }
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => {
+                    *input_closed = true;
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    /// 处理一条控制消息 —— 循环顶排空 / 停靠 recv / 暂停 recv 三处消费点
+    /// 共用的唯一分发。返回 `Ok(true)` 表示 Shutdown，调用方应退出 `run()`。
+    async fn handle_control_msg(&mut self, msg: UserMsg) -> Result<bool, AgentError> {
+        match msg {
+            UserMsg::Query(content) => {
+                if matches!(self.outer_state, OuterState::Paused) {
+                    // 暂停期间收到的输入放入 pending 队列
+                    info!("Message queued (looper paused). Will process after resume.");
+                    self.session.enqueue_pending(content);
+                } else {
+                    self.handle_user_query(content, MessageSource::UserInput)
+                        .await?;
+                }
+                Ok(false)
+            }
+            UserMsg::Pause => {
+                // ★ 进入 Paused：记录暂停前状态，挂起循环（已暂停则幂等忽略）
+                if !matches!(self.outer_state, OuterState::Paused) {
+                    let old = self.outer_state;
+                    self.pre_pause_state = Some(old);
+                    self.outer_state = OuterState::Paused;
+                    self.pause_flag.store(true, Ordering::Release);
+                    self.emit_outer_state_change(old, OuterState::Paused);
+                }
+                Ok(false)
+            }
+            UserMsg::Resume => {
+                // 未处于 Paused — 幂等忽略
+                if matches!(self.outer_state, OuterState::Paused) {
+                    // ★ 从 Paused 恢复到暂停前的状态
+                    let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
+
+                    // 暂停期间排队的输入：停靠 Idle 时立即一次排空合并续接
+                    // （轮次进行中的排队项仍走 turn 结束时的 dequeue）。
+                    // 排空时外层保持 Paused —— handle_user_query 读到的
+                    // old_outer=Paused，发出 Paused→RunningInnerLoop（to≠Idle），
+                    // server 端 runner 不会在排队输入被消费前看到 to=Idle 而
+                    // 触发回收丢弃 handle；无排队输入才发 Paused→prev。
+                    if matches!(self.session.state(), SessionState::Idle)
+                        && let Some(content) = self.session.take_pending_all()
+                    {
+                        self.handle_user_query(content, MessageSource::MergedPending)
+                            .await?;
+                    } else {
+                        self.outer_state = prev;
+                        self.emit_outer_state_change(OuterState::Paused, prev);
+                    }
+                    // 镜像最后复位 —— 保证 pause_flag 与 outer_state 的
+                    // 「Paused 当且仅当 flag=true」在外部观察下不倒挂
+                    self.pause_flag.store(false, Ordering::Release);
+                }
+                Ok(false)
+            }
+            UserMsg::Cancel => {
+                // 消息负责唤醒阻塞的 recv，flag 负责状态；收尾统一交给
+                // 循环顶的取消分支（finalize → break）
+                self.cancel_flag.store(true, Ordering::Release);
+                Ok(false)
+            }
+            UserMsg::Shutdown => Ok(true),
+        }
+    }
+
     // ── 用户输入处理 ──────────────────────────────────────────────────────
 
     /// 处理用户查询：根据 Session 状态决定直接启动 turn 或放入 pending 队列。
-    async fn handle_user_query(&mut self, content: Content) -> Result<(), AgentError> {
+    /// `source` 标记该 turn 用户消息的来源（直发 = `UserInput`，
+    /// pending 批量合并续接 = `MergedPending`，展示层据此剥离合并标记）。
+    async fn handle_user_query(
+        &mut self,
+        content: Content,
+        source: MessageSource,
+    ) -> Result<(), AgentError> {
         // 事件面保持文本视图；部件整体进入 Session（rollback 重排队同样保留）
         let text = content.text_view().into_owned();
         match self.session.state() {
             SessionState::Idle => {
                 // 直接启动新 turn
                 self.session
-                    .start_turn(content)
+                    .start_turn_with_source(content, source)
                     .map_err(|e| AgentError::AgentProtocol(e.to_string()))?;
 
                 // 记录启动时间（首次查询时记录 run_start_time）
@@ -1644,8 +1730,8 @@ impl AgentLooper {
 
     /// 执行 ReAct 状态机的一步。
     ///
-    /// 当内层循环未激活时（outer_state != RunningInnerLoop），此 future 永久 pending，
-    /// 让 `select!` 只处理用户输入。
+    /// 仅在 `outer_state == RunningInnerLoop` 时由 `run()` 循环调用
+    /// （分派点守卫）；停靠/暂停时 `run()` 阻塞在 `recv()` 上，不推进内层。
     async fn react_step(&mut self) {
         // Per-turn timeout 检查
         if let (Some(timeout), Some(turn_start)) = (self.config.per_turn_timeout, self.turn_start)
@@ -1814,13 +1900,13 @@ impl AgentLooper {
             }
 
             ReActState::Failed => {
-                // 纯同步 no-op。收尾交给 `run()` 循环顶部 —— 那里不在 `select!` 内，
-                // 且 `run()` 的 task 从不被 abort，收尾两段（冻结 + 落盘）都能跑完。
+                // 纯同步 no-op。收尾交给 `run()` 循环顶部 —— 循环不使用
+                // `select!`，在途 future 不会被消息抢占丢弃，且 `run()` 的
+                // task 从不被 abort，收尾两段（冻结 + 落盘）都能跑完。
                 //
-                // 在此处 await 会丢掉异步尾巴：`select!`（`biased`，用户输入优先）
-                // 在用户侧任一分支胜出时都会 drop 掉本 future，而本设计里异步尾巴
-                // 不只是事件 —— 还有 `snapshot` / `save`，丢了就是「冻结进了
-                // committed 却没落盘」。
+                // 在此处 await 会把异步尾巴（事件之外还有 `snapshot` /
+                // `save`）拉进 react_step 的调用栈，模糊「步进」与「收尾」
+                // 的边界 —— 收尾只应在循环顶发生。
                 return;
             }
 
@@ -2445,7 +2531,7 @@ impl AgentLooper {
 
     /// 消费一个 stream chunk，处理后在同一个状态内循环直到流结束。
     ///
-    /// 每收到一个 chunk 就返回（让 select! 有机会处理用户输入 / 取消）。
+    /// 每收到一个 chunk 就返回（让 `run()` 循环顶有机会排空控制消息）。
     async fn consume_stream_chunk(&mut self, turn: usize) {
         let stream = match &mut self.active_stream {
             Some(s) => s,
@@ -2751,8 +2837,8 @@ impl AgentLooper {
     ///
     /// 替代原来阻塞的 `join_all`，利用 `JoinSet` 将执行拆分为多个
     /// `react_step()` 调用。每次调用要么收集一个已完成 tool 的结果，要么在
-    /// 短超时（200ms）后返回，让 `run()` 的 `select!` 循环有机会检查取消标志
-    /// 和处理用户输入。
+    /// 短超时（200ms）后返回，让 `run()` 循环顶有机会排空控制消息、
+    /// 检查取消标志。
     ///
     /// 支持断点续执行：`result: Some(...)` 的已完成项自动跳过。
     async fn execute_tools_step(&mut self, turn: usize) {
@@ -2989,7 +3075,7 @@ impl AgentLooper {
                 );
             }
 
-            // 超时 — 返回 select! 循环以检查取消和用户输入
+            // 超时 — 返回 run() 循环顶以排空控制消息、检查取消
             Err(_elapsed) => {}
 
             // 所有 task 已全部完成
@@ -3081,7 +3167,24 @@ impl AgentLooper {
             self.retries_used > 0,
         ) {
             Some(plan) => self.finalize_failure_async(plan).await,
-            None => false,
+            None => {
+                // 无在途轮（plan_failure 守卫：session Idle + staging 空）：
+                // 同样要把状态带回停靠位，否则 Failed 留在循环顶反复命中
+                // （镜像 async 路径 3164-3170 的修复）—— 防御任何未知路径
+                // 再产生「finalize 返回 false 且 react_state 仍为 Failed」
+                // 的热自旋。
+                if matches!(self.react_state, ReActState::Failed) {
+                    self.react_state = ReActState::Done;
+                }
+                if matches!(self.outer_state, OuterState::RunningInnerLoop) {
+                    // 状态不一致（无在途轮却还在跑内层）——带回 Idle；
+                    // Paused 不动（恢复时按 pre_pause 正常还原）
+                    let old = self.outer_state;
+                    self.outer_state = OuterState::Idle;
+                    self.emit_outer_state_change(old, OuterState::Idle);
+                }
+                false
+            }
         }
     }
 
@@ -4353,7 +4456,10 @@ mod tests {
 
     /// spawn 一个脚本化 provider 的 looper 及其句柄 —— 暂停/恢复走
     /// [`LooperHandle`]，与生产路径同构。
-    fn spawn_scripted_looper(scripts: Vec<Script>) -> (LooperHandle, Arc<ScriptedStreamProvider>) {
+    fn spawn_scripted_looper(
+        scripts: Vec<Script>,
+        config: LooperConfig,
+    ) -> (LooperHandle, Arc<ScriptedStreamProvider>) {
         let profile: crate::agent::AgentProfile = serde_yaml::from_str(
             "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
         )
@@ -4375,7 +4481,7 @@ mod tests {
         let handle = AgentLooper::spawn(
             agent,
             Box::new(session),
-            LooperConfig::default(),
+            config,
             Arc::new(crate::persistence::NullSessionPersister),
         );
         (handle, provider)
@@ -4415,7 +4521,7 @@ mod tests {
     /// `user_listener`，Resume 消息本身唤醒阻塞在 `recv()` 上的 looper。
     #[tokio::test]
     async fn test_bare_resume_unpauses_looper() {
-        let (h, _provider) = spawn_scripted_looper(vec![completed("ok")]);
+        let (h, _provider) = spawn_scripted_looper(vec![completed("ok")], LooperConfig::default());
 
         h.pause().await.expect("looper alive");
         recv_until_state(&h, OuterState::Paused).await;
@@ -4440,10 +4546,10 @@ mod tests {
     /// 必须是消息，且无在途轮时 shutdown_reason 要反映 Cancelled 而非 "done"。
     #[tokio::test]
     async fn test_cancel_wakes_docked_looper() {
-        let (h, _provider) = spawn_scripted_looper(vec![]);
+        let (h, _provider) = spawn_scripted_looper(vec![], LooperConfig::default());
 
         // 等 looper 进入停靠（首帧 OuterStateChange 不发，Idle 为初始态；
-        // 停靠本身无事件，用短暂等待确保已挂在 select 的 recv 上）
+        // 停靠本身无事件，用短暂等待确保已挂在阻塞 recv 上）
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // 关键：不发任何 query，仅靠 Cancel 消息唤醒并退出
@@ -4478,7 +4584,7 @@ mod tests {
     /// 必须穿透暂停并走循环顶的取消收尾退出。
     #[tokio::test]
     async fn test_cancel_wakes_paused_looper() {
-        let (h, _provider) = spawn_scripted_looper(vec![]);
+        let (h, _provider) = spawn_scripted_looper(vec![], LooperConfig::default());
 
         h.pause().await.expect("looper alive");
         recv_until_state(&h, OuterState::Paused).await;
@@ -4504,6 +4610,191 @@ mod tests {
         );
         assert!(h.is_cancelled());
         assert!(!h.is_paused(), "退出时暂停镜像必须已复位");
+    }
+
+    /// finalize 在「无在途轮」（plan=None）时也必须把状态带回停靠位 ——
+    /// Failed 留在循环顶会反复命中形成热自旋（C1 兜底），外层的
+    /// RunningInnerLoop 不一致同样要带回 Idle；Paused 不动。
+    #[tokio::test]
+    async fn test_finalize_none_repairs_state() {
+        let mut h = failure_looper_harness(false, true, false);
+        // 造「无在途轮」：回滚到 Idle、staging 清空
+        h.looper.session.rollback_turn(false).unwrap();
+
+        h.looper.react_state = ReActState::Failed;
+        h.looper.outer_state = OuterState::RunningInnerLoop; // 模拟状态不一致
+        let handled = h
+            .looper
+            .finalize_failure(TurnFailureReason::Other("x".into()), true)
+            .await;
+        assert!(!handled, "无在途轮不应报告续接");
+        assert!(
+            matches!(h.looper.react_state, ReActState::Done),
+            "plan=None 后 react_state 必须离开 Failed，实际={:?}",
+            h.looper.react_state
+        );
+        assert_eq!(
+            h.looper.outer_state,
+            OuterState::Idle,
+            "无在途轮却处于 RunningInnerLoop —— 必须带回 Idle"
+        );
+
+        // Paused 不得被 None 分支推平（恢复时按 pre_pause 还原）
+        h.looper.react_state = ReActState::Failed;
+        h.looper.outer_state = OuterState::Paused;
+        let _ = h
+            .looper
+            .finalize_failure(TurnFailureReason::Other("x".into()), false)
+            .await;
+        assert!(matches!(h.looper.react_state, ReActState::Done));
+        assert_eq!(h.looper.outer_state, OuterState::Paused);
+    }
+
+    /// 停靠态被总超时杀掉时 shutdown_reason 必须报 TotalTimeout ——
+    /// 与取消分支对称（无在途轮时 finalize 不回写原因，需在 break 前补记），
+    /// 否则误报 "done" 或上一轮残留原因。
+    #[tokio::test]
+    async fn test_total_timeout_reason_reported() {
+        let (h, _provider) = spawn_scripted_looper(
+            vec![],
+            LooperConfig {
+                total_timeout: Some(Duration::ZERO),
+                ..Default::default()
+            },
+        );
+
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before Shutdown"),
+                }
+            }
+        })
+        .await;
+        let reason = res.expect("总超时应触发退出");
+        assert!(
+            reason.contains("TotalTimeout"),
+            "停靠态超时退出 reason 应为 TotalTimeout，实际 {reason}"
+        );
+    }
+
+    /// Resume 带排队输入时：先排空续接（外层保持 Paused 调用
+    /// handle_user_query → 事件 Paused→RunningInnerLoop），期间不得出现
+    /// to=Idle 的状态迁移 —— runner 见 to=Idle 且无 SSE 订阅者会回收
+    /// handle，把刚要启动的续接轮冻成 Failed{Cancelled}。
+    #[tokio::test]
+    async fn test_resume_with_pending_skips_idle_emit() {
+        let (h, _provider) = spawn_scripted_looper(vec![completed("ok")], LooperConfig::default());
+
+        h.pause().await.expect("looper alive");
+        recv_until_state(&h, OuterState::Paused).await;
+
+        // 暂停期间排队一条消息，再恢复 —— 恢复必须直接续接
+        h.send_query("queued".into()).await.expect("looper alive");
+        h.resume().await.expect("looper alive");
+
+        let mut saw_running = false;
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::OuterStateChange { from, to, .. }) => {
+                        assert!(
+                            !(from == OuterState::Paused && to == OuterState::Idle),
+                            "Resume 不得先发 Paused→Idle（排队输入被消费前会触发 runner 回收）"
+                        );
+                        if from == OuterState::Paused && to == OuterState::RunningInnerLoop {
+                            saw_running = true;
+                        }
+                    }
+                    Some(LooperEvent::TurnComplete { outcome, .. }) => {
+                        assert!(saw_running, "必须先观察到 Paused→RunningInnerLoop");
+                        match outcome {
+                            TurnOutcome::Success { text } => assert_eq!(text, "ok"),
+                            other => panic!("排队输入的续接轮应成功，实际 {other:?}"),
+                        }
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => panic!("event channel closed before TurnComplete"),
+                }
+            }
+        })
+        .await;
+        res.expect("恢复后排队输入应在超时内续接完成");
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 暂停中通道关闭：先还原暂停前状态、再走 input_closed 常规收尾 ——
+    /// 在途轮必须跑完（发出 TurnComplete）后才退出，不再静默丢轮。
+    #[tokio::test]
+    async fn test_paused_input_closed_completes_turn() {
+        // 手工构造（非 spawn）：需要单独 drop user_speaker；
+        // LooperHandle 整体 drop 会 abort 后台任务。
+        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![completed("ok")]));
+        let agent = Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::clone(&provider) as Arc<dyn model_provider::ModelProvider>,
+            crate::agent::ModelConfigBuilder::new().stream(true).build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        ));
+        let session = Session::new("s1".to_string(), "d".to_string());
+        let (looper_side, caller_side) = make_async_intercom_pair::<LooperEvent, UserMsg>(64);
+        let (event_speaker, user_listener) = looper_side.split();
+        let (user_speaker, mut event_listener) = caller_side.split();
+        let mut looper = AgentLooper::new(
+            agent,
+            Box::new(session),
+            event_speaker,
+            LooperConfig::default(),
+            Arc::new(crate::persistence::NullSessionPersister),
+        );
+        let run_task = tokio::spawn(async move { looper.run(user_listener).await });
+
+        // 先发 Query（启动轮）再 Pause（步进边界生效），随后关闭通道 ——
+        // FIFO 保证 looper 先见 Query 后见 Pause，再观察到 Disconnected
+        user_speaker.send(UserMsg::Query("q".into())).await.unwrap();
+        user_speaker.send(UserMsg::Pause).await.unwrap();
+        drop(user_speaker);
+
+        let mut saw_success = false;
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match event_listener.recv().await {
+                    Some(LooperEvent::TurnComplete {
+                        outcome: TurnOutcome::Success { text },
+                        ..
+                    }) => {
+                        assert_eq!(text, "ok");
+                        saw_success = true;
+                    }
+                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before Shutdown"),
+                }
+            }
+        })
+        .await;
+        let reason = res.expect("暂停中关闭通道应完成在途轮后正常退出");
+        assert!(
+            saw_success,
+            "暂停中通道关闭不得丢轮 —— 必须收到成功 TurnComplete"
+        );
+        assert_eq!(reason, "done", "正常收尾不应报失败原因，实际 {reason}");
+
+        run_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -5018,9 +5309,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_backoff_deadline_survives_future_drop() {
-        // run() 的 select 在用户输入到达时 drop 进行中的 react_step future。
-        // deadline 必须留在 self 上（只读等待），重入后继续等剩余时间 ——
-        // take() 会把它带进 future 栈帧，drop 即丢失 → 零退避立即重发。
+        // 防御性不变式：deadline 必须留在 self 上（只读等待），future 被 drop
+        // 后重入继续等剩余时间 —— take() 会把它带进 future 栈帧，drop 即丢失
+        // → 零退避立即重发。（run() 已不抢占在途 future；本测试手动 select
+        // 模拟 drop 来守护该不变式。）
         let mut h = retry_harness(vec![], LooperConfig::default());
         h.looper.retry_deadline = Some(Instant::now() + Duration::from_millis(150));
 

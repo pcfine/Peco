@@ -82,7 +82,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - 双层状态机驱动 ReAct 循环：
   - **外层**：`Idle → ProcessingUserInput → RunningInnerLoop → Paused`
   - **内层**：`PreparingRequest → [batch] AwaitingModel → ResolvingResponse` 或 `[stream] Streaming → ExecutingTools →（循环回）→ Done / Failed`
-- **协作式设计**：looper 在 `tokio::select!` 中运行，交替处理用户输入和 ReAct 进度。`react_step()` 每次调用仅推进内层状态机一步，因此循环永不会被模型响应或工具执行阻塞。
+- **步进边界控制**：主循环不用 `select!` 抢占 —— 每轮先以 `try_recv` 非阻塞排空 user channel（Query/Pause/Resume/Cancel/Shutdown 同通道 FIFO，经 `handle_control_msg` 统一分发），再做失败/取消/超时收尾检查，然后直接 `await` 一步 `react_step()`（仅 `RunningInnerLoop`）或阻塞 `recv()` 停靠。控制消息在**步进边界**生效（流式=单 chunk、工具=≤200ms 轮询、batch=整段生成），在途 future 永不被消息丢弃 —— commit→save、prepare 重发、工具 poll 回收等异步尾巴完整跑完。
 - 工具执行分两阶段：**spawn 阶段**（将所有工具调用启动到 `JoinSet` 中），然后 **poll 阶段**（以 200ms 超时贪婪排空结果，每完成一个即发出事件）。
 - **流式路径**：使用 `StreamAssembler` 将 `StreamEvent` 块中的增量文本/推理/工具调用增量累积为完整的 assistant 消息。
 - 动态上下文组装：系统提示词每轮重新注入，工具结果追加其后。`DynamicContext` trait 支持在每次新用户查询时注入 RAG 增强内容；同一轮的 ReAct 迭代复用缓存上下文。
@@ -106,7 +106,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - 状态机：`Idle → Active → Commit/Rollback/Cancel`。还有 `Cancelling` 和 `Interrupted` 中间状态。
 - 双层消息缓冲区：`CommittedBuffer`（已持久化的轮次，`Vec<Vec<AnnotatedMessage>>`）+ `StagingBuffer`（当前轮次的在途消息）。
 - `TurnBoundaryToken` — 一个零大小证明令牌，仅由 `commit_turn()` 和 `rollback_turn()` 返回。`snapshot()` 需要此令牌，提供编译期保证：快照仅在轮次边界发生，永不在轮次中间。
-- `PendingInput` 队列处理活跃轮次期间的并发用户输入：轮结束时整个队列一次排空，经 `merge_contents()` 合并为一条 user 消息启动新轮（单条原样、多条每条前置 `---` 标记行、图片部件保留），交由大模型自行判断如何处理。
+- `PendingInput` 队列处理活跃轮次期间的并发用户输入：轮结束时整个队列一次排空，经 `merge_contents()` 合并为一条 user 消息启动新轮（单条原样、多条每条前置 `---` 标记行、图片部件保留；纯文本与含图两分支产出的 wire 文本一致），交由大模型自行判断如何处理。合并消息标记 `MessageSource::MergedPending`，展示层（session_dto / markdown 导出）据此经 `strip_merge_markers()` 剥离 `---` 标记后再渲染，模型侧原样。
 - 消息以 `Arc<Message>` 包裹在 `AnnotatedMessage` 中（含 id、turn_index、timestamp、source、estimated_tokens），实现零拷贝上下文构建。
 - 持久化是外部的：`SessionPersister` trait（基于文件的 `FileSessionPersister` 或 `NullSessionPersister`）。Looper 在轮次边界调用 `persister.save()`。在 peco-server 中，Session 快照也通过 `SqliteSessionPersister` 持久化到 SQLite。
 

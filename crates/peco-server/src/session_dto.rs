@@ -7,7 +7,7 @@
 // 并额外保留每条消息的来源与时间戳，供三处快照 handler 复用。
 
 use model_provider::{InputItem, Role, ToolCall};
-use peco_core::session::{AnnotatedMessage, MessageSource};
+use peco_core::session::{AnnotatedMessage, MessageSource, strip_merge_markers};
 
 /// 分组输入：内容 + 来源 + 时间戳，三者同源于一条 [`AnnotatedMessage`]。
 ///
@@ -140,9 +140,17 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
                         .into_iter()
                         .map(str::to_string)
                         .collect();
+                    // MergedPending（pending 批量合并）的 user 消息带 ---
+                    // 分隔标记，模型侧原样保留，展示前按来源剥离 —— 用户
+                    // 自己输入的 --- 行不在此列（source != MergedPending）。
+                    let text = if matches!(view.source, MessageSource::MergedPending) {
+                        strip_merge_markers(content)
+                    } else {
+                        content.text_view().into_owned()
+                    };
                     messages.push(GroupedMessage {
                         role: "user",
-                        content: Some(content.text_view().into_owned()),
+                        content: Some(text),
                         images,
                         tool_calls: Vec::new(),
                         reasoning_content: None,
