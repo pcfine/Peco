@@ -291,30 +291,48 @@ const TRANSCRIPT_ITEM_MAX_CHARS: usize = 2000;
 /// 整份转录的最大字符数（防止摘要请求本身超限）。
 const TRANSCRIPT_MAX_CHARS: usize = 60_000;
 
-/// 将驱逐的 turns 组装为 `role: content` 行的转录。
-fn build_transcript(evicted_turns: &[Vec<crate::session::AnnotatedMessage>]) -> String {
+/// 把一条消息格式化为转录行；不构成转录内容的消息（如 `Reasoning`）返回 `None`。
+fn transcript_line(am: &crate::session::AnnotatedMessage) -> Option<String> {
     use model_provider::InputItem;
+    match am.message.as_ref() {
+        InputItem::Message { role, content } => {
+            Some(format!("{}: {}", role_label(*role), content.text_view()))
+        }
+        InputItem::FunctionCall { name, .. } => Some(format!("[tool call {name}]")),
+        InputItem::FunctionCallOutput { output, .. } => {
+            Some(format!("[tool output] {}", output.text_view()))
+        }
+        InputItem::Reasoning { .. } => None,
+        _ => None,
+    }
+}
 
+/// 追加一条消息到转录（逐条截断，累计整份字符数）。
+///
+/// 返回 `false` 表示整份已达 [`TRANSCRIPT_MAX_CHARS`]，调用方应立即停止。
+/// 跳过项（`transcript_line` 为 `None`）不算停止条件，与截断前的行为一致。
+fn push_transcript_line(
+    out: &mut String,
+    total_chars: &mut usize,
+    am: &crate::session::AnnotatedMessage,
+) -> bool {
+    let Some(line) = transcript_line(am) else {
+        return true;
+    };
+    let truncated: String = line.chars().take(TRANSCRIPT_ITEM_MAX_CHARS).collect();
+    *total_chars += truncated.chars().count() + 1;
+    out.push_str(&truncated);
+    out.push('\n');
+    *total_chars < TRANSCRIPT_MAX_CHARS
+}
+
+/// 将驱逐的 turns 组装为 `role: content` 行的转录（轮间留一空行）。
+fn build_transcript(evicted_turns: &[Vec<crate::session::AnnotatedMessage>]) -> String {
     let mut transcript = String::new();
     let mut total_chars = 0usize;
     'outer: for turn in evicted_turns {
         for am in turn {
-            let line = match am.message.as_ref() {
-                InputItem::Message { role, content } => {
-                    format!("{}: {}", role_label(*role), content.text_view())
-                }
-                InputItem::FunctionCall { name, .. } => format!("[tool call {name}]"),
-                InputItem::FunctionCallOutput { output, .. } => {
-                    format!("[tool output] {}", output.text_view())
-                }
-                InputItem::Reasoning { .. } => continue,
-                _ => continue,
-            };
-            let truncated: String = line.chars().take(TRANSCRIPT_ITEM_MAX_CHARS).collect();
-            total_chars += truncated.chars().count() + 1;
-            transcript.push_str(&truncated);
-            transcript.push('\n');
-            if total_chars >= TRANSCRIPT_MAX_CHARS {
+            if !push_transcript_line(&mut transcript, &mut total_chars, am) {
                 break 'outer;
             }
         }
