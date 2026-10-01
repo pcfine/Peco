@@ -9,7 +9,7 @@
 
 import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { getPecoSession } from "@/api/peco";
+import { getPecoSessionMetrics } from "@/api/peco";
 import type { ContextMetrics } from "@/types/chat";
 
 /** 单条预算占比条。 */
@@ -46,8 +46,8 @@ export function ContextMetricsCard() {
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    getPecoSession()
-      .then((snap) => setMetrics(snap.context_metrics ?? null))
+    getPecoSessionMetrics()
+      .then((resp) => setMetrics(resp.context_metrics))
       .catch(() => setFailed(true));
   }, []);
 

@@ -25,7 +25,9 @@ use uuid::Uuid;
 use crate::auth::AuthUser;
 use crate::db::{agents, conversations, messages};
 use crate::error::ApiError;
-use crate::session_dto::{ItemView, group_input_items, turn_interrupted_reason};
+use crate::session_dto::{
+    ItemView, TurnData, group_input_items, turn_interrupted_reason, turns_to_dto,
+};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
 
@@ -674,41 +676,6 @@ pub struct SessionSnapshotResponse {
     pub total_usage: UsageData,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TurnData {
-    pub turn_index: usize,
-    pub messages: Vec<MessageData>,
-    /// 本轮是否因中断被冻结入史（非正常完成）。
-    pub interrupted: bool,
-    /// 中断原因（人类可读），仅中断轮序列化。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interrupted_reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MessageData {
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// 用户消息携带的图片部件 URL（含 data URI），无图时不序列化。
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCallData>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    pub timestamp_ms: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ToolCallData {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
 /// `GET /api/chat/:agentId/conversations/:id/session`
 pub async fn get_session_snapshot(
     AuthUser { user_id }: AuthUser,
@@ -727,47 +694,8 @@ pub async fn get_session_snapshot(
 
     let (turns, usage) = match snapshot_opt {
         Some((snap, _meta)) => {
-            let turns: Vec<TurnData> = snap
-                .committed_turns
-                .iter()
-                .enumerate()
-                .map(|(i, msgs): (usize, &Vec<_>)| {
-                    // 两字段同源，杜绝「有原因却 interrupted=false」的自相矛盾态。
-                    let interrupted_reason = turn_interrupted_reason(msgs);
-                    TurnData {
-                        turn_index: i,
-                        interrupted: interrupted_reason.is_some(),
-                        interrupted_reason,
-                        messages: {
-                            group_input_items(&ItemView::from_turn(msgs))
-                                .into_iter()
-                                .map(|msg| MessageData {
-                                    role: msg.role.to_string(),
-                                    content: msg.content,
-                                    images: msg.images,
-                                    tool_calls: if msg.tool_calls.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            msg.tool_calls
-                                                .into_iter()
-                                                .map(|tc| ToolCallData {
-                                                    id: tc.id,
-                                                    name: tc.function.name,
-                                                    arguments: tc.function.arguments,
-                                                })
-                                                .collect(),
-                                        )
-                                    },
-                                    reasoning_content: msg.reasoning_content,
-                                    tool_call_id: msg.tool_call_id,
-                                    timestamp_ms: msg.timestamp_ms,
-                                })
-                                .collect()
-                        },
-                    }
-                })
-                .collect();
+            // 全量窗口（chat 链路不分页，保持行为不变）。
+            let turns = turns_to_dto(&snap.committed_turns, 0..snap.committed_turns.len());
 
             let usage = UsageData {
                 input_tokens: snap.total_usage.input_tokens,

@@ -6,8 +6,11 @@
 // 消息合并 reasoning + tool_calls）。本模块提供中立分组，并额外保留每条消息的
 // 来源与时间戳，供三处快照 handler 复用。
 
+use std::ops::Range;
+
 use model_provider::{InputItem, Role, ToolCall};
 use peco_core::session::{AnnotatedMessage, MessageSource, strip_merge_markers};
+use serde::Serialize;
 
 /// 分组输入：内容 + 来源 + 时间戳，三者同源于一条 [`AnnotatedMessage`]。
 ///
@@ -233,6 +236,96 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
     flush(&mut messages, &mut current);
 
     messages
+}
+
+// ============================================================================
+// 快照 DTO 类型（TurnData / MessageData / ToolCallData）
+// ============================================================================
+
+/// 工具调用简化格式（前端友好）。
+#[derive(Debug, Serialize)]
+pub struct ToolCallData {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// 单条消息（前端友好格式，含 tool_calls / reasoning_content）。
+#[derive(Debug, Serialize)]
+pub struct MessageData {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// 用户消息携带的图片部件 URL（含 data URI），无图时不序列化。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub timestamp_ms: u64,
+}
+
+/// 单轮对话数据。
+#[derive(Debug, Serialize)]
+pub struct TurnData {
+    pub turn_index: usize,
+    pub messages: Vec<MessageData>,
+    /// 本轮是否因中断被冻结入史（非正常完成）。
+    pub interrupted: bool,
+    /// 中断原因（人类可读），仅中断轮序列化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_reason: Option<String>,
+}
+
+/// 把 committed 轮的窗口映射为 `TurnData` 列表。
+///
+/// `turn_index` 取全局 enumerate 位置（不是窗口内相对位置）—— 切尾页时
+/// 首轮 `turn_index` 保持全局位置号，前端据此做 turn 段级合并与 `before`
+/// 游标。切片在 `enumerate` 之后（`skip/take`），禁止「先切 Vec 再 enumerate」。
+pub fn turns_to_dto(committed: &[Vec<AnnotatedMessage>], window: Range<usize>) -> Vec<TurnData> {
+    committed
+        .iter()
+        .enumerate()
+        .skip(window.start)
+        .take(window.end.saturating_sub(window.start))
+        .map(|(i, msgs)| {
+            // 两字段同源，杜绝「有原因却 interrupted=false」的自相矛盾态。
+            let interrupted_reason = turn_interrupted_reason(msgs);
+            TurnData {
+                turn_index: i,
+                interrupted: interrupted_reason.is_some(),
+                interrupted_reason,
+                messages: group_input_items(&ItemView::from_turn(msgs))
+                    .into_iter()
+                    .map(|msg| MessageData {
+                        role: msg.role.to_string(),
+                        content: msg.content,
+                        images: msg.images,
+                        tool_calls: if msg.tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                msg.tool_calls
+                                    .into_iter()
+                                    .map(|tc| ToolCallData {
+                                        id: tc.id,
+                                        name: tc.function.name,
+                                        arguments: tc.function.arguments,
+                                    })
+                                    .collect(),
+                            )
+                        },
+                        reasoning_content: msg.reasoning_content,
+                        tool_call_id: msg.tool_call_id,
+                        timestamp_ms: msg.timestamp_ms,
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

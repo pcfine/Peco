@@ -1,6 +1,12 @@
 // ChatView — 共享聊天组件，被 PecoChatPage 和 AgentChatPage 共用
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import {
+  useEffect,
+  useState,
+  useRef,
+  useCallback,
+  useLayoutEffect,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -28,6 +34,8 @@ export interface ChatMessage {
   role: "user" | "assistant" | "tool" | "agent-call";
   content: string;
   turnIndex: number;
+  /** 稳定标识（快照消息恒有）；分页前置插入时据此保持 DOM 节点不重挂。 */
+  id?: string;
   toolCalls?: {
     id: string;
     name: string;
@@ -93,6 +101,12 @@ export interface ChatViewProps {
   externalIsStreaming?: boolean;
   /** [mode="external"] 外部提供的当前 token 用量（驱动底部用量圆环）。 */
   externalUsage?: UsageData | null;
+  /** [mode="external" 可选] 拉取更早一页对话的回调（顶部按钮触发）。 */
+  onLoadEarlier?: () => void;
+  /** [mode="external" 可选] 是否还有更早的轮可加载（决定按钮显隐）。 */
+  hasMore?: boolean;
+  /** [mode="external" 可选] 「加载更早」请求进行中（按钮置灰）。 */
+  loadingEarlier?: boolean;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
@@ -116,6 +130,9 @@ export function ChatView({
   onExternalStop,
   externalIsStreaming,
   externalUsage = null,
+  onLoadEarlier,
+  hasMore = false,
+  loadingEarlier = false,
 }: ChatViewProps) {
   const isExternalMode = mode === "external";
   if (isExternalMode && import.meta.env.DEV) {
@@ -356,12 +373,40 @@ export function ChatView({
     }
   }, [visible]);
 
-  // ── Auto-scroll (paused when hidden) ────────────────────────────────────
+  // ── 滚动锚定（分页前置插入不拽底）────────────────────────────────────
+  //
+  // 记录滚前 `gap = scrollHeight - scrollTop`，渲染后按增量回补
+  // `scrollTop = scrollHeight - gap`：前置插入旧轮时 gap 不变 → 视口不动；
+  // 仅当用户本就贴底（distanceToBottom 很小）时继续贴底（流式/尾部追加）。
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const prevGeometryRef = useRef({ scrollHeight: 0, scrollTop: 0 });
 
-  useEffect(() => {
-    if (visible) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "instant" });
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceToBottom < 80;
+    prevGeometryRef.current = {
+      scrollHeight: el.scrollHeight,
+      scrollTop: el.scrollTop,
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !visible) return;
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      const gap =
+        prevGeometryRef.current.scrollHeight - prevGeometryRef.current.scrollTop;
+      el.scrollTop = el.scrollHeight - gap;
     }
+    prevGeometryRef.current = {
+      scrollHeight: el.scrollHeight,
+      scrollTop: el.scrollTop,
+    };
   }, [displayMessages, visible]);
 
   // ── Cleanup on unmount ─────────────────────────────────────────────────
@@ -461,14 +506,30 @@ export function ChatView({
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto space-y-4 pr-2"
+      >
+        {onLoadEarlier && hasMore && (
+          <div className="flex justify-center">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onLoadEarlier}
+              disabled={loadingEarlier || (externalIsStreaming ?? streaming)}
+            >
+              {loadingEarlier ? "加载中…" : "加载更早的对话"}
+            </Button>
+          </div>
+        )}
         {displayMessages.length === 0 && welcomeMessage && (
           <div className="text-center text-muted-foreground mt-20">
             {welcomeMessage}
           </div>
         )}
         {displayMessages.map((msg, i) => (
-          <ChatBubble key={i} message={msg} />
+          <ChatBubble key={msg.id ?? i} message={msg} />
         ))}
         <div ref={messagesEndRef} />
       </div>
@@ -883,36 +944,44 @@ function handleSSEEvent(
 
 export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
   return turns.flatMap((turn) => {
-    const restored = turn.messages.map((md: MessageData): ChatMessage => {
-      if (md.role === "user") {
+    const restored = turn.messages.map(
+      (md: MessageData, idx: number): ChatMessage => {
+        // 稳定 key：turn 位置号 + 轮内序号。分页前置插入时据此不重挂 DOM。
+        const id = `turn-${turn.turn_index}-${idx}`;
+        if (md.role === "user") {
+          return {
+            id,
+            role: "user",
+            content: md.content ?? "",
+            turnIndex: turn.turn_index,
+            images: md.images,
+          };
+        }
+        if (md.role === "tool") {
+          return {
+            id,
+            role: "tool",
+            content: md.content ?? "",
+            turnIndex: turn.turn_index,
+          };
+        }
         return {
-          role: "user",
+          id,
+          role: "assistant",
           content: md.content ?? "",
           turnIndex: turn.turn_index,
-          images: md.images,
+          toolCalls: md.tool_calls?.map((tc) => ({ ...tc, result: undefined })),
+          reasoning: md.reasoning_content,
         };
-      }
-      if (md.role === "tool") {
-        return {
-          role: "tool",
-          content: md.content ?? "",
-          turnIndex: turn.turn_index,
-        };
-      }
-      return {
-        role: "assistant",
-        content: md.content ?? "",
-        turnIndex: turn.turn_index,
-        toolCalls: md.tool_calls?.map((tc) => ({ ...tc, result: undefined })),
-        reasoning: md.reasoning_content,
-      };
-    });
+      },
+    );
 
     // 中断轮（取消/超时/失败后冻结入史）在两轮之间补一条居中横幅，
     // 在该轮消息之前 —— 与 compaction 归档分隔条同一渲染路径。
     if (!turn.interrupted) return restored;
     return [
       {
+        id: `turn-${turn.turn_index}-notice`,
         role: "assistant" as const,
         content: `本轮被中断（${turn.interrupted_reason ?? "原因未知"}）`,
         turnIndex: turn.turn_index,

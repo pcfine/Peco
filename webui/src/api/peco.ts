@@ -1,7 +1,10 @@
 // Peco 永续对话 API
 
 import api from "./client";
-import type { SessionSnapshotResponse } from "@/types/chat";
+import type {
+  SessionMetricsResponse,
+  SessionSnapshotResponse,
+} from "@/types/chat";
 
 // axios baseURL is '/api', so paths here are relative to that.
 const PATH = "/peco";
@@ -9,8 +12,20 @@ const PATH = "/peco";
 // Native fetch() doesn't use axios baseURL — use the full path.
 const SSE_BASE = "/api/peco";
 
-export async function getPecoSession(): Promise<SessionSnapshotResponse> {
-  const resp = await api.get<SessionSnapshotResponse>(`${PATH}/session`);
+export async function getPecoSession(
+  params?: { turns?: number; before?: number },
+): Promise<SessionSnapshotResponse> {
+  const resp = await api.get<SessionSnapshotResponse>(`${PATH}/session`, {
+    params,
+  });
+  return resp.data;
+}
+
+/** 上下文指标轻量端点：只回 `context_metrics`，不拖全量 turn 历史。 */
+export async function getPecoSessionMetrics(): Promise<SessionMetricsResponse> {
+  const resp = await api.get<SessionMetricsResponse>(
+    `${PATH}/session/metrics`,
+  );
   return resp.data;
 }
 

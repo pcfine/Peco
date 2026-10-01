@@ -22,6 +22,9 @@ export function PecoChatPage() {
   const abortStream = usePecoChatStore((s) => s.abortStream);
   const error = usePecoChatStore((s) => s.error);
   const clearError = usePecoChatStore((s) => s.clearError);
+  const hasMore = usePecoChatStore((s) => s.hasMore);
+  const loadingEarlier = usePecoChatStore((s) => s.loadingEarlier);
+  const loadEarlier = usePecoChatStore((s) => s.loadEarlier);
   const token = useAuthStore((s) => s.token);
 
   useEffect(() => {
@@ -74,6 +77,9 @@ export function PecoChatPage() {
       onExternalStop={abortStream}
       externalIsStreaming={isStreaming}
       externalUsage={usage}
+      onLoadEarlier={loadEarlier}
+      hasMore={hasMore}
+      loadingEarlier={loadingEarlier}
       headerTitle="Peco"
       headerActions={
         <Button variant="ghost" size="sm" onClick={handleClear}>

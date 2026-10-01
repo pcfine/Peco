@@ -166,6 +166,16 @@ export interface SessionSnapshotResponse {
   pinned_summary?: string;
   /** 上下文指标（会话不存在时缺省） */
   context_metrics?: ContextMetrics;
+  /** 当前快照总轮数（压缩后会变）。chat 侧不返回。 */
+  total_turns?: number;
+  /** 本窗口之前是否还有更早的轮（翻页游标判定）。chat 侧不返回。 */
+  has_more?: boolean;
+}
+
+/** 上下文指标轻量响应（GET /api/peco/session/metrics） */
+export interface SessionMetricsResponse {
+  /** 上下文指标；会话不存在时为 null。 */
+  context_metrics: ContextMetrics | null;
 }
 
 export interface TurnData {

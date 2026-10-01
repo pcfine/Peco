@@ -219,6 +219,284 @@ async fn test_session_metrics_absent_when_no_session() {
     assert!(body["context_metrics"].is_null());
 }
 
+/// 为测试用户预置一个含 `n` 轮（每轮 user + assistant）的会话快照，无 pinned 摘要。
+async fn seed_turns(app: &TestApp, session_id: &str, n: usize) {
+    let committed_turns: Vec<Vec<AnnotatedMessage>> = (0..n)
+        .map(|i| {
+            vec![
+                annotated(i, user_msg(&format!("第 {i} 轮提问"))),
+                annotated(i, assistant_msg(&format!("第 {i} 轮回答"))),
+            ]
+        })
+        .collect();
+    let snapshot = SessionSnapshot {
+        committed_turns,
+        turn_index: n,
+        total_usage: Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            total_tokens: 1500,
+        },
+        next_message_id: 10,
+        pending_inputs: Vec::new(),
+        pinned_summary: None,
+    };
+    let persister = SqliteSessionPersister::new(app.state.db.clone());
+    persister
+        .save(&snapshot, session_id, "个人助理", 1_700_000_000)
+        .await
+        .unwrap();
+}
+
+// ── 分 turn 分页 ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_session_pagination_returns_tail_window_with_global_turn_index() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 5).await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session?turns=2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    // turn_index 保持全局位置号（尾部两轮 = 3、4），非窗口内相对位置
+    assert_eq!(turns[0]["turn_index"], 3);
+    assert_eq!(turns[1]["turn_index"], 4);
+    assert_eq!(body["total_turns"], 5);
+    assert_eq!(body["has_more"], true);
+}
+
+#[tokio::test]
+async fn test_session_pagination_before_window() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 5).await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session?before=3&turns=2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // before=3（排他上界）→ 窗口 [1, 3)
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["turn_index"], 1);
+    assert_eq!(turns[1]["turn_index"], 2);
+    assert_eq!(body["total_turns"], 5);
+    assert_eq!(body["has_more"], true);
+}
+
+#[tokio::test]
+async fn test_session_pagination_clamps_turns_and_full_default() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 5).await;
+
+    // turns=0 → clamp 到 1，返回尾部 1 轮
+    let body: serde_json::Value = app
+        .get("/api/peco/session?turns=0")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(body["turns"][0]["turn_index"], 4);
+
+    // turns 缺省 → 全量（向后兼容），无 has_more
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["turns"].as_array().unwrap().len(), 5);
+    assert_eq!(body["total_turns"], 5);
+    assert_eq!(body["has_more"], false);
+}
+
+#[tokio::test]
+async fn test_session_pagination_has_more_false_at_head() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 5).await;
+
+    // 窗口起点 0（before 覆盖到最早）→ 无更早轮
+    let body: serde_json::Value = app
+        .get("/api/peco/session?turns=10")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["turns"].as_array().unwrap().len(), 5);
+    assert_eq!(body["has_more"], false);
+}
+
+#[tokio::test]
+async fn test_session_pagination_before_zero_is_empty_window() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 5).await;
+
+    // before=0（排他上界为 0）→ 空窗口；前面已无可加载轮
+    let body: serde_json::Value = app
+        .get("/api/peco/session?before=0&turns=2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["turns"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total_turns"], 5);
+    assert_eq!(body["has_more"], false);
+}
+
+#[tokio::test]
+async fn test_session_pagination_before_out_of_range_clamps_to_total() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 5).await;
+
+    // before 越界 → clamp 到 total，等价于尾部窗口
+    let body: serde_json::Value = app
+        .get("/api/peco/session?before=999&turns=2")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["turn_index"], 3);
+    assert_eq!(turns[1]["turn_index"], 4);
+    assert_eq!(body["has_more"], true);
+}
+
+#[tokio::test]
+async fn test_session_pagination_turns_clamped_to_max_page() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    // 超过 MAX_PAGE_TURNS(200) 一档
+    seed_turns(&app, &session_id, 201).await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session?turns=999")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    // 显式 turns 收 clamp 到 1..=200 → 只回最近 200 轮，全局位置号从 1 起
+    assert_eq!(turns.len(), 200);
+    assert_eq!(turns[0]["turn_index"], 1);
+    assert_eq!(body["total_turns"], 201);
+    assert_eq!(body["has_more"], true);
+}
+
+// ── /session/metrics 轻量端点 ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_session_metrics_endpoint_returns_metrics_without_turns() {
+    let app = TestApp::new().await;
+    let session_id = format!("{}-private-session", app.user_id);
+    seed_turns(&app, &session_id, 3).await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session/metrics")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // 轻量端点只回 context_metrics，不携带 turn 历史
+    assert!(body.get("turns").is_none());
+    let metrics = &body["context_metrics"];
+    assert!(!metrics.is_null());
+    assert_eq!(metrics["compaction_count"], 0);
+    assert!(metrics["estimated_total_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_session_metrics_endpoint_null_when_no_session() {
+    let app = TestApp::new().await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session/metrics")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body["context_metrics"].is_null());
+}
+
+// ── chat 会话快照无回归（turns_to_dto 共享 helper 后行为不变）──────────────
+
+#[tokio::test]
+async fn test_chat_session_snapshot_still_returns_full_turns() {
+    let app = TestApp::new().await;
+
+    // 建对话
+    let conv_resp = app
+        .post("/api/conversations")
+        .json(&serde_json::json!({ "title": "回归对话" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conv_resp.status(), 201);
+    let conv: serde_json::Value = conv_resp.json().await.unwrap();
+    let conv_id = conv["id"].as_str().unwrap();
+
+    // 为该对话预置 3 轮快照
+    seed_turns(&app, conv_id, 3).await;
+
+    // 旧路由（DEPRECATED /api/conversations/:id/session）仍走同一 handler
+    let body: serde_json::Value = app
+        .get(&format!("/api/conversations/{conv_id}/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // 全量轮、全局位置号、不含 peco 专属分页字段
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[0]["turn_index"], 0);
+    assert_eq!(turns[2]["turn_index"], 2);
+    assert!(body.get("total_turns").is_none());
+    assert!(body.get("has_more").is_none());
+    assert!(body.get("context_metrics").is_none());
+    // 正文可读（首轮 user 提问在 messages 中）
+    assert_eq!(turns[0]["messages"][0]["role"], "user");
+    assert_eq!(turns[0]["messages"][0]["content"], "第 0 轮提问");
+}
+
 #[tokio::test]
 async fn test_archive_download_is_user_scoped() {
     let app = TestApp::new().await;

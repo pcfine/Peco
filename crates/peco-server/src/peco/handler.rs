@@ -37,7 +37,7 @@ use model_provider::InputItem;
 use peco_core::agent::{AgentLooper, LooperEvent, LooperHandle, OuterState, strip_summary_wrapper};
 use peco_core::knowledge::KnowledgeModuleError;
 use peco_core::persistence::SessionPersister;
-use peco_core::session::Session;
+use peco_core::session::{Session, SessionSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
@@ -48,7 +48,7 @@ use crate::error::ApiError;
 use crate::peco::active::{
     CancelWaitResult, ControlCommand, EnqueueOutcome, RunGuard, RunRegistration,
 };
-use crate::session_dto::{ItemView, group_input_items, turn_interrupted_reason};
+use crate::session_dto::{TurnData, turns_to_dto};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
 
@@ -92,43 +92,21 @@ fn default_export_format() -> String {
     "json".to_string()
 }
 
-/// 工具调用简化格式。
-#[derive(Debug, Serialize)]
-pub struct ToolCallData {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
+/// 会话快照分页查询参数。
+///
+/// `turns` 缺省 = 全量（向后兼容旧客户端）；取值 clamp 到 `1..=200`。
+/// `before` 缺省 = 尾部；语义为排他上界（只返回 `turn_index < before` 的轮）。
+/// `turn_index` 保持全局位置号（非窗口内相对位置），前端据此做 turn 段级合并。
+#[derive(Debug, Deserialize)]
+pub struct SessionQuery {
+    #[serde(default)]
+    pub turns: Option<usize>,
+    #[serde(default)]
+    pub before: Option<usize>,
 }
 
-/// 单条消息（前端友好格式，含 tool_calls / reasoning_content）。
-#[derive(Debug, Serialize)]
-pub struct MessageData {
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// 用户消息携带的图片部件 URL（含 data URI），无图时不序列化。
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCallData>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    pub timestamp_ms: u64,
-}
-
-/// 单轮对话数据。
-#[derive(Debug, Serialize)]
-pub struct TurnData {
-    pub turn_index: usize,
-    pub messages: Vec<MessageData>,
-    /// 本轮是否因中断被冻结入史（非正常完成）。
-    pub interrupted: bool,
-    /// 中断原因（人类可读），仅中断轮序列化。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interrupted_reason: Option<String>,
-}
+/// `turns` 分页大小的合法上界。
+const MAX_PAGE_TURNS: usize = 200;
 
 /// 单条压缩记录（时间线条目）。
 #[derive(Debug, Serialize)]
@@ -178,6 +156,17 @@ pub struct SessionSnapshotResponse {
     pub pinned_summary: Option<String>,
     /// 上下文指标。会话不存在时缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_metrics: Option<ContextMetrics>,
+    /// 当前快照总轮数（压缩后会变）。
+    pub total_turns: usize,
+    /// 本窗口之前是否还有更早的轮（翻页游标判定）。
+    pub has_more: bool,
+}
+
+/// 上下文指标轻量响应（`/session/metrics`）。
+#[derive(Debug, Serialize)]
+pub struct SessionMetricsResponse {
+    /// 上下文指标。会话不存在时为 null（字段恒在，不 skip）。
     pub context_metrics: Option<ContextMetrics>,
 }
 
@@ -591,13 +580,51 @@ pub async fn query_stream(
 
 // ── Handler: GET /api/peco/session ──────────────────────────────────────
 
-/// 获取 Peco 永续会话快照。
+/// 计算会话上下文指标（`/session` 与 `/session/metrics` 共用）。
 ///
-/// 返回完整的 turn 历史（含 tool calls、reasoning_content），
-/// 供前端刷新页面后重建聊天 UI。
+/// 预算阈值取默认配置 — GET /session 不构建 PecoManager（无模板安装等重
+/// 副作用），阈值实际为常量，口径注释见 PecoConfig。
+async fn compute_context_metrics(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+    snap: &SessionSnapshot,
+) -> ContextMetrics {
+    let peco_config = super::config::PecoConfig::default();
+    let est = super::metrics::estimate_session_context(snap, peco_config.history_token_budget);
+    let compactions =
+        crate::db::compaction_log::list_by_conversation(&state.db, user_id, session_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| CompactionRecord {
+                at: row.created_at,
+                evicted_turns: row.evicted_turns as usize,
+                tokens_before: row.tokens_before as usize,
+                tokens_after: row.tokens_after as usize,
+                summary_chars: row.summary_chars as usize,
+            })
+            .collect::<Vec<_>>();
+    let compaction_count = compactions.len();
+    ContextMetrics {
+        estimated_total_tokens: est.total_tokens,
+        estimated_view_tokens: est.view_tokens,
+        pinned_summary_tokens: est.pinned_tokens,
+        history_token_budget: peco_config.history_token_budget,
+        compaction_trigger_tokens: peco_config.compaction_trigger_tokens,
+        compaction_count,
+        compactions,
+    }
+}
+
+/// 获取 Peco 永续会话快照（分 turn 分页）。
+///
+/// `?turns=<N>&before=<turn_index>` 只返回 `[before-N, before)` 的轮窗口，
+/// `turn_index` 保持全局位置号；`turns` 缺省返回全量历史（向后兼容）。
 pub async fn get_session_snapshot(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
+    Query(params): Query<SessionQuery>,
 ) -> Result<Json<SessionSnapshotResponse>, ApiError> {
     let session_id = private_session_id(&user_id);
     let persister = SqliteSessionPersister::new(state.db.clone());
@@ -607,7 +634,8 @@ pub async fn get_session_snapshot(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to load session: {e}")))?;
 
-    let (turns, usage, pinned_summary, context_metrics) = match snapshot_opt {
+    let (turns, usage, pinned_summary, context_metrics, total_turns, has_more) = match snapshot_opt
+    {
         Some((snap, _meta)) => {
             let pinned_summary: Option<String> =
                 snap.pinned_summary
@@ -619,84 +647,36 @@ pub async fn get_session_snapshot(
                         }
                         _ => None,
                     });
-            let turns: Vec<TurnData> = snap
-                .committed_turns
-                .iter()
-                .enumerate()
-                .map(|(i, msgs): (usize, &Vec<_>)| {
-                    // 两字段同源，杜绝「有原因却 interrupted=false」的自相矛盾态。
-                    let interrupted_reason = turn_interrupted_reason(msgs);
-                    TurnData {
-                        turn_index: i,
-                        interrupted: interrupted_reason.is_some(),
-                        interrupted_reason,
-                        messages: {
-                            group_input_items(&ItemView::from_turn(msgs))
-                                .into_iter()
-                                .map(|msg| MessageData {
-                                    role: msg.role.to_string(),
-                                    content: msg.content,
-                                    images: msg.images,
-                                    tool_calls: if msg.tool_calls.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            msg.tool_calls
-                                                .into_iter()
-                                                .map(|tc| ToolCallData {
-                                                    id: tc.id,
-                                                    name: tc.function.name,
-                                                    arguments: tc.function.arguments,
-                                                })
-                                                .collect(),
-                                        )
-                                    },
-                                    reasoning_content: msg.reasoning_content,
-                                    tool_call_id: msg.tool_call_id,
-                                    timestamp_ms: msg.timestamp_ms,
-                                })
-                                .collect()
-                        },
-                    }
-                })
-                .collect();
+
+            // 窗口：[start, end)。end 收 `before` 或总轮数；n 收 `turns`
+            // 或全量（显式值才 clamp 到 1..=200，缺省全量不受 clamp 影响）。
+            let total = snap.committed_turns.len();
+            let end = params.before.unwrap_or(total).min(total);
+            let n = params
+                .turns
+                .map(|t| t.clamp(1, MAX_PAGE_TURNS))
+                .unwrap_or(usize::MAX);
+            let start = end.saturating_sub(n);
+            let has_more = start > 0;
+            // 切片在 enumerate 之后，turn_index 保持全局位置号。
+            let turns = turns_to_dto(&snap.committed_turns, start..end);
 
             let usage = UsageData {
                 input_tokens: snap.total_usage.input_tokens,
                 output_tokens: snap.total_usage.output_tokens,
             };
 
-            // ── 上下文指标 ──────────────────────────────────────────────
-            // 预算阈值取默认配置 — GET /session 不构建 PecoManager（无模板
-            // 安装等重副作用），阈值实际为常量，口径注释见 PecoConfig。
-            let peco_config = super::config::PecoConfig::default();
-            let est =
-                super::metrics::estimate_session_context(&snap, peco_config.history_token_budget);
-            let compactions =
-                crate::db::compaction_log::list_by_conversation(&state.db, &user_id, &session_id)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|row| CompactionRecord {
-                        at: row.created_at,
-                        evicted_turns: row.evicted_turns as usize,
-                        tokens_before: row.tokens_before as usize,
-                        tokens_after: row.tokens_after as usize,
-                        summary_chars: row.summary_chars as usize,
-                    })
-                    .collect::<Vec<_>>();
-            let compaction_count = compactions.len();
-            let context_metrics = ContextMetrics {
-                estimated_total_tokens: est.total_tokens,
-                estimated_view_tokens: est.view_tokens,
-                pinned_summary_tokens: est.pinned_tokens,
-                history_token_budget: peco_config.history_token_budget,
-                compaction_trigger_tokens: peco_config.compaction_trigger_tokens,
-                compaction_count,
-                compactions,
-            };
+            let context_metrics =
+                compute_context_metrics(&state, &user_id, &session_id, &snap).await;
 
-            (turns, usage, pinned_summary, Some(context_metrics))
+            (
+                turns,
+                usage,
+                pinned_summary,
+                Some(context_metrics),
+                total,
+                has_more,
+            )
         }
         None => (
             Vec::new(),
@@ -706,6 +686,8 @@ pub async fn get_session_snapshot(
             },
             None,
             None,
+            0,
+            false,
         ),
     };
 
@@ -724,7 +706,37 @@ pub async fn get_session_snapshot(
         turn_in_flight: state.peco_runs.turn_in_flight(&user_id),
         pinned_summary,
         context_metrics,
+        total_turns,
+        has_more,
     }))
+}
+
+// ── Handler: GET /api/peco/session/metrics ──────────────────────────────
+
+/// 上下文指标轻量端点。
+///
+/// 只返回 `context_metrics`，不序列化 turn 历史 —— 供 ContextMetricsCard
+/// 等只关心指标、不关心正文的调用方使用。会话不存在时返回 `{ context_metrics: null }`。
+pub async fn get_session_metrics(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SessionMetricsResponse>, ApiError> {
+    let session_id = private_session_id(&user_id);
+    let persister = SqliteSessionPersister::new(state.db.clone());
+
+    let snapshot_opt = persister
+        .load(&session_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to load session: {e}")))?;
+
+    let context_metrics = match snapshot_opt {
+        Some((snap, _meta)) => {
+            Some(compute_context_metrics(&state, &user_id, &session_id, &snap).await)
+        }
+        None => None,
+    };
+
+    Ok(Json(SessionMetricsResponse { context_metrics }))
 }
 
 // ── Handler: DELETE /api/peco/session ───────────────────────────────────
@@ -1429,7 +1441,8 @@ pub async fn export_session(
 /// - `GET /stream` — SSE 流式对话（无 message 时为纯附着模式）
 /// - `POST /stream/query` — 向已注册的 run 排队一条消息（不新开连接）
 /// - `POST /stream/cancel` — 取消进行中的任务
-/// - `GET /session` — 获取会话快照
+/// - `GET /session` — 获取会话快照（`?turns=&before=` 分 turn 分页）
+/// - `GET /session/metrics` — 上下文指标轻量端点
 /// - `DELETE /session` — 清除会话（默认先归档，`?archive=false` 硬删除）
 /// - `GET /session/export` — 导出会话
 /// - `GET /archives` — 归档列表
@@ -1446,6 +1459,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/stream/query", post(query_stream))
         .route("/stream/cancel", post(cancel_stream))
         .route("/session", get(get_session_snapshot).delete(clear_session))
+        .route("/session/metrics", get(get_session_metrics))
         .route("/session/export", get(export_session))
         .route("/archives", get(list_archives))
         .route("/archives/{id}", get(download_archive))

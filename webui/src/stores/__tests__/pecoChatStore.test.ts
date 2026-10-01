@@ -5,6 +5,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { usePecoChatStore, __resetPecoStreamForTests } from "../pecoChatStore";
+import { snapshotToMessages } from "../../components/chat/ChatView";
 import { useAuthStore } from "../../stores/authStore";
 
 vi.mock("@/api/peco", () => ({
@@ -100,6 +101,11 @@ const resetStore = () => {
     isStreaming: false,
     error: null,
     usage: null,
+    oldestLoadedTurn: null,
+    hasMore: false,
+    totalTurns: 0,
+    historyRevision: 0,
+    loadingEarlier: false,
   });
 };
 
@@ -479,5 +485,389 @@ describe("pecoChatStore refresh()", () => {
       expect.objectContaining({ role: "user", content: "刚发的消息" }),
     );
     expect(usePecoChatStore.getState().isStreaming).toBe(true);
+  });
+});
+
+// ── 分页状态机（turn 级分页 + revision 失效） ────────────────────────────
+
+/** 造单轮：user + assistant 各一条，turn_index 取全局位置号。 */
+const turn = (turn_index: number, text: string) => ({
+  turn_index,
+  messages: [
+    { role: "user", content: text, timestamp_ms: turn_index * 10 },
+    { role: "assistant", content: `${text}-答`, timestamp_ms: turn_index * 10 + 1 },
+  ],
+});
+
+/** 造分页快照（按需携带 context_metrics / total_turns / has_more / pinned_summary）。 */
+const pagedSnapshot = (opts: {
+  turns: ReturnType<typeof turn>[];
+  compaction_count?: number;
+  total_turns?: number;
+  has_more?: boolean;
+  pinned_summary?: string;
+  turn_in_flight?: boolean;
+}) => ({
+  conversation_id: "u1-private-session",
+  turns: opts.turns,
+  total_usage: { input_tokens: 10, output_tokens: 5 },
+  is_running: true,
+  turn_in_flight: opts.turn_in_flight ?? false,
+  ...(opts.pinned_summary ? { pinned_summary: opts.pinned_summary } : {}),
+  ...(opts.compaction_count !== undefined
+    ? { context_metrics: { compaction_count: opts.compaction_count } }
+    : {}),
+  ...(opts.total_turns !== undefined ? { total_turns: opts.total_turns } : {}),
+  ...(opts.has_more !== undefined ? { has_more: opts.has_more } : {}),
+});
+
+const pinnedMsg = () => ({
+  id: "pinned-summary",
+  role: "assistant",
+  content: "更早的对话已归档为摘要，仍在模型上下文中",
+  turnIndex: 0,
+  isNotice: true,
+  summary: "<earlier_context_summary>…</earlier_context_summary>",
+});
+
+describe("pecoChatStore 分页", () => {
+  it("revision 不变时保留旧页，仅 turn 段级替换尾部窗口", async () => {
+    // 旧页（turn 0）已加载 + 尾部（turn 2）已加载，处于翻页中途
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: [
+        { id: "turn-0-0", role: "user", content: "旧页提问", turnIndex: 0 },
+        { id: "turn-2-0", role: "user", content: "旧尾部提问", turnIndex: 2 },
+      ],
+      oldestLoadedTurn: 0,
+      hasMore: true,
+      totalTurns: 5,
+      historyRevision: 0,
+    });
+
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(2, "新2"), turn(3, "新3"), turn(4, "新4")],
+        compaction_count: 0,
+        total_turns: 5,
+        has_more: true,
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().refresh();
+
+    const messages = usePecoChatStore.getState().messages;
+    // 旧页（turnIndex < 尾部窗口起点 2）保留
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "旧页提问", turnIndex: 0 }),
+    );
+    // 尾部被权威替换：旧的尾部文本消失，新的就位
+    expect(messages).not.toContainEqual(
+      expect.objectContaining({ content: "旧尾部提问" }),
+    );
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "新4", turnIndex: 4 }),
+    );
+    expect(usePecoChatStore.getState().oldestLoadedTurn).toBe(0);
+    // 已加载到 turn 0：前面没有可加载的轮 → hasMore 必须为 false。
+    // （尾页 has_more 恒真，是「尾窗口之前还有轮」而非「本端还有未加载轮」。）
+    expect(usePecoChatStore.getState().hasMore).toBe(false);
+    expect(usePecoChatStore.getState().totalTurns).toBe(5);
+  });
+
+  it("revision 变化（compaction）时丢弃旧页，只保留尾部窗口", async () => {
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: [
+        { id: "turn-0-0", role: "user", content: "旧页提问", turnIndex: 0 },
+        { id: "turn-2-0", role: "user", content: "旧尾部提问", turnIndex: 2 },
+      ],
+      oldestLoadedTurn: 0,
+      hasMore: true,
+      totalTurns: 5,
+      historyRevision: 0,
+    });
+
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(1, "压缩后1"), turn(2, "压缩后2")],
+        compaction_count: 1, // 位置号整体前移，旧页游标全部失效
+        total_turns: 2,
+        has_more: false,
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().refresh();
+
+    const messages = usePecoChatStore.getState().messages;
+    expect(messages).not.toContainEqual(
+      expect.objectContaining({ content: "旧页提问" }),
+    );
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "压缩后2", turnIndex: 2 }),
+    );
+    expect(usePecoChatStore.getState().oldestLoadedTurn).toBe(1);
+    expect(usePecoChatStore.getState().historyRevision).toBe(1);
+  });
+
+  it("clear 重置全部分页状态", async () => {
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: [{ id: "turn-0-0", role: "user", content: "x", turnIndex: 0 }],
+      oldestLoadedTurn: 0,
+      hasMore: true,
+      totalTurns: 5,
+      historyRevision: 2,
+      loadingEarlier: true,
+    });
+
+    await usePecoChatStore.getState().clear();
+
+    const s = usePecoChatStore.getState();
+    expect(s.messages).toEqual([]);
+    expect(s.oldestLoadedTurn).toBeNull();
+    expect(s.hasMore).toBe(false);
+    expect(s.totalTurns).toBe(0);
+    expect(s.historyRevision).toBe(0);
+    expect(s.loadingEarlier).toBe(false);
+  });
+
+  it("loadEarlier 前置合并更早轮并保持 pinned 摘要恒在最前、恰好一条", async () => {
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: [
+        pinnedMsg(),
+        ...snapshotToMessages([turn(3, "尾部3"), turn(4, "尾部4")]),
+      ],
+      oldestLoadedTurn: 3,
+      hasMore: true,
+      totalTurns: 6,
+      historyRevision: 0,
+    });
+
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(0, "更早0"), turn(1, "更早1"), turn(2, "更早2")],
+        compaction_count: 0,
+        total_turns: 6,
+        has_more: false,
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().loadEarlier();
+
+    const messages = usePecoChatStore.getState().messages;
+    // pinned 摘要恰好一条，恒在最前（与 turn 0 撞号不重复、不丢失）
+    expect(messages.filter((m) => m.id === "pinned-summary")).toHaveLength(1);
+    expect(messages[0].id).toBe("pinned-summary");
+    // 更早的轮插在 pinned 之后、尾部之前，位置号连续
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "更早0", turnIndex: 0 }),
+    );
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "尾部4", turnIndex: 4 }),
+    );
+    expect(messages.slice(1).map((m) => m.turnIndex)).toEqual([
+      0, 0, 1, 1, 2, 2, 3, 3, 4, 4,
+    ]);
+
+    expect(usePecoChatStore.getState().oldestLoadedTurn).toBe(0);
+    expect(usePecoChatStore.getState().hasMore).toBe(false);
+    expect(usePecoChatStore.getState().totalTurns).toBe(6);
+  });
+
+  it("loadEarlier 在流式中 / 无更多 / 无已加载轮时直接返回，不发请求", async () => {
+    usePecoChatStore.setState({
+      isStreaming: true,
+      hasMore: true,
+      oldestLoadedTurn: 3,
+    });
+    await usePecoChatStore.getState().loadEarlier();
+    expect(getPecoSession).not.toHaveBeenCalled();
+
+    usePecoChatStore.setState({
+      isStreaming: false,
+      hasMore: false,
+      oldestLoadedTurn: 3,
+    });
+    await usePecoChatStore.getState().loadEarlier();
+    expect(getPecoSession).not.toHaveBeenCalled();
+
+    usePecoChatStore.setState({
+      isStreaming: false,
+      hasMore: true,
+      oldestLoadedTurn: null,
+    });
+    await usePecoChatStore.getState().loadEarlier();
+    expect(getPecoSession).not.toHaveBeenCalled();
+  });
+
+  it("loadEarlier 用 before=oldestLoadedTurn 翻页", async () => {
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: snapshotToMessages([turn(3, "尾部3")]),
+      oldestLoadedTurn: 3,
+      hasMore: true,
+      totalTurns: 5,
+      historyRevision: 0,
+    });
+
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(0, "更早0")],
+        compaction_count: 0,
+        total_turns: 5,
+        has_more: false,
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().loadEarlier();
+
+    expect(getPecoSession).toHaveBeenCalledWith({
+      turns: 3,
+      before: 3,
+    });
+  });
+
+  // 回归：refreshSession 的「保留旧页」合并必须先剥除旧 pinned 分隔线，
+  // 否则它 turnIndex 恒为 0，会被 < tailStart 选中，与尾部窗口新带的那条重复。
+  it("refresh 追平后 pinned 摘要恒为一条（尾部窗口权威）", async () => {
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(3, "t3"), turn(4, "t4"), turn(5, "t5")],
+        compaction_count: 0,
+        total_turns: 6,
+        has_more: true,
+        pinned_summary: "<earlier_context_summary>…</earlier_context_summary>",
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().load();
+    expect(
+      usePecoChatStore.getState().messages.filter((m) => m.id === "pinned-summary"),
+    ).toHaveLength(1);
+
+    // 窗口获焦追平：再次 refreshSession 走「保留旧页」分支
+    await usePecoChatStore.getState().refresh();
+
+    const messages = usePecoChatStore.getState().messages;
+    expect(messages.filter((m) => m.id === "pinned-summary")).toHaveLength(1);
+    expect(messages[0].id).toBe("pinned-summary");
+    expect(messages.map((m) => m.turnIndex)).toEqual([0, 3, 3, 4, 4, 5, 5]);
+  });
+
+  it("loadEarlier 后再 refresh 仍恰好一条 pinned", async () => {
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: [
+        pinnedMsg(),
+        ...snapshotToMessages([turn(0, "更早0"), turn(1, "更早1")]),
+        ...snapshotToMessages([turn(3, "尾部3"), turn(4, "尾部4")]),
+      ],
+      oldestLoadedTurn: 0,
+      hasMore: false,
+      totalTurns: 5,
+      historyRevision: 0,
+    });
+
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(3, "尾部3"), turn(4, "尾部4")],
+        compaction_count: 0,
+        total_turns: 5,
+        has_more: false,
+        pinned_summary: "<earlier_context_summary>…</earlier_context_summary>",
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().refresh();
+
+    const messages = usePecoChatStore.getState().messages;
+    expect(messages.filter((m) => m.id === "pinned-summary")).toHaveLength(1);
+    expect(messages[0].id).toBe("pinned-summary");
+    // 更早的已加载轮保留，尾部被权威替换
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "更早0", turnIndex: 0 }),
+    );
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "尾部4", turnIndex: 4 }),
+    );
+    expect(usePecoChatStore.getState().oldestLoadedTurn).toBe(0);
+  });
+
+  it("refresh 丢弃流式残留（无 id、turnIndex 0），已完成的轮不重复", async () => {
+    // 复现：≥3 轮会话发一条消息、流式到完成 → 本地残留（无 id、turnIndex 0）
+    // 仍在 messages 尾部；切走切回触发 refresh 时若被当旧页保留，就会与尾部
+    // 窗口里的同一条轮重复渲染，且错位到更早轮之前。
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: [
+        ...snapshotToMessages([turn(3, "t3"), turn(4, "t4")]),
+        // sendMessage 追加的形状：无 id、turnIndex 恒 0
+        { role: "user", content: "我刚发的问题", turnIndex: 0 },
+        { role: "assistant", content: "我刚得到的回答", turnIndex: 0 },
+      ],
+      oldestLoadedTurn: 3,
+      hasMore: true,
+      totalTurns: 5,
+      historyRevision: 0,
+    });
+
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(4, "t4"), turn(5, "t5"), turn(6, "我刚发的问题")],
+        compaction_count: 0,
+        total_turns: 7,
+        has_more: true,
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().refresh();
+
+    const messages = usePecoChatStore.getState().messages;
+    // 刚发的那轮只由尾部窗口权威提供一份 —— 本地残留必须被丢弃
+    expect(messages.filter((m) => m.content === "我刚发的问题")).toHaveLength(1);
+    // 本地残留的 assistant 文本必须消失（快照权威版本是「我刚发的问题-答」）
+    expect(messages.filter((m) => m.content === "我刚得到的回答")).toHaveLength(0);
+    // 且必须落在尾部（turnIndex 6），不得错位到更早轮之前
+    const idx = messages.findIndex((m) => m.content === "我刚发的问题");
+    expect(messages[idx].turnIndex).toBe(6);
+    // 更早已加载轮（turn 3）仍保留
+    expect(messages).toContainEqual(
+      expect.objectContaining({ content: "t3", turnIndex: 3 }),
+    );
+  });
+
+  it("翻到底（oldestLoadedTurn=0）后 refresh，hasMore 不假真", async () => {
+    usePecoChatStore.setState({
+      loaded: true,
+      messages: snapshotToMessages([
+        turn(0, "t0"),
+        turn(1, "t1"),
+        turn(2, "t2"),
+        turn(3, "t3"),
+        turn(4, "t4"),
+      ]),
+      oldestLoadedTurn: 0,
+      hasMore: false,
+      totalTurns: 5,
+      historyRevision: 0,
+    });
+
+    // 尾页 has_more 恒为 true（total 5 > PAGE_TURNS 3），不能据此判定本端还有旧页
+    vi.mocked(getPecoSession).mockResolvedValue(
+      pagedSnapshot({
+        turns: [turn(2, "t2"), turn(3, "t3"), turn(4, "t4")],
+        compaction_count: 0,
+        total_turns: 5,
+        has_more: true,
+      }) as never,
+    );
+
+    await usePecoChatStore.getState().refresh();
+
+    const state = usePecoChatStore.getState();
+    expect(state.oldestLoadedTurn).toBe(0);
+    expect(state.hasMore).toBe(false);
   });
 });

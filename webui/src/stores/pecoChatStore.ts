@@ -15,7 +15,11 @@ import {
   isStreamTerminalEvent,
 } from "@/components/chat/ChatView";
 import type { ChatMessage } from "@/components/chat/ChatView";
-import type { ChatSseEvent, UsageData } from "@/types/chat";
+import type {
+  ChatSseEvent,
+  SessionSnapshotResponse,
+  UsageData,
+} from "@/types/chat";
 
 // ── 常驻 SSE 连接 ────────────────────────────────────────────────────────
 //
@@ -162,13 +166,44 @@ async function readStream(
   }
 }
 
+/** 每页拉取的 turn 数（尾部页与「加载更早」页一致）。 */
+const PAGE_TURNS = 3;
+
+/** pinned 摘要归档分隔线（恒在列表最前，turnIndex 0 与 turn 0 撞号但不重复）。 */
+function pinnedNotice(summary: string): ChatMessage {
+  return {
+    id: "pinned-summary",
+    role: "assistant",
+    content: "更早的对话已归档为摘要，仍在模型上下文中",
+    turnIndex: 0,
+    isNotice: true,
+    summary,
+  };
+}
+
+/** 识别 pinned 摘要分隔线（与 context_compacted / 中断横幅区分）。 */
+function isPinnedNotice(m: ChatMessage): boolean {
+  return m.id === "pinned-summary";
+}
+
+/** 由快照拼装「尾部窗口」消息列表（pinned 摘要 + turns）。 */
+function buildTailWindow(snap: SessionSnapshotResponse): ChatMessage[] {
+  const restored = snapshotToMessages(snap.turns);
+  return snap.pinned_summary
+    ? [pinnedNotice(snap.pinned_summary), ...restored]
+    : restored;
+}
+
 /**
- * 拉取会话快照并重建消息列表；服务端有轮次在途时追加占位并附着。
+ * 拉取尾部页（最新 PAGE_TURNS 轮）并按 turn 段合并进消息列表。
  *
- * load()（首载）与 refresh()（窗口获焦追平）共用。快照是唯一真相源，
- * 整表替换可自愈本窗口与其他窗口/服务端之间的任何漂移。
- * 快照不含进行中轮次，替换会丢占位里已流出的内容 — 调用方须保证
- * 本窗口不在流式中（isStreaming 空闲）。
+ * 新不变量（分页后）：
+ *  - 尾部窗口由快照权威替换，可自愈本窗口与其他窗口/服务端之间的漂移；
+ *  - 窗口之前的旧页仅在 revision（compaction_count）不变的条件下可信，
+ *    变了即丢弃 —— compaction 会让位置号整体前移，旧页游标全部失效。
+ *
+ * load()（首载）与 refresh()（窗口获焦追平）共用。快照不含进行中轮次，
+ * 调用方须保证本窗口不在流式中（isStreaming 空闲）。
  */
 async function refreshSession(
   set: (partial: Partial<PecoChatState>) => void,
@@ -176,27 +211,61 @@ async function refreshSession(
 ): Promise<void> {
   if (get().isStreaming) return;
 
-  const snap = await getPecoSession();
+  const snap = await getPecoSession({ turns: PAGE_TURNS });
 
   // 快照在途期间用户可能刚发出消息（sendMessage 会置 isStreaming）：
   // 此时整表替换会抹掉刚追加的用户消息与占位，必须放弃这次快照。
   if (get().isStreaming) return;
 
-  const restored = snapshotToMessages(snap.turns);
-  // 有 pinned 摘要时在顶部渲染归档分隔线（hover 分隔条可看摘要正文）
-  const messages: ChatMessage[] = snap.pinned_summary
-    ? [
-        {
-          role: "assistant",
-          content: "更早的对话已归档为摘要，仍在模型上下文中",
-          turnIndex: 0,
-          isNotice: true,
-          summary: snap.pinned_summary,
-        },
-        ...restored,
-      ]
-    : restored;
-  set({ messages, loaded: true });
+  const rev = snap.context_metrics?.compaction_count ?? 0;
+  const revisionChanged = rev !== get().historyRevision;
+  const tailStart = snap.turns.length > 0 ? snap.turns[0].turn_index : null;
+  const tailWindow = buildTailWindow(snap);
+
+  let messages: ChatMessage[];
+  let oldestLoadedTurn: number | null;
+  let hasMore: boolean;
+
+  if (revisionChanged || get().oldestLoadedTurn === null || tailStart === null) {
+    // 首载 / 历史版本变化（compaction）/ 快照无轮：丢弃旧页，只留尾部窗口。
+    messages = tailWindow;
+    oldestLoadedTurn = tailStart;
+    hasMore = snap.has_more ?? false;
+  } else {
+    // 版本未变：turn 段级替换尾部窗口，保留更早的已加载轮。
+    //
+    // 只保留「快照来源」的旧页：快照消息恒有 id（snapshotToMessages 赋
+    // `turn-<位置号>-<轮内序号>`），而流式残留（刚发的那轮、占位气泡、banner）
+    // 恒无 id 且 turnIndex 恒 0 —— 不按 id 过滤，这些残留就满足 `0 < tailStart`
+    // 被当成旧页保留，与尾部窗口里的同一条轮重复渲染（发完消息切走切回即见）。
+    //
+    // pinned 分隔线恒由尾部窗口权威携带（快照无摘要时即不存在），且必须恒在最前：
+    // 先从旧页剥除（其 turnIndex 恒为 0，会被 < tailStart 选中而与尾部那条重复），
+    // 再整体前置 —— 否则更早的已加载轮会插到它前面，分隔线错位到列表中间。
+    const prevOldest = get().oldestLoadedTurn;
+    const head = get().messages.filter(
+      (m) => m.id !== undefined && !isPinnedNotice(m) && m.turnIndex < tailStart,
+    );
+    const pinned =
+      tailWindow.length > 0 && isPinnedNotice(tailWindow[0])
+        ? [tailWindow[0]]
+        : [];
+    messages = [...pinned, ...head, ...tailWindow.slice(pinned.length)];
+    oldestLoadedTurn = prevOldest;
+    // 尾页 has_more 只说明「尾窗口之前还有轮」（= total > PAGE_TURNS），恒真；
+    // 已加载到 turn 0 时前面已无可加载轮，必须据 oldestLoadedTurn 判定，
+    // 否则翻到底后「加载更早」按钮假重现（点击拉空页后才自愈为 false）。
+    hasMore = (prevOldest ?? 0) > 0;
+  }
+
+  set({
+    messages,
+    loaded: true,
+    oldestLoadedTurn,
+    hasMore,
+    totalTurns: snap.total_turns ?? snap.turns.length,
+    historyRevision: rev,
+  });
 
   // 服务端有轮次在途 → 追加 assistant 占位并重新附着。
   // 占位是必须的：reduceStreamEvent 的 delta 只在末条是 assistant 时应用，
@@ -227,6 +296,11 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   isStreaming: false,
   error: null,
   usage: null,
+  oldestLoadedTurn: null,
+  hasMore: false,
+  totalTurns: 0,
+  historyRevision: 0,
+  loadingEarlier: false,
 
   load: async () => {
     if (get().loaded) return;
@@ -273,7 +347,54 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       isStreaming: false,
       usage: null,
       sessionKey: s.sessionKey + 1,
+      oldestLoadedTurn: null,
+      hasMore: false,
+      totalTurns: 0,
+      historyRevision: 0,
+      loadingEarlier: false,
     }));
+  },
+
+  // ── loadEarlier ──────────────────────────────────────────────────────
+
+  loadEarlier: async () => {
+    const { isStreaming, hasMore, oldestLoadedTurn, totalTurns } = get();
+    if (isStreaming || !hasMore || oldestLoadedTurn === null) return;
+
+    set({ loadingEarlier: true });
+    try {
+      const snap = await getPecoSession({
+        turns: PAGE_TURNS,
+        before: oldestLoadedTurn,
+      });
+      if (get().isStreaming) return;
+
+      const rev = snap.context_metrics?.compaction_count ?? 0;
+      if (rev !== get().historyRevision) {
+        // 历史版本已变（compaction）：放弃本次结果，重拉尾部页统一重建。
+        await refreshSession(set, get);
+        return;
+      }
+
+      // 版本未变：前置合并更早的轮（before 排他，返回轮 turnIndex 全 < oldestLoadedTurn）。
+      const earlier = snapshotToMessages(snap.turns);
+      const current = get().messages;
+      // pinned 摘要分隔线恒在最前、恰好一条 —— 更早的轮插在它之后。
+      const pinned =
+        current.length > 0 && isPinnedNotice(current[0]) ? [current[0]] : [];
+      const rest = current.slice(pinned.length);
+      set({
+        messages: [...pinned, ...earlier, ...rest],
+        oldestLoadedTurn:
+          snap.turns.length > 0 ? snap.turns[0].turn_index : oldestLoadedTurn,
+        hasMore: snap.has_more ?? false,
+        totalTurns: snap.total_turns ?? totalTurns,
+      });
+    } catch {
+      // 加载更早失败：静默保留现状，按钮可重试。
+    } finally {
+      set({ loadingEarlier: false });
+    }
   },
 
   // ── sendMessage ──────────────────────────────────────────────────────
@@ -418,10 +539,24 @@ interface PecoChatState {
   // Current token usage for the context ring (null until the first stream event).
   usage: UsageData | null;
 
+  // ── 分页状态（turn 级分页）──────────────────────────────────────────
+  /** 已加载的最早轮位置号；null = 尚无已加载轮。 */
+  oldestLoadedTurn: number | null;
+  /** 是否还有更早的轮可加载（= 服务端窗口起点 > 0）。 */
+  hasMore: boolean;
+  /** 服务端报告的当前总轮数。 */
+  totalTurns: number;
+  /** 历史版本号（= context_metrics.compaction_count）；变了旧页即失效。 */
+  historyRevision: number;
+  /** 「加载更早」请求进行中（按钮置灰/加载态）。 */
+  loadingEarlier: boolean;
+
   load: () => Promise<void>;
   /** 获焦/切回标签页时追平会话：重拉快照 + 检测在途轮次附着。 */
   refresh: () => Promise<void>;
   clear: () => Promise<void>;
+  /** 拉取更早的一页（before=oldestLoadedTurn）并前置合并。 */
+  loadEarlier: () => Promise<void>;
 
   /** Start an SSE streaming request. The async fetch runs inside the store
    *  and is NOT tied to any React component lifecycle. */
