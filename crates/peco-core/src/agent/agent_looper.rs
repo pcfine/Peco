@@ -3218,9 +3218,15 @@ impl AgentLooper {
     /// 消费 [`FinalizePlan`] 的异步段：事件 → hook → 落盘 → 回写原因。冻结 + 快照
     /// 已在 [`plan_failure`] 内同步完成，此处只做 I/O 与编排。
     async fn commit_failure_plan(&mut self, plan: FinalizePlan) {
+        // `iteration` / `max_turns` 取自此处的 `self` 而非 `plan`：两者是「本用户轮的
+        // ReAct 深度」与「该轮预算」，`plan` 只承载 Session 侧的产物。计数在
+        // `reset_turn_counters`（下一轮启动）才清零，收尾时仍是本轮的终值 ——
+        // `MaxTurnsExceeded` 下二者必然相等，其余失败原因则回答「预算用掉多少才挂的」。
         warn!(
             turn = plan.turn,
             reason = ?plan.reason,
+            iteration = self.react_loop_iteration,
+            max_turns = self.max_turns,
             frozen_staging_messages = plan.frozen_staging_messages,
             partial_text_len = plan.partial_text_len,
             "Turn interrupted; staging frozen into committed history"

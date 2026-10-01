@@ -43,7 +43,7 @@ tools:
 mcp: []
 skills: []
 knowledge_bases: ["@private_memory"]
-max_turns: 50
+max_turns: 500
 ---
 
 # 我是 Peco

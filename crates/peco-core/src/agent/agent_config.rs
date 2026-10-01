@@ -52,7 +52,7 @@ pub struct AgentProfile {
     #[serde(default)]
     pub knowledge_bases: Vec<String>,
 
-    /// 单次响应最大对话轮数。未配置时默认为 50。
+    /// 单次响应最大对话轮数。未配置时默认为 500。
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
 
@@ -63,9 +63,9 @@ pub struct AgentProfile {
     pub template_version: Option<u32>,
 }
 
-/// `max_turns` 的默认值：50 轮对话。
+/// `max_turns` 的默认值：500 轮对话。
 pub fn default_max_turns() -> usize {
-    50
+    500
 }
 
 /// Agent 身份信息。
@@ -284,7 +284,7 @@ pub struct AssembleAgentMdParams {
 ///     tools: vec!["shell".into()],
 ///     mcp_servers: vec![],
 ///     skills: vec![],
-///     max_turns: 50,
+///     max_turns: 500,
 ///     system_prompt: "You are a helpful assistant.".into(),
 /// };
 /// let md = assemble_agent_md(&params);
@@ -575,7 +575,7 @@ mod tests {
             mcp_servers: vec![],
             skills: vec![],
             knowledge_bases: vec![],
-            max_turns: 50, // 默认值，不应写入
+            max_turns: default_max_turns(), // 默认值，不应写入
             system_prompt: "Be helpful.".into(),
         };
 
@@ -596,7 +596,7 @@ mod tests {
         assert!(profile.tools.is_empty());
         assert!(profile.mcp.is_empty());
         assert!(profile.skills.is_empty());
-        assert_eq!(profile.max_turns, 50);
+        assert_eq!(profile.max_turns, default_max_turns());
         assert_eq!(body, "Be helpful.");
     }
 

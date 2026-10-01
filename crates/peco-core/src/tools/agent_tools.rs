@@ -117,7 +117,7 @@ impl ToolDyn for SaveAgent {
                   agent.description: what this agent does\n\
                 \n\
                 Optional fields: llm (provider, model, temperature, max_tokens, stream, \
-                reasoning_effort), tools, mcp, skills, knowledge_bases, max_turns (default 50).\n\
+                reasoning_effort), tools, mcp, skills, knowledge_bases, max_turns (default 500).\n\
                 \n\
                 Before choosing the tools field, call the list_tools tool (if available in your \
                 toolset) to discover the tools valid in this environment and their descriptions. \

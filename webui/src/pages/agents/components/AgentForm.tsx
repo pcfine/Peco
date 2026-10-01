@@ -542,7 +542,7 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
               })}
             />
             <p className="text-xs text-muted-foreground">
-              单次对话最多执行多少轮 ReAct 循环（默认 50）。
+              单次对话最多执行多少轮 ReAct 循环（默认 500）。
             </p>
             {errors.max_turns && (
               <p className="text-sm text-destructive">
