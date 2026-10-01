@@ -151,6 +151,13 @@ pub struct SessionSnapshotResponse {
     /// 与 `is_running` 的区别只在停靠态：run 已注册但当前无轮次在跑时
     /// 该字段为 false，前端不应附着（否则会挂出一条永不填充的空占位）。
     pub turn_in_flight: bool,
+    /// 在途轮的用户输入文本（无在途轮时缺省）。
+    ///
+    /// 快照只含已 committed 的轮，在途轮不在其中。整页刷新后前端内存全清，仅凭
+    /// `turn_in_flight` 只能补一个空占位 —— 用户刚发出的 query 会消失到该轮落盘
+    /// 为止。下发本字段让前端把它渲染回列表尾部。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inflight_user_input: Option<String>,
     /// 钉扎的历史摘要（compaction 产物）。无压缩历史时缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_summary: Option<String>,
@@ -413,10 +420,21 @@ async fn runner_loop(
         tokio::select! {
             event = handle.recv_event() => match event {
                 Some(ev) => {
-                    if let LooperEvent::OuterStateChange { to, .. } = &ev {
-                        looper_idle = matches!(to, OuterState::Idle);
-                        // 停靠态 = 无轮次在途；附着方据此判断要不要补占位气泡
-                        runs.set_turn_in_flight(&user_id, !looper_idle);
+                    match &ev {
+                        LooperEvent::OuterStateChange { to, .. } => {
+                            looper_idle = matches!(to, OuterState::Idle);
+                            // 停靠态 = 无轮次在途；附着方据此判断要不要补占位气泡
+                            runs.set_turn_in_flight(&user_id, !looper_idle);
+                            // 收尾即清空在途 query —— 与 turn_in_flight 同寿命
+                            if looper_idle {
+                                runs.set_inflight_input(&user_id, None);
+                            }
+                        }
+                        // 在途轮的用户输入：供快照端点在整页刷新后恢复本轮 query
+                        LooperEvent::TurnStart { user_input, .. } => {
+                            runs.set_inflight_input(&user_id, Some(user_input.clone()));
+                        }
+                        _ => {}
                     }
                     // 无订阅者时广播失败是常态（Err 忽略）
                     let _ = event_tx.send(ev.clone());
@@ -704,6 +722,7 @@ pub async fn get_session_snapshot(
         total_usage: usage,
         is_running: state.peco_runs.is_running(&user_id),
         turn_in_flight: state.peco_runs.turn_in_flight(&user_id),
+        inflight_user_input: state.peco_runs.inflight_input(&user_id),
         pinned_summary,
         context_metrics,
         total_turns,

@@ -928,6 +928,53 @@ async fn test_snapshot_reports_turn_in_flight() {
     assert_eq!(body["turn_in_flight"], false);
 }
 
+#[tokio::test]
+async fn test_snapshot_reports_inflight_user_input() {
+    let app = TestApp::new().await;
+
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    // 尚未上报在途输入：字段缺省（serde skip_serializing_if）
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body.get("inflight_user_input").is_none());
+
+    // runner 在 TurnStart 上报本轮 query → 快照带回，供整页刷新后恢复
+    app.state
+        .peco_runs
+        .set_inflight_input(&app.user_id, Some("我刚发的问题".to_string()));
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["turn_in_flight"], true);
+    assert_eq!(body["inflight_user_input"], "我刚发的问题");
+
+    // 轮次收尾（Idle）：字段随 turn_in_flight 一并清空
+    app.state.peco_runs.set_turn_in_flight(&app.user_id, false);
+    app.state.peco_runs.set_inflight_input(&app.user_id, None);
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["turn_in_flight"], false);
+    assert!(body.get("inflight_user_input").is_none());
+}
+
 /// 完整流测试：需要 DEEPSEEK_API_KEY（与 chat 端的 SSE 测试同门槛）。
 /// 覆盖 发起 → 断开 → is_running → 重新附着 → cancel 的端到端链路。
 #[tokio::test]

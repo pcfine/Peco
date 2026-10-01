@@ -58,6 +58,12 @@ struct ActiveEntry {
     ///
     /// 由 runner 在 `OuterStateChange` 时更新，读侧无需取锁。
     turn_in_flight: Arc<AtomicBool>,
+    /// 在途轮的用户输入文本。
+    ///
+    /// 由 runner 在 `TurnStart` 时上报、`OuterStateChange → Idle` 时清空 ——
+    /// 与 `turn_in_flight` 同寿命。快照端点据此让「整页刷新」后仍能显示刚发出、
+    /// 尚未落盘的那句 query（快照只含 committed_turns，不含在途轮）。
+    inflight_input: Option<String>,
 }
 
 /// runner 退出 / 构建失败 / panic unwind 时自清理注册表的守卫。
@@ -137,6 +143,7 @@ impl PecoActiveRuns {
                 event_tx: event_tx.clone(),
                 reclaim_notify: Arc::clone(&reclaim_notify),
                 turn_in_flight: Arc::new(AtomicBool::new(true)),
+                inflight_input: None,
             },
         );
         Some(RunRegistration {
@@ -258,6 +265,26 @@ impl PecoActiveRuns {
             entry.turn_in_flight.store(in_flight, Ordering::Relaxed);
         }
     }
+
+    /// 在途轮的用户输入文本（无 run / 无在途轮时为 `None`）。
+    ///
+    /// 供快照端点在整页刷新（前端内存全清）后恢复「刚发出、尚未落盘」的 query。
+    pub fn inflight_input(&self, user_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(user_id)
+            .and_then(|entry| entry.inflight_input.clone())
+    }
+
+    /// 由 runner 在 `TurnStart` 上报在途轮的用户输入；轮次收尾（Idle）时传
+    /// `None` 清空。无 run 时为 no-op。
+    pub fn set_inflight_input(&self, user_id: &str, input: Option<String>) {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(entry) = map.get_mut(user_id) {
+            entry.inflight_input = input;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,6 +396,31 @@ mod tests {
 
         drop(reg);
         assert!(!registry.turn_in_flight("u1"), "条目移除后回落为 false");
+    }
+
+    #[test]
+    fn inflight_input_tracks_runner_reports() {
+        let registry = PecoActiveRuns::new();
+        assert_eq!(registry.inflight_input("u1"), None, "无 run 时为 None");
+
+        let reg = registry.try_register("u1").expect("register");
+        assert_eq!(registry.inflight_input("u1"), None, "抢注时尚未上报输入");
+
+        registry.set_inflight_input("u1", Some("我刚发的问题".into()));
+        assert_eq!(
+            registry.inflight_input("u1").as_deref(),
+            Some("我刚发的问题")
+        );
+
+        // 轮次收尾（Idle）清空 —— 与 turn_in_flight 同寿命
+        registry.set_inflight_input("u1", None);
+        assert_eq!(registry.inflight_input("u1"), None);
+
+        registry.set_inflight_input("ghost", Some("x".into())); // 无 run：no-op 不 panic
+        assert_eq!(registry.inflight_input("ghost"), None);
+
+        drop(reg);
+        assert_eq!(registry.inflight_input("u1"), None, "条目移除后回落 None");
     }
 
     #[tokio::test]

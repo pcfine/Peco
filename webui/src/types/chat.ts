@@ -162,6 +162,14 @@ export interface SessionSnapshotResponse {
    * 此时附着会挂出一条永不填充的空占位。chat 侧不返回该字段。
    */
   turn_in_flight?: boolean;
+  /**
+   * 在途轮的用户输入文本（无在途轮时缺省）。
+   *
+   * 快照只含已 committed 的轮，在途轮不在其中 —— 整页刷新后前端内存全清，
+   * 仅凭 `turn_in_flight` 只能补一个空占位，用户刚发出的 query 会消失到该轮
+   * 落盘为止。有此字段时把它渲染回列表尾部。chat 侧不返回该字段。
+   */
+  inflight_user_input?: string;
   /** 钉扎的历史摘要（compaction 产物，无压缩历史时缺省） */
   pinned_summary?: string;
   /** 上下文指标（会话不存在时缺省） */

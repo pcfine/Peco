@@ -226,6 +226,41 @@ async function refreshSession(
   let oldestLoadedTurn: number | null;
   let hasMore: boolean;
 
+  // 本地乐观尾部：列表末尾连续的「无 id」消息（乐观 user + 空占位 + 运行中
+  // 横幅）。它们代表服务端尚未 committed 的本轮 —— 快照只含 committed_turns，
+  // 任务进行中时本轮不在快照里；若照旧无条件丢弃，用户刚发的 query 会瞬间
+  // 从列表消失，直到该轮落盘后才回来。
+  const live = get().messages;
+  let localTailStart = live.length;
+  while (localTailStart > 0 && live[localTailStart - 1].id === undefined) {
+    localTailStart -= 1;
+  }
+  // 尾部可能跨多轮：上一轮 turn_complete 后未追平就又发了一条。轮次按序落盘，
+  // 更早的本地轮快照里必已有 —— 只保留最新一段，否则它会与尾部窗口里的同一条
+  // 成对重复渲染；去重判据也必须取这一段的用户消息，拿整段的第一条比对会既漏又错。
+  const localTailAll = live.slice(localTailStart);
+  let localTail = localTailAll;
+  for (let i = localTailAll.length - 1; i > 0; i -= 1) {
+    if (localTailAll[i].role === "user") {
+      localTail = localTailAll.slice(i);
+      break;
+    }
+  }
+  // 只看「最后一条已 committed 轮」的用户消息：本轮若已落盘，只可能是它（轮次按序
+  // 追加、落在窗口末尾）。**不能**用整个窗口 —— 用户重复发同一句话（如「继续」）时，
+  // 在途轮会被历史里的同文本误判为已落盘而丢弃，刚发的 query 再次消失。
+  const lastCommittedUser = [...tailWindow]
+    .reverse()
+    .find((m) => m.role === "user")?.content;
+  const localUser = localTail.find((m) => m.role === "user");
+  // 本地 query 已出现在快照里 = 本轮已 committed → 以快照为准，丢弃本地副本
+  // （否则与尾部窗口重复渲染）。尚未出现 = 在途 → 必须保留。
+  const keepLocal =
+    localTail.length > 0 &&
+    (localUser !== undefined
+      ? lastCommittedUser !== localUser.content
+      : snap.turn_in_flight === true);
+
   if (revisionChanged || get().oldestLoadedTurn === null || tailStart === null) {
     // 首载 / 历史版本变化（compaction）/ 快照无轮：丢弃旧页，只留尾部窗口。
     messages = tailWindow;
@@ -258,6 +293,26 @@ async function refreshSession(
     hasMore = (prevOldest ?? 0) > 0;
   }
 
+  if (keepLocal) {
+    messages = [...messages, ...localTail];
+  }
+
+  // 整页刷新（冷启动）恢复在途轮的 query：此时前端内存全清、localTail 必空，
+  // 而快照只含 committed_turns —— 不补这一条，用户刚发的 query 会一直消失到
+  // 本轮落盘为止。有本地副本时 keepLocal 已覆盖（二者互斥），内容已在快照里时
+  // 由上面的去重判定丢弃，故此注入不会与既有来源重复。
+  const inflightQuery = snap.turn_in_flight ? snap.inflight_user_input : undefined;
+  if (
+    !keepLocal &&
+    inflightQuery !== undefined &&
+    lastCommittedUser !== inflightQuery
+  ) {
+    messages = [
+      ...messages,
+      { role: "user", content: inflightQuery, turnIndex: 0 },
+    ];
+  }
+
   set({
     messages,
     loaded: true,
@@ -274,11 +329,18 @@ async function refreshSession(
   // 同样为真，会挂出一条永不填充的空占位。
   const token = useAuthStore.getState().token;
   if (snap.turn_in_flight && token) {
+    // 保留的本地尾部可能已带空占位（刚发那轮的 assistant 气泡）——
+    // 重复追加会让 delta 落到错误的占位上。判据必须限定「无 id」：快照来源的
+    // 空正文 assistant（如只带工具调用的那一轮）同样满足空正文，误判会让本轮的
+    // delta 全落进那条已落盘的历史消息里。
+    const cur = get().messages;
+    const last = cur[cur.length - 1];
+    const hasPlaceholder =
+      last?.id === undefined && last.role === "assistant" && last.content === "";
     set({
-      messages: [
-        ...get().messages,
-        { role: "assistant", content: "", turnIndex: 0 },
-      ],
+      messages: hasPlaceholder
+        ? cur
+        : [...cur, { role: "assistant", content: "", turnIndex: 0 }],
       isStreaming: true,
     });
     openStream(pecoAttachUrl(), token, set, get);
