@@ -28,7 +28,7 @@ pub enum ContextStrategy {
     /// Token 预算：保留不超过 max_context_tokens 的消息
     TokenBudget {
         max_context_tokens: usize,
-        /// 超出预算时是否用摘要替代早期 turn（Phase 4 实现）
+        /// 超出预算时是否用摘要替代早期 turn（尚未实现）
         summarize_overflow: bool,
     },
     /// 全量历史（默认）

@@ -31,7 +31,7 @@ impl Default for RrfConfig {
         Self {
             k: 60.0,
             // 0.003 过滤单路径弱信号和纯噪声，同时保留所有合法的双路径
-            // 以及强单路径结果。Phase 2 将引入自适应 min_score。
+            // 以及强单路径结果。
             min_score: 0.003,
         }
     }

@@ -102,7 +102,7 @@ impl TemplateContext {
         }
     }
 
-    /// 渲染模板并将其解析为 JSON Value（用于 Tool 类型步骤的参数渲染，Phase 4）。
+    /// 渲染模板并将其解析为 JSON Value（供 Tool 类型步骤的参数渲染用）。
     #[allow(dead_code)]
     pub fn render_json(
         &self,

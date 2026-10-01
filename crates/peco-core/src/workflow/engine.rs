@@ -715,10 +715,10 @@ impl WorkflowEngine {
                             );
                         }
                         OnFailure::Retry => {
-                            // Phase 4: 重试逻辑（此处退化为 Continue）
+                            // 重试逻辑尚未实现，此处退化为 Continue
                             debug!(
                                 step_id = %result.step.id,
-                                "Retry not supported in Phase 1, continuing"
+                                "Retry not supported yet; continuing"
                             );
                         }
                     }

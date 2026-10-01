@@ -213,7 +213,7 @@ pub struct SearchRequest {
     pub strategy: SearchStrategy,
     pub filters: Option<SearchFilters>,
     /// 最低置信度阈值 — 低于此值的结果将被丢弃。
-    /// Phase 1 预留字段（暂不参与过滤逻辑），Phase 2 启用。
+    /// 预留字段，暂不参与过滤逻辑。
     pub min_confidence: Option<ConfidenceLevel>,
 }
 
@@ -277,7 +277,7 @@ pub struct SearchResult {
     pub match_sources: Vec<MatchSource>,
     /// 结果置信度 — 基于信号一致性评估。
     pub confidence: ConfidenceLevel,
-    /// 诊断信息（Phase 1 暂为 None，Phase 2 启用）。
+    /// 诊断信息（当前恒为 None）。
     pub diagnostic: Option<String>,
 }
 

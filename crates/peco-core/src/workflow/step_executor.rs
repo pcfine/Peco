@@ -21,7 +21,7 @@ const DEFAULT_STEP_TIMEOUT_SECS: u64 = 300;
 
 /// 执行单个步骤（静态方法，供 tokio::spawn 使用），返回 StepResult。
 ///
-/// Phase 1 支持 Shell 和 Agent 两种步骤类型。Llm/Tool 在 validate() 阶段已被拒绝。
+/// 仅支持 Shell 和 Agent 两种步骤类型；Llm/Tool 在 validate() 阶段已被拒绝。
 ///
 /// 步骤级超时在此处统一收敛：显式设置 `timeout_seconds` 时用 `tokio::time::timeout`
 /// 包裹整个步骤分派 future；未设置时仅 shell 步骤获得 `DEFAULT_STEP_TIMEOUT_SECS`
@@ -69,7 +69,7 @@ pub(crate) async fn execute_step_static(
                 Err(e) => StepOutcome::Failed(format!("template error: {e}")),
             },
             StepConfig::Llm { .. } | StepConfig::Tool { .. } => {
-                unreachable!("Phase 4 step types are rejected during validation")
+                unreachable!("Llm/Tool step types are rejected during validation")
             }
         }
     };
@@ -130,14 +130,13 @@ async fn execute_shell_step(command: &str) -> StepOutcome {
 
 /// 执行 Agent 类型步骤（复用 SimpleAgentLooper）。
 ///
-/// Phase 1: output_schema 通过在 prompt 末尾追加 JSON schema 指令来处理。
-/// Phase 4: 使用 StructuredOutputExecutor 做真正的结构化输出。
+/// output_schema 通过在 prompt 末尾追加 JSON schema 指令实现，尚未做真正的
+/// 结构化输出。
 ///
-/// TODO(Phase 4): cancel_flag 当前未在 Agent 步骤执行期间检查。
+/// TODO: cancel_flag 当前未在 Agent 步骤执行期间检查。
 /// SimpleAgentLooper 内部等待 LLM 响应时对 tokio 的 abort 不敏感
 ///（tokio JoinHandle::abort 对 pending I/O future 无效），取消信号仅
-/// 在层级边界生效。Phase 4 可考虑为 SimpleAgentLooper 增加取消通道或
-/// timeout 机制来缩短取消响应延迟。
+/// 在层级边界生效；可考虑为其增加取消通道或 timeout 机制来缩短取消响应延迟。
 async fn execute_agent_step(
     agent_access: &Arc<dyn AgentAccess>,
     agent_name: &str,

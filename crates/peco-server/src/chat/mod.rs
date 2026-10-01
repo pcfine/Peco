@@ -54,7 +54,7 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 /// DEPRECATED: 旧路由兼容层（/api/conversations）。
-/// 将在 Phase 4 完全移除。新代码应使用 /api/chat/{agentId}/conversations。
+/// 新代码应使用 /api/chat/{agentId}/conversations。
 pub fn conversation_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_legacy).post(create_legacy))

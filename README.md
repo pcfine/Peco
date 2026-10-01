@@ -260,7 +260,7 @@ steps:
 ---
 ```
 
-Workflow 支持 Shell、Agent 两种步骤类型（Llm、Tool 为 Phase 4 规划），通过 `depends_on` 定义 DAG 拓扑，`condition` 控制条件执行，`{{ steps.X.output }}` 在步骤间传递数据。
+Workflow 支持 Shell、Agent 两种步骤类型（Llm、Tool 已定义类型但尚未实现），通过 `depends_on` 定义 DAG 拓扑，`condition` 控制条件执行，`{{ steps.X.output }}` 在步骤间传递数据。
 
 ## 配置
 

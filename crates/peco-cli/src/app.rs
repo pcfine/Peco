@@ -108,19 +108,19 @@ impl CliApp {
 
     /// 运行完整启动流程：交互选择 Agent → 交互选择 Session → REPL。
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        // ── Phase 1: 选择 Agent ────────────────────────────────────────
+        // ── Step 1: 选择 Agent ─────────────────────────────────────────
         self.init_agent().await?;
 
-        // ── Phase 2: 选择/创建 Session ─────────────────────────────────
+        // ── Step 2: 选择/创建 Session ──────────────────────────────────
         self.init_session().await?;
 
-        // ── Phase 3: Spawn looper ──────────────────────────────────────
+        // ── Step 3: Spawn looper ───────────────────────────────────────
         self.spawn_looper().await?;
 
-        // ── Phase 4: 打印问候 ──────────────────────────────────────────
+        // ── Step 4: 打印问候 ───────────────────────────────────────────
         self.renderer.render_greeting(&self.session_id)?;
 
-        // ── Phase 5: REPL ──────────────────────────────────────────────
+        // ── Step 5: REPL ───────────────────────────────────────────────
         while !self.should_exit {
             match self.input.read_line("> ")? {
                 Some(line) if line.is_empty() => continue,

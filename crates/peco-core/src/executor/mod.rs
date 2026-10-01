@@ -61,7 +61,7 @@ pub struct ExecutorInput {
     pub prompt: String,
     /// 注入到临时 Session 的上下文消息（不含 system prompt）
     pub context: Vec<Arc<InputItem>>,
-    /// 结构化输出 schema（StructuredOutputExecutor 使用，Phase 2）
+    /// 结构化输出 schema（StructuredOutputExecutor 使用）
     pub output_schema: Option<serde_json::Value>,
 }
 
@@ -101,7 +101,7 @@ pub struct ExecutorOutput {
     pub content: String,
     /// Token 用量（SimpleAgentLooper 路径为 Default）
     pub usage: Usage,
-    /// 结构化数据（仅 StructuredOutputExecutor 填充，Phase 2）
+    /// 结构化数据（仅 StructuredOutputExecutor 填充）
     pub structured_data: Option<serde_json::Value>,
     /// 执行的 ReAct 轮数（SimpleAgentLooper 路径为 0）
     pub turns: usize,
@@ -123,7 +123,7 @@ pub enum ExecutorError {
     #[error("agent error: {0}")]
     Agent(#[from] AgentError),
 
-    /// Schema 解析失败（StructuredOutputExecutor，Phase 2）
+    /// Schema 解析失败（StructuredOutputExecutor）
     #[error("schema parse failed after {retries} retries: {message}")]
     Schema { retries: usize, message: String },
 
@@ -143,7 +143,7 @@ pub enum ExecutorError {
     #[error("looper exited unexpectedly: {0}")]
     LooperExited(String),
 
-    /// 链式步骤失败（ChainExecutor，Phase 2）
+    /// 链式步骤失败（ChainExecutor）
     #[error("step {step} failed: {error}")]
     ChainStep {
         step: usize,

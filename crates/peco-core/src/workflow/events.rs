@@ -25,7 +25,7 @@ pub enum WorkflowEvent {
         step_type: String, // "shell" | "agent"
     },
 
-    /// 步骤执行中的增量输出（Phase 4 预留）
+    /// 步骤执行中的增量输出（预留，尚未发出）
     StepDelta {
         run_id: String,
         step_id: String,
@@ -61,7 +61,7 @@ pub enum WorkflowEvent {
         failure_policy: String, // "continue" | "abort" | "retry" | "pause"
     },
 
-    /// 等待重试（Phase 4 预留）
+    /// 等待重试（预留，尚未发出）
     StepRetrying {
         run_id: String,
         step_id: String,

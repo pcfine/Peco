@@ -622,6 +622,6 @@ async fn compute_statistics(
         max_duration_ms: max_dur.unwrap_or(0),
         last_run: last_execution,
         run_history_30d: run_history,
-        step_stats: vec![], // Phase 1: step-level stats require JSON parsing, skip
+        step_stats: vec![], // step 级统计需解析 JSON，暂缺
     })
 }

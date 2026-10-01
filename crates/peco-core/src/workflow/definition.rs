@@ -187,10 +187,10 @@ impl<'de> Deserialize<'de> for WorkflowStep {
 pub enum StepType {
     Shell,
     Agent,
-    /// Phase 4: 纯 LLM 调用（无工具）
+    /// 纯 LLM 调用（无工具），尚未实现
     #[serde(rename = "llm")]
     Llm,
-    /// Phase 4: 调用指定工具
+    /// 调用指定工具，尚未实现
     #[serde(rename = "tool")]
     Tool,
 }
@@ -226,11 +226,11 @@ pub enum StepConfig {
         #[serde(default)]
         max_turns: Option<usize>,
     },
-    /// Phase 4: 纯 LLM 推理
+    /// 纯 LLM 推理，尚未实现
     Llm {
         prompt: String,
     },
-    /// Phase 4: 调用指定工具
+    /// 调用指定工具，尚未实现
     Tool {
         tool_name: String,
         arguments: serde_json::Value,
@@ -555,7 +555,7 @@ impl WorkflowDefinition {
     /// - depends_on 引用的步骤 ID 存在
     /// - 无自身依赖
     /// - 无循环依赖
-    /// - Phase 1 步骤类型过滤（拒绝 Llm/Tool）
+    /// - 步骤类型过滤（拒绝尚未实现的 Llm/Tool）
     pub fn validate(&self) -> Result<(), WorkflowError> {
         use std::collections::HashSet;
 
@@ -570,13 +570,13 @@ impl WorkflowDefinition {
             }
         }
 
-        // 验证 depends_on + Phase 1 类型检查
+        // 验证 depends_on + 步骤类型检查
         for step in &self.steps {
-            // Phase 1: 拒绝 Phase 4 的步骤类型
+            // 拒绝尚未实现的步骤类型
             match &step.config {
                 StepConfig::Llm { .. } | StepConfig::Tool { .. } => {
                     return Err(WorkflowError::Parse(format!(
-                        "step '{}': {:?} type is not supported in Phase 1 (planned for Phase 4)",
+                        "step '{}': {:?} type is not supported yet",
                         step.id, step.step_type
                     )));
                 }

@@ -136,12 +136,12 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **定义格式**：`workflow.md`（YAML frontmatter + 可选 Markdown body），与 `agent.md`/`SKILL.md` 风格一致。
 - **引擎模型**：`WorkflowEngine::spawn()` 在 tokio 任务中运行，通过 `tokio::sync::mpsc` 通道发射 `WorkflowEvent`（Started → StepStarted → StepCompleted/StepFailed/StepSkipped → Completed/Failed/Cancelled）。外部通过 `WorkflowHandle` 消费事件、发送审批决策、取消或等待完成。
 - **DAG 拓扑执行**：Kahn 算法拓扑排序 + BFS 分层，层级间串行，层级内步骤通过 `tokio::spawn` 并行执行。
-- **步骤类型**（Phase 1–2）：`shell`（`tokio::process::Command`）、`agent`（复用 `SimpleAgentLooper`，Agent 自带 `agent.md` 中定义的工具）。Phase 4 计划：`llm`（纯推理）、`tool`（调用 `ToolExecutor`）。
+- **步骤类型**：`shell`（`tokio::process::Command`）、`agent`（复用 `SimpleAgentLooper`，Agent 自带 `agent.md` 中定义的工具）；`llm`（纯推理）、`tool`（调用 `ToolExecutor`）已定义类型但尚未实现。
 - **模板变量**：基于 minijinja，支持 `{{ steps.X.output }}`、`{{ inputs.xxx }}`、`{% if %}` 条件、`truncate`/`length`/`replace` 过滤器。
-- **失败策略**：`Continue`（记录失败继续）| `Abort`（默认，中止并取消同级未完成步骤）| `Pause`（暂停等待审批，通过独立 mpsc channel）| `Retry`（Phase 4）。
+- **失败策略**：`Continue`（记录失败继续）| `Abort`（默认，中止并取消同级未完成步骤）| `Pause`（暂停等待审批，通过独立 mpsc channel）| `Retry`（已定义，尚未实现）。
 - **条件门控**：`condition` 字段通过 minijinja 求值控制步骤是否执行，正交于 `depends_on` 拓扑依赖。
-- **持久化**：`WorkflowPersister` trait（与 `SessionPersister` 同模式）。引擎在 Pause、每层完成、Completed/Failed 时自动保存快照。CLI/测试使用 `NullWorkflowPersister`，peco-server 提供 `SqliteWorkflowPersister`。Phase 3（REST API + SSE 流式 + Cron 触发）已完成。
-- **工具集成**：`execute_workflow` 是一个 `ToolDyn` 工具，Agent 可在 ReAct 循环中调用（同步阻塞语义，适合短 workflow）。`OutputSchema` 功能通过在 prompt 中追加 JSON schema 指令实现，Phase 4 将使用 `StructuredOutputExecutor`。
+- **持久化**：`WorkflowPersister` trait（与 `SessionPersister` 同模式）。引擎在 Pause、每层完成、Completed/Failed 时自动保存快照。CLI/测试使用 `NullWorkflowPersister`，peco-server 提供 `SqliteWorkflowPersister`。
+- **工具集成**：`execute_workflow` 是一个 `ToolDyn` 工具，Agent 可在 ReAct 循环中调用（同步阻塞语义，适合短 workflow）。`OutputSchema` 功能通过在 prompt 中追加 JSON schema 指令实现，尚未做真正的结构化输出。
 - **DI 契约**：`WorkflowAccess` trait（窄接口，load/list/reload）由 `WorkSpace` 实现，注入 `ToolDependencies`。
 
 **MCP**（[crates/peco-core/src/mcp/](crates/peco-core/src/mcp/)）：

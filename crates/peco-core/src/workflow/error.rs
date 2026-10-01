@@ -33,7 +33,7 @@ pub enum WorkflowError {
     #[error("workflow cancelled")]
     Cancelled,
 
-    /// 持久化错误（Phase 2）
+    /// 持久化错误
     #[error("persistence error: {0}")]
     Persist(String),
 

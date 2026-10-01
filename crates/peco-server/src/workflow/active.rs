@@ -2,11 +2,11 @@
 // ActiveExecutions — 活跃 Workflow 执行注册表
 // ============================================================================
 //
-// 事件转发架构（Phase 1 为 Phase 3 SSE 做准备）：
+// 事件转发架构：
 //
 //   WorkflowHandle ──→ tokio task ──→ broadcast::Sender<WorkflowEvent>
 //                                          │
-//                     mpsc::Receiver         ├── Phase 3 SSE endpoint (subscribe)
+//                     mpsc::Receiver         ├── SSE endpoint (subscribe)
 //                     (control commands)     │
 //
 // 后台任务从 handle 消费事件，转发到 broadcast channel。
@@ -29,7 +29,6 @@ enum ControlCommand {
 struct ActiveEntry {
     control_tx: mpsc::Sender<ControlCommand>,
     /// Broadcast sender for forwarding WorkflowEvents to subscribers (e.g., SSE endpoint).
-    /// Phase 1: sender exists but no subscribers yet. Phase 3: SSE endpoint subscribes.
     event_tx: broadcast::Sender<WorkflowEvent>,
 }
 
@@ -65,7 +64,7 @@ pub async fn approve_run(run_id: &str, decision: ApprovalDecision, note: Option<
 ///
 /// 返回 broadcast Receiver，调用方可通过 `recv().await` 消费事件。
 /// 若执行不存在或已完成，返回 None。
-/// Phase 3 由 SSE endpoint 调用。
+/// 由 SSE endpoint 调用。
 pub fn subscribe_events(run_id: &str) -> Option<broadcast::Receiver<WorkflowEvent>> {
     let map = ACTIVE.lock().unwrap();
     map.get(run_id).map(|entry| entry.event_tx.subscribe())

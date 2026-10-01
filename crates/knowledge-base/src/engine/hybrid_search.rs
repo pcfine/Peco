@@ -33,7 +33,7 @@ use tracing::{info, warn};
 ///
 /// 设计原则：宁缺毋滥 — 优先降低假阳性，可接受少量假阴性。
 ///
-/// 注意：Phase 2 中，当启用自适应管道时，此常量作为
+/// 注意：启用自适应管道时，此常量作为
 /// `PathCalibration::adaptive_threshold` 的下限。
 /// 每个路径的实际阈值会根据其分数分布动态上调。
 const MIN_VECTOR_SCORE: f32 = 0.55;
@@ -148,8 +148,7 @@ fn confidence_from_cv(cv: CrossValidation) -> ConfidenceLevel {
 /// 3. **Layer 3 — 交叉验证**：检查跨路径的一致性。
 /// 4. **Layer 4 — 自适应融合**：根据信号质量调整 RRF 参数。
 ///
-/// 当未设置查询分析器时，引擎使用 Phase 1 的简单固定阈值行为
-/// （向后兼容）。
+/// 当未设置查询分析器时，引擎使用简单固定阈值行为（向后兼容）。
 pub struct HybridSearchEngine {
     doc_store: Arc<dyn DocumentStore>,
     vector_index: Option<Arc<dyn VectorIndex>>,
@@ -216,7 +215,7 @@ impl HybridSearchEngine {
 
     /// 注入查询分析器以启用自适应 Layer 1–4 管道。
     ///
-    /// 未设置时，引擎回退到 Phase 1 的固定阈值行为。
+    /// 未设置时，引擎回退到固定阈值行为。
     pub fn with_query_analyzer(mut self, analyzer: Box<dyn QueryAnalyzer>) -> Self {
         self.query_analyzer = Some(analyzer);
         self
@@ -280,7 +279,7 @@ impl HybridSearchEngine {
         if self.has_adaptive_pipeline() {
             self.compose_search_adaptive(request, &strategy).await
         } else {
-            self.compose_search_phase1(request, &strategy).await
+            self.compose_search(request, &strategy).await
         }
     }
 
@@ -314,13 +313,13 @@ impl HybridSearchEngine {
     }
 
     // ------------------------------------------------------------------
-    // Phase 1 compose_search（向后兼容）
+    // compose_search —— 固定阈值路径（向后兼容）
     // ------------------------------------------------------------------
 
-    /// Phase 1 搜索：固定阈值 + 简单单路径弱信号检查。
+    /// 固定阈值搜索：简单单路径弱信号检查。
     ///
     /// 当未通过 [`with_query_analyzer`] 设置查询分析器时使用。
-    async fn compose_search_phase1(
+    async fn compose_search(
         &self,
         request: &SearchRequest,
         strategy: &SearchStrategy,
@@ -415,7 +414,7 @@ impl HybridSearchEngine {
             return Ok(Vec::new());
         }
 
-        // ── Phase 1 简单信号检查 ──
+        // ── 简单信号检查 ──
         if ranked_lists.len() == 1 {
             let all_weak = ranked_lists[0].1.iter().all(|(_, s)| *s < 0.6);
             if all_weak {
@@ -457,7 +456,7 @@ impl HybridSearchEngine {
     }
 
     // ------------------------------------------------------------------
-    // Phase 2 compose_search_adaptive（Layer 1–4 管道）
+    // 自适应路径 compose_search_adaptive（Layer 1–4 管道）
     // ------------------------------------------------------------------
 
     /// 自适应搜索：完整的 Layer 1–4 管道。
@@ -936,7 +935,7 @@ mod tests {
         (doc, vec![chunk])
     }
 
-    // ── Phase 1 兼容性测试（无 query_analyzer） ──
+    // ── 固定阈值路径兼容性测试（无 query_analyzer） ──
 
     #[tokio::test]
     async fn hybrid_search_basic() {
@@ -1046,7 +1045,7 @@ mod tests {
         assert!(et.is_empty());
     }
 
-    // ── Phase 1 regression tests ──
+    // ── 固定阈值路径回归测试 ──
 
     #[tokio::test]
     async fn search_relevant_query_returns_results() {
@@ -1142,7 +1141,7 @@ mod tests {
         }
     }
 
-    // ── Phase 2 自适应管道测试 ──
+    // ── 自适应管道测试 ──
 
     #[tokio::test]
     async fn adaptive_pipeline_enabled_with_query_analyzer() {

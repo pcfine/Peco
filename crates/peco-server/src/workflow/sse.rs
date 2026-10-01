@@ -175,7 +175,7 @@ impl WorkflowSseEvent {
 ///
 /// - **单参数**：所有 `WorkflowEvent` 变体均自包含 `run_id: String`
 ///   （见 events.rs 头部注释），无需外部注入
-/// - **返回 Option**：`StepDelta` / `StepRetrying`（Phase 4 预留）返回 `None`，
+/// - **返回 Option**：`StepDelta` / `StepRetrying`（预留）返回 `None`，
 ///   调用方跳过该事件，不 panic
 /// - **不写 `_` 通配符**：显式匹配全部 13 个变体，编译器在新增变体时产生
 ///   non-exhaustive match 错误，开发者必须显式决定处理方式
@@ -206,7 +206,7 @@ pub fn map_event(event: &WorkflowEvent) -> Option<WorkflowSseEvent> {
             step_id,
             text: _text,
         } => {
-            // Phase 4 预留 — 前端暂无对应类型，静默跳过
+            // 预留事件，前端暂无对应类型，静默跳过
             tracing::debug!(%run_id, %step_id, "StepDelta not mapped to SSE");
             None
         }
@@ -256,7 +256,7 @@ pub fn map_event(event: &WorkflowEvent) -> Option<WorkflowSseEvent> {
         WorkflowEvent::StepRetrying {
             run_id, step_id, ..
         } => {
-            // Phase 4 预留 — 前端暂无对应类型，静默跳过
+            // 预留事件，前端暂无对应类型，静默跳过
             tracing::debug!(%run_id, %step_id, "StepRetrying not mapped to SSE");
             None
         }
@@ -573,10 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn test_map_event_phase4_variants_return_none() {
+    fn test_map_event_reserved_variants_return_none() {
         let rid = test_run_id();
 
-        // StepDelta — Phase 4 预留，不 panic
+        // StepDelta — 预留，不 panic
         let ev = WorkflowEvent::StepDelta {
             run_id: rid.clone(),
             step_id: "s1".into(),
@@ -584,7 +584,7 @@ mod tests {
         };
         assert!(map_event(&ev).is_none());
 
-        // StepRetrying — Phase 4 预留，不 panic
+        // StepRetrying — 预留，不 panic
         let ev = WorkflowEvent::StepRetrying {
             run_id: rid.clone(),
             step_id: "s1".into(),
