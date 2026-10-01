@@ -16,6 +16,7 @@
 // 模型只需维护少量明确规则 — 复杂度体现在驱逐选择而非提示词。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use model_provider::{ContentBlock, GenerateRequest, InputItem, ReasoningConfig, Role};
@@ -98,6 +99,13 @@ pub trait TurnSummarizer: Send + Sync {
     async fn summarize_inflight(&self, inflight_transcript: &str) -> Result<String, AgentError>;
 }
 
+/// 元任务调用的输出预算。
+///
+/// 摘要提示词要求 500 字符以内，但实测正文常到 1500–1900 字符（约 800–1300 token）——
+/// 1024 的旧值贴着真实输出长度，模型稍有超出即以 `Incomplete` 失败。4096 留足余量；
+/// 这是**上限**而非目标长度，超出提示词要求的部分照收。
+const SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 4096;
+
 /// 基于 [`ModelProvider`] 的摘要器 — 复用主 Agent 的 provider，
 /// 用 Flash 档模型做低成本摘要。
 pub struct ModelSummarizer {
@@ -111,7 +119,7 @@ impl ModelSummarizer {
         Self {
             provider,
             model: model.into(),
-            max_output_tokens: 1024,
+            max_output_tokens: SUMMARIZER_MAX_OUTPUT_TOKENS,
         }
     }
 
@@ -237,6 +245,16 @@ pub fn strip_summary_wrapper(content: &str) -> &str {
 // CompactionPolicy
 // ============================================================================
 
+/// 连续摘要失败达到该次数即放弃调用摘要模型，转为降级强制驱逐。
+///
+/// 阈值存在的意义是「给瞬时故障几次机会，但绝不允许死锁」：摘要请求由固定的 pinned
+/// 摘要 + 固定的被驱逐转录拼成，只要失败原因是请求本身（超长、内容触发过滤），
+/// 重试多少次都是同一个请求 —— 不设上限就是每轮边界白烧一次模型调用且永不推进。
+const MAX_CONSECUTIVE_SUMMARY_FAILURES: u32 = 3;
+
+/// 降级摘要保留的原始转录字符上限。
+const DEGRADED_SUMMARY_MAX_CHARS: usize = 4_000;
+
 /// 压缩策略参数 + 摘要器。
 #[derive(Clone)]
 pub struct CompactionPolicy {
@@ -245,6 +263,13 @@ pub struct CompactionPolicy {
     /// 压缩后 verbatim 保留区目标 token（从最新轮往回保留）。
     pub keep_recent_tokens: usize,
     pub summarizer: Arc<dyn TurnSummarizer>,
+    /// 跨 turn 边界累计的「摘要生成失败」计数，成功后清零。
+    ///
+    /// `Arc<AtomicU32>` 而非裸 `u32`：`CompactionPolicy` 必须保持 `Clone`
+    /// （随 `PecoConfig` 被复制），而计数是要跨调用累积的状态 —— 若随克隆各持一份，
+    /// 每个副本都从 0 开始，阈值永远够不着。私有字段：计数是策略内部状态，
+    /// 调用方只能经 [`CompactionPolicy::new`] 构造（初始恒为 0）。
+    consecutive_summary_failures: Arc<AtomicU32>,
 }
 
 /// 一次压缩的结果。
@@ -258,9 +283,27 @@ pub struct CompactionOutcome {
     pub estimated_tokens_before: usize,
     /// 压缩后估算 token
     pub estimated_tokens_after: usize,
+    /// 本次摘要是否为**降级摘要**（摘要模型连续失败后的机械兜底）。
+    ///
+    /// 降级仍然驱逐、仍然推进，只是 pinned 摘要退化为原始转录截断 ——
+    /// 这条路径必须可观测，否则「上下文被悄悄换成了转录碎片」无人知晓。
+    pub degraded: bool,
 }
 
 impl CompactionPolicy {
+    pub fn new(
+        trigger_tokens: usize,
+        keep_recent_tokens: usize,
+        summarizer: Arc<dyn TurnSummarizer>,
+    ) -> Self {
+        Self {
+            trigger_tokens,
+            keep_recent_tokens,
+            summarizer,
+            consecutive_summary_failures: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
     /// 在 turn 边界检查并执行压缩（若有必要）。
     ///
     /// 返回 `Ok(None)` 表示无需压缩或单轮即超预算（不驱逐）。
@@ -321,10 +364,25 @@ impl CompactionPolicy {
             })
             .filter(|s| !s.is_empty());
 
-        let summary = self
+        // 摘要生成：失败只累计计数，不改变会话。连续失败到阈值时**不再重试**，
+        // 改用机械摘要 —— 宁可 pinned 摘要退化，也不能让驱逐永远不发生。
+        let (summary, degraded) = match self
             .summarizer
             .summarize(previous.as_deref(), &transcript)
-            .await?;
+            .await
+        {
+            Ok(summary) => (summary, false),
+            Err(e) => {
+                let failures = self
+                    .consecutive_summary_failures
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
+                if failures < MAX_CONSECUTIVE_SUMMARY_FAILURES {
+                    return Err(e);
+                }
+                (degraded_summary(&transcript, failures), true)
+            }
+        };
 
         let evicted = session
             .compact(evict_count, summary.clone())
@@ -332,6 +390,10 @@ impl CompactionPolicy {
         if evicted == 0 {
             return Ok(None);
         }
+
+        // 驱逐成功即摘要链路已在推进 —— 清零计数。降级路径同样清零：否则下一个
+        // 边界上计数仍贴着阈值，一次普通失败就会立刻再降级。
+        self.consecutive_summary_failures.store(0, Ordering::SeqCst);
 
         // evicted == evict_count（compact 的 clamp 不会更小，因 keep_count ≥ 1），
         // 保留区 token 即 keep_tokens，无需重新遍历 committed
@@ -345,8 +407,24 @@ impl CompactionPolicy {
             summary,
             estimated_tokens_before: total,
             estimated_tokens_after: pinned_after + keep_tokens,
+            degraded,
         }))
     }
+}
+
+/// 机械摘要：摘要模型连续失败时，以被驱逐转录的前 [`DEGRADED_SUMMARY_MAX_CHARS`]
+/// 个字符充当 pinned 摘要。
+///
+/// 前缀必须写明降级原因 —— 读到这条摘要的模型（以及人）要知道它是原始转录碎片，
+/// 而不是模型的结论。截断走 `chars().take()`：转录是中文，按字节切会切坏 UTF-8。
+fn degraded_summary(transcript: &str, failures: u32) -> String {
+    let head: String = transcript
+        .chars()
+        .take(DEGRADED_SUMMARY_MAX_CHARS)
+        .collect();
+    wrap_summary(format!(
+        "[降级摘要] 摘要模型连续 {failures} 次失败，以下为被折叠历史的原始转录截断：\n{head}"
+    ))
 }
 
 /// 单条消息在转录中的最大字符数。
@@ -653,11 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_compaction_below_trigger() {
-        let policy = CompactionPolicy {
-            trigger_tokens: usize::MAX,
-            keep_recent_tokens: 1000,
-            summarizer: Arc::new(MockSummarizer),
-        };
+        let policy = CompactionPolicy::new(usize::MAX, 1000, Arc::new(MockSummarizer));
         let mut session = make_session_with_turns(3);
         assert!(policy.maybe_compact(&mut session).await.unwrap().is_none());
         assert_eq!(session.committed_turns().len(), 3);
@@ -666,11 +740,7 @@ mod tests {
     #[tokio::test]
     async fn test_compaction_evicts_oldest_and_pins() {
         // 每 turn 约 2 条 × 25 字 × 0.6 ≈ 30 token。阈值 80 触发，保留区 40。
-        let policy = CompactionPolicy {
-            trigger_tokens: 80,
-            keep_recent_tokens: 40,
-            summarizer: Arc::new(MockSummarizer),
-        };
+        let policy = CompactionPolicy::new(80, 40, Arc::new(MockSummarizer));
         let mut session = make_session_with_turns(4);
         let outcome = policy.maybe_compact(&mut session).await.unwrap().unwrap();
 
@@ -692,11 +762,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_oversized_turn_not_evicted() {
-        let policy = CompactionPolicy {
-            trigger_tokens: 1, // 任何内容都触发
-            keep_recent_tokens: 0,
-            summarizer: Arc::new(MockSummarizer),
-        };
+        // 任何内容都触发
+        let policy = CompactionPolicy::new(1, 0, Arc::new(MockSummarizer));
         let mut session = make_session_with_turns(1);
         // 单轮：keep_count 恒为 1，无可驱逐
         assert!(policy.maybe_compact(&mut session).await.unwrap().is_none());
@@ -727,11 +794,7 @@ mod tests {
         let summarizer = Arc::new(CaptureSummarizer {
             seen_previous: std::sync::Mutex::new(None),
         });
-        let policy = CompactionPolicy {
-            trigger_tokens: 1,
-            keep_recent_tokens: 0,
-            summarizer: summarizer.clone(),
-        };
+        let policy = CompactionPolicy::new(1, 0, summarizer.clone());
 
         let mut session = make_session_with_turns(3);
         let _ = session.compact(1, wrap_summary("v1")).unwrap();
@@ -758,5 +821,270 @@ mod tests {
             ),
             "v2"
         );
+    }
+
+    /// 追加一轮到既有会话，内容量级与 [`make_session_with_turns`] 一致。
+    fn push_turn(session: &mut Session, i: usize) {
+        session
+            .start_turn(format!("这是第 {i} 轮的问题，内容足够长以产生 token 占用。").into())
+            .unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::Message {
+                    role: Role::Assistant,
+                    content: format!("这是第 {i} 轮的回答，同样足够长以产生 token 占用。").into(),
+                },
+            )
+            .unwrap();
+        let _ = session.commit_turn().unwrap();
+    }
+
+    /// 记录请求的假 provider —— 只关心摘要器发出的输出预算。
+    struct CaptureProvider {
+        seen_max_output_tokens: std::sync::Mutex<Option<u32>>,
+    }
+
+    #[async_trait]
+    impl model_provider::ModelProvider for CaptureProvider {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        async fn generate_full(
+            &self,
+            request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateResult, model_provider::ProviderError> {
+            *self.seen_max_output_tokens.lock().unwrap() = request.max_output_tokens;
+            Ok(model_provider::GenerateResult {
+                id: "r1".to_string(),
+                output: vec![ContentBlock::Text {
+                    text: "摘要".to_string(),
+                }],
+                usage: model_provider::Usage::default(),
+                status: model_provider::ResponseStatus::Completed,
+                finish_reason: None,
+                error: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateStream, model_provider::ProviderError> {
+            unimplemented!("meta tasks never stream")
+        }
+    }
+
+    /// 摘要请求的输出预算必须留出余量：实测摘要正文 1500–1900 字符（约 800–1300 token），
+    /// 贴着 1024 会被 max_tokens 截断成 `Incomplete`，压缩从此永不成功。
+    #[tokio::test]
+    async fn test_summarizer_requests_full_output_budget() {
+        let capture = Arc::new(CaptureProvider {
+            seen_max_output_tokens: std::sync::Mutex::new(None),
+        });
+        let provider: Arc<dyn model_provider::ModelProvider> = capture.clone();
+        let summarizer = ModelSummarizer::new(provider, "m");
+
+        summarizer.summarize(None, "转录").await.unwrap();
+
+        assert_eq!(
+            *capture.seen_max_output_tokens.lock().unwrap(),
+            Some(SUMMARIZER_MAX_OUTPUT_TOKENS),
+            "摘要请求必须带上摘要器的输出预算"
+        );
+        assert_eq!(
+            SUMMARIZER_MAX_OUTPUT_TOKENS, 4096,
+            "预算须显著高于实测摘要长度，1024 会让摘要长期贴顶被截断"
+        );
+    }
+
+    /// 恒定失败的摘要器 —— 驱动连续失败 → 降级驱逐。
+    struct FailingSummarizer;
+
+    #[async_trait]
+    impl TurnSummarizer for FailingSummarizer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _evicted: &str,
+        ) -> Result<String, AgentError> {
+            Err(AgentError::Compaction(
+                "summary generation incomplete".to_string(),
+            ))
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            unimplemented!("compaction tests never compose turn epilogues")
+        }
+    }
+
+    /// 摘要模型持续失败时，压缩**必须**在有限次后仍然驱逐 —— 否则每轮边界重发同一个
+    /// 必然失败的请求，白烧 token 且上下文无界增长。
+    #[tokio::test]
+    async fn test_consecutive_summary_failures_degrade_to_forced_eviction() {
+        let policy = CompactionPolicy::new(1, 0, Arc::new(FailingSummarizer));
+        let mut session = make_session_with_turns(4);
+
+        // 阈值之前：维持「非致命失败」语义，一轮都不驱逐
+        for attempt in 1..MAX_CONSECUTIVE_SUMMARY_FAILURES {
+            assert!(
+                policy.maybe_compact(&mut session).await.is_err(),
+                "第 {attempt} 次失败应原样返回 Err"
+            );
+            assert_eq!(session.committed_turns().len(), 4, "摘要失败不得驱逐任何轮");
+            assert!(session.pinned_summary().is_none());
+        }
+
+        // 达到阈值：不再调用模型，机械摘要 + 强制驱逐
+        let outcome = policy
+            .maybe_compact(&mut session)
+            .await
+            .expect("降级路径必须返回 Ok")
+            .expect("降级路径必须产出 outcome");
+
+        assert!(outcome.degraded, "机械摘要必须标记为降级");
+        assert!(outcome.evicted_turns > 0, "降级路径必须真的驱逐");
+        assert_eq!(
+            session.committed_turns().len(),
+            4 - outcome.evicted_turns,
+            "会话轮数必须实际减少"
+        );
+        assert!(outcome.summary.starts_with(SUMMARY_OPEN));
+        assert!(outcome.summary.ends_with(SUMMARY_CLOSE));
+        let body = strip_summary_wrapper(&outcome.summary);
+        assert!(
+            body.contains("[降级摘要]"),
+            "降级摘要必须自带降级标注，否则无从知晓 pinned 已退化为转录碎片"
+        );
+
+        // 驱逐后 pinned 即该降级摘要
+        let pinned = session.pinned_summary().unwrap();
+        assert_eq!(
+            match pinned.message.as_ref() {
+                InputItem::Message { content, .. } => content.text_view().to_string(),
+                _ => panic!("expected message"),
+            },
+            outcome.summary
+        );
+    }
+
+    /// 脚本化摘要器：按序弹出 `true` = 失败 / `false` = 成功。
+    struct ScriptedSummarizer {
+        script: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    }
+
+    #[async_trait]
+    impl TurnSummarizer for ScriptedSummarizer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _evicted: &str,
+        ) -> Result<String, AgentError> {
+            let fail = self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script exhausted");
+            if fail {
+                Err(AgentError::Compaction("boom".to_string()))
+            } else {
+                Ok(wrap_summary("成功摘要"))
+            }
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            unimplemented!("compaction tests never compose turn epilogues")
+        }
+    }
+
+    /// 成功路径清零计数：失败 → 成功 → 失败，第三次失败仍是普通 Err 而非降级。
+    #[tokio::test]
+    async fn test_success_resets_consecutive_failure_counter() {
+        let policy = CompactionPolicy::new(
+            1,
+            0,
+            Arc::new(ScriptedSummarizer {
+                script: std::sync::Mutex::new([true, false, true].into_iter().collect()),
+            }),
+        );
+        let mut session = make_session_with_turns(4);
+
+        // 1. 失败
+        assert!(policy.maybe_compact(&mut session).await.is_err());
+        assert_eq!(session.committed_turns().len(), 4);
+
+        // 2. 成功 —— 计数清零（补两轮以保证仍有可驱逐轮）
+        push_turn(&mut session, 4);
+        push_turn(&mut session, 5);
+        let ok = policy.maybe_compact(&mut session).await.unwrap().unwrap();
+        assert!(!ok.degraded);
+        assert!(ok.evicted_turns > 0);
+
+        // 3. 再失败一次：若计数没清零，这里会直接降级
+        let remaining = session.committed_turns().len();
+        push_turn(&mut session, 6);
+        push_turn(&mut session, 7);
+        assert!(
+            policy.maybe_compact(&mut session).await.is_err(),
+            "成功已清零计数，单次失败不得触发降级"
+        );
+        assert_eq!(
+            session.committed_turns().len(),
+            remaining + 2,
+            "未达阈值不得驱逐"
+        );
+    }
+
+    /// 降级摘要是**按字符**截断：转录含中文时按字节切会切坏 UTF-8（panic）。
+    #[test]
+    fn test_degraded_summary_truncates_on_char_boundary() {
+        let transcript = "汉".repeat(DEGRADED_SUMMARY_MAX_CHARS * 2 + 7);
+        let summary = degraded_summary(&transcript, 3);
+
+        assert!(summary.starts_with(SUMMARY_OPEN));
+        assert!(summary.ends_with(SUMMARY_CLOSE));
+        let body = strip_summary_wrapper(&summary);
+        assert!(body.contains("[降级摘要]"), "降级摘要须自带标注");
+        assert!(body.contains("连续 3 次失败"), "标注须写明失败次数");
+
+        // 正文末行即被截断的转录，长度恰为字符上限（而非字节数的一半）
+        let head = body.rsplit('\n').next().unwrap();
+        assert_eq!(head.chars().count(), DEGRADED_SUMMARY_MAX_CHARS);
+        assert!(head.chars().all(|c| c == '汉'));
+    }
+
+    /// 端到端：多字节超长转录走降级路径，摘要长度受控且未切坏字符。
+    #[tokio::test]
+    async fn test_degraded_eviction_bounds_multibyte_transcript() {
+        let policy = CompactionPolicy::new(1, 0, Arc::new(FailingSummarizer));
+        let mut session = Session::new("test".to_string(), "test".to_string());
+        for i in 0..4 {
+            session
+                .start_turn(format!("第{i}轮：{}", "汉".repeat(3_000)).into())
+                .unwrap();
+            let _ = session.commit_turn().unwrap();
+        }
+
+        // 失败路径不驱逐，转录在三次调用间不变 —— 先算出它，好逐字符比对
+        let expected_transcript = build_transcript(&session.committed_turns()[..3]);
+        let expected_head: String = expected_transcript
+            .chars()
+            .take(DEGRADED_SUMMARY_MAX_CHARS)
+            .collect();
+        assert!(expected_transcript.chars().count() > DEGRADED_SUMMARY_MAX_CHARS);
+
+        for _ in 1..MAX_CONSECUTIVE_SUMMARY_FAILURES {
+            assert!(policy.maybe_compact(&mut session).await.is_err());
+        }
+        let outcome = policy.maybe_compact(&mut session).await.unwrap().unwrap();
+        assert!(outcome.degraded);
+
+        let body = strip_summary_wrapper(&outcome.summary);
+        let head = body.split_once('\n').expect("降级摘要须有标注行").1;
+        // 逐字符相等即证明按字符边界截断：按字节切会 panic，丢弃式解码会出替换字符
+        assert_eq!(head, expected_head, "降级摘要须为转录前 N 字符的精确前缀");
+        assert_eq!(head.chars().count(), DEGRADED_SUMMARY_MAX_CHARS);
     }
 }

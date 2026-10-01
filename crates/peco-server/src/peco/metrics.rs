@@ -251,6 +251,7 @@ mod tests {
             summary: "## 已做决定\n- 采用方案 A".to_string(),
             estimated_tokens_before: 24_500,
             estimated_tokens_after: 8_800,
+            degraded: false,
         };
         hook.on_context_compacted(&outcome).await;
 

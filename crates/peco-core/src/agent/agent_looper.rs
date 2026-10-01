@@ -2010,12 +2010,25 @@ impl AgentLooper {
                 if let Some(policy) = &self.config.compaction {
                     match policy.maybe_compact(&mut self.session).await {
                         Ok(Some(outcome)) => {
-                            info!(
-                                evicted_turns = outcome.evicted_turns,
-                                tokens_before = outcome.estimated_tokens_before,
-                                tokens_after = outcome.estimated_tokens_after,
-                                "Context compacted at turn boundary"
-                            );
+                            // 降级摘要（摘要模型连续失败后的机械兜底）走 warn：
+                            // 驱逐照常发生，但 pinned 摘要已退化为转录碎片，必须能被看见。
+                            if outcome.degraded {
+                                warn!(
+                                    evicted_turns = outcome.evicted_turns,
+                                    tokens_before = outcome.estimated_tokens_before,
+                                    tokens_after = outcome.estimated_tokens_after,
+                                    degraded = outcome.degraded,
+                                    "Context compacted with degraded summary at turn boundary"
+                                );
+                            } else {
+                                info!(
+                                    evicted_turns = outcome.evicted_turns,
+                                    tokens_before = outcome.estimated_tokens_before,
+                                    tokens_after = outcome.estimated_tokens_after,
+                                    degraded = outcome.degraded,
+                                    "Context compacted at turn boundary"
+                                );
+                            }
                             Self::emit_event_guaranteed(
                                 &self.event_speaker,
                                 LooperEvent::ContextCompacted {

@@ -83,11 +83,11 @@ impl PecoManager {
         ));
         let mut config = config;
         config.epilogue = Some(Arc::clone(&summarizer));
-        config.compaction = Some(Arc::new(CompactionPolicy {
-            trigger_tokens: config.compaction_trigger_tokens,
-            keep_recent_tokens: config.compaction_keep_recent_tokens,
+        config.compaction = Some(Arc::new(CompactionPolicy::new(
+            config.compaction_trigger_tokens,
+            config.compaction_keep_recent_tokens,
             summarizer,
-        }));
+        )));
 
         // ── 5.5 记忆双路径（写 hook + 读 dynamic_context）────────────────
         //
