@@ -354,10 +354,10 @@ fn estimate_tokens_arc(messages: &[Arc<InputItem>]) -> usize {
 
 /// 校准 token 估算：CJK 字符 ≈ 0.6 token/字符，其它 ≈ 0.3 token/字符。
 ///
-/// 旧的 `字节 × 0.3` 估算对中文系统性偏差（UTF-8 每汉字 3 字节 × 0.3 ≈ 0.9
-/// token/字，高估 1.5×；纯 ASCII 场景则低估）。此估算器按字符类别分别计权，
-/// 供上下文压缩、历史窗口预算与 ContextUsage 等所有 token 估算路径使用 —
-/// 全项目单一实现，防漂移。
+/// 按字节 × 0.3 估算对中文系统性偏差（UTF-8 每汉字 3 字节 × 0.3 ≈ 0.9 token/字，
+/// 高估 1.5×；纯 ASCII 场景则低估），故此处按字符类别分别计权。供上下文压缩、
+/// 历史窗口预算与 ContextUsage 等所有 token 估算路径使用 —— 全项目单一实现，
+/// 防漂移。
 pub fn estimate_item_tokens(item: &InputItem) -> usize {
     estimate_str_tokens(&input_item_text(item))
 }

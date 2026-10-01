@@ -584,8 +584,8 @@ mod tests {
     #[tokio::test]
     async fn test_incremental_append_after_compaction() {
         // compaction 后 turn_index 计数器不再等于 committed_turns.len()，
-        // 增量追加必须按「位置」取边界 —— 旧实现用 turn_index 切片，
-        // 压缩后的首次追加会以越界切片 panic（committed_turns[2..3]，len=2）。
+        // 增量追加必须按「位置」取边界 —— 若按 turn_index 切片，压缩后的首次
+        // 追加会越界 panic（committed_turns[2..3]，len=2）。
         let p = setup("append-after-compact").await;
         let id = "append-after-compact-session";
 

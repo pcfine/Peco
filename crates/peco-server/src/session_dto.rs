@@ -2,9 +2,9 @@
 // Session 快照 DTO 分组辅助 — InputItem → 中立分组消息
 // ============================================================================
 //
-// 迁移后 Session 以 `InputItem` 细粒度存储，而前端快照仍消费旧的 `Message`
-// 形状（assistant 消息合并 reasoning + tool_calls）。本模块提供中立分组，
-// 并额外保留每条消息的来源与时间戳，供三处快照 handler 复用。
+// Session 以 `InputItem` 细粒度存储，前端快照消费 `Message` 形状（assistant
+// 消息合并 reasoning + tool_calls）。本模块提供中立分组，并额外保留每条消息的
+// 来源与时间戳，供三处快照 handler 复用。
 
 use model_provider::{InputItem, Role, ToolCall};
 use peco_core::session::{AnnotatedMessage, MessageSource, strip_merge_markers};

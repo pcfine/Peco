@@ -6,7 +6,6 @@
 // PecoManager 构造期填充 — handler 无需改动即可增减注入组件。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use peco_core::agent::hooks::LooperHook;
 use peco_core::agent::{CompactionPolicy, DynamicContext, LooperConfig, MessageFilter};
@@ -18,10 +17,6 @@ use super::memory::MemoryConfig;
 pub struct PecoConfig {
     /// 事件通道缓冲区大小
     pub event_buffer: usize,
-    /// 每轮超时
-    pub per_turn_timeout_secs: u64,
-    /// 总超时
-    pub total_timeout_secs: u64,
     /// 历史轮 verbatim 保留区 token 预算（不含当前轮与 pinned 摘要）。
     ///
     /// 口径：仅统计轮内 viewable 条目（User / Assistant 文本），
@@ -82,8 +77,6 @@ impl Default for PecoConfig {
         let retry = LooperConfig::from_env();
         Self {
             event_buffer: 256,
-            per_turn_timeout_secs: 7200,
-            total_timeout_secs: 7200,
             history_token_budget: 128_000,
             compaction_trigger_tokens: 256_000,
             compaction_keep_recent_tokens: 96_000,
@@ -109,8 +102,6 @@ impl PecoConfig {
     pub fn to_looper_config(&self, message_filter: Arc<dyn MessageFilter>) -> LooperConfig {
         LooperConfig {
             event_buffer: self.event_buffer,
-            per_turn_timeout: Some(Duration::from_secs(self.per_turn_timeout_secs)),
-            total_timeout: Some(Duration::from_secs(self.total_timeout_secs)),
             persist_on_failure: true,
             environment: self.environment.clone(),
             dynamic_context: self.dynamic_context.clone(),

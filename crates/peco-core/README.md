@@ -130,8 +130,8 @@ agent.md
 [`AgentLooper`](src/agent/agent_looper.rs) 实现双层状态机驱动的 ReAct 循环（外层用户交互 + 内层推理-执行），是驱动多轮 Agent 的主引擎：
 
 ```
-外层: Idle ──→ ProcessingUserInput ──→ RunningInnerLoop ──→ Paused
-                                            │
+外层: Idle ↔ Paused / RunningInnerLoop
+               │
 内层: PreparingRequest ──→ [batch] AwaitingModel → ResolvingResponse
                       ──→ [stream] Streaming
                       ──→ ExecutingTools ──→ (循环回 PreparingRequest)

@@ -26,7 +26,7 @@
 
 ### Agent 引擎
 - **声明式定义**：通过 `agent.md`（YAML frontmatter + Markdown）定义 Agent 的模型、工具、MCP、Skills 和 KB 访问白名单
-- **ReAct 执行循环**：双层状态机驱动（外层 Idle → ProcessingUserInput → RunningInnerLoop → Paused，内层 PreparingRequest → AwaitingModel/Streaming → ExecutingTools），支持流式 + batch 双路径
+- **ReAct 执行循环**：双层状态机驱动（外层 Idle ↔ Paused / RunningInnerLoop，内层 PreparingRequest → AwaitingModel/Streaming → ExecutingTools），支持流式 + batch 双路径
 - **Workflow 编排**：声明式 DAG 工作流（`workflow.md`），Kahn 拓扑分层并行执行，支持条件门控、minijinja 模板变量传递、失败策略（Continue/Abort/Pause，Retry 已定义待实现）和人工审批暂停/恢复。完整 REST API（11 端点）+ SSE 流式执行追踪 + Cron 定时触发
 - **子 Agent 编排**：支持串行委派 (`delegate_sub_agent`) 和并行执行 (`run_parallel_sub_agents`)，前端可视化追踪
 - **Session 管理**：状态机驱动（Idle → Active → Commit/Rollback/Cancel），支持 turn 回滚、中断队列。双层持久化：`FileSessionPersister`（CLI，JSON 文件增量追加）和 `SqliteSessionPersister`（Server，SQLite UPSERT）

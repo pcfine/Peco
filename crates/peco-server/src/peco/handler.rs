@@ -384,14 +384,22 @@ async fn spawn_peco_run(
 /// runner 任务：独占 LooperHandle，驱动 looper 并向订阅者广播事件。
 ///
 /// 三路 select：
-/// - looper 事件 → 广播；`Shutdown` 结束；`OuterStateChange → Idle`（轮边界
-///   且无排队输入）且无订阅者 → 回收退出
-/// - 控制命令 → `Query` 排队消息 / `Cancel` 取消在途轮次（不 break，继续
-///   转发收尾事件让附着端看到 error + done）
+/// - looper 事件 → 广播；`Shutdown` 结束；`OuterStateChange → Idle` 且无订阅者
+///   → 回收退出
+/// - 控制命令 → `Query` 排队消息 / `Cancel` 取消在途轮次（不 break，继续转发
+///   收尾事件让附着端看到 error）
 /// - 回收唤醒（桥接退出时 `request_reclaim`）→ looper 停靠且无订阅者 → 回收
 ///
-/// 退出即 drop handle：user_speaker 消亡使停靠的 looper 经
-/// `input_closed + Idle` 优雅终止；`_guard` drop 清理注册表。
+/// **取消不再结束 run**：looper 收尾后停在 Idle，事件流继续，「无订阅者」成了回收的
+/// 唯一触发器 —— 客户端断连后 `request_reclaim` 才回收，附着中的 run 一直留着等下一
+/// 条 query。
+///
+/// `to=Idle` 的回收窗口在续接轮之间也存在（一轮 Done 后先发 `Idle`，下一轮才由
+/// looper 发出 `Idle→RunningInnerLoop`）：无订阅者时会把本该续接的排队轮一并回收 ——
+/// 用户已离开，不替他跑是合理取舍。
+///
+/// 退出即 drop handle：user_speaker 消亡使停靠的 looper 在 `Idle` 上经 `recv()` 返回
+/// `None` 优雅终止；`_guard` drop 清理注册表。
 #[allow(clippy::too_many_arguments)]
 async fn runner_loop(
     handle: LooperHandle,
@@ -521,9 +529,14 @@ fn bridge_sse_response(
 
 /// POST /api/peco/stream/cancel — 取消当前用户进行中的任务。
 ///
-/// 无活跃 run 时 404。取消后 looper 在下个检查点收尾
-/// （`TurnComplete{Failed}` → `Shutdown`），附着中的客户端会看到
-/// error + done 事件；注册表条目随 runner 退出自动清理。
+/// 无活跃 run 时 404。取消 = **中止当前 ReAct 轮，looper 不退出**：在下个步进边界
+/// （流式/工具 ≤200ms、batch = 整段生成）收尾成 `TurnComplete{Failed{Cancelled}}` →
+/// SSE `error`，随后停在 Idle 等输入。**不再有 `Shutdown` / `done`** —— 连接保持
+/// 打开，下一条 query 直接开启新一轮。
+///
+/// ⚠ 已知偏差：web 前端 `abortStream()` 在本请求后立即关闭 SSE 连接，run 随即被
+/// runner 回收 —— 「取消后不退出 looper」在 web 主路径不成立，只对 CLI / 长连接有效
+/// （详见 CLAUDE.md）。
 pub async fn cancel_stream(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -764,8 +777,7 @@ pub async fn clear_session(
         let uid = user_id.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
-            // 上限对齐 looper 的 per_turn_timeout（7200s）：取消后在途模型
-            // 调用返回即收尾，不会更久。
+            // 兜底上限：取消后在途模型调用返回即收尾，正常不会更久。
             if runs
                 .wait_until_absent(&uid, Duration::from_secs(2 * 60 * 60))
                 .await

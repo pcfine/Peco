@@ -5,7 +5,7 @@
 // 进程崩溃时，内存里「已落地但未 commit」的那一轮会整体消失。检查点把它
 // 落一次盘，重启后由宿主层水化进 Session 并冻结入史（见 `Session::hydrate_inflight`）。
 //
-// 只在**一批工具刚落地**的时刻写（`finalize_tool_execution`）——那是本设计里
+// 只在**一批工具刚落地**的时刻写（`finish_tool_execution`）——那是本设计里
 // 副作用已经发生、最不该丢的时刻。随后的模型调用不产生副作用，不必再写。
 
 use serde::{Deserialize, Serialize};

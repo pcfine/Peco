@@ -4,8 +4,8 @@
 //
 // 架构：外层（用户交互）+ 内层（ReAct Loop: 模型推理 → tool 执行 → 循环）
 //
-//   外层: Idle ──→ ProcessingUserInput ──→ RunningInnerLoop
-//                                           │
+//   外层: Idle ──→ Paused ──→ RunningInnerLoop
+//                                 │
 //   内层: PreparingRequest ──→ [batch] AwaitingModel → ResolvingResponse
 //                         ──→ [stream] Streaming
 //                         ──→ ExecutingTools ──→ (循环回 PreparingRequest)
@@ -32,10 +32,20 @@ use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
-use crate::persistence::{INFLIGHT_CRASH_REASON, InflightCheckpoint};
+use crate::persistence::{INFLIGHT_CRASH_REASON, InflightCheckpoint, PersistError, PersistResult};
 use crate::session::{AnnotatedMessage, MessageSource, Session, SessionSnapshot, SessionState};
 use crate::utils::intercom::{Listener, Speaker, make_async_intercom_pair};
 use tracing::{debug, error, info, warn};
+
+/// 步进边界上界 —— looper 里唯一的「一步最多等多久」，三处共用：流式
+/// `consume_stream_chunk` 等 chunk、工具 `execute_tools_step` poll 等任务、
+/// `wait_retry_backoff` 的退避切片。
+///
+/// `run()` 的 ① 只在每步返回后才消费控制消息，故它同时是**取消的最坏生效延迟**。
+///
+/// **batch 路径（`stream: false`）没有步进边界**：`generate_full().await` 整段生成
+/// 期间不可重入，该轮取消延迟 = 整段生成时间。
+const STEP_POLL: Duration = Duration::from_millis(200);
 
 // ============================================================================
 // 纯标记状态枚举（不携带数据）
@@ -46,8 +56,6 @@ use tracing::{debug, error, info, warn};
 pub enum OuterState {
     /// 初始/空闲，等待用户输入
     Idle,
-    /// 正在处理用户输入
-    ProcessingUserInput,
     /// 内层 ReAct 循环运行中
     RunningInnerLoop,
     /// 已暂停（收到 [`UserMsg::Pause`]），等待 [`UserMsg::Resume`] 解除
@@ -129,15 +137,11 @@ pub(crate) struct ToolCallResult {
 
 /// AgentLooper 的配置。
 ///
-/// 聚合所有 looper 级别的可配置参数，包括超时、事件 buffer 和 hook 链。
+/// 聚合所有 looper 级别的可配置参数，包括事件 buffer 和 hook 链。
 #[derive(Clone)]
 pub struct LooperConfig {
     /// 事件通道 buffer 大小。
     pub event_buffer: usize,
-    /// 每轮超时（从 PreparingRequest 到 Done/Failed）。
-    pub per_turn_timeout: Option<Duration>,
-    /// 总超时（从第一个 Query 到 looper 退出）。
-    pub total_timeout: Option<Duration>,
     /// Hook 链（按注册顺序调用）。
     pub hooks: Vec<Arc<dyn LooperHook>>,
     /// 环境上下文：会话级恒定的运行环境描述（用户身份、工作空间路径、日期等）。
@@ -208,8 +212,6 @@ impl Default for LooperConfig {
     fn default() -> Self {
         Self {
             event_buffer: 256,
-            per_turn_timeout: Some(Duration::from_secs(180)),
-            total_timeout: None,
             hooks: Vec::new(),
             environment: None,
             dynamic_context: None,
@@ -275,8 +277,6 @@ impl std::fmt::Debug for LooperConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LooperConfig")
             .field("event_buffer", &self.event_buffer)
-            .field("per_turn_timeout", &self.per_turn_timeout)
-            .field("total_timeout", &self.total_timeout)
             .field("hooks", &format_args!("{} hooks", self.hooks.len()))
             .finish()
     }
@@ -339,20 +339,14 @@ fn block_kinds_of(blocks: &[ContentBlock]) -> Vec<&'static str> {
 
 /// Turn 失败原因。
 ///
-/// 替代原来散落在代码各处的魔法字符串（`"cancelled"`、`"max_turns_exceeded"` 等），
-/// 通过 [`TurnComplete`](LooperEvent::TurnComplete) 的 `failure` 字段传递。
-///
-/// 当 `failure: None` 时表示正常完成（`ReActState::Done`）；
-/// `failure: Some(...)` 时表示异常终止（`ReActState::Failed`）。
+/// 经 [`TurnComplete`](LooperEvent::TurnComplete) 的 `failure` 字段传递：
+/// `None` 表示正常完成（`ReActState::Done`），`Some(...)` 表示异常终止
+/// （`ReActState::Failed`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TurnFailureReason {
     /// 外部取消
     Cancelled,
-    /// 总运行超时
-    TotalTimeout,
-    /// 单轮超时
-    PerTurnTimeout,
     /// 超出最大轮数
     MaxTurnsExceeded,
     /// Hook 中止（含原因描述）
@@ -593,7 +587,7 @@ enum RetryCause {
 
 impl RetryCause {
     /// 通知载荷里的输出 token 数：截断取实际值，瞬时无意义传 0。
-    fn notice_output_tokens(&self) -> u32 {
+    fn retry_notice_output_tokens(&self) -> u32 {
         match self {
             Self::Truncated { output_tokens } => *output_tokens,
             Self::Transient { .. } => 0,
@@ -601,7 +595,7 @@ impl RetryCause {
     }
 
     /// 通知载荷里的重发原因（wire 枚举 [`RetryNoticeReason`] 不变）。
-    fn notice_reason(&self) -> RetryNoticeReason {
+    fn retry_notice_reason(&self) -> RetryNoticeReason {
         match self {
             Self::Truncated { .. } => RetryNoticeReason::Truncated,
             Self::Transient { .. } => RetryNoticeReason::Transient,
@@ -630,10 +624,24 @@ pub enum UserMsg {
     Pause,
     /// 请求恢复：解除 `Paused`，回到暂停前的外层状态
     Resume,
-    /// 请求取消：在途轮冻结进历史后退出（收尾复用循环顶的取消分支）
+    /// 请求取消：中止当前 ReAct 轮，looper 继续运行（收尾见
+    /// [`AgentLooper::finalize_cancel`]）
     Cancel,
     /// 关闭请求（在途轮直接丢弃，不记账）
     Shutdown,
+}
+
+/// 一条用户消息对「继续读取同批剩余消息」的裁决。
+///
+/// `Cancel` 与 `Shutdown` 都要丢弃同批后续消息（典型是「按停后马上发的新 query」），
+/// 但两者对循环的诉求不同 —— 单个 `bool` 表达不了「停不停读」与「退不退出」两件事，
+/// 故本枚举只管前者，后者由 [`AgentLooper::shutdown_requested`] 承担。
+#[derive(Debug, Clone, Copy)]
+enum ReadDirective {
+    /// 继续读同批剩余消息。
+    Continue,
+    /// 本条消息改变了后续消息的解释前提 —— 同批剩余一律丢弃。
+    StopReading,
 }
 
 // ============================================================================
@@ -941,10 +949,6 @@ pub struct AgentLooper {
     react_ctx: ReActContext,
 
     // ── 运行时追踪（不可持久化）──
-    /// looper run 启动时间（用于 total_timeout）
-    run_start_time: Option<Instant>,
-    /// 本轮开始时间（用于 per_turn_timeout）
-    turn_start: Option<Instant>,
     /// 本轮失败原因；`None` 表示尚未失败 / 正常完成
     failure_reason: Option<TurnFailureReason>,
 
@@ -960,6 +964,18 @@ pub struct AgentLooper {
     // ── 暂停状态恢复 ──
     /// 进入 `Paused` 状态前的外层状态，用于 resume 时恢复。
     pre_pause_state: Option<OuterState>,
+
+    // ── pending 调度 ──
+    /// pending 队列是否「现在该跑」—— 由用户意图驱动，与「有没有 pending」正交。
+    /// `Resume` / 新 `Query` 置位，`Cancel` 收尾与启动一轮后清零，初值 `true`。
+    /// 取消不自动开新轮（pending 保留、随快照落盘），「保留」不等于「该跑」。
+    pending_armed: bool,
+
+    // ── 退出信号 ──
+    /// 收到 [`UserMsg::Shutdown`]。**是字段而非返回值**：`Shutdown` 不关闭通道，
+    /// `recv` 的 `None` 替代不了它；且消费点里含非阻塞排空，返回值会被丢掉。
+    /// 字段能穿过去，循环顶一句 `if self.shutdown_requested { break }` 即可。
+    shutdown_requested: bool,
 
     // ── 事件输出 ──
     event_speaker: Speaker<LooperEvent>,
@@ -1008,7 +1024,7 @@ pub struct AgentLooper {
     /// [`Self::prepare_and_send_request`] 入口以可取消的切片 sleep 等待 ——
     /// 等待贴在请求发出前，回退与通知立即发生。
     /// 等待**只读不清**（见 [`Self::wait_retry_backoff`]）：`react_step` future
-    /// 被 select drop 后重入仍能继续等剩余时间。
+    /// 被 drop 后重入仍能继续等剩余时间。
     retry_deadline: Option<Instant>,
 }
 
@@ -1022,7 +1038,7 @@ impl AgentLooper {
     /// - `agent` — 已组装的 Agent 实例
     /// - `session` — 对话会话（含历史消息）
     /// - `event_speaker` — 事件广播通道
-    /// - `config` — looper 配置（超时、hook 链等）
+    /// - `config` — looper 配置（事件 buffer、hook 链等）
     ///
     /// 取消/暂停标志在内部创建 —— 控制入口是 `UserMsg::{Cancel,Pause,Resume}`
     /// （走 user channel），标志只是 looper 写、外部读的状态
@@ -1051,11 +1067,11 @@ impl AgentLooper {
             outer_state: OuterState::Idle,
             react_state: ReActState::PreparingRequest,
             react_ctx: ReActContext::default(),
-            run_start_time: None,
-            turn_start: None,
             failure_reason: None,
             react_loop_iteration: 0,
             pre_pause_state: None,
+            pending_armed: true,
+            shutdown_requested: false,
             event_speaker,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pause_flag: Arc::new(AtomicBool::new(false)),
@@ -1379,19 +1395,27 @@ impl AgentLooper {
 
     // ── run() 主循环 ──────────────────────────────────────────────────────
 
-    /// 执行 agent run 循环。
+    /// 执行 agent run 循环 —— 四步，每步只问一个问题。
     ///
-    /// 控制流不使用 `select!` 抢占：每轮先以 `try_recv` 非阻塞排空
-    /// `user_listener`（查询 / 暂停 / 恢复 / 取消 / 关闭，同通道 FIFO 全序），
-    /// 再做失败/取消/超时收尾检查，然后推进一步 `react_step()`（仅
-    /// `RunningInnerLoop`）或阻塞 `recv()` 停靠等输入。控制消息因此在
-    /// **步进边界**生效 —— 在途 future 永不被消息丢弃（commit→save、
-    /// prepare 重发、工具 poll 回收等异步尾巴完整跑完）；停靠与暂停期间
-    /// 靠消息本身唤醒阻塞的 `recv()`。
+    /// ```text
+    /// ① 取消息（无待办才阻塞）
+    /// ② 收尾（取消 / 失败，互斥）
+    /// ③ 启动 pending 轮（唯一的「pending → turn」入口）
+    /// ④ 推进一步 react_step（仅 RunningInnerLoop）
+    /// ```
     ///
-    /// 当 input channel 关闭后（所有 `Speaker` 被 drop），`run()` 不会立即退出，
-    /// 而是等待内层 ReAct 循环自然完成后再退出。这确保 `drop(user_speaker)` 后
-    /// 仍能正常完成最后一轮对话处理。
+    /// 不用 `select!` 抢占：控制消息只在 ① 消费，在途 future（commit→save、prepare
+    /// 重发、工具 poll 回收）永不被消息丢弃，故消息在**步进边界**生效（流式=单
+    /// chunk、工具=≤200ms、batch=整段生成）。
+    ///
+    /// **不空转不变量**：每轮迭代要么在 ① 阻塞，要么严格推进一个状态 ——
+    /// `has_pending_work` 的每个「非阻塞」触发点都有消解者（`cancel_flag` /
+    /// `Failed` / `pending_armed && has_pending` / `RunningInnerLoop` 分别由
+    /// [`Self::finalize_cancel`] / [`Self::finalize_failure`] /
+    /// [`Self::start_turn_from_pending`] / [`Self::react_step`]）。**新增触发点必须
+    /// 同时给出消解者**，否则热自旋。
+    ///
+    /// 通道关闭后：无在途轮直接退，有在途轮跑完回到 Idle 才退（不静默丢轮）。
     pub async fn run(
         &mut self,
         mut user_listener: Listener<UserMsg>,
@@ -1406,143 +1430,65 @@ impl AgentLooper {
         // Ensure deferred MCP connections are established before first tool use.
         self.agent.mcp_manager().ensure_connected().await;
 
-        // 用户输入 channel 是否已关闭（所有 sender 被 drop）。
-        // 关闭后不再尝试接收新输入，专注驱动 react_step 直至 Idle。
-        let mut input_closed = false;
-        // 记录 run 启动时间（若 handle_user_query 未设置则以此为基准）
-        let run_start = Instant::now();
-
         loop {
-            // ── 非阻塞排空控制消息（必须先于失败/取消检查）────────────────
-            // drain-first 保证 cancel_flag 在 Failed 收尾的 drain_pending
-            // 判定（!is_cancelled）前可见 —— 用户按停后不再启动幽灵续接轮；
-            // cancel 恰在 finalize 的 await 期间到达的更窄窗口与 6d4deac
-            // 行为一致（既有），不另修。
-            if self
-                .drain_control(&mut user_listener, &mut input_closed)
-                .await?
-            {
-                break; // Shutdown
-            }
-
-            // ── 消费 react_step 挂起的失败收尾 ────────────────────────────
-            // 必须在取消/超时检查**之前** —— 否则 failure_reason 已被 take，
-            // 取消分支会用 Cancelled 覆盖真实原因（如 HookAbort）。
-            if matches!(self.react_state, ReActState::Failed) {
-                // 兜底：非取消类失败若未设原因则记 Other
-                let reason = self
-                    .failure_reason
-                    .take()
-                    .unwrap_or(TurnFailureReason::Other("failed".into()));
-                let cancelled = self.is_cancelled();
-                // drain_pending 由 !is_cancelled() 推导：用户按了停就不续接排队输入
-                if self.finalize_failure(reason, !cancelled).await {
-                    // 续接了 pending，保留「失败后自动续接」行为
-                    continue;
+            // ── ① 取消息 ──────────────────────────────────────────────────
+            // 有待办时只非阻塞排空（排完立刻回 ②③④），无待办才阻塞等一条，真暂停
+            // 天然落进后者。排空不可省 —— 在途轮期间的 Cancel / Pause / Query 全靠
+            // 它被消费。
+            if self.has_pending_work() {
+                self.drain_user_msgs(&mut user_listener);
+            } else if !self.recv_user_msgs(&mut user_listener).await {
+                // 通道已关，不会再有消息解除暂停 —— 按取消语义收尾（冻结在途轮
+                // 为 Cancelled + 强制落盘，pending 不丢）。
+                if matches!(self.outer_state, OuterState::Paused) {
+                    self.finalize_cancel().await;
                 }
-                if cancelled {
-                    // 取消标志常驻，回到循环顶部会立刻再次命中取消检查 → 自旋。
-                    // 收尾已完成，此处直接退出。
+                // 无在途轮 → 无可推进，退出。有在途轮 → 落穿到 ②③④ 跑完，
+                // 回到 Idle 后再阻塞一次 recv() 拿到 None 才退。
+                if matches!(self.outer_state, OuterState::Idle) {
                     break;
                 }
-                // 非取消失败：收尾已把 session 置回 `Idle`、内层状态机带回 `Done`，
-                // 回到循环顶部停靠等下一句输入 —— 与正常完成后的停靠行为一致。
-                continue;
             }
-
-            // ── 检查取消 ──────────────────────────────────────────────────
-            if self.is_cancelled() {
-                if self
-                    .finalize_failure(TurnFailureReason::Cancelled, false)
-                    .await
-                {
-                    continue;
-                }
-                // 无在途轮时 finalize 不回写原因 —— 补记 Cancelled，
-                // 保证 shutdown_reason 反映真实退出原因而非 "done" 或
-                // 上一轮残留。消息路径与 drop 安全网共用此出口。
-                self.failure_reason = Some(TurnFailureReason::Cancelled);
+            if self.shutdown_requested {
                 break;
             }
 
-            // ── 检查总超时 ────────────────────────────────────────────────
-            if let Some(total_timeout) = self.config.total_timeout {
-                let base = self.run_start_time.unwrap_or(run_start);
-                if base.elapsed() > total_timeout {
-                    if self
-                        .finalize_failure(TurnFailureReason::TotalTimeout, false)
-                        .await
-                    {
-                        continue;
-                    }
-                    // 与取消分支对称：无在途轮时 finalize 不回写原因 ——
-                    // 补记 TotalTimeout，否则 shutdown_reason 误报 "done"
-                    // 或上一轮残留原因。
-                    self.failure_reason = Some(TurnFailureReason::TotalTimeout);
-                    break;
-                }
+            // ── ② 收尾（互斥）────────────────────────────────────────────
+            // 取消优先，但 `finalize_cancel` **继承**已有 failure_reason —— 只看状态，
+            // 不看谁先到，无顺序耦合。
+            if self.is_cancelled() {
+                self.finalize_cancel().await;
+            } else if matches!(self.react_state, ReActState::Failed) {
+                self.finalize_failure().await;
             }
 
-            // ── 暂停时只接收控制消息（阻塞 recv —— Resume 消息即唤醒）──────
-            // 进入 Paused 由 `handle_control_msg` 的 `UserMsg::Pause` 分支完成；
-            // 此处只挂起。通道关闭时先还原暂停前状态，**落穿**到下方
-            // input_closed 分支按常规收尾 —— 在途轮继续跑完，不再静默丢轮。
-            if matches!(self.outer_state, OuterState::Paused) {
-                if input_closed {
-                    let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
-                    self.outer_state = prev;
-                    self.pause_flag.store(false, Ordering::Release);
-                    self.emit_outer_state_change(OuterState::Paused, prev);
-                    // 落穿到 input_closed 分支
-                } else {
-                    match user_listener.recv().await {
-                        Some(msg) => {
-                            if self.handle_control_msg(msg).await? {
-                                break;
-                            }
-                        }
-                        None => {
-                            input_closed = true;
-                        }
-                    }
-                    continue;
-                }
+            // ── ③ 启动 pending 轮 —— 唯一的「pending → turn」入口 ─────────
+            // 守卫接受 `Paused`：`Resume` 带排队输入时本处直接发
+            // `Paused→RunningInnerLoop`，绝不经过 `Paused→Idle` —— server 的 runner
+            // 见 `to=Idle` 且无订阅者会回收 handle，冻掉续接轮。
+            if matches!(self.outer_state, OuterState::Idle | OuterState::Paused)
+                && matches!(self.session.state(), SessionState::Idle)
+                && self.pending_armed
+                && self.session.has_pending()
+            {
+                self.start_turn_from_pending();
             }
 
-            // ── channel closed ────────────────────────────────────────────
-            if input_closed {
-                if matches!(self.outer_state, OuterState::RunningInnerLoop) {
-                    self.react_step().await;
-                } else {
-                    // Idle + 无更多输入 → 退出
-                    break;
-                }
-                continue;
+            // ── ③.5 Resume 的过渡态归位 ──────────────────────────────────
+            // `Resume` 只清 `pause_flag` 不还原 `outer_state`：还原与随即的启动
+            // 必须原子地产生一条事件。③ 已启动时此处自然跳过。
+            if matches!(self.outer_state, OuterState::Paused)
+                && !self.pause_flag.load(Ordering::Acquire)
+            {
+                let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
+                self.leave_pause_to(prev);
             }
 
-            // ── 分派：步进或停靠（无 select —— 消息不抢占在途 future）────
-            // 控制消息只在循环顶/阻塞 recv 处消费，react_step 在途时
-            // 永不被丢弃：commit→save、prepare 重发、工具 poll 回收等
-            // 异步尾巴完整跑完。
+            // ── ④ 推进 ───────────────────────────────────────────────────
+            // Idle / Paused 回顶，① 会阻塞在 `recv()` 上。
             if matches!(self.outer_state, OuterState::RunningInnerLoop) {
                 self.react_step().await;
-            } else {
-                // Idle 停靠：阻塞等输入，消息本身即唤醒（flag 叫不醒 recv）
-                match user_listener.recv().await {
-                    Some(msg) => {
-                        if self.handle_control_msg(msg).await? {
-                            break;
-                        }
-                    }
-                    None => {
-                        // Channel closed — 标记并继续，让 react loop 自然完成
-                        input_closed = true;
-                    }
-                }
             }
-
-            // NOTE: Idle 状态表示等待下一个用户输入，
-            // 不应退出循环。退出仅在 input_closed + Idle 或收到 Shutdown 时触发。
         }
 
         let (usage, turns) = {
@@ -1550,6 +1496,17 @@ impl AgentLooper {
             let t = self.session.turn_index();
             (u, t)
         };
+
+        // 退出即丢弃积压消息（Cancel/Shutdown 收到就退，后面的消息随 listener
+        // drop 消失）。送出方只会看到 channel 接收成功，故必须留痕，别让消息
+        // 凭空不见。
+        let mut dropped = 0usize;
+        while user_listener.try_recv().is_ok() {
+            dropped += 1;
+        }
+        if dropped > 0 {
+            warn!(dropped, "Dropped queued control messages on looper exit");
+        }
 
         // 暂停中退出（Shutdown/input_closed）时复位镜像，避免 is_paused() 残留 true
         self.pause_flag.store(false, Ordering::Release);
@@ -1583,49 +1540,68 @@ impl AgentLooper {
         Ok(self.build_model_response(usage, turns))
     }
 
-    // ── 控制消息处理 ──────────────────────────────────────────────────────
+    // ── 用户消息处理 ──────────────────────────────────────────────────────
 
-    /// 非阻塞排空 `user_listener` 中积压的控制消息。
+    /// 阻塞取一条用户消息，随后非阻塞排空同批剩余。
     ///
-    /// `run()` 循环顶调用，**先于**失败/取消检查 —— 保证 `cancel_flag`
-    /// 在 Failed 收尾的 `drain_pending` 判定（`!is_cancelled`）前可见。
-    /// 返回 `Ok(true)` 表示收到 Shutdown，调用方应退出 `run()`。
-    async fn drain_control(
-        &mut self,
-        user_listener: &mut Listener<UserMsg>,
-        input_closed: &mut bool,
-    ) -> Result<bool, AgentError> {
+    /// **「阻塞后补排空」不可省**：只阻塞收一条会让一批 `[Q1, Q2, Q3]` 一条占一个
+    /// 迭代，退化成「Q1 一轮 + Q2Q3 续接一轮」。`StopReading`（Cancel / Shutdown）时
+    /// 后面的消息解释前提已变，一律丢弃，故随时直接返回、不再排空。
+    ///
+    /// 返回 `false` = 通道已关闭（所有 `Speaker` 被 drop）。
+    async fn recv_user_msgs(&mut self, user_listener: &mut Listener<UserMsg>) -> bool {
+        let Some(msg) = user_listener.recv().await else {
+            return false;
+        };
+        if matches!(self.handle_user_msg(msg), ReadDirective::StopReading) {
+            return true;
+        }
+        self.drain_user_msgs(user_listener);
+        true
+    }
+
+    /// 非阻塞排空积压用户消息，直到 Empty / Disconnected / `StopReading`。
+    fn drain_user_msgs(&mut self, user_listener: &mut Listener<UserMsg>) {
         use tokio::sync::mpsc::error::TryRecvError;
         loop {
             match user_listener.try_recv() {
                 Ok(msg) => {
-                    if self.handle_control_msg(msg).await? {
-                        return Ok(true);
+                    if matches!(self.handle_user_msg(msg), ReadDirective::StopReading) {
+                        return;
                     }
                 }
-                Err(TryRecvError::Empty) => return Ok(false),
-                Err(TryRecvError::Disconnected) => {
-                    *input_closed = true;
-                    return Ok(false);
-                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
             }
         }
     }
 
-    /// 处理一条控制消息 —— 循环顶排空 / 停靠 recv / 暂停 recv 三处消费点
-    /// 共用的唯一分发。返回 `Ok(true)` 表示 Shutdown，调用方应退出 `run()`。
-    async fn handle_control_msg(&mut self, msg: UserMsg) -> Result<bool, AgentError> {
+    /// 还有可推进的工作 → 不阻塞，非阻塞取消息后立刻干活。`run()` 里唯一的调度
+    /// 开关，也是终止性的关键（见其「不空转不变量」）。`RunningInnerLoop` 那项
+    /// 不可省：少了它，③ 启动一轮后回顶就阻塞在 `recv()` 上，整轮停摆。
+    fn has_pending_work(&self) -> bool {
+        if matches!(self.outer_state, OuterState::Paused) {
+            // 真暂停只等消息（阻塞 recv 才能被 Resume / Cancel 唤醒）；
+            // 已 Resume 但尚未归位的过渡态必须能推进，否则 ③ 永不执行。
+            return !self.pause_flag.load(Ordering::Acquire);
+        }
+        matches!(self.outer_state, OuterState::RunningInnerLoop)
+            || self.is_cancelled()
+            || matches!(self.react_state, ReActState::Failed)
+            || (self.pending_armed && self.session.has_pending())
+    }
+
+    /// 处理一条用户消息 —— 消费点共用的唯一分发，同步、零 await 重活。
+    ///
+    /// 三条不变量：① 只有 `Query` 触碰 Session 内容，其余四条只动 flag /
+    /// `outer_state`；② `StopReading` 的判据 = 本条消息改变了后续消息的解释前提，
+    /// 只有 `Cancel` / `Shutdown` 满足（见 [`ReadDirective`]）；③ `pending_armed`
+    /// 由用户意图驱动 —— `Resume` / 新 `Query` 表示「想要它跑」，`Cancel` 表示「停」。
+    fn handle_user_msg(&mut self, msg: UserMsg) -> ReadDirective {
         match msg {
             UserMsg::Query(content) => {
-                if matches!(self.outer_state, OuterState::Paused) {
-                    // 暂停期间收到的输入放入 pending 队列
-                    info!("Message queued (looper paused). Will process after resume.");
-                    self.session.enqueue_pending(content);
-                } else {
-                    self.handle_user_query(content, MessageSource::UserInput)
-                        .await?;
-                }
-                Ok(false)
+                self.session.enqueue_pending(content);
+                self.pending_armed = true;
+                ReadDirective::Continue
             }
             UserMsg::Pause => {
                 // ★ 进入 Paused：记录暂停前状态，挂起循环（已暂停则幂等忽略）
@@ -1636,94 +1612,215 @@ impl AgentLooper {
                     self.pause_flag.store(true, Ordering::Release);
                     self.emit_outer_state_change(old, OuterState::Paused);
                 }
-                Ok(false)
+                ReadDirective::Continue
             }
             UserMsg::Resume => {
                 // 未处于 Paused — 幂等忽略
                 if matches!(self.outer_state, OuterState::Paused) {
-                    // ★ 从 Paused 恢复到暂停前的状态
-                    let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
-
-                    // 暂停期间排队的输入：停靠 Idle 时立即一次排空合并续接
-                    // （轮次进行中的排队项仍走 turn 结束时的 dequeue）。
-                    // 排空时外层保持 Paused —— handle_user_query 读到的
-                    // old_outer=Paused，发出 Paused→RunningInnerLoop（to≠Idle），
-                    // server 端 runner 不会在排队输入被消费前看到 to=Idle 而
-                    // 触发回收丢弃 handle；无排队输入才发 Paused→prev。
-                    if matches!(self.session.state(), SessionState::Idle)
-                        && let Some(content) = self.session.take_pending_all()
-                    {
-                        self.handle_user_query(content, MessageSource::MergedPending)
-                            .await?;
-                    } else {
-                        self.outer_state = prev;
-                        self.emit_outer_state_change(OuterState::Paused, prev);
-                    }
-                    // 镜像最后复位 —— 保证 pause_flag 与 outer_state 的
-                    // 「Paused 当且仅当 flag=true」在外部观察下不倒挂
+                    self.pending_armed = true;
+                    // **只清镜像，不还原 outer_state**：排队输入要由 ③ 一次发出
+                    // Paused→RunningInnerLoop。若此处还原成 Idle，中途的 to=Idle 会被
+                    // server runner 当成「已停靠无订阅者」而回收 handle，冻掉续接轮。
                     self.pause_flag.store(false, Ordering::Release);
                 }
-                Ok(false)
+                ReadDirective::Continue
             }
             UserMsg::Cancel => {
-                // 消息负责唤醒阻塞的 recv，flag 负责状态；收尾统一交给
-                // 循环顶的取消分支（finalize → break）
+                // 只置标志，收尾交给 ②（finalize_cancel 继承已有的 failure_reason）。
                 self.cancel_flag.store(true, Ordering::Release);
-                Ok(false)
+                ReadDirective::StopReading
             }
-            UserMsg::Shutdown => Ok(true),
+            UserMsg::Shutdown => {
+                self.shutdown_requested = true;
+                ReadDirective::StopReading
+            }
         }
     }
 
-    // ── 用户输入处理 ──────────────────────────────────────────────────────
+    /// 还原暂停 —— `outer_state` / `pause_flag` / `pre_pause_state` 三处镜像集中
+    /// 在此修改。半吊子归位（清了 flag 却不动 `outer_state`）会让 looper 卡在
+    /// 「`Paused` 但 `is_paused() == false`」的幽灵态：消息只入队、永不启动。
+    fn leave_pause_to(&mut self, prev: OuterState) {
+        self.pre_pause_state = None;
+        self.outer_state = prev;
+        self.pause_flag.store(false, Ordering::Release);
+        self.emit_outer_state_change(OuterState::Paused, prev);
+    }
 
-    /// 处理用户查询：根据 Session 状态决定直接启动 turn 或放入 pending 队列。
-    /// `source` 标记该 turn 用户消息的来源（直发 = `UserInput`，
-    /// pending 批量合并续接 = `MergedPending`，展示层据此剥离合并标记）。
-    async fn handle_user_query(
+    /// 取消收尾 —— 中止当前 ReAct 轮，**looper 继续运行**，收尾后停在干净 Idle。
+    /// 三条来源共用：消息路径 [`UserMsg::Cancel`]、handle 被 drop 的安全网标志、
+    /// 暂停中通道关闭。
+    async fn finalize_cancel(&mut self) {
+        // ① 按内层状态回收在途资源（各状态的差异只在这一处）
+        match self.react_state {
+            // `active_stream` 握着活的 HTTP 连接 —— 取消不再 drop looper，不显式
+            // 丢就是跨轮连接泄漏。
+            ReActState::Streaming => self.active_stream = None,
+            ReActState::ExecutingTools => self.abort_inflight_tools(),
+            // 其余状态无在途资源（PreparingRequest 的 retry_deadline 由
+            // reset_turn_counters 清）。
+            _ => {}
+        }
+
+        // ② 冻结 + 强制落盘。有在途轮时**继承**已有失败原因（取消一个已失败的轮不该
+        //    改写成 Cancelled）。`had_inflight` 必须在此刻取 —— finalize 会改变 session。
+        let had_inflight = self.has_inflight_turn();
+        let reason = if had_inflight {
+            self.failure_reason
+                .take()
+                .unwrap_or(TurnFailureReason::Cancelled)
+        } else {
+            TurnFailureReason::Cancelled
+        };
+        self.apply_failure(reason.clone(), /* force_persist */ true)
+            .await;
+        // 无条件回填：`apply_failure` 在「无在途轮」时不回写原因，
+        // 不补这句 `shutdown_reason` 就退化成 "done"，看不出是取消。
+        self.failure_reason = Some(reason);
+
+        // ③ 补落盘：无在途轮时 finalize 产不出 plan，也就不会落盘 —— 而 pending
+        //    可能正排在内存里。取消不丢 pending，所以补一次。
+        if !had_inflight && self.session.has_pending() {
+            self.persist_boundary_snapshot().await;
+        }
+
+        // ④ 归位到干净 Idle —— 留着幽灵 Paused 会让后续消息只入队不启动。
+        self.pending_armed = false;
+        self.cancel_flag.store(false, Ordering::Release); // 一次性，否则回到 Idle 会反复命中
+        self.pre_pause_state = None;
+        self.pause_flag.store(false, Ordering::Release);
+        if !matches!(self.outer_state, OuterState::Idle) {
+            let old = self.outer_state;
+            self.outer_state = OuterState::Idle;
+            self.emit_outer_state_change(old, OuterState::Idle);
+        }
+    }
+
+    /// 失败收尾。续接交给 `run()` 的 ③ —— 收尾的契约是「把状态搬到可推进的位置」，
+    /// 不回报布尔让调用方决定续接。
+    async fn finalize_failure(&mut self) {
+        let reason = self
+            .failure_reason
+            .take()
+            .unwrap_or(TurnFailureReason::Other("failed".into()));
+        self.apply_failure(reason, /* force_persist */ false).await;
+    }
+
+    fn has_inflight_turn(&self) -> bool {
+        session_has_inflight(&self.session)
+    }
+
+    /// 按会话元数据落盘一份快照 —— 轮提交、压缩后、失败收尾、取消补落盘四处
+    /// 共用，元数据字段只在此处拼装。
+    ///
+    /// 取 `&mut self` 而非 `&self`：`AgentLooper` 不 `Sync`，`&self` 跨 await
+    /// 会让 `run()` 的 future 失去 `Send`。
+    async fn save_snapshot(
         &mut self,
-        content: Content,
-        source: MessageSource,
-    ) -> Result<(), AgentError> {
-        // 事件面保持文本视图；部件整体进入 Session（rollback 重排队同样保留）
-        let text = content.text_view().into_owned();
-        match self.session.state() {
-            SessionState::Idle => {
-                // 直接启动新 turn
-                self.session
-                    .start_turn_with_source(content, source)
-                    .map_err(|e| AgentError::AgentProtocol(e.to_string()))?;
+        snapshot: &SessionSnapshot,
+    ) -> Result<PersistResult, PersistError> {
+        self.persister
+            .save(
+                snapshot,
+                self.session.id(),
+                self.session.description(),
+                self.session.created_at(),
+            )
+            .await
+    }
 
-                // 记录启动时间（首次查询时记录 run_start_time）
-                if self.run_start_time.is_none() {
-                    self.run_start_time = Some(Instant::now());
-                }
-                self.turn_start = Some(Instant::now());
-
-                // ★ 新对话轮次：重置 ReAct 循环计数
-                self.reset_turn_counters();
-
-                let old_outer = self.outer_state;
-                self.outer_state = OuterState::RunningInnerLoop;
-                self.react_state = ReActState::PreparingRequest;
-                self.failure_reason = None;
-
-                // Emit 状态变更事件
-                self.emit_outer_state_change(old_outer, self.outer_state);
-
-                self.emit_event(LooperEvent::TurnStart {
-                    turn_index: self.session.turn_index(),
-                    user_input: text,
-                });
+    /// 无在途轮时的补落盘。
+    ///
+    /// `snapshot` 需要 `TurnBoundaryToken`，而 `rollback_turn` 是唯一「无 state
+    /// 守卫、必回 Idle」的 token 来源。此处只在 Idle + staging 已清时调用，是幂等
+    /// 空操作 —— 只为取 token。
+    async fn persist_boundary_snapshot(&mut self) {
+        let token = match self.session.rollback_turn(false) {
+            Ok(t) => t,
+            Err(e) => {
+                error!(error = %e, "Failed to obtain boundary token; pending not persisted");
+                return;
             }
-            SessionState::Active | SessionState::Cancelling | SessionState::Interrupted => {
-                // InnerLoop 进行中或收尾中 — 放入 pending 队列；
-                // 整体入队保留部件，与 turn 启动、rollback 重排队对称
-                info!("Message queued. Will process after current turn.");
-                self.session.enqueue_pending(content);
+        };
+        let snapshot = self.session.snapshot(&token);
+        if let Err(e) = self.save_snapshot(&snapshot).await {
+            error!(error = %e, "Failed to persist pending inputs at cancel boundary");
+        }
+    }
+
+    /// 回收在途工具任务：先非阻塞捞回已完成的写进 `pending_tool_calls`，再 abort
+    /// 其余。`active_tool_tasks` 为 `None` 时 no-op（只有 `ExecutingTools` 持有任务）。
+    fn abort_inflight_tools(&mut self) {
+        let Some(mut joinset) = self.active_tool_tasks.take() else {
+            return;
+        };
+        let drained =
+            Self::drain_finished_join_results(&mut joinset, &mut self.react_ctx.pending_tool_calls);
+        if drained > 0 {
+            debug!(drained, "Salvaged completed tool results before abort");
+        }
+        joinset.abort_all();
+    }
+
+    // ── 轮次启动 ──────────────────────────────────────────────────────────
+
+    /// **唯一**的「pending → turn」入口。
+    ///
+    /// 失败即解除武装 —— 否则 `has_pending_work` 的「`pending_armed && has_pending`」
+    /// 无人消解会让 `run()` 空转（见其「不空转不变量」）。启动失败时 pending 原封
+    /// 不动（`dequeue_and_start_turn` 的前置检查保证），下一句输入会重新武装。
+    fn start_turn_from_pending(&mut self) {
+        match self.session.dequeue_and_start_turn() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                // Ok(false) 是「队列空了」的竞态；Err 是 Session 非 Idle 的
+                // 状态守卫失败（在途轮尚未收尾）。两者都不该重试。
+                self.pending_armed = false;
+                self.repair_stalled_pause();
+                return;
             }
         }
-        Ok(())
+
+        // ★ 新对话轮次：重置 ReAct 循环计数
+        self.reset_turn_counters();
+        self.failure_reason = None;
+        self.pending_armed = false;
+
+        let old_outer = self.outer_state;
+        self.outer_state = OuterState::RunningInnerLoop;
+        self.react_state = ReActState::PreparingRequest;
+        if matches!(old_outer, OuterState::Paused) {
+            // 暂停态被本轮的启动吸收，否则 ③.5 会再发一条重复的归位事件
+            self.pre_pause_state = None;
+        }
+
+        // 事件面保持文本视图；部件整体已在 Session 里（合并后为一条 user 消息）
+        let user_input = match self
+            .session
+            .staging_user_input()
+            .map(|am| am.message.as_ref())
+        {
+            Some(InputItem::Message { content, .. }) => content.text_view().into_owned(),
+            _ => String::new(),
+        };
+
+        self.emit_outer_state_change(old_outer, OuterState::RunningInnerLoop);
+        self.emit_event(LooperEvent::TurnStart {
+            turn_index: self.session.turn_index(),
+            user_input,
+        });
+    }
+
+    /// `Resume` 留下的过渡态收尾：`outer_state` 仍是 `Paused` 但镜像已清。③ 没能
+    /// 消化它（session 非 Idle、或队列已空）时靠本函数归位，否则
+    /// `has_pending_work` 的暂停分支恒 true 而 ④ 不推进 —— 热自旋。
+    fn repair_stalled_pause(&mut self) {
+        if matches!(self.outer_state, OuterState::Paused)
+            && !self.pause_flag.load(Ordering::Acquire)
+        {
+            let prev = self.pre_pause_state.take().unwrap_or(OuterState::Idle);
+            self.leave_pause_to(prev);
+        }
     }
 
     // ── ReAct 状态机步进 ─────────────────────────────────────────────────
@@ -1733,15 +1830,6 @@ impl AgentLooper {
     /// 仅在 `outer_state == RunningInnerLoop` 时由 `run()` 循环调用
     /// （分派点守卫）；停靠/暂停时 `run()` 阻塞在 `recv()` 上，不推进内层。
     async fn react_step(&mut self) {
-        // Per-turn timeout 检查
-        if let (Some(timeout), Some(turn_start)) = (self.config.per_turn_timeout, self.turn_start)
-            && turn_start.elapsed() > timeout
-        {
-            self.failure_reason = Some(TurnFailureReason::PerTurnTimeout);
-            self.react_state = ReActState::Failed;
-            // 不 return — 让 Failed 分支处理收尾
-        }
-
         let old_react_state = self.react_state;
         // ★ Session 零锁：turn_index() 是字段访问，无需缓存
         let turn = self.session.turn_index();
@@ -1753,7 +1841,7 @@ impl AgentLooper {
 
             // ── batch 分支 ──
             ReActState::ResolvingResponse => {
-                self.resolve_batch_response(turn).await;
+                self.consume_batch_response(turn).await;
             }
 
             // ── streaming 分支 ──
@@ -1809,16 +1897,7 @@ impl AgentLooper {
 
                 // ★ 持久化：turn 边界触发（commit 后）
                 let snapshot = self.session.snapshot(&_token);
-                if let Err(e) = self
-                    .persister
-                    .save(
-                        &snapshot,
-                        self.session.id(),
-                        self.session.description(),
-                        self.session.created_at(),
-                    )
-                    .await
-                {
+                if let Err(e) = self.save_snapshot(&snapshot).await {
                     error!(error = %e, "Failed to persist session after turn commit");
                 }
                 // ★ 本轮已入史，在途检查点作废（早于压缩：压缩只改 committed 内容）。
@@ -1848,16 +1927,7 @@ impl AgentLooper {
 
                             // 重新持久化：快照现在含 pinned 摘要 + 修剪后的历史
                             let snapshot = self.session.snapshot(&_token);
-                            if let Err(e) = self
-                                .persister
-                                .save(
-                                    &snapshot,
-                                    self.session.id(),
-                                    self.session.description(),
-                                    self.session.created_at(),
-                                )
-                                .await
-                            {
+                            if let Err(e) = self.save_snapshot(&snapshot).await {
                                 error!(error = %e, "Failed to persist session after compaction");
                             }
 
@@ -1871,42 +1941,19 @@ impl AgentLooper {
                     }
                 }
 
-                // 检查是否有 pending 输入自动续接 —— 一次排空全部排队输入，
-                // 合并为一条消息启动新轮
-                match self.session.dequeue_and_start_turn() {
-                    Ok(true) => {
-                        // ★ 新对话轮次：重置 ReAct 循环计数
-                        self.reset_turn_counters();
-                        self.react_state = ReActState::PreparingRequest;
-                        self.turn_start = Some(Instant::now());
-                    }
-                    Ok(false) => {
-                        // commit_turn 已设置 Idle，无需 set_state
-                        let old_outer = self.outer_state;
-                        self.outer_state = OuterState::Idle;
-                        self.emit_outer_state_change(old_outer, self.outer_state);
-                        Self::invoke_on_outer_state_change(
-                            &self.config.hooks,
-                            old_outer,
-                            self.outer_state,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to dequeue pending input");
-                        self.react_state = ReActState::Failed;
-                    }
-                }
+                // 提交完就交还循环 —— 续接排队输入由 `run()` 的 ③ 决定。`commit_turn`
+                // 已把 session 置回 Idle，此处只需把外层带回停靠位。
+                let old_outer = self.outer_state;
+                self.outer_state = OuterState::Idle;
+                self.emit_outer_state_change(old_outer, self.outer_state);
+                Self::invoke_on_outer_state_change(&self.config.hooks, old_outer, self.outer_state)
+                    .await;
             }
 
             ReActState::Failed => {
-                // 纯同步 no-op。收尾交给 `run()` 循环顶部 —— 循环不使用
-                // `select!`，在途 future 不会被消息抢占丢弃，且 `run()` 的
-                // task 从不被 abort，收尾两段（冻结 + 落盘）都能跑完。
-                //
-                // 在此处 await 会把异步尾巴（事件之外还有 `snapshot` /
-                // `save`）拉进 react_step 的调用栈，模糊「步进」与「收尾」
-                // 的边界 —— 收尾只应在循环顶发生。
+                // 纯同步 no-op，收尾交给 `run()` 循环顶 —— 循环不 `select!`、task
+                // 从不被 abort，收尾两段（冻结 + 落盘）都能跑完；在此 await 会把
+                // 异步尾巴拉进 react_step 的调用栈，模糊「步进」与「收尾」的边界。
                 return;
             }
 
@@ -2039,7 +2086,7 @@ impl AgentLooper {
     ///
     /// # 锚点由调用方在收敛点就地取
     /// `checkpoint` 是**本次模型请求发出前** staging 的条数，由
-    /// [`Self::finish_stream`] / [`Self::resolve_batch_response`] /
+    /// [`Self::finish_stream`] / [`Self::consume_batch_response`] /
     /// 各 Err 站点在 [`Self::stage_output_blocks`] 之前就地读取。它不存成
     /// 字段：从 `PreparingRequest` 到收敛点之间没有任何 staging 写入
     /// （chunk 处理只发事件、写 `react_ctx`、记账 usage），因此收敛点的
@@ -2118,10 +2165,10 @@ impl AgentLooper {
                     turn_index: turn,
                     attempt: self.retries_used as u32,
                     limit: self.config.retry_limit,
-                    output_tokens: cause.notice_output_tokens(),
+                    output_tokens: cause.retry_notice_output_tokens(),
                     retry_budget: self.effective_output_budget(),
                     discarded_text,
-                    reason: cause.notice_reason(),
+                    reason: cause.retry_notice_reason(),
                 },
             )
             .await;
@@ -2190,46 +2237,42 @@ impl AgentLooper {
         Some((dropped, discarded_text, had_output))
     }
 
-    /// 退避等待：等到 `retry_deadline`（若有）。可取消 — 每 ~200ms 切片
-    /// 检查一次取消标志，取消后立即返回，让 [`Self::prepare_and_send_request`]
-    /// 入口的取消守卫收尾。无待等待的 deadline 时是 no-op。
+    /// 退避等待：等到 `retry_deadline`（若有），每 ~200ms 切片查一次取消标志，被
+    /// 打断立刻返回 `false`；无 deadline 时 no-op。过期 deadline 循环条件天然为
+    /// 假，无需在此清除（由 [`Self::begin_retry`] 覆写、`reset_turn_counters` 清零）。
     ///
-    /// **只读不 `take()`**：`run()` 的 select 在用户输入到达时会 drop 进行中
-    /// 的 `react_step` future。取走 deadline 会把它带进 future 栈帧，drop 即
-    /// 丢失，重建后零退避立即重发 —— 退避对「等待期间用户发过消息」失效。
-    /// 留在 `self` 上则被 drop 后重入本函数继续等**剩余**时间（幂等）。
-    /// 过期 deadline 循环条件天然为假；下次 [`Self::begin_retry`]
-    /// 覆写、[`Self::reset_turn_counters`] 清零，无需在此清除。
-    async fn wait_retry_backoff(&mut self) {
+    /// 打断只可能来自 handle 被 drop 的安全网 —— 消息路径的取消在步内不可见
+    /// （Cancel 要先被 drain 消费才置位标志，步内没有 drain）。故 `false` 不是
+    /// 「用户按了停」，而是「没人再要这轮结果」，放弃发送即可。
+    ///
+    /// **只读不 `take()`**：取走 deadline 会把它带进 future 栈帧，future 被 drop
+    /// 即丢失，重建后零退避立即重发。留在 `self` 上则重入时继续等**剩余**时间。
+    async fn wait_retry_backoff(&mut self) -> bool {
         let Some(deadline) = self.retry_deadline else {
-            return;
+            return true;
         };
         while Instant::now() < deadline {
             if self.is_cancelled() {
-                return;
+                return false;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let slice = remaining.min(Duration::from_millis(200));
+            let slice = remaining.min(STEP_POLL);
             tokio::time::sleep(slice).await;
         }
+        true
     }
 
     // ── PreparingRequest — 分叉点 ────────────────────────────────────────
 
     /// 准备请求并分叉到 batch 或 streaming 路径。
     async fn prepare_and_send_request(&mut self, turn: usize) {
-        // 0. 瞬时重发的退避等待（可取消；无待等待 deadline 时是 no-op）。
-        //    放在最前：等待期间取消 → 下面第 1 步照常收尾为 Cancelled。
-        self.wait_retry_backoff().await;
-
-        // 1. 检查取消
-        if self.is_cancelled() {
-            self.failure_reason = Some(TurnFailureReason::Cancelled);
-            self.react_state = ReActState::Failed;
+        // 0. 瞬时重发的退避等待（无 deadline 时 no-op）。被打断 = handle 已
+        //    drop，发出去也没人接 —— 直接返回，收尾交给循环顶。
+        if !self.wait_retry_backoff().await {
             return;
         }
 
-        // 2. 检查 max_turns 限制（限制当前对话轮次内的模型调用次数）
+        // 1. 检查 max_turns 限制（限制当前对话轮次内的模型调用次数）
         if self.react_loop_iteration >= self.max_turns {
             self.failure_reason = Some(TurnFailureReason::MaxTurnsExceeded);
             self.react_state = ReActState::Failed;
@@ -2238,7 +2281,7 @@ impl AgentLooper {
         // ★ 递增模型调用计数
         self.react_loop_iteration += 1;
 
-        // 3. 构建消息列表（Agent 层上下文策略，零拷贝 Arc 共享）
+        // 2. 构建消息列表（Agent 层上下文策略，零拷贝 Arc 共享）
         let all_refs: Vec<&AnnotatedMessage> = self.session.all_message_refs().collect();
 
         // ★ MessageFilter: 在 build_context 之前过滤，system prompt + 动态上下文
@@ -2318,7 +2361,7 @@ impl AgentLooper {
             return;
         }
 
-        // 4. 分支：根据 ModelConfig.stream 决定路径
+        // 3. 分支：根据 ModelConfig.stream 决定路径
         let use_stream = self.agent.model_config().stream.unwrap_or(false);
 
         // 请求前估算 token — 响应到达后经 [`Self::log_estimate_calibration`]
@@ -2402,7 +2445,7 @@ impl AgentLooper {
     // ── Batch 分支：ResolvingResponse ─────────────────────────────────────
 
     /// 解析 batch 响应：提取内容、更新 usage、写入 staging、判断下一步。
-    async fn resolve_batch_response(&mut self, turn: usize) {
+    async fn consume_batch_response(&mut self, turn: usize) {
         // ★ 截断重试的回退锚点。必须在 `stage_output_blocks` **之前**取 ——
         //   之后 staging 就带上本次调用的产出了。此刻的值恒等于发请求前的长度：
         //   从 `PreparingRequest` 到这里没有任何 staging 写入。
@@ -2542,7 +2585,15 @@ impl AgentLooper {
             }
         };
 
-        match stream.next_chunk().await {
+        // 超时 = 一个「空步」：不改状态、不发事件，只把控制权还给 `run()` 让它
+        // 排空消息、检查取消。丢掉的 future 是 cancel-safe 的 ——
+        // 解析缓冲与重连退避都在 `SseState` 这个 pinned struct 内，跨 poll 保留。
+        let next = match tokio::time::timeout(STEP_POLL, stream.next_chunk()).await {
+            Err(_elapsed) => return,
+            Ok(next) => next,
+        };
+
+        match next {
             Some(Ok(chunk)) => {
                 // 双轨：delta 原样转发前端，BlockEnd 交由 assembler 折叠。
                 self.stream_assembler.push(chunk.clone());
@@ -2835,22 +2886,16 @@ impl AgentLooper {
 
     /// Tool 执行增量步进：spawn（首次进入）→ 轮询（后续进入）→ 完成。
     ///
-    /// 替代原来阻塞的 `join_all`，利用 `JoinSet` 将执行拆分为多个
-    /// `react_step()` 调用。每次调用要么收集一个已完成 tool 的结果，要么在
-    /// 短超时（200ms）后返回，让 `run()` 循环顶有机会排空控制消息、
-    /// 检查取消标志。
+    /// 用 `JoinSet` 将执行拆分为多个 `react_step()` 调用。每次调用要么收集一个
+    /// 已完成 tool 的结果，要么在短超时后返回，让 `run()` 循环顶有机会排空控制
+    /// 消息。取消不在这里检查 —— 收尾在 `run()` 循环顶发生，在途任务由
+    /// [`Self::abort_inflight_tools`] 回收；本函数看到的取消标志恒为假（标志只在
+    /// drain 消费消息时置位，步内无 drain）。
     ///
     /// 支持断点续执行：`result: Some(...)` 的已完成项自动跳过。
     async fn execute_tools_step(&mut self, turn: usize) {
         // ── Spawn 阶段：active_tool_tasks 为 None ───────────────────────
         if self.active_tool_tasks.is_none() {
-            // 进入 spawn 前检查取消
-            if self.is_cancelled() {
-                self.failure_reason = Some(TurnFailureReason::Cancelled);
-                self.react_state = ReActState::Failed;
-                return;
-            }
-
             let executor = self.agent.mcp_manager().tools_executor().clone();
 
             // 收集所有尚未执行的 tool calls（result == None）
@@ -2865,7 +2910,7 @@ impl AgentLooper {
 
             if pending_indices.is_empty() {
                 // 全部已完成（从断点恢复后的情况），直接进入收尾
-                self.finalize_tool_execution().await;
+                self.finish_tool_execution().await;
                 return;
             }
 
@@ -2922,7 +2967,7 @@ impl AgentLooper {
 
             // 如果所有 tool 已被 hook 处理（Override/Reject），直接收尾
             if to_spawn.is_empty() {
-                self.finalize_tool_execution().await;
+                self.finish_tool_execution().await;
                 return;
             }
 
@@ -2958,28 +3003,9 @@ impl AgentLooper {
         }
 
         // ── Poll 阶段：active_tool_tasks 为 Some ────────────────────────
-        // 每次轮询前检查取消
-        if self.is_cancelled() {
-            // 先捞回已完成的 task（try_join_next 非阻塞），再 abort 在途的 ——
-            // 这是本设计里唯一「连内存都留不住」的窗口。
-            if let Some(mut joinset) = self.active_tool_tasks.take() {
-                let drained = Self::drain_finished_join_results(
-                    &mut joinset,
-                    &mut self.react_ctx.pending_tool_calls,
-                );
-                if drained > 0 {
-                    debug!(drained, "Salvaged completed tool results before abort");
-                }
-                joinset.abort_all();
-            }
-            self.failure_reason = Some(TurnFailureReason::Cancelled);
-            self.react_state = ReActState::Failed;
-            return;
-        }
-
         // 以短超时轮询下一个完成的 task
         let poll_result = tokio::time::timeout(
-            Duration::from_millis(200),
+            STEP_POLL,
             self.active_tool_tasks
                 .as_mut()
                 .expect("active_tool_tasks must be Some in poll phase")
@@ -3063,7 +3089,7 @@ impl AgentLooper {
                     .is_none_or(|js| js.is_empty());
                 if all_done {
                     self.active_tool_tasks = None;
-                    self.finalize_tool_execution().await;
+                    self.finish_tool_execution().await;
                 }
             }
 
@@ -3081,14 +3107,14 @@ impl AgentLooper {
             // 所有 task 已全部完成
             Ok(None) => {
                 self.active_tool_tasks = None;
-                self.finalize_tool_execution().await;
+                self.finish_tool_execution().await;
             }
         }
     }
 
     /// 把 `pending_tool_calls` 中 `result: Some` 的项写入 staging。**只写不清理**。
     ///
-    /// 写入与清理彻底分开：`finalize_tool_execution` 写完还要清 looper 状态，
+    /// 写入与清理彻底分开：`finish_tool_execution` 写完还要清 looper 状态，
     /// 而失败收尾（[`plan_failure`]，走同一个自由函数 `stage_tool_results`）
     /// 一个字段都不该清 —— 它还要从 `assistant_text` 取 partial_text。
     /// 用一个 `clear: bool` 表达不了这组差异，硬塞会变成三个 bool，且调用点写错
@@ -3123,7 +3149,7 @@ impl AgentLooper {
     }
 
     /// 所有 tool 执行完毕后的收尾：批量写入 staging，切换状态。
-    async fn finalize_tool_execution(&mut self) {
+    async fn finish_tool_execution(&mut self) {
         self.stage_completed_tool_results();
 
         // ★ 在途轮检查点：一批工具刚落地的时刻 —— 副作用已经发生，
@@ -3152,27 +3178,29 @@ impl AgentLooper {
 
     // ── 失败收尾 ──────────────────────────────────────────────────────────
 
-    /// 统一的 turn 失败收尾：冻结在途轮 → 落盘 → 发事件 → 续接 pending。
+    /// 统一的 turn 失败收尾：冻结在途轮 → 落盘 → 发事件。
     ///
-    /// 返回 `true` 表示续接了排队输入（调用方应 `continue`）。
-    async fn finalize_failure(&mut self, reason: TurnFailureReason, drain_pending: bool) -> bool {
+    /// `force_persist` 与 `persist_on_failure` 取或：后者门控普通失败轮是否落盘
+    /// （CLI 走 `NullSessionPersister` 时置 false 即无副作用），前者供取消路径
+    /// **强制**落盘 —— 取消不丢 pending，而 pending 只活在 Session 内存里。
+    ///
+    /// 契约是「把状态搬到可推进的位置」，不回报布尔让调用方决定续接 —— 续接交给
+    /// `run()` 的 ③ 单一入口。
+    async fn apply_failure(&mut self, reason: TurnFailureReason, force_persist: bool) {
         // `retry_happened` 决定 `plan_failure` 是否补存活桩：只有「回退已发生、
         // 新尝试零产出」才需要桩 —— 那正是回退把 staging 清空留下的洞。
         match plan_failure(
             &mut self.session,
             &mut self.react_ctx,
-            self.config.persist_on_failure,
+            self.config.persist_on_failure || force_persist,
             reason,
-            drain_pending,
             self.retries_used > 0,
         ) {
-            Some(plan) => self.finalize_failure_async(plan).await,
+            Some(plan) => self.commit_failure_plan(plan).await,
             None => {
-                // 无在途轮（plan_failure 守卫：session Idle + staging 空）：
-                // 同样要把状态带回停靠位，否则 Failed 留在循环顶反复命中
-                // （镜像 async 路径 3164-3170 的修复）—— 防御任何未知路径
-                // 再产生「finalize 返回 false 且 react_state 仍为 Failed」
-                // 的热自旋。
+                // 无在途轮（plan_failure 守卫：session Idle + staging 空）：同样要把
+                // 状态带回停靠位，否则 Failed 留在循环顶反复命中 —— 防御未知路径再
+                // 产生「收尾后 react_state 仍为 Failed」的热自旋。
                 if matches!(self.react_state, ReActState::Failed) {
                     self.react_state = ReActState::Done;
                 }
@@ -3183,15 +3211,13 @@ impl AgentLooper {
                     self.outer_state = OuterState::Idle;
                     self.emit_outer_state_change(old, OuterState::Idle);
                 }
-                false
             }
         }
     }
 
-    /// 消费 [`FinalizePlan`] 的异步段：事件 → hook → 落盘 → 回写原因 → 续接。
-    ///
-    /// 变更（冻结 + 快照）已在 [`plan_failure`] 内同步完成，此处只做 I/O 与编排。
-    async fn finalize_failure_async(&mut self, plan: FinalizePlan) -> bool {
+    /// 消费 [`FinalizePlan`] 的异步段：事件 → hook → 落盘 → 回写原因。冻结 + 快照
+    /// 已在 [`plan_failure`] 内同步完成，此处只做 I/O 与编排。
+    async fn commit_failure_plan(&mut self, plan: FinalizePlan) {
         warn!(
             turn = plan.turn,
             reason = ?plan.reason,
@@ -3223,15 +3249,7 @@ impl AgentLooper {
 
         // 落盘门控：冻结无条件发生（内存），持久化由 persist_on_failure 决定
         if let Some(snapshot) = plan.snapshot
-            && let Err(e) = self
-                .persister
-                .save(
-                    &snapshot,
-                    self.session.id(),
-                    self.session.description(),
-                    self.session.created_at(),
-                )
-                .await
+            && let Err(e) = self.save_snapshot(&snapshot).await
         {
             error!(error = %e, "Failed to persist session after turn failure");
         }
@@ -3243,27 +3261,6 @@ impl AgentLooper {
         //   "done"，Shutdown 事件丢失失败原因。这次回写是刻意的，不是冗余赋值。
         self.failure_reason = Some(plan.reason.clone());
 
-        if plan.drain_pending {
-            // 排空全部排队输入（合并为一条）启动续接轮
-            match self.session.dequeue_and_start_turn() {
-                Ok(true) => {
-                    // ★ 新对话轮次：重置 ReAct 循环计数
-                    self.reset_turn_counters();
-                    self.react_state = ReActState::PreparingRequest;
-                    self.turn_start = Some(Instant::now());
-                    // ★ 上一轮的失败原因不得跨轮存活：新一轮若不经过
-                    //   `handle_user_query`（那条路径会清），会在正常跑到 `Done` 时
-                    //   撞上 `debug_assert!(failure_reason.is_none())`。
-                    self.failure_reason = None;
-                    return true;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    error!(error = %e, "Failed to dequeue pending input");
-                }
-            }
-        }
-
         // interrupt_turn / rollback_turn 已把 session 置回 Idle。
         // 内层也回到 `Done`（无在途工作）—— 留着 `Failed` 会让循环顶部反复命中。
         self.react_state = ReActState::Done;
@@ -3271,7 +3268,6 @@ impl AgentLooper {
         self.outer_state = OuterState::Idle;
         self.emit_outer_state_change(old_outer, self.outer_state);
         Self::invoke_on_outer_state_change(&self.config.hooks, old_outer, self.outer_state).await;
-        false
     }
 }
 
@@ -3296,8 +3292,6 @@ struct FinalizePlan {
     snapshot: Option<SessionSnapshot>,
     /// 冻结前 staging 中的消息数（合成 Output 与中断说明尚未追加）。
     frozen_staging_messages: usize,
-    /// 是否续接排队输入。由 `!is_cancelled()` 单点推导 —— 用户按了停就不自动跑下一条。
-    drain_pending: bool,
 }
 
 /// 把 `pending_tool_calls` 中 `result: Some` 的项写入 session 的 staging。只写不清理。
@@ -3324,8 +3318,6 @@ fn stage_tool_results(session: &mut Session, pending: &[PendingToolCall]) {
 fn failure_label(reason: &TurnFailureReason) -> String {
     match reason {
         TurnFailureReason::Cancelled => "cancelled by user".to_string(),
-        TurnFailureReason::TotalTimeout => "total run timeout".to_string(),
-        TurnFailureReason::PerTurnTimeout => "per-turn timeout".to_string(),
         TurnFailureReason::MaxTurnsExceeded => "max turns exceeded".to_string(),
         TurnFailureReason::HookAbort(detail) => format!("aborted by hook: {detail}"),
         TurnFailureReason::RateLimited { attempts, message } => {
@@ -3397,6 +3389,14 @@ fn model_failure_reason(
     }
 }
 
+/// 会话是否还有在途轮可收尾 —— 非 `Idle`，或 staging 里还留着本轮消息。
+///
+/// [`AgentLooper::has_inflight_turn`]（取消收尾的补落盘判据）与 [`plan_failure`] ①
+/// 共用同一判据：两处漂移会让「取消补落盘」与「失败冻结」对相同状态得出不同结论。
+fn session_has_inflight(session: &Session) -> bool {
+    !matches!(session.state(), SessionState::Idle) || !session.staging_messages().is_empty()
+}
+
 /// 无 await，全部 session 变更在此完成。
 ///
 /// **不变量：本函数全程禁止 `.await`。** 正因为是纯同步，「冻结」对取消免疫 ——
@@ -3417,11 +3417,10 @@ fn plan_failure(
     ctx: &mut ReActContext,
     persist: bool,
     reason: TurnFailureReason,
-    drain_pending: bool,
     retry_happened: bool,
 ) -> Option<FinalizePlan> {
     // ① 无在途轮守卫
-    if session.state() == SessionState::Idle && session.staging_messages().is_empty() {
+    if !session_has_inflight(session) {
         return None;
     }
 
@@ -3430,18 +3429,19 @@ fn plan_failure(
     let partial_text = std::mem::take(&mut ctx.assistant_text);
     let partial_text_len = partial_text.len();
 
-    // ③ 补回轮次存活桩。重发回退后 staging 只剩 `user_input`，
-    //    `interrupt_turn` 会因此退化成 `rollback_turn`，这一轮（含用户提问）
-    //    整轮丢失 —— 比不重试还差。补一条 assistant 消息让冻结路径照常成立：
-    //    新尝试自己吐过文本 → 用它的 partial_text（既有路径）；
-    //    新尝试零产出 → 补固定文案桩（仅在发生过重发时，非重试路径逐字节不变）。
-    //    被回退的截断文本**不进历史** —— 实时视图的残句由 TruncationRetry
-    //    通知解释，重载后随快照消失。
+    // ③ 补回轮次存活桩。staging 只剩 `user_input` 时 `interrupt_turn` 会退化成
+    //    `rollback_turn(false)`，这一轮（含用户提问）整轮丢失。
+    //    补一条 assistant 消息让冻结路径照常成立：吐过文本用 partial_text，零产出
+    //    补固定文案桩（「重试后无产出」/「取消」两种来源各补各的；取消后 looper 留在
+    //    Idle，不补桩用户重载页面会发现自己那条消息凭空消失）。被回退的截断文本
+    //    **不进历史** —— 实时视图的残句由 TruncationRetry 解释，重载后随快照消失。
     if session.staging_messages().is_empty() {
         if !partial_text.is_empty() {
             session.stage_salvage(partial_text.clone());
         } else if retry_happened {
             session.stage_salvage("[response discarded after retry]".into());
+        } else if matches!(reason, TurnFailureReason::Cancelled) {
+            session.stage_salvage("[cancelled before response]".into());
         }
     }
 
@@ -3471,9 +3471,9 @@ fn plan_failure(
         _ => None,
     };
 
-    // ⑦ 清 ctx —— pending_tool_calls 必须清，否则 drain_pending 时下一轮的
-    //    execute_tools_step 会把上一轮取消掉的 tool 重跑一遍（to_spawn 只 filter
-    //    result.is_none()），正是本设计明确禁止的重放副作用。
+    // ⑦ 清 ctx —— pending_tool_calls 必须清，否则下一轮续接的 execute_tools_step
+    //    会把上一轮取消掉的 tool 重跑一遍（to_spawn 只 filter result.is_none()），
+    //    即重放副作用。
     ctx.pending_tool_calls.clear();
     ctx.assistant_text.clear();
     ctx.assistant_reasoning.clear();
@@ -3489,7 +3489,6 @@ fn plan_failure(
         partial_text_len,
         snapshot,
         frozen_staging_messages,
-        drain_pending,
     })
 }
 
@@ -3508,8 +3507,6 @@ mod tests {
     fn test_looper_config_default() {
         let config = LooperConfig::default();
         assert_eq!(config.event_buffer, 256);
-        assert_eq!(config.per_turn_timeout, Some(Duration::from_secs(180)));
-        assert!(config.total_timeout.is_none());
         assert!(config.hooks.is_empty());
         assert!(config.environment.is_none());
         assert_eq!(config.retry_limit, 3);
@@ -3558,46 +3555,6 @@ mod tests {
         // effective prompt == agent.system_prompt()
         let stable = compose_stable_prefix("SYS", None);
         assert_eq!(compose_effective_prompt(&stable, None), "SYS");
-    }
-
-    // ── ReActContext tests ─────────────────────────────────────────────
-
-    #[test]
-    fn test_react_context_default() {
-        let ctx = ReActContext::default();
-        assert!(ctx.batch_response.is_none());
-        assert!(ctx.pending_tool_calls.is_empty());
-        assert!(ctx.assistant_text.is_empty());
-        assert!(ctx.assistant_reasoning.is_empty());
-    }
-
-    // ── PendingToolCall tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_pending_tool_call_new() {
-        let tc = Arc::new(ToolCall::new("id1", "test_tool", "{}"));
-        let ptc = PendingToolCall {
-            call: Arc::clone(&tc),
-            result: None,
-        };
-        assert_eq!(ptc.call.id, "id1");
-        assert!(ptc.result.is_none());
-    }
-
-    #[test]
-    fn test_pending_tool_call_with_result() {
-        let tc = Arc::new(ToolCall::new("id1", "test_tool", "{}"));
-        let result = ToolCallResult {
-            call: Arc::clone(&tc),
-            result: Content::Text("output".to_string()),
-            is_error: false,
-        };
-        let ptc = PendingToolCall {
-            call: tc,
-            result: Some(result),
-        };
-        assert!(ptc.result.is_some());
-        assert!(!ptc.result.unwrap().is_error);
     }
 
     // ── drain_finished_join_results tests ──────────────────────────────
@@ -3703,7 +3660,6 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
-            false,
         )
         .expect("in-flight turn must produce a plan");
 
@@ -3760,7 +3716,6 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
-            false,
         )
         .expect("有在途轮");
 
@@ -3779,8 +3734,11 @@ mod tests {
         assert!(ctx.pending_tool_calls.is_empty(), "ctx 必须清空，防重放");
     }
 
+    /// 取消时模型还没吐字：必须补桩冻结，**不能**退化成 rollback —— 退化路径会
+    /// 把这一轮（含用户提问）整轮丢掉，用户按停后重载页面会发现自己那条消息凭空
+    /// 消失。取消是主停止手段，这条必须锁住。
     #[test]
-    fn test_plan_failure_only_user_input_degenerates() {
+    fn test_plan_failure_cancel_before_output_freezes_with_stub() {
         let mut session = plan_session();
         session.start_turn("hi".into()).unwrap();
         let mut ctx = ReActContext::default();
@@ -3791,6 +3749,44 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+        )
+        .expect("Active with only user_input still has a turn to close");
+
+        assert_eq!(plan.turn, 0);
+        assert_eq!(session.committed_turns().len(), 1, "取消必须冻结而非丢弃");
+        assert_eq!(session.turn_index(), 1);
+        assert_eq!(session.state(), SessionState::Idle);
+        let turn = &session.committed_turns()[0];
+        assert!(
+            turn.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::Message { role: Role::Assistant, content }
+                    if matches!(content, Content::Text(t) if t == "[cancelled before response]")
+            )),
+            "必须补存活桩，否则 interrupt_turn 退化成 rollback，用户提问丢失"
+        );
+        assert!(
+            turn.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::Message { role: Role::User, content }
+                    if matches!(content, Content::Text(t) if t == "hi")
+            )),
+            "用户提问必须留在历史里"
+        );
+    }
+
+    /// 非取消、零产出、无重发 → 仍走退化 rollback（守住该路径不被误删）。
+    #[test]
+    fn test_plan_failure_non_cancel_only_user_input_degenerates() {
+        let mut session = plan_session();
+        session.start_turn("hi".into()).unwrap();
+        let mut ctx = ReActContext::default();
+
+        let plan = plan_failure(
+            &mut session,
+            &mut ctx,
+            true,
+            TurnFailureReason::MaxTurnsExceeded,
             false,
         )
         .expect("Active with only user_input still has a turn to close");
@@ -3813,7 +3809,6 @@ mod tests {
                 &mut ctx,
                 true,
                 TurnFailureReason::Cancelled,
-                false,
                 false,
             )
             .is_none()
@@ -3840,8 +3835,7 @@ mod tests {
             &mut session,
             &mut ctx,
             false,
-            TurnFailureReason::TotalTimeout,
-            false,
+            TurnFailureReason::MaxTurnsExceeded,
             false,
         )
         .unwrap();
@@ -3855,8 +3849,6 @@ mod tests {
     fn test_failure_label_covers_all_variants_without_debug_leak() {
         let variants = [
             TurnFailureReason::Cancelled,
-            TurnFailureReason::TotalTimeout,
-            TurnFailureReason::PerTurnTimeout,
             TurnFailureReason::MaxTurnsExceeded,
             TurnFailureReason::HookAbort("hook says no".to_string()),
             TurnFailureReason::Other("boom".to_string()),
@@ -3944,7 +3936,6 @@ mod tests {
         /// `run()` 取所有权，故用 `Option` 让调用点能把它移出去。
         user_listener: Option<Listener<UserMsg>>,
         events: Listener<LooperEvent>,
-        persister: Arc<CountingPersister>,
     }
 
     /// 构造失败收尾测试用的 looper：`PanicProvider` + 计数 persister
@@ -4011,7 +4002,6 @@ mod tests {
             _user_speaker: user_speaker,
             user_listener: Some(user_listener),
             events: event_listener,
-            persister,
         }
     }
 
@@ -4028,33 +4018,36 @@ mod tests {
         }
     }
 
-    /// 驱动 run() 直到取消收尾完成，返回 (TurnComplete 次数, committed 轮数, 落盘次数)。
-    async fn drive_cancelled_looper(persist_on_failure: bool) -> (usize, usize, usize) {
-        let mut h = failure_looper_harness(true, persist_on_failure, false);
-        let listener = h.user_listener.take().expect("harness 持有 listener");
-        let _ = h.looper.run(listener).await;
-
-        (
-            h.turn_completes(),
-            h.looper.session().committed_turns().len(),
-            h.persister.saves.load(Ordering::SeqCst),
-        )
-    }
-
-    /// 失败后自动续接排队输入时，上一轮的失败原因不得跨轮存活 ——
-    /// 续接的那一轮若正常跑到 `Done`，会撞上 `debug_assert!(failure_reason.is_none())`。
-    /// 同时验证：多条排队输入被一次排空、合并进续接轮。
+    /// 失败后自动续接排队输入时，上一轮的失败原因不得跨轮存活 —— 续接那轮若正常
+    /// 跑到 `Done`，会撞上 `debug_assert!(failure_reason.is_none())`。同时验证多条
+    /// 排队输入被一次排空、合并进续接轮。
+    ///
+    /// 收尾与续接是两步（`finalize_failure` → `start_turn_from_pending`），对应
+    /// `run()` 的 ② 与 ③；这里按同样顺序手动驱动。
     #[tokio::test]
     async fn test_auto_continue_clears_failure_reason() {
         let mut h = failure_looper_harness(false, true, true);
         // harness 已入队 "queued"，再补一条 —— 续接时必须一次消化两条
         h.looper.session.enqueue_pending("second".into());
 
-        let continued = h
-            .looper
-            .finalize_failure(TurnFailureReason::HookAbort("hooked".into()), true)
-            .await;
-        assert!(continued, "队列里有输入时必须续接");
+        h.looper.failure_reason = Some(TurnFailureReason::HookAbort("hooked".into()));
+        h.looper.react_state = ReActState::Failed;
+        h.looper.finalize_failure().await;
+        assert!(
+            h.looper.session().has_pending(),
+            "失败收尾不得吞掉排队输入 —— 那是 ③ 的事"
+        );
+        assert!(
+            matches!(
+                h.looper.failure_reason,
+                Some(TurnFailureReason::HookAbort(_))
+            ),
+            "收尾后原因留在 self 上等 Shutdown 读取；现状={:?}",
+            h.looper.failure_reason
+        );
+
+        h.looper.pending_armed = true;
+        h.looper.start_turn_from_pending();
         assert!(
             h.looper.failure_reason.is_none(),
             "续接后必须清空 failure_reason；现状={:?}",
@@ -4105,24 +4098,6 @@ mod tests {
         );
         assert!(matches!(h.looper.outer_state(), OuterState::Idle));
         assert_eq!(h.turn_completes(), 1, "冻结必须恰好发一次 TurnComplete");
-    }
-
-    #[tokio::test]
-    async fn test_cancel_freezes_turn_and_emits_turn_complete_once() {
-        let (turn_completes, committed, _) = drive_cancelled_looper(true).await;
-        assert_eq!(turn_completes, 1, "取消收尾必须恰好发一次 TurnComplete");
-        assert_eq!(committed, 1, "中断轮必须冻结进 committed");
-    }
-
-    #[tokio::test]
-    async fn test_persist_on_failure_gates_save() {
-        let (_, committed_on, saves_on) = drive_cancelled_looper(true).await;
-        assert_eq!(committed_on, 1);
-        assert_eq!(saves_on, 1, "persist_on_failure=true 必须落盘一次");
-
-        let (_, committed_off, saves_off) = drive_cancelled_looper(false).await;
-        assert_eq!(committed_off, 1, "冻结无条件发生（内存）");
-        assert_eq!(saves_off, 0, "persist_on_failure=false 不得落盘");
     }
 
     // ── State enum tests ───────────────────────────────────────────────
@@ -4293,8 +4268,6 @@ mod tests {
         user_listener: Option<Listener<UserMsg>>,
         provider: Arc<ScriptedStreamProvider>,
         events: Listener<LooperEvent>,
-        /// 与 looper 共享的取消标志 — 测试用来在退避等待期间触发取消。
-        cancel_flag: Arc<AtomicBool>,
     }
 
     impl RetryHarness {
@@ -4426,8 +4399,6 @@ mod tests {
             config,
             Arc::new(crate::persistence::NullSessionPersister),
         );
-        // 测试用：取共享克隆，退避等待期间直写触发取消（走 flag 内部检查点）
-        let cancel_flag = Arc::clone(&looper.cancel_flag);
 
         RetryHarness {
             looper,
@@ -4435,7 +4406,6 @@ mod tests {
             user_listener: Some(user_listener),
             provider,
             events: event_listener,
-            cancel_flag,
         }
     }
 
@@ -4542,79 +4512,87 @@ mod tests {
         h.shutdown().await.expect("clean shutdown");
     }
 
-    /// 空闲停靠时 select 只有 `recv` 分支激活 —— 裸 flag 叫不醒，Cancel
-    /// 必须是消息，且无在途轮时 shutdown_reason 要反映 Cancelled 而非 "done"。
+    /// 取消语义是「中止当前 ReAct 轮，looper 不退出」—— 暂停中取消同样如此：
+    /// 收尾把外层状态带回 Idle、复位暂停镜像与一次性的 `cancel_flag`，looper 停在
+    /// Idle 继续等输入。
     #[tokio::test]
-    async fn test_cancel_wakes_docked_looper() {
-        let (h, _provider) = spawn_scripted_looper(vec![], LooperConfig::default());
-
-        // 等 looper 进入停靠（首帧 OuterStateChange 不发，Idle 为初始态；
-        // 停靠本身无事件，用短暂等待确保已挂在阻塞 recv 上）
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // 关键：不发任何 query，仅靠 Cancel 消息唤醒并退出
-        h.cancel().await.expect("looper alive");
-
-        let res = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match h.recv_event().await {
-                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
-                    Some(_) => continue,
-                    None => panic!("event channel closed before Shutdown"),
-                }
-            }
-        })
-        .await;
-        let reason = res.expect("停靠时 cancel 必须能唤醒 select 并退出");
-        assert!(
-            reason.contains("Cancelled"),
-            "无在途轮的取消退出 reason 应为 Cancelled，实际 {reason}"
-        );
-        assert!(h.is_cancelled(), "消费 Cancel 后镜像必须为 true");
-
-        // run() 已退出，wait 应立即返回
-        let final_res = tokio::time::timeout(Duration::from_secs(5), h.wait()).await;
-        assert!(
-            final_res.is_ok_and(|r| r.is_ok()),
-            "cancel 退出后 wait() 应正常返回"
-        );
-    }
-
-    /// 暂停分支阻塞在 `recv()` 上 —— 裸 flag 同样叫不醒，Cancel 消息
-    /// 必须穿透暂停并走循环顶的取消收尾退出。
-    #[tokio::test]
-    async fn test_cancel_wakes_paused_looper() {
-        let (h, _provider) = spawn_scripted_looper(vec![], LooperConfig::default());
+    async fn test_cancel_from_paused_returns_to_idle_and_looper_survives() {
+        let (h, _provider) = spawn_scripted_looper(vec![completed("ok")], LooperConfig::default());
 
         h.pause().await.expect("looper alive");
         recv_until_state(&h, OuterState::Paused).await;
         assert!(h.is_paused(), "进入 Paused 后镜像必须为 true");
 
-        // 关键：暂停中不发 Resume、不发 query，仅靠 Cancel 退出
+        // 关键：暂停中不发 Resume、不发 query，仅靠 Cancel 收尾
         h.cancel().await.expect("looper alive");
 
-        let res = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match h.recv_event().await {
-                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
-                    Some(_) => continue,
-                    None => panic!("event channel closed before Shutdown"),
-                }
-            }
-        })
-        .await;
-        let reason = res.expect("暂停中 cancel 必须穿透 recv 阻塞并退出");
-        assert!(
-            reason.contains("Cancelled"),
-            "暂停中的取消退出 reason 应为 Cancelled，实际 {reason}"
-        );
-        assert!(h.is_cancelled());
-        assert!(!h.is_paused(), "退出时暂停镜像必须已复位");
+        // 新语义：取消不退出 looper —— 收尾后回到 Idle
+        recv_until_state(&h, OuterState::Idle).await;
+        assert!(!h.is_paused(), "取消收尾后暂停镜像必须复位");
+        assert!(!h.is_cancelled(), "cancel_flag 是一次性的，收尾后必须复位");
+
+        // looper 仍存活：下一句 Query 能正常跑完一轮
+        h.send_query("again".into())
+            .await
+            .expect("取消后 looper 仍须接受输入");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok"),
+            other => panic!("取消后续接轮应正常完成，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
     }
 
-    /// finalize 在「无在途轮」（plan=None）时也必须把状态带回停靠位 ——
-    /// Failed 留在循环顶会反复命中形成热自旋（C1 兜底），外层的
-    /// RunningInnerLoop 不一致同样要带回 Idle；Paused 不动。
+    /// 取消收尾必须先把在途工具**已完成**的结果捞回来，再 abort 其余任务。工具
+    /// 轮询是唯一持有在途 tokio 任务、也是唯一「成果连内存都进不去」的状态 ——
+    /// 最后一个 200ms 窗口内完成的结果只存在于 JoinSet 里，漏掉就永久丢失。
+    /// 顺序颠倒（先 abort 后冻结）本测试必须红。
+    #[tokio::test]
+    async fn test_cancel_salvages_finished_tool_results() {
+        let mut h = failure_looper_harness(false, false, false);
+
+        // 两个在途任务：一个立刻完成（必须被捞回），一个永不完成（必须被 abort）
+        let mut joinset: tokio::task::JoinSet<(usize, ToolCallResult)> =
+            tokio::task::JoinSet::new();
+        joinset.spawn(async { tool_result(0) });
+        joinset.spawn(async {
+            std::future::pending::<()>().await;
+            tool_result(1)
+        });
+        // 模拟「最后一次轮询之后、取消之前」完成的那个
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        h.looper.react_ctx.pending_tool_calls = pending_slots(2);
+        h.looper.active_tool_tasks = Some(joinset);
+        h.looper.react_state = ReActState::ExecutingTools;
+
+        h.looper.finalize_cancel().await;
+
+        assert!(
+            h.looper.active_tool_tasks.is_none(),
+            "取消必须回收在途任务集"
+        );
+        assert!(
+            matches!(h.looper.failure_reason, Some(TurnFailureReason::Cancelled)),
+            "取消收尾必须留下 Cancelled 原因，实际={:?}",
+            h.looper.failure_reason
+        );
+        // 已完成的 c0 结果随本轮一起冻结（悬空的 c1 由 plan_failure 补占位）
+        let turn = &h.looper.session().committed_turns()[0];
+        assert!(
+            turn.iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::FunctionCallOutput { call_id, output }
+                    if call_id == "c0" && matches!(output, Content::Text(t) if t == "r0")
+            )),
+            "取消前已完成的工具结果必须随本轮冻结，实际={:?}",
+            turn.iter().map(|am| &am.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// finalize 在「无在途轮」（plan=None）时也必须把状态带回停靠位 —— Failed 留在
+    /// 循环顶会反复命中形成热自旋，外层的 RunningInnerLoop 不一致同样要带回 Idle；
+    /// Paused 不动。
     #[tokio::test]
     async fn test_finalize_none_repairs_state() {
         let mut h = failure_looper_harness(false, true, false);
@@ -4623,11 +4601,9 @@ mod tests {
 
         h.looper.react_state = ReActState::Failed;
         h.looper.outer_state = OuterState::RunningInnerLoop; // 模拟状态不一致
-        let handled = h
-            .looper
-            .finalize_failure(TurnFailureReason::Other("x".into()), true)
+        h.looper
+            .apply_failure(TurnFailureReason::Other("x".into()), true)
             .await;
-        assert!(!handled, "无在途轮不应报告续接");
         assert!(
             matches!(h.looper.react_state, ReActState::Done),
             "plan=None 后 react_state 必须离开 Failed，实际={:?}",
@@ -4642,46 +4618,15 @@ mod tests {
         // Paused 不得被 None 分支推平（恢复时按 pre_pause 还原）
         h.looper.react_state = ReActState::Failed;
         h.looper.outer_state = OuterState::Paused;
-        let _ = h
-            .looper
-            .finalize_failure(TurnFailureReason::Other("x".into()), false)
+        h.looper
+            .apply_failure(TurnFailureReason::Other("x".into()), false)
             .await;
         assert!(matches!(h.looper.react_state, ReActState::Done));
         assert_eq!(h.looper.outer_state, OuterState::Paused);
     }
 
-    /// 停靠态被总超时杀掉时 shutdown_reason 必须报 TotalTimeout ——
-    /// 与取消分支对称（无在途轮时 finalize 不回写原因，需在 break 前补记），
-    /// 否则误报 "done" 或上一轮残留原因。
-    #[tokio::test]
-    async fn test_total_timeout_reason_reported() {
-        let (h, _provider) = spawn_scripted_looper(
-            vec![],
-            LooperConfig {
-                total_timeout: Some(Duration::ZERO),
-                ..Default::default()
-            },
-        );
-
-        let res = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match h.recv_event().await {
-                    Some(LooperEvent::Shutdown { reason, .. }) => break reason,
-                    Some(_) => continue,
-                    None => panic!("event channel closed before Shutdown"),
-                }
-            }
-        })
-        .await;
-        let reason = res.expect("总超时应触发退出");
-        assert!(
-            reason.contains("TotalTimeout"),
-            "停靠态超时退出 reason 应为 TotalTimeout，实际 {reason}"
-        );
-    }
-
-    /// Resume 带排队输入时：先排空续接（外层保持 Paused 调用
-    /// handle_user_query → 事件 Paused→RunningInnerLoop），期间不得出现
+    /// Resume 带排队输入时：续接由 `start_turn_from_pending` 在外层仍是
+    /// Paused 时启动（发出 Paused→RunningInnerLoop），期间不得出现
     /// to=Idle 的状态迁移 —— runner 见 to=Idle 且无 SSE 订阅者会回收
     /// handle，把刚要启动的续接轮冻成 Failed{Cancelled}。
     #[tokio::test]
@@ -5100,6 +5045,9 @@ mod tests {
         // 收窄前的判据是裸 `Incomplete`，content_filter 也会被当成截断重发一次
         // —— 抬预算救不回来，纯白烧一次调用。`GenerateResult::finish_reason`
         // 让批量路径能做出与流式路径同样的区分。
+        //
+        // 上游没给原因（`finish_reason == None`）走同一条 else 分支，同样不重试 ——
+        // 「不臆测成截断」由本用例一并守住。
         let mut h = batch_retry_harness(
             vec![batch_response(
                 "filtered",
@@ -5121,28 +5069,6 @@ mod tests {
             h.turn_outcomes().as_slice(),
             [TurnOutcome::Failed { .. }]
         ));
-    }
-
-    #[tokio::test]
-    async fn test_batch_incomplete_without_finish_reason_does_not_retry() {
-        // 上游没给原因时不臆测成截断 —— 抬预算未必救得了，重试代价却是确定的。
-        let mut h = batch_retry_harness(
-            vec![batch_response(
-                "unknown",
-                12,
-                model_provider::ResponseStatus::Incomplete,
-                None,
-            )],
-            LooperConfig {
-                retry_limit: 1,
-                retry_output_budget: 32_768,
-                ..Default::default()
-            },
-        );
-
-        drive_query(&mut h).await;
-
-        assert_eq!(h.provider.budgets().len(), 1, "原因未知时不得重试");
     }
 
     #[tokio::test]
@@ -5326,7 +5252,10 @@ mod tests {
             "future 被 drop 不得丢失 deadline"
         );
 
-        h.looper.wait_retry_backoff().await;
+        assert!(
+            h.looper.wait_retry_backoff().await,
+            "无人取消时退避应正常等满"
+        );
         assert!(
             started.elapsed() >= Duration::from_millis(130),
             "重入必须等满剩余退避（幂等），实际 {:?}",
@@ -5614,58 +5543,6 @@ mod tests {
         match &h.turn_outcomes()[..] {
             [TurnOutcome::Success { text }] => assert_eq!(text, "重试成功"),
             other => panic!("期望重试后 Success，实际 {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_cancel_during_backoff_stops_before_resend() {
-        // 退避等待期间用户取消 → 立即收尾，不发第二次请求。
-        let mut h = batch_retry_harness(
-            vec![
-                Script::Fail(api_err(503, "service unavailable")),
-                Script::Fail(api_err(503, "service unavailable")),
-            ],
-            LooperConfig {
-                retry_limit: 2,
-                // 大退避：给取消留出窗口
-                retry_base_delay_ms: 60_000,
-                retry_max_delay_ms: 60_000,
-                ..Default::default()
-            },
-        );
-
-        let listener = h.user_listener.take().expect("harness 持有 listener");
-        h._user_speaker
-            .send(UserMsg::Query("hi".into()))
-            .await
-            .expect("looper 侧仍在监听");
-
-        // 退避 60s，取消在 300ms 到达 —— run() 必须在取消后立刻收敛，
-        // 而不是等满 60s 再发第二次请求。
-        let flag = Arc::clone(&h.cancel_flag);
-        let canceller = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            flag.store(true, Ordering::Release);
-        });
-
-        let started = Instant::now();
-        let _ = tokio::time::timeout(Duration::from_secs(5), h.looper.run(listener)).await;
-        let elapsed = started.elapsed();
-        canceller.await.ok();
-
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "取消必须打断退避等待，实际 {elapsed:?}"
-        );
-        assert_eq!(h.provider.budgets().len(), 1, "取消后不得发出第二次请求");
-        match &h.turn_outcomes()[..] {
-            [TurnOutcome::Failed { reason, .. }] => {
-                assert!(
-                    matches!(reason, TurnFailureReason::Cancelled),
-                    "应为 Cancelled，实际 {reason:?}"
-                );
-            }
-            other => panic!("期望 Cancelled，实际 {other:?}"),
         }
     }
 

@@ -701,25 +701,17 @@ impl Session {
         self.pending.push_back(PendingInput::new(content));
     }
 
-    /// 排空整个 pending 队列（FIFO），合并为一条 Content，不启动 turn。
-    ///
-    /// looper 恢复暂停时用它取出排队消息再走 `handle_user_query`，
-    /// 复用完整的 turn 启动簿记（状态迁移 + 事件）。
-    /// 队列为空返回 `None`。
-    pub fn take_pending_all(&mut self) -> Option<Content> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        let items: Vec<Content> = self.pending.drain(..).map(|i| i.content).collect();
-        Some(merge_contents(items))
-    }
-
     /// 排空整个 pending 队列，合并为一条消息，启动新 turn。
     ///
-    /// 一次消化全部排队输入（而非逐条），合并语义见 [`merge_contents`]；
-    /// 出队的消息标记 [`MessageSource::MergedPending`]。
-    /// 返回 `Ok(true)` 表示成功启动新 turn，
-    /// `Ok(false)` 表示队列为空。
+    /// 一次消化全部排队输入（而非逐条），合并语义见 [`merge_contents`]。
+    /// **来源按批大小定**：单条走 [`MessageSource::UserInput`]（逐字节未改的原始
+    /// 输入），多条才走 [`MessageSource::MergedPending`]。
+    ///
+    /// 展示层只对 `MergedPending` 调 [`strip_merge_markers`]，而它会剥掉内容里
+    /// **任何**恰好等于 `---` 的行 —— 靠来源标记把直接输入挡在门外。若单条也打
+    /// `MergedPending`，用户自己写的一行 `---` 会在渲染时凭空消失。
+    ///
+    /// 返回 `Ok(true)` = 成功启动新 turn，`Ok(false)` = 队列为空。
     pub fn dequeue_and_start_turn(&mut self) -> Result<bool, SessionError> {
         if self.pending.is_empty() {
             return Ok(false);
@@ -736,13 +728,17 @@ impl Session {
         }
 
         let batch: Vec<PendingInput> = self.pending.drain(..).collect();
+        let source = if batch.len() == 1 {
+            MessageSource::UserInput
+        } else {
+            MessageSource::MergedPending
+        };
         let merged = merge_contents(batch.into_iter().map(|i| i.content).collect());
 
         // 前置检查后不可达（其间无状态变更）；万一未来 start_turn 增加
         // 新失败点，这里只报错不回队 —— 合并态已无法还原为原序批次，
         // 新增失败点时应同步在此补回队策略。
-        self.start_turn_with_source(merged, MessageSource::MergedPending)
-            .map(|()| true)
+        self.start_turn_with_source(merged, source).map(|()| true)
     }
 
     /// 是否有排队中的输入。
@@ -1941,15 +1937,28 @@ mod tests {
         assert_eq!(ui.message.as_ref(), &user("---\nq1\n---\nq2"));
     }
 
+    /// 来源按批大小定：单条 `UserInput`、多条 `MergedPending`（理由见
+    /// [`Session::dequeue_and_start_turn`]）。
     #[test]
-    fn test_take_pending_all_empty_returns_none() {
+    fn test_dequeue_source_depends_on_batch_size() {
         let mut s = make_session();
-        assert!(s.take_pending_all().is_none());
+        s.enqueue_pending("only".into());
+        assert!(s.dequeue_and_start_turn().unwrap());
+        assert_eq!(
+            s.staging_user_input().unwrap().source,
+            MessageSource::UserInput,
+            "单条出队必须是 UserInput，否则展示层会剥用户自己的 --- 行"
+        );
 
+        let mut s = make_session();
+        let _ = s.rollback_turn(false).unwrap();
         s.enqueue_pending("a".into());
         s.enqueue_pending("b".into());
-        let merged = s.take_pending_all().unwrap();
-        assert_eq!(merged, Content::Text("---\na\n---\nb".to_string()));
-        assert!(!s.has_pending());
+        assert!(s.dequeue_and_start_turn().unwrap());
+        assert_eq!(
+            s.staging_user_input().unwrap().source,
+            MessageSource::MergedPending,
+            "多条合并才是 MergedPending"
+        );
     }
 }

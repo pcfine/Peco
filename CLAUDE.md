@@ -80,10 +80,17 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 
 **AgentLooper**（[crates/peco-core/src/agent/agent_looper.rs](crates/peco-core/src/agent/agent_looper.rs)）：
 - 双层状态机驱动 ReAct 循环：
-  - **外层**：`Idle → ProcessingUserInput → RunningInnerLoop → Paused`
+  - **外层**：`Idle ↔ Paused` / `RunningInnerLoop`
   - **内层**：`PreparingRequest → [batch] AwaitingModel → ResolvingResponse` 或 `[stream] Streaming → ExecutingTools →（循环回）→ Done / Failed`
-- **步进边界控制**：主循环不用 `select!` 抢占 —— 每轮先以 `try_recv` 非阻塞排空 user channel（Query/Pause/Resume/Cancel/Shutdown 同通道 FIFO，经 `handle_control_msg` 统一分发），再做失败/取消/超时收尾检查，然后直接 `await` 一步 `react_step()`（仅 `RunningInnerLoop`）或阻塞 `recv()` 停靠。控制消息在**步进边界**生效（流式=单 chunk、工具=≤200ms 轮询、batch=整段生成），在途 future 永不被消息丢弃 —— commit→save、prepare 重发、工具 poll 回收等异步尾巴完整跑完。
-- 工具执行分两阶段：**spawn 阶段**（将所有工具调用启动到 `JoinSet` 中），然后 **poll 阶段**（以 200ms 超时贪婪排空结果，每完成一个即发出事件）。
+- **主循环四步**：`run()` 每轮只做四件事 —— ① 取消息（`has_pending_work()` 为真时只非阻塞排空，否则阻塞 `recv()` 等一条再补排空同批）→ ② 收尾（`is_cancelled()` 走 `finalize_cancel`，否则 `react_state == Failed` 走 `finalize_failure`，互斥）→ ③ 启动 pending 轮（**唯一的「pending → turn」入口**）→ ④ 推进一步 `react_step()`（仅 `RunningInnerLoop`）。
+- **不空转不变量**：每一轮迭代要么在 ① 阻塞、要么严格推进一个状态。`has_pending_work` 的四个非阻塞触发点（`RunningInnerLoop` / `cancel_flag` / `Failed` / `armed && has_pending`）各自有明确消解者，**新增触发点必须同时给出消解者**，否则热自旋。
+- **取消 = 中止当前 ReAct 轮，looper 不退出**（`Cancel` 只置 `cancel_flag`，收尾在 ② 完成）：`finalize_cancel` 按内层状态回收在途资源（`Streaming` 丢 `active_stream`、`ExecutingTools` 走 `abort_inflight_tools`）→ 冻结 + **强制落盘**（`force_persist`，取消不丢 pending）→ 归位到干净 Idle。`cancel_flag` 是**一次性**的，收尾后必须复位。`Cancel` / `Shutdown` 都返回 `ReadDirective::StopReading`（丢弃同批后续消息），但只有 `Shutdown` 置 `shutdown_requested` 退出循环。
+- **`pending_armed`** 区分「有待处理输入」与「这些输入现在该不该跑」：`Resume` / 新 `Query` 置位，`Cancel` 收尾与启动轮后清零。取消后不自动开新轮，pending 保留并随快照落盘。
+- **步进上界 `STEP_POLL`（200ms）**：流式等 chunk、工具 poll、退避切片三处共用的唯一数字，同时是**取消的最坏生效延迟**。**batch 路径（`stream: false`）没有步进边界** —— 该轮取消延迟 = 整段生成时间。looper 无整轮看门狗，唯一的中止入口是取消。
+- 工具执行分两阶段：**spawn 阶段**（将所有工具调用启动到 `JoinSet` 中），然后 **poll 阶段**（以 `STEP_POLL` 超时贪婪排空结果，每完成一个即发出事件）。
+- **pending → 一条消息**：pending 不是消息，全项目只有 `Session::dequeue_and_start_turn` 一处把它变成消息（`merge_contents` 合并，产出恰好一条 user message）。合并来源**按批大小定**：单条走 `MessageSource::UserInput`（逐字节未改），多条才走 `MergedPending` —— 展示层只对后者调 `strip_merge_markers`，标错会让用户自己写的一行 `---` 在渲染时消失。
+- **通道关闭**：无在途轮直接退出；有在途轮则继续步进把它跑完、回到 Idle 时才退。暂停中通道关闭走**取消语义**（没人能再解除暂停了）。
+- ⚠ 已知偏差：web 前端 `abortStream()` 发出取消后立即关闭 SSE 连接，导致 run 被 runner 回收、「取消后不退出 looper」在 web 主路径未兑现（只对 CLI / 长连接有效）。
 - **流式路径**：使用 `StreamAssembler` 将 `StreamEvent` 块中的增量文本/推理/工具调用增量累积为完整的 assistant 消息。
 - 动态上下文组装：系统提示词每轮重新注入，工具结果追加其后。`DynamicContext` trait 支持在每次新用户查询时注入 RAG 增强内容；同一轮的 ReAct 迭代复用缓存上下文。
 - **上下文策略**：`FullHistory`（默认）、`SlidingWindow { max_turns }`、`TokenBudget { max_tokens, summarize_overflow }` 或 `Custom(Arc<dyn ContextFilter>)`。通过 `LooperConfig` 为每个 looper 选择。
