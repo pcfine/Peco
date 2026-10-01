@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use peco_core::agent::hooks::LooperHook;
-use peco_core::agent::{CompactionPolicy, DynamicContext, LooperConfig, MessageFilter};
+use peco_core::agent::{
+    CompactionPolicy, DynamicContext, LooperConfig, MessageFilter, TurnSummarizer,
+};
 
 use super::memory::MemoryConfig;
 
@@ -35,6 +37,9 @@ pub struct PecoConfig {
     /// 压缩后 verbatim 保留区目标 token。
     pub compaction_keep_recent_tokens: usize,
     /// 摘要模型名（Flash 档，低延迟低成本）。
+    ///
+    /// 撞上 `max_turns` 时合成的收尾报告共用同一个模型 —— 两者都是「读一遍既有
+    /// 内容、产出短文本」的元任务，只是提示词不同。
     pub summarizer_model: String,
     /// 记忆双路径配置（写路径提取 hook + 读路径召回）。
     pub memory: MemoryConfig,
@@ -59,6 +64,10 @@ pub struct PecoConfig {
     // ── 以下由 PecoManager 构造期填充 ──────────────────────
     /// 上下文滚动压缩策略。由 `PecoManager` 基于主 Agent 的 provider 构建。
     pub compaction: Option<Arc<CompactionPolicy>>,
+    /// 轮末收尾报告合成器。由 `PecoManager` 装配为与压缩摘要器**同一个**实例
+    /// （见 `TurnSummarizer::summarize_inflight`）。
+    /// 未装配（`None`）时撞上 `max_turns` 走固定中断说明。
+    pub epilogue: Option<Arc<dyn TurnSummarizer>>,
     /// 环境上下文（恒定前缀）：用户身份、工作空间路径、日期平台等。
     /// 由 `PecoManager` 在构造时经 `EnvironmentInfo::render()` 求值一次填入。
     pub environment: Option<String>,
@@ -87,6 +96,7 @@ impl Default for PecoConfig {
             retry_base_delay_ms: retry.retry_base_delay_ms,
             retry_max_delay_ms: retry.retry_max_delay_ms,
             compaction: None,
+            epilogue: None,
             environment: None,
             dynamic_context: None,
             hooks: Vec::new(),
@@ -108,6 +118,7 @@ impl PecoConfig {
             hooks: self.hooks.clone(),
             message_filter: Some(message_filter),
             compaction: self.compaction.clone(),
+            epilogue: self.epilogue.clone(),
             retry_limit: self.retry_limit,
             retry_output_budget: self.retry_output_budget,
             retry_base_delay_ms: self.retry_base_delay_ms,

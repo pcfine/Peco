@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use peco_agents::BuiltinTemplate;
-use peco_core::agent::{CompactionPolicy, ModelSummarizer};
+use peco_core::agent::{CompactionPolicy, ModelSummarizer, TurnSummarizer};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -72,12 +72,17 @@ impl PecoManager {
         // ── 4. 加载 @assistant Agent（从 WorkSpace 目录，非 DB）─────────
         let agent = state.workspace_manager.get_agent(user_id, "@assistant")?;
 
-        // ── 5. 构建上下文压缩策略（复用主 Agent 的 provider + Flash 模型）──
-        let summarizer = Arc::new(ModelSummarizer::new(
+        // ── 5. 构建元任务模型（复用主 Agent 的 provider + Flash 模型）────
+        //
+        // 一个实例担两职：轮边界压缩的摘要器，与撞上 max_turns 时的收尾报告器
+        // （`summarize_inflight`）。两者同范式，差异只在提示词。合成失败非致命，
+        // 收尾那条路径回退到固定中断说明。
+        let summarizer: Arc<dyn TurnSummarizer> = Arc::new(ModelSummarizer::new(
             Arc::clone(agent.provider()),
             config.summarizer_model.clone(),
         ));
         let mut config = config;
+        config.epilogue = Some(Arc::clone(&summarizer));
         config.compaction = Some(Arc::new(CompactionPolicy {
             trigger_tokens: config.compaction_trigger_tokens,
             keep_recent_tokens: config.compaction_keep_recent_tokens,

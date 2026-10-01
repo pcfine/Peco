@@ -46,11 +46,39 @@ Rules:
 4. For tool calls keep only conclusions, not command details;
 5. At most 8 items per section, one line each, total length under 500 characters. Write summary content in the same language as the conversation."#;
 
+/// 收尾报告（撞上 `max_turns` 上限）的系统提示词。
+///
+/// 与摘要提示词同风格：英文指令 + 固定小节，正文语言跟随对话。三个小节是给用户
+/// 看的结论骨架；末行「回复继续」是续接交互的**唯一**载体 —— 没有按钮、没有事件、
+/// 没有端点，提示词弄丢它就静默失效。
+///
+/// 「不能调用工具」必须在提示词里再申明一次 —— 请求本身已 `tools: vec![]`，但模型
+/// 仍可能以叙述口吻「继续做事」，那会让报告退化成第二轮臆想的工作。
+const EPILOGUE_SYSTEM_PROMPT: &str = r#"You are a turn-ending report writer. A conversation turn was forcibly stopped after hitting its maximum number of tool-calling iterations.
+
+You CANNOT call any tools. Write only a closing report, in the same language as the conversation, using exactly these three Markdown sections:
+
+## 本轮已完成
+## 尚未完成
+## 续接建议
+
+Rules:
+1. Base every statement strictly on the transcript provided. Never invent results, file contents, or conclusions the transcript does not show;
+2. Summarize tool calls by their conclusions, not by command details;
+3. If the work is unfinished, say plainly what was in flight and what the next concrete step is;
+4. The report must end with this line verbatim, as its own final line: 如需继续，请回复"继续"。;
+5. Keep the whole report under 400 characters."#;
+
 // ============================================================================
 // TurnSummarizer
 // ============================================================================
 
-/// 摘要器 — 将被驱逐的轮次转录合并为结构化摘要。
+/// 元任务模型 — 把一段转录合成为短文本。
+///
+/// 服务两个入口：轮边界的上下文压缩（[`Self::summarize`]）与撞上 `max_turns` 时的
+/// 轮末收尾报告（[`Self::summarize_inflight`]）。两者同范式 —— 复用主 Agent 的
+/// provider 与 Flash 档模型、无工具、关 reasoning、失败非致命 —— 差异只有提示词，
+/// 以及结果是否需要摘要定界标签。故由同一个实现（[`ModelSummarizer`]）承担。
 #[async_trait]
 pub trait TurnSummarizer: Send + Sync {
     /// 生成合并后的新摘要。
@@ -62,6 +90,12 @@ pub trait TurnSummarizer: Send + Sync {
         previous_summary: Option<&str>,
         evicted_transcript: &str,
     ) -> Result<String, AgentError>;
+
+    /// 把**在途轮**（staging，尚未分轮）的转录合成为轮末收尾报告。
+    ///
+    /// 与 [`Self::summarize`] 的区别有二：提示词不同；返回值**不**包摘要定界标签
+    /// —— 收尾报告是写给用户看的结论，不是被钉回上下文的历史摘要。
+    async fn summarize_inflight(&self, inflight_transcript: &str) -> Result<String, AgentError>;
 }
 
 /// 基于 [`ModelProvider`] 的摘要器 — 复用主 Agent 的 provider，
@@ -79,6 +113,71 @@ impl ModelSummarizer {
             model: model.into(),
             max_output_tokens: 1024,
         }
+    }
+
+    /// 元任务调用的公共路径：一次**不带工具、关 reasoning** 的 Flash 模型调用，
+    /// 返回修剪后的正文。摘要与收尾报告都走这里，差异只在提示词与温度。
+    ///
+    /// `label` 只用于错误信息 —— 两条路径共用失败口径，但要能看出是谁挂了。
+    async fn generate_text(
+        &self,
+        label: &str,
+        system_prompt: &str,
+        user_content: String,
+        temperature: f64,
+    ) -> Result<String, AgentError> {
+        let request = GenerateRequest {
+            model: self.model.clone(),
+            instructions: Some(system_prompt.to_string()),
+            input: vec![Arc::new(InputItem::Message {
+                role: Role::User,
+                content: user_content.into(),
+            })]
+            .into(),
+            tools: vec![],
+            tool_choice: None,
+            temperature: Some(temperature),
+            top_p: None,
+            max_output_tokens: Some(self.max_output_tokens),
+            // 元任务不需要推理 — 关闭 thinking 降低延迟与成本
+            reasoning: Some(ReasoningConfig {
+                enabled: false,
+                effort: None,
+            }),
+            text: None,
+            additional_params: None,
+        };
+
+        let result = self
+            .provider
+            .generate_full(&request)
+            .await
+            .map_err(AgentError::from)?;
+
+        if result.status != model_provider::ResponseStatus::Completed {
+            return Err(AgentError::Compaction(format!(
+                "{label} generation incomplete: status={:?}, error={:?}",
+                result.status, result.error
+            )));
+        }
+
+        let text: String = result
+            .output
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if text.trim().is_empty() {
+            return Err(AgentError::Compaction(format!(
+                "{label} generation returned empty text"
+            )));
+        }
+
+        Ok(text.trim().to_string())
     }
 }
 
@@ -101,58 +200,22 @@ impl TurnSummarizer for ModelSummarizer {
         user_content.push_str("[Conversation to summarize]\n");
         user_content.push_str(evicted_transcript);
 
-        let request = GenerateRequest {
-            model: self.model.clone(),
-            instructions: Some(SUMMARY_SYSTEM_PROMPT.to_string()),
-            input: vec![Arc::new(InputItem::Message {
-                role: Role::User,
-                content: user_content.into(),
-            })]
-            .into(),
-            tools: vec![],
-            tool_choice: None,
-            temperature: Some(0.1),
-            top_p: None,
-            max_output_tokens: Some(self.max_output_tokens),
-            // 摘要不需要推理 — 关闭 thinking 降低延迟与成本
-            reasoning: Some(ReasoningConfig {
-                enabled: false,
-                effort: None,
-            }),
-            text: None,
-            additional_params: None,
-        };
+        let text = self
+            .generate_text("summary", SUMMARY_SYSTEM_PROMPT, user_content, 0.1)
+            .await?;
+        Ok(wrap_summary(text))
+    }
 
-        let result = self
-            .provider
-            .generate_full(&request)
-            .await
-            .map_err(AgentError::from)?;
-
-        if result.status != model_provider::ResponseStatus::Completed {
-            return Err(AgentError::Compaction(format!(
-                "summary generation incomplete: status={:?}, error={:?}",
-                result.status, result.error
-            )));
-        }
-
-        let text: String = result
-            .output
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if text.trim().is_empty() {
-            return Err(AgentError::Compaction(
-                "summary generation returned empty text".to_string(),
-            ));
-        }
-
-        Ok(wrap_summary(text.trim()))
+    async fn summarize_inflight(&self, inflight_transcript: &str) -> Result<String, AgentError> {
+        // 温度略高于摘要（0.2 vs 0.1）：报告要读出「哪些还没做完」，比机械压缩
+        // 多一点判断余地。返回值不加定界标签 —— 它是给用户看的结论。
+        self.generate_text(
+            "epilogue",
+            EPILOGUE_SYSTEM_PROMPT,
+            inflight_transcript.to_string(),
+            0.2,
+        )
+        .await
     }
 }
 
@@ -341,6 +404,22 @@ fn build_transcript(evicted_turns: &[Vec<crate::session::AnnotatedMessage>]) -> 
     transcript
 }
 
+/// 将一段扁平消息序列组装为转录，截断规则与 [`build_transcript`] 完全一致。
+///
+/// 供**在途轮**（staging，尚未分轮）使用 —— 收尾报告要在冻结前拿到本轮转录。
+/// 两级截断（逐条 [`TRANSCRIPT_ITEM_MAX_CHARS`] / 整份 [`TRANSCRIPT_MAX_CHARS`]）
+/// 与格式化只此一处，两个入口不各写一份常量。
+pub(crate) fn build_flat_transcript(messages: &[crate::session::AnnotatedMessage]) -> String {
+    let mut transcript = String::new();
+    let mut total_chars = 0usize;
+    for am in messages {
+        if !push_transcript_line(&mut transcript, &mut total_chars, am) {
+            break;
+        }
+    }
+    transcript
+}
+
 fn role_label(role: Role) -> &'static str {
     match role {
         Role::User => "user",
@@ -358,6 +437,104 @@ mod tests {
     use super::*;
     use crate::session::MessageSource;
 
+    /// 收尾提示词里那行「回复继续」是整个续接交互的**唯一**载体 —— 没有按钮、
+    /// 没有事件、没有端点，提示词弄丢它就静默失效。不带工具同理：请求已
+    /// `tools: vec![]`，仍须在提示词里重申。
+    #[test]
+    fn test_epilogue_prompt_keeps_continue_hint_and_tool_ban() {
+        assert!(
+            EPILOGUE_SYSTEM_PROMPT.contains("如需继续，请回复"),
+            "收尾提示词必须保留续接提示，否则用户拿不到「怎么继续」的指引"
+        );
+        assert!(
+            EPILOGUE_SYSTEM_PROMPT.contains("CANNOT call any tools"),
+            "请求已 tools: vec![]，提示词仍须重申，否则模型可能改以叙述口吻继续做事"
+        );
+    }
+
+    /// 固定输出的假 provider —— 直接驱动 [`ModelSummarizer::generate_text`]，
+    /// 覆盖摘要与收尾共用的成/败两条分支。
+    struct FixedProvider {
+        text: &'static str,
+        status: model_provider::ResponseStatus,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl model_provider::ModelProvider for FixedProvider {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+
+        async fn generate_full(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateResult, model_provider::ProviderError> {
+            if self.fail {
+                return Err(model_provider::ProviderError::Request("boom".into()));
+            }
+            Ok(model_provider::GenerateResult {
+                id: "r1".to_string(),
+                output: vec![ContentBlock::Text {
+                    text: self.text.to_string(),
+                }],
+                usage: model_provider::Usage::default(),
+                status: self.status,
+                finish_reason: None,
+                error: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateStream, model_provider::ProviderError> {
+            unimplemented!("meta tasks never stream")
+        }
+    }
+
+    fn meta_summarizer(
+        text: &'static str,
+        status: model_provider::ResponseStatus,
+        fail: bool,
+    ) -> ModelSummarizer {
+        ModelSummarizer::new(Arc::new(FixedProvider { text, status, fail }), "m")
+    }
+
+    /// 收尾正文被修剪，且**不带**摘要定界标签 —— 它是给用户看的结论而非历史摘要。
+    #[tokio::test]
+    async fn test_summarize_inflight_returns_trimmed_text_without_wrapper() {
+        let s = meta_summarizer(
+            "  报告正文  ",
+            model_provider::ResponseStatus::Completed,
+            false,
+        );
+        let out = s.summarize_inflight("转录").await.unwrap();
+        assert_eq!(out, "报告正文");
+        assert!(
+            !out.contains(SUMMARY_OPEN),
+            "收尾不得包摘要定界标签，否则会被当成 pinned 历史摘要"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_summarize_inflight_incomplete_status_is_error() {
+        let s = meta_summarizer("x", model_provider::ResponseStatus::Incomplete, false);
+        assert!(s.summarize_inflight("转录").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_summarize_inflight_empty_text_is_error() {
+        let s = meta_summarizer("   ", model_provider::ResponseStatus::Completed, false);
+        assert!(s.summarize_inflight("转录").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_summarize_inflight_provider_error_propagates() {
+        let s = meta_summarizer("x", model_provider::ResponseStatus::Completed, true);
+        assert!(s.summarize_inflight("转录").await.is_err());
+    }
+
     /// 固定输出的假摘要器（摘要远小于原文 — 压缩必然减小 token）。
     struct MockSummarizer;
 
@@ -371,6 +548,10 @@ mod tests {
             Ok(wrap_summary(
                 "用户偏好中文交流；已决定用 Rust；待办：写测试",
             ))
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            unimplemented!("compaction tests never compose turn epilogues")
         }
     }
 
@@ -405,6 +586,68 @@ mod tests {
         assert_eq!(
             strip_summary_wrapper("残缺</earlier_context_summary>"),
             "残缺"
+        );
+    }
+
+    /// 扁平入口与分轮入口共享同一套逐条格式化与截断，差异只该是「轮间空行」。
+    ///
+    /// 用超长单条消息覆盖截断路径 —— 这是两个入口最容易漂移的地方。
+    #[test]
+    fn test_flat_transcript_shares_format_and_truncation_with_turn_entry() {
+        let long = "甲".repeat(TRANSCRIPT_ITEM_MAX_CHARS + 500);
+
+        let mut session = Session::new("t".to_string(), "d".to_string());
+        session.start_turn("问题".into()).unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::Message {
+                    role: Role::Assistant,
+                    content: long.clone().into(),
+                },
+            )
+            .unwrap();
+        session
+            .stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::FunctionCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                },
+            )
+            .unwrap();
+        session
+            .stage_item(
+                MessageSource::ToolExecution {
+                    tool_name: "shell".into(),
+                },
+                InputItem::FunctionCallOutput {
+                    call_id: "c1".into(),
+                    output: "输出".into(),
+                },
+            )
+            .unwrap();
+        let _token = session.commit_turn().unwrap();
+
+        let turn = &session.committed_turns()[0];
+        let flat = build_flat_transcript(turn);
+        let by_turn = build_transcript(std::slice::from_ref(turn));
+
+        // 分轮入口 = 扁平内容 + 一个轮间空行
+        assert_eq!(
+            by_turn,
+            format!("{flat}\n"),
+            "两条入口除轮间空行外必须逐字节相同"
+        );
+        // 逐条截断生效：超长正文被截到上限（不含前缀与换行）
+        assert!(
+            !flat.contains(&long),
+            "超长条目必须被逐条截断，不能整段进转录"
+        );
+        assert!(
+            flat.chars().count() < long.chars().count(),
+            "截断后转录必然短于原文"
         );
     }
 
@@ -474,6 +717,10 @@ mod tests {
             ) -> Result<String, AgentError> {
                 *self.seen_previous.lock().unwrap() = previous.map(str::to_string);
                 Ok(wrap_summary("v2"))
+            }
+
+            async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+                unimplemented!("compaction tests never compose turn epilogues")
             }
         }
 

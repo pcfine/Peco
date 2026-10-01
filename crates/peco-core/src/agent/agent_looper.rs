@@ -47,6 +47,13 @@ use tracing::{debug, error, info, warn};
 /// 期间不可重入，该轮取消延迟 = 整段生成时间。
 const STEP_POLL: Duration = Duration::from_millis(200);
 
+/// 轮末收尾报告的合成超时。
+///
+/// 这段期间 `run()` 不在循环顶，消息通道不被排空 —— 因此它同时是**取消的最坏
+/// 生效延迟**：排在通道里的 `Cancel` 要等它返回才看得见。取 30s：Flash 档模型
+/// 生成千字符以内文本的正常耗时远低于此，超时即视为上游异常、直接回退。
+const EPILOGUE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ============================================================================
 // 纯标记状态枚举（不携带数据）
 // ============================================================================
@@ -206,6 +213,17 @@ pub struct LooperConfig {
     /// 重发的退避延迟上限（毫秒）。默认 5000。
     /// env `PECO_RETRY_MAX_DELAY_MS` 可覆盖。
     pub retry_max_delay_ms: u64,
+    /// 撞上 `max_turns` 上限时的收尾报告合成器。
+    ///
+    /// `Some` 时，冻结前额外调一次**不带工具**的元任务模型（见
+    /// [`super::compaction::TurnSummarizer::summarize_inflight`]），产出「完成了
+    /// 什么 / 还剩什么 / 怎么续接」作为本轮最后一条 assistant 消息；`None` 时
+    /// 保持既有的固定中断说明。合成失败/超时**非致命**，回退到固定说明 —— 收尾
+    /// 只决定「多不多一条 assistant 消息」，绝不改变 `TurnOutcome` / 落盘门控。
+    ///
+    /// 只对 `MaxTurnsExceeded` 生效（`Cancelled` / 瞬时类失败不合成）。
+    /// 默认为 `None`（关闭）。
+    pub epilogue: Option<Arc<dyn super::compaction::TurnSummarizer>>,
 }
 
 impl Default for LooperConfig {
@@ -223,6 +241,7 @@ impl Default for LooperConfig {
             retry_output_budget: 32_768,
             retry_base_delay_ms: 500,
             retry_max_delay_ms: 5_000,
+            epilogue: None,
         }
     }
 }
@@ -1672,7 +1691,9 @@ impl AgentLooper {
         } else {
             TurnFailureReason::Cancelled
         };
-        self.apply_failure(reason.clone(), /* force_persist */ true)
+        // 取消路径不合成收尾：收尾器只服务 `max_turns`（见
+        // `compose_epilogue_if_needed`），且此刻用户已经在等停。
+        self.apply_failure(reason.clone(), /* force_persist */ true, None)
             .await;
         // 无条件回填：`apply_failure` 在「无在途轮」时不回写原因，
         // 不补这句 `shutdown_reason` 就退化成 "done"，看不出是取消。
@@ -1698,12 +1719,93 @@ impl AgentLooper {
 
     /// 失败收尾。续接交给 `run()` 的 ③ —— 收尾的契约是「把状态搬到可推进的位置」，
     /// 不回报布尔让调用方决定续接。
+    ///
+    /// 撞上 `max_turns` 时在冻结**之前**补一次收尾报告合成（见
+    /// [`Self::compose_epilogue_if_needed`]）—— 唯一的 `.await` 落点：`plan_failure`
+    /// 是同步自由函数，而收尾文本必须赶在它之前备好。
     async fn finalize_failure(&mut self) {
         let reason = self
             .failure_reason
             .take()
             .unwrap_or(TurnFailureReason::Other("failed".into()));
-        self.apply_failure(reason, /* force_persist */ false).await;
+        let epilogue = self.compose_epilogue_if_needed(&reason).await;
+        self.apply_failure(reason, /* force_persist */ false, epilogue)
+            .await;
+    }
+
+    /// 撞上 `max_turns` 时合成收尾报告，其余失败原因一律返回 `None`。
+    ///
+    /// 三个前置守卫（任一不满足即不合成，行为与不装收尾器时逐字节一致）：
+    /// 原因必须是 `MaxTurnsExceeded`（`Cancelled` / 瞬时故障没有「还没做完」可言）、
+    /// 必须装配了收尾器、必须确有在途轮（与 `plan_failure` ① 同判据）。
+    ///
+    /// 结果只影响「多不多一条 assistant 消息」。失败、空产出、超时、被取消
+    /// 都退回 `None`，由 [`Session::interrupt_turn`] 走原有的固定中断说明。
+    async fn compose_epilogue_if_needed(&mut self, reason: &TurnFailureReason) -> Option<String> {
+        if !matches!(reason, TurnFailureReason::MaxTurnsExceeded) {
+            return None;
+        }
+        let summarizer = self.config.epilogue.clone()?;
+        if !session_has_inflight(&self.session) {
+            return None;
+        }
+
+        // `staging_all` 而非 `staging_messages`：转录要含本轮的用户提问，
+        // 否则模型看不出这轮在回答什么。
+        let transcript = super::compaction::build_flat_transcript(&self.session.staging_all());
+
+        match Self::compose_epilogue_cancellable(&summarizer, &transcript).await {
+            Some(text) if !text.trim().is_empty() => {
+                info!(chars = text.chars().count(), "Turn epilogue composed");
+                Some(text)
+            }
+            Some(_) => {
+                warn!("Turn epilogue was empty; falling back to fixed interrupt notice");
+                None
+            }
+            // 具体原因已由 `compose_epilogue_cancellable` 记过日志，此处不重复
+            None => None,
+        }
+    }
+
+    /// 带超时地调一次收尾合成。
+    ///
+    /// `Some(text)` = 合成成功；`None` = 失败/超时，调用方一律回退。
+    ///
+    /// 超时是硬上界 —— 也是这段路径唯一需要的边界：`run()` 此刻不在循环顶，
+    /// 消息通道不被排空，取消要等它返回才看得见（见 [`EPILOGUE_TIMEOUT`]）。
+    /// 不再额外观察取消标志：`Cancel` 本就排在通道里等着，这里主动放弃合成既
+    /// 省不下延迟，又要多养一条并发臂。
+    ///
+    /// 取 `&Arc<dyn TurnSummarizer>` 而非 `&self`：`AgentLooper` 不 `Sync`，
+    /// `&self` 跨 await 会让 `run()` 的 future 失去 `Send`（同
+    /// [`Self::save_snapshot`] 的理由）。
+    async fn compose_epilogue_cancellable(
+        summarizer: &Arc<dyn super::compaction::TurnSummarizer>,
+        transcript: &str,
+    ) -> Option<String> {
+        // 「没合成出来」在此记一次日志 —— 调用方只认 Some/None，不重复记账
+        // （否则超时会既 warn 又 error）。
+        let work = async {
+            match summarizer.summarize_inflight(transcript).await {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    error!(error = %e, "Turn epilogue composition failed (non-fatal)");
+                    None
+                }
+            }
+        };
+
+        match tokio::time::timeout(EPILOGUE_TIMEOUT, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    timeout_secs = EPILOGUE_TIMEOUT.as_secs(),
+                    "Turn epilogue timed out"
+                );
+                None
+            }
+        }
     }
 
     fn has_inflight_turn(&self) -> bool {
@@ -3186,7 +3288,15 @@ impl AgentLooper {
     ///
     /// 契约是「把状态搬到可推进的位置」，不回报布尔让调用方决定续接 —— 续接交给
     /// `run()` 的 ③ 单一入口。
-    async fn apply_failure(&mut self, reason: TurnFailureReason, force_persist: bool) {
+    ///
+    /// `epilogue` 是已合成好的收尾报告（仅 `max_turns` 路径可能为 `Some`），
+    /// 透传给 `plan_failure` 后在冻结时取代固定中断说明；`None` 时行为不变。
+    async fn apply_failure(
+        &mut self,
+        reason: TurnFailureReason,
+        force_persist: bool,
+        epilogue: Option<String>,
+    ) {
         // `retry_happened` 决定 `plan_failure` 是否补存活桩：只有「回退已发生、
         // 新尝试零产出」才需要桩 —— 那正是回退把 staging 清空留下的洞。
         match plan_failure(
@@ -3195,6 +3305,7 @@ impl AgentLooper {
             self.config.persist_on_failure || force_persist,
             reason,
             self.retries_used > 0,
+            epilogue.as_deref(),
         ) {
             Some(plan) => self.commit_failure_plan(plan).await,
             None => {
@@ -3231,6 +3342,20 @@ impl AgentLooper {
             partial_text_len = plan.partial_text_len,
             "Turn interrupted; staging frozen into committed history"
         );
+
+        // ★ 收尾报告先于 TurnComplete 下发。它不是流式产物（`generate_full` 一次
+        //   成形），若不在这里补发，用户不刷新页面就看不到 —— 实时视图只认
+        //   `text_delta`，而它会追加到最后一条 assistant 气泡。必达发送：
+        //   丢一条就等于这轮白白多花了一次模型调用。
+        if let Some(text) = &plan.epilogue {
+            Self::emit_event_guaranteed(
+                &self.event_speaker,
+                LooperEvent::TextDelta {
+                    delta: text.clone(),
+                },
+            )
+            .await;
+        }
 
         // 事件照发 —— 冻结失败只跳过落盘，不跳过 TurnComplete。
         // 「这轮失败了」这个消息不能让用户看不到。
@@ -3298,6 +3423,11 @@ struct FinalizePlan {
     snapshot: Option<SessionSnapshot>,
     /// 冻结前 staging 中的消息数（合成 Output 与中断说明尚未追加）。
     frozen_staging_messages: usize,
+    /// 已合成好的收尾报告（仅 `max_turns` 路径可能为 `Some`）。
+    ///
+    /// 冻结时已写进本轮历史，此字段只剩一个用途：让 `commit_failure_plan`
+    /// 把它作为 `TextDelta` 补发给客户端。
+    epilogue: Option<String>,
 }
 
 /// 把 `pending_tool_calls` 中 `result: Some` 的项写入 session 的 staging。只写不清理。
@@ -3424,6 +3554,7 @@ fn plan_failure(
     persist: bool,
     reason: TurnFailureReason,
     retry_happened: bool,
+    epilogue: Option<&str>,
 ) -> Option<FinalizePlan> {
     // ① 无在途轮守卫
     if !session_has_inflight(session) {
@@ -3457,9 +3588,11 @@ fn plan_failure(
     //    必须在 ⑤ 之前 —— 这些结果是「这一轮已完成的成果」，要和本轮一起冻结。
     stage_tool_results(session, &ctx.pending_tool_calls);
 
-    // ⑤ 冻结在途轮（内部补齐悬空 tool_call 并追加中断说明）
+    // ⑤ 冻结在途轮（内部补齐悬空 tool_call，再追加中断说明或收尾报告）
+    //    `epilogue` 有值时**取代**中断说明：两者并存会让历史以两条连续 assistant
+    //    消息收尾。顺序由 `interrupt_turn_with_closing` 保证（补齐恒在前）。
     let label = failure_label(&reason);
-    let token = match session.interrupt_turn(&label) {
+    let token = match session.interrupt_turn_with_closing(&label, epilogue) {
         Ok(token) => Some(token),
         Err(e) => {
             error!(error = %e, "Failed to interrupt turn; falling back to rollback");
@@ -3495,6 +3628,7 @@ fn plan_failure(
         partial_text_len,
         snapshot,
         frozen_staging_messages,
+        epilogue: epilogue.map(str::to_string),
     })
 }
 
@@ -3666,6 +3800,7 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+            None,
         )
         .expect("in-flight turn must produce a plan");
 
@@ -3722,6 +3857,7 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+            None,
         )
         .expect("有在途轮");
 
@@ -3755,6 +3891,7 @@ mod tests {
             true,
             TurnFailureReason::Cancelled,
             false,
+            None,
         )
         .expect("Active with only user_input still has a turn to close");
 
@@ -3794,6 +3931,7 @@ mod tests {
             true,
             TurnFailureReason::MaxTurnsExceeded,
             false,
+            None,
         )
         .expect("Active with only user_input still has a turn to close");
 
@@ -3816,6 +3954,7 @@ mod tests {
                 true,
                 TurnFailureReason::Cancelled,
                 false,
+                None,
             )
             .is_none()
         );
@@ -3843,6 +3982,7 @@ mod tests {
             false,
             TurnFailureReason::MaxTurnsExceeded,
             false,
+            None,
         )
         .unwrap();
 
@@ -3952,6 +4092,59 @@ mod tests {
         persist_on_failure: bool,
         pending_input: bool,
     ) -> FailureHarness {
+        failure_looper_harness_with_epilogue(cancel, persist_on_failure, pending_input, None)
+    }
+
+    /// 取一条消息的纯文本；非 `Message` 条目（工具调用/结果）返回空串。
+    fn text_of(am: &crate::session::AnnotatedMessage) -> String {
+        match am.message.as_ref() {
+            InputItem::Message { content, .. } => content.text_view().into_owned(),
+            _ => String::new(),
+        }
+    }
+
+    /// 固定输出的假收尾器 —— 直接实现元任务接口，不走 Agent 的 provider。
+    struct MockEpiloguer(&'static str);
+
+    #[async_trait::async_trait]
+    impl super::super::compaction::TurnSummarizer for MockEpiloguer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _evicted: &str,
+        ) -> Result<String, AgentError> {
+            unimplemented!("failure harness never compacts")
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// 必然失败的收尾器 —— 验证回退到固定中断说明。
+    struct FailingEpiloguer;
+
+    #[async_trait::async_trait]
+    impl super::super::compaction::TurnSummarizer for FailingEpiloguer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _evicted: &str,
+        ) -> Result<String, AgentError> {
+            unimplemented!("failure harness never compacts")
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            Err(AgentError::Compaction("boom".into()))
+        }
+    }
+
+    fn failure_looper_harness_with_epilogue(
+        cancel: bool,
+        persist_on_failure: bool,
+        pending_input: bool,
+        epilogue: Option<Arc<dyn super::super::compaction::TurnSummarizer>>,
+    ) -> FailureHarness {
         let profile: crate::agent::AgentProfile = serde_yaml::from_str(
             "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
         )
@@ -3996,6 +4189,7 @@ mod tests {
             event_speaker,
             LooperConfig {
                 persist_on_failure,
+                epilogue,
                 ..Default::default()
             },
             Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
@@ -4022,6 +4216,104 @@ mod tests {
             }
             n
         }
+    }
+
+    /// 撞上 `max_turns` 时合成收尾报告：成为本轮最后一条 assistant 消息，
+    /// 且补发 `TextDelta` 让实时视图（不刷新页面）也能看到。
+    #[tokio::test]
+    async fn test_max_turns_composes_epilogue_as_last_message() {
+        let mut h = failure_looper_harness_with_epilogue(
+            false,
+            true,
+            false,
+            Some(Arc::new(MockEpiloguer("## 本轮已完成\n- 查了三处"))),
+        );
+        h.looper.failure_reason = Some(TurnFailureReason::MaxTurnsExceeded);
+        h.looper.react_state = ReActState::Failed;
+        h.looper.finalize_failure().await;
+
+        let turn = &h.looper.session().committed_turns()[0];
+        let last = turn.last().unwrap();
+        assert!(matches!(
+            last.message.as_ref(),
+            InputItem::Message { content, .. } if content.text_view().contains("本轮已完成")
+        ));
+        assert_eq!(
+            last.source,
+            MessageSource::TurnEpilogue,
+            "收尾必须按来源可识别，不靠猜文案"
+        );
+        // 固定中断说明被取代 —— 两条连续 assistant 会破坏历史合法性
+        assert!(
+            !turn.iter().any(|am| text_of(am).contains("[interrupted]")),
+            "收尾存在时不得再追加固定中断说明"
+        );
+        // 失败语义不因收尾而变
+        assert!(matches!(
+            h.looper.failure_reason,
+            Some(TurnFailureReason::MaxTurnsExceeded)
+        ));
+
+        let mut deltas = Vec::new();
+        while let Ok(ev) = h.events.try_recv() {
+            if let LooperEvent::TextDelta { delta } = ev {
+                deltas.push(delta);
+            }
+        }
+        assert!(
+            deltas.iter().any(|d| d.contains("本轮已完成")),
+            "收尾是 generate_full 产物，不补发 TextDelta 用户就看不到；现状={deltas:?}"
+        );
+    }
+
+    /// 收尾合成失败 → 回退到固定中断说明，失败原因与事件面都不变。
+    #[tokio::test]
+    async fn test_epilogue_failure_falls_back() {
+        let mut h = failure_looper_harness_with_epilogue(
+            false,
+            true,
+            false,
+            Some(Arc::new(FailingEpiloguer)),
+        );
+        h.looper.failure_reason = Some(TurnFailureReason::MaxTurnsExceeded);
+        h.looper.react_state = ReActState::Failed;
+        h.looper.finalize_failure().await;
+
+        let turn = &h.looper.session().committed_turns()[0];
+        let last = turn.last().unwrap();
+        assert!(
+            text_of(last).contains("[interrupted]"),
+            "合成失败必须回退到固定中断说明"
+        );
+        assert!(matches!(last.source, MessageSource::InterruptedTurn { .. }));
+        assert_eq!(h.turn_completes(), 1, "失败轮照发一次 TurnComplete");
+        assert!(matches!(
+            h.looper.failure_reason,
+            Some(TurnFailureReason::MaxTurnsExceeded)
+        ));
+    }
+
+    /// 只有 `MaxTurnsExceeded` 才合成收尾 —— 取消 / Hook 中止没有「还没做完」可言。
+    #[tokio::test]
+    async fn test_epilogue_only_for_max_turns() {
+        let mut h = failure_looper_harness_with_epilogue(
+            false,
+            true,
+            false,
+            Some(Arc::new(MockEpiloguer("不该出现的收尾"))),
+        );
+        h.looper.failure_reason = Some(TurnFailureReason::HookAbort("hooked".into()));
+        h.looper.react_state = ReActState::Failed;
+        h.looper.finalize_failure().await;
+
+        let turn = &h.looper.session().committed_turns()[0];
+        assert!(
+            !turn
+                .iter()
+                .any(|am| matches!(am.source, MessageSource::TurnEpilogue)),
+            "非 max_turns 失败不得合成收尾"
+        );
+        assert!(text_of(turn.last().unwrap()).contains("[interrupted]"));
     }
 
     /// 失败后自动续接排队输入时，上一轮的失败原因不得跨轮存活 —— 续接那轮若正常
@@ -4608,7 +4900,7 @@ mod tests {
         h.looper.react_state = ReActState::Failed;
         h.looper.outer_state = OuterState::RunningInnerLoop; // 模拟状态不一致
         h.looper
-            .apply_failure(TurnFailureReason::Other("x".into()), true)
+            .apply_failure(TurnFailureReason::Other("x".into()), true, None)
             .await;
         assert!(
             matches!(h.looper.react_state, ReActState::Done),
@@ -4625,7 +4917,7 @@ mod tests {
         h.looper.react_state = ReActState::Failed;
         h.looper.outer_state = OuterState::Paused;
         h.looper
-            .apply_failure(TurnFailureReason::Other("x".into()), false)
+            .apply_failure(TurnFailureReason::Other("x".into()), false, None)
             .await;
         assert!(matches!(h.looper.react_state, ReActState::Done));
         assert_eq!(h.looper.outer_state, OuterState::Paused);

@@ -389,6 +389,21 @@ impl Session {
         );
     }
 
+    /// 追加合成收尾报告，**取代** [`Self::push_interrupt_notice`]。
+    ///
+    /// 与中断说明同构（同样走 `push_staged`，收尾态可写），但来源标
+    /// [`MessageSource::TurnEpilogue`] —— 消费方据此识别「这条是撞上轮数上限后
+    /// 合成的收尾」，不必去猜文案特征串。报告正文已由调用方备好，此处不做加工。
+    fn push_closing_notice(&mut self, text: &str) {
+        self.push_staged(
+            MessageSource::TurnEpilogue,
+            InputItem::Message {
+                role: Role::Assistant,
+                content: text.to_string().into(),
+            },
+        );
+    }
+
     /// 把收尾时的部分文本补进 staging，供 [`Self::interrupt_turn`] 冻结。
     ///
     /// 截断重试会先回退掉上一次尝试的产物；若此后收尾失败，staging 只剩
@@ -419,6 +434,22 @@ impl Session {
     ///
     /// `Idle` 上调用返回 `Err`（staging 必空，调用方应显式 `rollback_turn`）。
     pub fn interrupt_turn(&mut self, reason: &str) -> Result<TurnBoundaryToken, SessionError> {
+        self.interrupt_turn_with_closing(reason, None)
+    }
+
+    /// 同 [`Self::interrupt_turn`]，但可用 `closing` 取代通常的中断说明。
+    ///
+    /// `closing` 是撞上 `max_turns` 上限时合成的收尾报告（已由调用方异步备好）。
+    /// 它**取代**而非追加 [`Self::push_interrupt_notice`]：两者同时存在会让
+    /// 历史以两条连续 assistant 消息收尾 —— 补齐的工具结果之后只该有一条。
+    /// 悬空 `FunctionCall` 的补齐与收尾的相对顺序因此是强制的（补齐在前）。
+    ///
+    /// `None` 时与 [`Self::interrupt_turn`] 逐字节一致。
+    pub fn interrupt_turn_with_closing(
+        &mut self,
+        reason: &str,
+        closing: Option<&str>,
+    ) -> Result<TurnBoundaryToken, SessionError> {
         // 与 commit/rollback 不同，这里认 `Cancelling` / `Interrupted`：
         // 补齐项要能在收尾态写入（见 `push_staged`）。
         if !matches!(
@@ -439,7 +470,10 @@ impl Session {
         // ★ 补齐必须先于说明。顺序颠倒会产出「assistant(tool_calls) → assistant(text)
         //   → tool」，即 tool_calls 后紧跟 assistant 而非 tool → 400。
         self.patch_dangling_tool_calls(reason);
-        self.push_interrupt_notice(reason);
+        match closing {
+            Some(text) => self.push_closing_notice(text),
+            None => self.push_interrupt_notice(reason),
+        }
 
         let turn_messages = self.staging.take_all();
         self.committed.push_turn(turn_messages);
@@ -1359,6 +1393,19 @@ mod tests {
         }
     }
 
+    /// 抽出一轮的协议层条目，供 [`assert_wire_valid`] 校验。
+    fn items(turn: &[AnnotatedMessage]) -> Vec<InputItem> {
+        turn.iter().map(|am| am.message.as_ref().clone()).collect()
+    }
+
+    /// 取一条消息的纯文本；非 `Message` 条目（工具调用/结果）返回空串。
+    fn text_of(am: &AnnotatedMessage) -> String {
+        match am.message.as_ref() {
+            InputItem::Message { content, .. } => content.text_view().into_owned(),
+            _ => String::new(),
+        }
+    }
+
     #[test]
     fn test_interrupt_turn_patches_dangling_tool_calls() {
         // ① 悬空 c2：补齐必须按 called 原序，且插在中断说明之前
@@ -1484,6 +1531,110 @@ mod tests {
             InputItem::FunctionCallOutput { call_id, .. } if call_id == "c1"
         ));
         assert!(turn.iter().any(|am| interrupted_reason(am).is_some()));
+    }
+
+    /// 收尾报告取代固定中断说明，且成为本轮唯一的一条收尾 assistant 消息。
+    #[test]
+    fn test_interrupt_turn_with_closing_replaces_notice() {
+        let mut s = make_session();
+        s.start_turn("long task".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("working"))
+            .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+            .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "t1".to_string(),
+            },
+            tool("c1", "done"),
+        )
+        .unwrap();
+
+        s.interrupt_turn_with_closing("max turns exceeded", Some("收尾报告正文"))
+            .unwrap();
+
+        let turn = &s.committed_turns()[0];
+        // 末条是收尾报告，来源是 TurnEpilogue
+        let last = turn.last().unwrap();
+        assert!(matches!(
+            last.message.as_ref(),
+            InputItem::Message { role: Role::Assistant, content } if content.text_view() == "收尾报告正文"
+        ));
+        assert_eq!(last.source, MessageSource::TurnEpilogue);
+        // 固定中断说明不得出现 —— 两条连续 assistant 会破坏历史合法性
+        assert!(
+            !turn.iter().any(|am| text_of(am).contains("[interrupted]")),
+            "收尾存在时不得再追加固定中断说明"
+        );
+        assert_wire_valid(&items(turn));
+    }
+
+    /// `closing` 为 `None` 时与 `interrupt_turn` 逐字段一致。
+    #[test]
+    fn test_interrupt_turn_with_closing_none_matches_plain() {
+        let build = || {
+            let mut s = make_session();
+            s.start_turn("q".into()).unwrap();
+            s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+                .unwrap();
+            s.stage_item(
+                MessageSource::ToolExecution {
+                    tool_name: "t1".to_string(),
+                },
+                tool("c1", "r"),
+            )
+            .unwrap();
+            s
+        };
+
+        let mut plain = build();
+        plain.interrupt_turn("cancelled").unwrap();
+        let mut with_none = build();
+        with_none
+            .interrupt_turn_with_closing("cancelled", None)
+            .unwrap();
+
+        assert_eq!(
+            items(&plain.committed_turns()[0]),
+            items(&with_none.committed_turns()[0])
+        );
+        assert_eq!(plain.turn_index(), with_none.turn_index());
+    }
+
+    /// 悬空 tool_call 的补齐必须先于收尾报告 —— 顺序颠倒会产出
+    /// 「assistant(tool_calls) → assistant(text) → tool」的非法历史。
+    #[test]
+    fn test_interrupt_turn_with_closing_patches_before_closing() {
+        let mut s = make_session();
+        s.start_turn("do two things".into()).unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c1", "t1"))
+            .unwrap();
+        s.stage_item(MessageSource::ModelGeneration, function_call("c2", "t2"))
+            .unwrap();
+        s.stage_item(
+            MessageSource::ToolExecution {
+                tool_name: "t1".to_string(),
+            },
+            tool("c1", "done 1"),
+        )
+        .unwrap();
+
+        s.interrupt_turn_with_closing("max turns exceeded", Some("收尾"))
+            .unwrap();
+
+        let turn = &s.committed_turns()[0];
+        // c2 的合成补齐夹在 tool 结果与收尾之间
+        assert!(matches!(
+            turn[turn.len() - 2].message.as_ref(),
+            InputItem::FunctionCallOutput { call_id, .. } if call_id == "c2"
+        ));
+        assert!(matches!(
+            turn.last().unwrap().message.as_ref(),
+            InputItem::Message { content, .. } if content.text_view() == "收尾"
+        ));
+        // 补齐项仍带中断标记（消费方据此识别「这轮没跑完」）
+        assert!(interrupted_reason(&turn[turn.len() - 2]).is_some());
+        assert_wire_valid(&items(turn));
     }
 
     #[test]
