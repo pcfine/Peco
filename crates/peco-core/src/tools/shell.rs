@@ -1,11 +1,40 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures::Future;
 use peco_derive::peco_tool;
 use serde_json::json;
+use tracing::warn;
 
 use super::{Content, Tool, ToolDefinition, ToolDyn, ToolError};
+
+/// shell 命令超时默认 20 分钟；`PECO_SHELL_TIMEOUT_SECS` 可覆盖，`0` 表示不设超时。
+const DEFAULT_TIMEOUT_SECS: u64 = 20 * 60;
+const TIMEOUT_ENV: &str = "PECO_SHELL_TIMEOUT_SECS";
+
+fn shell_timeout() -> Option<Duration> {
+    timeout_from(std::env::var(TIMEOUT_ENV).ok().as_deref())
+}
+
+/// 解析超时值：缺失取默认，`0` 关闭超时，非法值告警后取默认。
+fn timeout_from(raw: Option<&str>) -> Option<Duration> {
+    let secs = match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    variable = TIMEOUT_ENV,
+                    value = %raw,
+                    "Invalid numeric env var; using default"
+                );
+                DEFAULT_TIMEOUT_SECS
+            }
+        },
+        None => DEFAULT_TIMEOUT_SECS,
+    };
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
 
 /// Shell command execution tool.
 ///
@@ -30,10 +59,24 @@ pub async fn shell_exec(command: String, cwd: Option<String>) -> Result<String, 
     if let Some(dir) = cwd.as_deref().filter(|d| !d.is_empty()) {
         cmd.current_dir(dir);
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+    // 取消/回收工具任务时一并杀掉子进程，避免孤儿进程继续跑。
+    cmd.kill_on_drop(true);
+
+    let output = match shell_timeout() {
+        Some(limit) => tokio::time::timeout(limit, cmd.output())
+            .await
+            .map_err(|_| {
+                ToolError::ToolCallError(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("shell command timed out after {}s", limit.as_secs()),
+                )))
+            })?
+            .map_err(|e| ToolError::ToolCallError(Box::new(e)))?,
+        None => cmd
+            .output()
+            .await
+            .map_err(|e| ToolError::ToolCallError(Box::new(e)))?,
+    };
 
     let mut result = String::new();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -145,6 +188,18 @@ mod tests {
         assert_eq!(resolve_cwd(None, Some(default)), Some("/ws".to_string()));
         // 双缺 → None（行为与旧 ShellExec 完全一致）
         assert_eq!(resolve_cwd(None, None), None);
+    }
+
+    #[test]
+    fn test_timeout_from() {
+        assert_eq!(timeout_from(None), Some(Duration::from_secs(20 * 60)));
+        assert_eq!(timeout_from(Some("90")), Some(Duration::from_secs(90)));
+        assert_eq!(timeout_from(Some("0")), None);
+        assert_eq!(
+            timeout_from(Some("abc")),
+            Some(Duration::from_secs(20 * 60))
+        );
+        assert_eq!(timeout_from(Some(" 30 ")), Some(Duration::from_secs(30)));
     }
 
     #[test]

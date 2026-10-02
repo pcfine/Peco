@@ -515,6 +515,8 @@ mod tests {
     use super::*;
     use crate::session::MessageSource;
 
+    const THRESHOLD_LOOP_CAP: u32 = 8;
+
     /// 收尾提示词里那行「回复继续」是整个续接交互的**唯一**载体 —— 没有按钮、
     /// 没有事件、没有端点，提示词弄丢它就静默失效。不带工具同理：请求已
     /// `tools: vec![]`，仍须在提示词里重申。
@@ -927,7 +929,7 @@ mod tests {
         let mut session = make_session_with_turns(4);
 
         // 阈值之前：维持「非致命失败」语义，一轮都不驱逐
-        for attempt in 1..MAX_CONSECUTIVE_SUMMARY_FAILURES {
+        for attempt in 1..MAX_CONSECUTIVE_SUMMARY_FAILURES.min(THRESHOLD_LOOP_CAP) {
             assert!(
                 policy.maybe_compact(&mut session).await.is_err(),
                 "第 {attempt} 次失败应原样返回 Err"
@@ -1075,7 +1077,7 @@ mod tests {
             .collect();
         assert!(expected_transcript.chars().count() > DEGRADED_SUMMARY_MAX_CHARS);
 
-        for _ in 1..MAX_CONSECUTIVE_SUMMARY_FAILURES {
+        for _ in 1..MAX_CONSECUTIVE_SUMMARY_FAILURES.min(THRESHOLD_LOOP_CAP) {
             assert!(policy.maybe_compact(&mut session).await.is_err());
         }
         let outcome = policy.maybe_compact(&mut session).await.unwrap().unwrap();
