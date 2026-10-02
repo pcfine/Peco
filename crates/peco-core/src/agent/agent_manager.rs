@@ -21,7 +21,7 @@ use crate::config::{McpConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::mcp::McpConfigStore;
 use crate::search::SearchBackend;
-use crate::skills::SkillRegister;
+use crate::skills::{SkillRegister, SkillResourceFile};
 use crate::tools::McpAccess;
 use crate::tools::MemoryAuditAccess;
 use crate::workflow::WorkflowAccess;
@@ -531,6 +531,17 @@ impl SkillProvider for AgentManager {
             .map_err(|e| e.to_string())
     }
 
+    fn save_skill_bundle(
+        &self,
+        name: &str,
+        content: &str,
+        files: &[SkillResourceFile],
+    ) -> Result<(), String> {
+        self.skill_registry
+            .save_skill_bundle(name, content, files)
+            .map_err(|e| e.to_string())
+    }
+
     fn delete_skill(&self, name: &str) -> Result<(), String> {
         self.skill_registry
             .delete_skill(name)
@@ -677,6 +688,17 @@ impl SkillProvider for AmSkillProvider {
     fn save_skill(&self, name: &str, content: &str) -> Result<(), String> {
         self.registry
             .save_skill(name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn save_skill_bundle(
+        &self,
+        name: &str,
+        content: &str,
+        files: &[SkillResourceFile],
+    ) -> Result<(), String> {
+        self.registry
+            .save_skill_bundle(name, content, files)
             .map_err(|e| e.to_string())
     }
 

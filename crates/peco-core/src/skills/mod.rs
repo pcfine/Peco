@@ -64,7 +64,9 @@ pub mod loader;
 pub mod skill_register;
 
 // Re-export the main public types for convenience
-pub use config::{Skill, SkillFrontmatter, SkillMeta, validate_name};
+pub use config::{
+    Skill, SkillFrontmatter, SkillMeta, SkillResourceFile, validate_name, validate_resource_path,
+};
 pub use error::SkillError;
 pub use loader::SkillLoader;
 pub use skill_register::{SkillRegister, SkillRegisterStats};

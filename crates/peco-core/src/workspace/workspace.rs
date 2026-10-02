@@ -9,7 +9,7 @@ use crate::agent::AgentManager;
 use crate::config::{McpConfig, SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::mcp::McpConfigStore;
-use crate::skills::SkillRegister;
+use crate::skills::{SkillRegister, SkillResourceFile};
 use crate::workflow::{WorkflowAccess, WorkflowManager};
 
 use super::error::WorkspaceError;
@@ -532,6 +532,17 @@ impl SkillProvider for WorkSpace {
     fn save_skill(&self, name: &str, content: &str) -> Result<(), String> {
         self.skill_registry
             .save_skill(name, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn save_skill_bundle(
+        &self,
+        name: &str,
+        content: &str,
+        files: &[SkillResourceFile],
+    ) -> Result<(), String> {
+        self.skill_registry
+            .save_skill_bundle(name, content, files)
             .map_err(|e| e.to_string())
     }
 

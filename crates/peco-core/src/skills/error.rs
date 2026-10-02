@@ -66,6 +66,15 @@ pub enum SkillError {
         name: String,
     },
 
+    /// A Tier-3 resource path is invalid (absolute, traversal, unknown subdir, …).
+    #[error("invalid resource path '{path}': {reason}")]
+    InvalidResourcePath {
+        /// The offending path as supplied by the caller.
+        path: String,
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
+
     /// Attempted to activate a Skill that was not discovered during init.
     #[error("skill '{0}' is not registered — run init() first")]
     NotRegistered(String),

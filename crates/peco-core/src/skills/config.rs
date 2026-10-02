@@ -66,6 +66,21 @@ pub struct SkillFrontmatter {
     pub metadata: HashMap<String, serde_yaml::Value>,
 }
 
+// ── Tier-3 resource files ────────────────────────────────────────────────────
+
+/// A Tier-3 resource file bundled with a Skill (`scripts` / `references` / `assets`).
+///
+/// `path` is relative to the Skill root directory and must live under one of
+/// [`KNOWN_SUBDIRS`]. Used by `save_skill` to persist a Skill together with its
+/// bundled scripts and reference documents in a single call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillResourceFile {
+    /// Path relative to the Skill root, e.g. `scripts/run.py`.
+    pub path: String,
+    /// Full UTF-8 content of the file.
+    pub content: String,
+}
+
 // ── Tier 1: SkillMeta ────────────────────────────────────────────────────────
 
 /// Lightweight metadata loaded at startup (Tier 1).
@@ -198,6 +213,61 @@ pub fn validate_description(desc: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validate and normalise a Tier-3 resource path.
+///
+/// A valid path is relative, uses `/` as the separator, and its first component
+/// is one of [`KNOWN_SUBDIRS`] (`scripts`, `references`, `assets`). Absolute
+/// paths, `..` traversal, empty components, NUL bytes, and backslashes are
+/// rejected.
+///
+/// Returns the normalised relative path on success.
+pub fn validate_resource_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("resource path must not be empty".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("resource path must not contain NUL bytes".into());
+    }
+    if trimmed.contains('\\') {
+        return Err(format!(
+            "resource path '{trimmed}' must separate directories with '/'"
+        ));
+    }
+    if trimmed.starts_with('/') {
+        return Err(format!("resource path '{trimmed}' must be relative"));
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for part in trimmed.split('/') {
+        match part {
+            "" => {
+                return Err(format!(
+                    "resource path '{trimmed}' contains an empty path component"
+                ));
+            }
+            "." | ".." => {
+                return Err(format!(
+                    "resource path '{trimmed}' must not contain '.' or '..' components"
+                ));
+            }
+            _ => parts.push(part),
+        }
+    }
+
+    match parts.first().copied() {
+        Some(top) if KNOWN_SUBDIRS.contains(&top) => {}
+        _ => {
+            return Err(format!(
+                "resource path '{trimmed}' must live under one of: {}",
+                KNOWN_SUBDIRS.join(", ")
+            ));
+        }
+    }
+
+    Ok(parts.into_iter().collect())
 }
 
 // ── Frontmatter parsing ──────────────────────────────────────────────────────
@@ -342,6 +412,37 @@ metadata:
         assert_eq!(fm.name, "pdf-form-filler");
         assert_eq!(fm.allowed_tools, vec!["Read", "Write"]);
         assert_eq!(fm.license.as_deref(), Some("Apache-2.0"));
+    }
+
+    #[test]
+    fn test_validate_resource_path_accepts_known_subdirs() {
+        assert_eq!(
+            validate_resource_path("scripts/run.py").unwrap(),
+            PathBuf::from("scripts/run.py")
+        );
+        assert_eq!(
+            validate_resource_path("references/nested/deep.md").unwrap(),
+            PathBuf::from("references/nested/deep.md")
+        );
+        assert_eq!(
+            validate_resource_path("assets/logo.svg").unwrap(),
+            PathBuf::from("assets/logo.svg")
+        );
+    }
+
+    #[test]
+    fn test_validate_resource_path_rejects_escapes() {
+        assert!(validate_resource_path("").is_err());
+        assert!(validate_resource_path("   ").is_err());
+        assert!(validate_resource_path("/etc/passwd").is_err());
+        assert!(validate_resource_path("scripts/../../etc/passwd").is_err());
+        assert!(validate_resource_path("../scripts/x.py").is_err());
+        assert!(validate_resource_path("./scripts/x.py").is_err());
+        assert!(validate_resource_path("scripts//x.py").is_err());
+        assert!(validate_resource_path("scripts/x.py/").is_err());
+        assert!(validate_resource_path("secret/key.pem").is_err());
+        assert!(validate_resource_path("scripts\\x.py").is_err());
+        assert!(validate_resource_path("scripts/\0bad").is_err());
     }
 
     #[test]

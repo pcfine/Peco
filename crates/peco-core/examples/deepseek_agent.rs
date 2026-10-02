@@ -23,7 +23,7 @@ use std::sync::Arc;
 use peco_core::agent::{Agent, AgentError, AgentLooper, LooperConfig, LooperEvent, UserMsg};
 use peco_core::config::{SystemConfig, UserConfig};
 use peco_core::knowledge::KnowledgeManager;
-use peco_core::skills::SkillRegister;
+use peco_core::skills::{SkillRegister, SkillResourceFile};
 use peco_core::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
 use peco_core::utils::intercom::make_async_intercom_pair;
 
@@ -56,6 +56,14 @@ impl SkillProvider for NoopSkillProvider {
         &self.registry
     }
     fn save_skill(&self, _name: &str, _content: &str) -> Result<(), String> {
+        Err("noop skill writer".into())
+    }
+    fn save_skill_bundle(
+        &self,
+        _name: &str,
+        _content: &str,
+        _files: &[SkillResourceFile],
+    ) -> Result<(), String> {
         Err("noop skill writer".into())
     }
     fn delete_skill(&self, _name: &str) -> Result<(), String> {

@@ -13,12 +13,12 @@
 //! so the register can be shared across threads via `Arc<SkillRegister>`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use tracing::{debug, info, warn};
 
-use super::config::{Skill, SkillMeta};
+use super::config::{Skill, SkillMeta, SkillResourceFile};
 use super::error::SkillError;
 use super::loader::SkillLoader;
 
@@ -359,10 +359,30 @@ impl SkillRegister {
     /// 创建或更新一个 Skill，写入 SKILL.md 文件并刷新缓存。
     ///
     /// `content` 必须是完整的 SKILL.md 内容（YAML frontmatter + Markdown body）。
-    /// 内部流程：校验名称 → 解析 YAML → 校验一致性 → 原子写入 → 刷新缓存。
+    /// 等价于不带资源文件的 [`save_skill_bundle`](Self::save_skill_bundle)。
     pub fn save_skill(&self, name: &str, content: &str) -> Result<(), SkillError> {
+        self.save_skill_bundle(name, content, &[])
+    }
+
+    /// 一次性写入 SKILL.md 与其 Tier-3 资源文件（`scripts` / `references` / `assets`）。
+    ///
+    /// 内部流程：校验名称 → 解析 YAML → 校验一致性 → **校验全部资源路径** →
+    /// 原子写入 SKILL.md → 原子写入资源文件 → 刷新缓存。
+    ///
+    /// 所有校验都在任何落盘之前完成：任一校验失败时磁盘保持原样，
+    /// 不会留下半写入的技能目录。
+    ///
+    /// `scripts/` 下的文件在 Unix 上会被赋予可执行位（`0o755`），使
+    /// `read_skill` 返回的路径可以按相对路径直接执行。
+    pub fn save_skill_bundle(
+        &self,
+        name: &str,
+        content: &str,
+        files: &[SkillResourceFile],
+    ) -> Result<(), SkillError> {
         use super::config::{
-            parse_frontmatter, split_frontmatter, validate_description, validate_name,
+            SKILL_MD_FILENAME, parse_frontmatter, split_frontmatter, validate_description,
+            validate_name, validate_resource_path,
         };
 
         // 1. 校验名称格式
@@ -398,7 +418,19 @@ impl SkillRegister {
             reason,
         })?;
 
-        // 5. 原子写入文件（先写临时文件再重命名）
+        // 5. 校验全部资源路径（先校验、后落盘）
+        let mut resources: Vec<(PathBuf, &str)> = Vec::with_capacity(files.len());
+        for file in files {
+            let rel = validate_resource_path(&file.path).map_err(|reason| {
+                SkillError::InvalidResourcePath {
+                    path: file.path.clone(),
+                    reason,
+                }
+            })?;
+            resources.push((rel, file.content.as_str()));
+        }
+
+        // 6. 原子写入 SKILL.md
         let skills_root = {
             let inner = self.inner.read().expect("RwLock poisoned");
             inner.loader.skills_root.clone()
@@ -408,21 +440,41 @@ impl SkillRegister {
             path: dir.clone(),
             source,
         })?;
-        let md_path = dir.join(super::config::SKILL_MD_FILENAME);
-        let tmp_path = dir.join(format!(".{}.tmp", super::config::SKILL_MD_FILENAME));
-        std::fs::write(&tmp_path, content).map_err(|source| SkillError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-        std::fs::rename(&tmp_path, &md_path).map_err(|source| SkillError::Io {
-            path: md_path.clone(),
-            source,
-        })?;
+        atomic_write(&dir.join(SKILL_MD_FILENAME), content)?;
 
-        // 6. 刷新缓存
+        // 7. 原子写入资源文件
+        for (rel, file_content) in resources {
+            let target = dir.join(&rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| SkillError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            atomic_write(&target, file_content)?;
+
+            // scripts/ 下的文件赋予可执行位
+            #[cfg(unix)]
+            {
+                let is_script = rel
+                    .components()
+                    .next()
+                    .map(|c| c.as_os_str() == std::ffi::OsStr::new("scripts"))
+                    .unwrap_or(false);
+                if is_script {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+
+            debug!(skill = %name, path = %rel.display(), "Skill resource written");
+        }
+
+        // 8. 刷新缓存
         self.refresh_one(name);
 
-        info!(name = %name, "Skill saved");
+        info!(name = %name, files = files.len(), "Skill saved");
         Ok(())
     }
 
@@ -443,16 +495,137 @@ impl SkillRegister {
     }
 }
 
+// ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// 原子写入：先写同目录下的临时文件，再 `rename` 覆盖目标。
+///
+/// `rename` 在同一文件系统内是原子操作，因此读者要么看到旧内容，要么看到
+/// 完整的新内容，不会读到半截文件。
+fn atomic_write(path: &Path, content: &str) -> Result<(), SkillError> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("resource");
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
+    std::fs::write(&tmp_path, content).map_err(|source| SkillError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|source| SkillError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
 // ── Integration tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::SkillResourceFile;
+    use std::path::Path;
+
+    const DEMO_SKILL: &str =
+        "---\nname: demo\ndescription: A demo skill for tests\n---\n\n# Demo\n\nDo things.\n";
 
     #[test]
     fn test_list_empty_when_root_missing() {
         let list = SkillRegister::new("/nonexistent/path/to/skills").unwrap();
         assert!(list.all_meta().is_empty());
         assert_eq!(list.stats().registered, 0);
+    }
+
+    #[test]
+    fn save_skill_bundle_writes_resources_and_marks_scripts_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = SkillRegister::new(tmp.path()).unwrap();
+
+        let files = vec![
+            SkillResourceFile {
+                path: "scripts/run.sh".into(),
+                content: "#!/bin/sh\necho hi\n".into(),
+            },
+            SkillResourceFile {
+                path: "references/notes.md".into(),
+                content: "# Notes\n".into(),
+            },
+        ];
+        reg.save_skill_bundle("demo", DEMO_SKILL, &files).unwrap();
+
+        let skill = reg.activate("demo").unwrap();
+        assert_eq!(skill.list_scripts(), vec![PathBuf::from("scripts/run.sh")]);
+        assert_eq!(
+            skill.list_references(),
+            vec![PathBuf::from("references/notes.md")]
+        );
+        assert!(skill.list_assets().is_empty());
+        assert_eq!(
+            skill.read_resource(Path::new("scripts/run.sh")).unwrap(),
+            "#!/bin/sh\necho hi\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join("demo/scripts/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "scripts must be executable");
+        }
+    }
+
+    #[test]
+    fn save_skill_bundle_is_all_or_nothing_on_bad_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = SkillRegister::new(tmp.path()).unwrap();
+
+        let files = vec![
+            SkillResourceFile {
+                path: "scripts/ok.sh".into(),
+                content: "ok".into(),
+            },
+            SkillResourceFile {
+                path: "../../escape.txt".into(),
+                content: "nope".into(),
+            },
+        ];
+        let err = reg
+            .save_skill_bundle("demo", DEMO_SKILL, &files)
+            .unwrap_err();
+        assert!(
+            matches!(err, SkillError::InvalidResourcePath { .. }),
+            "got {err:?}"
+        );
+
+        // 校验失败时不应落下任何文件
+        assert!(!tmp.path().join("demo/SKILL.md").exists());
+        assert!(!tmp.path().join("demo/scripts/ok.sh").exists());
+        assert!(!tmp.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn save_skill_bundle_rejects_name_mismatch_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = SkillRegister::new(tmp.path()).unwrap();
+        let bad = "---\nname: other\ndescription: mismatch\n---\n";
+        let err = reg.save_skill_bundle("demo", bad, &[]).unwrap_err();
+        assert!(
+            matches!(err, SkillError::NameMismatch { .. }),
+            "got {err:?}"
+        );
+        assert!(!tmp.path().join("demo/SKILL.md").exists());
+    }
+
+    #[test]
+    fn save_skill_accepts_a_fresh_skill_and_refreshes_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = SkillRegister::new(tmp.path()).unwrap();
+        assert!(!reg.has_skill("demo"));
+
+        reg.save_skill("demo", DEMO_SKILL).unwrap();
+        assert!(reg.has_skill("demo"));
+        assert_eq!(reg.stats().registered, 1);
     }
 }

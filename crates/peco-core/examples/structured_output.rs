@@ -23,7 +23,7 @@ use peco_core::executor::AgentExecutor;
 use peco_core::executor::ExecutorInput;
 use peco_core::executor::StructuredOutputExecutor;
 use peco_core::knowledge::KnowledgeManager;
-use peco_core::skills::SkillRegister;
+use peco_core::skills::{SkillRegister, SkillResourceFile};
 use peco_core::tools::{AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies};
 
 // ── Noop trait implementations（本示例无需真实子 agent / KB / skill）─────────
@@ -55,6 +55,14 @@ impl SkillProvider for NoopSkillProvider {
         &self.registry
     }
     fn save_skill(&self, _name: &str, _content: &str) -> Result<(), String> {
+        Err("noop skill writer".into())
+    }
+    fn save_skill_bundle(
+        &self,
+        _name: &str,
+        _content: &str,
+        _files: &[SkillResourceFile],
+    ) -> Result<(), String> {
         Err("noop skill writer".into())
     }
     fn delete_skill(&self, _name: &str) -> Result<(), String> {

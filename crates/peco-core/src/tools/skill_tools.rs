@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::deps::SkillProvider;
 use super::{Content, StringError, ToolDyn, ToolError};
+use crate::skills::SkillResourceFile;
 
 pub struct ReadSkill {
     skill_registry: Arc<crate::skills::SkillRegister>,
@@ -212,6 +213,13 @@ impl ToolDyn for SaveSkill {
                 \n\
                 Optional fields: allowed-tools, license, compatibility.\n\
                 \n\
+                Optional: pass `files` to bundle Tier-3 resource files \
+                (scripts, references, assets) alongside the SKILL.md. Each path must be \
+                relative to the skill directory and start with `scripts/`, `references/`, \
+                or `assets/`. Files under `scripts/` are written executable (0755) on Unix. \
+                The SKILL.md body can then reference them by relative path and the agent \
+                can run them with the `shell` tool using the skill directory as cwd.\n\
+                \n\
                 Example:\n\
                 ---\n\
                 name: \"code-review\"\n\
@@ -233,6 +241,24 @@ impl ToolDyn for SaveSkill {
                     "content": {
                         "type": "string",
                         "description": "Complete SKILL.md content: YAML frontmatter + Markdown body."
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Optional Tier-3 resource files written next to SKILL.md. Paths are relative to the skill directory and must start with 'scripts/', 'references/', or 'assets/'.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Path relative to the skill directory, e.g. 'scripts/run.py'."
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Full UTF-8 content of the file."
+                                }
+                            },
+                            "required": ["path", "content"]
+                        }
                     }
                 },
                 "required": ["name", "content"]
@@ -249,6 +275,8 @@ impl ToolDyn for SaveSkill {
             struct SaveSkillArgs {
                 name: String,
                 content: String,
+                #[serde(default)]
+                files: Vec<SkillResourceFile>,
             }
 
             let parsed: SaveSkillArgs =
@@ -267,14 +295,22 @@ impl ToolDyn for SaveSkill {
             }
 
             self.skill_provider
-                .save_skill(name, &parsed.content)
+                .save_skill_bundle(name, &parsed.content, &parsed.files)
                 .map_err(|e| {
                     ToolError::ToolCallError(Box::new(StringError(format!(
                         "failed to save skill '{name}': {e}"
                     ))))
                 })?;
 
-            Ok(Content::Text(format!("Skill '{name}' saved successfully.")))
+            let message = if parsed.files.is_empty() {
+                format!("Skill '{name}' saved successfully.")
+            } else {
+                format!(
+                    "Skill '{name}' saved successfully with {} resource file(s).",
+                    parsed.files.len()
+                )
+            };
+            Ok(Content::Text(message))
         })
     }
 }

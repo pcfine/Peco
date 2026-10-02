@@ -350,6 +350,14 @@ mod tests {
         fn save_skill(&self, _name: &str, _content: &str) -> Result<(), String> {
             unimplemented!()
         }
+        fn save_skill_bundle(
+            &self,
+            _name: &str,
+            _content: &str,
+            _files: &[crate::skills::SkillResourceFile],
+        ) -> Result<(), String> {
+            unimplemented!()
+        }
         fn delete_skill(&self, _name: &str) -> Result<(), String> {
             unimplemented!()
         }

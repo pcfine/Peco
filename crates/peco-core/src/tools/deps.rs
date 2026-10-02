@@ -10,7 +10,7 @@ use crate::agent::{Agent, AgentError};
 use crate::config::{McpServerConfig, TransportType};
 use crate::knowledge::KnowledgeManager;
 use crate::search::SearchBackend;
-use crate::skills::SkillRegister;
+use crate::skills::{SkillRegister, SkillResourceFile};
 use crate::workflow::WorkflowAccess;
 use crate::workflow::persistence::WorkflowPersister;
 
@@ -39,6 +39,15 @@ pub trait SkillProvider: Send + Sync {
     /// 创建或更新 SKILL.md 文件。
     /// `content` 必须是完整的 SKILL.md 内容（YAML frontmatter + Markdown body）。
     fn save_skill(&self, name: &str, content: &str) -> Result<(), String>;
+    /// 一次性写入 SKILL.md 与 Tier-3 资源文件（`scripts` / `references` / `assets`）。
+    /// 资源路径必须相对于 Skill 根目录且首段为已知子目录 — 绝对路径与 `..` 逃逸被拒绝。
+    /// 全部校验通过后才落盘。
+    fn save_skill_bundle(
+        &self,
+        name: &str,
+        content: &str,
+        files: &[SkillResourceFile],
+    ) -> Result<(), String>;
     /// 删除 Skill 目录（不可逆操作）。
     fn delete_skill(&self, name: &str) -> Result<(), String>;
 }
