@@ -332,7 +332,7 @@ async fn load_or_new_session(
 ///
 /// 构建失败时 `registration` 在本函数帧内 drop → guard 清理注册表；
 /// 成功时注册产物整体移入 runner 任务，随其退出而清理。
-async fn spawn_peco_run(
+pub(crate) async fn spawn_peco_run(
     state: &Arc<AppState>,
     user_id: &str,
     message: String,

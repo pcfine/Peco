@@ -126,6 +126,9 @@ async fn main() -> anyhow::Result<()> {
         "CronScheduler started"
     );
 
+    // ── 11.5 启动目录序列（契约见 `peco_server::peco::boot`）───────────────
+    peco_server::peco::boot::spawn_start_sequence(Arc::clone(&state));
+
     // ── 12. 构建 Router（启用 API 限流）───────────────────────────────────
     let app = peco_server::build_router_with_limits(state, true);
 
