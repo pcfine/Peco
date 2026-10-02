@@ -9,6 +9,7 @@ import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { LoginPage } from "@/pages/auth/LoginPage";
 import { RegisterPage } from "@/pages/auth/RegisterPage";
 import { PecoChatPage } from "@/pages/peco/PecoChatPage";
+import { MemoryPage } from "@/pages/memory/MemoryPage";
 import { AgentChatPage } from "@/pages/chat/AgentChatPage";
 import { AgentListPage } from "@/pages/agents/AgentListPage";
 import { AgentCreatePage } from "@/pages/agents/AgentCreatePage";
@@ -59,6 +60,9 @@ export default function App() {
 
                   {/* Peco 永续聊天 */}
                   <Route path="/peco" element={<PecoChatPage />} />
+
+                  {/* 记忆 */}
+                  <Route path="/memory" element={<MemoryPage />} />
 
                   {/* 空间 */}
                   <Route path="/workspace/agents" element={<AgentListPage />} />

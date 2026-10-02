@@ -16,6 +16,7 @@ import {
   Puzzle,
   Plug,
   BookOpen,
+  BrainCircuit,
   LogOut,
 } from "lucide-react";
 
@@ -32,6 +33,7 @@ interface NavItem {
 
 const NAV_ITEMS: NavItem[] = [
   { to: "/peco", label: "Peco", icon: Sparkles },
+  { to: "/memory", label: "记忆", icon: BrainCircuit },
   {
     to: "/workspace",
     label: "空间",
