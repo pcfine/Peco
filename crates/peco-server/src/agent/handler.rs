@@ -52,7 +52,7 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
-    pub max_turns: Option<usize>,
+    pub max_iterations: Option<usize>,
     #[serde(default)]
     pub knowledge_bases: Option<Vec<String>>,
 }
@@ -78,7 +78,7 @@ pub struct UpdateAgentRequest {
     pub max_tokens: Option<Option<u32>>,
     pub stream: Option<Option<bool>>,
     pub reasoning_effort: Option<Option<String>>,
-    pub max_turns: Option<usize>,
+    pub max_iterations: Option<usize>,
     pub knowledge_bases: Option<Vec<String>>,
 }
 
@@ -118,7 +118,7 @@ pub struct AgentDetail {
     pub max_tokens: Option<u32>,          // agent.md llm.max_tokens
     pub stream: Option<bool>,             // agent.md llm.stream
     pub reasoning_effort: Option<String>, // agent.md llm.reasoning_effort
-    pub max_turns: usize,                 // agent.md max_turns
+    pub max_iterations: usize,            // agent.md max_iterations
     /// 用户消息图片输入能力（provider 类型 + api 分派，未实例化）
     pub supports_images: bool,
     pub created_at: String, // DB
@@ -160,7 +160,7 @@ fn agent_detail_from_profile(
         max_tokens: llm.and_then(|l| l.max_tokens),
         stream: llm.and_then(|l| l.stream),
         reasoning_effort: llm.and_then(|l| l.reasoning_effort.clone()),
-        max_turns: profile.max_turns,
+        max_iterations: profile.max_iterations,
         supports_images,
         created_at: db_row.created_at.clone(),
         updated_at: db_row.updated_at.clone(),
@@ -185,7 +185,9 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
         mcp_servers: req.mcp_servers.clone(),
         skills: req.skills.clone(),
         knowledge_bases: req.knowledge_bases.clone().unwrap_or_default(),
-        max_turns: req.max_turns.unwrap_or(agent_config::default_max_turns()),
+        max_iterations: req
+            .max_iterations
+            .unwrap_or(agent_config::default_max_iterations()),
         system_prompt: req.system_prompt.trim().to_string(),
     }
 }
@@ -245,7 +247,7 @@ fn merge_agent_profile(
             .knowledge_bases
             .clone()
             .unwrap_or_else(|| old_profile.knowledge_bases.clone()),
-        max_turns: req.max_turns.unwrap_or(old_profile.max_turns),
+        max_iterations: req.max_iterations.unwrap_or(old_profile.max_iterations),
         system_prompt: req
             .system_prompt
             .clone()
@@ -441,7 +443,7 @@ pub async fn create(
         max_tokens: assemble_params.max_tokens,
         stream: assemble_params.stream,
         reasoning_effort: assemble_params.reasoning_effort,
-        max_turns: assemble_params.max_turns,
+        max_iterations: assemble_params.max_iterations,
         supports_images,
         created_at: db_row.created_at,
         updated_at: db_row.updated_at,
@@ -630,7 +632,7 @@ pub async fn update(
         max_tokens: merged.max_tokens,
         stream: merged.stream,
         reasoning_effort: merged.reasoning_effort,
-        max_turns: merged.max_turns,
+        max_iterations: merged.max_iterations,
         supports_images,
         created_at: updated_row.created_at,
         updated_at: updated_row.updated_at,

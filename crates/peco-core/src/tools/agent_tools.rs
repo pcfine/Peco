@@ -117,7 +117,7 @@ impl ToolDyn for SaveAgent {
                   agent.description: what this agent does\n\
                 \n\
                 Optional fields: llm (provider, model, temperature, max_tokens, stream, \
-                reasoning_effort), tools, mcp, skills, knowledge_bases, max_turns (default 500).\n\
+                reasoning_effort), tools, mcp, skills, knowledge_bases, max_iterations (default 500).\n\
                 \n\
                 Before choosing the tools field, call the list_tools tool (if available in your \
                 toolset) to discover the tools valid in this environment and their descriptions. \
@@ -133,7 +133,7 @@ impl ToolDyn for SaveAgent {
                   provider: \"deepseek\"\n\
                   model: \"deepseek-v4-flash\"\n\
                 tools: [\"shell\", \"fetch\", \"read_skill\"]\n\
-                max_turns: 15\n\
+                max_iterations: 15\n\
                 ---\n\
                 You are a code reviewer. When given code, analyze it for...\n\
                 \n\

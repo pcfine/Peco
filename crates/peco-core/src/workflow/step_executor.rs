@@ -53,14 +53,14 @@ pub(crate) async fn execute_step_static(
             StepConfig::Agent {
                 agent,
                 prompt,
-                max_turns,
+                max_iterations,
             } => match tpl_ctx.render(prompt) {
                 Ok(rendered_prompt) => {
                     execute_agent_step(
                         agent_access,
                         agent,
                         &rendered_prompt,
-                        *max_turns,
+                        *max_iterations,
                         step.output_schema.clone(),
                         cancel_flag,
                     )
@@ -141,7 +141,7 @@ async fn execute_agent_step(
     agent_access: &Arc<dyn AgentAccess>,
     agent_name: &str,
     prompt: &str,
-    max_turns: Option<usize>,
+    max_iterations: Option<usize>,
     output_schema: Option<serde_json::Value>,
     _cancel_flag: &Arc<AtomicBool>,
 ) -> StepOutcome {
@@ -162,7 +162,7 @@ async fn execute_agent_step(
     };
 
     // 3. 启动 SimpleAgentLooper（batch 模式）
-    let handle = SimpleAgentLooper::spawn(agent, final_prompt, max_turns);
+    let handle = SimpleAgentLooper::spawn(agent, final_prompt, max_iterations);
 
     // 4. 等待完成
     match handle.wait().await {

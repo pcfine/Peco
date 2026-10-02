@@ -149,7 +149,7 @@ async fn example_weather_info(agent: Arc<Agent>) -> Result<(), Box<dyn std::erro
     // 2. 创建 StructuredOutputExecutor
     let executor = StructuredOutputExecutor::new(agent.clone())
         .with_max_retries(2)
-        .with_max_turns(10);
+        .with_max_iterations(10);
 
     // 3. 执行
     let input =
@@ -205,7 +205,7 @@ async fn example_code_analysis(agent: Arc<Agent>) -> Result<(), Box<dyn std::err
 
     let executor = StructuredOutputExecutor::new(agent.clone())
         .with_max_retries(2)
-        .with_max_turns(10);
+        .with_max_iterations(10);
 
     let code_snippet = r#"
 pub async fn fetch_user(id: u64) -> Result<User, Error> {
@@ -271,7 +271,7 @@ async fn example_retry_on_missing_submit(
     // 设置较多重试 — 展示重试机制的鲁棒性
     let executor = StructuredOutputExecutor::new(agent.clone())
         .with_max_retries(3)
-        .with_max_turns(8);
+        .with_max_iterations(8);
 
     let input = ExecutorInput::with_schema(
         "分析这段文本的情感：\"这个产品的续航超出预期，但屏幕亮度在阳光下不太够用。\"",
@@ -356,7 +356,7 @@ llm:
 tools: []
 mcp: []
 skills: []
-max_turns: 10
+max_iterations: 10
 ---
 
 ## Role

@@ -103,7 +103,7 @@ pub struct ExecutorOutput {
     pub usage: Usage,
     /// 结构化数据（仅 StructuredOutputExecutor 填充）
     pub structured_data: Option<serde_json::Value>,
-    /// 执行的 ReAct 轮数（SimpleAgentLooper 路径为 0）
+    /// 执行的 ReAct 迭代次数（SimpleAgentLooper 路径为 0）
     pub turns: usize,
     /// 是否成功完成
     pub success: bool,

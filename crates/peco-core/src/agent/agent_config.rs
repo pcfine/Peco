@@ -52,9 +52,10 @@ pub struct AgentProfile {
     #[serde(default)]
     pub knowledge_bases: Vec<String>,
 
-    /// 单次响应最大对话轮数。未配置时默认为 500。
-    #[serde(default = "default_max_turns")]
-    pub max_turns: usize,
+    /// 单个对话轮次（用户一次输入到最终答复）内允许的最大 ReAct 迭代次数，
+    /// 即模型调用次数。**不是对话轮数**。未配置时默认为 500。
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
 
     /// 模板版本号 — 仅内置模板的 agent.md 携带，供 `init_from_template`
     /// 做增量迁移比对（版本更高则备份覆盖）。用户手写 agent.md 无此字段，
@@ -63,8 +64,8 @@ pub struct AgentProfile {
     pub template_version: Option<u32>,
 }
 
-/// `max_turns` 的默认值：500 轮对话。
-pub fn default_max_turns() -> usize {
+/// `max_iterations` 的默认值：500 次 ReAct 迭代。
+pub fn default_max_iterations() -> usize {
     500
 }
 
@@ -260,7 +261,7 @@ pub struct AssembleAgentMdParams {
     pub mcp_servers: Vec<String>,
     pub skills: Vec<String>,
     pub knowledge_bases: Vec<String>,
-    pub max_turns: usize,
+    pub max_iterations: usize,
     pub system_prompt: String,
 }
 
@@ -284,7 +285,7 @@ pub struct AssembleAgentMdParams {
 ///     tools: vec!["shell".into()],
 ///     mcp_servers: vec![],
 ///     skills: vec![],
-///     max_turns: 500,
+///     max_iterations: 500,
 ///     system_prompt: "You are a helpful assistant.".into(),
 /// };
 /// let md = assemble_agent_md(&params);
@@ -353,9 +354,9 @@ pub fn assemble_agent_md(params: &AssembleAgentMdParams) -> String {
         }
     }
 
-    // max_turns（只在非默认值时写出，保持最小惊讶原则）
-    if params.max_turns != default_max_turns() {
-        yaml.push_str(&format!("max_turns: {}\n", params.max_turns));
+    // max_iterations（只在非默认值时写出，保持最小惊讶原则）
+    if params.max_iterations != default_max_iterations() {
+        yaml.push_str(&format!("max_iterations: {}\n", params.max_iterations));
     }
 
     yaml.push_str("---\n");
@@ -526,7 +527,7 @@ mod tests {
             mcp_servers: vec!["filesystem".into()],
             skills: vec!["code-review".into()],
             knowledge_bases: vec!["test-kb".into()],
-            max_turns: 30,
+            max_iterations: 30,
             system_prompt: "You are a helpful assistant.\nBe concise.".into(),
         };
 
@@ -555,8 +556,8 @@ mod tests {
         assert_eq!(profile.skills, vec!["code-review"]);
         assert_eq!(profile.knowledge_bases, vec!["test-kb"]);
 
-        // 验证 max_turns 和 body
-        assert_eq!(profile.max_turns, 30);
+        // 验证 max_iterations 和 body
+        assert_eq!(profile.max_iterations, 30);
         assert_eq!(body, "You are a helpful assistant.\nBe concise.");
     }
 
@@ -575,7 +576,7 @@ mod tests {
             mcp_servers: vec![],
             skills: vec![],
             knowledge_bases: vec![],
-            max_turns: default_max_turns(), // 默认值，不应写入
+            max_iterations: default_max_iterations(), // 默认值，不应写入
             system_prompt: "Be helpful.".into(),
         };
 
@@ -596,7 +597,7 @@ mod tests {
         assert!(profile.tools.is_empty());
         assert!(profile.mcp.is_empty());
         assert!(profile.skills.is_empty());
-        assert_eq!(profile.max_turns, default_max_turns());
+        assert_eq!(profile.max_iterations, default_max_iterations());
         assert_eq!(body, "Be helpful.");
     }
 
@@ -615,7 +616,7 @@ mod tests {
             mcp_servers: vec![],
             skills: vec![],
             knowledge_bases: vec![],
-            max_turns: 20,
+            max_iterations: 20,
             system_prompt: "You are helpful.".into(),
         };
 

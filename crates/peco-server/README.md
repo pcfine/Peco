@@ -497,7 +497,7 @@ SQLite 数据库，13 张表，完整外键约束 + CASCADE 删除。Agent 完�
 
 Agent 以 `agent.md`（YAML frontmatter + Markdown body）为唯一真相源：
 
-- **agent.md** 包含完整配置：`llm`（provider/model/temperature/max_tokens）、`tools`、`mcp`、`skills`、`max_turns`，以及 Markdown 格式的 system prompt
+- **agent.md** 包含完整配置：`llm`（provider/model/temperature/max_tokens）、`tools`、`mcp`、`skills`、`max_iterations`，以及 Markdown 格式的 system prompt
 - **DB agents 表**仅保存轻量索引（name, description, icon, color）
 - `assemble_agent_md()` / `parse_agent_md()` 负责序列化与反序列化
 

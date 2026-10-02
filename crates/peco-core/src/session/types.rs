@@ -80,7 +80,7 @@ pub enum MessageSource {
     /// 与 `InterruptedTurn` 同理：按来源识别，不猜文案特征串。
     /// 旧快照无此值，反序列化天然兼容。
     MergedPending,
-    /// 撞上 `max_turns` 上限时合成的收尾报告。
+    /// 撞上 `max_iterations` 上限时合成的收尾报告。
     ///
     /// 由 [`Session::interrupt_turn_with_closing`](super::Session::interrupt_turn_with_closing)
     /// 追加在悬空工具调用补齐**之后**，**取代**通常的 `InterruptedTurn`

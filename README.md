@@ -204,7 +204,7 @@ skills:
   - code-review
 knowledge_bases:
   - @project_docs
-max_turns: 30
+max_iterations: 30
 ---
 
 # System Prompt

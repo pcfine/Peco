@@ -36,7 +36,7 @@ use crate::agent::simple_looper::SimpleAgentLooper;
 /// ```
 pub struct SingleTurnExecutor {
     agent: Arc<Agent>,
-    max_turns: Option<usize>,
+    max_iterations: Option<usize>,
     timeout: Option<Duration>,
 }
 
@@ -45,16 +45,16 @@ impl SingleTurnExecutor {
     pub fn new(agent: Arc<Agent>) -> Self {
         Self {
             agent,
-            max_turns: None,
+            max_iterations: None,
             timeout: None,
         }
     }
 
-    /// 设置最大 ReAct 轮数。
+    /// 设置最大 ReAct 迭代次数。
     ///
-    /// 默认使用 agent profile 中的 max_turns 配置。
-    pub fn with_max_turns(mut self, max_turns: usize) -> Self {
-        self.max_turns = Some(max_turns);
+    /// 默认使用 agent profile 中的 max_iterations 配置。
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = Some(max_iterations);
         self
     }
 
@@ -76,8 +76,11 @@ impl AgentExecutor for SingleTurnExecutor {
     }
 
     async fn execute(&self, input: ExecutorInput) -> Result<ExecutorOutput, ExecutorError> {
-        let handle =
-            SimpleAgentLooper::spawn(self.agent.clone(), input.prompt.clone(), self.max_turns);
+        let handle = SimpleAgentLooper::spawn(
+            self.agent.clone(),
+            input.prompt.clone(),
+            self.max_iterations,
+        );
 
         let content = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, handle.wait())

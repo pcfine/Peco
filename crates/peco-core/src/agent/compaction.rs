@@ -47,7 +47,7 @@ Rules:
 4. For tool calls keep only conclusions, not command details;
 5. At most 8 items per section, one line each, total length under 500 characters. Write summary content in the same language as the conversation."#;
 
-/// 收尾报告（撞上 `max_turns` 上限）的系统提示词。
+/// 收尾报告（撞上 `max_iterations` 上限）的系统提示词。
 ///
 /// 与摘要提示词同风格：英文指令 + 固定小节，正文语言跟随对话。三个小节是给用户
 /// 看的结论骨架；末行「回复继续」是续接交互的**唯一**载体 —— 没有按钮、没有事件、
@@ -76,7 +76,7 @@ Rules:
 
 /// 元任务模型 — 把一段转录合成为短文本。
 ///
-/// 服务两个入口：轮边界的上下文压缩（[`Self::summarize`]）与撞上 `max_turns` 时的
+/// 服务两个入口：轮边界的上下文压缩（[`Self::summarize`]）与撞上 `max_iterations` 时的
 /// 轮末收尾报告（[`Self::summarize_inflight`]）。两者同范式 —— 复用主 Agent 的
 /// provider 与 Flash 档模型、无工具、关 reasoning、失败非致命 —— 差异只有提示词，
 /// 以及结果是否需要摘要定界标签。故由同一个实现（[`ModelSummarizer`]）承担。

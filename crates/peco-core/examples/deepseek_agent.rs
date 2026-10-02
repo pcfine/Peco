@@ -138,7 +138,7 @@ llm:
 tools: []
 mcp: []
 skills: []
-max_turns: 5
+max_iterations: 5
 ---
 
 ## Role
@@ -266,7 +266,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
                         }
                         LooperEvent::ModelUsage { call_index, usage } => {
                             println!(
-                                "\n[📊 turn {call_index}: {} in / {} out / {} total tokens]",
+                                "\n[📊 call #{call_index}: {} in / {} out / {} total tokens]",
                                 usage.input_tokens, usage.output_tokens, usage.total_tokens
                             );
                         }

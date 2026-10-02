@@ -67,7 +67,7 @@ skills:
   - code-review
 mcp:
   - filesystem
-max_turns: 20
+max_iterations: 20
 ---
 
 你是一个 AI 助手，可以使用工具和知识库来帮助用户。

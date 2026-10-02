@@ -38,7 +38,7 @@ pub struct PecoConfig {
     pub compaction_keep_recent_tokens: usize,
     /// 摘要模型名（Flash 档，低延迟低成本）。
     ///
-    /// 撞上 `max_turns` 时合成的收尾报告共用同一个模型 —— 两者都是「读一遍既有
+    /// 撞上 `max_iterations` 时合成的收尾报告共用同一个模型 —— 两者都是「读一遍既有
     /// 内容、产出短文本」的元任务，只是提示词不同。
     pub summarizer_model: String,
     /// 记忆双路径配置（写路径提取 hook + 读路径召回）。
@@ -66,7 +66,7 @@ pub struct PecoConfig {
     pub compaction: Option<Arc<CompactionPolicy>>,
     /// 轮末收尾报告合成器。由 `PecoManager` 装配为与压缩摘要器**同一个**实例
     /// （见 `TurnSummarizer::summarize_inflight`）。
-    /// 未装配（`None`）时撞上 `max_turns` 走固定中断说明。
+    /// 未装配（`None`）时撞上 `max_iterations` 走固定中断说明。
     pub epilogue: Option<Arc<dyn TurnSummarizer>>,
     /// 环境上下文（恒定前缀）：用户身份、工作空间路径、日期平台等。
     /// 由 `PecoManager` 在构造时经 `EnvironmentInfo::render()` 求值一次填入。

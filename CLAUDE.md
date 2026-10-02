@@ -74,7 +74,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 ### peco-core：Agent 引擎
 
 **Agent**（[crates/peco-core/src/agent/](crates/peco-core/src/agent/)）：
-- 由 `agent.md` 文件定义：YAML frontmatter（模型、工具、MCP 服务器、Skills、max_turns）+ Markdown 正文（系统提示词）。
+- 由 `agent.md` 文件定义：YAML frontmatter（模型、工具、MCP 服务器、Skills、max_iterations）+ Markdown 正文（系统提示词）。
 - `Agent::from_file(path)` 解析文件，从 `providers.toml` 解析 provider 配置，创建 `ModelProvider`（目前始终为 DeepSeek），并注册工具 + MCP 工具。
 - `MessageFilter` trait：上下文组装后的钩子，可在消息列表发送给 LLM 之前对其进行转换（如脱敏、注入）。
 
@@ -316,7 +316,7 @@ tools: [shell, fetch, search_knowledge]
 mcp: [helixdb-docs]
 skills: [code-review]
 knowledge_bases: [@project_docs]
-max_turns: 30
+max_iterations: 30
 ---
 # 系统提示词
 ...
@@ -374,7 +374,18 @@ steps:
 
 5. **peco-server 中的 WorkspaceManager 是桥梁**：持有按用户 ID 索引的 `WorkSpace` 实例 LRU 缓存（128 条目）。每个 workspace 持有 `SkillRegister`、`KnowledgeManager`、`AgentManager`，并通过 `tools::ToolRegister::build()` 按需为 Agent 组装 `ToolExecutor`。
 
-6. **错误处理**：`AgentError` 覆盖完整生命周期（IO、YAML 解析、缺失字段、环境变量、配置、工具执行、超过最大轮次、协议违规）。`?` 运算符可在各处使用，因为它为常见错误类型实现了 `From`。
+6. **错误处理**：`AgentError` 覆盖完整生命周期（IO、YAML 解析、缺失字段、环境变量、配置、工具执行、超过最大迭代次数、协议违规）。`?` 运算符可在各处使用，因为它为常见错误类型实现了 `From`。
+
+## 命名约定：turn vs iteration
+
+两个尺度都叫过 `turn`，是歧义的根源。**永远不要用 `turn` 表示 ReAct 迭代**：
+
+- **`turn` / `turn_index` / `turns` = 对话轮次** —— 用户一次输入到最终答复，持久化单元。`Session::turn_index()`、`committed_turns`、`TurnBoundaryToken`、`LooperEvent::TurnComplete { turn_index }`、`ContextStrategy::SlidingWindow { max_turns }`（保留最近 N 个**对话轮**）。
+- **`iteration` / `react_loop_iteration` / `max_iterations` = ReAct 循环迭代** —— 单个对话轮次内模型被调用的次数。`AgentProfile.max_iterations`（agent.md YAML / REST DTO / workflow step 同名字段）、`AgentError::MaxIterations`、`TurnFailureReason::MaxIterationsExceeded`、`reset_iteration_counters()`。
+
+对齐 LangChain `AgentExecutor::max_iterations` / Semantic Kernel `max_iterations`；OpenAI Agents SDK 的 `max_turns` 是少数派用词，不跟。
+
+日志字段：承载对话轮次写 `turn_index`，承载迭代次数写 `iteration`，预算值写 `max_iterations` —— 三者同时出现时应一眼可分。
 
 ## 日志约定
 

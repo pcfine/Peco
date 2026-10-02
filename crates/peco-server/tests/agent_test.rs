@@ -391,7 +391,7 @@ async fn test_create_agent_with_all_new_fields() {
             "tools": ["shell", "fetch"],
             "mcp_servers": ["filesystem"],
             "skills": ["code-review"],
-            "max_turns": 30,
+            "max_iterations": 30,
             "icon": "🧪"
         }))
         .send()
@@ -409,7 +409,7 @@ async fn test_create_agent_with_all_new_fields() {
     assert_eq!(body["max_tokens"], 8192);
     assert_eq!(body["stream"], true);
     assert_eq!(body["reasoning_effort"], "high");
-    assert_eq!(body["max_turns"], 30);
+    assert_eq!(body["max_iterations"], 30);
     assert_eq!(body["icon"], "🧪");
 
     let tools: Vec<&str> = body["tools"]
@@ -451,7 +451,7 @@ async fn test_update_partial_fields_preserves_others() {
             "system_prompt": "原始 prompt",
             "model": "deepseek-v4-flash",
             "temperature": 0.7,
-            "max_turns": 25,
+            "max_iterations": 25,
             "tools": ["shell"]
         }))
         .send()
@@ -476,7 +476,7 @@ async fn test_update_partial_fields_preserves_others() {
     // 未更新的字段保持不变
     assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["temperature"], 0.7);
-    assert_eq!(body["max_turns"], 25);
+    assert_eq!(body["max_iterations"], 25);
     let tools: Vec<&str> = body["tools"]
         .as_array()
         .unwrap()

@@ -20,7 +20,7 @@ export interface AgentDetail extends AgentListItem {
   temperature?: number;
   max_tokens?: number;
   reasoning_effort?: string;
-  max_turns: number;
+  max_iterations: number;
   /** agent 绑定的 provider 是否支持用户消息图片输入 */
   supports_images: boolean;
   updated_at: string;
@@ -41,7 +41,7 @@ export interface CreateAgentRequest {
   temperature?: number;
   max_tokens?: number;
   reasoning_effort?: string;
-  max_turns?: number;
+  max_iterations?: number;
 }
 
 export interface UpdateAgentRequest {
@@ -59,7 +59,7 @@ export interface UpdateAgentRequest {
   temperature?: number;
   max_tokens?: number;
   reasoning_effort?: string;
-  max_turns?: number;
+  max_iterations?: number;
 }
 
 export interface SuccessResponse {

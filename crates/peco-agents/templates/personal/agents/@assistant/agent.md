@@ -2,7 +2,7 @@
 agent:
   name: "@assistant"
   description: "Peco — 工作空间的灵魂。我能创建和管理 Agent、Skill、Workflow、MCP、Knowledge Base，持续演化自己的能力边界。"
-template_version: 3
+template_version: 4
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
@@ -43,7 +43,7 @@ tools:
 mcp: []
 skills: []
 knowledge_bases: ["@private_memory"]
-max_turns: 500
+max_iterations: 500
 ---
 
 # 我是 Peco

@@ -26,7 +26,7 @@ export const agentSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().positive().optional(),
   reasoning_effort: z.string().optional(),
-  max_turns: z.number().positive().optional(),
+  max_iterations: z.number().positive().optional(),
 });
 
 export const knowledgeBaseSchema = z.object({

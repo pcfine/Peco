@@ -11,7 +11,7 @@ tools:
   - shell
   - fetch
 skills: []
-max_turns: 20
+max_iterations: 20
 ---
 
 # 角色定义

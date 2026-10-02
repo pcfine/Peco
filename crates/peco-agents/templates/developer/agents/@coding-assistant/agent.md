@@ -14,7 +14,7 @@ tools:
   - delegate_sub_agent
   - search_knowledge
 skills: []
-max_turns: 30
+max_iterations: 30
 ---
 
 # 角色定义

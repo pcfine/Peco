@@ -439,7 +439,7 @@ impl Session {
 
     /// 同 [`Self::interrupt_turn`]，但可用 `closing` 取代通常的中断说明。
     ///
-    /// `closing` 是撞上 `max_turns` 上限时合成的收尾报告（已由调用方异步备好）。
+    /// `closing` 是撞上 `max_iterations` 上限时合成的收尾报告（已由调用方异步备好）。
     /// 它**取代**而非追加 [`Self::push_interrupt_notice`]：两者同时存在会让
     /// 历史以两条连续 assistant 消息收尾 —— 补齐的工具结果之后只该有一条。
     /// 悬空 `FunctionCall` 的补齐与收尾的相对顺序因此是强制的（补齐在前）。

@@ -40,7 +40,7 @@ pub struct SimpleAgentLooper {
     /// The assembled Agent (model + tools + MCP).
     agent: Arc<Agent>,
     /// Maximum model-call iterations before forcing failure.
-    max_turns: usize,
+    max_iterations: usize,
 
     /// Accumulated message history.
     ///
@@ -49,7 +49,7 @@ pub struct SimpleAgentLooper {
     /// FunctionCallOutput [`InputItem`]s only.
     messages: Vec<Arc<InputItem>>,
 
-    /// Model calls made so far in this run. Checked against `max_turns`.
+    /// Model calls made so far in this run. Checked against `max_iterations`.
     react_loop_iteration: usize,
 
     /// External cancel signal shared with [`SimpleLooperHandle`].
@@ -70,19 +70,19 @@ impl SimpleAgentLooper {
     ///
     /// * `agent` — The assembled Agent instance.
     /// * `prompt` — The task description / user query.
-    /// * `max_turns` — Override for `agent.max_turns()`. Pass `None` to use
+    /// * `max_iterations` — Override for `agent.max_iterations()`. Pass `None` to use
     ///   the agent's configured value.
     pub fn spawn(
         agent: Arc<Agent>,
         prompt: String,
-        max_turns: Option<usize>,
+        max_iterations: Option<usize>,
     ) -> SimpleLooperHandle {
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let max_turns = max_turns.unwrap_or_else(|| agent.max_turns());
+        let max_iterations = max_iterations.unwrap_or_else(|| agent.max_iterations());
 
         let mut looper = SimpleAgentLooper {
             agent,
-            max_turns,
+            max_iterations,
             messages: Vec::new(),
             react_loop_iteration: 0,
             cancel_flag: cancel_flag.clone(),
@@ -107,14 +107,14 @@ impl SimpleAgentLooper {
         agent: Arc<Agent>,
         prompt: String,
         tool_executor: Arc<dyn ToolExecutor>,
-        max_turns: Option<usize>,
+        max_iterations: Option<usize>,
     ) -> SimpleLooperHandle {
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let max_turns = max_turns.unwrap_or_else(|| agent.max_turns());
+        let max_iterations = max_iterations.unwrap_or_else(|| agent.max_iterations());
 
         let mut looper = SimpleAgentLooper {
             agent,
-            max_turns,
+            max_iterations,
             messages: Vec::new(),
             react_loop_iteration: 0,
             cancel_flag: cancel_flag.clone(),
@@ -150,10 +150,10 @@ impl SimpleAgentLooper {
                 return Err(AgentError::AgentProtocol("cancelled".into()));
             }
 
-            // ── Check max_turns ───────────────────────────────────────────
-            if self.react_loop_iteration >= self.max_turns {
-                return Err(AgentError::MaxTurns {
-                    max_turns: self.max_turns,
+            // ── Check max_iterations ───────────────────────────────────────────
+            if self.react_loop_iteration >= self.max_iterations {
+                return Err(AgentError::MaxIterations {
+                    max_iterations: self.max_iterations,
                 });
             }
             self.react_loop_iteration += 1;
@@ -517,7 +517,7 @@ mod tests {
     async fn test_handle_wait_returns_error() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = tokio::spawn(async {
-            Err::<String, AgentError>(AgentError::MaxTurns { max_turns: 1 })
+            Err::<String, AgentError>(AgentError::MaxIterations { max_iterations: 1 })
         });
         let abort_handle = join_handle.abort_handle();
         let handle = SimpleLooperHandle {

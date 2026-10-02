@@ -183,7 +183,7 @@ mod tests {
             config: StepConfig::Agent {
                 agent: "@reviewer".into(),
                 prompt: "review".into(),
-                max_turns: None,
+                max_iterations: None,
             },
             depends_on: vec![],
             condition: None,
@@ -228,7 +228,7 @@ mod tests {
             config: StepConfig::Agent {
                 agent: "@reviewer".into(),
                 prompt: "review".into(),
-                max_turns: None,
+                max_iterations: None,
             },
             depends_on: vec![],
             condition: None,
@@ -328,7 +328,7 @@ mod tests {
             config: StepConfig::Agent {
                 agent: "@reviewer".into(),
                 prompt: "review".into(),
-                max_turns: None,
+                max_iterations: None,
             },
             depends_on: vec![],
             condition: None,

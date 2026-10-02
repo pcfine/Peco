@@ -22,7 +22,7 @@ mcp:
 skills:
   - code-review
 
-max_turns: 10
+max_iterations: 10
 ---
 
 ## 角色定义

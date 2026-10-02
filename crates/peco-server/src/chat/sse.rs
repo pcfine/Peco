@@ -306,7 +306,7 @@ pub fn extract_sub_agent_result(tool_result: &str, info: &SubAgentInfo, tool_nam
 fn format_failure_message(reason: &TurnFailureReason, partial_text: &str) -> String {
     let reason_msg = match reason {
         TurnFailureReason::Cancelled => "对话已被取消".to_string(),
-        TurnFailureReason::MaxTurnsExceeded => "已达到最大轮数限制".to_string(),
+        TurnFailureReason::MaxIterationsExceeded => "已达到最大迭代次数限制".to_string(),
         TurnFailureReason::HookAbort(msg) => format!("响应已被中断: {msg}"),
         TurnFailureReason::RateLimited { attempts, message } => {
             let retries = attempts.saturating_sub(1);

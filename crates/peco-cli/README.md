@@ -96,7 +96,7 @@ skills:
   - code-review
 mcp:
   - helixdb-docs
-max_turns: 30
+max_iterations: 30
 ---
 
 # System Prompt

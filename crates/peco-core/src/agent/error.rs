@@ -49,9 +49,9 @@ pub enum AgentError {
     #[error("tool execution error: tool={tool}, message={message}")]
     ToolExecution { tool: String, message: String },
 
-    /// The agent exceeded its maximum number of ReAct turns.
-    #[error("max turns exceeded: {max_turns} turn(s) allowed")]
-    MaxTurns { max_turns: usize },
+    /// The agent exceeded its maximum number of ReAct loop iterations.
+    #[error("max iterations exceeded: {max_iterations} iteration(s) allowed")]
+    MaxIterations { max_iterations: usize },
 
     /// Internal state machine protocol violation.
     #[error("agent protocol error: {0}")]

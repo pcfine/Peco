@@ -276,7 +276,7 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
       temperature: defaultValues?.temperature ?? undefined,
       max_tokens: defaultValues?.max_tokens ?? undefined,
       reasoning_effort: defaultValues?.reasoning_effort ?? "",
-      max_turns: defaultValues?.max_turns ?? undefined,
+      max_iterations: defaultValues?.max_iterations ?? undefined,
     },
   });
 
@@ -373,7 +373,7 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
       temperature: data.temperature as number | undefined,
       max_tokens: data.max_tokens as number | undefined,
       reasoning_effort: (data.reasoning_effort as string) || undefined,
-      max_turns: data.max_turns as number | undefined,
+      max_iterations: data.max_iterations as number | undefined,
     });
   };
 
@@ -531,22 +531,22 @@ export function AgentForm({ defaultValues, onSubmit, onCancel }: Props) {
             )}
           </div>
           <div className="space-y-2">
-            <Label htmlFor="maxTurns">Max Turns</Label>
+            <Label htmlFor="maxIterations">Max Iterations</Label>
             <Input
-              id="maxTurns"
+              id="maxIterations"
               type="number"
               min={1}
               placeholder="留空使用默认值"
-              {...register("max_turns", {
+              {...register("max_iterations", {
                 setValueAs: (v) => (v === "" ? undefined : Number(v)),
               })}
             />
             <p className="text-xs text-muted-foreground">
               单次对话最多执行多少轮 ReAct 循环（默认 500）。
             </p>
-            {errors.max_turns && (
+            {errors.max_iterations && (
               <p className="text-sm text-destructive">
-                {errors.max_turns.message}
+                {errors.max_iterations.message}
               </p>
             )}
           </div>

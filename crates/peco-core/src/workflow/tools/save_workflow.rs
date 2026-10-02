@@ -46,7 +46,7 @@ impl ToolDyn for SaveWorkflow {
                 Step config by type:\n\
                   shell: { command: \"shell command to run\" }\n\
                   agent: { agent: \"@agent-name\", prompt: \"what the agent should do\" }\n\
-                    Optional: max_turns (integer, max ReAct loop iterations)\n\
+                    Optional: max_iterations (integer, max ReAct loop iterations)\n\
                 \n\
                 Example:\n\
                   steps:\n\

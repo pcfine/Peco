@@ -74,7 +74,7 @@ impl PecoManager {
 
         // ── 5. 构建元任务模型（复用主 Agent 的 provider + Flash 模型）────
         //
-        // 一个实例担两职：轮边界压缩的摘要器，与撞上 max_turns 时的收尾报告器
+        // 一个实例担两职：轮边界压缩的摘要器，与撞上 max_iterations 时的收尾报告器
         // （`summarize_inflight`）。两者同范式，差异只在提示词。合成失败非致命，
         // 收尾那条路径回退到固定中断说明。
         let summarizer: Arc<dyn TurnSummarizer> = Arc::new(ModelSummarizer::new(

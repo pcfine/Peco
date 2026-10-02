@@ -268,9 +268,9 @@ impl Agent {
         &self.tool_executor
     }
 
-    /// 返回此 Agent 单次运行的最大对话轮数。
-    pub fn max_turns(&self) -> usize {
-        self.profile.max_turns
+    /// 返回此 Agent 单个对话轮次内的最大 ReAct 迭代次数。
+    pub fn max_iterations(&self) -> usize {
+        self.profile.max_iterations
     }
 
     /// 综合前缀和 skill 描述，返回完整的 system prompt。

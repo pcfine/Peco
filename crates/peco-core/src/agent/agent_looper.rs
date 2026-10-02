@@ -191,7 +191,7 @@ pub struct LooperConfig {
     /// 触发原因 `RetryCause`：截断（抬输出预算重发）与瞬时故障
     /// （限流/网络/5xx/流被掐断，退避后原样重发），共用单计数。
     ///
-    /// 每次重发消耗一次 `react_loop_iteration`（即 `max_turns` 预算），
+    /// 每次重发消耗一次 `react_loop_iteration`（即 `max_iterations` 预算），
     /// 与本上限双重有界 ⇒ 无死循环。默认 3。
     /// env `PECO_RETRY_LIMIT` 可覆盖（[`Self::from_env`]）。
     pub retry_limit: u32,
@@ -213,7 +213,7 @@ pub struct LooperConfig {
     /// 重发的退避延迟上限（毫秒）。默认 5000。
     /// env `PECO_RETRY_MAX_DELAY_MS` 可覆盖。
     pub retry_max_delay_ms: u64,
-    /// 撞上 `max_turns` 上限时的收尾报告合成器。
+    /// 撞上 `max_iterations` 上限时的收尾报告合成器。
     ///
     /// `Some` 时，冻结前额外调一次**不带工具**的元任务模型（见
     /// [`super::compaction::TurnSummarizer::summarize_inflight`]），产出「完成了
@@ -221,7 +221,7 @@ pub struct LooperConfig {
     /// 保持既有的固定中断说明。合成失败/超时**非致命**，回退到固定说明 —— 收尾
     /// 只决定「多不多一条 assistant 消息」，绝不改变 `TurnOutcome` / 落盘门控。
     ///
-    /// 只对 `MaxTurnsExceeded` 生效（`Cancelled` / 瞬时类失败不合成）。
+    /// 只对 `MaxIterationsExceeded` 生效（`Cancelled` / 瞬时类失败不合成）。
     /// 默认为 `None`（关闭）。
     pub epilogue: Option<Arc<dyn super::compaction::TurnSummarizer>>,
 }
@@ -366,8 +366,8 @@ fn block_kinds_of(blocks: &[ContentBlock]) -> Vec<&'static str> {
 pub enum TurnFailureReason {
     /// 外部取消
     Cancelled,
-    /// 超出最大轮数
-    MaxTurnsExceeded,
+    /// 超出最大迭代次数
+    MaxIterationsExceeded,
     /// Hook 中止（含原因描述）
     HookAbort(String),
     /// 触发限流，已进行 `attempts` 次尝试（含首次）后放弃。
@@ -935,7 +935,7 @@ impl Clone for LooperHandle {
 pub struct AgentLooper {
     // ── 静态配置 ──
     agent: Arc<Agent>,
-    max_turns: usize,
+    max_iterations: usize,
     config: LooperConfig,
     /// 稳定前缀：`agent.system_prompt()` + `config.environment`，
     /// 构造时计算一次并缓存，避免每次 turn 重新拼接。
@@ -955,7 +955,7 @@ pub struct AgentLooper {
     /// 不是幂等的。以本标记取代「复用它」的隐式约定。
     ///
     /// 与 `react_loop_iteration` **同生命周期**（单个用户轮），由
-    /// [`Self::reset_turn_counters`] 清除。
+    /// [`Self::reset_iteration_counters`] 清除。
     dynamic_context_resolved: bool,
 
     // ── 会话 ──
@@ -971,13 +971,13 @@ pub struct AgentLooper {
     /// 本轮失败原因；`None` 表示尚未失败 / 正常完成
     failure_reason: Option<TurnFailureReason>,
 
-    // ── 重命名的 turn 概念 ──
+    // ── ReAct 迭代计数（非对话轮次）──
     /// ReAct 循环迭代计数：当前对话轮次中已发出的模型调用次数。
     ///
     /// 与 Session 的 `turn_index`（对话轮次）不同，此计数器在每次用户输入
     /// 开始新对话轮次时重置为 0，每次回到 `PreparingRequest` 时递增。
-    /// 用于 `max_turns` 限制——限制的是单次对话轮次内得到最终结果
-    /// 所需的模型调用轮数，而非对话轮数。
+    /// 用于 `max_iterations` 限制——限制的是单次对话轮次内得到最终结果
+    /// 所需的模型调用次数，而非对话轮数。
     react_loop_iteration: usize,
 
     // ── 暂停状态恢复 ──
@@ -1028,13 +1028,13 @@ pub struct AgentLooper {
     /// 本用户轮内已用掉的重发次数（全部 [`RetryCause`] 合计，单计数单上限）。
     ///
     /// 与 `react_loop_iteration` **同生命周期**（单个用户轮），因此凡是要重置
-    /// 前者的地方都必须重置后者 —— 见 [`Self::reset_turn_counters`]。
+    /// 前者的地方都必须重置后者 —— 见 [`Self::reset_iteration_counters`]。
     retries_used: usize,
     /// 本轮是否抬过输出预算（粘性布尔，只由截断重发置位）。
     ///
     /// 必须是独立布尔而非 `retries_used > 0`：瞬时重发递增同一个计数，
     /// 但绝不能抬预算（抬了可能超出模型真实上限 → 400，且改变了原样重发
-    /// 的语义）。随 `reset_turn_counters` 清零，粘性不出轮 —— 本轮抬过一次
+    /// 的语义）。随 `reset_iteration_counters` 清零，粘性不出轮 —— 本轮抬过一次
     /// 后，后续 ReAct 迭代继续用抬高的预算，否则 tool 调用之后的下一次
     /// 迭代可能以同样的方式再截断一次。
     budget_raised: bool,
@@ -1070,14 +1070,14 @@ impl AgentLooper {
         config: LooperConfig,
         persister: Arc<dyn crate::persistence::SessionPersister>,
     ) -> Self {
-        let max_turns = agent.max_turns();
+        let max_iterations = agent.max_iterations();
         // 在 config 被 move 进结构体之前求值稳定前缀
         let stable_prefix =
             compose_stable_prefix(&agent.system_prompt(), config.environment.as_deref());
 
         AgentLooper {
             agent,
-            max_turns,
+            max_iterations,
             config,
             stable_prefix,
             dynamic_context: None,
@@ -1211,7 +1211,7 @@ impl AgentLooper {
             debug!(
                 agent = %self.agent.config().agent.name,
                 session_id = %self.session.id(),
-                turn = turn_index,
+                turn_index,
                 from = ?from,
                 to = ?to,
                 "ReAct state changed"
@@ -1246,11 +1246,11 @@ impl AgentLooper {
 
     async fn invoke_on_before_request(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         messages: &mut Vec<Arc<InputItem>>,
     ) -> HookAction {
         for hook in hooks {
-            match hook.on_before_request(turn, messages).await {
+            match hook.on_before_request(turn_index, messages).await {
                 HookAction::Continue => continue,
                 other => return other,
             }
@@ -1260,11 +1260,11 @@ impl AgentLooper {
 
     async fn invoke_on_after_response(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         response: &GenerateResult,
     ) -> HookAction {
         for hook in hooks {
-            match hook.on_after_response(turn, response).await {
+            match hook.on_after_response(turn_index, response).await {
                 HookAction::Continue => continue,
                 other => return other,
             }
@@ -1274,12 +1274,12 @@ impl AgentLooper {
 
     async fn invoke_on_text_delta(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         delta: &str,
         accumulated: &str,
     ) -> HookAction {
         for hook in hooks {
-            match hook.on_text_delta(turn, delta, accumulated).await {
+            match hook.on_text_delta(turn_index, delta, accumulated).await {
                 HookAction::Continue => continue,
                 other => return other,
             }
@@ -1289,11 +1289,11 @@ impl AgentLooper {
 
     async fn invoke_on_before_tool(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         tool_call: &ToolCall,
     ) -> ToolHookAction {
         for hook in hooks {
-            match hook.on_before_tool(turn, tool_call).await {
+            match hook.on_before_tool(turn_index, tool_call).await {
                 ToolHookAction::Continue => continue,
                 other => return other,
             }
@@ -1303,25 +1303,27 @@ impl AgentLooper {
 
     async fn invoke_on_after_tool(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         tool_call: &ToolCall,
         result: &str,
         is_error: bool,
     ) {
         for hook in hooks {
-            hook.on_after_tool(turn, tool_call, result, is_error).await;
+            hook.on_after_tool(turn_index, tool_call, result, is_error)
+                .await;
         }
     }
 
     async fn invoke_on_turn_complete(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         failure: Option<&TurnFailureReason>,
         usage: &Usage,
         session: &Session,
     ) {
         for hook in hooks {
-            hook.on_turn_complete(turn, failure, usage, session).await;
+            hook.on_turn_complete(turn_index, failure, usage, session)
+                .await;
         }
     }
 
@@ -1337,7 +1339,7 @@ impl AgentLooper {
     /// 对照请求前的估算 token 与 API 返回的实际 input_tokens。
     ///
     /// 只在 debug 级别记录 — 数据用于长期观测估算器偏差，非运行时告警。
-    fn log_estimate_calibration(&mut self, turn: usize, actual_input_tokens: u32) {
+    fn log_estimate_calibration(&mut self, turn_index: usize, actual_input_tokens: u32) {
         if let Some(estimated) = self.last_request_estimated_tokens.take() {
             let ratio = if actual_input_tokens > 0 {
                 estimated as f64 / actual_input_tokens as f64
@@ -1345,7 +1347,7 @@ impl AgentLooper {
                 0.0
             };
             debug!(
-                turn,
+                turn_index,
                 estimated,
                 actual = actual_input_tokens,
                 ratio = format!("{ratio:.2}"),
@@ -1356,12 +1358,12 @@ impl AgentLooper {
 
     async fn invoke_on_react_state_change(
         hooks: &[Arc<dyn LooperHook>],
-        turn: usize,
+        turn_index: usize,
         from: ReActState,
         to: ReActState,
     ) {
         for hook in hooks {
-            hook.on_react_state_change(turn, from, to).await;
+            hook.on_react_state_change(turn_index, from, to).await;
         }
     }
 
@@ -1442,7 +1444,7 @@ impl AgentLooper {
         info!(
             agent = %self.agent.config().agent.name,
             session_id = %self.session.id(),
-            max_turns = self.max_turns,
+            max_iterations = self.max_iterations,
             "AgentLooper::run() started"
         );
 
@@ -1677,7 +1679,7 @@ impl AgentLooper {
             ReActState::Streaming => self.active_stream = None,
             ReActState::ExecutingTools => self.abort_inflight_tools(),
             // 其余状态无在途资源（PreparingRequest 的 retry_deadline 由
-            // reset_turn_counters 清）。
+            // reset_iteration_counters 清）。
             _ => {}
         }
 
@@ -1691,7 +1693,7 @@ impl AgentLooper {
         } else {
             TurnFailureReason::Cancelled
         };
-        // 取消路径不合成收尾：收尾器只服务 `max_turns`（见
+        // 取消路径不合成收尾：收尾器只服务 `max_iterations`（见
         // `compose_epilogue_if_needed`），且此刻用户已经在等停。
         self.apply_failure(reason.clone(), /* force_persist */ true, None)
             .await;
@@ -1720,7 +1722,7 @@ impl AgentLooper {
     /// 失败收尾。续接交给 `run()` 的 ③ —— 收尾的契约是「把状态搬到可推进的位置」，
     /// 不回报布尔让调用方决定续接。
     ///
-    /// 撞上 `max_turns` 时在冻结**之前**补一次收尾报告合成（见
+    /// 撞上 `max_iterations` 时在冻结**之前**补一次收尾报告合成（见
     /// [`Self::compose_epilogue_if_needed`]）—— 唯一的 `.await` 落点：`plan_failure`
     /// 是同步自由函数，而收尾文本必须赶在它之前备好。
     async fn finalize_failure(&mut self) {
@@ -1733,16 +1735,16 @@ impl AgentLooper {
             .await;
     }
 
-    /// 撞上 `max_turns` 时合成收尾报告，其余失败原因一律返回 `None`。
+    /// 撞上 `max_iterations` 时合成收尾报告，其余失败原因一律返回 `None`。
     ///
     /// 三个前置守卫（任一不满足即不合成，行为与不装收尾器时逐字节一致）：
-    /// 原因必须是 `MaxTurnsExceeded`（`Cancelled` / 瞬时故障没有「还没做完」可言）、
+    /// 原因必须是 `MaxIterationsExceeded`（`Cancelled` / 瞬时故障没有「还没做完」可言）、
     /// 必须装配了收尾器、必须确有在途轮（与 `plan_failure` ① 同判据）。
     ///
     /// 结果只影响「多不多一条 assistant 消息」。失败、空产出、超时、被取消
     /// 都退回 `None`，由 [`Session::interrupt_turn`] 走原有的固定中断说明。
     async fn compose_epilogue_if_needed(&mut self, reason: &TurnFailureReason) -> Option<String> {
-        if !matches!(reason, TurnFailureReason::MaxTurnsExceeded) {
+        if !matches!(reason, TurnFailureReason::MaxIterationsExceeded) {
             return None;
         }
         let summarizer = self.config.epilogue.clone()?;
@@ -1884,7 +1886,7 @@ impl AgentLooper {
         }
 
         // ★ 新对话轮次：重置 ReAct 循环计数
-        self.reset_turn_counters();
+        self.reset_iteration_counters();
         self.failure_reason = None;
         self.pending_armed = false;
 
@@ -1934,26 +1936,26 @@ impl AgentLooper {
     async fn react_step(&mut self) {
         let old_react_state = self.react_state;
         // ★ Session 零锁：turn_index() 是字段访问，无需缓存
-        let turn = self.session.turn_index();
+        let turn_index = self.session.turn_index();
 
         match self.react_state {
             ReActState::PreparingRequest => {
-                self.prepare_and_send_request(turn).await;
+                self.prepare_and_send_request(turn_index).await;
             }
 
             // ── batch 分支 ──
             ReActState::ResolvingResponse => {
-                self.consume_batch_response(turn).await;
+                self.consume_batch_response(turn_index).await;
             }
 
             // ── streaming 分支 ──
             ReActState::Streaming => {
-                self.consume_stream_chunk(turn).await;
+                self.consume_stream_chunk(turn_index).await;
             }
 
             // ── 共享后续状态 ──
             ReActState::ExecutingTools => {
-                self.execute_tools_step(turn).await;
+                self.execute_tools_step(turn_index).await;
             }
 
             ReActState::Done => {
@@ -1982,7 +1984,7 @@ impl AgentLooper {
                 Self::emit_event_guaranteed(
                     &self.event_speaker,
                     LooperEvent::TurnComplete {
-                        turn_index: turn,
+                        turn_index,
                         outcome: outcome.clone(),
                         usage: usage.clone(),
                     },
@@ -1990,7 +1992,7 @@ impl AgentLooper {
                 .await;
                 Self::invoke_on_turn_complete(
                     &self.config.hooks,
-                    turn,
+                    turn_index,
                     outcome.failure_reason(),
                     &usage,
                     &self.session,
@@ -2080,10 +2082,10 @@ impl AgentLooper {
 
         // Emit ReactStateChange event + hook（if state changed）
         if old_react_state != self.react_state {
-            self.emit_react_state_change(old_react_state, self.react_state, turn);
+            self.emit_react_state_change(old_react_state, self.react_state, turn_index);
             Self::invoke_on_react_state_change(
                 &self.config.hooks,
-                turn,
+                turn_index,
                 old_react_state,
                 self.react_state,
             )
@@ -2100,7 +2102,7 @@ impl AgentLooper {
     /// 一个用户轮 —— 抽成方法就是为了让这条不变量无法被单独违反。
     /// `budget_raised` 尤其不能跨轮：粘性一旦泄漏，下一轮的截断重试会
     /// 被第 4 条判据误拦（生效预算看似已抬过）。
-    fn reset_turn_counters(&mut self) {
+    fn reset_iteration_counters(&mut self) {
         self.react_loop_iteration = 0;
         self.retries_used = 0;
         self.budget_raised = false;
@@ -2122,10 +2124,10 @@ impl AgentLooper {
     ///    全部原因共用单计数，先查 limit 再查 headroom：headroom 判据
     ///    只会拒绝、不能放行。
     /// 2. 用户按了停止 —— 不再发起新的模型调用。
-    /// 3. 轮数预算：重发要重新走 `prepare_and_send_request`，会消耗一次
+    /// 3. 迭代预算：重发要重新走 `prepare_and_send_request`，会消耗一次
     ///    `react_loop_iteration`。没有下一次调用额度时不重发 —— 否则状态机
-    ///    刚被置回 `PreparingRequest` 就撞上 `MaxTurnsExceeded`，把「截断」
-    ///    或「限流」这个真实原因换成「超出轮数」，诊断信息反而变差。
+    ///    刚被置回 `PreparingRequest` 就撞上 `MaxIterationsExceeded`，把「截断」
+    ///    或「限流」这个真实原因换成「超出迭代次数」，诊断信息反而变差。
     /// 4. **仅截断**需要抬得动预算：抬不动（当前生效预算已 ≥
     ///    `retry_output_budget`）⇒ 重发与上一次逐字节相同，必然同样截断，
     ///    白烧一次调用。比的是**当前生效**预算而非配置值 —— 抬过一次后
@@ -2141,7 +2143,7 @@ impl AgentLooper {
         if self.is_cancelled() {
             return false;
         }
-        if self.react_loop_iteration >= self.max_turns {
+        if self.react_loop_iteration >= self.max_iterations {
             return false;
         }
         if matches!(cause, RetryCause::Truncated { .. })
@@ -2166,7 +2168,7 @@ impl AgentLooper {
     ///
     /// **粘性**：本轮发生过截断重试（`budget_raised` 置位）后，后续 ReAct
     /// 迭代继续用抬高的预算。否则 tool 调用之后的下一次迭代可能以同样的
-    /// 方式再截断一次，把刚省下的那次调用又浪费掉。随 [`Self::reset_turn_counters`]
+    /// 方式再截断一次，把刚省下的那次调用又浪费掉。随 [`Self::reset_iteration_counters`]
     /// 归零，粘性不出轮。瞬时重发不置位本标志 —— 它原样重发，抬预算可能
     /// 超出模型真实上限（网关 400）。
     fn max_output_tokens_override(&self) -> Option<u32> {
@@ -2189,10 +2191,10 @@ impl AgentLooper {
     /// 「这次模型调用从未发生」—— 回退后 staging 的结尾与发请求前逐字节
     /// 相同，而那个状态本身是合法的（它来自上一次成功步骤）。
     ///
-    /// # 为什么不会死循环、为什么不吞掉轮数预算
+    /// # 为什么不会死循环、为什么不吞掉迭代预算
     /// 重发要重新走 `prepare_and_send_request`，因此**消耗一次
     /// `react_loop_iteration`**：重发是一次真实的模型调用，不占额度会让
-    /// `max_turns` 失去意义。次数另受 [`LooperConfig::retry_limit`] 约束，
+    /// `max_iterations` 失去意义。次数另受 [`LooperConfig::retry_limit`] 约束，
     /// 两个上限都有界 ⇒ 不可能死循环。
     ///
     /// # 不设 `failure_reason`
@@ -2226,7 +2228,12 @@ impl AgentLooper {
     /// 用 `emit_event_guaranteed` 而非 `try_send`：丢一条通知 = 画面上多出
     /// 一段无法解释的残句、本特性整个没发生（同
     /// [`LooperEvent::ContextCompacted`] 的处置）。
-    async fn begin_retry(&mut self, cause: RetryCause, turn: usize, checkpoint: usize) -> bool {
+    async fn begin_retry(
+        &mut self,
+        cause: RetryCause,
+        turn_index: usize,
+        checkpoint: usize,
+    ) -> bool {
         if !self.can_retry(&cause) {
             return false;
         }
@@ -2256,7 +2263,7 @@ impl AgentLooper {
             RetryCause::Truncated { .. } => "max_tokens",
         };
         warn!(
-            turn,
+            turn_index,
             cause = ?cause,
             trigger,
             dropped_staging_messages = dropped,
@@ -2277,7 +2284,7 @@ impl AgentLooper {
             Self::emit_event_guaranteed(
                 &self.event_speaker,
                 LooperEvent::TruncationRetry {
-                    turn_index: turn,
+                    turn_index,
                     attempt: self.retries_used as u32,
                     limit: self.config.retry_limit,
                     output_tokens: cause.retry_notice_output_tokens(),
@@ -2303,7 +2310,7 @@ impl AgentLooper {
     async fn fail_or_retry(
         &mut self,
         e: &model_provider::ProviderError,
-        turn: usize,
+        turn_index: usize,
         checkpoint: usize,
     ) -> bool {
         let classified = e.classify();
@@ -2313,7 +2320,7 @@ impl AgentLooper {
                     RetryCause::Transient {
                         trigger: classified.kind.as_str(),
                     },
-                    turn,
+                    turn_index,
                     checkpoint,
                 )
                 .await
@@ -2354,7 +2361,7 @@ impl AgentLooper {
 
     /// 退避等待：等到 `retry_deadline`（若有），每 ~200ms 切片查一次取消标志，被
     /// 打断立刻返回 `false`；无 deadline 时 no-op。过期 deadline 循环条件天然为
-    /// 假，无需在此清除（由 [`Self::begin_retry`] 覆写、`reset_turn_counters` 清零）。
+    /// 假，无需在此清除（由 [`Self::begin_retry`] 覆写、`reset_iteration_counters` 清零）。
     ///
     /// 打断只可能来自 handle 被 drop 的安全网 —— 消息路径的取消在步内不可见
     /// （Cancel 要先被 drain 消费才置位标志，步内没有 drain）。故 `false` 不是
@@ -2380,16 +2387,16 @@ impl AgentLooper {
     // ── PreparingRequest — 分叉点 ────────────────────────────────────────
 
     /// 准备请求并分叉到 batch 或 streaming 路径。
-    async fn prepare_and_send_request(&mut self, turn: usize) {
+    async fn prepare_and_send_request(&mut self, turn_index: usize) {
         // 0. 瞬时重发的退避等待（无 deadline 时 no-op）。被打断 = handle 已
         //    drop，发出去也没人接 —— 直接返回，收尾交给循环顶。
         if !self.wait_retry_backoff().await {
             return;
         }
 
-        // 1. 检查 max_turns 限制（限制当前对话轮次内的模型调用次数）
-        if self.react_loop_iteration >= self.max_turns {
-            self.failure_reason = Some(TurnFailureReason::MaxTurnsExceeded);
+        // 1. 检查 max_iterations 限制（限制当前对话轮次内的模型调用次数）
+        if self.react_loop_iteration >= self.max_iterations {
+            self.failure_reason = Some(TurnFailureReason::MaxIterationsExceeded);
             self.react_state = ReActState::Failed;
             return;
         }
@@ -2469,7 +2476,8 @@ impl AgentLooper {
 
         // ★ Hook: on_before_request — 可修改消息或中止（在 filter 之后，看到最终消息列表）
         if let HookAction::Abort(reason) =
-            Self::invoke_on_before_request(&self.config.hooks, turn, &mut session_messages).await
+            Self::invoke_on_before_request(&self.config.hooks, turn_index, &mut session_messages)
+                .await
         {
             self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
             self.react_state = ReActState::Failed;
@@ -2487,7 +2495,10 @@ impl AgentLooper {
                 .map(|m| estimate_item_tokens(m))
                 .sum::<usize>();
         self.last_request_estimated_tokens = Some(estimated_request_tokens);
-        debug!(turn, estimated_request_tokens, "Request token estimate");
+        debug!(
+            turn_index,
+            estimated_request_tokens, "Request token estimate"
+        );
 
         if use_stream {
             // ── Streaming 路径 ──
@@ -2510,7 +2521,7 @@ impl AgentLooper {
                     // 此处 staging 未被本次尝试写入（阶段不变量），锚点即当前长度。
                     if let AgentError::Provider(pe) = &e {
                         if self
-                            .fail_or_retry(pe, turn, self.session.staging_checkpoint())
+                            .fail_or_retry(pe, turn_index, self.session.staging_checkpoint())
                             .await
                         {
                             return;
@@ -2541,7 +2552,7 @@ impl AgentLooper {
                     // 同流式路径：瞬时类退避重发，永久类类型化失败。
                     if let AgentError::Provider(pe) = &e {
                         if self
-                            .fail_or_retry(pe, turn, self.session.staging_checkpoint())
+                            .fail_or_retry(pe, turn_index, self.session.staging_checkpoint())
                             .await
                         {
                             return;
@@ -2560,7 +2571,7 @@ impl AgentLooper {
     // ── Batch 分支：ResolvingResponse ─────────────────────────────────────
 
     /// 解析 batch 响应：提取内容、更新 usage、写入 staging、判断下一步。
-    async fn consume_batch_response(&mut self, turn: usize) {
+    async fn consume_batch_response(&mut self, turn_index: usize) {
         // ★ 截断重试的回退锚点。必须在 `stage_output_blocks` **之前**取 ——
         //   之后 staging 就带上本次调用的产出了。此刻的值恒等于发请求前的长度：
         //   从 `PreparingRequest` 到这里没有任何 staging 写入。
@@ -2577,7 +2588,7 @@ impl AgentLooper {
 
         // ★ Hook: on_after_response
         if let HookAction::Abort(reason) =
-            Self::invoke_on_after_response(&self.config.hooks, turn, &response).await
+            Self::invoke_on_after_response(&self.config.hooks, turn_index, &response).await
         {
             self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
             self.react_state = ReActState::Failed;
@@ -2586,11 +2597,11 @@ impl AgentLooper {
 
         // 聚合 usage
         self.session.add_usage(response.usage.clone());
-        self.log_estimate_calibration(turn, response.usage.input_tokens);
+        self.log_estimate_calibration(turn_index, response.usage.input_tokens);
 
         // 广播 usage 事件
         self.emit_event(LooperEvent::ModelUsage {
-            call_index: turn,
+            call_index: self.react_loop_iteration,
             usage: response.usage.clone(),
         });
 
@@ -2613,7 +2624,7 @@ impl AgentLooper {
                         RetryCause::Truncated {
                             output_tokens: response.usage.output_tokens,
                         },
-                        turn,
+                        turn_index,
                         checkpoint,
                     )
                     .await
@@ -2631,7 +2642,7 @@ impl AgentLooper {
                     _ => "model response failed".to_string(),
                 });
             error!(
-                turn,
+                turn_index,
                 status = ?response.status,
                 finish_reason = response.finish_reason.map_or("-", |r| r.as_str()),
                 message = %msg,
@@ -2690,7 +2701,7 @@ impl AgentLooper {
     /// 消费一个 stream chunk，处理后在同一个状态内循环直到流结束。
     ///
     /// 每收到一个 chunk 就返回（让 `run()` 循环顶有机会排空控制消息）。
-    async fn consume_stream_chunk(&mut self, turn: usize) {
+    async fn consume_stream_chunk(&mut self, turn_index: usize) {
         let stream = match &mut self.active_stream {
             Some(s) => s,
             None => {
@@ -2720,7 +2731,7 @@ impl AgentLooper {
                         // ★ Hook: on_text_delta — 可中止流式响应
                         if let HookAction::Abort(reason) = Self::invoke_on_text_delta(
                             &self.config.hooks,
-                            turn,
+                            turn_index,
                             &delta,
                             &self.react_ctx.assistant_text,
                         )
@@ -2770,10 +2781,10 @@ impl AgentLooper {
 
                     StreamChunk::Usage { usage } => {
                         self.emit_event(LooperEvent::ModelUsage {
-                            call_index: turn,
+                            call_index: self.react_loop_iteration,
                             usage: usage.clone(),
                         });
-                        self.log_estimate_calibration(turn, usage.input_tokens);
+                        self.log_estimate_calibration(turn_index, usage.input_tokens);
                         self.session.add_usage(usage);
                     }
 
@@ -2792,7 +2803,7 @@ impl AgentLooper {
                 // 瞬时类回退 staging 后退避重发（chunk 不碰 staging，锚点即当前长度；
                 // react_ctx 里的增量随回退被丢弃）；永久类类型化失败。
                 if self
-                    .fail_or_retry(&e, turn, self.session.staging_checkpoint())
+                    .fail_or_retry(&e, turn_index, self.session.staging_checkpoint())
                     .await
                 {
                     return;
@@ -2805,7 +2816,7 @@ impl AgentLooper {
                 // 这里没有 Finish 可依，收敛结果完全取决于块是否闭合，属于异常路径，
                 // 必须留下痕迹：否则「流被上游掐断」与「正常结束」在日志里长得一样。
                 debug!(
-                    turn,
+                    turn_index,
                     "Model stream ended without a Finish chunk; converging on assembler state"
                 );
                 self.finish_stream().await;
@@ -2884,7 +2895,7 @@ impl AgentLooper {
             // output_tokens 用来判断截断是否真的顶到了输出上限；
             // block_kinds 说明收到的到底是哪些块。
             error!(
-                turn = self.session.turn_index(),
+                turn_index = self.session.turn_index(),
                 ?status,
                 finish_reason = finish_reason.map_or("-", |r| r.as_str()),
                 message = %msg,
@@ -3008,7 +3019,7 @@ impl AgentLooper {
     /// drain 消费消息时置位，步内无 drain）。
     ///
     /// 支持断点续执行：`result: Some(...)` 的已完成项自动跳过。
-    async fn execute_tools_step(&mut self, turn: usize) {
+    async fn execute_tools_step(&mut self, turn_index: usize) {
         // ── Spawn 阶段：active_tool_tasks 为 None ───────────────────────
         if self.active_tool_tasks.is_none() {
             let executor = self.agent.mcp_manager().tools_executor().clone();
@@ -3042,7 +3053,7 @@ impl AgentLooper {
                     arguments: call.function.arguments.clone(),
                 });
 
-                match Self::invoke_on_before_tool(&self.config.hooks, turn, &call).await {
+                match Self::invoke_on_before_tool(&self.config.hooks, turn_index, &call).await {
                     ToolHookAction::Continue => {
                         to_spawn.push(idx);
                     }
@@ -3148,7 +3159,7 @@ impl AgentLooper {
 
                 Self::invoke_on_after_tool(
                     &self.config.hooks,
-                    turn,
+                    turn_index,
                     &tool_result.call,
                     &tool_result.result.text_view(),
                     tool_result.is_error,
@@ -3180,7 +3191,7 @@ impl AgentLooper {
 
                             Self::invoke_on_after_tool(
                                 &self.config.hooks,
-                                turn,
+                                turn_index,
                                 &tr.call,
                                 &tr.result.text_view(),
                                 tr.is_error,
@@ -3302,7 +3313,7 @@ impl AgentLooper {
     /// 契约是「把状态搬到可推进的位置」，不回报布尔让调用方决定续接 —— 续接交给
     /// `run()` 的 ③ 单一入口。
     ///
-    /// `epilogue` 是已合成好的收尾报告（仅 `max_turns` 路径可能为 `Some`），
+    /// `epilogue` 是已合成好的收尾报告（仅 `max_iterations` 路径可能为 `Some`），
     /// 透传给 `plan_failure` 后在冻结时取代固定中断说明；`None` 时行为不变。
     async fn apply_failure(
         &mut self,
@@ -3342,15 +3353,15 @@ impl AgentLooper {
     /// 消费 [`FinalizePlan`] 的异步段：事件 → hook → 落盘 → 回写原因。冻结 + 快照
     /// 已在 [`plan_failure`] 内同步完成，此处只做 I/O 与编排。
     async fn commit_failure_plan(&mut self, plan: FinalizePlan) {
-        // `iteration` / `max_turns` 取自此处的 `self` 而非 `plan`：两者是「本用户轮的
+        // `iteration` / `max_iterations` 取自此处的 `self` 而非 `plan`：两者是「本用户轮的
         // ReAct 深度」与「该轮预算」，`plan` 只承载 Session 侧的产物。计数在
-        // `reset_turn_counters`（下一轮启动）才清零，收尾时仍是本轮的终值 ——
-        // `MaxTurnsExceeded` 下二者必然相等，其余失败原因则回答「预算用掉多少才挂的」。
+        // `reset_iteration_counters`（下一轮启动）才清零，收尾时仍是本轮的终值 ——
+        // `MaxIterationsExceeded` 下二者必然相等，其余失败原因则回答「预算用掉多少才挂的」。
         warn!(
-            turn = plan.turn,
+            turn_index = plan.turn_index,
             reason = ?plan.reason,
             iteration = self.react_loop_iteration,
-            max_turns = self.max_turns,
+            max_iterations = self.max_iterations,
             frozen_staging_messages = plan.frozen_staging_messages,
             partial_text_len = plan.partial_text_len,
             "Turn interrupted; staging frozen into committed history"
@@ -3376,7 +3387,7 @@ impl AgentLooper {
         Self::emit_event_guaranteed(
             &self.event_speaker,
             LooperEvent::TurnComplete {
-                turn_index: plan.turn,
+                turn_index: plan.turn_index,
                 outcome: plan.outcome.clone(),
                 usage: usage.clone(),
             },
@@ -3384,7 +3395,7 @@ impl AgentLooper {
         .await;
         Self::invoke_on_turn_complete(
             &self.config.hooks,
-            plan.turn,
+            plan.turn_index,
             plan.outcome.failure_reason(),
             &usage,
             &self.session,
@@ -3424,7 +3435,7 @@ impl AgentLooper {
 struct FinalizePlan {
     /// 冻结前的 turn 编号。必须在 `interrupt_turn` **之前**取 ——
     /// 之后取则 `TurnComplete` 报的编号比 committed 轮数大 1，前端与历史对不上。
-    turn: usize,
+    turn_index: usize,
     outcome: TurnOutcome,
     /// 供 `Shutdown` 回写。
     reason: TurnFailureReason,
@@ -3436,7 +3447,7 @@ struct FinalizePlan {
     snapshot: Option<SessionSnapshot>,
     /// 冻结前 staging 中的消息数（合成 Output 与中断说明尚未追加）。
     frozen_staging_messages: usize,
-    /// 已合成好的收尾报告（仅 `max_turns` 路径可能为 `Some`）。
+    /// 已合成好的收尾报告（仅 `max_iterations` 路径可能为 `Some`）。
     ///
     /// 冻结时已写进本轮历史，此字段只剩一个用途：让 `commit_failure_plan`
     /// 把它作为 `TextDelta` 补发给客户端。
@@ -3467,7 +3478,7 @@ fn stage_tool_results(session: &mut Session, pending: &[PendingToolCall]) {
 fn failure_label(reason: &TurnFailureReason) -> String {
     match reason {
         TurnFailureReason::Cancelled => "cancelled by user".to_string(),
-        TurnFailureReason::MaxTurnsExceeded => "max turns exceeded".to_string(),
+        TurnFailureReason::MaxIterationsExceeded => "max iterations exceeded".to_string(),
         TurnFailureReason::HookAbort(detail) => format!("aborted by hook: {detail}"),
         TurnFailureReason::RateLimited { attempts, message } => {
             format!(
@@ -3515,7 +3526,7 @@ fn label_msg(message: &str) -> String {
 /// `ClassifiedError.message` 原样带进变体 — 分类不吞原文，SSE error 文案
 /// 与 session 中断标签都靠它保留 provider 诊断信息。
 ///
-/// `AgentError` 的非 Provider 变体（Io/Config/MaxTurns…）不走本函数，
+/// `AgentError` 的非 Provider 变体（Io/Config/MaxIterations…）不走本函数，
 /// 由各自调用点直接构造原因。
 fn model_failure_reason(
     classified: model_provider::ClassifiedError,
@@ -3575,7 +3586,7 @@ fn plan_failure(
     }
 
     // ② 取标量 —— 必须在所有变更之前
-    let turn = session.turn_index(); // interrupt_turn 后会 +1
+    let turn_index = session.turn_index(); // interrupt_turn 后会 +1
     let partial_text = std::mem::take(&mut ctx.assistant_text);
     let partial_text_len = partial_text.len();
 
@@ -3632,7 +3643,7 @@ fn plan_failure(
     ctx.batch_response = None;
 
     Some(FinalizePlan {
-        turn,
+        turn_index,
         outcome: TurnOutcome::Failed {
             reason: reason.clone(),
             partial_text,
@@ -3818,7 +3829,7 @@ mod tests {
         .expect("in-flight turn must produce a plan");
 
         // turn 必须等于冻结**前**的 index（interrupt_turn 后会 +1）
-        assert_eq!(plan.turn, turn_before);
+        assert_eq!(plan.turn_index, turn_before);
         assert_eq!(session.turn_index(), turn_before + 1);
         assert_eq!(session.committed_turns().len(), 1);
         assert!(plan.snapshot.is_some(), "persist=true 必须产出快照");
@@ -3908,7 +3919,7 @@ mod tests {
         )
         .expect("Active with only user_input still has a turn to close");
 
-        assert_eq!(plan.turn, 0);
+        assert_eq!(plan.turn_index, 0);
         assert_eq!(session.committed_turns().len(), 1, "取消必须冻结而非丢弃");
         assert_eq!(session.turn_index(), 1);
         assert_eq!(session.state(), SessionState::Idle);
@@ -3942,13 +3953,13 @@ mod tests {
             &mut session,
             &mut ctx,
             true,
-            TurnFailureReason::MaxTurnsExceeded,
+            TurnFailureReason::MaxIterationsExceeded,
             false,
             None,
         )
         .expect("Active with only user_input still has a turn to close");
 
-        assert_eq!(plan.turn, 0);
+        assert_eq!(plan.turn_index, 0);
         assert!(session.committed_turns().is_empty(), "退化路径=rollback");
         assert_eq!(session.turn_index(), 0, "退化路径不自增");
         assert_eq!(session.state(), SessionState::Idle);
@@ -3993,7 +4004,7 @@ mod tests {
             &mut session,
             &mut ctx,
             false,
-            TurnFailureReason::MaxTurnsExceeded,
+            TurnFailureReason::MaxIterationsExceeded,
             false,
             None,
         )
@@ -4008,7 +4019,7 @@ mod tests {
     fn test_failure_label_covers_all_variants_without_debug_leak() {
         let variants = [
             TurnFailureReason::Cancelled,
-            TurnFailureReason::MaxTurnsExceeded,
+            TurnFailureReason::MaxIterationsExceeded,
             TurnFailureReason::HookAbort("hook says no".to_string()),
             TurnFailureReason::Other("boom".to_string()),
         ];
@@ -4231,17 +4242,17 @@ mod tests {
         }
     }
 
-    /// 撞上 `max_turns` 时合成收尾报告：成为本轮最后一条 assistant 消息，
+    /// 撞上 `max_iterations` 时合成收尾报告：成为本轮最后一条 assistant 消息，
     /// 且补发 `TextDelta` 让实时视图（不刷新页面）也能看到。
     #[tokio::test]
-    async fn test_max_turns_composes_epilogue_as_last_message() {
+    async fn test_max_iterations_composes_epilogue_as_last_message() {
         let mut h = failure_looper_harness_with_epilogue(
             false,
             true,
             false,
             Some(Arc::new(MockEpiloguer("## 本轮已完成\n- 查了三处"))),
         );
-        h.looper.failure_reason = Some(TurnFailureReason::MaxTurnsExceeded);
+        h.looper.failure_reason = Some(TurnFailureReason::MaxIterationsExceeded);
         h.looper.react_state = ReActState::Failed;
         h.looper.finalize_failure().await;
 
@@ -4264,7 +4275,7 @@ mod tests {
         // 失败语义不因收尾而变
         assert!(matches!(
             h.looper.failure_reason,
-            Some(TurnFailureReason::MaxTurnsExceeded)
+            Some(TurnFailureReason::MaxIterationsExceeded)
         ));
 
         let mut deltas = Vec::new();
@@ -4288,7 +4299,7 @@ mod tests {
             false,
             Some(Arc::new(FailingEpiloguer)),
         );
-        h.looper.failure_reason = Some(TurnFailureReason::MaxTurnsExceeded);
+        h.looper.failure_reason = Some(TurnFailureReason::MaxIterationsExceeded);
         h.looper.react_state = ReActState::Failed;
         h.looper.finalize_failure().await;
 
@@ -4302,13 +4313,13 @@ mod tests {
         assert_eq!(h.turn_completes(), 1, "失败轮照发一次 TurnComplete");
         assert!(matches!(
             h.looper.failure_reason,
-            Some(TurnFailureReason::MaxTurnsExceeded)
+            Some(TurnFailureReason::MaxIterationsExceeded)
         ));
     }
 
-    /// 只有 `MaxTurnsExceeded` 才合成收尾 —— 取消 / Hook 中止没有「还没做完」可言。
+    /// 只有 `MaxIterationsExceeded` 才合成收尾 —— 取消 / Hook 中止没有「还没做完」可言。
     #[tokio::test]
-    async fn test_epilogue_only_for_max_turns() {
+    async fn test_epilogue_only_for_max_iterations() {
         let mut h = failure_looper_harness_with_epilogue(
             false,
             true,
@@ -4324,7 +4335,7 @@ mod tests {
             !turn
                 .iter()
                 .any(|am| matches!(am.source, MessageSource::TurnEpilogue)),
-            "非 max_turns 失败不得合成收尾"
+            "非 max_iterations 失败不得合成收尾"
         );
         assert!(text_of(turn.last().unwrap()).contains("[interrupted]"));
     }
@@ -5246,7 +5257,7 @@ mod tests {
     #[tokio::test]
     async fn test_can_retry_truncation_no_headroom_is_false() {
         // 没有下一次模型调用额度时不重试：否则状态机刚被置回 PreparingRequest
-        // 就撞上 MaxTurnsExceeded，把「截断」这个真实原因换掉。
+        // 就撞上 MaxIterationsExceeded，把「截断」这个真实原因换掉。
         let mut h = retry_harness(
             vec![],
             LooperConfig {
@@ -5255,11 +5266,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        h.looper.react_loop_iteration = h.looper.max_turns;
+        h.looper.react_loop_iteration = h.looper.max_iterations;
         assert!(
             !h.looper
                 .can_retry(&RetryCause::Truncated { output_tokens: 1 }),
-            "无轮数余量必须不重试"
+            "无迭代余量必须不重试"
         );
     }
 
@@ -5281,7 +5292,7 @@ mod tests {
         assert_eq!(h.looper.max_output_tokens_override(), Some(32_768));
 
         // 计数器随新用户轮归零，粘性不出轮
-        h.looper.reset_turn_counters();
+        h.looper.reset_iteration_counters();
         assert_eq!(h.looper.max_output_tokens_override(), None);
     }
 
@@ -6095,7 +6106,7 @@ mod tests {
         }
         assert!(
             h.committed_turns() == 0 && h.looper.session().turn_index() == 0,
-            "无重试的普通失败照旧退化（不冻结、不补桩），实际 committed={}, turn={}",
+            "无重试的普通失败照旧退化（不冻结、不补桩），实际 committed={}, turn_index={}",
             h.committed_turns(),
             h.looper.session().turn_index()
         );

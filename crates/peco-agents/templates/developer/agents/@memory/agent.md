@@ -2,7 +2,7 @@
 agent:
   name: "@memory"
   description: "记忆管理 Agent — 在项目知识库中检索、存储、整理开发记忆"
-template_version: 4
+template_version: 5
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
@@ -23,7 +23,7 @@ tools:
 skills: []
 knowledge_bases:
   - "@project_docs"
-max_turns: 20
+max_iterations: 20
 ---
 
 # 角色定义

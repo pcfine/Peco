@@ -224,7 +224,7 @@ pub enum StepConfig {
         agent: String,
         prompt: String,
         #[serde(default)]
-        max_turns: Option<usize>,
+        max_iterations: Option<usize>,
     },
     /// 纯 LLM 推理，尚未实现
     Llm {
@@ -433,7 +433,7 @@ pub fn pre_validate_workflow_yaml(yaml: &str) -> Result<(), WorkflowError> {
                                  config:\n  \
                                    agent: \"<agent-name>\"     # required\n  \
                                    prompt: \"<instructions>\"  # required\n  \
-                                   max_turns: <number>        # optional\n\n\
+                                   max_iterations: <number>        # optional\n\n\
                                  Received:\n  {}",
                             missing.join("\n  - "),
                             serde_yaml::to_string(&config_map)

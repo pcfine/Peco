@@ -125,8 +125,8 @@ pub struct StructuredOutputExecutor {
     agent: Arc<Agent>,
     /// 验证失败时的最大重试次数（默认 3）
     max_retries: usize,
-    /// 每次尝试的最大 ReAct 轮数
-    max_turns: Option<usize>,
+    /// 每次尝试的最大 ReAct 迭代次数
+    max_iterations: Option<usize>,
     /// 每次尝试的超时时间
     timeout: Option<Duration>,
 }
@@ -137,7 +137,7 @@ impl StructuredOutputExecutor {
         Self {
             agent,
             max_retries: 3,
-            max_turns: None,
+            max_iterations: None,
             timeout: None,
         }
     }
@@ -148,9 +148,9 @@ impl StructuredOutputExecutor {
         self
     }
 
-    /// 设置每次尝试的最大 ReAct 轮数。
-    pub fn with_max_turns(mut self, max_turns: usize) -> Self {
-        self.max_turns = Some(max_turns);
+    /// 设置每次尝试的最大 ReAct 迭代次数。
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = Some(max_iterations);
         self
     }
 
@@ -187,7 +187,7 @@ impl StructuredOutputExecutor {
             self.agent.clone(),
             prompt,
             wrapper.clone(),
-            self.max_turns,
+            self.max_iterations,
         );
 
         let final_text = if let Some(timeout) = self.timeout {

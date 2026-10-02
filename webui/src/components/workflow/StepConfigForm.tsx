@@ -26,7 +26,7 @@ export interface StepFormData {
   command?: string;
   agentName?: string;
   prompt?: string;
-  maxTurns?: number;
+  maxIterations?: number;
   toolName?: string;
   toolArgs?: string;
   dependsOn: string[];
@@ -242,14 +242,14 @@ export function StepConfigForm({
                     </div>
                     {step.type === "agent" && (
                       <div className="space-y-1">
-                        <Label className="text-xs">最大轮次</Label>
+                        <Label className="text-xs">最大迭代次数</Label>
                         <Input
                           className="h-8 text-xs w-24"
                           type="number"
-                          value={step.maxTurns ?? ""}
+                          value={step.maxIterations ?? ""}
                           onChange={(e) =>
                             updateStep(idx, {
-                              maxTurns: e.target.value
+                              maxIterations: e.target.value
                                 ? Number(e.target.value)
                                 : undefined,
                             })
