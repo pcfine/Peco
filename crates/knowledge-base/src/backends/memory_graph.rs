@@ -282,6 +282,32 @@ impl GraphStore for MemoryGraphStore {
     async fn get_node(&self, node_id: &str) -> Result<Option<GraphNode>, KnowledgeError> {
         Ok(self.nodes.read().await.get(node_id).cloned())
     }
+
+    /// 遍历内存 map 取子图：先按 label 收节点集，再按节点集过滤边（子图闭合）。
+    ///
+    /// 与 HelixDB 实现的语义一致 —— 节点集**由节点侧**决定（不靠边反推），
+    /// 因此孤立点仍会出现在返回节点集内；两端有一端不在节点集内的边一律丢弃。
+    async fn list_subgraph(
+        &self,
+        label: &str,
+    ) -> Result<(Vec<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        let nodes_map = self.nodes.read().await;
+        let nodes: Vec<GraphNode> = nodes_map
+            .values()
+            .filter(|n| n.labels.iter().any(|l| l.as_str() == label))
+            .cloned()
+            .collect();
+        let kept: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+
+        let edges = self.edges.read().await;
+        let closed = edges
+            .iter()
+            .filter(|e| kept.contains(e.source_id.as_str()) && kept.contains(e.target_id.as_str()))
+            .cloned()
+            .collect();
+
+        Ok((nodes, closed))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,5 +610,58 @@ mod tests {
             !steps.iter().any(|s| s.node.id == "C"),
             "C 不应再是 A 的邻居"
         );
+    }
+
+    // ── 子图快照（list_subgraph）──────────────────────────────────────────
+
+    /// 子图闭合 + 孤立点：节点集**由节点侧**决定，不能靠 edges 反推。
+    #[tokio::test]
+    async fn list_subgraph_keeps_isolated_entity_and_drops_cross_label_edges() {
+        let gs = MemoryGraphStore::new();
+        for (id, label) in [
+            ("entity:Entity:e1", "Entity"),
+            ("entity:Entity:e2", "Entity"),
+            ("entity:Entity:e3", "Entity"), // 孤立点：无边
+            ("chunk:c1", "Chunk"),
+        ] {
+            gs.upsert_node(GraphNode {
+                id: id.into(),
+                labels: vec![label.into()],
+                properties: HashMap::new(),
+                distance: 0,
+            })
+            .await
+            .unwrap();
+        }
+        gs.add_edges(&[
+            edge("entity:Entity:e1", "entity:Entity:e2", "朋友", 0.95),
+            // 跨 label：有一端不是 Entity，必须丢
+            edge("entity:Entity:e1", "chunk:c1", "MENTIONS", 1.0),
+        ])
+        .await
+        .unwrap();
+
+        let (nodes, edges) = gs.list_subgraph("Entity").await.unwrap();
+
+        // (c) 孤立实体仍在返回节点集内（证明不能靠 edges 反推 nodes）
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "3 个 Entity 节点（含 1 个孤立点）：{ids:?}");
+        assert!(ids.contains(&"entity:Entity:e3"), "孤立实体不得丢失");
+
+        // (a) 只保留 Entity→Entity 边
+        assert_eq!(edges.len(), 1, "Entity→Chunk 的边必须丢：{edges:?}");
+        assert_eq!(edges[0].edge_type, EdgeType::Custom("朋友".into()));
+        // (b) 端点是稳定 id
+        assert_eq!(edges[0].source_id, "entity:Entity:e1");
+        assert_eq!(edges[0].target_id, "entity:Entity:e2");
+    }
+
+    /// 空图 / 无匹配 label：返回空，不报错。
+    #[tokio::test]
+    async fn list_subgraph_empty_when_no_matching_label() {
+        let gs = MemoryGraphStore::new();
+        let (nodes, edges) = gs.list_subgraph("Entity").await.unwrap();
+        assert!(nodes.is_empty());
+        assert!(edges.is_empty());
     }
 }

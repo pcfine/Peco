@@ -230,11 +230,50 @@ impl KnowledgeManager {
     // ── 文档列表 ────────────────────────────────────────────────────────────
 
     /// 查看指定知识库中的文档列表。
+    ///
+    /// **对外行为（逐字不变）**：`open_kb` 的**任何**失败都收敛为
+    /// [`KnowledgeModuleError::NotFound`]（供 agent 工具 `get_knowledge_base_docs`
+    /// 复用）。记忆文档端点若需区分基础设施故障，请用
+    /// [`Self::list_memory_documents`]。
     pub async fn list_documents(
         &self,
         kb_name: &str,
         offset: usize,
         limit: usize,
+    ) -> Result<Vec<knowledge_base::DocumentSummary>, KnowledgeModuleError> {
+        self.list_documents_impl(kb_name, offset, limit, |name, _e| {
+            KnowledgeModuleError::NotFound(name.to_string())
+        })
+        .await
+    }
+
+    /// 记忆文档列表端点（E2 `GET /api/peco/memory/documents`）专用。
+    ///
+    /// 与 [`Self::list_documents`] 同骨架，但 `open_kb` 失败**只**把
+    /// [`KnowledgeError::NotFound`](knowledge_base::KnowledgeError::NotFound) 收敛为
+    /// [`KnowledgeModuleError::NotFound`]（REST 层 → 404）；其余变体（如 HelixDB
+    /// 不可达的 `Internal`）经 [`map_open_kb_error`] **原样透传**为
+    /// [`KnowledgeModuleError::Knowledge`]（REST 层 → 500）—— 与
+    /// [`Self::list_entity_graph`] 及 design §3.3 同语义，不把基础设施故障
+    /// 伪装成「知识库不存在」。
+    pub async fn list_memory_documents(
+        &self,
+        kb_name: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<knowledge_base::DocumentSummary>, KnowledgeModuleError> {
+        self.list_documents_impl(kb_name, offset, limit, map_open_kb_error)
+            .await
+    }
+
+    /// `list_documents` / `list_memory_documents` 共用的「打开 KB + 列举文档」骨架；
+    /// `map_open_err` 决定 `open_kb` 失败如何收敛（见两个公共包装的文档）。
+    async fn list_documents_impl(
+        &self,
+        kb_name: &str,
+        offset: usize,
+        limit: usize,
+        map_open_err: impl FnOnce(&str, knowledge_base::KnowledgeError) -> KnowledgeModuleError,
     ) -> Result<Vec<knowledge_base::DocumentSummary>, KnowledgeModuleError> {
         self.ensure_loaded().await?;
 
@@ -244,9 +283,38 @@ impl KnowledgeManager {
         let kb = mgr
             .open_kb(kb_name)
             .await
-            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+            .map_err(|e| map_open_err(kb_name, e))?;
 
         Ok(kb.list_documents(offset, limit).await?)
+    }
+
+    /// 列出指定知识库的记忆图谱子图（`Entity` 节点集 + 两端皆实体的边）。
+    ///
+    /// 与 [`Self::list_documents`] 同骨架：`ensure_loaded` + `open_kb` 门。KB 不存在时
+    /// 返回 [`KnowledgeModuleError::NotFound`]，交由 REST 层映射为 404；其余打开失败
+    /// （如 HelixDB 不可达）**保留原始错误**，REST 层映射为 500（design §3.3）——
+    /// 不把基础设施故障伪装成「不存在」。
+    pub async fn list_entity_graph(
+        &self,
+        kb_name: &str,
+    ) -> Result<
+        (
+            Vec<knowledge_base::GraphNode>,
+            Vec<knowledge_base::KnowledgeEdge>,
+        ),
+        KnowledgeModuleError,
+    > {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|e| map_open_kb_error(kb_name, e))?;
+
+        Ok(kb.list_entity_graph().await?)
     }
 
     /// 直接添加文本内容到知识库（不需要文件）。
@@ -786,6 +854,25 @@ impl KnowledgeManager {
 }
 
 // ---------------------------------------------------------------------------
+// 内部辅助
+// ---------------------------------------------------------------------------
+
+/// 把 `open_kb` 的失败收敛为模块级错误：**只**把
+/// [`KnowledgeError::NotFound`](knowledge_base::KnowledgeError::NotFound) 收敛为
+/// 业务语义的 [`KnowledgeModuleError::NotFound`]（REST 层 → 404）；其余变体
+/// （如 HelixDB 不可达的 `KnowledgeError::Internal` / `GraphError`）**原样透传**
+/// 为 [`KnowledgeModuleError::Knowledge`]（REST 层 → 500），不把基础设施故障
+/// 伪装成「知识库不存在」（design §3.3）。
+fn map_open_kb_error(kb_name: &str, e: knowledge_base::KnowledgeError) -> KnowledgeModuleError {
+    match e {
+        knowledge_base::KnowledgeError::NotFound(_) => {
+            KnowledgeModuleError::NotFound(kb_name.to_string())
+        }
+        other => other.into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 内部类型
 // ---------------------------------------------------------------------------
 
@@ -982,5 +1069,110 @@ mod tests {
 
         let report4 = km.sync_kb("test-sync").await.unwrap();
         assert_eq!(report4.removed, 1);
+    }
+
+    /// BK-3 回归：`open_kb` 失败映射**只**把 `KnowledgeError::NotFound` 收敛为
+    /// `KnowledgeModuleError::NotFound`（REST 层 404）；其余变体（如 HelixDB 不可达的
+    /// `Internal`）**原样透传**为 `Knowledge`（REST 层 500）—— 不伪装成「KB 不存在」。
+    #[test]
+    fn map_open_kb_error_only_converges_not_found() {
+        // 分支 1：NotFound → 模块级 NotFound（→ 404）
+        let mapped = map_open_kb_error(
+            "@private_memory",
+            knowledge_base::KnowledgeError::NotFound("no such kb".into()),
+        );
+        assert!(
+            matches!(mapped, KnowledgeModuleError::NotFound(ref n) if n == "@private_memory"),
+            "NotFound 应收敛为 KnowledgeModuleError::NotFound，实际: {mapped}"
+        );
+
+        // 分支 2：其余（HelixDB 不可达 = Internal）→ 透传 Knowledge(Internal)（→ 500）
+        let mapped = map_open_kb_error(
+            "@private_memory",
+            knowledge_base::KnowledgeError::Internal("helixdb unreachable".into()),
+        );
+        match mapped {
+            KnowledgeModuleError::Knowledge(knowledge_base::KnowledgeError::Internal(msg)) => {
+                assert!(msg.contains("helixdb unreachable"));
+            }
+            other => panic!("Internal 必须透传为 Knowledge(Internal)，实际: {other}"),
+        }
+    }
+
+    /// `list_entity_graph` 骨架：KB 不存在经 `open_kb` 门报 `NotFound`（404 语义）。
+    #[tokio::test]
+    async fn list_entity_graph_on_missing_kb_reports_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+
+        let err = km.list_entity_graph("no-such-kb").await.unwrap_err();
+        assert!(
+            matches!(err, KnowledgeModuleError::NotFound(_)),
+            "KB 不存在应报 NotFound，实际: {err}"
+        );
+    }
+
+    /// E2 新路径（manager 层，非 REST 映射层）：记忆文档端点所用的
+    /// `list_memory_documents` 在 KB 不存在时经 `map_open_kb_error` 报
+    /// `NotFound` ⇒ handler `map_memory_kb_error` 映射为 404。
+    #[tokio::test]
+    async fn list_memory_documents_on_missing_kb_reports_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+
+        let err = km
+            .list_memory_documents("no-such-kb", 0, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KnowledgeModuleError::NotFound(_)),
+            "KB 不存在应报 NotFound（→404），实际: {err}"
+        );
+    }
+
+    /// E2 新路径（manager 层）的另一分支：`open_kb` 阶段非 `NotFound` 的失败
+    /// 必须**透传**为 `KnowledgeModuleError::Knowledge(..)` ⇒ handler 映射为 500，
+    /// 不被吞成 404。同时对照既有 `list_documents`：对外行为未变 —— 同样的失败
+    /// 仍被收敛为 `NotFound`（agent 工具 `get_knowledge_base_docs` 依赖它）。
+    ///
+    /// 构造：用一个「扫描目录」`scan-slot/` 承载 `config.name = "broken"` 的配置，
+    /// 而 `sanitize("broken")` 指向的构建目录被一个**普通文件**占位 ⇒
+    /// `KnowledgeBase::build` 的 `create_dir_all` 失败 → `KnowledgeError::InvalidInput`
+    /// （非 NotFound）。
+    #[tokio::test]
+    async fn list_memory_documents_propagates_non_not_found_open_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan_dir = tmp.path().join("scan-slot");
+        tokio::fs::create_dir_all(&scan_dir).await.unwrap();
+        let cfg = make_test_config("broken");
+        tokio::fs::write(
+            scan_dir.join("kb_config.json"),
+            serde_json::to_vec(&cfg).unwrap(),
+        )
+        .await
+        .unwrap();
+        // sanitize("broken") == "broken" —— 让构建目录是一个文件而非目录
+        tokio::fs::write(tmp.path().join("broken"), b"occupied by a file")
+            .await
+            .unwrap();
+
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+
+        // E2 新路径：非 NotFound 失败透传为 Knowledge（→500），不被吞成 404
+        let err = km.list_memory_documents("broken", 0, 10).await.unwrap_err();
+        assert!(
+            matches!(err, KnowledgeModuleError::Knowledge(_)),
+            "非 NotFound 的 open_kb 失败必须透传为 Knowledge（→500），实际: {err}"
+        );
+
+        // 对照（行为未变的证据）：既有 list_documents 仍把所有 open_kb 失败收敛为 NotFound
+        let err = km.list_documents("broken", 0, 10).await.unwrap_err();
+        assert!(
+            matches!(err, KnowledgeModuleError::NotFound(_)),
+            "既有 list_documents 对外行为应保持收敛为 NotFound，实际: {err}"
+        );
     }
 }

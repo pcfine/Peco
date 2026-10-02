@@ -569,6 +569,46 @@ pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Valu
     })
 }
 
+/// 子图快照：一次 read batch 内并发取回某 label 的**节点集**与**边集**。
+///
+/// 这是「一次往返拿回 (nodes, edges)」的唯一构造 —— 任何拆成两条独立查询的
+/// 方案都会让「节点集」与「边集」来自不同快照，无法保证子图闭合。
+///
+/// 形状（只读实测，design §3.2）：
+/// 1. `nodes` —— `NWhere{$label=<label>} → Project($id, id_property, name)`：
+///    同时投影内部 `$id`（关联键）与稳定 `id_property`（对外身份）；
+/// 2. `edges` —— `NWhere{$label=<label>} → OutE:null → EdgeProperties:null`：
+///    从**全部命中节点**扇出（`NWhere` 多命中的既定语义），返回每条出边的
+///    `$label` 与端点内部 `$id`。
+///
+/// `EdgeProperties` 是终结步骤且不能在边流上 `Project`，故边的「标签 + 端点稳定
+/// id」必须靠调用方按内部 `$id` 关联两份结果 —— 与 `labeled_edge_batch` 同一技巧。
+/// 只发 `OutE` 一条：子图闭合要求两端皆该 label 的节点，而 `OutE` 从全部该 label
+/// 节点扇出即已覆盖全部两端命中的边，`InE` 冗余（design §3.2.3）。
+pub fn list_subgraph(schema: &HelixSchema, label: &str) -> Value {
+    json!({
+        "request_type": "read",
+        "query": {
+            "queries": [
+                {"Query": {"name": "nodes", "steps": [
+                    {"NWhere": {"Eq": ["$label", {"String": label}]}},
+                    {"Project": [
+                        {"source": "$id", "alias": "internal_id"},
+                        {"source": schema.id_property, "alias": "node_id"},
+                        {"source": "name", "alias": "name"}
+                    ]}
+                ], "condition": null}},
+                {"Query": {"name": "edges", "steps": [
+                    {"NWhere": {"Eq": ["$label", {"String": label}]}},
+                    {"OutE": null},
+                    {"EdgeProperties": null}
+                ], "condition": null}}
+            ],
+            "returns": ["nodes", "edges"]
+        }
+    })
+}
+
 /// 按 ID 获取节点（v2 投影格式）。
 ///
 /// 投影 `id_property` 而非内置 `$id`，与 `upsert_node` 写入的 ID 口径一致。
@@ -1494,5 +1534,58 @@ mod tests {
             );
             assert_eq!(query["Query"]["steps"][1]["Repeat"]["max_depth"], depth);
         }
+    }
+
+    /// `list_subgraph` 的 AST 形状 —— 一个 read batch、两个子查询、闭包所需的两份投影。
+    ///
+    /// 与 design §3.2 只读实测逐字比对：`nodes` = `NWhere{$label} → Project($id, id, name)`；
+    /// `edges` = `NWhere{$label} → OutE:null → EdgeProperties:null`。形状漂移会先在这里炸。
+    #[test]
+    fn list_subgraph_shape() {
+        let s = HelixSchema::default();
+        let q = list_subgraph(&s, "Entity");
+
+        assert_eq!(q["request_type"], "read");
+        // 一个 batch（不是两次往返）
+        let batch = q["query"]["queries"].as_array().unwrap();
+        assert_eq!(batch.len(), 2, "一个 batch 内并发 nodes + edges");
+        assert_eq!(q["query"]["returns"], json!(["nodes", "edges"]));
+
+        // nodes：NWhere{$label=Entity} → Project($id, id_property, name)
+        let nodes = &batch[0]["Query"];
+        assert_eq!(nodes["name"], "nodes");
+        let nsteps = nodes["steps"].as_array().unwrap();
+        assert_eq!(
+            nsteps[0],
+            json!({"NWhere": {"Eq": ["$label", {"String": "Entity"}]}})
+        );
+        // 身份字段名硬编码为字面量 "id"（而非 `s.id_property`）：design §3.2 实测形状
+        // 就是 `id`，且 `id_property` 默认即 "id" —— 用同一表达式断言会恒真、锁不住
+        // 「稳定 id(=id) ≠ 内部 $id」这条最易混的口径。改动 schema 默认即在此炸。
+        assert_eq!(
+            nsteps[1],
+            json!({"Project": [
+                {"source": "$id", "alias": "internal_id"},
+                {"source": "id", "alias": "node_id"},
+                {"source": "name", "alias": "name"}
+            ]}),
+            "同时投影内部 $id（join 键）与稳定身份字段 id（对外身份）"
+        );
+
+        // edges：NWhere{$label=Entity} → OutE:null → EdgeProperties:null
+        let edges = &batch[1]["Query"];
+        assert_eq!(edges["name"], "edges");
+        let esteps = edges["steps"].as_array().unwrap();
+        assert_eq!(
+            esteps.len(),
+            3,
+            "OutE 通配 + EdgeProperties 终结，边流上无 Project"
+        );
+        assert_eq!(
+            esteps[0],
+            json!({"NWhere": {"Eq": ["$label", {"String": "Entity"}]}})
+        );
+        assert_eq!(esteps[1], json!({"OutE": null}), "null 才是通配，空串不是");
+        assert_eq!(esteps[2], json!({"EdgeProperties": null}));
     }
 }

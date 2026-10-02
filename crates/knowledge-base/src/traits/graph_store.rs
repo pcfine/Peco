@@ -187,4 +187,23 @@ pub trait GraphStore: Send + Sync {
     async fn node_exists(&self, node_id: &str) -> Result<bool, KnowledgeError> {
         Ok(self.get_node(node_id).await?.is_some())
     }
+
+    /// 取回某个 label 的**子图快照**：节点集 + 两端都在节点集内的边。
+    ///
+    /// 语义（design §3.2.4）：
+    /// - **节点**：所有 label 等于 `label` 的节点；`GraphNode.id` 必须是**稳定 id**
+    ///   （`schema.id_property`，`entity:Entity:<hash8>`），不是内部 `$id`；
+    /// - **边**：只保留 `source_id` 与 `target_id` **都落在节点集内**的边（子图闭合）；
+    ///   端点落在节点集外的边（如 `Entity→Chunk` 的 `MENTIONS`）一律丢弃；
+    /// - **孤立点必须保留**：节点集**不能**由边反推 —— 存在无边实体，它们也必须
+    ///   出现在返回的节点集里。
+    ///
+    /// **必须在同一快照内取回节点与边**（HelixDB 实现即一个 read batch），否则无法
+    /// 保证闭包与节点集来自同一个快照。默认实现返回空 —— 不支持图存储的后端无需覆盖。
+    async fn list_subgraph(
+        &self,
+        _label: &str,
+    ) -> Result<(Vec<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        Ok((Vec::new(), Vec::new()))
+    }
 }

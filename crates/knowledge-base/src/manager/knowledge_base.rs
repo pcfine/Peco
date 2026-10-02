@@ -524,6 +524,21 @@ impl KnowledgeBase {
             .await
     }
 
+    /// 列出「记忆图谱」子图 —— `Entity` label 的节点集 + 两端皆实体的边。
+    ///
+    /// 与 [`Self::query_entity_facts`] 同层：二者都以 `ENTITY_TYPE` 为唯一实体口径，
+    /// 故本方法不暴露 label 参数 —— 「记忆图谱 = 实体子图」是既定范围决策。
+    /// 语义与子图闭合规则见 [`GraphStore::list_subgraph`]。
+    pub async fn list_entity_graph(
+        &self,
+    ) -> Result<(Vec<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        let gs = self.graph_store.as_ref().ok_or_else(|| {
+            KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
+        })?;
+
+        gs.list_subgraph(ENTITY_TYPE).await
+    }
+
     /// 查询两个实体间的关系路径。
     ///
     /// `entity_type` 默认为 `"Entity"`，与 [`add_facts`] 保持一致。

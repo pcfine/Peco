@@ -14,6 +14,8 @@
 //   - GET  /api/peco/memory/consolidation/state  查询最近一次整理结果
 //   - GET  /api/peco/memory/consolidation/optin  查询自动整理 opt-in 开关
 //   - PUT  /api/peco/memory/consolidation/optin  写入自动整理 opt-in 开关
+//   - GET  /api/peco/memory/graph                记忆实体子图（节点 + 谓词边）
+//   - GET  /api/peco/memory/documents            记忆文档列表（分页）
 //
 // 任务生命周期与 SSE 连接解耦：runner 任务独占 LooperHandle 持续驱动，
 // 桥接任务把 broadcast 事件流转发给每个 SSE 连接。连接断开只结束桥接，
@@ -54,6 +56,7 @@ use crate::state::AppState;
 
 use super::filter::PecoContextFilter;
 use super::manager::PecoManager;
+use super::memory::view;
 use super::session::{SESSION_TITLE, private_session_id};
 
 /// 附着时等待将死 run 退出的上限（回收只发生在停靠态，退出是毫秒级）。
@@ -1454,6 +1457,118 @@ pub async fn export_session(
     }
 }
 
+// ── Handler: GET /api/peco/memory/graph + GET /api/peco/memory/documents ──
+
+/// 私人记忆库名 —— 与 `MemoryConfig.kb_name` 的生产默认值一致（`peco/memory/config.rs`）。
+///
+/// 就地定义而非提升为 `peco-core` 公共常量：为单个字符串引入跨 crate 依赖，收益
+/// （省一处字面量）小于成本（design §3.3）。
+const PRIVATE_MEMORY_KB: &str = "@private_memory";
+
+/// 图谱端点查询参数。
+#[derive(Debug, Deserialize)]
+pub struct GraphQuery {
+    /// 实体节点上限（默认 200，clamp 1..=1000）。
+    #[serde(default = "default_node_limit")]
+    pub node_limit: i64,
+    /// 边上限（默认 500，clamp 1..=2000）。
+    #[serde(default = "default_edge_limit")]
+    pub edge_limit: i64,
+}
+
+fn default_node_limit() -> i64 {
+    200
+}
+
+fn default_edge_limit() -> i64 {
+    500
+}
+
+/// 文档列表端点查询参数。
+#[derive(Debug, Deserialize)]
+pub struct MemoryDocumentQuery {
+    /// 偏移量（默认 0，负数按 0）。
+    #[serde(default)]
+    pub offset: i64,
+    /// 页大小（默认 20，clamp 1..=100）。
+    #[serde(default = "default_memory_doc_limit")]
+    pub limit: i64,
+}
+
+fn default_memory_doc_limit() -> i64 {
+    20
+}
+
+/// 把 KB 定位失败映射到 [`ApiError`]：`NotFound` → 404，其余 → 500。
+///
+/// 无 `From<KnowledgeModuleError> for ApiError`，逐处 `.map_err`（design §3.3）。
+/// `op` 是 500 details 的操作前缀（`"failed to load memory graph"` /
+/// `"failed to load memory documents"`）。
+fn map_memory_kb_error(op: &str, e: KnowledgeModuleError) -> ApiError {
+    match e {
+        KnowledgeModuleError::NotFound(name) => {
+            ApiError::NotFound(format!("知识库 '{name}' 不存在"))
+        }
+        other => ApiError::Internal(format!("{op}: {other}")),
+    }
+}
+
+/// `GET /api/peco/memory/graph` —— 当前用户 `@private_memory` 的实体子图。
+///
+/// **隔离缺口（design §3.4）**：HelixDB 单一命名空间 + `Entity` 无 owner 字段 ⇒
+/// 多用户部署下会返回该实例内所有用户写入的 Entity / 边；本轮接受现状、不加过滤。
+pub async fn get_memory_graph(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GraphQuery>,
+) -> Result<Json<view::MemoryGraphResponse>, ApiError> {
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let (nodes, edges) = ws
+        .knowledge_manager()
+        .list_entity_graph(PRIVATE_MEMORY_KB)
+        .await
+        .map_err(|e| map_memory_kb_error("failed to load memory graph", e))?;
+
+    Ok(Json(view::build_graph(
+        nodes,
+        edges,
+        params.node_limit.clamp(1, 1000) as usize,
+        params.edge_limit.clamp(1, 2000) as usize,
+    )))
+}
+
+/// `GET /api/peco/memory/documents` —— 当前用户 `@private_memory` 的文档列表（分页）。
+///
+/// **隔离缺口（design §3.4）**：同 `get_memory_graph` —— `Document` 不写 `kb_id`，
+/// 多用户部署下会返回该实例内所有 KB 的文档；本轮接受现状、不加过滤。
+pub async fn list_memory_documents(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<MemoryDocumentQuery>,
+) -> Result<Json<view::MemoryDocumentPage>, ApiError> {
+    let offset = params.offset.max(0) as usize;
+    let limit = params.limit.clamp(1, 100) as usize;
+
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    // `limit+1` 探测 `has_more`：多取一条，由 build_document_page 截断。
+    // 用 `list_memory_documents`（而非 agent 工具复用的 `list_documents`）——
+    // 后者会把 `open_kb` 的**全部**失败收敛为 `NotFound`，本次修复让 E2 与 E1
+    // 一致：只有 KB 真的不存在才 404，HelixDB 不可达等 → 500（design §3.3）。
+    let rows = ws
+        .knowledge_manager()
+        .list_memory_documents(PRIVATE_MEMORY_KB, offset, limit + 1)
+        .await
+        .map_err(|e| map_memory_kb_error("failed to load memory documents", e))?;
+
+    Ok(Json(view::build_document_page(rows, offset, limit)))
+}
+
 /// 构建 Peco 路由。
 ///
 /// 注册到 `/api/peco`：
@@ -1472,6 +1587,8 @@ pub async fn export_session(
 /// - `GET /memory/consolidation/state` — 查询最近一次整理结果
 /// - `GET /memory/consolidation/optin` — 查询自动整理 opt-in 开关
 /// - `PUT /memory/consolidation/optin` — 写入自动整理 opt-in 开关
+/// - `GET /memory/graph` — 记忆实体子图（节点 + 谓词边）
+/// - `GET /memory/documents` — 记忆文档列表（分页）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
@@ -1488,4 +1605,96 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/consolidation/state", get(get_consolidation_state))
         .route("/memory/consolidation/optin", get(get_memory_optin))
         .route("/memory/consolidation/optin", put(set_memory_optin))
+        .route("/memory/graph", get(get_memory_graph))
+        .route("/memory/documents", get(list_memory_documents))
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    async fn status_and_json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// E1 404：KB 不存在 ⇒ `NotFound` ⇒ 404 `{"error":"not_found", ...}`。
+    #[tokio::test]
+    async fn memory_graph_maps_kb_not_found_to_404() {
+        let err = map_memory_kb_error(
+            "failed to load memory graph",
+            KnowledgeModuleError::NotFound(PRIVATE_MEMORY_KB.into()),
+        );
+        let (status, body) = status_and_json(err.into_response()).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        assert_eq!(body["details"], "知识库 '@private_memory' 不存在");
+    }
+
+    /// E1 500：其余 `KnowledgeModuleError` ⇒ `Internal` ⇒ 500 `{"error":"internal", ...}`。
+    #[tokio::test]
+    async fn memory_graph_maps_other_errors_to_500() {
+        let err = map_memory_kb_error(
+            "failed to load memory graph",
+            KnowledgeModuleError::NotInitialized,
+        );
+        let (status, body) = status_and_json(err.into_response()).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "internal");
+        assert!(
+            body["details"]
+                .as_str()
+                .unwrap()
+                .starts_with("failed to load memory graph"),
+            "500 details 应带操作前缀：{}",
+            body["details"]
+        );
+    }
+
+    /// E2 404 / 500：同一映射函数，`documents` 操作前缀不同。
+    #[tokio::test]
+    async fn memory_documents_maps_errors() {
+        let not_found = map_memory_kb_error(
+            "failed to load memory documents",
+            KnowledgeModuleError::NotFound(PRIVATE_MEMORY_KB.into()),
+        );
+        let (status, body) = status_and_json(not_found.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+
+        let internal = map_memory_kb_error(
+            "failed to load memory documents",
+            KnowledgeModuleError::NotInitialized,
+        );
+        let (status, body) = status_and_json(internal.into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "internal");
+        assert!(
+            body["details"]
+                .as_str()
+                .unwrap()
+                .starts_with("failed to load memory documents")
+        );
+    }
+
+    /// 401：`AuthUser` 缺失/无效时抛的就是 `ApiError::Unauthorized` ⇒
+    /// 401 `{"error":"unauthorized"}`（与 handler 的 extractor 同源）。
+    #[tokio::test]
+    async fn auth_failure_maps_to_401() {
+        let err = ApiError::Unauthorized("missing authorization header".into());
+        let (status, body) = status_and_json(err.into_response()).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+    }
 }

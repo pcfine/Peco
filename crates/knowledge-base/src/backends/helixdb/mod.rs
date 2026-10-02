@@ -1047,6 +1047,79 @@ impl GraphStore for HelixDbBackend {
         Ok(count_value(&response, "count") > 0)
     }
 
+    /// 一次 read batch 取回某 label 的子图（节点集 + 两端皆在节点集内的边）。
+    ///
+    /// 关联键是内部 `$id`（`edges.$from/$to` == `nodes.internal_id`），与返回行序
+    /// 无关 —— 形状见 [`queries::list_subgraph`]，两端缺一即丢，等价于「子图闭合」。
+    /// 端点稳定 id 取自 `Project` 出来的 `schema.id_property`。
+    async fn list_subgraph(
+        &self,
+        label: &str,
+    ) -> Result<(Vec<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        let query = queries::list_subgraph(&self.schema, label);
+        let response = self.client.execute_read(query).await?;
+
+        // 节点：内部 `$id` → 稳定 id。同一份快照既做返回节点集，又做边的闭包判据。
+        let mut identity: HashMap<String, String> = HashMap::new();
+        let mut nodes: Vec<GraphNode> = Vec::new();
+        if let Some(rows) = extract_properties(&response, "nodes") {
+            for row in rows {
+                let Some(internal) = row.get("internal_id").and_then(parse_id_value) else {
+                    continue;
+                };
+                let Some(stable) = row.get("node_id").and_then(parse_id_value) else {
+                    continue;
+                };
+                let name = row
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let mut properties = HashMap::new();
+                if !name.is_empty() {
+                    properties.insert("name".to_string(), name);
+                }
+                nodes.push(GraphNode {
+                    id: stable.clone(),
+                    labels: vec![label.to_string()],
+                    properties,
+                    distance: 0,
+                });
+                identity.insert(internal, stable);
+            }
+        }
+
+        // 边：`$from`/`$to` 都命中节点集才保留（子图闭合）；`$label` 即谓词原文。
+        let mut edges: Vec<KnowledgeEdge> = Vec::new();
+        if let Some(rows) = extract_properties(&response, "edges") {
+            for row in rows {
+                let Some(from) = row.get("$from").and_then(parse_id_value) else {
+                    continue;
+                };
+                let Some(to) = row.get("$to").and_then(parse_id_value) else {
+                    continue;
+                };
+                let Some(edge_label) = row.get("$label").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let (Some(source_id), Some(target_id)) = (identity.get(&from), identity.get(&to))
+                else {
+                    continue;
+                };
+                let weight = row.get("weight").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                edges.push(KnowledgeEdge {
+                    source_id: source_id.clone(),
+                    target_id: target_id.clone(),
+                    edge_type: self.edge_type_from_label(edge_label),
+                    weight,
+                    properties: HashMap::new(),
+                });
+            }
+        }
+
+        Ok((nodes, edges))
+    }
+
     async fn traverse(
         &self,
         start_node: &str,

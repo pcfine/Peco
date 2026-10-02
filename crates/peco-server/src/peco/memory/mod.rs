@@ -23,6 +23,7 @@ pub mod cron;
 pub mod dedup;
 pub mod hook;
 pub mod recall;
+pub mod view;
 
 pub use analyzer::{MemoryCategory, MemoryFact, ModelTurnAnalyzer, TurnAnalyzer};
 pub use config::{ConsolidationConfig, MemoryConfig};
