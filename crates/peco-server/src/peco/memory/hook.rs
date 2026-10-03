@@ -401,17 +401,7 @@ impl MemoryExtractionHook {
             "would_act": items.len().min(config.supersede_per_turn_cap),
             "items": items,
         });
-        let candidates_json: Vec<_> = candidates
-            .iter()
-            .map(|c| {
-                json!({
-                    "id": c.id,
-                    "source": c.source,
-                    "text": c.text,
-                    "channel": c.channel,
-                })
-            })
-            .collect();
+        let candidates_json = Self::candidates_snapshot(candidates);
         let facts_json: Vec<_> = validated
             .iter()
             .map(|f| {
@@ -427,8 +417,7 @@ impl MemoryExtractionHook {
         let row = ShadowRow {
             user_id: user_id.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
-            candidates_json: serde_json::to_string(&candidates_json)
-                .unwrap_or_else(|_| "[]".to_string()),
+            candidates_json,
             facts_json: serde_json::to_string(&facts_json).unwrap_or_else(|_| "[]".to_string()),
             decisions_json: serde_json::to_string(&decisions).unwrap_or_else(|_| "{}".to_string()),
             acted: false,
@@ -444,6 +433,71 @@ impl MemoryExtractionHook {
             Err(e) => {
                 warn!(error = %e, user_id = %user_id, "Supersede shadow write failed (non-fatal)")
             }
+        }
+    }
+
+    /// 候选集快照 → JSON 字符串（shadow 行共用）。
+    fn candidates_snapshot(candidates: &[MemoryCandidateWithChannel]) -> String {
+        let v: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "source": c.source,
+                    "text": c.text,
+                    "channel": c.channel,
+                })
+            })
+            .collect();
+        serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// 落一条「提取失败」观测行（阶段一：只记录，不执行）。
+    ///
+    /// 与 [`Self::record_shadow`] 的区别：facts 为空、decisions 带 `error` 原因。
+    /// 效果门必须看到**全部**尝试轮次（截断 / 超时 / 模型报错），否则分母系统性
+    /// 偏小、动作率被高估。
+    async fn record_shadow_failure(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        config: &MemoryConfig,
+        candidates: &[MemoryCandidateWithChannel],
+        kind: &str,
+        detail: &str,
+    ) {
+        if !config.supersede_shadow {
+            return;
+        }
+        let decisions = json!({
+            "per_turn_cap": config.supersede_per_turn_cap,
+            "raw_count": 0,
+            "dropped": 0,
+            "would_act": 0,
+            "items": [],
+            "error": { "kind": kind, "detail": detail },
+        });
+        let row = ShadowRow {
+            user_id: user_id.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            candidates_json: Self::candidates_snapshot(candidates),
+            facts_json: "[]".to_string(),
+            decisions_json: serde_json::to_string(&decisions).unwrap_or_else(|_| "{}".to_string()),
+            acted: false,
+            extracted_topic_cnt: 0,
+            episodic_cnt: 0,
+        };
+        match insert_shadow(db, &row).await {
+            Ok(id) => debug!(
+                shadow_id = id,
+                user_id = %user_id,
+                error_kind = kind,
+                "Supersede shadow failure row written"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                user_id = %user_id,
+                "Supersede shadow failure write failed (non-fatal)"
+            ),
         }
     }
 }
@@ -499,6 +553,16 @@ impl LooperHook for MemoryExtractionHook {
                 Ok(Ok(facts)) => facts,
                 Ok(Err(e)) => {
                     warn!(error = %e, "Memory extraction failed (non-fatal)");
+                    // 失败也落一行观测 —— 否则效果门的分母系统性偏小、动作率被高估
+                    Self::record_shadow_failure(
+                        &db,
+                        &user_id,
+                        &config,
+                        &set.candidates,
+                        "analyzer_error",
+                        &e,
+                    )
+                    .await;
                     return;
                 }
                 Err(_) => {
@@ -506,6 +570,15 @@ impl LooperHook for MemoryExtractionHook {
                         timeout_secs = config.analyzer_timeout_secs,
                         "Memory extraction timed out (non-fatal)"
                     );
+                    Self::record_shadow_failure(
+                        &db,
+                        &user_id,
+                        &config,
+                        &set.candidates,
+                        "analyzer_timeout",
+                        &format!("analyzer timed out after {}s", config.analyzer_timeout_secs),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -845,6 +918,46 @@ mod tests {
             1,
             "提取器应被调用一次"
         );
+    }
+
+    #[tokio::test]
+    async fn test_analyzer_error_writes_failure_shadow_row() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::err("model exploded"));
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
+        let session = make_session_with_turn(
+            "这是一个足够长的用户提问内容",
+            "这是一个足够长的助手回答内容",
+        );
+
+        hook.on_turn_complete(0, None, &Usage::default(), &session)
+            .await;
+
+        // 等失败观测行落库（spawn 后台任务）
+        let mut n = 0i64;
+        for _ in 0..100 {
+            n = crate::db::memory_supersede::count_for_user(&pool, "test-user")
+                .await
+                .unwrap();
+            if n >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(n, 1, "提取失败也必须落一行观测（效果门分母）");
+
+        let decisions: String = sqlx::query_scalar(
+            "SELECT decisions_json FROM memory_supersede_shadow \
+             WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind("test-user")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&decisions).unwrap();
+        assert_eq!(v["error"]["kind"], "analyzer_error");
+        assert_eq!(v["error"]["detail"], "model exploded");
+        assert_eq!(v["would_act"], 0);
     }
 
     // ── 写路径去重（Stage 4 / 事项 5）────────────────────────────────────

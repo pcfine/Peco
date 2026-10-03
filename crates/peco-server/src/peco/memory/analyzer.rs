@@ -120,7 +120,9 @@ impl ModelTurnAnalyzer {
         Self {
             provider,
             model: model.into(),
-            max_output_tokens: 512,
+            // 512 会让“话痨轮”的 JSON 撞顶截断（实测约 18% 轮次），
+            // 截断即丢样本、系统性偏置效果门 —— 提到 2048 覆盖多事实轮。
+            max_output_tokens: 2048,
         }
     }
 }
