@@ -37,3 +37,30 @@ export interface MemoryDocumentPage {
   limit: number;
   has_more: boolean;
 }
+
+/** E3 响应：单条记忆文档详情（含全文）。`content` 可能为空串。 */
+export interface MemoryDocumentDetail {
+  id: string;
+  title: string;
+  source: string;
+  file_type: string | null;
+  created_at: string | null;
+  content: string;
+}
+
+/**
+ * E4 检索的一条文档级命中。**无 `score`** —— 服务端为正文子串扫描，
+ * 无相关性信号，不承诺任何恒定分数；排序恒为 `id` 升序。
+ */
+export interface MemorySearchHit {
+  id: string;
+  title: string;
+  source: string;
+  file_type: string | null;
+  snippet: string;
+}
+
+/** E4 响应：一次返回 ≤ `limit` 条命中（无分页 / `total` / `has_more`）。 */
+export interface MemorySearchResponse {
+  hits: MemorySearchHit[];
+}

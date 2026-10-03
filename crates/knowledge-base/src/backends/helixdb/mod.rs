@@ -436,6 +436,97 @@ impl HelixDbBackend {
 
         Ok(steps)
     }
+
+    // ── 辅助：HelixDB 读响应 → 领域类型（list / get / list_all 共用） ────────
+
+    /// 把 `list_documents*` 响应解析为 `DocumentSummary` 列表。
+    ///
+    /// 读取结果键 `"docs"`；`chunk_count` 需图遍历（CONTAINS 出边数），此处置 0，
+    /// 调用方可自行查询。缺 `id`/不可解析的行被丢弃（与既有 `list` 行为一致）。
+    fn parse_summaries(response: &Value) -> Vec<DocumentSummary> {
+        extract_properties(response, "docs")
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let id = parse_id_value(item.get("id")?)?;
+                        let title = item
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let source_path = item
+                            .get("source_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let file_type = item
+                            .get("metadata")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str::<DocumentMetadata>(s).ok())
+                            .and_then(|m| m.file_type);
+                        Some(DocumentSummary {
+                            id,
+                            title,
+                            source_path,
+                            chunk_count: 0,
+                            file_type,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 把一行文档投影解析为 `Document`（`id` 缺失/不可解析时回退到 `fallback_id`）。
+    ///
+    /// `metadata` 为 JSON 串，解析失败时回退 `DocumentMetadata::default()`
+    /// （与既有 `get` 行为一致）。
+    fn parse_document_row(item: &Value, fallback_id: &str) -> Document {
+        let id = item
+            .get("id")
+            .and_then(parse_id_value)
+            .unwrap_or_else(|| fallback_id.to_string());
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let source_path = item
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let content = item
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let metadata: DocumentMetadata = item
+            .get("metadata")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        Document {
+            kb_id: None,
+            id,
+            title,
+            source_path,
+            content,
+            metadata,
+        }
+    }
+
+    /// 把 `"docs"` 下的文档投影数组解析为 `Document` 列表（`list_all` 扫描用）。
+    fn parse_documents(response: &Value) -> Vec<Document> {
+        extract_properties(response, "docs")
+            .map(|arr| {
+                arr.iter()
+                    .map(|item| Self::parse_document_row(item, ""))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -512,41 +603,7 @@ impl DocumentStore for HelixDbBackend {
 
         let doc = extract_properties(&response, "doc")
             .and_then(|arr| arr.first())
-            .map(|item| {
-                let doc_id = item
-                    .get("id")
-                    .and_then(parse_id_value)
-                    .unwrap_or_else(|| id.to_string());
-                let title = item
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let source_path = item
-                    .get("source_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let content = item
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let metadata: DocumentMetadata = item
-                    .get("metadata")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_default();
-
-                Document {
-                    kb_id: None,
-                    id: doc_id,
-                    title,
-                    source_path,
-                    content,
-                    metadata,
-                }
-            });
+            .map(|item| Self::parse_document_row(item, id));
 
         Ok(doc)
     }
@@ -567,42 +624,41 @@ impl DocumentStore for HelixDbBackend {
         debug!(offset, limit, "Listing documents");
         let query = queries::list_documents(&self.schema, offset, limit);
         let response = self.client.execute_read(query).await?;
+        Ok(Self::parse_summaries(&response))
+    }
 
-        let summaries = extract_properties(&response, "docs")
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| {
-                        let id = parse_id_value(item.get("id")?)?;
-                        let title = item
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let source_path = item
-                            .get("source_path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let file_type = item
-                            .get("metadata")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| serde_json::from_str::<DocumentMetadata>(s).ok())
-                            .and_then(|m| m.file_type);
-                        // chunk_count 需要通过图遍历获取（CONTAINS 出边数）
-                        // 此处设为 0，调用方可自行查询
-                        Some(DocumentSummary {
-                            id,
-                            title,
-                            source_path,
-                            chunk_count: 0,
-                            file_type,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// E2：按 `source_path` **精确**过滤的下推覆写。
+    ///
+    /// `source = None` ⇒ 退化为 [`Self::list`]（AST 与既有 `list_documents` 逐字相同）；
+    /// `Some(s)` ⇒ `NWhere.And:[Eq:$label, Eq:source_path=s]` 在 `Skip`/`Limit` **之前**
+    /// 下推（design §3.2 E2 / §3.3-M11）。
+    async fn list_by_source(
+        &self,
+        offset: usize,
+        limit: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<DocumentSummary>, KnowledgeError> {
+        match source {
+            None => self.list(offset, limit).await,
+            Some(want) => {
+                debug!(offset, limit, source = want, "Listing documents by source");
+                let query =
+                    queries::list_documents_filtered(&self.schema, offset, limit, Some(want));
+                let response = self.client.execute_read(query).await?;
+                Ok(Self::parse_summaries(&response))
+            }
+        }
+    }
 
-        Ok(summaries)
+    /// E4：**单次**只读查询取回至多 `limit` 条 `Document`（含正文 + metadata）。
+    ///
+    /// 覆写掉默认的 N+1 兜底（生产记忆 KB 恒为 HelixDB）。不做匹配/片段/排序 ——
+    /// 检索语义在 server 纯函数（design §3.3-M11 / M13）。
+    async fn list_all(&self, limit: usize) -> Result<Vec<Document>, KnowledgeError> {
+        debug!(limit, "Listing all documents with content");
+        let query = queries::list_documents_with_content(&self.schema, limit);
+        let response = self.client.execute_read(query).await?;
+        Ok(Self::parse_documents(&response))
     }
 
     async fn chunks(&self, doc_id: &DocumentId) -> Result<Vec<Chunk>, KnowledgeError> {

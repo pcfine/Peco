@@ -352,6 +352,30 @@ impl KnowledgeBase {
         self.pipeline.list_documents(offset, limit).await
     }
 
+    /// 列出文档摘要（分页），可选按 `source_path` **精确**过滤（E2）。
+    ///
+    /// `source = None` ⇒ 与 [`Self::list_documents`] 等价（HelixDB AST 逐字不变）；
+    /// `Some(s)` ⇒ HelixDB 下推 `NWhere.And`，其余后端走可移植兜底；两种路径的
+    /// `offset` 均为「过滤后的偏移」（design §3.2 E2）。
+    pub async fn list_documents_by_source(
+        &self,
+        offset: usize,
+        limit: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<DocumentSummary>, KnowledgeError> {
+        self.pipeline
+            .list_documents_by_source(offset, limit, source)
+            .await
+    }
+
+    /// 取回至多 `scan_limit` 条文档（**含正文 + metadata**），供 E4 全量扫描（M9）。
+    pub async fn list_documents_with_content(
+        &self,
+        scan_limit: usize,
+    ) -> Result<Vec<Document>, KnowledgeError> {
+        self.pipeline.list_all_documents(scan_limit).await
+    }
+
     /// 获取知识库配置。
     pub fn config(&self) -> &KbConfig {
         &self.config

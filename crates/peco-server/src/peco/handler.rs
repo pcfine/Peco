@@ -15,7 +15,9 @@
 //   - GET  /api/peco/memory/consolidation/optin  查询自动整理 opt-in 开关
 //   - PUT  /api/peco/memory/consolidation/optin  写入自动整理 opt-in 开关
 //   - GET  /api/peco/memory/graph                记忆实体子图（节点 + 谓词边）
-//   - GET  /api/peco/memory/documents            记忆文档列表（分页）
+//   - GET  /api/peco/memory/documents            记忆文档列表（分页，可按 source 过滤）
+//   - GET  /api/peco/memory/documents/{id}       记忆文档详情（全文 + 元数据）
+//   - GET  /api/peco/memory/search               记忆内容检索（正文子串扫描）
 //
 // 任务生命周期与 SSE 连接解耦：runner 任务独占 LooperHandle 持续驱动，
 // 桥接任务把 broadcast 事件流转发给每个 SSE 连接。连接断开只结束桥接，
@@ -29,7 +31,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -1493,10 +1495,39 @@ pub struct MemoryDocumentQuery {
     /// 页大小（默认 20，clamp 1..=100）。
     #[serde(default = "default_memory_doc_limit")]
     pub limit: i64,
+    /// v2 新增：按 `source_path` **精确**过滤；缺省/空白 = 不过滤。
+    pub source: Option<String>,
 }
 
 fn default_memory_doc_limit() -> i64 {
     20
+}
+
+/// 内容检索端点查询参数（E4）。
+///
+/// `q` 为 `Option<String>`：缺省能成功反序列化为 `None`，由 handler 主动判空返回
+/// `400 BadRequest`（JSON），而非让 axum `Query` 反序列化失败的**纯文本 400**。
+#[derive(Debug, Deserialize)]
+pub struct MemorySearchQuery {
+    /// 检索词（对**正文**子串、大小写不敏感）；缺失/空白 → 400。
+    pub q: Option<String>,
+    /// 返回条数上限（默认 20，clamp 1..=50）。
+    ///
+    /// **必须带 `#[serde(default = ..)]`**：否则 `?q=x` 省略 `limit` 会走 axum
+    /// `QueryRejection` → 纯文本 400，拿不到默认值。
+    #[serde(default = "default_memory_search_limit")]
+    pub limit: i64,
+    /// 按 `source_path` **精确**过滤；缺省/空白 = 不过滤（语义同 E2）。
+    pub source: Option<String>,
+}
+
+fn default_memory_search_limit() -> i64 {
+    20
+}
+
+/// 检索条数 clamp 到 `1..=50`（比 E2 的 100 更小：每条命中含一段 snippet，限响应体积）。
+fn clamp_search_limit(limit: i64) -> usize {
+    limit.clamp(1, 50) as usize
 }
 
 /// 把 KB 定位失败映射到 [`ApiError`]：`NotFound` → 404，其余 → 500。
@@ -1551,6 +1582,12 @@ pub async fn list_memory_documents(
 ) -> Result<Json<view::MemoryDocumentPage>, ApiError> {
     let offset = params.offset.max(0) as usize;
     let limit = params.limit.clamp(1, 100) as usize;
+    // 空白 source 视作不过滤（防御性，与 agent 工具层「空前缀匹配全部」一致）。
+    let source = params
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let ws = state
         .workspace_manager
@@ -1562,11 +1599,88 @@ pub async fn list_memory_documents(
     // 一致：只有 KB 真的不存在才 404，HelixDB 不可达等 → 500（design §3.3）。
     let rows = ws
         .knowledge_manager()
-        .list_memory_documents(PRIVATE_MEMORY_KB, offset, limit + 1)
+        .list_memory_documents(PRIVATE_MEMORY_KB, offset, limit + 1, source)
         .await
         .map_err(|e| map_memory_kb_error("failed to load memory documents", e))?;
 
     Ok(Json(view::build_document_page(rows, offset, limit)))
+}
+
+/// `GET /api/peco/memory/documents/{id}` —— 文档详情（E3）。
+///
+/// 复用既有 `KnowledgeManager::get_document`（core/kb 层零新增能力）。文档不存在
+/// （`Ok(None)`）→ 404「文档不存在或已被删除」。
+///
+/// **隔离缺口（design §3.4）**：同 E2 —— 多用户部署下会返回该 HelixDB 实例内
+/// 所有 KB 的文档；本轮接受现状、不加过滤。
+pub async fn get_memory_document(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path(doc_id): Path<String>,
+) -> Result<Json<view::MemoryDocumentDetail>, ApiError> {
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let doc = ws
+        .knowledge_manager()
+        .get_document(PRIVATE_MEMORY_KB, &doc_id)
+        .await
+        .map_err(|e| map_memory_kb_error("failed to load memory document", e))?
+        .ok_or_else(|| ApiError::NotFound("文档不存在或已被删除".into()))?;
+
+    Ok(Json(view::build_document_detail(doc)))
+}
+
+/// `GET /api/peco/memory/search` —— 记忆内容检索（E4，正文子串扫描）。
+///
+/// 一次只读查询取回至多 `SCAN_LIMIT + 1` 条文档（含正文），Rust 侧做大小写不敏感
+/// 子串匹配并生成 snippet。命中数超 `SCAN_LIMIT` ⇒ 500 + `warn!`（**不静默截断**）。
+/// 检索语义（匹配/片段/排序）在 `view` 纯函数，core/kb 层只提供「取回全部文档」原语。
+///
+/// **隔离缺口（design §3.4）**：同 E1/E2 —— 不加 per-user / per-KB 过滤。
+pub async fn search_memory_documents(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<MemorySearchQuery>,
+) -> Result<Json<view::MemorySearchResponse>, ApiError> {
+    let q = params.q.as_deref().map(str::trim).unwrap_or("");
+    if q.is_empty() {
+        return Err(ApiError::BadRequest("查询参数 q 不能为空".into()));
+    }
+    let limit = clamp_search_limit(params.limit);
+    let source = params
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    // `SCAN_LIMIT + 1` 探测超限（同 E2 的 `limit+1` 范式）。
+    let rows = ws
+        .knowledge_manager()
+        .list_memory_documents_with_content(PRIVATE_MEMORY_KB, view::SCAN_LIMIT + 1)
+        .await
+        .map_err(|e| map_memory_kb_error("failed to search memory documents", e))?;
+
+    if rows.len() > view::SCAN_LIMIT {
+        warn!(
+            found = rows.len(),
+            scan_limit = view::SCAN_LIMIT,
+            "memory document scan exceeded SCAN_LIMIT"
+        );
+        return Err(ApiError::Internal(format!(
+            "memory document scan exceeded SCAN_LIMIT={}",
+            view::SCAN_LIMIT
+        )));
+    }
+
+    Ok(Json(view::build_search_response(view::search_documents(
+        rows, q, source, limit,
+    ))))
 }
 
 /// 构建 Peco 路由。
@@ -1588,7 +1702,9 @@ pub async fn list_memory_documents(
 /// - `GET /memory/consolidation/optin` — 查询自动整理 opt-in 开关
 /// - `PUT /memory/consolidation/optin` — 写入自动整理 opt-in 开关
 /// - `GET /memory/graph` — 记忆实体子图（节点 + 谓词边）
-/// - `GET /memory/documents` — 记忆文档列表（分页）
+/// - `GET /memory/documents` — 记忆文档列表（分页，可按 `source` 过滤）
+/// - `GET /memory/documents/{id}` — 记忆文档详情（全文 + 元数据）
+/// - `GET /memory/search` — 记忆内容检索（正文子串扫描，`?q=&limit[&source]`）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
@@ -1607,6 +1723,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/consolidation/optin", put(set_memory_optin))
         .route("/memory/graph", get(get_memory_graph))
         .route("/memory/documents", get(list_memory_documents))
+        .route("/memory/documents/{id}", get(get_memory_document))
+        .route("/memory/search", get(search_memory_documents))
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,5 +1814,89 @@ mod tests {
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "unauthorized");
+    }
+
+    /// E4 `q` 空判定 → 400 `bad_request`（JSON，非 axum 纯文本）。
+    #[tokio::test]
+    async fn search_empty_q_maps_to_bad_request() {
+        let err = ApiError::BadRequest("查询参数 q 不能为空".into());
+        let (status, body) = status_and_json(err.into_response()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_request");
+        assert_eq!(body["details"], "查询参数 q 不能为空");
+    }
+
+    /// E4 handler 错误映射：`search` 操作前缀 + NotFound→404 / 其余→500。
+    #[tokio::test]
+    async fn memory_search_maps_errors() {
+        let not_found = map_memory_kb_error(
+            "failed to search memory documents",
+            KnowledgeModuleError::NotFound(PRIVATE_MEMORY_KB.into()),
+        );
+        let (status, body) = status_and_json(not_found.into_response()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+
+        let internal = map_memory_kb_error(
+            "failed to search memory documents",
+            KnowledgeModuleError::NotInitialized,
+        );
+        let (status, body) = status_and_json(internal.into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "internal");
+        assert!(
+            body["details"]
+                .as_str()
+                .unwrap()
+                .starts_with("failed to search memory documents")
+        );
+    }
+
+    /// E4 clamp：区间 `1..=50`（999→50、0→1、负数→1、20→20）。
+    #[test]
+    fn search_limit_is_clamped_to_1_50() {
+        assert_eq!(clamp_search_limit(999), 50);
+        assert_eq!(clamp_search_limit(0), 1);
+        assert_eq!(clamp_search_limit(-5), 1);
+        assert_eq!(clamp_search_limit(20), 20);
+        assert_eq!(clamp_search_limit(50), 50);
+        assert_eq!(clamp_search_limit(51), 50);
+    }
+
+    /// E4 `MemorySearchQuery` 反序列化：省略 `limit` 仍得默认 20
+    /// （缺 `#[serde(default = ..)]` 时反序列化会失败）。
+    #[test]
+    fn memory_search_query_defaults_limit() {
+        use axum::http::Uri;
+
+        let uri: Uri = "/memory/search?q=x".parse().unwrap();
+        let q = Query::<MemorySearchQuery>::try_from_uri(&uri)
+            .expect("省略 limit 必须能反序列化（默认 20）");
+        assert_eq!(q.q.as_deref(), Some("x"));
+        assert_eq!(q.limit, 20);
+        assert_eq!(q.source, None);
+
+        let uri: Uri = "/memory/search?q=x&limit=999&source=ppa_profile"
+            .parse()
+            .unwrap();
+        let q = Query::<MemorySearchQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.limit, 999, "解析值原样给出，再由 clamp_search_limit 收敛");
+        assert_eq!(q.source.as_deref(), Some("ppa_profile"));
+    }
+
+    /// E2 `MemoryDocumentQuery`：`source` 可选（缺省 → None）。
+    #[test]
+    fn memory_document_query_source_is_optional() {
+        use axum::http::Uri;
+
+        let uri: Uri = "/memory/documents?offset=20&limit=10".parse().unwrap();
+        let q = Query::<MemoryDocumentQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.offset, 20);
+        assert_eq!(q.limit, 10);
+        assert_eq!(q.source, None);
+
+        let uri: Uri = "/memory/documents?source=ppa_profile".parse().unwrap();
+        let q = Query::<MemoryDocumentQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.source.as_deref(), Some("ppa_profile"));
     }
 }

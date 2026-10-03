@@ -2,7 +2,12 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import api from "../client";
-import { getMemoryGraph, listMemoryDocuments } from "../memory";
+import {
+  getMemoryDocument,
+  getMemoryGraph,
+  listMemoryDocuments,
+  searchMemoryDocuments,
+} from "../memory";
 
 vi.mock("../client", () => ({
   default: { get: vi.fn() },
@@ -63,6 +68,73 @@ describe("memory API", () => {
     await expect(listMemoryDocuments(20, 10)).resolves.toEqual(payload);
     expect(GET).toHaveBeenCalledWith("/peco/memory/documents", {
       params: { offset: 20, limit: 10 },
+    });
+  });
+
+  it("listMemoryDocuments(0,20) 不塞 source 键", async () => {
+    GET.mockResolvedValue({
+      data: { documents: [], offset: 0, limit: 20, has_more: false },
+    });
+
+    await listMemoryDocuments(0, 20);
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/documents", {
+      params: { offset: 0, limit: 20 },
+    });
+  });
+
+  it("listMemoryDocuments(0,20,'ppa_profile') 透传 source", async () => {
+    GET.mockResolvedValue({
+      data: { documents: [], offset: 0, limit: 20, has_more: false },
+    });
+
+    await listMemoryDocuments(0, 20, "ppa_profile");
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/documents", {
+      params: { offset: 0, limit: 20, source: "ppa_profile" },
+    });
+  });
+
+  it("getMemoryDocument('abc') GET 详情路径并 resolve data", async () => {
+    const payload = {
+      id: "abc",
+      title: "t",
+      source: "ppa_semantic",
+      file_type: "txt",
+      created_at: null,
+      content: "正文",
+    };
+    GET.mockResolvedValue({ data: payload });
+
+    await expect(getMemoryDocument("abc")).resolves.toEqual(payload);
+    expect(GET).toHaveBeenCalledWith("/peco/memory/documents/abc");
+  });
+
+  it("getMemoryDocument('a/b') 对 id 做 URL 编码", async () => {
+    GET.mockResolvedValue({ data: {} });
+
+    await getMemoryDocument("a/b");
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/documents/a%2Fb");
+  });
+
+  it("searchMemoryDocuments('小C',20) 不带 source 键", async () => {
+    GET.mockResolvedValue({ data: { hits: [] } });
+
+    await searchMemoryDocuments("小C", 20);
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/search", {
+      params: { q: "小C", limit: 20 },
+    });
+  });
+
+  it("searchMemoryDocuments('小C',20,'ppa_semantic') 透传 source", async () => {
+    GET.mockResolvedValue({ data: { hits: [] } });
+
+    await searchMemoryDocuments("小C", 20, "ppa_semantic");
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/search", {
+      params: { q: "小C", limit: 20, source: "ppa_semantic" },
     });
   });
 });

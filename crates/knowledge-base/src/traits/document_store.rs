@@ -28,6 +28,101 @@ pub trait DocumentStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<DocumentSummary>, KnowledgeError>;
 
+    /// 分页列出文档，可选按 `source_path` **精确**过滤（E2）。
+    ///
+    /// 默认实现是**可移植**的「先过滤、后分页」兜底：以 `RAW_PAGE` 为步长循环
+    /// [`Self::list`]，逐条比对 `source_path == want`（**精确**，非前缀），再
+    /// `skip(offset)` / `take(limit)` —— 语义与 HelixDB 下推逐位一致
+    /// （`offset` 为过滤后的偏移）。HelixDB 覆写为下推查询。
+    ///
+    /// **终止条件（三者任一即停，防死循环）**：
+    /// ① 取回批次为空；② 批次长度 < `RAW_PAGE`（数据耗尽）；③ 已攒满 `limit`。
+    async fn list_by_source(
+        &self,
+        offset: usize,
+        limit: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<DocumentSummary>, KnowledgeError> {
+        let Some(want) = source else {
+            return self.list(offset, limit).await;
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 兜底分页读取的原始页大小。
+        const RAW_PAGE: usize = 200;
+
+        let mut raw_offset = 0usize;
+        let mut skipped = 0usize;
+        let mut out: Vec<DocumentSummary> = Vec::new();
+        loop {
+            let batch = self.list(raw_offset, RAW_PAGE).await?;
+            let exhausted = batch.len() < RAW_PAGE;
+            let batch_len = batch.len();
+            for item in batch {
+                if item.source_path != want {
+                    continue;
+                }
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                out.push(item);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            if exhausted || batch_len == 0 {
+                return Ok(out);
+            }
+            raw_offset += batch_len;
+        }
+    }
+
+    /// 取回至多 `limit` 条文档（**含正文 + metadata**），供 E4 全量扫描（M9）。
+    ///
+    /// 默认实现是**可移植**兜底（仅用于非 HelixDB 后端，允许 N+1）：以 `RAW_PAGE`
+    /// 为步长循环 [`Self::list`] 取摘要，再逐条 [`Self::get`] 取全文（`None` 跳过），
+    /// 累积到 `limit` 条。HelixDB 覆写为单次 `Limit + Project(content, metadata)`。
+    ///
+    /// **终止条件（任一即停）**：① 取回批次为空；② 批次长度 < `RAW_PAGE`；
+    /// ③ 已累积达 `limit`。
+    async fn list_all(&self, limit: usize) -> Result<Vec<Document>, KnowledgeError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 兜底分页读取的原始页大小。
+        const RAW_PAGE: usize = 200;
+
+        let mut raw_offset = 0usize;
+        let mut out: Vec<Document> = Vec::new();
+        loop {
+            if out.len() >= limit {
+                return Ok(out);
+            }
+            let batch = self.list(raw_offset, RAW_PAGE).await?;
+            let exhausted = batch.len() < RAW_PAGE;
+            let batch_len = batch.len();
+            if batch_len == 0 {
+                return Ok(out);
+            }
+            for summary in batch {
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+                if let Some(doc) = self.get(&summary.id).await? {
+                    out.push(doc);
+                }
+            }
+            if exhausted {
+                return Ok(out);
+            }
+            raw_offset += batch_len;
+        }
+    }
+
     /// 获取文档的分块，按 `sequence_index` 排序。
     async fn chunks(&self, doc_id: &DocumentId) -> Result<Vec<Chunk>, KnowledgeError>;
 

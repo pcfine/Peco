@@ -300,6 +300,28 @@ impl IngestionPipeline {
     ) -> Result<Vec<DocumentSummary>, KnowledgeError> {
         self.doc_store.list(offset, limit).await
     }
+
+    /// 列出文档摘要（分页），可选按 `source_path` **精确**过滤（E2）。
+    ///
+    /// 纯透传给 [`DocumentStore::list_by_source`]：HelixDB 下推为 `NWhere.And`，
+    /// 其余后端走可移植「先过滤后分页」兜底 —— 两者的 `offset` 语义一致
+    /// （过滤后的偏移，design §3.2 E2）。
+    pub async fn list_documents_by_source(
+        &self,
+        offset: usize,
+        limit: usize,
+        source: Option<&str>,
+    ) -> Result<Vec<DocumentSummary>, KnowledgeError> {
+        self.doc_store.list_by_source(offset, limit, source).await
+    }
+
+    /// 取回至多 `limit` 条文档（**含正文**），供 E4 全量扫描（M9）。
+    ///
+    /// 纯透传给 [`DocumentStore::list_all`]；**不掺入**检索语义
+    /// （匹配 / 片段 / 排序在 server 纯函数，design §3.3-M13）。
+    pub async fn list_all_documents(&self, limit: usize) -> Result<Vec<Document>, KnowledgeError> {
+        self.doc_store.list_all(limit).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,5 +628,117 @@ mod tests {
         let first = pipeline.embed_texts(&texts).await.unwrap();
         let second = pipeline.embed_texts(&texts).await.unwrap();
         assert_eq!(first, second, "同文本两次嵌入应 bit 级一致");
+    }
+
+    // ── v2：E2 来源筛选 / E4 全量扫描取数原语 ──────────────────────────────
+
+    /// 构造一个仅带 `doc_store` 的管道（检索语义不在本层，无需向量/图/全文）。
+    fn list_pipeline(backend: Arc<InMemoryBackend>) -> IngestionPipeline {
+        IngestionPipeline::new(
+            backend as Arc<dyn DocumentStore>,
+            None,
+            None,
+            None,
+            Arc::new(MockEmbedding { ndims: 4 }),
+            make_chunker(ChunkingStrategy::FixedSize { size: 100 }),
+        )
+    }
+
+    fn full_doc(id: &str, source: &str, content: &str) -> Document {
+        Document {
+            id: id.into(),
+            kb_id: None,
+            title: id.into(),
+            source_path: source.into(),
+            content: content.into(),
+            metadata: DocumentMetadata::default(),
+        }
+    }
+
+    /// E2：`list_documents_by_source` —— InMemory 默认实现（先过滤后分页）语义：
+    /// 精确匹配、非法值为空、None 不过滤、offset 为过滤后偏移。
+    #[tokio::test]
+    async fn list_documents_by_source_filters_then_pages() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pipeline = list_pipeline(backend.clone());
+        for (id, source) in [
+            ("a", "ppa_episodic"),
+            ("b", "ppa_episodic"),
+            ("c", "ppa_semantic"),
+            ("d", "ppa_profile"),
+        ] {
+            backend
+                .store(full_doc(id, source, "x"), vec![])
+                .await
+                .unwrap();
+        }
+
+        let ids = |rows: Vec<DocumentSummary>| {
+            let mut v: Vec<String> = rows.into_iter().map(|r| r.id).collect();
+            v.sort();
+            v
+        };
+
+        // Some("ppa_episodic") → 恰那 2 条
+        let rows = pipeline
+            .list_documents_by_source(0, 10, Some("ppa_episodic"))
+            .await
+            .unwrap();
+        assert_eq!(ids(rows), vec!["a".to_string(), "b".to_string()]);
+
+        // 非法 source → 空（非错误）
+        let rows = pipeline
+            .list_documents_by_source(0, 10, Some("ppa_nope"))
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+
+        // None → 全 4 条
+        let rows = pipeline
+            .list_documents_by_source(0, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(ids(rows).len(), 4);
+
+        // offset 为**过滤后**的偏移：两页各 1 条、并集 = 那 2 条
+        let p0 = pipeline
+            .list_documents_by_source(0, 1, Some("ppa_episodic"))
+            .await
+            .unwrap();
+        let p1 = pipeline
+            .list_documents_by_source(1, 1, Some("ppa_episodic"))
+            .await
+            .unwrap();
+        assert_eq!(p0.len(), 1);
+        assert_eq!(p1.len(), 1);
+
+        let mut union = ids(p0);
+        union.extend(ids(p1));
+        union.sort();
+        union.dedup();
+        assert_eq!(union, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// E4：`list_all_documents` 返回**含正文**的文档、并截断到 `limit`。
+    #[tokio::test]
+    async fn list_all_documents_returns_content_and_truncates() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pipeline = list_pipeline(backend.clone());
+        for id in ["a", "b", "c"] {
+            backend
+                .store(full_doc(id, "s", &format!("正文-{id}")), vec![])
+                .await
+                .unwrap();
+        }
+
+        let docs = pipeline.list_all_documents(10).await.unwrap();
+        assert_eq!(docs.len(), 3);
+        assert!(
+            docs.iter().all(|d| !d.content.is_empty()),
+            "必须返回含正文的文档（非摘要）"
+        );
+
+        let two = pipeline.list_all_documents(2).await.unwrap();
+        assert_eq!(two.len(), 2, "limit=2 ⇒ 恰 2 条");
     }
 }

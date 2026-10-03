@@ -544,22 +544,75 @@ pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
 
 /// 分页列出文档（v2: NWithLabel → NWhere + $label 等式）。
 ///
+/// 委托 [`list_documents_filtered`] 且 `source = None` ⇒ AST 与 v2 逐字相同
+/// （首步骤为 `NWhere.Eq:$label`，**无** `And` 包裹）—— 既有形状单测与线上行为
+/// 均不受 `source` 扩展影响（design §3.3-M11）。
+pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Value {
+    list_documents_filtered(schema, offset, limit, None)
+}
+
+/// 分页列出文档，可选按 `source_path` **精确**过滤（E2）。
+///
 /// 投影的 `id` 取 `schema.id_property`（内容哈希）而非 HelixDB 内置 `$id`，
 /// 与 `get_document_by_id` / `delete_document_cascade` 的匹配口径保持一致 ——
 /// 否则列表返回的 ID 无法回传给删除接口。
-pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Value {
+///
+/// `source = None` ⇒ 首步骤 `NWhere.Eq:$label`（与既有 `list_documents` 逐字相同）；
+/// `source = Some(s)` ⇒ 首步骤 `NWhere.And:[Eq:$label, Eq:source_path=s]`。
+/// 过滤在 `Skip`/`Limit` **之前**下推 ⇒ `offset` 是「过滤后的偏移」（design §3.2 E2）。
+pub fn list_documents_filtered(
+    schema: &HelixSchema,
+    offset: usize,
+    limit: usize,
+    source: Option<&str>,
+) -> Value {
+    let node_match = match source {
+        None => json!({"Eq": ["$label", {"String": schema.content_node_label}]}),
+        Some(s) => json!({"And": [
+            {"Eq": ["$label", {"String": schema.content_node_label}]},
+            {"Eq": ["source_path", {"String": s}]}
+        ]}),
+    };
+
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "docs", "steps": [
-                    {"NWhere": {"Eq": ["$label", {"String": schema.content_node_label}]}},
+                    {"NWhere": node_match},
                     {"Skip": offset},
                     {"Limit": limit},
                     {"Project": [
                         {"source": schema.id_property, "alias": "id"},
                         {"source": "title", "alias": "title"},
                         {"source": "source_path", "alias": "source_path"},
+                        {"source": "metadata", "alias": "metadata"}
+                    ]}
+                ], "condition": null}}
+            ],
+            "returns": ["docs"]
+        }
+    })
+}
+
+/// 全量扫描文档（E4）：取回至多 `limit` 条 `Document`（**含正文 + metadata**）。
+///
+/// 一次只读查询：`NWhere.Eq:$label` → `Limit` → `Project(id,title,source_path,content,metadata)`。
+/// **不做**分页 `Skip`，投影含 `content`（同 `get_document_by_id` 的正文属性口径）——
+/// 这是「中文全文索引不可用」的替代机制所需的取数原语（design §3.2 E4 / §3.3-M11）。
+pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value {
+    json!({
+        "request_type": "read",
+        "query": {
+            "queries": [
+                {"Query": {"name": "docs", "steps": [
+                    {"NWhere": {"Eq": ["$label", {"String": schema.content_node_label}]}},
+                    {"Limit": limit},
+                    {"Project": [
+                        {"source": schema.id_property, "alias": "id"},
+                        {"source": "title", "alias": "title"},
+                        {"source": "source_path", "alias": "source_path"},
+                        {"source": schema.content_text_property, "alias": "content"},
                         {"source": "metadata", "alias": "metadata"}
                     ]}
                 ], "condition": null}}
@@ -1385,6 +1438,99 @@ mod tests {
         assert!(
             !props.iter().any(|p| p[0] == "embedding"),
             "空 embedding 不应写入 embedding 属性，实际 props: {props:?}"
+        );
+    }
+
+    /// ① v2 `list_documents_filtered(Some)`：首步骤 `NWhere.And` =
+    /// `[Eq:$label, Eq:source_path]`，随后 `Skip`/`Limit`/`Project`，`Project[0].source=="id"`。
+    #[test]
+    fn list_documents_filtered_with_source_uses_and_pushdown() {
+        let s = test_schema();
+        let q = list_documents_filtered(&s, 5, 10, Some("ppa_profile"));
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+
+        let and = steps[0]["NWhere"]["And"]
+            .as_array()
+            .expect("Some(source) ⇒ NWhere.And");
+        assert_eq!(and.len(), 2, "And 恰两条等式");
+        assert_eq!(
+            and[0],
+            json!({"Eq": ["$label", {"String": s.content_node_label}]})
+        );
+        assert_eq!(
+            and[1],
+            json!({"Eq": ["source_path", {"String": "ppa_profile"}]})
+        );
+
+        // 过滤在 Skip/Limit 之前下推
+        assert_eq!(steps[1]["Skip"], 5);
+        assert_eq!(steps[2]["Limit"], 10);
+        let project = steps[3]["Project"].as_array().unwrap();
+        assert_eq!(project[0]["source"], "id");
+        assert_eq!(project[0]["alias"], "id");
+    }
+
+    /// ② v2 回归：`list_documents`（无 source）首步骤为 `NWhere.Eq:$label`，
+    /// **无** `And` 包裹，且与 `list_documents_filtered(.., None)` 逐字相同。
+    #[test]
+    fn list_documents_without_source_has_no_and() {
+        let s = test_schema();
+        let q = list_documents(&s, 0, 10);
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+
+        let nwhere = &steps[0]["NWhere"];
+        assert!(
+            nwhere.get("And").is_none(),
+            "无 source 不得出现 And：{nwhere:?}"
+        );
+        assert_eq!(nwhere["Eq"], json!(["$label", {"String": "Document"}]));
+
+        assert_eq!(
+            q,
+            list_documents_filtered(&s, 0, 10, None),
+            "list_documents 必须逐字委托 filtered(None)"
+        );
+    }
+
+    /// ③ v2 `list_documents_with_content`：`NWhere.Eq:$label` → `Limit` →
+    /// `Project` 含 `content`/`metadata`，`Project[0].source=="id"`，无 `Skip`。
+    #[test]
+    fn list_documents_with_content_projects_content() {
+        let s = test_schema();
+        let q = list_documents_with_content(&s, 2001);
+        let steps = q["query"]["queries"][0]["Query"]["steps"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            steps[0]["NWhere"],
+            json!({"Eq": ["$label", {"String": s.content_node_label}]})
+        );
+        assert_eq!(steps[1]["Limit"], 2001);
+        assert!(
+            steps.iter().all(|st| st.get("Skip").is_none()),
+            "扫描不分页，不得含 Skip"
+        );
+
+        let project = steps[2]["Project"].as_array().unwrap();
+        assert_eq!(project[0]["source"], "id");
+        assert_eq!(project[0]["alias"], "id");
+        let aliases: Vec<&str> = project
+            .iter()
+            .map(|p| p["alias"].as_str().unwrap())
+            .collect();
+        assert!(aliases.contains(&"content"), "必须投影正文：{aliases:?}");
+        assert!(
+            aliases.contains(&"metadata"),
+            "必须投影 metadata：{aliases:?}"
+        );
+        assert_eq!(
+            project.iter().find(|p| p["alias"] == "content").unwrap()["source"],
+            s.content_text_property
         );
     }
 
