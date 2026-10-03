@@ -11,6 +11,7 @@ pub mod memory_audit;
 pub mod memory_consolidation_optin;
 pub mod memory_consolidation_state;
 pub mod memory_recall_stats;
+pub mod memory_supersede;
 pub mod messages;
 pub mod session_archive;
 pub mod sync;
@@ -295,6 +296,26 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 010 skipped: memory_consolidation_optin table already exists");
     }
 
+    // ── Migration 011: 记忆取代 shadow 观测表 ─────────────────────────────
+    let has_supersede_shadow = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_supersede_shadow'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_supersede_shadow {
+        run_migration(
+            pool,
+            "011",
+            include_str!("migrations/011_peco_memory_supersede_shadow.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 011 completed");
+    } else {
+        tracing::debug!("Migration 011 skipped: memory_supersede_shadow table already exists");
+    }
+
     Ok(())
 }
 
@@ -463,6 +484,53 @@ mod tests {
         assert_eq!(
             count, 1,
             "重跑迁移后表 memory_consolidation_optin 不得重复创建"
+        );
+    }
+
+    /// 迁移 011：首次执行建出 shadow 观测表；已有数据在二次执行后保持不变
+    /// （前置存在性检查命中 → 跳过，不重建、不清空）。
+    #[tokio::test]
+    async fn migration_011_creates_table_once_and_survives_rerun() {
+        let (pool, _dir) = test_pool().await;
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("memory_supersede_shadow")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "表 memory_supersede_shadow 应已由迁移 011 创建");
+
+        // 写入一行 shadow 记录后重跑迁移，数据与表数量必须保持不变
+        sqlx::query(
+            "INSERT INTO memory_supersede_shadow \
+             (user_id, created_at, candidates_json, facts_json, decisions_json) \
+             VALUES ('u1', '2026-10-01T00:00:00+00:00', '[]', '[]', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let shadow_rows =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_supersede_shadow")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(shadow_rows, 1, "重跑迁移不得清空已有 shadow 记录");
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("memory_supersede_shadow")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "重跑迁移后表 memory_supersede_shadow 不得重复创建"
         );
     }
 }

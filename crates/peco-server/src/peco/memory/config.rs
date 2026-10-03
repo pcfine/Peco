@@ -109,6 +109,32 @@ pub struct MemoryConfig {
     pub recall_half_life_days: u64,
     /// 自动整理（巩固流水线）配置。
     pub consolidation: ConsolidationConfig,
+
+    // ── 取代机制 · 阶段一（在线 shadow：只观测，不删除）────────────────
+    /// 是否写 shadow 观测行（效果门数据源）。
+    ///
+    /// `false` 时提取照常、KB 照写，但不落 `memory_supersede_shadow`，
+    /// 且候选召回退回单通道（见 hook 的 `build_candidates`）。
+    pub supersede_shadow: bool,
+    /// 是否真退役（取代执行开关）。
+    ///
+    /// **阶段一恒 `false`** —— 只留位：除候选召回门控外没有任何读取点，
+    /// 不触发任何删除；效果门标定完成前禁止开启（fail-closed）。
+    pub supersede_enforce: bool,
+    /// 双通道「近期」通道每类目取几条。
+    pub candidate_recent_per_category: usize,
+    /// 候选总数上限。
+    pub candidate_cap: usize,
+    /// 单条候选展示文本的**字符**上限（近期通道对 `content` 截断）。
+    pub candidate_text_cap: usize,
+    /// 候选区 prompt 的 token 上限（`estimate_str_tokens` 估算，超限截断）。
+    pub candidate_token_cap: usize,
+    /// 单轮最多接受几条取代决策（本阶段仅用于 shadow 记 `would_act`）。
+    pub supersede_per_turn_cap: usize,
+    /// 「近期通道」全量扫描文档的上限（与 `@memory` 检索端点同口径）。
+    pub shadow_scan_limit: usize,
+    /// shadow 行保留期（天）。本阶段只提供清理函数，未接调度器。
+    pub shadow_retention_days: u64,
 }
 
 impl Default for MemoryConfig {
@@ -124,6 +150,15 @@ impl Default for MemoryConfig {
             analyzer_timeout_secs: 10,
             recall_half_life_days: 30,
             consolidation: ConsolidationConfig::default(),
+            supersede_shadow: true,
+            supersede_enforce: false,
+            candidate_recent_per_category: 10,
+            candidate_cap: 30,
+            candidate_text_cap: 200,
+            candidate_token_cap: 2000,
+            supersede_per_turn_cap: 3,
+            shadow_scan_limit: 2000,
+            shadow_retention_days: 30,
         }
     }
 }
@@ -143,6 +178,16 @@ mod tests {
         assert_eq!(c.recall_top_k, 5);
         assert_eq!(c.injection_token_cap, 1000);
         assert_eq!(c.recall_half_life_days, 30);
+        // 取代机制 · 阶段一：shadow 开、enforce 关（fail-closed）
+        assert!(c.supersede_shadow);
+        assert!(!c.supersede_enforce);
+        assert_eq!(c.candidate_recent_per_category, 10);
+        assert_eq!(c.candidate_cap, 30);
+        assert_eq!(c.candidate_text_cap, 200);
+        assert_eq!(c.candidate_token_cap, 2000);
+        assert_eq!(c.supersede_per_turn_cap, 3);
+        assert_eq!(c.shadow_scan_limit, 2000);
+        assert_eq!(c.shadow_retention_days, 30);
     }
 
     #[test]

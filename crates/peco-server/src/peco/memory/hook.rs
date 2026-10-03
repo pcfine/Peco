@@ -12,6 +12,10 @@
 // 执行模型：守卫与收集在 looper 上下文内同步完成（O(1)，只看最后一轮），
 // 检索、LLM 提取与 KB 写入全部 `tokio::spawn` 到后台 — turn 边界零阻塞。
 // spawn 前数据全部转 owned，无借用问题；单用户场景写入乱序风险可接受。
+//
+// 取代机制 · 阶段一（在线 shadow）：候选召回双通道带 doc_id，提取产出的
+// supersedes 决策只落 `memory_supersede_shadow` 观测表 —— KB 只 append，
+// 绝不调用删除。
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -19,20 +23,54 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use model_provider::{InputItem, Role, Usage};
-use peco_core::agent::{LooperHook, TurnFailureReason};
+use peco_core::agent::{LooperHook, TurnFailureReason, estimate_str_tokens};
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::session::Session;
-use tracing::{info, warn};
+use serde_json::json;
+use tracing::{debug, info, warn};
 
-use super::analyzer::{MemoryFact, TurnAnalyzer};
+use super::analyzer::{MemoryCandidate, MemoryCategory, MemoryFact, TurnAnalyzer};
 use super::config::MemoryConfig;
 use super::dedup::max_cosine;
+use crate::db::memory_supersede::{ShadowRow, insert_shadow};
+
+/// 带来源通道的候选 — shadow 快照要记 channel，analyzer 只见 [`MemoryCandidate`]。
+struct MemoryCandidateWithChannel {
+    id: String,
+    /// KB source 标签（如 `ppa_semantic`）
+    source: String,
+    /// 展示文本（snippet 或截断后的正文）
+    text: String,
+    /// `"search"` | `"recent"` | `"both"`
+    channel: &'static str,
+}
+
+impl MemoryCandidateWithChannel {
+    fn to_candidate(&self) -> MemoryCandidate {
+        MemoryCandidate {
+            id: self.id.clone(),
+            source: self.source.clone(),
+            text: self.text.clone(),
+        }
+    }
+}
+
+/// `build_candidates` 的返回值：候选集 + 通道 A 原始结果（供近重复判定）。
+struct CandidateSet {
+    candidates: Vec<MemoryCandidateWithChannel>,
+    /// 通道 A（search_kb）原始 `(source_path, snippet)`，**不受任何候选上限截断影响** ——
+    /// 近重复判定比对集必须与旧单通道行为逐字一致。
+    dedup_baseline: Vec<(String, String)>,
+}
 
 /// 记忆提取写路径。
 pub struct MemoryExtractionHook {
     km: Arc<KnowledgeManager>,
     analyzer: Arc<dyn TurnAnalyzer>,
     config: MemoryConfig,
+    /// shadow 观测行的落库位置（`supersede_shadow=false` 时不会被写）
+    db: sqlx::SqlitePool,
+    user_id: String,
 }
 
 impl MemoryExtractionHook {
@@ -40,11 +78,15 @@ impl MemoryExtractionHook {
         km: Arc<KnowledgeManager>,
         analyzer: Arc<dyn TurnAnalyzer>,
         config: MemoryConfig,
+        db: sqlx::SqlitePool,
+        user_id: String,
     ) -> Self {
         Self {
             km,
             analyzer,
             config,
+            db,
+            user_id,
         }
     }
 
@@ -158,6 +200,252 @@ impl MemoryExtractionHook {
                 .collect(),
         )
     }
+
+    /// 双通道候选召回（取代指针的校验集）。
+    ///
+    /// - 通道 A（search）：相似度检索，取 `{document_id, source_path, snippet}`；
+    /// - 通道 B（recent）：全量扫描 `ppa_*` 记忆按 `created_at` 倒序、每类目取
+    ///   前 N 条 —— 补相似度检索漏掉的「近期前身」（取代的主要目标）。
+    ///
+    /// 合并按 id 去重（同 id 双通道 → `both`，保留通道 A 的 snippet）；
+    /// 任一通道失败只 warn 并用另一通道，两通道都空则空候选照常调模型。
+    /// shadow 与 enforce 同时关闭时只走通道 A（候选集合与旧单通道一致，
+    /// 仅新增 id/source 展示字段）。
+    ///
+    /// 返回 [`CandidateSet`]：`candidates` 受三个候选上限截断（供 prompt /
+    /// shadow 快照），`dedup_baseline` 是通道 A 原始结果（供近重复判定），
+    /// 不受截断影响。
+    async fn build_candidates(
+        km: &KnowledgeManager,
+        config: &MemoryConfig,
+        query: &str,
+    ) -> CandidateSet {
+        // 通道 A —— 失败只失去相似度提示，不阻断
+        let search_hits: Vec<MemoryCandidateWithChannel> = match km
+            .search_kb(&config.kb_name, query, config.extraction_top_k)
+            .await
+        {
+            Ok(results) => results
+                .into_iter()
+                .map(|r| MemoryCandidateWithChannel {
+                    id: r.document_id,
+                    source: r.source_path,
+                    text: r.snippet,
+                    channel: "search",
+                })
+                .collect(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    kb = %config.kb_name,
+                    "Candidate search failed (using remaining channel)"
+                );
+                Vec::new()
+            }
+        };
+
+        // 近重复判定比对集：通道 A 原始 (source_path, snippet)，在任何截断之前
+        // 取出 —— 尾部搜索命中被候选上限挤出候选集时仍须参与判重
+        let dedup_baseline: Vec<(String, String)> = search_hits
+            .iter()
+            .map(|c| (c.source.clone(), c.text.clone()))
+            .collect();
+
+        // 通道 B —— 仅在 shadow/enforce 至少其一时启用
+        let recent_hits = if config.supersede_shadow || config.supersede_enforce {
+            Self::recent_candidates(km, config).await
+        } else {
+            Vec::new()
+        };
+
+        // 合并：search 在前（相关性优先），同 id 覆盖为 "both"（text 保留 search 的）
+        let mut merged: Vec<MemoryCandidateWithChannel> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for c in search_hits.into_iter().chain(recent_hits) {
+            match seen.get(&c.id) {
+                Some(&idx) => merged[idx].channel = "both",
+                None => {
+                    seen.insert(c.id.clone(), merged.len());
+                    merged.push(c);
+                }
+            }
+        }
+
+        // 条数上限
+        merged.truncate(config.candidate_cap);
+
+        // token 上限：按 prompt 渲染行估算，超限即止（不放进第一条兜底 —
+        // 上限是硬约束，首条超限就返回空候选）
+        let mut used = 0usize;
+        let mut kept: Vec<MemoryCandidateWithChannel> = Vec::new();
+        for c in merged {
+            let line = format!("- [{}] ({}) {}", c.id, c.source, c.text);
+            let tokens = estimate_str_tokens(&line);
+            if used + tokens > config.candidate_token_cap {
+                break;
+            }
+            used += tokens;
+            kept.push(c);
+        }
+        CandidateSet {
+            candidates: kept,
+            dedup_baseline,
+        }
+    }
+
+    /// 通道 B（近期）：全量扫描 `ppa_*` 记忆文档，`created_at` 倒序，
+    /// 按 source 分组各取 `candidate_recent_per_category` 条。
+    async fn recent_candidates(
+        km: &KnowledgeManager,
+        config: &MemoryConfig,
+    ) -> Vec<MemoryCandidateWithChannel> {
+        let docs = match km
+            .list_memory_documents_with_content(&config.kb_name, config.shadow_scan_limit)
+            .await
+        {
+            Ok(docs) => docs,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    kb = %config.kb_name,
+                    "Recent candidate scan failed (using remaining channel)"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut docs: Vec<_> = docs
+            .into_iter()
+            .filter(|d| d.source_path.starts_with("ppa_"))
+            .collect();
+        // 倒序：None（无创建时间）视为最旧沉底
+        docs.sort_by(|a, b| b.metadata.created_at.cmp(&a.metadata.created_at));
+
+        let mut per_source: HashMap<String, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for d in docs {
+            let count = per_source.entry(d.source_path.clone()).or_insert(0);
+            if *count >= config.candidate_recent_per_category {
+                continue;
+            }
+            *count += 1;
+            out.push(MemoryCandidateWithChannel {
+                text: d.content.chars().take(config.candidate_text_cap).collect(),
+                id: d.id,
+                source: d.source_path,
+                channel: "recent",
+            });
+        }
+        out
+    }
+
+    /// 校验取代指针并落一条 shadow 观测行（阶段一：只记录，不执行）。
+    ///
+    /// - victim 必须在候选集内（A3 契约），越界的 supersedes 剔除并计 `dropped`；
+    /// - analyzer 成功即写 —— **facts 为空也写**（效果门的分母）；
+    /// - 写失败只 warn，不影响后续 KB 写入。
+    /// - `would_act` 只按 `supersede_per_turn_cap` 做条数封顶，**未套用阶段二
+    ///   的前置校验（同槽、`topic_key` 非空）** —— 标定动作率时该口径会偏高，
+    ///   读数时须按此折算。
+    async fn record_shadow(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        config: &MemoryConfig,
+        candidates: &[MemoryCandidateWithChannel],
+        facts: &[MemoryFact],
+    ) {
+        if !config.supersede_shadow {
+            return;
+        }
+
+        let candidate_ids: HashSet<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        let mut validated: Vec<MemoryFact> = Vec::with_capacity(facts.len());
+        let mut items = Vec::new();
+        let mut raw_count = 0usize;
+        let mut dropped = 0usize;
+        for (i, fact) in facts.iter().enumerate() {
+            let mut kept: Vec<String> = Vec::new();
+            let mut victim: Option<String> = None;
+            for id in &fact.supersedes {
+                raw_count += 1;
+                if !candidate_ids.contains(id.as_str()) {
+                    dropped += 1;
+                    continue;
+                }
+                if victim.is_none() {
+                    victim = Some(id.clone());
+                }
+                if !kept.iter().any(|k| k == id) {
+                    kept.push(id.clone());
+                }
+            }
+            // 越界项不入 items（只计 dropped）
+            if let Some(v) = &victim {
+                items.push(json!({
+                    "fact_index": i,
+                    "victim": v,
+                }));
+            }
+            validated.push(MemoryFact {
+                category: fact.category,
+                content: fact.content.clone(),
+                topic: fact.topic.clone(),
+                supersedes: kept,
+            });
+        }
+
+        let decisions = json!({
+            "per_turn_cap": config.supersede_per_turn_cap,
+            "raw_count": raw_count,
+            "dropped": dropped,
+            "would_act": items.len().min(config.supersede_per_turn_cap),
+            "items": items,
+        });
+        let candidates_json: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "source": c.source,
+                    "text": c.text,
+                    "channel": c.channel,
+                })
+            })
+            .collect();
+        let facts_json: Vec<_> = validated
+            .iter()
+            .map(|f| {
+                json!({
+                    "category": f.category.as_str(),
+                    "content": f.content,
+                    "topic": f.topic,
+                    "supersedes": f.supersedes,
+                })
+            })
+            .collect();
+
+        let row = ShadowRow {
+            user_id: user_id.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            candidates_json: serde_json::to_string(&candidates_json)
+                .unwrap_or_else(|_| "[]".to_string()),
+            facts_json: serde_json::to_string(&facts_json).unwrap_or_else(|_| "[]".to_string()),
+            decisions_json: serde_json::to_string(&decisions).unwrap_or_else(|_| "{}".to_string()),
+            acted: false,
+            extracted_topic_cnt: validated.iter().filter(|f| f.topic.is_some()).count() as i64,
+            episodic_cnt: validated
+                .iter()
+                .filter(|f| f.category == MemoryCategory::Episodic)
+                .count() as i64,
+        };
+
+        match insert_shadow(db, &row).await {
+            Ok(id) => debug!(shadow_id = id, user_id = %user_id, "Supersede shadow row written"),
+            Err(e) => {
+                warn!(error = %e, user_id = %user_id, "Supersede shadow write failed (non-fatal)")
+            }
+        }
+    }
 }
 
 /// fact 对应的 KB source 标签（与写入时一致）。
@@ -189,31 +477,21 @@ impl LooperHook for MemoryExtractionHook {
         let km = Arc::clone(&self.km);
         let analyzer = Arc::clone(&self.analyzer);
         let config = self.config.clone();
+        let db = self.db.clone();
+        let user_id = self.user_id.clone();
 
         tokio::spawn(async move {
-            // 提取前检索既有相关记忆（进入 prompt 抑制重复提取）。
-            // 检索失败不阻断 — 只是失去去重提示。
+            // 双通道候选召回（带 doc_id）：进 prompt 供模型指 supersedes，
+            // 快照供 shadow 落库。通道失败不阻断 — 只是失去该通道提示。
             let query = dialogue.chars().take(200).collect::<String>();
-            // 保留 (source_path, snippet) 两份视图：snippet 序列进 analyzer
-            // 抑制重复提取，source_path 供写前近重复判定按类目比对
-            let existing: Vec<(String, String)> = match km
-                .search_kb(&config.kb_name, &query, config.extraction_top_k)
-                .await
-            {
-                Ok(results) => results
-                    .into_iter()
-                    .map(|r| (r.source_path, r.snippet))
-                    .collect(),
-                Err(e) => {
-                    warn!(error = %e, kb = %config.kb_name, "Pre-extraction recall failed (proceeding without existing memories)");
-                    Vec::new()
-                }
-            };
-            let existing_snippets: Vec<String> = existing.iter().map(|(_, s)| s.clone()).collect();
+            let set = Self::build_candidates(&km, &config, &query).await;
+
+            let prompt_candidates: Vec<MemoryCandidate> =
+                set.candidates.iter().map(|c| c.to_candidate()).collect();
 
             let analyzed = tokio::time::timeout(
                 std::time::Duration::from_secs(config.analyzer_timeout_secs),
-                analyzer.analyze(&dialogue, &existing_snippets),
+                analyzer.analyze(&dialogue, &prompt_candidates),
             )
             .await;
 
@@ -231,16 +509,23 @@ impl LooperHook for MemoryExtractionHook {
                     return;
                 }
             };
+
+            // 提取成功即落 shadow（空事实也写 — 效果门的分母）；失败只 warn
+            Self::record_shadow(&db, &user_id, &config, &set.candidates, &facts).await;
+
             if facts.is_empty() {
                 return;
             }
 
-            // 写前近重复判定（shadow 下只记日志）。嵌入不可用 → None → 全部放行
+            // 写前近重复判定（shadow 下只记日志）。嵌入不可用 → None → 全部放行。
+            // 比对集用 `dedup_baseline`（通道 A 原始结果）而非候选集 —— 候选集
+            // 已被 candidate_cap / candidate_token_cap 截断，尾部搜索命中若被
+            // 挤出候选也仍须参与判重
             let duplicates = Self::near_duplicate_flags(
                 &km,
                 &config.kb_name,
                 &facts,
-                &existing,
+                &set.dedup_baseline,
                 config.consolidation.dedup_cos,
             )
             .await
@@ -299,7 +584,7 @@ mod tests {
     /// 可编程 mock 提取器 — 记录调用入参，返回预设结果。
     struct MockAnalyzer {
         result: std::sync::Mutex<Result<Vec<MemoryFact>, String>>,
-        calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+        calls: std::sync::Mutex<Vec<(String, Vec<MemoryCandidate>)>>,
     }
 
     impl MockAnalyzer {
@@ -323,14 +608,35 @@ mod tests {
         async fn analyze(
             &self,
             turn_dialogue: &str,
-            existing_memories: &[String],
+            candidates: &[MemoryCandidate],
         ) -> Result<Vec<MemoryFact>, String> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((turn_dialogue.to_string(), existing_memories.to_vec()));
+                .push((turn_dialogue.to_string(), candidates.to_vec()));
             self.result.lock().unwrap().clone()
         }
+    }
+
+    /// 已迁移的 shadow 测试池（tempdir 须被持有到断言之后）。
+    async fn migrated_pool() -> (sqlx::SqlitePool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        (pool, dir)
+    }
+
+    /// 构造挂已迁移池的 hook（shadow 表存在，user_id 固定为 test-user）。
+    async fn make_hook(
+        km: Arc<KnowledgeManager>,
+        analyzer: Arc<dyn TurnAnalyzer>,
+        config: MemoryConfig,
+    ) -> (MemoryExtractionHook, sqlx::SqlitePool, tempfile::TempDir) {
+        let (pool, dir) = migrated_pool().await;
+        let hook =
+            MemoryExtractionHook::new(km, analyzer, config, pool.clone(), "test-user".to_string());
+        (hook, pool, dir)
     }
 
     fn make_test_kb_config(name: &str) -> KbConfig {
@@ -379,6 +685,17 @@ mod tests {
         km.add_text_to_kb("@private_memory", title, content, source)
             .await
             .unwrap();
+        km
+    }
+
+    /// 多条记忆的 KB（`(title, content, source)` 三元组，按序写入）。
+    async fn make_km_with_docs(docs: &[(&str, &str, &str)]) -> Arc<KnowledgeManager> {
+        let km = make_km().await;
+        for (title, content, source) in docs {
+            km.add_text_to_kb("@private_memory", title, content, source)
+                .await
+                .unwrap();
+        }
         km
     }
 
@@ -431,7 +748,7 @@ mod tests {
     #[tokio::test]
     async fn test_skips_failed_turn() {
         let analyzer = Arc::new(MockAnalyzer::ok(vec![]));
-        let hook = MemoryExtractionHook::new(make_km().await, analyzer.clone(), make_config());
+        let (hook, _pool, _dir) = make_hook(make_km().await, analyzer.clone(), make_config()).await;
         let session = make_session_with_turn(
             "这是一个足够长的用户提问内容",
             "这是一个足够长的助手回答内容",
@@ -454,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn test_skips_short_turns() {
         let analyzer = Arc::new(MockAnalyzer::ok(vec![]));
-        let hook = MemoryExtractionHook::new(make_km().await, analyzer.clone(), make_config());
+        let (hook, _pool, _dir) = make_hook(make_km().await, analyzer.clone(), make_config()).await;
         // "用户: 你好\n" 共 8 字符 < analyze_min_chars(10)
         let session = make_session_with_turn("你好", "");
 
@@ -473,9 +790,11 @@ mod tests {
         let facts = vec![MemoryFact {
             category: MemoryCategory::Profile,
             content: "用户偏好简洁的回答风格".to_string(),
+            topic: None,
+            supersedes: vec![],
         }];
         let analyzer = Arc::new(MockAnalyzer::ok(facts));
-        let hook = MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), make_config());
+        let (hook, _pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
         let session = make_session_with_turn(
             "请记住：我偏好简洁的回答风格，以后所有回答都尽量精炼",
             "好的，我已记住你的偏好，之后会以简洁风格回答。",
@@ -501,7 +820,7 @@ mod tests {
     async fn test_analyzer_error_is_non_fatal() {
         let km = make_km().await;
         let analyzer = Arc::new(MockAnalyzer::err("model exploded"));
-        let hook = MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), make_config());
+        let (hook, _pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
         let session = make_session_with_turn(
             "这是一个足够长的用户提问内容",
             "这是一个足够长的助手回答内容",
@@ -538,6 +857,8 @@ mod tests {
         vec![MemoryFact {
             category: MemoryCategory::Profile,
             content: NEAR_DUP.to_string(),
+            topic: None,
+            supersedes: vec![],
         }]
     }
 
@@ -552,7 +873,8 @@ mod tests {
     async fn dedup_enforce_skips_near_duplicate_write() {
         let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
         let analyzer = Arc::new(MockAnalyzer::ok(near_dup_facts()));
-        let hook = MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), dedup_config(true));
+        let (hook, _pool, _dir) =
+            make_hook(Arc::clone(&km), analyzer.clone(), dedup_config(true)).await;
 
         hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
             .await;
@@ -571,8 +893,8 @@ mod tests {
     async fn dedup_shadow_writes_near_duplicate() {
         let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
         let analyzer = Arc::new(MockAnalyzer::ok(near_dup_facts()));
-        let hook =
-            MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), dedup_config(false));
+        let (hook, _pool, _dir) =
+            make_hook(Arc::clone(&km), analyzer.clone(), dedup_config(false)).await;
 
         hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
             .await;
@@ -594,8 +916,11 @@ mod tests {
         let analyzer = Arc::new(MockAnalyzer::ok(vec![MemoryFact {
             category: MemoryCategory::Episodic,
             content: NEAR_DUP.to_string(),
+            topic: None,
+            supersedes: vec![],
         }]));
-        let hook = MemoryExtractionHook::new(Arc::clone(&km), analyzer.clone(), dedup_config(true));
+        let (hook, _pool, _dir) =
+            make_hook(Arc::clone(&km), analyzer.clone(), dedup_config(true)).await;
 
         hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
             .await;
@@ -635,10 +960,14 @@ mod tests {
             MemoryFact {
                 category: MemoryCategory::Profile,
                 content: NEAR_DUP.to_string(),
+                topic: None,
+                supersedes: vec![],
             },
             MemoryFact {
                 category: MemoryCategory::Semantic,
                 content: "The user's primary programming language is Rust.".to_string(),
+                topic: None,
+                supersedes: vec![],
             },
         ];
         let existing = vec![
@@ -660,5 +989,532 @@ mod tests {
         .expect("KB 存在时嵌入可用");
 
         assert_eq!(flags, vec![true, false], "只对同类目近重复置位");
+    }
+
+    // ── 取代机制 · 阶段一（在线 shadow）────────────────────────────────────
+
+    async fn shadow_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_supersede_shadow")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn shadow_json_col(pool: &sqlx::SqlitePool, col: &str) -> String {
+        sqlx::query_scalar::<_, String>(&format!("SELECT {col} FROM memory_supersede_shadow"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// 轮询等待 shadow 行落库（record_shadow 在 spawn 的后台任务里）。
+    async fn wait_for_shadow(pool: &sqlx::SqlitePool, expected: i64) {
+        for _ in 0..100 {
+            if shadow_count(pool).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("shadow 行应在超时前达到 {expected} 条");
+    }
+
+    #[tokio::test]
+    async fn shadow_records_supersede_victim_from_candidates() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户现在偏好详尽的回答".to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_shadow(&pool, 1).await;
+
+        let decisions: serde_json::Value =
+            serde_json::from_str(&shadow_json_col(&pool, "decisions_json").await).unwrap();
+        assert_eq!(
+            decisions["items"][0]["victim"].as_str(),
+            Some(victim.as_str()),
+            "decisions_json 应含候选集内的 victim"
+        );
+        assert_eq!(decisions["would_act"], 1);
+        assert_eq!(decisions["raw_count"], 1);
+        assert_eq!(decisions["dropped"], 0);
+
+        // 候选快照带 id（供离线算 oracle_hit），facts_json 带 topic
+        assert!(
+            shadow_json_col(&pool, "candidates_json")
+                .await
+                .contains(&victim),
+            "候选快照应含 victim id"
+        );
+        assert!(
+            shadow_json_col(&pool, "facts_json")
+                .await
+                .contains("\"topic\":\"answer_style\""),
+            "facts_json 应含 topic"
+        );
+
+        // KB append 照旧：既有 1 条 + 新写 1 条，victim 不被删除
+        for _ in 0..100 {
+            if doc_count(&km).await == 2 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("KB 应 append 新事实，victim 保留（doc_count=2）");
+    }
+
+    #[tokio::test]
+    async fn shadow_drops_supersede_outside_candidates() {
+        let km = make_km().await;
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Semantic,
+            content: "项目切换到新架构".to_string(),
+            topic: Some("project_phase".to_string()),
+            supersedes: vec!["doc-not-in-candidate-set".to_string()],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_shadow(&pool, 1).await;
+
+        let decisions: serde_json::Value =
+            serde_json::from_str(&shadow_json_col(&pool, "decisions_json").await).unwrap();
+        assert_eq!(decisions["raw_count"], 1);
+        assert_eq!(decisions["dropped"], 1, "越界 victim 计入 dropped");
+        assert!(
+            decisions["items"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "越界项不得进入 items"
+        );
+        assert_eq!(decisions["would_act"], 0);
+        // facts_json 中越界 supersedes 已被剔除（A3 契约）
+        let facts_json = shadow_json_col(&pool, "facts_json").await;
+        assert!(
+            !facts_json.contains("doc-not-in-candidate-set"),
+            "facts_json 不得保留候选集外的 supersedes: {facts_json}"
+        );
+
+        // 越界只影响决策记录 —— KB 写入照旧（本阶段零删除面）
+        for _ in 0..100 {
+            if doc_count(&km).await == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("候选越界不得阻断 KB append");
+    }
+
+    #[tokio::test]
+    async fn shadow_disabled_writes_no_row() {
+        let km = make_km().await;
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户偏好简洁的回答风格".to_string(),
+            topic: None,
+            supersedes: vec![],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            extraction_top_k: 3,
+            supersede_shadow: false,
+            ..MemoryConfig::default()
+        };
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), config).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+
+        // KB 写入发生在 record_shadow 之后 —— 写入完成即证明 shadow 已被求值
+        for _ in 0..100 {
+            if doc_count(&km).await == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(doc_count(&km).await, 1, "shadow 关闭不影响 KB 写入");
+        assert_eq!(
+            shadow_count(&pool).await,
+            0,
+            "supersede_shadow=false 时不得写 shadow 行"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_facts_still_writes_shadow_row() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![]));
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_shadow(&pool, 1).await;
+
+        assert_eq!(
+            shadow_json_col(&pool, "facts_json").await,
+            "[]",
+            "空事实轮仍落行，facts_json 为空数组（效果门分母）"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_write_failure_does_not_block_kb_write() {
+        let km = make_km().await;
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户偏好简洁的回答风格".to_string(),
+            topic: None,
+            supersedes: vec![],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        // 未迁移的池 — memory_supersede_shadow 不存在，insert 必失败
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        let hook = MemoryExtractionHook::new(
+            Arc::clone(&km),
+            analyzer.clone(),
+            make_config(),
+            pool,
+            "test-user".to_string(),
+        );
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+
+        for _ in 0..100 {
+            if doc_count(&km).await == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("shadow 写失败不得阻断 KB 写入");
+    }
+
+    // ── 候选召回：双通道 / 上限 / 降级 ────────────────────────────────────
+
+    /// 两条与查询共享全部词元的 ppa 文档 —— 全文路径得分 1.0，search 必命中。
+    const CHANNEL_DOCS: [(&str, &str, &str); 2] = [
+        (
+            "memory_2000_0",
+            "The user prefers concise answers when discussing Rust.",
+            "ppa_profile",
+        ),
+        (
+            "memory_2001_0",
+            "The user prefers concise answers when discussing Python.",
+            "ppa_semantic",
+        ),
+    ];
+    const CHANNEL_QUERY: &str = "user prefers concise answers";
+
+    /// T1a（开）：shadow 开启时通道 B 必须贡献候选（channel != "search"），
+    /// 且双通道共同命中的 id 合并为 "both"、按 id 去重。
+    #[tokio::test]
+    async fn channel_b_contributes_when_shadow_enabled() {
+        let km = make_km_with_docs(&CHANNEL_DOCS).await;
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            ..MemoryConfig::default()
+        };
+        let set = MemoryExtractionHook::build_candidates(&km, &config, CHANNEL_QUERY).await;
+
+        let channels: Vec<&str> = set.candidates.iter().map(|c| c.channel).collect();
+        assert!(
+            channels.iter().any(|c| *c != "search"),
+            "shadow 开启时通道 B 应贡献候选，实际 channels: {channels:?}"
+        );
+        assert!(
+            channels.contains(&"both"),
+            "双通道共同命中的候选应合并为 both，实际 channels: {channels:?}"
+        );
+        let ids: HashSet<&str> = set.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            set.candidates.len(),
+            "合并按 id 去重后不得有重复候选"
+        );
+    }
+
+    /// T1a（关）：shadow 与 enforce 同时关闭 → 只走通道 A，候选全部
+    /// channel == "search"（门控真能关）。
+    #[tokio::test]
+    async fn channel_b_gated_off_returns_search_only() {
+        let km = make_km_with_docs(&CHANNEL_DOCS).await;
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            supersede_shadow: false,
+            supersede_enforce: false,
+            ..MemoryConfig::default()
+        };
+        let set = MemoryExtractionHook::build_candidates(&km, &config, CHANNEL_QUERY).await;
+
+        assert!(!set.candidates.is_empty(), "通道 A 应召回候选");
+        let channels: Vec<&str> = set.candidates.iter().map(|c| c.channel).collect();
+        assert!(
+            channels.iter().all(|c| *c == "search"),
+            "门控关闭时不得出现 recent/both，实际 channels: {channels:?}"
+        );
+    }
+
+    /// T1b：`recent_candidates` 自身语义 —— 每类目取 1 条、非 `ppa_` 前缀
+    /// 过滤、channel 全为 recent、`created_at` 倒序取较晚写入的那条。
+    #[tokio::test]
+    async fn recent_candidates_filters_groups_and_orders_by_created_at() {
+        let km = make_km().await;
+        km.add_text_to_kb(
+            "@private_memory",
+            "memory_2100_0",
+            "semantic fact alpha version",
+            "ppa_semantic",
+        )
+        .await
+        .unwrap();
+        // 拉开两条同类目文档的 created_at（倒序判定依赖时间戳可分）
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        km.add_text_to_kb(
+            "@private_memory",
+            "memory_2101_0",
+            "semantic fact beta version",
+            "ppa_semantic",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        km.add_text_to_kb(
+            "@private_memory",
+            "memory_2102_0",
+            "episodic event gamma",
+            "ppa_episodic",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        km.add_text_to_kb(
+            "@private_memory",
+            "memory_2103_0",
+            "manual note delta",
+            "manual",
+        )
+        .await
+        .unwrap();
+
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            candidate_recent_per_category: 1,
+            ..MemoryConfig::default()
+        };
+        let out = MemoryExtractionHook::recent_candidates(&km, &config).await;
+
+        assert_eq!(out.len(), 2, "每类目取 1 条 ⇒ 恰 2 条，实为 {}", out.len());
+        let sources: HashSet<&str> = out.iter().map(|c| c.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            HashSet::from(["ppa_semantic", "ppa_episodic"]),
+            "非 ppa_ 前缀的文档应被过滤，实际 source: {sources:?}"
+        );
+        assert!(
+            out.iter().all(|c| c.channel == "recent"),
+            "recent_candidates 产出的 channel 应恒为 recent"
+        );
+        let semantic = out
+            .iter()
+            .find(|c| c.source == "ppa_semantic")
+            .expect("应含 ppa_semantic 候选");
+        assert_eq!(
+            semantic.text, "semantic fact beta version",
+            "created_at 倒序 ⇒ 同类目应取较晚写入的 beta"
+        );
+    }
+
+    /// T2：`candidate_cap` 条数截断 —— 写入 > cap 条时返回长度 ≤ 1。
+    #[tokio::test]
+    async fn candidate_cap_truncates_count() {
+        let km = make_km_with_docs(&[
+            (
+                "memory_2200_0",
+                "fact number one for cap test",
+                "ppa_profile",
+            ),
+            (
+                "memory_2201_0",
+                "fact number two for cap test",
+                "ppa_profile",
+            ),
+            (
+                "memory_2202_0",
+                "fact number three for cap test",
+                "ppa_profile",
+            ),
+        ])
+        .await;
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            candidate_cap: 1,
+            ..MemoryConfig::default()
+        };
+        let set = MemoryExtractionHook::build_candidates(&km, &config, CHANNEL_QUERY).await;
+
+        assert!(!set.candidates.is_empty(), "通道应召回候选");
+        assert!(
+            set.candidates.len() <= 1,
+            "candidate_cap=1 时返回长度应 ≤ 1，实为 {}",
+            set.candidates.len()
+        );
+    }
+
+    /// T3：`candidate_text_cap` 字符截断 —— 近期通道正文按字符数截断。
+    #[tokio::test]
+    async fn candidate_text_cap_truncates_recent_text() {
+        let km = make_km_with_docs(&[(
+            "memory_2300_0",
+            "A long memory sentence that definitely exceeds eight characters.",
+            "ppa_semantic",
+        )])
+        .await;
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            candidate_text_cap: 8,
+            ..MemoryConfig::default()
+        };
+        let out = MemoryExtractionHook::recent_candidates(&km, &config).await;
+
+        assert_eq!(out.len(), 1, "应召回唯一的 ppa 文档");
+        let len = out[0].text.chars().count();
+        assert!(
+            len <= 8,
+            "正文应截断到 candidate_text_cap=8，实为 {len} 字符"
+        );
+    }
+
+    /// T4：`candidate_token_cap` 硬上限 —— 首条渲染行即超限则返回空，
+    /// 不得兜底放行首条。
+    #[tokio::test]
+    async fn candidate_token_cap_hard_limit_returns_empty() {
+        let km = make_km_with_docs(&CHANNEL_DOCS).await;
+        let base = MemoryConfig {
+            analyze_min_chars: 10,
+            ..MemoryConfig::default()
+        };
+        let full = MemoryExtractionHook::build_candidates(&km, &base, CHANNEL_QUERY).await;
+        assert!(
+            !full.candidates.is_empty(),
+            "对照：无 token 上限时应有候选，否则本测试无意义"
+        );
+
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            candidate_token_cap: 1,
+            ..MemoryConfig::default()
+        };
+        let capped = MemoryExtractionHook::build_candidates(&km, &config, CHANNEL_QUERY).await;
+        assert!(
+            capped.candidates.is_empty(),
+            "首行超 candidate_token_cap=1 时应返回空候选（不得兜底放行）"
+        );
+    }
+
+    /// N1：近重复比对集不受候选上限截断 —— 候选被 `candidate_token_cap`
+    /// 截空时，`dedup_baseline` 仍含全部 `search_kb` 命中。
+    #[tokio::test]
+    async fn dedup_baseline_survives_candidate_token_cap() {
+        let km = make_km_with_docs(&[
+            (
+                "memory_2400_0",
+                "The user prefers concise answers about rust performance tuning.",
+                "ppa_profile",
+            ),
+            (
+                "memory_2401_0",
+                "The user prefers concise answers about rust performance profiling.",
+                "ppa_semantic",
+            ),
+            (
+                "memory_2402_0",
+                "The user prefers concise answers about rust performance debugging.",
+                "ppa_episodic",
+            ),
+        ])
+        .await;
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            extraction_top_k: 3,
+            candidate_token_cap: 1,
+            ..MemoryConfig::default()
+        };
+        let set = MemoryExtractionHook::build_candidates(
+            &km,
+            &config,
+            "user prefers concise answers about rust performance",
+        )
+        .await;
+
+        assert!(
+            set.candidates.is_empty(),
+            "候选集应被 candidate_token_cap=1 截空（否则本测试未覆盖截断）"
+        );
+        assert_eq!(
+            set.dedup_baseline.len(),
+            config.extraction_top_k,
+            "近重复比对集须含全部 search_kb 命中，不受候选上限截断"
+        );
+    }
+
+    /// T5（静态）：双通道 KB 不存在 → 双双降级，返回空且不 panic。
+    #[tokio::test]
+    async fn build_candidates_degrades_to_empty_on_missing_kb() {
+        let km = make_km().await;
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            kb_name: "@no_such_kb".to_string(),
+            ..MemoryConfig::default()
+        };
+        let set = MemoryExtractionHook::build_candidates(&km, &config, CHANNEL_QUERY).await;
+
+        assert!(set.candidates.is_empty(), "两通道均失败应返回空候选");
+        assert!(set.dedup_baseline.is_empty());
+    }
+
+    /// T5（端到端）：候选为空不得跳过提取 —— analyzer 仍被调用，
+    /// shadow 行照写（candidates_json == "[]"，效果门分母）。
+    #[tokio::test]
+    async fn missing_kb_still_runs_extraction_and_shadow() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![]));
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            kb_name: "@no_such_kb".to_string(),
+            ..MemoryConfig::default()
+        };
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), config).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_shadow(&pool, 1).await;
+        wait_for_analyzer(&analyzer).await;
+
+        {
+            let calls = analyzer.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "候选为空不得跳过提取");
+            assert!(calls[0].1.is_empty(), "双通道降级后候选为空");
+        }
+        assert_eq!(
+            shadow_json_col(&pool, "candidates_json").await,
+            "[]",
+            "shadow 行应记录空候选快照"
+        );
     }
 }

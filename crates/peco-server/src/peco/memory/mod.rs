@@ -25,7 +25,7 @@ pub mod hook;
 pub mod recall;
 pub mod view;
 
-pub use analyzer::{MemoryCategory, MemoryFact, ModelTurnAnalyzer, TurnAnalyzer};
+pub use analyzer::{MemoryCandidate, MemoryCategory, MemoryFact, ModelTurnAnalyzer, TurnAnalyzer};
 pub use config::{ConsolidationConfig, MemoryConfig};
 pub use consolidation::{ConsolidationWorker, Distiller, ModelDistiller, RunStats, WorkerError};
 pub use hook::MemoryExtractionHook;
