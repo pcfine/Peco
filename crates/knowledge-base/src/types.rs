@@ -201,6 +201,17 @@ pub fn compute_entity_id(entity_name: &str, entity_type: &str) -> String {
     format!("entity:{}:{}", entity_type, hex::encode(&hash[..8]))
 }
 
+/// 文本内容 → 文档 ID（内容寻址：sha256(content) 前 8 字节 → 16 hex 字符）。
+///
+/// 摄入侧（`build_text_document` / `add_file_with_mode`）与调用方**预计算**
+/// doc id（如记忆取代的 `new_doc_id` 前置判定）必须同源 —— 两侧各自
+/// 复制公式会在漂移时把「同内容」误判成两条文档。
+pub fn text_doc_id(content: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(content.as_bytes());
+    hex::encode(&hash[..8])
+}
+
 // ---------------------------------------------------------------------------
 // 搜索类型
 // ---------------------------------------------------------------------------

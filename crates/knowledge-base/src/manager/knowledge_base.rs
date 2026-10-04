@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use sha2::Digest;
 use tracing::{info, warn};
 
 use crate::chunking::make_chunker;
@@ -92,8 +91,7 @@ async fn build_helix_components(
 ///
 /// `created_at` 记录写入时刻（ISO 8601），供 TTL 判定等下游逻辑使用。
 fn build_text_document(kb_name: &str, title: &str, content: &str, source: &str) -> Document {
-    let hash = sha2::Sha256::digest(content.as_bytes());
-    let doc_id = hex::encode(&hash[..8]);
+    let doc_id = crate::types::text_doc_id(content);
 
     Document {
         id: doc_id,
@@ -238,8 +236,7 @@ impl KnowledgeBase {
     ) -> Result<Document, KnowledgeError> {
         let parser = make_parser(path)?;
         let parsed = parser.parse_file(path).await?;
-        let hash = sha2::Sha256::digest(parsed.content.as_bytes());
-        let doc_id = hex::encode(&hash[..8]);
+        let doc_id = crate::types::text_doc_id(&parsed.content);
 
         let doc = Document {
             id: doc_id,
