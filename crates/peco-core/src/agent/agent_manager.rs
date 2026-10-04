@@ -789,6 +789,8 @@ mod tests {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         };
 
         let id = audit.record_pending(entry).await.unwrap();

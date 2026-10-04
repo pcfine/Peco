@@ -117,6 +117,10 @@ pub struct MemoryAuditEntry {
     pub deleted_by: String,
     /// ISO 8601 时刻。
     pub deleted_at: String,
+    /// 取代槽键（仅 `reason='superseded'` 行）：**取代方 fact 的 topic**（M2 口径）。
+    pub topic_key: Option<String>,
+    /// 后继 doc id（仅 `reason='superseded'` 行）：取代方新条的 doc id。
+    pub successor_doc_id: Option<String>,
 }
 
 /// 记忆删除审计访问接口。
@@ -224,6 +228,8 @@ mod tests {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         }
     }
 

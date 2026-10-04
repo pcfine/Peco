@@ -1284,6 +1284,8 @@ async fn delete_one(
             reason: AGENT_DELETE_REASON.to_string(),
             deleted_by: AGENT_DELETED_BY.to_string(),
             deleted_at: now_iso8601(),
+            topic_key: None,
+            successor_doc_id: None,
         })
         .await
         .map_err(string_err)?;
@@ -1365,6 +1367,8 @@ async fn delete_fact_one(
             reason: AGENT_DELETE_REASON.to_string(),
             deleted_by: AGENT_DELETED_BY.to_string(),
             deleted_at: now_iso8601(),
+            topic_key: None,
+            successor_doc_id: None,
         })
         .await
         .map_err(string_err)?;
@@ -1451,6 +1455,8 @@ async fn delete_entity_one(
             reason: AGENT_DELETE_REASON.to_string(),
             deleted_by: AGENT_DELETED_BY.to_string(),
             deleted_at: now_iso8601(),
+            topic_key: None,
+            successor_doc_id: None,
         })
         .await
         .map_err(string_err)?;

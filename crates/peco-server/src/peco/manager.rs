@@ -9,10 +9,12 @@
 //
 // 位于 peco 模块（统一入口）。
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use peco_agents::BuiltinTemplate;
 use peco_core::agent::{CompactionPolicy, ModelSummarizer, TurnSummarizer};
+use tracing::{debug, warn};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -127,6 +129,12 @@ impl PecoManager {
                 super::session::private_session_id(user_id),
             )));
 
+        // ── 5.7 启动通道：每用户一次对账 + 每进程一次保留期清理 ─────────
+        //
+        // PecoManager 每次流连接都新建，两个静态闸门保证对账按用户、清理按
+        // 进程各只跑一次；均为 fire-and-forget spawn，失败只记日志，不阻塞建连。
+        startup_housekeeping(&state.db, ws.knowledge_manager(), &config.memory, user_id);
+
         // ── 6. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
         //
         // PecoManager 在每次流连接时新建（handler 每请求调用），
@@ -212,6 +220,98 @@ fn resolve_username(raw: Option<String>, user_id: &str) -> String {
     }
 }
 
+/// 进程内已做过启动对账的用户 —— 每用户每进程一次。
+static STARTUP_RECONCILED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// 进程级启动保留期清理闸门 —— 每进程一次。
+static STARTUP_PURGE: OnceLock<()> = OnceLock::new();
+
+/// 启动通道：未收口取代意图的对账 + 三表保留期清理。
+///
+/// 不依赖 `memory.enabled`：开关关闭时历史上开门期写入的 intent 仍需收口。
+/// 守卫判重抽成独立函数（[`claim_startup_reconcile`] / [`claim_startup_purge`]），
+/// spawn 本身不可断言，测试只测守卫语义。
+fn startup_housekeeping(
+    db: &sqlx::SqlitePool,
+    km: &Arc<peco_core::knowledge::KnowledgeManager>,
+    memory: &super::memory::MemoryConfig,
+    user_id: &str,
+) {
+    if claim_startup_reconcile(user_id) {
+        let db = db.clone();
+        let km = Arc::clone(km);
+        let memory = memory.clone();
+        let user_id = user_id.to_string();
+        tokio::spawn(async move {
+            super::memory::reconcile(&db, &km, &memory, &user_id).await;
+        });
+    }
+    if claim_startup_purge() {
+        let db = db.clone();
+        let memory = memory.clone();
+        tokio::spawn(async move { purge_expired(&db, &memory).await });
+    }
+}
+
+/// 对账守卫：该用户本进程首次领取返回 true。
+fn claim_startup_reconcile(user_id: &str) -> bool {
+    STARTUP_RECONCILED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        // 中毒时取回内部值继续 —— 集合判重无不变量可破坏，不值得 panic
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(user_id.to_string())
+}
+
+/// 清理守卫：本进程首次触发返回 true。
+fn claim_startup_purge() -> bool {
+    STARTUP_PURGE.set(()).is_ok()
+}
+
+/// 三表保留期清理（§6.6 启动通道）：intent 按 done / failed+cancelled 分档，
+/// shadow 单档，audit 按 reason 分档（superseded 独立档，pending 永不清）。
+/// 任一失败仅记日志 —— 清理非致命，下个进程周期重试。
+async fn purge_expired(db: &sqlx::SqlitePool, memory: &super::memory::MemoryConfig) {
+    let cutoff =
+        |days: u64| (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+
+    match crate::db::memory_supersede::purge_intent_older_than(
+        db,
+        &cutoff(memory.intent_done_retention_days),
+        &cutoff(memory.intent_failed_retention_days),
+    )
+    .await
+    {
+        Ok(n) if n > 0 => debug!(purged = n, "Supersede intents purged"),
+        Err(e) => warn!("supersede intent purge failed; {e}"),
+        _ => {}
+    }
+
+    match crate::db::memory_supersede::purge_shadow_older_than(
+        db,
+        &cutoff(memory.shadow_retention_days),
+    )
+    .await
+    {
+        Ok(n) if n > 0 => debug!(purged = n, "Supersede shadow rows purged"),
+        Err(e) => warn!("supersede shadow purge failed; {e}"),
+        _ => {}
+    }
+
+    match crate::db::memory_audit::purge_older_than(
+        db,
+        // 审计保留期挂在巩固配置上（清理只消费天数，不依赖巩固开关）
+        &cutoff(memory.consolidation.audit_retention_days),
+        &cutoff(memory.superseded_retention_days),
+    )
+    .await
+    {
+        Ok(n) if n > 0 => debug!(purged = n, "Memory audit rows purged"),
+        Err(e) => warn!("memory audit purge failed; {e}"),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +334,155 @@ mod tests {
     #[test]
     fn test_resolve_username_whitespace() {
         assert_eq!(resolve_username(Some("   ".into()), "uid-1"), "uid-1");
+    }
+
+    // ── 启动通道（对账守卫 + 保留期清理）────────────────────────────────
+
+    #[test]
+    fn startup_reconcile_guard_is_once_per_user() {
+        // 每用户每进程一次：同用户重复领取被拦截，不同用户互不影响
+        assert!(claim_startup_reconcile("guard-user-a"));
+        assert!(!claim_startup_reconcile("guard-user-a"));
+        assert!(claim_startup_reconcile("guard-user-b"));
+        assert!(!claim_startup_reconcile("guard-user-b"));
+    }
+
+    fn days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339()
+    }
+
+    /// 插入一条 intent 并按需改写终态 —— 直写 UPDATE 绕过 CAS 领取流程，
+    /// 保证 updated_at 就是我们指定的时刻。
+    async fn put_intent(pool: &sqlx::SqlitePool, doc: &str, status: &str, ts: &str) {
+        let id = crate::db::memory_supersede::write_intent(
+            pool,
+            &crate::db::memory_supersede::IntentRow {
+                user_id: "purge-user".to_string(),
+                kb_name: "@private_memory".to_string(),
+                topic_key: Some("answer_style".to_string()),
+                old_doc_id: format!("old-{doc}"),
+                old_title: "old_title".to_string(),
+                old_source: "ppa_profile".to_string(),
+                new_doc_id: doc.to_string(),
+                new_title: "new_title".to_string(),
+                new_content: format!("content {doc}"),
+                new_source: "ppa_profile".to_string(),
+                created_at: ts.to_string(),
+                updated_at: ts.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        if status != "pending" {
+            sqlx::query(
+                "UPDATE memory_supersede_intent SET status = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(status)
+            .bind(ts)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// 插入一条审计行，`done=true` 时迁移到终态（deleted_at 保持入参时刻）。
+    async fn put_audit(
+        pool: &sqlx::SqlitePool,
+        doc: &str,
+        reason: &str,
+        deleted_at: &str,
+        done: bool,
+    ) {
+        let id = crate::db::memory_audit::insert_pending(
+            pool,
+            &peco_core::tools::MemoryAuditEntry {
+                user_id: "purge-user".to_string(),
+                kb_name: "@private_memory".to_string(),
+                doc_id: doc.to_string(),
+                title: "t".to_string(),
+                content: "c".to_string(),
+                source: "ppa_profile".to_string(),
+                reason: reason.to_string(),
+                deleted_by: "hook:supersede".to_string(),
+                deleted_at: deleted_at.to_string(),
+                topic_key: None,
+                successor_doc_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        if done {
+            crate::db::memory_audit::mark_done(pool, id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_purge_expired_rows_by_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+
+        // intent：done 超 7d 清、failed 超 90d 清；done 新鲜与陈旧 pending 都保留
+        put_intent(&pool, "i-done-old", "done", &days_ago(8)).await;
+        put_intent(&pool, "i-done-new", "done", &days_ago(1)).await;
+        put_intent(&pool, "i-failed-old", "failed", &days_ago(91)).await;
+        put_intent(&pool, "i-pending-old", "pending", &days_ago(400)).await;
+
+        // shadow：超 30d 清、新鲜保留
+        for ts in [days_ago(31), days_ago(1)] {
+            crate::db::memory_supersede::insert_shadow(
+                &pool,
+                &crate::db::memory_supersede::ShadowRow {
+                    user_id: "purge-user".to_string(),
+                    created_at: ts,
+                    candidates_json: "[]".to_string(),
+                    facts_json: "[]".to_string(),
+                    decisions_json: "[]".to_string(),
+                    acted: false,
+                    extracted_topic_cnt: 0,
+                    episodic_cnt: 0,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // audit：superseded 走 30d 档、其余走 90d 档、pending 永不清
+        put_audit(&pool, "a-sup-old", "superseded", &days_ago(45), true).await;
+        put_audit(&pool, "a-other-old", "manual_organize", &days_ago(45), true).await;
+        put_audit(&pool, "a-sup-pending", "superseded", &days_ago(45), false).await;
+        put_audit(
+            &pool,
+            "a-other-ancient",
+            "manual_organize",
+            &days_ago(91),
+            true,
+        )
+        .await;
+
+        purge_expired(&pool, &crate::peco::memory::MemoryConfig::default()).await;
+
+        let intents: Vec<String> = sqlx::query_scalar(
+            "SELECT new_doc_id FROM memory_supersede_intent ORDER BY new_doc_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(intents, ["i-done-new", "i-pending-old"]);
+
+        let shadows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_supersede_shadow")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(shadows, 1);
+
+        let audits: Vec<String> =
+            sqlx::query_scalar("SELECT doc_id FROM memory_audit ORDER BY doc_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(audits, ["a-other-old", "a-sup-pending"]);
     }
 }

@@ -71,6 +71,8 @@ async fn seed_deleted_memory(app: &TestApp, content: &str) -> (String, i64) {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         },
     )
     .await
@@ -220,6 +222,8 @@ async fn test_restore_rejects_pending_row() {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         },
     )
     .await
@@ -249,6 +253,8 @@ async fn test_restore_missing_kb_returns_404() {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         },
     )
     .await
@@ -349,6 +355,8 @@ async fn seed_graph_audit(app: &TestApp, doc_id: &str, content: &str) -> i64 {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         },
     )
     .await

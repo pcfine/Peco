@@ -43,6 +43,7 @@ use peco_core::knowledge::KnowledgeManager;
 use peco_core::tools::MemoryAuditEntry;
 
 use super::config::ConsolidationConfig;
+use super::retire::RetireOutcome;
 
 /// 删除审计的执行者标识。
 pub const DELETED_BY_WORKER: &str = "worker";
@@ -747,8 +748,8 @@ impl ConsolidationWorker {
                     .delete_with_audit(user_id, doc, REASON_DEDUP, now)
                     .await
                 {
-                    Ok(true) => stats.dedup_deleted += 1,
-                    Ok(false) => {}
+                    Ok(RetireOutcome::Deleted) => stats.dedup_deleted += 1,
+                    Ok(RetireOutcome::AlreadyAbsent) => {}
                     Err(e) => tracing::warn!(user_id = %user_id, error = %e, "Dedup delete failed"),
                 }
             }
@@ -801,8 +802,8 @@ impl ConsolidationWorker {
                 continue;
             }
             match self.delete_with_audit(user_id, &doc, REASON_TTL, now).await {
-                Ok(true) => stats.ttl_deleted += 1,
-                Ok(false) => {}
+                Ok(RetireOutcome::Deleted) => stats.ttl_deleted += 1,
+                Ok(RetireOutcome::AlreadyAbsent) => {}
                 Err(e) => tracing::warn!(user_id = %user_id, error = %e, "TTL delete failed"),
             }
         }
@@ -837,7 +838,9 @@ impl ConsolidationWorker {
     async fn purge_audit(&self, user_id: &str, now: DateTime<Utc>, stats: &mut RunStats) {
         let cutoff =
             (now - chrono::Duration::days(self.config.audit_retention_days as i64)).to_rfc3339();
-        match crate::db::memory_audit::purge_older_than(&self.db, &cutoff).await {
+        // worker 不持有 superseded_retention_days：两档同传 audit_retention_days。
+        // 30d 短档由启动通道执行（90d ≥ 30d，同值不会提前清 superseded）。
+        match crate::db::memory_audit::purge_older_than(&self.db, &cutoff, &cutoff).await {
             Ok(purged) => {
                 stats.audit_purged = purged as usize;
                 if purged > 0 {
@@ -854,13 +857,15 @@ impl ConsolidationWorker {
     }
 
     /// 审计先行删除：pending → 删除 → done / cancelled（fail-closed）。
+    ///
+    /// 事务本体在共享原语 [`super::retire::delete_with_audit`]（取代路径共用）。
     async fn delete_with_audit(
         &self,
         user_id: &str,
         doc: &knowledge_base::Document,
         reason: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, String> {
+    ) -> Result<RetireOutcome, String> {
         let entry = MemoryAuditEntry {
             user_id: user_id.to_string(),
             kb_name: self.kb_name.clone(),
@@ -871,38 +876,10 @@ impl ConsolidationWorker {
             reason: reason.to_string(),
             deleted_by: DELETED_BY_WORKER.to_string(),
             deleted_at: now.to_rfc3339(),
+            topic_key: None,
+            successor_doc_id: None,
         };
-        let audit_id = crate::db::memory_audit::insert_pending(&self.db, &entry)
-            .await
-            .map_err(|e| format!("audit write failed (fail-closed): {e}"))?;
-
-        match self.km.delete_document(&self.kb_name, &doc.id).await {
-            Ok(report) => {
-                if let Err(e) = crate::db::memory_audit::mark_done(&self.db, audit_id).await {
-                    tracing::warn!(
-                        audit_id,
-                        error = %e,
-                        "Audit row left pending after successful delete"
-                    );
-                }
-                tracing::info!(
-                    user_id = %user_id,
-                    doc_id = %doc.id,
-                    reason = %reason,
-                    removed_chunks = report.removed_chunks,
-                    "Memory deleted by consolidation worker"
-                );
-                Ok(true)
-            }
-            Err(e) => {
-                if let Err(mark_err) =
-                    crate::db::memory_audit::mark_cancelled(&self.db, audit_id).await
-                {
-                    tracing::warn!(audit_id, error = %mark_err, "Failed to cancel audit row");
-                }
-                Err(format!("delete failed for {}: {e}", doc.id))
-            }
-        }
+        super::retire::delete_with_audit(&self.db, &self.km, &entry).await
     }
 }
 
@@ -1093,6 +1070,8 @@ mod tests {
                 reason: REASON_TTL.into(),
                 deleted_by: DELETED_BY_WORKER.into(),
                 deleted_at: deleted_at.into(),
+                topic_key: None,
+                successor_doc_id: None,
             },
         )
         .await

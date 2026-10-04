@@ -23,12 +23,13 @@ pub mod cron;
 pub mod dedup;
 pub mod hook;
 pub mod recall;
+pub mod retire;
 pub mod view;
 
 pub use analyzer::{MemoryCandidate, MemoryCategory, MemoryFact, ModelTurnAnalyzer, TurnAnalyzer};
 pub use config::{ConsolidationConfig, MemoryConfig};
 pub use consolidation::{ConsolidationWorker, Distiller, ModelDistiller, RunStats, WorkerError};
-pub use hook::MemoryExtractionHook;
+pub use hook::{MemoryExtractionHook, degraded_count, last_converged_at, reconcile};
 pub use recall::MemoryRecallContext;
 
 use std::sync::Arc;

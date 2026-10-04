@@ -16,23 +16,34 @@
 // 取代机制 · 阶段一（在线 shadow）：候选召回双通道带 doc_id，提取产出的
 // supersedes 决策只落 `memory_supersede_shadow` 观测表 —— KB 只 append，
 // 绝不调用删除。
+//
+// 取代机制 · 阶段二（enforcement）：`supersede_enforce` 开启后，通过写前
+// 前置的 fact 走 §6.1 outbox 取代事务（intent WAL → add new → 删旧留审计
+// → CAS done），失败退化 append；对账（`reconcile`）在每轮 hook 收尾与
+// 进程启动时收口未完成意图。门闭时与阶段一逐字一致（fail-closed）。
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use model_provider::{InputItem, Role, Usage};
 use peco_core::agent::{LooperHook, TurnFailureReason, estimate_str_tokens};
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::session::Session;
+use peco_core::tools::MemoryAuditEntry;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
 use super::analyzer::{MemoryCandidate, MemoryCategory, MemoryFact, TurnAnalyzer};
 use super::config::MemoryConfig;
 use super::dedup::max_cosine;
-use crate::db::memory_supersede::{ShadowRow, insert_shadow};
+use crate::db::memory_audit::{list_pending_superseded_before, mark_audit_row_done};
+use crate::db::memory_supersede::{
+    ClaimedIntent, IntentRow, ShadowRow, claim_next, insert_shadow, mark_done, mark_failed,
+    release_to_pending, write_intent,
+};
 
 /// 带来源通道的候选 — shadow 快照要记 channel，analyzer 只见 [`MemoryCandidate`]。
 struct MemoryCandidateWithChannel {
@@ -500,11 +511,408 @@ impl MemoryExtractionHook {
             ),
         }
     }
+
+    /// 提取主流程（`on_turn_complete` 的 spawn 体）：候选召回 → 模型提取 →
+    /// shadow 观测 → 写前近重复判定 → 取代事务 → 常规 append。
+    ///
+    /// 与收尾对账解耦 —— 对账由调用方在本函数返回后统一触发。
+    async fn run_extraction(
+        km: &KnowledgeManager,
+        analyzer: &dyn TurnAnalyzer,
+        config: &MemoryConfig,
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        dialogue: String,
+    ) {
+        // 双通道候选召回（带 doc_id）：进 prompt 供模型指 supersedes，
+        // 快照供 shadow 落库。通道失败不阻断 — 只是失去该通道提示。
+        let query = dialogue.chars().take(200).collect::<String>();
+        let set = Self::build_candidates(km, config, &query).await;
+
+        let prompt_candidates: Vec<MemoryCandidate> =
+            set.candidates.iter().map(|c| c.to_candidate()).collect();
+
+        let analyzed = tokio::time::timeout(
+            std::time::Duration::from_secs(config.analyzer_timeout_secs),
+            analyzer.analyze(&dialogue, &prompt_candidates),
+        )
+        .await;
+
+        let facts = match analyzed {
+            Ok(Ok(facts)) => facts,
+            Ok(Err(e)) => {
+                warn!(error = %e, "Memory extraction failed (non-fatal)");
+                // 失败也落一行观测 —— 否则效果门的分母系统性偏小、动作率被高估
+                Self::record_shadow_failure(
+                    db,
+                    user_id,
+                    config,
+                    &set.candidates,
+                    "analyzer_error",
+                    &e,
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = config.analyzer_timeout_secs,
+                    "Memory extraction timed out (non-fatal)"
+                );
+                Self::record_shadow_failure(
+                    db,
+                    user_id,
+                    config,
+                    &set.candidates,
+                    "analyzer_timeout",
+                    &format!("analyzer timed out after {}s", config.analyzer_timeout_secs),
+                )
+                .await;
+                return;
+            }
+        };
+
+        // 提取成功即落 shadow（空事实也写 — 效果门的分母）；失败只 warn
+        Self::record_shadow(db, user_id, config, &set.candidates, &facts).await;
+
+        if facts.is_empty() {
+            return;
+        }
+
+        // 写前近重复判定（shadow 下只记日志）。嵌入不可用 → None → 全部放行。
+        // 比对集用 `dedup_baseline`（通道 A 原始结果）而非候选集 —— 候选集
+        // 已被 candidate_cap / candidate_token_cap 截断，尾部搜索命中若被
+        // 挤出候选也仍须参与判重
+        let duplicates = Self::near_duplicate_flags(
+            km,
+            &config.kb_name,
+            &facts,
+            &set.dedup_baseline,
+            config.consolidation.dedup_cos,
+        )
+        .await
+        .unwrap_or_else(|| vec![false; facts.len()]);
+        let enforce = config.consolidation.dedup_enforce;
+        let dedup_blocked: Vec<bool> = (0..facts.len())
+            .map(|i| enforce && duplicates.get(i).copied().unwrap_or(false))
+            .collect();
+
+        // KB 由 personal 模板幂等安装保证存在；缺失（NotFound）按非致命处理
+        let base_ts = chrono::Utc::now().timestamp_millis();
+        let titles: Vec<String> = (0..facts.len())
+            .map(|i| format!("memory_{base_ts}_{i}"))
+            .collect();
+
+        // 阶段二：写前前置 + outbox 取代事务（门闭时零副作用）
+        let handled = Self::enforce_supersede(
+            km,
+            db,
+            config,
+            user_id,
+            &set.candidates,
+            &facts,
+            &dedup_blocked,
+            &titles,
+        )
+        .await;
+
+        for (i, fact) in facts.iter().enumerate() {
+            if handled.contains(&i) {
+                // 取代事务已写入新条（或已入 intent WAL 交对账收口）
+                continue;
+            }
+            let source = source_of(fact);
+            if duplicates.get(i).copied().unwrap_or(false) {
+                if enforce {
+                    info!(
+                        kb = %config.kb_name,
+                        category = fact.category.as_str(),
+                        content = %fact.content,
+                        "Near-duplicate memory skipped (dedup enforce)"
+                    );
+                    continue;
+                }
+                warn!(
+                    kb = %config.kb_name,
+                    category = fact.category.as_str(),
+                    content = %fact.content,
+                    "dedup shadow: near-duplicate memory would be suppressed (written anyway)"
+                );
+            }
+            let title = &titles[i];
+            match km
+                .add_text_to_kb(&config.kb_name, title, &fact.content, &source)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        kb = %config.kb_name,
+                        category = fact.category.as_str(),
+                        "Memory written"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, kb = %config.kb_name, "Memory write failed (non-fatal)");
+                }
+            }
+        }
+    }
+
+    /// 阶段二 enforcement：§6.2 写前前置 + §6.1 outbox 取代事务。
+    ///
+    /// 返回被事务接管的 fact 下标 —— 这些 fact 的 `add(new)` 已在事务内完成
+    /// （或已入 intent WAL），常规 append 循环必须跳过；未通过前置 / 门闭 /
+    /// ①失败退化的 fact 不入集合，照旧走 append。
+    ///
+    /// 六项前置（design-v4 §6.2，任一不满足即退化 append）：
+    /// ① victim 在候选白名单内；② 类目同槽；③ `new_doc_id != old_doc_id`；
+    /// ④ `topic_key` 非空；⑤ 单条 fact 至多一个受害者；⑥ 单轮 ≤ cap（全有全无）。
+    // 8 个参数是刻意的：六项前置各取一个输入，合并入参会把两条不相干的
+    // 前置（如 dedup_blocked 与 titles）揉进同一个结构，反而更难读
+    #[allow(clippy::too_many_arguments)]
+    async fn enforce_supersede(
+        km: &KnowledgeManager,
+        db: &sqlx::SqlitePool,
+        config: &MemoryConfig,
+        user_id: &str,
+        candidates: &[MemoryCandidateWithChannel],
+        facts: &[MemoryFact],
+        dedup_blocked: &[bool],
+        titles: &[String],
+    ) -> HashSet<usize> {
+        // 门B（fail-closed）：门闭时到此为止，与阶段一行为逐字一致
+        if !config.supersede_enforce {
+            return HashSet::new();
+        }
+
+        let candidate_ids: HashSet<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        let mut plan: Vec<SupersedePlanItem> = Vec::new();
+        for (i, fact) in facts.iter().enumerate() {
+            // 门A（dedup_enforce）拦截的近重复不进计划 —— 取代指针随事实一并作废
+            if dedup_blocked.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            // 前置④：topic_key 非空（使槽可识别）
+            let Some(topic_key) = fact
+                .topic
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            else {
+                continue;
+            };
+            // 前置①+⑤：取首个候选白名单内的 id 作唯一受害者（越界 id 剔除）
+            let Some(victim_id) = fact
+                .supersedes
+                .iter()
+                .find(|id| candidate_ids.contains(id.as_str()))
+            else {
+                continue;
+            };
+            // 前置②：类目同槽 —— 受害者取不到（缺失/后端故障，M1 同口径不误判）
+            // 或类目不符，均退化 append
+            let old_doc = match km.get_document(&config.kb_name, victim_id).await {
+                Ok(Some(doc)) => doc,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        doc_id = %victim_id,
+                        "Supersede victim lookup failed (degrading to append)"
+                    );
+                    continue;
+                }
+            };
+            if old_doc.source_path != source_of(fact) {
+                continue;
+            }
+            // 前置③：同内容同 id ⇒ 取代零活（§6.3），跳过
+            let new_doc_id = knowledge_base::text_doc_id(&fact.content);
+            if new_doc_id == *victim_id {
+                continue;
+            }
+            plan.push(SupersedePlanItem {
+                fact_index: i,
+                old_doc_id: victim_id.clone(),
+                old_title: old_doc.title,
+                old_source: old_doc.source_path,
+                new_doc_id,
+                topic_key: topic_key.to_string(),
+            });
+        }
+
+        // 前置⑥：全部预检后判上限 —— 超限整轮不取代（全有全无，A9）
+        if plan.len() > config.supersede_per_turn_cap {
+            warn!(
+                planned = plan.len(),
+                cap = config.supersede_per_turn_cap,
+                "Supersede plan over per-turn cap (whole round degraded to append)"
+            );
+            return HashSet::new();
+        }
+
+        let mut handled = HashSet::new();
+        for item in plan {
+            let fact = &facts[item.fact_index];
+            let title = &titles[item.fact_index];
+            match Self::supersede_one(km, db, config, user_id, &item, fact, title).await {
+                SupersedeOutcome::Handled => {
+                    handled.insert(item.fact_index);
+                }
+                // ① write_intent 失败 ⇒ intent 未落库 ⇒ 退回常规 append（A13）
+                SupersedeOutcome::Degraded => {}
+            }
+        }
+        handled
+    }
+
+    /// 执行单条 §6.1 outbox 事务：① `write_intent(pending)` → ② `add(new)` →
+    /// ③ `delete_with_audit(old)` → ④ CAS `done`。
+    ///
+    /// 只有 ① 失败返回 `Degraded`（不碰 KB、`degraded+1`）；① 落库后任何
+    /// 失败都返回 `Handled` —— intent 已在 WAL，跳过常规 append，由对账
+    /// 幂等收口（§6.4 全表：②失败不删旧、③失败留 pending、④失败补 done）。
+    async fn supersede_one(
+        km: &KnowledgeManager,
+        db: &sqlx::SqlitePool,
+        config: &MemoryConfig,
+        user_id: &str,
+        item: &SupersedePlanItem,
+        fact: &MemoryFact,
+        title: &str,
+    ) -> SupersedeOutcome {
+        let now = chrono::Utc::now().to_rfc3339();
+        let row = IntentRow {
+            user_id: user_id.to_string(),
+            kb_name: config.kb_name.clone(),
+            topic_key: Some(item.topic_key.clone()),
+            old_doc_id: item.old_doc_id.clone(),
+            old_title: item.old_title.clone(),
+            old_source: item.old_source.clone(),
+            new_doc_id: item.new_doc_id.clone(),
+            new_title: title.to_string(),
+            new_content: fact.content.clone(),
+            new_source: source_of(fact),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        // ① WAL —— 失败即退化 append：intent 不落库、不碰 KB、不删旧
+        let intent_id = match write_intent(db, &row).await {
+            Ok(id) => id,
+            Err(e) => {
+                DEGRADED_COUNT.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %e, "Supersede intent write failed, degrading to append");
+                return SupersedeOutcome::Degraded;
+            }
+        };
+
+        // ② add(new)（幂等同 id 替换）—— 失败不删旧（保持至少一条存活），
+        // intent 留 pending 交对账重放 add
+        let source = source_of(fact);
+        if let Err(e) = km
+            .add_text_to_kb(&config.kb_name, title, &fact.content, &source)
+            .await
+        {
+            warn!(
+                error = %e,
+                doc_id = %item.new_doc_id,
+                "Supersede add new failed (intent left pending)"
+            );
+            return SupersedeOutcome::Handled;
+        }
+
+        // ③ 旧条退役 —— 先预检再调共享原语：
+        //   Ok(None)  = §6.4 ③c 旧已不在 → 显式视为成功（不调原语、不产生 cancelled 行）；
+        //   Err       = M1 后端故障 ≠ 已删 → 留 pending 重试，不得误判成功。
+        match km.get_document(&config.kb_name, &item.old_doc_id).await {
+            Ok(None) => {}
+            Ok(Some(old_doc)) => {
+                let entry = MemoryAuditEntry {
+                    user_id: user_id.to_string(),
+                    kb_name: config.kb_name.clone(),
+                    doc_id: item.old_doc_id.clone(),
+                    title: old_doc.title,
+                    content: old_doc.content,
+                    source: old_doc.source_path,
+                    reason: "superseded".to_string(),
+                    deleted_by: "hook:supersede".to_string(),
+                    deleted_at: now.clone(),
+                    // M2（design-v4 §17）：topic_key 记**取代方（行凶者）fact 的 topic** —
+                    // §7.4 守卫与 §7.2 选行依赖此口径
+                    topic_key: Some(item.topic_key.clone()),
+                    successor_doc_id: Some(item.new_doc_id.clone()),
+                };
+                if let Err(e) = super::retire::delete_with_audit(db, km, &entry).await {
+                    warn!(error = %e, "Supersede delete old failed (intent left pending)");
+                    return SupersedeOutcome::Handled;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    doc_id = %item.old_doc_id,
+                    "Supersede victim re-check failed (intent left pending)"
+                );
+                return SupersedeOutcome::Handled;
+            }
+        }
+
+        // ④ CAS done —— 失败仅状态未落（旧删新活），对账补 done
+        if let Err(e) = mark_done(db, intent_id, &now).await {
+            warn!(
+                error = %e,
+                intent_id,
+                "Supersede intent done write failed (reconcile will close)"
+            );
+        }
+        SupersedeOutcome::Handled
+    }
 }
 
 /// fact 对应的 KB source 标签（与写入时一致）。
 fn source_of(fact: &MemoryFact) -> String {
     format!("ppa_{}", fact.category.as_str())
+}
+
+/// §11 `degraded`：① `write_intent` 失败退化为 append 的次数。
+/// 进程级累计（不按用户隔离），进程重启清零 —— health 端点回显。
+static DEGRADED_COUNT: AtomicI64 = AtomicI64::new(0);
+
+/// §11 `last_converged_at`：最近一次对账完整收口的时刻（RFC 3339）。
+/// 进程内存态（重启清空）；SQL 级错误的轮次不更新（口径见 `reconcile`）。
+static LAST_CONVERGED_AT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `degraded` 计数（health 端点回显）。
+pub fn degraded_count() -> i64 {
+    DEGRADED_COUNT.load(Ordering::Relaxed)
+}
+
+/// 最近一次对账完整收口时刻（RFC 3339，进程内存态）。
+pub fn last_converged_at() -> Option<String> {
+    LAST_CONVERGED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 通过 §6.2 全部写前前置的单条取代计划。
+struct SupersedePlanItem {
+    /// 对应 `facts[]` 下标 — 返回给 append 循环跳过。
+    fact_index: usize,
+    old_doc_id: String,
+    old_title: String,
+    old_source: String,
+    new_doc_id: String,
+    /// 取代方 fact 的 topic（trim 后非空，M2 审计口径同源）。
+    topic_key: String,
+}
+
+/// 单条 outbox 事务的结局。
+enum SupersedeOutcome {
+    /// intent 已落库（后续环节成败由对账收口）— append 循环必须跳过。
+    Handled,
+    /// ① `write_intent` 失败 — intent 未落库，退回常规 append（A13）。
+    Degraded,
 }
 
 #[async_trait]
@@ -535,115 +943,174 @@ impl LooperHook for MemoryExtractionHook {
         let user_id = self.user_id.clone();
 
         tokio::spawn(async move {
-            // 双通道候选召回（带 doc_id）：进 prompt 供模型指 supersedes，
-            // 快照供 shadow 落库。通道失败不阻断 — 只是失去该通道提示。
-            let query = dialogue.chars().take(200).collect::<String>();
-            let set = Self::build_candidates(&km, &config, &query).await;
-
-            let prompt_candidates: Vec<MemoryCandidate> =
-                set.candidates.iter().map(|c| c.to_candidate()).collect();
-
-            let analyzed = tokio::time::timeout(
-                std::time::Duration::from_secs(config.analyzer_timeout_secs),
-                analyzer.analyze(&dialogue, &prompt_candidates),
-            )
-            .await;
-
-            let facts = match analyzed {
-                Ok(Ok(facts)) => facts,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "Memory extraction failed (non-fatal)");
-                    // 失败也落一行观测 —— 否则效果门的分母系统性偏小、动作率被高估
-                    Self::record_shadow_failure(
-                        &db,
-                        &user_id,
-                        &config,
-                        &set.candidates,
-                        "analyzer_error",
-                        &e,
-                    )
-                    .await;
-                    return;
-                }
-                Err(_) => {
-                    warn!(
-                        timeout_secs = config.analyzer_timeout_secs,
-                        "Memory extraction timed out (non-fatal)"
-                    );
-                    Self::record_shadow_failure(
-                        &db,
-                        &user_id,
-                        &config,
-                        &set.candidates,
-                        "analyzer_timeout",
-                        &format!("analyzer timed out after {}s", config.analyzer_timeout_secs),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            // 提取成功即落 shadow（空事实也写 — 效果门的分母）；失败只 warn
-            Self::record_shadow(&db, &user_id, &config, &set.candidates, &facts).await;
-
-            if facts.is_empty() {
-                return;
-            }
-
-            // 写前近重复判定（shadow 下只记日志）。嵌入不可用 → None → 全部放行。
-            // 比对集用 `dedup_baseline`（通道 A 原始结果）而非候选集 —— 候选集
-            // 已被 candidate_cap / candidate_token_cap 截断，尾部搜索命中若被
-            // 挤出候选也仍须参与判重
-            let duplicates = Self::near_duplicate_flags(
-                &km,
-                &config.kb_name,
-                &facts,
-                &set.dedup_baseline,
-                config.consolidation.dedup_cos,
-            )
-            .await
-            .unwrap_or_else(|| vec![false; facts.len()]);
-            let enforce = config.consolidation.dedup_enforce;
-
-            // KB 由 personal 模板幂等安装保证存在；缺失（NotFound）按非致命处理
-            let base_ts = chrono::Utc::now().timestamp_millis();
-            for (i, fact) in facts.iter().enumerate() {
-                let source = source_of(fact);
-                if duplicates.get(i).copied().unwrap_or(false) {
-                    if enforce {
-                        info!(
-                            kb = %config.kb_name,
-                            category = fact.category.as_str(),
-                            content = %fact.content,
-                            "Near-duplicate memory skipped (dedup enforce)"
-                        );
-                        continue;
-                    }
-                    warn!(
-                        kb = %config.kb_name,
-                        category = fact.category.as_str(),
-                        content = %fact.content,
-                        "dedup shadow: near-duplicate memory would be suppressed (written anyway)"
-                    );
-                }
-                let title = format!("memory_{base_ts}_{i}");
-                match km
-                    .add_text_to_kb(&config.kb_name, &title, &fact.content, &source)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            kb = %config.kb_name,
-                            category = fact.category.as_str(),
-                            "Memory written"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, kb = %config.kb_name, "Memory write failed (non-fatal)");
-                    }
-                }
-            }
+            Self::run_extraction(&km, analyzer.as_ref(), &config, &db, &user_id, dialogue).await;
+            // §6.5 触发①：每轮 hook 收尾对账（门闭时 intent 表为空 → 幂等零副作用）
+            reconcile(&db, &km, &config, &user_id).await;
         });
+    }
+}
+
+/// 对账（design-v4 §6.5）：收口未完成的取代意图 + 超时的 audit pending 行。
+///
+/// 触发点：① 每轮 hook 收尾（`on_turn_complete` 的 spawn 尾部）；② 进程启动
+/// （`PecoManager`，per-user OnceLock 守卫）。手动端点留 S3b。
+///
+/// 领取语义：逐条 CAS（`claim_next`），**单条意图处理失败即 break 结束本轮**
+/// —— 持续失败（如 A8 drop audit 表）的意图留在 processing→pending，靠
+/// attempts 跨轮增长在领取时判定超上界转 failed；同轮内不重领，避免一次
+/// spawn 把 attempts 烧穿。`reconcile_batch` 只控单轮领取条数上界。
+///
+/// `last_converged_at` 口径：仅 **sqlx 级错误**（claim / mark / release /
+/// audit 查询与置位失败）置 `clean=false` 不更新；业务/KB 错误（留 pending
+/// 重试是设计内状态）照常更新。
+pub async fn reconcile(
+    db: &sqlx::SqlitePool,
+    km: &KnowledgeManager,
+    config: &MemoryConfig,
+    user_id: &str,
+) {
+    let now = chrono::Utc::now();
+    let reclaim_before =
+        (now - chrono::Duration::seconds(config.reconcile_claim_timeout_secs as i64)).to_rfc3339();
+    let now_str = now.to_rfc3339();
+    let mut clean = true;
+
+    // ① 意图收口：CAS 领取 → 幂等重放（ensure-add → delete-with-audit）→ done
+    for _ in 0..config.reconcile_batch {
+        let claimed = match claim_next(db, user_id, &reclaim_before).await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(error = %e, "Supersede claim failed");
+                clean = false;
+                break;
+            }
+        };
+        // attempts 跨轮增长 → 超上界转 failed（A14 第 4 次领取时触发）
+        if claimed.attempts > config.reconcile_max_attempts {
+            warn!(
+                intent_id = claimed.id,
+                attempts = claimed.attempts,
+                "Supersede intent exceeded reconcile attempts (marking failed)"
+            );
+            if let Err(e) = mark_failed(db, claimed.id, &now_str).await {
+                warn!(error = %e, intent_id = claimed.id, "Supersede mark failed failed");
+                clean = false;
+            }
+            continue;
+        }
+        match reconcile_one(db, km, &claimed).await {
+            Ok(()) => {
+                if let Err(e) = mark_done(db, claimed.id, &now_str).await {
+                    warn!(error = %e, intent_id = claimed.id, "Supersede mark done failed");
+                    clean = false;
+                }
+            }
+            Err(e) => {
+                // 释放回 pending 待下轮重领（attempts 不重置），并结束本轮 ——
+                // 同轮重领会让持续失败在一次 spawn 内烧穿上界
+                warn!(
+                    intent_id = claimed.id,
+                    attempts = claimed.attempts,
+                    error = %e,
+                    "Supersede reconcile failed (released to pending)"
+                );
+                if let Err(re) = release_to_pending(db, claimed.id, &now_str).await {
+                    warn!(error = %re, intent_id = claimed.id, "Supersede release failed");
+                    clean = false;
+                }
+                break;
+            }
+        }
+    }
+
+    // ② audit pending 收口：超时且旧文档确认不在 KB → 补 done（§6.4 ③b）
+    let audit_cutoff =
+        (now - chrono::Duration::seconds(config.audit_pending_timeout_secs as i64)).to_rfc3339();
+    match list_pending_superseded_before(db, &audit_cutoff, config.reconcile_batch).await {
+        Ok(rows) => {
+            for row in rows {
+                // 查询无 user 过滤（按 deleted_at 取批），内存过滤防跨用户误收口
+                if row.user_id != user_id {
+                    continue;
+                }
+                match km.get_document(&row.kb_name, &row.doc_id).await {
+                    Ok(None) => {
+                        if let Err(e) = mark_audit_row_done(db, row.id).await {
+                            warn!(error = %e, audit_id = row.id, "Audit row done write failed");
+                            clean = false;
+                        }
+                    }
+                    // 文档还在 → 未真正删除，不收口
+                    Ok(Some(_)) => {}
+                    // KB 故障 ≠ 已删，留 pending（M1）；不置 clean=false（业务重试态）
+                    Err(e) => {
+                        warn!(error = %e, doc_id = %row.doc_id, "Audit close re-check failed");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Audit pending list failed");
+            clean = false;
+        }
+    }
+
+    if clean {
+        *LAST_CONVERGED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(now_str);
+    }
+}
+
+/// 单条意图的幂等重放（§6.4）：ensure-add new → 三分支删旧。
+///
+/// `Ok(())` 可安全 `mark_done`；`Err` 表示该环节不可重放成功，调用方释放
+/// pending 待下轮。`get_document(new)` 的 `Err` 同样上抛（KB 故障 ≠ 缺失）。
+async fn reconcile_one(
+    db: &sqlx::SqlitePool,
+    km: &KnowledgeManager,
+    intent: &ClaimedIntent,
+) -> Result<(), String> {
+    // ensure-add：new 已在且内容一致 → 跳过；缺失/内容漂移 → 补写（幂等同 id 替换）
+    let present = match km.get_document(&intent.kb_name, &intent.new_doc_id).await {
+        Ok(None) => false,
+        Ok(Some(d)) => d.content == intent.new_content,
+        Err(e) => return Err(format!("get new failed: {e}")),
+    };
+    if !present {
+        km.add_text_to_kb(
+            &intent.kb_name,
+            &intent.new_title,
+            &intent.new_content,
+            &intent.new_source,
+        )
+        .await
+        .map_err(|e| format!("add new failed: {e}"))?;
+    }
+
+    // 旧条三分支（M1/M2/M3 口径与写入处一致）
+    match km.get_document(&intent.kb_name, &intent.old_doc_id).await {
+        Ok(None) => Ok(()), // ③c：旧已不在 → 成功
+        Ok(Some(old_doc)) => {
+            let entry = MemoryAuditEntry {
+                user_id: intent.user_id.clone(),
+                kb_name: intent.kb_name.clone(),
+                doc_id: intent.old_doc_id.clone(),
+                title: old_doc.title,
+                content: old_doc.content,
+                source: old_doc.source_path,
+                reason: "superseded".to_string(),
+                deleted_by: "hook:supersede".to_string(),
+                deleted_at: chrono::Utc::now().to_rfc3339(),
+                // M2（design-v4 §17）：与写入处同口径 — 取代方 fact 的 topic
+                topic_key: intent.topic_key.clone(),
+                successor_doc_id: Some(intent.new_doc_id.clone()),
+            };
+            super::retire::delete_with_audit(db, km, &entry)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("delete old failed: {e}"))
+        }
+        Err(e) => Err(format!("get old failed: {e}")), // M1：故障 ≠ 已删
     }
 }
 
@@ -1629,5 +2096,836 @@ mod tests {
             "[]",
             "shadow 行应记录空候选快照"
         );
+    }
+
+    // ── 取代 enforcement / outbox 对账 ─────────────────────────────────────
+
+    /// 门开配置：`supersede_enforce = true`，其余与 [`make_config`] 同。
+    fn enforce_config() -> MemoryConfig {
+        MemoryConfig {
+            analyze_min_chars: 10,
+            extraction_top_k: 3,
+            supersede_enforce: true,
+            ..MemoryConfig::default()
+        }
+    }
+
+    /// 构造带通道的候选（enforce 直调用；text/channel 不参与前置判定）。
+    fn cand(id: &str, source: &str) -> MemoryCandidateWithChannel {
+        MemoryCandidateWithChannel {
+            id: id.to_string(),
+            source: source.to_string(),
+            text: String::new(),
+            channel: "recent",
+        }
+    }
+
+    /// 构造一条待对账意图（test-user / @private_memory / ppa_profile 口径）。
+    fn intent_row(old_doc_id: &str, new_content: &str) -> IntentRow {
+        let now = chrono::Utc::now().to_rfc3339();
+        IntentRow {
+            user_id: "test-user".to_string(),
+            kb_name: "@private_memory".to_string(),
+            topic_key: Some("answer_style".to_string()),
+            old_doc_id: old_doc_id.to_string(),
+            old_title: "old_title".to_string(),
+            old_source: "ppa_profile".to_string(),
+            new_doc_id: knowledge_base::text_doc_id(new_content),
+            new_title: "new_title".to_string(),
+            new_content: new_content.to_string(),
+            new_source: "ppa_profile".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    async fn intent_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_supersede_intent")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// 测试各环节至多一条意图 —— 直接取唯一行状态。
+    async fn intent_status(pool: &sqlx::SqlitePool) -> Option<String> {
+        sqlx::query_scalar::<_, String>("SELECT status FROM memory_supersede_intent")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn audit_superseded_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM memory_audit WHERE reason = 'superseded'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// 轮询等待后台 spawn 的写路径把 KB 推到预期文档数。
+    async fn wait_for_doc_count(km: &KnowledgeManager, expected: usize) {
+        for _ in 0..100 {
+            if doc_count(km).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "KB 文档数应在超时前达到 {expected}，实际 {}",
+            doc_count(km).await
+        );
+    }
+
+    /// 门闭不变量：`supersede_enforce=false`（默认）时只写 shadow ——
+    /// 不删 KB、不写 intent、不写 audit，与门开前的行为逐字一致。
+    #[tokio::test]
+    async fn gate_closed_keeps_shadow_only_behavior() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户现在偏好详尽的回答".to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer, make_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        // append 发生在 enforce 之后 —— 到 2 条即证明 enforce 已跑完
+        wait_for_doc_count(&km, 2).await;
+
+        assert_eq!(shadow_count(&pool).await, 1, "门闭仍写 shadow 观测行");
+        assert_eq!(intent_count(&pool).await, 0, "门闭不得写 intent");
+        assert_eq!(audit_superseded_count(&pool).await, 0, "门闭不得写 audit");
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some(),
+            "门闭不得删除 victim"
+        );
+    }
+
+    /// 正常路径：六项前置全过 → 旧删新写、intent=done、审计行落全字段。
+    #[tokio::test]
+    async fn enforce_supersedes_victim_on_happy_path() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let (pool, _dir) = migrated_pool().await;
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        let candidates = vec![cand(&victim, "ppa_profile")];
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: new_content.to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let titles = vec!["memory_t_0".to_string()];
+        let config = enforce_config();
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false],
+            &titles,
+        )
+        .await;
+
+        assert_eq!(handled, HashSet::from([0usize]), "该 fact 应由事务接管");
+        // 单活：旧删新写
+        assert_eq!(doc_count(&km).await, 1);
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_none(),
+            "旧条应离 KB"
+        );
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "新条应入 KB"
+        );
+        // intent 终态与身份字段
+        assert_eq!(intent_count(&pool).await, 1);
+        assert_eq!(intent_status(&pool).await.as_deref(), Some("done"));
+        let (old_id, intent_new): (String, String) =
+            sqlx::query_as("SELECT old_doc_id, new_doc_id FROM memory_supersede_intent")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(old_id, victim);
+        assert_eq!(intent_new, new_id);
+        // 审计行全字段
+        assert_eq!(audit_superseded_count(&pool).await, 1);
+        let audits = crate::db::memory_audit::list_by_user(&pool, "test-user", 50, 0)
+            .await
+            .unwrap();
+        let row = audits
+            .iter()
+            .find(|r| r.reason == "superseded")
+            .expect("应有 superseded 审计行");
+        assert_eq!(row.status, "done");
+        assert_eq!(row.doc_id, victim);
+        assert_eq!(row.content, EXISTING);
+        assert_eq!(row.source, "ppa_profile");
+        assert_eq!(row.deleted_by, "hook:supersede");
+        assert_eq!(row.topic_key.as_deref(), Some("answer_style"));
+        assert_eq!(row.successor_doc_id.as_deref(), Some(new_id.as_str()));
+    }
+
+    /// 无 supersedes → 零计划 → 退化 append（victim 保留）。
+    #[tokio::test]
+    async fn enforce_without_supersedes_appends_only() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户现在偏好详尽的回答".to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        let (hook, pool, _dir) = make_hook(Arc::clone(&km), analyzer, enforce_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_doc_count(&km, 2).await;
+
+        assert_eq!(intent_count(&pool).await, 0, "无 supersedes 不写 intent");
+        assert_eq!(
+            audit_superseded_count(&pool).await,
+            0,
+            "无 supersedes 不写 audit"
+        );
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some(),
+            "victim 应保留"
+        );
+    }
+
+    /// 前置①：supersedes 指向候选白名单外的 id —— 即使该 id 真实在 KB 也不得删除。
+    #[tokio::test]
+    async fn enforce_ignores_non_candidate_victim() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let (pool, _dir) = migrated_pool().await;
+        // 白名单只有 decoy —— victim 不在其中
+        let candidates = vec![cand("decoy-doc", "ppa_profile")];
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户现在偏好详尽的回答".to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let titles = vec!["memory_t_0".to_string()];
+        let config = enforce_config();
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false],
+            &titles,
+        )
+        .await;
+
+        assert!(handled.is_empty(), "候选白名单外的 victim 不得进入事务");
+        assert_eq!(intent_count(&pool).await, 0);
+        assert_eq!(audit_superseded_count(&pool).await, 0);
+        assert_eq!(doc_count(&km).await, 1, "直调无 append，KB 应原样");
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some(),
+            "白名单外 victim 不得删除"
+        );
+    }
+
+    /// 前置③：同内容同 id（零活取代）→ 跳过，不写 intent/audit。
+    #[tokio::test]
+    async fn enforce_skips_identical_content_same_doc_id() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        // 前提钉住：内容寻址 id 同源 —— victim 就是 EXISTING 的内容 id
+        assert_eq!(victim, knowledge_base::text_doc_id(EXISTING));
+        let (pool, _dir) = migrated_pool().await;
+        let candidates = vec![cand(&victim, "ppa_profile")];
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: EXISTING.to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let titles = vec!["memory_t_0".to_string()];
+        let config = enforce_config();
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false],
+            &titles,
+        )
+        .await;
+
+        assert!(handled.is_empty(), "同内容同 id 必须跳过（零活取代）");
+        assert_eq!(intent_count(&pool).await, 0);
+        assert_eq!(audit_superseded_count(&pool).await, 0);
+        assert_eq!(doc_count(&km).await, 1);
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// 前置⑤：多受害者只取 supersedes 顺序中首个候选内的 id，单 fact 至多删 1 条。
+    #[tokio::test]
+    async fn enforce_takes_first_of_multiple_victims() {
+        let km = make_km_with_docs(&[
+            ("memory_1000_0", "旧的 Rust 偏好记忆。", "ppa_profile"),
+            ("memory_1001_0", "旧的 Python 偏好记忆。", "ppa_profile"),
+        ])
+        .await;
+        let docs = km.list_documents("@private_memory", 0, 10).await.unwrap();
+        let v1 = docs[0].id.clone();
+        let v2 = docs[1].id.clone();
+        let (pool, _dir) = migrated_pool().await;
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        let candidates = vec![cand(&v1, "ppa_profile"), cand(&v2, "ppa_profile")];
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: new_content.to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![v1.clone(), v2.clone()],
+        }];
+        let titles = vec!["memory_t_0".to_string()];
+        let config = enforce_config();
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false],
+            &titles,
+        )
+        .await;
+
+        assert_eq!(handled, HashSet::from([0usize]));
+        // v1 删、v2 留
+        assert!(
+            km.get_document("@private_memory", &v1)
+                .await
+                .unwrap()
+                .is_none(),
+            "supersedes 首个候选内 id 应被删除"
+        );
+        assert!(
+            km.get_document("@private_memory", &v2)
+                .await
+                .unwrap()
+                .is_some(),
+            "第二个受害者不得被删"
+        );
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(doc_count(&km).await, 2, "v2 + 新条");
+        // intent / audit 各恰 1 条，且指向 v1
+        assert_eq!(intent_count(&pool).await, 1);
+        let old_id: String = sqlx::query_scalar("SELECT old_doc_id FROM memory_supersede_intent")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(old_id, v1);
+        assert_eq!(audit_superseded_count(&pool).await, 1);
+        let audits = crate::db::memory_audit::list_by_user(&pool, "test-user", 50, 0)
+            .await
+            .unwrap();
+        let row = audits
+            .iter()
+            .find(|r| r.reason == "superseded")
+            .expect("应有 superseded 审计行");
+        assert_eq!(row.doc_id, v1, "审计行应指向首个受害者");
+    }
+
+    /// 前置④：topic 为空 / 全空白 → 跳过（使槽不可识别，退化 append）。
+    #[tokio::test]
+    async fn enforce_degrades_append_when_topic_empty() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let (pool, _dir) = migrated_pool().await;
+        let candidates = vec![cand(&victim, "ppa_profile")];
+        let facts = vec![
+            MemoryFact {
+                category: MemoryCategory::Profile,
+                content: "事实一：topic 为 None".to_string(),
+                topic: None,
+                supersedes: vec![victim.clone()],
+            },
+            MemoryFact {
+                category: MemoryCategory::Profile,
+                content: "事实二：topic 全空白".to_string(),
+                topic: Some("   ".to_string()),
+                supersedes: vec![victim.clone()],
+            },
+        ];
+        let titles = vec!["memory_t_0".to_string(), "memory_t_1".to_string()];
+        let config = enforce_config();
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false, false],
+            &titles,
+        )
+        .await;
+
+        assert!(handled.is_empty(), "topic 空/空白必须跳过");
+        assert_eq!(intent_count(&pool).await, 0);
+        assert_eq!(audit_superseded_count(&pool).await, 0);
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// 前置⑥（A9）：全部预检后超 `supersede_per_turn_cap` → 整轮不取代（全有全无）。
+    #[tokio::test]
+    async fn enforce_over_cap_skips_whole_round() {
+        let km = make_km_with_docs(&[
+            ("memory_1000_0", "旧的 Rust 偏好记忆。", "ppa_profile"),
+            ("memory_1001_0", "旧的 Python 偏好记忆。", "ppa_profile"),
+        ])
+        .await;
+        let docs = km.list_documents("@private_memory", 0, 10).await.unwrap();
+        let v1 = docs[0].id.clone();
+        let v2 = docs[1].id.clone();
+        let (pool, _dir) = migrated_pool().await;
+        let candidates = vec![cand(&v1, "ppa_profile"), cand(&v2, "ppa_profile")];
+        let facts = vec![
+            MemoryFact {
+                category: MemoryCategory::Profile,
+                content: "新记忆 A 内容。".to_string(),
+                topic: Some("topic_a".to_string()),
+                supersedes: vec![v1.clone()],
+            },
+            MemoryFact {
+                category: MemoryCategory::Profile,
+                content: "新记忆 B 内容。".to_string(),
+                topic: Some("topic_b".to_string()),
+                supersedes: vec![v2.clone()],
+            },
+        ];
+        let titles = vec!["memory_t_0".to_string(), "memory_t_1".to_string()];
+        let config = MemoryConfig {
+            supersede_per_turn_cap: 1,
+            ..enforce_config()
+        };
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false, false],
+            &titles,
+        )
+        .await;
+
+        assert!(handled.is_empty(), "超 cap 整轮跳过，不得部分取代");
+        assert_eq!(intent_count(&pool).await, 0, "整轮跳过不得写 intent");
+        assert_eq!(
+            audit_superseded_count(&pool).await,
+            0,
+            "整轮跳过不得写 audit"
+        );
+        assert_eq!(doc_count(&km).await, 2, "两条受害者都保留");
+        assert!(
+            km.get_document("@private_memory", &v1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            km.get_document("@private_memory", &v2)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A8：① 落库后 ③ 审计写失败（表被删）→ intent 留 pending、新旧两活。
+    ///
+    /// 不断言 `degraded` 差值 —— 该计数是进程级静态，cargo test 并行时
+    /// A13 会并发递增；「intent 已落库」本身即证明 ① 未失败（未退化）。
+    #[tokio::test]
+    async fn enforce_audit_write_failure_keeps_pending() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let (pool, _dir) = migrated_pool().await;
+        // 审计表移除 → delete_with_audit 的 insert_pending 必失败（fail-closed 不删旧）
+        sqlx::query("DROP TABLE memory_audit")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        let candidates = vec![cand(&victim, "ppa_profile")];
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: new_content.to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let titles = vec!["memory_t_0".to_string()];
+        let config = enforce_config();
+
+        let handled = MemoryExtractionHook::enforce_supersede(
+            &km,
+            &pool,
+            &config,
+            "test-user",
+            &candidates,
+            &facts,
+            &[false],
+            &titles,
+        )
+        .await;
+
+        assert_eq!(
+            handled,
+            HashSet::from([0usize]),
+            "① 已落库 → Handled（跳过常规 append，交对账收口）"
+        );
+        assert_eq!(intent_count(&pool).await, 1);
+        assert_eq!(
+            intent_status(&pool).await.as_deref(),
+            Some("pending"),
+            "③ 失败应留 pending 待对账重试"
+        );
+        assert_eq!(
+            doc_count(&km).await,
+            2,
+            "新旧两活：add 成功、delete fail-closed"
+        );
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some(),
+            "审计写不进不得删旧"
+        );
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A13：① write_intent 失败（intent 表不存在）→ 退化 append + degraded 可见。
+    #[tokio::test]
+    async fn enforce_intent_write_failure_degrades_and_counts() {
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let victim = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户现在偏好详尽的回答".to_string(),
+            topic: Some("answer_style".to_string()),
+            supersedes: vec![victim.clone()],
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        // 未迁移的池 — memory_supersede_intent 不存在，write_intent 必失败
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        let hook = MemoryExtractionHook::new(
+            Arc::clone(&km),
+            analyzer,
+            enforce_config(),
+            pool,
+            "test-user".to_string(),
+        );
+        let before = degraded_count();
+
+        hook.on_turn_complete(0, None, &Usage::default(), &dedup_session())
+            .await;
+        wait_for_doc_count(&km, 2).await;
+
+        // 全库唯一触发 ① 失败的测试 — before/after 差值即本次增量
+        assert_eq!(
+            degraded_count() - before,
+            1,
+            "① 失败必须计入 degraded 并退回 append"
+        );
+        assert!(
+            km.get_document("@private_memory", &victim)
+                .await
+                .unwrap()
+                .is_some(),
+            "退化路径不得删除旧条"
+        );
+    }
+
+    /// 对账收敛 ①后②前：intent 已写、add 未执行 → 重放补写新条、删旧条、收口 done。
+    #[tokio::test]
+    async fn reconcile_converges_after_add_before_delete() {
+        let (pool, _dir) = migrated_pool().await;
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let old_id = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        write_intent(&pool, &intent_row(&old_id, new_content))
+            .await
+            .unwrap();
+
+        reconcile(&pool, &km, &make_config(), "test-user").await;
+
+        assert_eq!(intent_status(&pool).await.as_deref(), Some("done"));
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "重放应补写新条"
+        );
+        assert!(
+            km.get_document("@private_memory", &old_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "重放应删除旧条"
+        );
+        assert_eq!(audit_superseded_count(&pool).await, 1);
+        let audits = crate::db::memory_audit::list_by_user(&pool, "test-user", 50, 0)
+            .await
+            .unwrap();
+        let row = audits
+            .iter()
+            .find(|r| r.reason == "superseded")
+            .expect("应有 superseded 审计行");
+        assert_eq!(row.status, "done");
+        assert_eq!(row.doc_id, old_id);
+        assert_eq!(row.successor_doc_id.as_deref(), Some(new_id.as_str()));
+    }
+
+    /// 对账收敛 ②后③前：新条已在（ensure-add 幂等跳过）→ 只补删除收口 done。
+    #[tokio::test]
+    async fn reconcile_converges_after_add_done() {
+        let (pool, _dir) = migrated_pool().await;
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let old_id = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        km.add_text_to_kb("@private_memory", "new_title", new_content, "ppa_profile")
+            .await
+            .unwrap();
+        write_intent(&pool, &intent_row(&old_id, new_content))
+            .await
+            .unwrap();
+
+        reconcile(&pool, &km, &make_config(), "test-user").await;
+
+        assert_eq!(intent_status(&pool).await.as_deref(), Some("done"));
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "新条应保持不动"
+        );
+        assert!(
+            km.get_document("@private_memory", &old_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "旧条应被补删"
+        );
+        assert_eq!(doc_count(&km).await, 1);
+        assert_eq!(audit_superseded_count(&pool).await, 1);
+    }
+
+    /// 对账收敛 ③b：旧已删、audit 行停 pending 超时 → intent 收口 done（非 failed），
+    /// audit 行补 done。
+    #[tokio::test]
+    async fn reconcile_closes_audit_pending_after_delete() {
+        let (pool, _dir) = migrated_pool().await;
+        let km = make_km().await;
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        km.add_text_to_kb("@private_memory", "new_title", new_content, "ppa_profile")
+            .await
+            .unwrap();
+        // 旧条已删（KB 中不存在）；intent 停在 pending
+        let old_id = "old-doc-already-removed".to_string();
+        write_intent(&pool, &intent_row(&old_id, new_content))
+            .await
+            .unwrap();
+        // audit 行 pending 且 deleted_at 超过 audit_pending_timeout（600s）
+        let deleted_at = (chrono::Utc::now() - chrono::Duration::seconds(1200)).to_rfc3339();
+        let audit_id = crate::db::memory_audit::insert_pending(
+            &pool,
+            &MemoryAuditEntry {
+                user_id: "test-user".to_string(),
+                kb_name: "@private_memory".to_string(),
+                doc_id: old_id.clone(),
+                title: "old_title".to_string(),
+                content: EXISTING.to_string(),
+                source: "ppa_profile".to_string(),
+                reason: "superseded".to_string(),
+                deleted_by: "hook:supersede".to_string(),
+                deleted_at,
+                topic_key: Some("answer_style".to_string()),
+                successor_doc_id: Some(new_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        reconcile(&pool, &km, &make_config(), "test-user").await;
+
+        assert_eq!(
+            intent_status(&pool).await.as_deref(),
+            Some("done"),
+            "旧已删 → 幂等成功，不得判 failed"
+        );
+        let audit_status: String =
+            sqlx::query_scalar("SELECT status FROM memory_audit WHERE id = ?")
+                .bind(audit_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(audit_status, "done", "超时 pending 审计行应补 done");
+    }
+
+    /// A6'：两个对账并发处理同一 intent — CAS 领取单方成功，审计行不重复。
+    #[tokio::test]
+    async fn reconcile_cas_single_winner_no_duplicate_audit() {
+        let (pool, _dir) = migrated_pool().await;
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let old_id = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        write_intent(&pool, &intent_row(&old_id, new_content))
+            .await
+            .unwrap();
+        let config = make_config();
+
+        tokio::join!(
+            reconcile(&pool, &km, &config, "test-user"),
+            reconcile(&pool, &km, &config, "test-user"),
+        );
+
+        assert_eq!(
+            audit_superseded_count(&pool).await,
+            1,
+            "CAS 领取单方成功，审计行恰 1 条"
+        );
+        assert_eq!(intent_status(&pool).await.as_deref(), Some("done"));
+        assert!(
+            km.get_document("@private_memory", &old_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A14：持续失败的意图跨 reconcile 轮次累计 attempts，第 4 次领取
+    /// （attempts=4 > 上界 3）转 failed，health 可见。
+    #[tokio::test]
+    async fn reconcile_marks_failed_after_attempts_cap() {
+        let (pool, _dir) = migrated_pool().await;
+        let km = make_km().await;
+        let mut row = intent_row("old-doc", "new-content");
+        // 指向不存在的 KB → reconcile_one 的 ensure-add 必失败（业务错误，留 pending）
+        row.kb_name = "@no_such_kb".to_string();
+        write_intent(&pool, &row).await.unwrap();
+        let config = make_config();
+
+        // attempts 1..3：持续失败但未超上界 → 释放回 pending
+        for round in 1..=3 {
+            reconcile(&pool, &km, &config, "test-user").await;
+            let health = crate::db::memory_supersede::health_counts(&pool, "test-user")
+                .await
+                .unwrap();
+            assert_eq!(health.pending, 1, "第 {round} 轮后仍应 pending");
+            assert_eq!(health.failed, 0, "第 {round} 轮未超上界不得 failed");
+            assert_eq!(intent_status(&pool).await.as_deref(), Some("pending"));
+        }
+
+        // 第 4 次领取：attempts=4 > 3 → mark_failed
+        reconcile(&pool, &km, &config, "test-user").await;
+        let health = crate::db::memory_supersede::health_counts(&pool, "test-user")
+            .await
+            .unwrap();
+        assert_eq!(health.pending, 0, "failed 后不应再 pending");
+        assert_eq!(health.failed, 1, "超上界应转 failed 并在 health 可见");
+        assert_eq!(intent_status(&pool).await.as_deref(), Some("failed"));
     }
 }

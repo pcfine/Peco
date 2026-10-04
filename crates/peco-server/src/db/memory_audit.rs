@@ -7,8 +7,8 @@
 // 回滚 = 按审计行重放 add_text（doc_id 由内容哈希派生、摄入为替换语义，重放幂等），
 // 完成后回填 restored_at / restored_doc_id。
 // 审计含被删记忆原文，只落 SQLite（不在任何检索面上）。
-// 保留期：purge_older_than 支持按截止时刻物理清除终态行；
-// 定时清理（默认 90 天）待接入调度器后生效。
+// 保留期：purge_older_than 按 reason 分档物理清除终态行
+// （superseded 30d / 其余 90d，pending 不清）；worker 与启动双通道清理。
 
 use sqlx::SqlitePool;
 
@@ -30,10 +30,14 @@ pub struct MemoryAuditRow {
     pub deleted_at: String,
     pub restored_at: Option<String>,
     pub restored_doc_id: Option<String>,
+    /// 取代槽键（仅 `reason='superseded'` 行）：**取代方 fact 的 topic**（M2 口径）。
+    pub topic_key: Option<String>,
+    /// 后继 doc id（仅 `reason='superseded'` 行）：取代方新条的 doc id。
+    pub successor_doc_id: Option<String>,
 }
 
 const ROW_COLUMNS: &str = "id, user_id, kb_name, doc_id, title, content, source, reason, \
-     deleted_by, status, deleted_at, restored_at, restored_doc_id";
+     deleted_by, status, deleted_at, restored_at, restored_doc_id, topic_key, successor_doc_id";
 
 /// 写入一条 pending 审计，返回审计行 id。
 ///
@@ -44,8 +48,9 @@ pub async fn insert_pending(
 ) -> Result<i64, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO memory_audit \
-         (user_id, kb_name, doc_id, title, content, source, reason, deleted_by, deleted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (user_id, kb_name, doc_id, title, content, source, reason, deleted_by, deleted_at, \
+          topic_key, successor_doc_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&entry.user_id)
     .bind(&entry.kb_name)
@@ -56,6 +61,8 @@ pub async fn insert_pending(
     .bind(&entry.reason)
     .bind(&entry.deleted_by)
     .bind(&entry.deleted_at)
+    .bind(&entry.topic_key)
+    .bind(&entry.successor_doc_id)
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
@@ -134,17 +141,77 @@ pub async fn list_by_user(
 
 /// 物理清除保留期之外的终态审计行（done / cancelled），返回删除行数。
 ///
+/// 按 reason 分档（design-v4 §6.6）：`superseded` 走 `superseded_cutoff`
+/// （默认 30d），其余 reason 走 `cutoff`（默认 90d）。
 /// pending 视为未决（删除流程尚未收口），不在此清除 —
 /// 调用方应先让 outbox 行落到终态，再依赖保留期清理。
-pub async fn purge_older_than(pool: &SqlitePool, cutoff: &str) -> Result<u64, sqlx::Error> {
+pub async fn purge_older_than(
+    pool: &SqlitePool,
+    cutoff: &str,
+    superseded_cutoff: &str,
+) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "DELETE FROM memory_audit \
-         WHERE deleted_at < ? AND status IN ('done', 'cancelled')",
+         WHERE status IN ('done', 'cancelled') \
+           AND ((reason = 'superseded' AND deleted_at < ?) \
+             OR (COALESCE(reason, '') != 'superseded' AND deleted_at < ?))",
     )
+    .bind(superseded_cutoff)
     .bind(cutoff)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// 按 (user, kb, doc_id) 取唯一一条 unrestored + done 的 superseded 行（§7.2）。
+///
+/// 同 doc_id 多行只可能来自复活路径；`ORDER BY deleted_at DESC, id DESC LIMIT 1`
+/// 保证选行唯一。
+pub async fn latest_superseded_row(
+    pool: &SqlitePool,
+    user_id: &str,
+    kb_name: &str,
+    doc_id: &str,
+) -> Result<Option<MemoryAuditRow>, sqlx::Error> {
+    sqlx::query_as::<_, MemoryAuditRow>(&format!(
+        "SELECT {ROW_COLUMNS} FROM memory_audit \
+         WHERE user_id = ? AND kb_name = ? AND doc_id = ? AND reason = 'superseded' \
+           AND status = 'done' AND restored_at IS NULL \
+         ORDER BY deleted_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(user_id)
+    .bind(kb_name)
+    .bind(doc_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// 扫超时的 pending superseded 行（对账收口用，§6.5-2）。
+///
+/// 跨用户返回 — 调用方按 `user_id` 内存过滤（对账按用户收口，签名保持无 user 维度）。
+pub async fn list_pending_superseded_before(
+    pool: &SqlitePool,
+    before: &str,
+    limit: i64,
+) -> Result<Vec<MemoryAuditRow>, sqlx::Error> {
+    sqlx::query_as::<_, MemoryAuditRow>(&format!(
+        "SELECT {ROW_COLUMNS} FROM memory_audit \
+         WHERE reason = 'superseded' AND status = 'pending' AND deleted_at < ? \
+         ORDER BY deleted_at ASC, id ASC LIMIT ?"
+    ))
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// 把 audit 行 status 置 done（对账补 done）。
+///
+/// 语义别名：与 [`mark_done`] 同一 CAS（仅 pending 可迁移），
+/// 对账面收口处用本名表意。
+pub async fn mark_audit_row_done(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
+    mark_done(pool, id).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -173,6 +240,35 @@ mod tests {
                 reason: "manual_organize".into(),
                 deleted_by: "agent:@memory".into(),
                 deleted_at: deleted_at.into(),
+                topic_key: None,
+                successor_doc_id: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// 取代行写入辅助（带 topic_key / successor_doc_id 两新列）。
+    async fn insert_superseded_row(
+        pool: &SqlitePool,
+        user_id: &str,
+        doc_id: &str,
+        deleted_at: &str,
+    ) -> i64 {
+        insert_pending(
+            pool,
+            &MemoryAuditEntry {
+                user_id: user_id.into(),
+                kb_name: "@private_memory".into(),
+                doc_id: doc_id.into(),
+                title: "memory_1".into(),
+                content: "旧事实".into(),
+                source: "ppa_semantic".into(),
+                reason: "superseded".into(),
+                deleted_by: "hook:supersede".into(),
+                deleted_at: deleted_at.into(),
+                topic_key: Some("project_phase".into()),
+                successor_doc_id: Some("new-1".into()),
             },
         )
         .await
@@ -290,9 +386,13 @@ mod tests {
         insert_row(&pool, "u1", "doc-old-pending", "2026-06-03T00:00:00+00:00").await;
         insert_row(&pool, "u1", "doc-recent", "2026-09-10T00:00:00+00:00").await;
 
-        let purged = purge_older_than(&pool, "2026-09-01T00:00:00+00:00")
-            .await
-            .unwrap();
+        let purged = purge_older_than(
+            &pool,
+            "2026-09-01T00:00:00+00:00",
+            "2026-09-01T00:00:00+00:00",
+        )
+        .await
+        .unwrap();
         assert_eq!(purged, 2, "只清除保留期外的终态行");
 
         assert!(get(&pool, old_done).await.unwrap().is_none());
@@ -302,5 +402,111 @@ mod tests {
         let doc_ids: Vec<&str> = remaining.iter().map(|r| r.doc_id.as_str()).collect();
         assert!(doc_ids.contains(&"doc-old-pending"));
         assert!(doc_ids.contains(&"doc-recent"));
+    }
+
+    /// 新列往返：superseded 行写入并读回 topic_key / successor_doc_id；
+    /// 非取代行两列为 NULL。
+    #[tokio::test]
+    async fn test_topic_and_successor_columns_roundtrip() {
+        let (pool, _dir) = test_pool().await;
+        let sid = insert_superseded_row(&pool, "u1", "old-1", "2026-10-01T00:00:00+00:00").await;
+        let nid = insert_row(&pool, "u1", "doc-a", "2026-10-01T00:00:00+00:00").await;
+
+        let srow = get(&pool, sid).await.unwrap().unwrap();
+        assert_eq!(srow.topic_key.as_deref(), Some("project_phase"));
+        assert_eq!(srow.successor_doc_id.as_deref(), Some("new-1"));
+
+        let nrow = get(&pool, nid).await.unwrap().unwrap();
+        assert!(nrow.topic_key.is_none());
+        assert!(nrow.successor_doc_id.is_none());
+    }
+
+    /// purge 分档：superseded 走短档（30d 口径），其余走长档（90d 口径）；
+    /// 同一时刻的两行只有 superseded 被清。
+    #[tokio::test]
+    async fn test_purge_tiers_by_reason() {
+        let (pool, _dir) = test_pool().await;
+        let sup = insert_superseded_row(&pool, "u1", "old-sup", "2026-08-01T00:00:00+00:00").await;
+        let manual = insert_row(&pool, "u1", "doc-manual", "2026-08-01T00:00:00+00:00").await;
+        mark_done(&pool, sup).await.unwrap();
+        mark_done(&pool, manual).await.unwrap();
+
+        // 短档 2026-09-01（≈30d）/ 长档 2026-07-03（≈90d）
+        let purged = purge_older_than(
+            &pool,
+            "2026-07-03T00:00:00+00:00",
+            "2026-09-01T00:00:00+00:00",
+        )
+        .await
+        .unwrap();
+        assert_eq!(purged, 1, "只有 superseded 行落入短档");
+        assert!(
+            get(&pool, sup).await.unwrap().is_none(),
+            "superseded 已过短档"
+        );
+        assert!(
+            get(&pool, manual).await.unwrap().is_some(),
+            "同一时刻的其余 reason 未过长档，必须保留"
+        );
+    }
+
+    /// latest_superseded_row 唯一选行：done 且未回滚、取最新一条。
+    #[tokio::test]
+    async fn test_latest_superseded_row_unique_pick() {
+        let (pool, _dir) = test_pool().await;
+        let older = insert_superseded_row(&pool, "u1", "doc-x", "2026-09-01T00:00:00+00:00").await;
+        let newer = insert_superseded_row(&pool, "u1", "doc-x", "2026-10-01T00:00:00+00:00").await;
+        mark_done(&pool, older).await.unwrap();
+        mark_done(&pool, newer).await.unwrap();
+        // 已回滚的行不参与选行
+        mark_restored(&pool, newer, "2026-10-02T00:00:00+00:00", "doc-x2")
+            .await
+            .unwrap();
+
+        let row = latest_superseded_row(&pool, "u1", "@private_memory", "doc-x")
+            .await
+            .unwrap()
+            .expect("应选到未回滚的 done 行");
+        assert_eq!(row.id, older, "restored 行被过滤后应回退到较早那条");
+        assert_eq!(row.successor_doc_id.as_deref(), Some("new-1"));
+
+        // 用户 / kb 隔离
+        assert!(
+            latest_superseded_row(&pool, "u2", "@private_memory", "doc-x")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            latest_superseded_row(&pool, "u1", "@other_kb", "doc-x")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// 对账收口面：超时 pending superseded 扫描 + mark_audit_row_done。
+    #[tokio::test]
+    async fn test_pending_superseded_scan_and_close() {
+        let (pool, _dir) = test_pool().await;
+        let stale = insert_superseded_row(&pool, "u1", "doc-s", "2026-09-01T00:00:00+00:00").await;
+        let fresh = insert_superseded_row(&pool, "u1", "doc-f", "2026-10-01T00:00:00+00:00").await;
+        // 非 superseded 的 pending 不进收口面
+        let other = insert_row(&pool, "u1", "doc-o", "2026-09-01T00:00:00+00:00").await;
+
+        let rows = list_pending_superseded_before(&pool, "2026-10-01T00:00:00+00:00", 50)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "只扫超时的 pending superseded 行");
+        assert_eq!(rows[0].id, stale);
+
+        mark_audit_row_done(&pool, stale).await.unwrap();
+        assert_eq!(
+            get(&pool, stale).await.unwrap().unwrap().status,
+            "done",
+            "对账补 done"
+        );
+        assert_eq!(get(&pool, fresh).await.unwrap().unwrap().status, "pending");
+        assert_eq!(get(&pool, other).await.unwrap().unwrap().status, "pending");
     }
 }

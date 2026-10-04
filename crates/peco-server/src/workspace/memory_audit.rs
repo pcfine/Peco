@@ -41,6 +41,8 @@ fn row_to_entry(row: dao::MemoryAuditRow) -> MemoryAuditEntry {
         reason: row.reason,
         deleted_by: row.deleted_by,
         deleted_at: row.deleted_at,
+        topic_key: row.topic_key,
+        successor_doc_id: row.successor_doc_id,
     }
 }
 
@@ -98,6 +100,8 @@ mod tests {
             reason: "manual_organize".into(),
             deleted_by: "agent:@memory".into(),
             deleted_at: "2026-09-10T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
         }
     }
 

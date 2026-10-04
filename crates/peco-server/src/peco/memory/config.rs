@@ -129,12 +129,30 @@ pub struct MemoryConfig {
     pub candidate_text_cap: usize,
     /// 候选区 prompt 的 token 上限（`estimate_str_tokens` 估算，超限截断）。
     pub candidate_token_cap: usize,
-    /// 单轮最多接受几条取代决策（本阶段仅用于 shadow 记 `would_act`）。
+    /// 单轮最多接受几条取代决策（shadow 记 `would_act`，enforce 时为意图上限）。
     pub supersede_per_turn_cap: usize,
     /// 「近期通道」全量扫描文档的上限（与 `@memory` 检索端点同口径）。
     pub shadow_scan_limit: usize,
     /// shadow 行保留期（天）。本阶段只提供清理函数，未接调度器。
     pub shadow_retention_days: u64,
+
+    // ── 取代机制 · 阶段二（enforcement / 对账 / 保留期）──────────────────
+    /// audit 中 superseded 行保留期（天），走短档。
+    pub superseded_retention_days: u64,
+    /// intent(done) 保留期（天），按 updated_at=落终态时刻计。
+    pub intent_done_retention_days: u64,
+    /// intent(failed/cancelled) 保留期（天）。
+    pub intent_failed_retention_days: u64,
+    /// 每轮对账领取条数上限（M3 逐条 CAS，此值只控条数）。
+    pub reconcile_batch: i64,
+    /// processing 陈旧回收阈值（秒）：claimed_at 早于 now−该值可被重领。
+    pub reconcile_claim_timeout_secs: u64,
+    /// 对账重试上界：attempts 超该值转 failed。
+    pub reconcile_max_attempts: i64,
+    /// audit pending 收口阈值（秒）：超时且 doc 不在 KB 才补 done。
+    pub audit_pending_timeout_secs: u64,
+    /// 回滚沿 successor 链的 hop 上限（S3b restore 用，本阶段先留位）。
+    pub restore_walk_max_hops: usize,
 }
 
 impl Default for MemoryConfig {
@@ -156,9 +174,17 @@ impl Default for MemoryConfig {
             candidate_cap: 30,
             candidate_text_cap: 200,
             candidate_token_cap: 2000,
-            supersede_per_turn_cap: 3,
+            supersede_per_turn_cap: 5,
             shadow_scan_limit: 2000,
             shadow_retention_days: 30,
+            superseded_retention_days: 30,
+            intent_done_retention_days: 7,
+            intent_failed_retention_days: 90,
+            reconcile_batch: 50,
+            reconcile_claim_timeout_secs: 300,
+            reconcile_max_attempts: 3,
+            audit_pending_timeout_secs: 600,
+            restore_walk_max_hops: 16,
         }
     }
 }
@@ -185,9 +211,19 @@ mod tests {
         assert_eq!(c.candidate_cap, 30);
         assert_eq!(c.candidate_text_cap, 200);
         assert_eq!(c.candidate_token_cap, 2000);
-        assert_eq!(c.supersede_per_turn_cap, 3);
+        // 对齐 design-v4 §6.2（阶段一暂取 3，本轮统一为 5）
+        assert_eq!(c.supersede_per_turn_cap, 5);
         assert_eq!(c.shadow_scan_limit, 2000);
         assert_eq!(c.shadow_retention_days, 30);
+        // 阶段二：保留期 / 对账 / 收口阈值默认值（design-v4 §6.5/§6.6）
+        assert_eq!(c.superseded_retention_days, 30);
+        assert_eq!(c.intent_done_retention_days, 7);
+        assert_eq!(c.intent_failed_retention_days, 90);
+        assert_eq!(c.reconcile_batch, 50);
+        assert_eq!(c.reconcile_claim_timeout_secs, 300);
+        assert_eq!(c.reconcile_max_attempts, 3);
+        assert_eq!(c.audit_pending_timeout_secs, 600);
+        assert_eq!(c.restore_walk_max_hops, 16);
     }
 
     #[test]

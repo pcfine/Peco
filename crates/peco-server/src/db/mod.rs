@@ -316,6 +316,28 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 011 skipped: memory_supersede_shadow table already exists");
     }
 
+    // ── Migration 012: 记忆取代 intent WAL + audit 扩展 ────────────────────
+    // 门控查 intent 表（迁移文件最后创建的表，「表在即视为已迁」——
+    // ALTER TABLE ADD COLUMN 不可重复执行，门控必须保证整块只跑一次）
+    let has_supersede_intent = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_supersede_intent'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_supersede_intent {
+        run_migration(
+            pool,
+            "012",
+            include_str!("migrations/012_peco_memory_supersede_intent.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 012 completed");
+    } else {
+        tracing::debug!("Migration 012 skipped: memory_supersede_intent table already exists");
+    }
+
     Ok(())
 }
 
@@ -531,6 +553,68 @@ mod tests {
         assert_eq!(
             count, 1,
             "重跑迁移后表 memory_supersede_shadow 不得重复创建"
+        );
+    }
+
+    /// 迁移 012：首次执行建出 intent WAL 表并扩展 memory_audit 列；
+    /// 已有数据在二次执行后保持不变（ALTER 不可重复，靠门控整块跳过）。
+    #[tokio::test]
+    async fn migration_012_creates_table_once_and_survives_rerun() {
+        let (pool, _dir) = test_pool().await;
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("memory_supersede_intent")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "表 memory_supersede_intent 应已由迁移 012 创建");
+
+        // audit 新列就位（topic_key / successor_doc_id）
+        for col in ["topic_key", "successor_doc_id"] {
+            let n = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('memory_audit') WHERE name = ?",
+            )
+            .bind(col)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "memory_audit 应含新列 {col}");
+        }
+
+        // 写入一行 intent 数据后重跑迁移，数据与表数量必须保持不变
+        sqlx::query(
+            "INSERT INTO memory_supersede_intent \
+             (user_id, kb_name, old_doc_id, old_title, old_source, \
+              new_doc_id, new_title, new_content, new_source, created_at, updated_at) \
+             VALUES ('u1', '@private_memory', 'old-1', 't-old', 'ppa_semantic', \
+             'new-1', 't-new', '新事实', 'ppa_semantic', \
+             '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let intent_rows =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_supersede_intent")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(intent_rows, 1, "重跑迁移不得清空已有 intent 数据");
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("memory_supersede_intent")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "重跑迁移后表 memory_supersede_intent 不得重复创建"
         );
     }
 }

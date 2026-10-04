@@ -18,6 +18,7 @@
 //   - GET  /api/peco/memory/documents            记忆文档列表（分页，可按 source 过滤）
 //   - GET  /api/peco/memory/documents/{id}       记忆文档详情（全文 + 元数据）
 //   - GET  /api/peco/memory/search               记忆内容检索（正文子串扫描）
+//   - GET  /api/peco/memory/supersede/health     取代对账健康计数
 //
 // 任务生命周期与 SSE 连接解耦：runner 任务独占 LooperHandle 持续驱动，
 // 桥接任务把 broadcast 事件流转发给每个 SSE 连接。连接断开只结束桥接，
@@ -58,7 +59,7 @@ use crate::state::AppState;
 
 use super::filter::PecoContextFilter;
 use super::manager::PecoManager;
-use super::memory::view;
+use super::memory::{degraded_count, last_converged_at, view};
 use super::session::{SESSION_TITLE, private_session_id};
 
 /// 附着时等待将死 run 退出的上限（回收只发生在停靠态，退出是毫秒级）。
@@ -1683,6 +1684,44 @@ pub async fn search_memory_documents(
     ))))
 }
 
+/// `GET /api/peco/memory/supersede/health` —— 取代对账健康计数（design §11）。
+///
+/// `{pending, processing, failed}` 按用户从 intent 表聚合（done 是终态历史，
+/// 不入响应）；`degraded` / `last_converged_at` 是进程级内存态 —— 前者为
+/// ① `write_intent` 失败退化为 append 的累计次数（重启清零、不按用户隔离），
+/// 后者为最近一次对账完整收口的时刻（SQL 级错误的轮次不更新）。
+pub async fn supersede_health(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SupersedeHealthResponse>, ApiError> {
+    let health = crate::db::memory_supersede::health_counts(&state.db, &user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to read supersede health: {e}")))?;
+
+    Ok(Json(SupersedeHealthResponse {
+        pending: health.pending,
+        processing: health.processing,
+        failed: health.failed,
+        degraded: degraded_count(),
+        last_converged_at: last_converged_at(),
+    }))
+}
+
+/// 取代对账健康响应（design §11）。
+#[derive(Debug, Serialize)]
+pub struct SupersedeHealthResponse {
+    /// 待处理意图数。
+    pub pending: i64,
+    /// 处理中（已领取）意图数。
+    pub processing: i64,
+    /// 超重试上界已放弃的意图数。
+    pub failed: i64,
+    /// ① intent 写失败退化为 append 的次数（进程级，重启清零）。
+    pub degraded: i64,
+    /// 最近一次对账完整收口时刻（RFC 3339；从未收口则为 null）。
+    pub last_converged_at: Option<String>,
+}
+
 /// 构建 Peco 路由。
 ///
 /// 注册到 `/api/peco`：
@@ -1705,6 +1744,7 @@ pub async fn search_memory_documents(
 /// - `GET /memory/documents` — 记忆文档列表（分页，可按 `source` 过滤）
 /// - `GET /memory/documents/{id}` — 记忆文档详情（全文 + 元数据）
 /// - `GET /memory/search` — 记忆内容检索（正文子串扫描，`?q=&limit[&source]`）
+/// - `GET /memory/supersede/health` — 取代对账健康计数（design §11）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
@@ -1725,6 +1765,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/documents", get(list_memory_documents))
         .route("/memory/documents/{id}", get(get_memory_document))
         .route("/memory/search", get(search_memory_documents))
+        .route("/memory/supersede/health", get(supersede_health))
 }
 
 // ---------------------------------------------------------------------------
