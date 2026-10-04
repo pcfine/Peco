@@ -49,6 +49,59 @@ export interface MemoryDocumentDetail {
 }
 
 /**
+ * 记忆删除审计行（`GET /peco/memory/audit` 裸数组元素）。
+ *
+ * 后端对 `restored_at` / `restored_doc_id` / `topic_key` / `successor_doc_id` /
+ * `successor_title` / `retention_days_remaining` 均 `skip_serializing_if=None`：
+ * **缺省即不存在**，TS 侧一律可选。`successor_*` 与 `retention_days_remaining`
+ * 仅 `reason === "superseded"` 行有值。
+ */
+export interface MemoryAuditItem {
+  id: number;
+  kb_name: string;
+  doc_id: string;
+  title: string;
+  content: string;
+  source: string;
+  reason: string;
+  deleted_by: string;
+  /** 'done' | 'pending' | 'cancelled' */
+  status: string;
+  /** RFC3339。 */
+  deleted_at: string;
+  /** 有值 ⇒ 已回滚。 */
+  restored_at?: string;
+  restored_doc_id?: string;
+  /** 取代槽键（仅 superseded）。 */
+  topic_key?: string;
+  /** 后继 doc id（仅 superseded）。 */
+  successor_doc_id?: string;
+  /** 后继标题（仅 superseded；可能缺失，也可能为空串）。 */
+  successor_title?: string;
+  /** superseded 保留期剩余天数（仅 superseded；∈[0,30]）。 */
+  retention_days_remaining?: number;
+}
+
+/** `POST /peco/memory/audit/{id}/restore` 响应。 */
+export interface RestoreMemoryResponse {
+  success: boolean;
+  doc_id: string;
+  restored_at: string;
+}
+
+/**
+ * 取代对账健康计数（`GET /memory/supersede/health` 与手动对账共用形状）。
+ * `degraded` 为进程级内存态（重启清零）；`last_converged_at` 从未收口则为 null。
+ */
+export interface SupersedeHealth {
+  pending: number;
+  processing: number;
+  failed: number;
+  degraded: number;
+  last_converged_at: string | null;
+}
+
+/**
  * E4 检索的一条文档级命中。**无 `score`** —— 服务端为正文子串扫描，
  * 无相关性信号，不承诺任何恒定分数；排序恒为 `id` 升序。
  */

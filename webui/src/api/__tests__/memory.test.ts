@@ -5,18 +5,24 @@ import api from "../client";
 import {
   getMemoryDocument,
   getMemoryGraph,
+  getSupersedeHealth,
+  listMemoryAudit,
   listMemoryDocuments,
+  restoreMemoryAudit,
   searchMemoryDocuments,
+  triggerSupersedeReconcile,
 } from "../memory";
 
 vi.mock("../client", () => ({
-  default: { get: vi.fn() },
+  default: { get: vi.fn(), post: vi.fn() },
 }));
 
 const GET = vi.mocked(api.get);
+const POST = vi.mocked(api.post);
 
 beforeEach(() => {
   GET.mockReset();
+  POST.mockReset();
 });
 
 describe("memory API", () => {
@@ -136,5 +142,92 @@ describe("memory API", () => {
     expect(GET).toHaveBeenCalledWith("/peco/memory/search", {
       params: { q: "小C", limit: 20, source: "ppa_semantic" },
     });
+  });
+
+  // ── 审计 / 取代健康（历史 tab） ─────────────────────────────────────────
+
+  const AUDIT_ROW = {
+    id: 7,
+    kb_name: "@private_memory",
+    doc_id: "c6cd2285ca896c7d",
+    title: "旧条",
+    content: "正文",
+    source: "ppa_semantic",
+    reason: "superseded",
+    deleted_by: "extraction",
+    status: "done",
+    deleted_at: "2026-09-20T10:30:00Z",
+    successor_doc_id: "aabbccddeeff0011",
+    successor_title: "新条",
+    retention_days_remaining: 12,
+  };
+
+  it("listMemoryAudit(0,20) 不塞 reason 键，resolve 裸数组", async () => {
+    GET.mockResolvedValue({ data: [AUDIT_ROW] });
+
+    await expect(listMemoryAudit(0, 20)).resolves.toEqual([AUDIT_ROW]);
+    expect(GET).toHaveBeenCalledWith("/peco/memory/audit", {
+      params: { offset: 0, limit: 20 },
+    });
+  });
+
+  it("listMemoryAudit(0,20,'superseded') 透传 reason", async () => {
+    GET.mockResolvedValue({ data: [] });
+
+    await listMemoryAudit(0, 20, "superseded");
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/audit", {
+      params: { offset: 0, limit: 20, reason: "superseded" },
+    });
+  });
+
+  it("listMemoryAudit 空串 reason 不传键（口径同 source）", async () => {
+    GET.mockResolvedValue({ data: [] });
+
+    await listMemoryAudit(20, 20, "");
+
+    expect(GET).toHaveBeenCalledWith("/peco/memory/audit", {
+      params: { offset: 20, limit: 20 },
+    });
+  });
+
+  it("restoreMemoryAudit(7) POST 回滚路径并 resolve data", async () => {
+    const payload = {
+      success: true,
+      doc_id: "c6cd2285ca896c7d",
+      restored_at: "2026-09-21T08:00:00Z",
+    };
+    POST.mockResolvedValue({ data: payload });
+
+    await expect(restoreMemoryAudit(7)).resolves.toEqual(payload);
+    expect(POST).toHaveBeenCalledWith("/peco/memory/audit/7/restore");
+  });
+
+  it("getSupersedeHealth() GET 健康计数", async () => {
+    const payload = {
+      pending: 2,
+      processing: 1,
+      failed: 0,
+      degraded: 3,
+      last_converged_at: null,
+    };
+    GET.mockResolvedValue({ data: payload });
+
+    await expect(getSupersedeHealth()).resolves.toEqual(payload);
+    expect(GET).toHaveBeenCalledWith("/peco/memory/supersede/health");
+  });
+
+  it("triggerSupersedeReconcile() POST 对账并 resolve 同形计数", async () => {
+    const payload = {
+      pending: 0,
+      processing: 0,
+      failed: 0,
+      degraded: 0,
+      last_converged_at: "2026-09-21T08:00:00Z",
+    };
+    POST.mockResolvedValue({ data: payload });
+
+    await expect(triggerSupersedeReconcile()).resolves.toEqual(payload);
+    expect(POST).toHaveBeenCalledWith("/peco/memory/supersede/reconcile");
   });
 });

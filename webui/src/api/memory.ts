@@ -2,10 +2,13 @@
 
 import api from "./client";
 import type {
+  MemoryAuditItem,
   MemoryDocumentDetail,
   MemoryDocumentPage,
   MemoryGraphResponse,
   MemorySearchResponse,
+  RestoreMemoryResponse,
+  SupersedeHealth,
 } from "@/types/memory";
 
 // axios baseURL 为 "/api"，故此处路径相对它。
@@ -81,5 +84,49 @@ export async function searchMemoryDocuments(
   if (source) params.source = source;
 
   const res = await api.get<MemorySearchResponse>(`${PATH}/search`, { params });
+  return res.data;
+}
+
+/**
+ * 分页列出当前用户的记忆删除审计（`GET /audit`，`deleted_at` 倒序）。
+ *
+ * **裸数组响应 —— 无 `has_more` 信封**，到底判定由调用方按返回条数做
+ * （返回条数 < limit ⇒ 到底）。`reason` 仅在给出**且非空**时放进 `params`
+ * （口径同 `listMemoryDocuments` 的 `source`）。
+ */
+export async function listMemoryAudit(
+  offset: number,
+  limit: number,
+  reason?: string,
+): Promise<MemoryAuditItem[]> {
+  const params: { offset: number; limit: number; reason?: string } = {
+    offset,
+    limit,
+  };
+  if (reason) params.reason = reason;
+
+  const res = await api.get<MemoryAuditItem[]>(`${PATH}/audit`, { params });
+  return res.data;
+}
+
+/** 按审计行回滚一条记忆删除（`POST /audit/{id}/restore`）。失败为 4xx/5xx，错误信息原样上抛。 */
+export async function restoreMemoryAudit(
+  id: number,
+): Promise<RestoreMemoryResponse> {
+  const res = await api.post<RestoreMemoryResponse>(
+    `${PATH}/audit/${id}/restore`,
+  );
+  return res.data;
+}
+
+/** 取代对账健康计数（`GET /supersede/health`）。 */
+export async function getSupersedeHealth(): Promise<SupersedeHealth> {
+  const res = await api.get<SupersedeHealth>(`${PATH}/supersede/health`);
+  return res.data;
+}
+
+/** 手动触发一次取代对账（`POST /supersede/reconcile`），返回与 health 同形的计数。 */
+export async function triggerSupersedeReconcile(): Promise<SupersedeHealth> {
+  const res = await api.post<SupersedeHealth>(`${PATH}/supersede/reconcile`);
   return res.data;
 }
