@@ -19,6 +19,7 @@
 //   - GET  /api/peco/memory/documents/{id}       记忆文档详情（全文 + 元数据）
 //   - GET  /api/peco/memory/search               记忆内容检索（正文子串扫描）
 //   - GET  /api/peco/memory/supersede/health     取代对账健康计数
+//   - POST /api/peco/memory/supersede/reconcile  手动触发一次取代对账
 //
 // 任务生命周期与 SSE 连接解耦：runner 任务独占 LooperHandle 持续驱动，
 // 桥接任务把 broadcast 事件流转发给每个 SSE 连接。连接断开只结束桥接，
@@ -1942,7 +1943,15 @@ pub async fn supersede_health(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SupersedeHealthResponse>, ApiError> {
-    let health = crate::db::memory_supersede::health_counts(&state.db, &user_id)
+    supersede_health_response(&state, &user_id).await
+}
+
+/// 组装 §11 健康响应 —— `GET /memory/supersede/health` 与手动对账端点共用。
+async fn supersede_health_response(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Json<SupersedeHealthResponse>, ApiError> {
+    let health = crate::db::memory_supersede::health_counts(&state.db, user_id)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to read supersede health: {e}")))?;
 
@@ -1953,6 +1962,26 @@ pub async fn supersede_health(
         degraded: degraded_count(),
         last_converged_at: last_converged_at(),
     }))
+}
+
+/// `POST /api/peco/memory/supersede/reconcile` —— 手动触发一次对账（§6.5 ③）。
+///
+/// 与每轮 hook 收尾、进程启动同一条 `peco::memory::reconcile` 入口，幂等；
+/// **不新增开关、不改变默认行为**（门恒闭）。同步跑完后返回与
+/// `GET /memory/supersede/health` 同形的健康计数。
+pub async fn supersede_reconcile(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SupersedeHealthResponse>, ApiError> {
+    let memory = super::config::PecoConfig::default().memory;
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    super::memory::reconcile(&state.db, ws.knowledge_manager(), &memory, &user_id).await;
+
+    info!(user_id = %user_id, "Manual supersede reconcile finished");
+    supersede_health_response(&state, &user_id).await
 }
 
 /// 取代对账健康响应（design §11）。
@@ -1993,6 +2022,7 @@ pub struct SupersedeHealthResponse {
 /// - `GET /memory/documents/{id}` — 记忆文档详情（全文 + 元数据）
 /// - `GET /memory/search` — 记忆内容检索（正文子串扫描，`?q=&limit[&source]`）
 /// - `GET /memory/supersede/health` — 取代对账健康计数（design §11）
+/// - `POST /memory/supersede/reconcile` — 手动触发一次取代对账（§6.5 ③）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))
@@ -2014,6 +2044,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/documents/{id}", get(get_memory_document))
         .route("/memory/search", get(search_memory_documents))
         .route("/memory/supersede/health", get(supersede_health))
+        .route("/memory/supersede/reconcile", post(supersede_reconcile))
 }
 
 // ---------------------------------------------------------------------------
