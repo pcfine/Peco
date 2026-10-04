@@ -189,6 +189,29 @@ pub async fn claim_next(
     Ok(Some(row))
 }
 
+/// 写路径专用领取（A6'）：按 id CAS `pending → processing`。
+///
+/// 写路径 ① 落 pending 后立即领取，使 ②③④ 期间 intent 处于 `processing`
+/// 且 `claimed_at` 新鲜 —— 对账 `claim_next` 只领 `pending` 或陈旧
+/// `processing`，故不会重领。否则「写路径 ‖ 对账」双方各过一遍
+/// `delete_with_audit` 的 `insert_pending` → 重复 audit 行。
+///
+/// 返回 `true`=领取成功；`false`=行非 pending（已被他人领取）—— 调用方
+/// 放弃本轮，由对账收口。
+pub async fn claim_intent(pool: &SqlitePool, id: i64, now: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE memory_supersede_intent \
+         SET status = 'processing', claimed_at = ?, attempts = attempts + 1, updated_at = ? \
+         WHERE id = ? AND status = 'pending'",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// pending/processing → done（写路径 ④ / 对账补 done）。
 ///
 /// 已终态（done/failed）行 no-op — 幂等收口。
@@ -523,6 +546,41 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "done", "done 终态不得被 release 回退");
+    }
+
+    /// A6'：写路径 ① 落 pending 后立即 `claim_intent`，并发对账的
+    /// `claim_next` 不得重领（否则双侧各 insert_pending → 重复 audit 行）。
+    #[tokio::test]
+    async fn test_write_path_claim_blocks_reconcile_steal() {
+        let (pool, _dir) = test_pool().await;
+        let id = write_intent(&pool, &sample_intent("u1", "2026-10-01T00:00:00+00:00"))
+            .await
+            .unwrap();
+
+        // 写路径领取（claimed_at 新鲜）
+        assert!(
+            claim_intent(&pool, id, "2026-10-01T00:00:00+00:00")
+                .await
+                .unwrap(),
+            "首次领取应成功"
+        );
+
+        // 对账用宽松陈旧窗口也领不到：新鲜 processing 不在可领条件内
+        assert!(
+            claim_next(&pool, "u1", "2000-01-01T00:00:00+00:00")
+                .await
+                .unwrap()
+                .is_none(),
+            "写路径持有新鲜 processing 时，对账不得重领"
+        );
+
+        // 重复 claim_intent 亦失败（行已非 pending）
+        assert!(
+            !claim_intent(&pool, id, "2026-10-01T00:00:01+00:00")
+                .await
+                .unwrap(),
+            "已领取的行不得被再次 claim_intent"
+        );
     }
 
     /// health 按用户聚合三态计数。

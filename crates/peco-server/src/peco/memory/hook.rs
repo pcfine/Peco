@@ -41,8 +41,8 @@ use super::config::MemoryConfig;
 use super::dedup::max_cosine;
 use crate::db::memory_audit::{list_pending_superseded_before, mark_audit_row_done};
 use crate::db::memory_supersede::{
-    ClaimedIntent, IntentRow, ShadowRow, claim_next, insert_shadow, mark_done, mark_failed,
-    release_to_pending, write_intent,
+    ClaimedIntent, IntentRow, ShadowRow, claim_intent, claim_next, insert_shadow, mark_done,
+    mark_failed, release_to_pending, write_intent,
 };
 
 /// 带来源通道的候选 — shadow 快照要记 channel，analyzer 只见 [`MemoryCandidate`]。
@@ -806,6 +806,28 @@ impl MemoryExtractionHook {
             }
         };
 
+        // ①.5 CAS 领取（A6'）—— 使 ②③④ 期间 intent 处 `processing`（claimed_at
+        // 新鲜），并发对账的 `claim_next` 不再可重领；否则两侧各 insert_pending
+        // 产出重复 audit 行。领取失败（DB 错 / 已被领取）⇒ 放弃本轮，交对账收口。
+        match claim_intent(db, intent_id, &now).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    intent_id,
+                    "Supersede intent already claimed, leaving to reconcile"
+                );
+                return SupersedeOutcome::Handled;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    intent_id,
+                    "Supersede intent claim failed, leaving to reconcile"
+                );
+                return SupersedeOutcome::Handled;
+            }
+        }
+
         // ② add(new)（幂等同 id 替换）—— 失败不删旧（保持至少一条存活），
         // intent 留 pending 交对账重放 add
         let source = source_of(fact);
@@ -818,6 +840,7 @@ impl MemoryExtractionHook {
                 doc_id = %item.new_doc_id,
                 "Supersede add new failed (intent left pending)"
             );
+            release_after_failure(db, intent_id, &now).await;
             return SupersedeOutcome::Handled;
         }
 
@@ -844,6 +867,7 @@ impl MemoryExtractionHook {
                 };
                 if let Err(e) = super::retire::delete_with_audit(db, km, &entry).await {
                     warn!(error = %e, "Supersede delete old failed (intent left pending)");
+                    release_after_failure(db, intent_id, &now).await;
                     return SupersedeOutcome::Handled;
                 }
             }
@@ -853,6 +877,7 @@ impl MemoryExtractionHook {
                     doc_id = %item.old_doc_id,
                     "Supersede victim re-check failed (intent left pending)"
                 );
+                release_after_failure(db, intent_id, &now).await;
                 return SupersedeOutcome::Handled;
             }
         }
@@ -864,8 +889,19 @@ impl MemoryExtractionHook {
                 intent_id,
                 "Supersede intent done write failed (reconcile will close)"
             );
+            release_after_failure(db, intent_id, &now).await;
         }
         SupersedeOutcome::Handled
+    }
+}
+
+/// 领取后的失败路径：把 intent 释放回 `pending`，使对账可**即时**重领
+///（否则停在 `processing` 需等 `reconcile_claim_timeout`(5min) 陈旧窗口，
+/// 违背 §6.4「③ 失败 → 对账重试」的即时性）。释放本身失败也仅告警 ——
+/// 行仍可由陈旧回收兜住。
+async fn release_after_failure(db: &sqlx::SqlitePool, intent_id: i64, now: &str) {
+    if let Err(e) = release_to_pending(db, intent_id, now).await {
+        warn!(error = %e, intent_id, "Supersede release to pending failed");
     }
 }
 
@@ -2880,6 +2916,94 @@ mod tests {
             audit_superseded_count(&pool).await,
             1,
             "CAS 领取单方成功，审计行恰 1 条"
+        );
+        assert_eq!(intent_status(&pool).await.as_deref(), Some("done"));
+        assert!(
+            km.get_document("@private_memory", &old_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            km.get_document("@private_memory", &new_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A6'（写路径 ‖ 对账）：写路径已领取（新鲜 processing）的在途 intent，
+    /// 对账不得重放（否则双侧各 insert_pending → 重复 audit 行）；写路径随后
+    /// 正常完成 → 审计行恰 1 条。
+    #[tokio::test]
+    async fn reconcile_skips_intent_held_by_write_path() {
+        let (pool, _dir) = migrated_pool().await;
+        let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
+        let old_id = km.list_documents("@private_memory", 0, 10).await.unwrap()[0]
+            .id
+            .clone();
+        let new_content = "用户现在偏好详尽的回答";
+        let new_id = knowledge_base::text_doc_id(new_content);
+        write_intent(&pool, &intent_row(&old_id, new_content))
+            .await
+            .unwrap();
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM memory_supersede_intent WHERE user_id = 'test-user'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // 写路径 ①.5：领取
+        assert!(
+            crate::db::memory_supersede::claim_intent(&pool, id, &chrono::Utc::now().to_rfc3339())
+                .await
+                .unwrap()
+        );
+        let config = make_config();
+
+        // 对账并发：不得重放（无 audit 行、旧条仍在）
+        reconcile(&pool, &km, &config, "test-user").await;
+        assert_eq!(
+            audit_superseded_count(&pool).await,
+            0,
+            "写路径在途（已领取）的 intent 不得被对账重放"
+        );
+        assert!(
+            km.get_document("@private_memory", &old_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "对账不应删旧"
+        );
+
+        // 写路径随后完成 ②③④
+        km.add_text_to_kb("@private_memory", "new_title", new_content, "ppa_profile")
+            .await
+            .unwrap();
+        let entry = peco_core::tools::MemoryAuditEntry {
+            user_id: "test-user".to_string(),
+            kb_name: "@private_memory".to_string(),
+            doc_id: old_id.clone(),
+            title: "old_title".to_string(),
+            content: EXISTING.to_string(),
+            source: "ppa_profile".to_string(),
+            reason: "superseded".to_string(),
+            deleted_by: "hook:supersede".to_string(),
+            deleted_at: chrono::Utc::now().to_rfc3339(),
+            topic_key: Some("answer_style".to_string()),
+            successor_doc_id: Some(new_id.clone()),
+        };
+        crate::peco::memory::retire::delete_with_audit(&pool, &km, &entry)
+            .await
+            .unwrap();
+        mark_done(&pool, id, &chrono::Utc::now().to_rfc3339())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            audit_superseded_count(&pool).await,
+            1,
+            "写路径完成后审计行恰 1 条（无重复）"
         );
         assert_eq!(intent_status(&pool).await.as_deref(), Some("done"));
         assert!(
