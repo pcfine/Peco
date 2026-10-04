@@ -128,14 +128,54 @@ pub async fn list_by_user(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<MemoryAuditRow>, sqlx::Error> {
+    list_by_user_reason(pool, user_id, None, limit, offset).await
+}
+
+/// 按用户分页列出审计行，可按 `reason` 过滤（design §11 历史 tab：
+/// `GET /memory/audit?reason=superseded`）。
+///
+/// `reason = None` 时不过滤；排序保持 `deleted_at DESC, id DESC`。
+pub async fn list_by_user_reason(
+    pool: &SqlitePool,
+    user_id: &str,
+    reason: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<MemoryAuditRow>, sqlx::Error> {
     sqlx::query_as::<_, MemoryAuditRow>(&format!(
-        "SELECT {ROW_COLUMNS} FROM memory_audit WHERE user_id = ? \
+        "SELECT {ROW_COLUMNS} FROM memory_audit \
+             WHERE user_id = ? AND (? IS NULL OR reason = ?) \
              ORDER BY deleted_at DESC, id DESC LIMIT ? OFFSET ?"
     ))
     .bind(user_id)
+    .bind(reason)
+    .bind(reason)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
+    .await
+}
+
+/// 某 doc_id 在审计面最新一条 `status='done'` 行的标题（§11 后继标题解析
+/// 第二路 —— 后继已再次退役时取这里）。
+///
+/// **必须先过滤 `status='done'`**：cancelled 重复行可能更新，不滤会顶替
+/// 正确标题（design nit10）。
+pub async fn latest_done_row_title(
+    pool: &SqlitePool,
+    user_id: &str,
+    kb_name: &str,
+    doc_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT title FROM memory_audit \
+         WHERE user_id = ? AND kb_name = ? AND doc_id = ? AND status = 'done' \
+         ORDER BY deleted_at DESC, id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(kb_name)
+    .bind(doc_id)
+    .fetch_optional(pool)
     .await
 }
 
@@ -479,6 +519,87 @@ mod tests {
         );
         assert!(
             latest_superseded_row(&pool, "u1", "@other_kb", "doc-x")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// reason 过滤：Some 只回该 reason 的行，None 不过滤（历史 tab 两态）。
+    #[tokio::test]
+    async fn test_list_by_user_reason_filter() {
+        let (pool, _dir) = test_pool().await;
+        insert_row(&pool, "u1", "doc-manual", "2026-10-01T00:00:00+00:00").await;
+        insert_superseded_row(&pool, "u1", "doc-sup", "2026-10-02T00:00:00+00:00").await;
+        insert_superseded_row(&pool, "u2", "doc-other", "2026-10-03T00:00:00+00:00").await;
+
+        let all = list_by_user_reason(&pool, "u1", None, 10, 0).await.unwrap();
+        assert_eq!(all.len(), 2, "None 不过滤");
+
+        let sup = list_by_user_reason(&pool, "u1", Some("superseded"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(sup.len(), 1);
+        assert_eq!(sup[0].doc_id, "doc-sup");
+
+        let none = list_by_user_reason(&pool, "u1", Some("manual_organize"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].doc_id, "doc-manual");
+
+        // 排序与分页口径不因过滤改变
+        let empty = list_by_user_reason(&pool, "u2", Some("superseded"), 1, 1)
+            .await
+            .unwrap();
+        assert!(empty.is_empty(), "分页偏移越过第二条");
+    }
+
+    /// latest_done_row_title：先滤 done（cancelled 更新行不得顶替），
+    /// 取最新；无 done 行 / 无行 → None；按 user+kb 隔离。
+    #[tokio::test]
+    async fn test_latest_done_row_title_filters_cancelled() {
+        let (pool, _dir) = test_pool().await;
+        let done_id = insert_row(&pool, "u1", "doc-t", "2026-09-01T00:00:00+00:00").await;
+        mark_done(&pool, done_id).await.unwrap();
+        // 同 doc_id 的 cancelled 行更晚写入 — 不滤 done 会顶替
+        let cancelled_id = insert_row(&pool, "u1", "doc-t", "2026-10-01T00:00:00+00:00").await;
+        mark_cancelled(&pool, cancelled_id).await.unwrap();
+
+        assert_eq!(
+            latest_done_row_title(&pool, "u1", "@private_memory", "doc-t")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("memory_1"),
+            "cancelled 行不得顶替 done 行标题"
+        );
+
+        // 隔离：用户 / kb / doc_id 任一不符 → None
+        assert!(
+            latest_done_row_title(&pool, "u2", "@private_memory", "doc-t")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            latest_done_row_title(&pool, "u1", "@other_kb", "doc-t")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            latest_done_row_title(&pool, "u1", "@private_memory", "doc-missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 只有 cancelled 行 → None（status='done' 过滤生效）
+        let only_cancelled = insert_row(&pool, "u1", "doc-c", "2026-10-01T00:00:00+00:00").await;
+        mark_cancelled(&pool, only_cancelled).await.unwrap();
+        assert!(
+            latest_done_row_title(&pool, "u1", "@private_memory", "doc-c")
                 .await
                 .unwrap()
                 .is_none()

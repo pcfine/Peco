@@ -25,6 +25,7 @@
 // 轮次继续执行；重开页面通过 subscribe() 重新附着。轮边界（Idle）且无
 // 订阅者时 runner 回收 looper，避免无人观看的停靠任务占用资源。
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,9 +41,10 @@ use axum::routing::{get, post, put};
 use futures::stream::Stream;
 use model_provider::InputItem;
 use peco_core::agent::{AgentLooper, LooperEvent, LooperHandle, OuterState, strip_summary_wrapper};
-use peco_core::knowledge::KnowledgeModuleError;
+use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::{Session, SessionSnapshot};
+use peco_core::tools::MemoryAuditEntry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
@@ -994,6 +996,9 @@ pub struct AuditQuery {
     /// 偏移量。
     #[serde(default)]
     pub offset: i64,
+    /// 按删除原因过滤（历史 tab：`?reason=superseded`）。缺省 / 空串不过滤。
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 fn default_audit_limit() -> i64 {
@@ -1001,6 +1006,10 @@ fn default_audit_limit() -> i64 {
 }
 
 /// 单条记忆删除审计记录（含被删原文 — 仅供本人查阅）。
+///
+/// `topic_key` / `successor_doc_id` 仅 `reason='superseded'` 行有值；
+/// `successor_title` / `retention_days_remaining` 需查 KB / 取当前时刻，
+/// 由 handler 在 `From` 之后逐条后填（仅 superseded 行）。
 #[derive(Debug, Serialize)]
 pub struct MemoryAuditItem {
     pub id: i64,
@@ -1017,6 +1026,18 @@ pub struct MemoryAuditItem {
     pub restored_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restored_doc_id: Option<String>,
+    /// 取代槽键（仅 superseded 行）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic_key: Option<String>,
+    /// 后继 doc id（仅 superseded 行）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_doc_id: Option<String>,
+    /// 后继标题 — §11 两路解析（① 存活活条标题 ② 审计面最新 done 行标题）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_title: Option<String>,
+    /// superseded 保留期剩余天数（30d 档，下限 0）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_days_remaining: Option<i64>,
 }
 
 impl From<crate::db::memory_audit::MemoryAuditRow> for MemoryAuditItem {
@@ -1034,26 +1055,113 @@ impl From<crate::db::memory_audit::MemoryAuditRow> for MemoryAuditItem {
             deleted_at: r.deleted_at,
             restored_at: r.restored_at,
             restored_doc_id: r.restored_doc_id,
+            topic_key: r.topic_key,
+            successor_doc_id: r.successor_doc_id,
+            successor_title: None,
+            retention_days_remaining: None,
         }
     }
 }
 
-/// 分页列出当前用户的记忆删除审计（deleted_at 倒序）。
+/// 分页列出当前用户的记忆删除审计（deleted_at 倒序，可按 `reason` 过滤）。
+///
+/// superseded 行额外后填后继标题（两路解析）与剩余保留天数 —
+/// 两者需查 KB / 取 now，不能在 `From` 里同步算。workspace 打不开 /
+/// KB 读失败只降级跳过对应展示字段，不阻断列表（I4 非致命）。
 pub async fn list_memory_audit(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
     Query(params): Query<AuditQuery>,
 ) -> Result<Json<Vec<MemoryAuditItem>>, ApiError> {
-    let rows = crate::db::memory_audit::list_by_user(
+    let reason = params.reason.as_deref().filter(|r| !r.is_empty());
+    let rows = crate::db::memory_audit::list_by_user_reason(
         &state.db,
         &user_id,
+        reason,
         params.limit.clamp(1, 100),
         params.offset.max(0),
     )
     .await
     .map_err(|e| ApiError::Internal(format!("failed to list memory audit: {e}")))?;
 
-    Ok(Json(rows.into_iter().map(MemoryAuditItem::from).collect()))
+    let memory = super::config::PecoConfig::default().memory;
+    // 后继标题解析①（活条）要读 KB —— 只在确有带后继的 superseded 行时开 workspace
+    let needs_successor_lookup = rows
+        .iter()
+        .any(|r| r.reason == "superseded" && r.successor_doc_id.is_some());
+    let ws = if needs_successor_lookup {
+        match state
+            .workspace_manager
+            .get_synced(&user_id, &state.db)
+            .await
+        {
+            Ok(ws) => Some(ws),
+            Err(e) => {
+                warn!(error = %e, "Audit list: workspace unavailable, successor titles degrade");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let km: Option<&KnowledgeManager> = ws.as_ref().map(|w| &**w.knowledge_manager());
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut item = MemoryAuditItem::from(row);
+        if item.reason == "superseded" {
+            item.retention_days_remaining =
+                retention_days_remaining(&item.deleted_at, memory.superseded_retention_days);
+            if let Some(successor) = item.successor_doc_id.as_deref() {
+                item.successor_title =
+                    resolve_successor_title(&state.db, &user_id, km, &item.kb_name, successor)
+                        .await;
+            }
+        }
+        items.push(item);
+    }
+
+    Ok(Json(items))
+}
+
+/// §11 后继标题两路解析：① 后继仍存活 → 活条标题；② 已再次退役 → 该
+/// doc_id 在审计面最新 `status='done'` 行的标题（先滤 done，防 cancelled
+/// 重复行顶替 — design nit10）。展示字段：任一路失败降级，不阻断列表。
+async fn resolve_successor_title(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    km: Option<&KnowledgeManager>,
+    kb_name: &str,
+    successor_doc_id: &str,
+) -> Option<String> {
+    if let Some(km) = km {
+        match km.get_document(kb_name, successor_doc_id).await {
+            Ok(Some(doc)) => return Some(doc.title),
+            Ok(None) => {}
+            Err(e) => warn!(
+                error = %e,
+                doc_id = successor_doc_id,
+                "Successor live lookup failed, falling back to audit title"
+            ),
+        }
+    }
+    match crate::db::memory_audit::latest_done_row_title(db, user_id, kb_name, successor_doc_id)
+        .await
+    {
+        Ok(title) => title,
+        Err(e) => {
+            warn!(error = %e, doc_id = successor_doc_id, "Successor audit title lookup failed");
+            None
+        }
+    }
+}
+
+/// superseded 保留期剩余天数 = 档期 − 已过天数，下限 0（§11 / §6.6）。
+/// `deleted_at` 解析失败返回 None（不冒充 0）。
+fn retention_days_remaining(deleted_at: &str, retention_days: u64) -> Option<i64> {
+    let deleted = chrono::DateTime::parse_from_rfc3339(deleted_at).ok()?;
+    let elapsed = (chrono::Utc::now() - deleted.with_timezone(&chrono::Utc)).num_days();
+    Some((retention_days as i64 - elapsed).max(0))
 }
 
 /// 回滚响应。
@@ -1067,7 +1175,14 @@ pub struct RestoreMemoryResponse {
 /// 按审计行回滚一条记忆删除，成功后回填 restored_at / restored_doc_id：
 /// - `source == "graph_fact"`（图事实删除）→ 解析边快照，`read_fact` 存在性门后
 ///   重放 `add_facts`（事实仍在则跳过，不产生并行边）；实体级联行与损坏快照 409 拒绝。
-/// - 其余（文档删除）→ 重放 `add_text`（doc_id 为内容哈希前缀，幂等复原）。
+///   分支原样保留，**不做内容哈希断言**（§7.4 —— graph_fact 的 doc_id 不是内容哈希）。
+/// - 其余（文档删除）→ 三阶段回滚契约（§7）：① 全量校验零副作用 →
+///   ② 沿 successor 链定位存活叶子（对环免疫 + 自身守门 + 跨槽 409）→
+///   ③ 重放自身 → 退役叶子 → 回填。
+///
+/// 取代行只重放不退役会让旧条与当前叶子两活（违反 I1）—— 叶子退役失败时
+/// 两活留存且 `restored_at` 仍为 NULL，**可再次发起 restore 收敛**
+/// （restore 路径无 intent，不经对账 —— §7.3 明文契约）。
 ///
 /// 他人审计行与不存在的行一律 404 — 不泄露记录的存在性。
 pub async fn restore_memory_audit(
@@ -1075,15 +1190,15 @@ pub async fn restore_memory_audit(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<RestoreMemoryResponse>, ApiError> {
-    // 1. 归属校验：仅本人审计行可见可回滚
+    // ── 阶段1（共享）：行存在 / 归属 / 状态 / 未回滚 —— 全部零副作用 ──
     let row = crate::db::memory_audit::get(&state.db, id)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to load memory audit: {e}")))?
         .filter(|r| r.user_id == user_id)
         .ok_or_else(|| ApiError::NotFound(format!("memory audit record #{id} not found")))?;
 
-    // 2. 状态校验：仅 done 且未回滚的行可回滚
-    //   （pending 是未决的删除流程；cancelled 表示删除未发生，无需回滚）
+    // 仅 done 且未回滚的行可回滚
+    // （pending 是未决的删除流程；cancelled 表示删除未发生，无需回滚）
     if row.status != "done" {
         return Err(ApiError::Conflict(format!(
             "审计行 #{id} 状态为 '{}'，仅 done 记录可回滚",
@@ -1096,21 +1211,17 @@ pub async fn restore_memory_audit(
         )));
     }
 
-    // 3. 分流：graph_fact 行先做纯校验（零副作用），其余走文档重建。
-    //    图行不得进 add_text 路径 —— 把快照 JSON 当文档灌进 KB 是污染（假失败 + 垃圾文档）。
-    let graph_fact = if row.source == "graph_fact" {
-        Some(parse_graph_fact_snapshot(id, &row.doc_id, &row.content)?)
-    } else {
-        None
-    };
-    let is_graph_fact = graph_fact.is_some();
+    // ── 分流：graph_fact 原样走图路径（§7.4）；文本行走 §7 三阶段契约 ──
+    // 图行不得进 add_text 路径 —— 把快照 JSON 当文档灌进 KB 是污染（假失败 + 垃圾文档）。
+    let is_graph_fact = row.source == "graph_fact";
+    let restored_doc_id = if is_graph_fact {
+        let (subject, predicate, object, weight) =
+            parse_graph_fact_snapshot(id, &row.doc_id, &row.content)?;
 
-    // 4. 重放写入
-    let ws = state
-        .workspace_manager
-        .get_synced(&user_id, &state.db)
-        .await?;
-    let restored_doc_id = if let Some((subject, predicate, object, weight)) = graph_fact {
+        let ws = state
+            .workspace_manager
+            .get_synced(&user_id, &state.db)
+            .await?;
         // 存在性门：事实已在（并发重建 / 人工重放 / 删↔回滚循环）→ 跳过重放，
         // 每次 restore 对图的净效果 ∈ {0, 1 条边}，杜绝并行边累积。
         let existing = ws
@@ -1140,30 +1251,13 @@ pub async fn restore_memory_audit(
                     other => ApiError::Internal(format!("failed to replay add_facts: {other}")),
                 })?;
         }
-        // doc_id 由校验步骤 5 保证与快照三元组一致（fact:xxx），直接复原
+        // doc_id 由 parse_graph_fact_snapshot 保证与快照三元组一致（fact:xxx），直接复原
         row.doc_id.clone()
     } else {
-        let doc = ws
-            .knowledge_manager()
-            .add_text_to_kb(&row.kb_name, &row.title, &row.content, &row.source)
-            .await
-            .map_err(|e| match &e {
-                KnowledgeModuleError::NotFound(name) => {
-                    ApiError::NotFound(format!("知识库 '{name}' 不存在，无法回滚审计行 #{id}"))
-                }
-                other => ApiError::Internal(format!("failed to replay add_text: {other}")),
-            })?;
-
-        if doc.id != row.doc_id {
-            return Err(ApiError::Conflict(format!(
-                "回滚后的文档 id '{}' 与审计行 doc_id '{}' 不一致（内容应逐字节一致）",
-                doc.id, row.doc_id
-            )));
-        }
-        doc.id
+        restore_text_row(&state, &user_id, &row).await?
     };
 
-    // 5. 回填 restored_at / restored_doc_id
+    // ── 回填 restored_at / restored_doc_id（CAS：仅 done 且未回滚）──
     let restored_at = chrono::Utc::now().to_rfc3339();
     let updated =
         crate::db::memory_audit::mark_restored(&state.db, id, &restored_at, &restored_doc_id)
@@ -1175,7 +1269,7 @@ pub async fn restore_memory_audit(
         )));
     }
 
-    tracing::info!(
+    info!(
         user_id = %user_id,
         audit_id = id,
         doc_id = %restored_doc_id,
@@ -1189,6 +1283,160 @@ pub async fn restore_memory_audit(
         doc_id: restored_doc_id,
         restored_at,
     }))
+}
+
+/// 文本行的 §7 三阶段回滚，返回重放后的 doc_id。
+///
+/// 行存在 / 归属 / 状态 / 未回滚已在调用方校验；本函数负责 KB 校验、
+/// 叶子定位与写入序（replay → retire → 由调用方回填）。
+async fn restore_text_row(
+    state: &Arc<AppState>,
+    user_id: &str,
+    row: &crate::db::memory_audit::MemoryAuditRow,
+) -> Result<String, ApiError> {
+    let ws = state
+        .workspace_manager
+        .get_synced(user_id, &state.db)
+        .await?;
+    let km: &KnowledgeManager = ws.knowledge_manager();
+
+    // ── 阶段1 续：KB 存在（读探测零副作用；文档在/不在均合法）──
+    match km.get_document(&row.kb_name, &row.doc_id).await {
+        Ok(_) => {}
+        Err(KnowledgeModuleError::NotFound(name)) => {
+            return Err(ApiError::NotFound(format!(
+                "知识库 '{name}' 不存在，无法回滚审计行 #{}",
+                row.id
+            )));
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!(
+                "failed to verify knowledge base: {e}"
+            )));
+        }
+    }
+
+    // ── 阶段2：定位叶子（§7.1，可能 ABORT，仍零副作用）──
+    let max_hops = super::config::PecoConfig::default()
+        .memory
+        .restore_walk_max_hops;
+    let leaf = locate_restore_leaf(&state.db, km, row, max_hops).await?;
+
+    // ── 阶段3：replay(R) —— 失败即中止，叶子未动（拒绝零副作用）──
+    let doc = km
+        .add_text_to_kb(&row.kb_name, &row.title, &row.content, &row.source)
+        .await
+        .map_err(|e| match &e {
+            KnowledgeModuleError::NotFound(name) => ApiError::NotFound(format!(
+                "知识库 '{name}' 不存在，无法回滚审计行 #{}",
+                row.id
+            )),
+            other => ApiError::Internal(format!("failed to replay add_text: {other}")),
+        })?;
+    if doc.id != row.doc_id {
+        return Err(ApiError::Conflict(format!(
+            "回滚后的文档 id '{}' 与审计行 doc_id '{}' 不一致（内容应逐字节一致）",
+            doc.id, row.doc_id
+        )));
+    }
+    let restored_doc_id = doc.id;
+
+    // 退役当前叶子（链上还有存活后继时）：successor 指回 R（§7.3 nit7）。
+    // 失败 → 两活、R.restored_at 仍 NULL —— 返回 5xx，可再次发起 restore 收敛
+    // （§7.3：不经对账，不计入有界收敛）。
+    if let Some(leaf_doc) = leaf {
+        let entry = MemoryAuditEntry {
+            user_id: user_id.to_string(),
+            kb_name: row.kb_name.clone(),
+            doc_id: leaf_doc.id.clone(),
+            title: leaf_doc.title,
+            content: leaf_doc.content,
+            source: leaf_doc.source_path,
+            reason: "superseded".to_string(),
+            deleted_by: format!("restore:{}", row.id),
+            deleted_at: chrono::Utc::now().to_rfc3339(),
+            topic_key: row.topic_key.clone(),
+            successor_doc_id: Some(row.doc_id.clone()),
+        };
+        if let Err(e) = super::memory::retire::delete_with_audit(&state.db, km, &entry).await {
+            return Err(ApiError::Internal(format!(
+                "回滚后继退役失败（两活态，restored_at 未回填，可再次回滚收敛）: {e}"
+            )));
+        }
+    }
+
+    Ok(restored_doc_id)
+}
+
+/// §7.1 叶子定位：沿 successor 链找第一个存活者（即当前版本），对环免疫。
+///
+/// - `visited` 单调增长 + 首存活即断 + `max_hops` 上限 → 必终止（A↔B 环可终止）；
+/// - 每跳经 §7.2 唯一选行取 successor，`topic_compatible` 不符 → 409 slot
+///   mismatch（此时零副作用）；
+/// - 链回到 R 自身且自身存活 → 自身守门返回 `None`（只重放不退役，不得
+///   zero-alive —— V4 Blocker1）；
+/// - `get_document` 的非 NotFound `Err` 是后端故障 ≠「已删」，中止上抛（M1）。
+async fn locate_restore_leaf(
+    db: &sqlx::SqlitePool,
+    km: &KnowledgeManager,
+    row: &crate::db::memory_audit::MemoryAuditRow,
+    max_hops: usize,
+) -> Result<Option<knowledge_base::Document>, ApiError> {
+    let mut node = row.successor_doc_id.clone();
+    let mut visited: HashSet<String> = HashSet::new();
+    while let Some(cur) = node {
+        if visited.len() >= max_hops {
+            warn!(
+                audit_id = row.id,
+                chain_len = visited.len(),
+                max_hops,
+                "Restore successor walk hit hop limit"
+            );
+            break;
+        }
+        if !visited.insert(cur.clone()) {
+            // 回到已访问节点 —— 环，visited 单调保证终止
+            break;
+        }
+        match km.get_document(&row.kb_name, &cur).await {
+            // 自身守门：链回到 R 且 R 已复活 → 只重放、不退役（不得 zero-alive）
+            Ok(Some(doc)) if doc.id == row.doc_id => return Ok(None),
+            Ok(Some(doc)) => return Ok(Some(doc)),
+            Ok(None) => {}
+            Err(KnowledgeModuleError::NotFound(name)) => {
+                return Err(ApiError::NotFound(format!(
+                    "知识库 '{name}' 不存在，无法回滚审计行 #{}",
+                    row.id
+                )));
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "failed to walk successor chain: {e}"
+                )));
+            }
+        }
+        // §7.2 唯一选行：同 doc_id 的 done + 未回滚 superseded 行取最新一条
+        let Some(next) =
+            crate::db::memory_audit::latest_superseded_row(db, &row.user_id, &row.kb_name, &cur)
+                .await
+                .map_err(|e| ApiError::Internal(format!("failed to pick successor row: {e}")))?
+        else {
+            break;
+        };
+        if !topic_compatible(row.topic_key.as_deref(), next.topic_key.as_deref()) {
+            return Err(ApiError::Conflict(format!(
+                "slot mismatch：审计行 #{} 与后继链上的审计行 #{} 不在同一事实槽，回滚中止（零副作用）",
+                row.id, next.id
+            )));
+        }
+        node = next.successor_doc_id;
+    }
+    Ok(None)
+}
+
+/// §7.4 topic 一致性守卫：回滚方 topic 不可判（None）放行，否则必须与跳点相等。
+fn topic_compatible(r_topic: Option<&str>, hop_topic: Option<&str>) -> bool {
+    r_topic.is_none() || r_topic == hop_topic
 }
 
 /// 解析 `source == "graph_fact"` 审计行的边快照，返回可重放的三元组与 weight。

@@ -534,6 +534,495 @@ async fn test_restore_graph_fact_entity_row_rejected_without_pollution() {
     );
 }
 
+// ============================================================================
+// 阶段二 B：restore 回滚契约（design §7）+ 审计历史面（§11）
+// ============================================================================
+
+/// 写入一条记忆并返回 doc_id（内容哈希派生）。
+async fn add_memory(app: &TestApp, title: &str, content: &str) -> String {
+    ensure_memory_kb(app).await;
+    let ws = app
+        .state
+        .workspace_manager
+        .get_synced(&app.user_id, &app.state.db)
+        .await
+        .unwrap();
+    ws.knowledge_manager()
+        .add_text_to_kb(KB, title, content, "ppa_semantic")
+        .await
+        .unwrap()
+        .id
+}
+
+/// 从 KB 删除文档（模拟被取代退役后的状态）。
+async fn delete_doc(app: &TestApp, doc_id: &str) {
+    let ws = app
+        .state
+        .workspace_manager
+        .get_synced(&app.user_id, &app.state.db)
+        .await
+        .unwrap();
+    ws.knowledge_manager()
+        .delete_document(KB, doc_id)
+        .await
+        .unwrap();
+}
+
+/// 文档是否存活于 KB。
+async fn doc_exists(app: &TestApp, doc_id: &str) -> bool {
+    let ws = app
+        .state
+        .workspace_manager
+        .get_synced(&app.user_id, &app.state.db)
+        .await
+        .unwrap();
+    ws.knowledge_manager()
+        .get_document(KB, doc_id)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// 落一条 `reason='superseded'` 的 done 审计行（§7 链节点）。
+/// `content` 必须与 `add_memory` 时逐字一致 —— 回滚重放按内容哈希断言 doc_id。
+async fn seed_superseded_row(
+    app: &TestApp,
+    doc_id: &str,
+    title: &str,
+    content: &str,
+    successor: &str,
+    topic: &str,
+    deleted_at: &str,
+) -> i64 {
+    let audit_id = db::memory_audit::insert_pending(
+        &app.state.db,
+        &MemoryAuditEntry {
+            user_id: app.user_id.clone(),
+            kb_name: KB.into(),
+            doc_id: doc_id.into(),
+            title: title.into(),
+            content: content.into(),
+            source: "ppa_semantic".into(),
+            reason: "superseded".into(),
+            deleted_by: "hook:supersede".into(),
+            deleted_at: deleted_at.into(),
+            topic_key: Some(topic.into()),
+            successor_doc_id: Some(successor.into()),
+        },
+    )
+    .await
+    .unwrap();
+    db::memory_audit::mark_done(&app.state.db, audit_id)
+        .await
+        .unwrap();
+    audit_id
+}
+
+/// 当前用户的审计行数。
+async fn audit_count(app: &TestApp) -> usize {
+    db::memory_audit::list_by_user(&app.state.db, &app.user_id, 200, 0)
+        .await
+        .unwrap()
+        .len()
+}
+
+/// A7 回滚长链：A→B→C（C 活）restore(A) → 复活 A、退役 C、单活。
+#[tokio::test]
+async fn test_restore_long_chain_revives_root_retires_leaf() {
+    let app = TestApp::new().await;
+    let content_a = "链上最老的事实 A";
+    let content_b = "链上中间的事实 B";
+    let content_c = "链上当前的事实 C";
+    let doc_a = add_memory(&app, "memory_a", content_a).await;
+    let doc_b = add_memory(&app, "memory_b", content_b).await;
+    let doc_c = add_memory(&app, "memory_c", content_c).await;
+    // A、B 已被取代（不在 KB）；C 是当前存活版本
+    delete_doc(&app, &doc_a).await;
+    delete_doc(&app, &doc_b).await;
+
+    let row_a = seed_superseded_row(
+        &app,
+        &doc_a,
+        "memory_a",
+        content_a,
+        &doc_b,
+        "fact_chain",
+        "2026-10-01T00:00:00+00:00",
+    )
+    .await;
+    let row_b = seed_superseded_row(
+        &app,
+        &doc_b,
+        "memory_b",
+        content_b,
+        &doc_c,
+        "fact_chain",
+        "2026-10-02T00:00:00+00:00",
+    )
+    .await;
+
+    let resp = app
+        .post(&format!("/api/peco/memory/audit/{row_a}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 单活：A 复活、B 仍不在、叶子 C 被退役
+    assert!(doc_exists(&app, &doc_a).await, "A 应复活");
+    assert!(!doc_exists(&app, &doc_b).await, "B 仍不在 KB");
+    assert!(!doc_exists(&app, &doc_c).await, "叶子 C 应被退役");
+    let ws = app
+        .state
+        .workspace_manager
+        .get_synced(&app.user_id, &app.state.db)
+        .await
+        .unwrap();
+    let docs = ws
+        .knowledge_manager()
+        .list_documents(KB, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(docs.len(), 1, "回滚后库内应单活，实际 {} 篇", docs.len());
+    assert_eq!(docs[0].id, doc_a);
+
+    // row_a 回填；row_b 未被触碰
+    let row_a_db = db::memory_audit::get(&app.state.db, row_a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row_a_db.restored_at.is_some());
+    let row_b_db = db::memory_audit::get(&app.state.db, row_b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row_b_db.restored_at.is_none(), "row_b 不在本次回滚范围");
+
+    // 退役 C 的新审计行：successor 指回 A（§7.3 nit7）、topic 继承、done
+    let audits = db::memory_audit::list_by_user(&app.state.db, &app.user_id, 200, 0)
+        .await
+        .unwrap();
+    let c_row = audits
+        .iter()
+        .find(|r| r.doc_id == doc_c && r.reason == "superseded")
+        .expect("退役叶子 C 应落 superseded 审计行");
+    assert_eq!(c_row.successor_doc_id.as_deref(), Some(doc_a.as_str()));
+    assert_eq!(c_row.topic_key.as_deref(), Some("fact_chain"));
+    assert_eq!(c_row.status, "done");
+    assert_eq!(c_row.deleted_by, format!("restore:{row_a}"));
+}
+
+/// A7' 回滚环：A↔B 且均不存活 → restore 必终止且得单活
+/// （visited 单调 + 首存活即断 + hop 上限；挂死即测试失败）。
+#[tokio::test]
+async fn test_restore_cycle_terminates_with_single_alive() {
+    let app = TestApp::new().await;
+    let content_a = "环上的事实 A";
+    let content_b = "环上的事实 B";
+    let doc_a = add_memory(&app, "memory_a", content_a).await;
+    let doc_b = add_memory(&app, "memory_b", content_b).await;
+    delete_doc(&app, &doc_a).await;
+    delete_doc(&app, &doc_b).await;
+
+    let row_a = seed_superseded_row(
+        &app,
+        &doc_a,
+        "memory_a",
+        content_a,
+        &doc_b,
+        "fact_cycle",
+        "2026-10-01T00:00:00+00:00",
+    )
+    .await;
+    seed_superseded_row(
+        &app,
+        &doc_b,
+        "memory_b",
+        content_b,
+        &doc_a,
+        "fact_cycle",
+        "2026-10-02T00:00:00+00:00",
+    )
+    .await;
+
+    let resp = app
+        .post(&format!("/api/peco/memory/audit/{row_a}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "环路回滚必须终止并成功");
+
+    assert!(doc_exists(&app, &doc_a).await, "A 应复活");
+    assert!(!doc_exists(&app, &doc_b).await, "B 不得复活");
+    let ws = app
+        .state
+        .workspace_manager
+        .get_synced(&app.user_id, &app.state.db)
+        .await
+        .unwrap();
+    let docs = ws
+        .knowledge_manager()
+        .list_documents(KB, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(docs.len(), 1, "环路回滚后应单活");
+    assert_eq!(docs[0].id, doc_a);
+    let row_a_db = db::memory_audit::get(&app.state.db, row_a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row_a_db.restored_at.is_some());
+}
+
+/// A7'' 自身守门：链回到 R 自身且自身已复活 → 只重放不退役，不得 zero-alive。
+#[tokio::test]
+async fn test_restore_self_gate_never_zero_alive() {
+    let app = TestApp::new().await;
+    // A 在被取代后以同 id 复活（内容逐字再现 → 同哈希），审计行仍未回滚
+    let content_a = "复活的事实 A";
+    let content_b = "被取代的事实 B";
+    let doc_a = add_memory(&app, "memory_a", content_a).await;
+    let doc_b = add_memory(&app, "memory_b", content_b).await;
+    delete_doc(&app, &doc_b).await;
+
+    let row_a = seed_superseded_row(
+        &app,
+        &doc_a,
+        "memory_a",
+        content_a,
+        &doc_b,
+        "fact_self",
+        "2026-10-01T00:00:00+00:00",
+    )
+    .await;
+    seed_superseded_row(
+        &app,
+        &doc_b,
+        "memory_b",
+        content_b,
+        &doc_a,
+        "fact_self",
+        "2026-10-02T00:00:00+00:00",
+    )
+    .await;
+
+    let resp = app
+        .post(&format!("/api/peco/memory/audit/{row_a}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert!(
+        doc_exists(&app, &doc_a).await,
+        "自身守门：回滚后 A 必须存活，不得 zero-alive"
+    );
+    assert!(!doc_exists(&app, &doc_b).await);
+    let ws = app
+        .state
+        .workspace_manager
+        .get_synced(&app.user_id, &app.state.db)
+        .await
+        .unwrap();
+    let docs = ws
+        .knowledge_manager()
+        .list_documents(KB, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].id, doc_a);
+
+    // 不得为 A 产生退役审计行（只重放、不退役）
+    let audits = db::memory_audit::list_by_user(&app.state.db, &app.user_id, 200, 0)
+        .await
+        .unwrap();
+    let a_superseded = audits
+        .iter()
+        .filter(|r| r.doc_id == doc_a && r.reason == "superseded")
+        .count();
+    assert_eq!(a_superseded, 1, "自身守门不得再为 A 落退役行");
+}
+
+/// A7'''' 跨槽守卫：跨 topic 链路 → restore ABORT(409)、零副作用。
+#[tokio::test]
+async fn test_restore_cross_topic_aborts_zero_side_effect() {
+    let app = TestApp::new().await;
+    let content_a = "槽一的旧事实";
+    let content_b = "槽二的旧事实";
+    let doc_a = add_memory(&app, "memory_a", content_a).await;
+    let doc_b = add_memory(&app, "memory_b", content_b).await;
+    let doc_c = add_memory(&app, "memory_c", "槽二的当前事实").await;
+    delete_doc(&app, &doc_a).await;
+    delete_doc(&app, &doc_b).await;
+
+    let row_a = seed_superseded_row(
+        &app,
+        &doc_a,
+        "memory_a",
+        content_a,
+        &doc_b,
+        "topic_one",
+        "2026-10-01T00:00:00+00:00",
+    )
+    .await;
+    seed_superseded_row(
+        &app,
+        &doc_b,
+        "memory_b",
+        content_b,
+        &doc_c,
+        "topic_two",
+        "2026-10-02T00:00:00+00:00",
+    )
+    .await;
+    let audits_before = audit_count(&app).await;
+
+    let resp = app
+        .post(&format!("/api/peco/memory/audit/{row_a}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "跨槽链路必须 ABORT");
+
+    // 零副作用：不复活 A、不退役 B/C、不回填、不新增审计行
+    assert!(!doc_exists(&app, &doc_a).await, "ABORT 不得重放 A");
+    assert!(!doc_exists(&app, &doc_b).await, "ABORT 不得动 B");
+    assert!(doc_exists(&app, &doc_c).await, "ABORT 不得退役 C");
+    let row_a_db = db::memory_audit::get(&app.state.db, row_a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row_a_db.restored_at.is_none(), "ABORT 不得回填 restored_at");
+    assert_eq!(
+        audit_count(&app).await,
+        audits_before,
+        "ABORT 不得新增审计行"
+    );
+}
+
+/// A10 历史面：reason 过滤 + 后继两路标题解析 + 剩余保留天数。
+#[tokio::test]
+async fn test_audit_list_reason_filter_and_successor_fields() {
+    let app = TestApp::new().await;
+
+    // 后继①：仍存活 → 活条标题
+    let live_successor = add_memory(&app, "memory_live_successor", "还活着的后继").await;
+    // 后继②：已退役 → 审计面最新 done 行标题
+    let dead_successor = add_memory(&app, "memory_dead_successor", "已退役的后继").await;
+    delete_doc(&app, &dead_successor).await;
+    let dead_audit_id = db::memory_audit::insert_pending(
+        &app.state.db,
+        &MemoryAuditEntry {
+            user_id: app.user_id.clone(),
+            kb_name: KB.into(),
+            doc_id: dead_successor.clone(),
+            title: "memory_dead_successor".into(),
+            content: "已退役的后继".into(),
+            source: "ppa_semantic".into(),
+            reason: "manual_organize".into(),
+            deleted_by: "agent:@memory".into(),
+            deleted_at: "2026-09-20T00:00:00+00:00".into(),
+            topic_key: None,
+            successor_doc_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::memory_audit::mark_done(&app.state.db, dead_audit_id)
+        .await
+        .unwrap();
+
+    let s1 = seed_superseded_row(
+        &app,
+        "doc-sup-live",
+        "旧条目一",
+        "旧条目一的内容",
+        &live_successor,
+        "topic_a",
+        "2026-10-01T00:00:00+00:00",
+    )
+    .await;
+    let s2 = seed_superseded_row(
+        &app,
+        "doc-sup-dead",
+        "旧条目二",
+        "旧条目二的内容",
+        &dead_successor,
+        "topic_b",
+        "2026-10-01T00:00:00+00:00",
+    )
+    .await;
+    // 非 superseded 对照行
+    let (_manual_doc_id, manual_row) = seed_deleted_memory(&app, "手动整理的旧记忆").await;
+
+    // reason 过滤：只回 superseded 行
+    let resp = app
+        .get("/api/peco/memory/audit?reason=superseded")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let items: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(items.len(), 2, "reason 过滤应只回 superseded 行");
+    assert!(items.iter().all(|i| i["reason"] == "superseded"));
+    assert!(
+        items.iter().all(|i| i["id"].as_i64() != Some(manual_row)),
+        "非 superseded 行不得混入"
+    );
+
+    let i1 = items
+        .iter()
+        .find(|i| i["id"].as_i64() == Some(s1))
+        .expect("s1 应在过滤结果中");
+    assert_eq!(i1["topic_key"], "topic_a");
+    assert_eq!(i1["successor_doc_id"], live_successor.as_str());
+    assert_eq!(
+        i1["successor_title"], "memory_live_successor",
+        "路①：存活后继取活条标题"
+    );
+    let days = i1["retention_days_remaining"]
+        .as_i64()
+        .expect("superseded 行应有剩余保留天数");
+    assert!(
+        (0..=30).contains(&days),
+        "剩余天数应落在 [0, 30]，实际 {days}"
+    );
+
+    let i2 = items
+        .iter()
+        .find(|i| i["id"].as_i64() == Some(s2))
+        .expect("s2 应在过滤结果中");
+    assert_eq!(i2["successor_doc_id"], dead_successor.as_str());
+    assert_eq!(
+        i2["successor_title"], "memory_dead_successor",
+        "路②：已退役后继取审计面最新 done 行标题"
+    );
+
+    // 不带 reason → 全量；非 superseded 行不带 successor 字段
+    let resp = app.get("/api/peco/memory/audit").send().await.unwrap();
+    let items: Vec<serde_json::Value> = resp.json().await.unwrap();
+    let m = items
+        .iter()
+        .find(|i| i["id"].as_i64() == Some(manual_row))
+        .expect("全量列表应含 manual_organize 行");
+    assert!(
+        m.get("topic_key").is_none(),
+        "非 superseded 行不回显 topic_key"
+    );
+    assert!(
+        m.get("successor_doc_id").is_none(),
+        "非 superseded 行不回显 successor_doc_id"
+    );
+    assert!(
+        m.get("successor_title").is_none(),
+        "非 superseded 行不回显 successor_title"
+    );
+    assert!(
+        m.get("retention_days_remaining").is_none(),
+        "非 superseded 行不回显保留天数"
+    );
+}
+
 /// 损坏快照三连：非 JSON / 缺字段 / doc_id 不匹配 → 409，全部零写入。
 #[tokio::test]
 async fn test_restore_graph_fact_corrupt_snapshots_rejected() {
