@@ -77,7 +77,8 @@ function eventLabel(entry: TimelineEntry): string {
     case "done":
       return "SSE 流结束";
     default:
-      return event.type;
+      // 联合已穷尽；此处仅为类型兜底（运行时不会到达）
+      return (event as { type: string }).type;
   }
 }
 

@@ -157,7 +157,9 @@ export function ChatView({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const token = useAuthStore((s) => s.token);
   const unreadCountRef = useRef(0);
-  const unreadDebounceRef = useRef<ReturnType<typeof setTimeout>>();
+  const unreadDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
 
   // Refs for stable closure access — avoids effect re-trigger from prop/state changes
   const inputRef = useRef(input);
@@ -171,7 +173,9 @@ export function ChatView({
 
   // StrictMode-safe unmount timer: setTimeout in cleanup is cleared on remount,
   // so abort only fires for genuine unmounts, not StrictMode double-invocation.
-  const unmountTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const unmountTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
 
   // Refs for callback props — eliminate dependency churn
   const streamUrlRef = useRef(streamUrl);

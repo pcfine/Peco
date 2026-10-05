@@ -158,20 +158,17 @@ export function WorkflowRunDetailPage() {
               {/* Connection indicator */}
               {!isTerminal &&
                 (currentRun.streamConnected ? (
-                  <Wifi
-                    className="h-3.5 w-3.5 text-green-500"
-                    title="SSE 已连接"
-                  />
+                  <span title="SSE 已连接">
+                    <Wifi className="h-3.5 w-3.5 text-green-500" />
+                  </span>
                 ) : currentRun.reconnecting ? (
-                  <WifiOff
-                    className="h-3.5 w-3.5 text-amber-500 animate-pulse"
-                    title="重连中..."
-                  />
+                  <span title="重连中...">
+                    <WifiOff className="h-3.5 w-3.5 text-amber-500 animate-pulse" />
+                  </span>
                 ) : (
-                  <WifiOff
-                    className="h-3.5 w-3.5 text-red-500"
-                    title="已断开"
-                  />
+                  <span title="已断开">
+                    <WifiOff className="h-3.5 w-3.5 text-red-500" />
+                  </span>
                 ))}
             </div>
             <p className="text-xs text-muted-foreground font-mono mt-0.5">

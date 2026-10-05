@@ -29,8 +29,17 @@ import {
   type ConsolidationStateResponse,
 } from "@/api/peco";
 
+/** 仅取数值型统计键（排除 machine_steps_skipped 这类字符串字段）。 */
+type NumericStatKey = {
+  [K in keyof ConsolidationRunStats]: ConsolidationRunStats[K] extends
+    | number
+    | null
+    ? K
+    : never;
+}[keyof ConsolidationRunStats];
+
 /** 统计字段的展示顺序与标签。 */
-const STAT_FIELDS: { key: keyof ConsolidationRunStats; label: string }[] = [
+const STAT_FIELDS: { key: NumericStatKey; label: string }[] = [
   { key: "scanned", label: "扫描" },
   { key: "candidates", label: "候选" },
   { key: "clustered_groups", label: "聚类组" },

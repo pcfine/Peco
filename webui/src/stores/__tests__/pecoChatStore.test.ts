@@ -523,7 +523,7 @@ const pagedSnapshot = (opts: {
 
 const pinnedMsg = () => ({
   id: "pinned-summary",
-  role: "assistant",
+  role: "assistant" as const,
   content: "更早的对话已归档为摘要，仍在模型上下文中",
   turnIndex: 0,
   isNotice: true,

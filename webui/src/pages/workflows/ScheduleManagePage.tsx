@@ -211,7 +211,7 @@ export function ScheduleManagePage() {
                   workflowName={sched.workflowName}
                   existing={sched}
                   onSave={(data) => handleUpdate(sched.workflowName, data)}
-                  onDelete={() => setDeleteTarget(sched)}
+                  onDelete={async () => setDeleteTarget(sched)}
                   saving={saving}
                 />
               </div>
