@@ -9,6 +9,7 @@ import {
   getSupersedeHealth,
   listMemoryAudit,
   listMemoryDocuments,
+  triggerSupersedeReconcile,
 } from "@/api/memory";
 import type { SupersedeHealth } from "@/types/memory";
 
@@ -33,6 +34,7 @@ class ResizeObserverStub {
 const HEALTH = vi.mocked(getSupersedeHealth);
 const AUDIT = vi.mocked(listMemoryAudit);
 const DOCS = vi.mocked(listMemoryDocuments);
+const RECON = vi.mocked(triggerSupersedeReconcile);
 
 const ZERO_HEALTH: SupersedeHealth = {
   pending: 0,
@@ -108,6 +110,7 @@ beforeEach(() => {
   ).scrollIntoView = () => {};
 
   HEALTH.mockReset().mockResolvedValue(ZERO_HEALTH);
+  RECON.mockReset().mockResolvedValue(ZERO_HEALTH);
   AUDIT.mockReset().mockResolvedValue([]);
   DOCS.mockReset().mockResolvedValue({
     documents: [],
@@ -203,5 +206,43 @@ describe("MemoryPage", () => {
 
     expect(DOCS.mock.calls.length).toBeGreaterThan(1);
     expect(AUDIT).not.toHaveBeenCalled();
+  });
+
+  it("历史 tab 提供「立即对账」：触发 reconcile 并同步刷新 health 与列表", async () => {
+    await renderPage();
+    await activateTab(tabByText("历史"));
+    expect(AUDIT).toHaveBeenCalledTimes(1);
+    const healthBefore = HEALTH.mock.calls.length;
+
+    await act(async () => {
+      buttonByText("立即对账").click();
+    });
+    await flush();
+    await flush();
+
+    expect(RECON).toHaveBeenCalledTimes(1);
+    // 成功：徽章来源 health 重取 + 审计列表重拉
+    expect(HEALTH.mock.calls.length).toBeGreaterThan(healthBefore);
+    expect(AUDIT).toHaveBeenCalledTimes(2);
+  });
+
+  it("对账失败：静默降级，不重拉列表也不阻断页面", async () => {
+    RECON.mockRejectedValue(new Error("boom"));
+    await renderPage();
+    await activateTab(tabByText("历史"));
+    const healthBefore = HEALTH.mock.calls.length;
+
+    await act(async () => {
+      buttonByText("立即对账").click();
+    });
+    await flush();
+    await flush();
+
+    expect(RECON).toHaveBeenCalledTimes(1);
+    // 失败不刷新列表，也不额外重取 health（仅切 tab 那次）
+    expect(AUDIT).toHaveBeenCalledTimes(1);
+    expect(HEALTH.mock.calls.length).toBe(healthBefore);
+    // 页面仍在，按钮回到可再试态
+    expect(buttonByText("立即对账")).toBeTruthy();
   });
 });

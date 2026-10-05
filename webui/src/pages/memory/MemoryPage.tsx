@@ -3,7 +3,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
-import { getSupersedeHealth } from "@/api/memory";
+import axios from "axios";
+import { toast } from "sonner";
+import { getSupersedeHealth, triggerSupersedeReconcile } from "@/api/memory";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -19,6 +21,17 @@ import {
   MemoryAuditList,
   type MemoryAuditListHandle,
 } from "@/components/memory/MemoryAuditList";
+
+/** 后端 `ApiError` → 可读文案（与 `MemoryAuditList` 同口径）。 */
+function getApiErrorMessage(err: unknown): string | undefined {
+  if (axios.isAxiosError(err)) {
+    if (err.response?.data?.details) return String(err.response.data.details);
+    if (err.response?.data?.message) return String(err.response.data.message);
+    if (err.message) return err.message;
+  }
+  if (err instanceof Error) return err.message;
+  return undefined;
+}
 
 export function MemoryPage() {
   // 状态提升：刷新按钮据此只触发「当前激活视图」重取。
@@ -55,6 +68,22 @@ export function MemoryPage() {
     else graphRef.current?.refresh();
   };
 
+  // 手动对账：对账由后台自动收敛，滞留时供人工立即重试；成功后同步徽章与列表。
+  const [reconciling, setReconciling] = useState(false);
+  const handleReconcile = async () => {
+    setReconciling(true);
+    try {
+      await triggerSupersedeReconcile();
+      toast.success("对账完成");
+      await loadHealth();
+      historyRef.current?.refresh();
+    } catch (err) {
+      toast.error(getApiErrorMessage(err) ?? "对账失败");
+    } finally {
+      setReconciling(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -88,7 +117,25 @@ export function MemoryPage() {
         </TabsList>
 
         <TabsContent value="history" className="mt-4">
-          <MemoryAuditList ref={historyRef} />
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-sm text-muted-foreground">
+                取代对账由后台自动收敛；如有滞留条目，可立即重试。
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={reconciling}
+                onClick={() => void handleReconcile()}
+              >
+                <RefreshCw
+                  className={`h-4 w-4 ${reconciling ? "animate-spin" : ""}`}
+                />
+                {reconciling ? "对账中…" : "立即对账"}
+              </Button>
+            </div>
+            <MemoryAuditList ref={historyRef} />
+          </div>
         </TabsContent>
         <TabsContent value="graph" className="mt-4">
           <MemoryGraphView ref={graphRef} />
