@@ -71,11 +71,17 @@ export function MemoryPage() {
   // 手动对账：对账由后台自动收敛，滞留时供人工立即重试；成功后同步徽章与列表。
   const [reconciling, setReconciling] = useState(false);
   const handleReconcile = async () => {
+    if (reconciling) return;
     setReconciling(true);
     try {
-      await triggerSupersedeReconcile();
-      toast.success("对账完成");
-      await loadHealth();
+      // reconcile 返回与 health 同形计数：直接用它更新徽章，省一次 GET。
+      const health = await triggerSupersedeReconcile();
+      setPendingCount(health.pending + health.failed);
+      if (health.failed > 0) {
+        toast.warning(`对账完成，仍有 ${health.failed} 条失败`);
+      } else {
+        toast.success("对账完成");
+      }
       historyRef.current?.refresh();
     } catch (err) {
       toast.error(getApiErrorMessage(err) ?? "对账失败");

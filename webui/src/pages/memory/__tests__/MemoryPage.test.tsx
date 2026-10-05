@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { toast } from "sonner";
 import { MemoryPage } from "../MemoryPage";
 import {
   getSupersedeHealth,
@@ -24,6 +25,10 @@ vi.mock("@/api/memory", () => ({
   triggerSupersedeReconcile: vi.fn(),
 }));
 
+vi.mock("sonner", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
+}));
+
 // jsdom 未实现 ResizeObserver（radix ScrollArea）；Select 亦需指针捕获 API。
 class ResizeObserverStub {
   observe() {}
@@ -35,6 +40,8 @@ const HEALTH = vi.mocked(getSupersedeHealth);
 const AUDIT = vi.mocked(listMemoryAudit);
 const DOCS = vi.mocked(listMemoryDocuments);
 const RECON = vi.mocked(triggerSupersedeReconcile);
+const TOAST_ERROR = vi.mocked(toast.error);
+const TOAST_WARNING = vi.mocked(toast.warning);
 
 const ZERO_HEALTH: SupersedeHealth = {
   pending: 0,
@@ -111,6 +118,8 @@ beforeEach(() => {
 
   HEALTH.mockReset().mockResolvedValue(ZERO_HEALTH);
   RECON.mockReset().mockResolvedValue(ZERO_HEALTH);
+  TOAST_ERROR.mockClear();
+  TOAST_WARNING.mockClear();
   AUDIT.mockReset().mockResolvedValue([]);
   DOCS.mockReset().mockResolvedValue({
     documents: [],
@@ -208,11 +217,18 @@ describe("MemoryPage", () => {
     expect(AUDIT).not.toHaveBeenCalled();
   });
 
-  it("历史 tab 提供「立即对账」：触发 reconcile 并同步刷新 health 与列表", async () => {
+  it("历史 tab 提供「立即对账」：触发 reconcile 并用返回计数刷新徽章与列表", async () => {
+    RECON.mockResolvedValue({
+      pending: 1,
+      processing: 0,
+      failed: 2,
+      degraded: 0,
+      last_converged_at: null,
+    });
     await renderPage();
     await activateTab(tabByText("历史"));
     expect(AUDIT).toHaveBeenCalledTimes(1);
-    const healthBefore = HEALTH.mock.calls.length;
+    expect(tabByText("历史").querySelector('[data-slot="badge"]')).toBeNull();
 
     await act(async () => {
       buttonByText("立即对账").click();
@@ -221,16 +237,18 @@ describe("MemoryPage", () => {
     await flush();
 
     expect(RECON).toHaveBeenCalledTimes(1);
-    // 成功：徽章来源 health 重取 + 审计列表重拉
-    expect(HEALTH.mock.calls.length).toBeGreaterThan(healthBefore);
     expect(AUDIT).toHaveBeenCalledTimes(2);
+    // 徽章 = pending + failed = 3，直接由 reconcile 返回值更新（不再 GET health）
+    expect(
+      tabByText("历史").querySelector('[data-slot="badge"]')?.textContent,
+    ).toBe("3");
+    expect(TOAST_WARNING).toHaveBeenCalled();
   });
 
-  it("对账失败：静默降级，不重拉列表也不阻断页面", async () => {
+  it("对账失败：弹出错误提示、不重拉列表", async () => {
     RECON.mockRejectedValue(new Error("boom"));
     await renderPage();
     await activateTab(tabByText("历史"));
-    const healthBefore = HEALTH.mock.calls.length;
 
     await act(async () => {
       buttonByText("立即对账").click();
@@ -239,9 +257,8 @@ describe("MemoryPage", () => {
     await flush();
 
     expect(RECON).toHaveBeenCalledTimes(1);
-    // 失败不刷新列表，也不额外重取 health（仅切 tab 那次）
-    expect(AUDIT).toHaveBeenCalledTimes(1);
-    expect(HEALTH.mock.calls.length).toBe(healthBefore);
+    expect(AUDIT).toHaveBeenCalledTimes(1); // 失败不刷新列表
+    expect(TOAST_ERROR).toHaveBeenCalled(); // 有可见错误提示
     // 页面仍在，按钮回到可再试态
     expect(buttonByText("立即对账")).toBeTruthy();
   });
