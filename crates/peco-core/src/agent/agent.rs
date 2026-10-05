@@ -336,13 +336,17 @@ impl Agent {
     ///
     /// 调用方提供历史 `input`（不含 system prompt）；system prompt 由
     /// `self.system_prompt()` 承载为 `instructions`。
+    ///
+    /// `max_output_tokens` 为本次请求的一次性覆盖（`None` = 用 `ModelConfig` 的值），
+    /// 供 [`SimpleAgentLooper`](super::simple_looper::SimpleAgentLooper) 在截断重试时抬高预算。
     pub(crate) async fn generate_full(
         &self,
         input: Vec<Arc<InputItem>>,
+        max_output_tokens: Option<u32>,
     ) -> Result<GenerateResult, AgentError> {
         let tools = self.tool_executor.definitions();
         let instructions = Some(self.system_prompt());
-        let request = self.build_generate_request(input, instructions, tools, None);
+        let request = self.build_generate_request(input, instructions, tools, max_output_tokens);
         Ok(self.model.generate_full(&request).await?)
     }
 

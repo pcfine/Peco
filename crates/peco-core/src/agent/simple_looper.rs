@@ -16,7 +16,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use model_provider::{Content, ContentBlock, InputItem, Role, ToolCall};
+use model_provider::{
+    Content, ContentBlock, FinishReason, InputItem, ResponseStatus, Role, ToolCall,
+};
 
 use super::agent::Agent;
 use super::error::AgentError;
@@ -27,6 +29,15 @@ type ToolExecResult = (usize, ToolCall, Result<Content, String>);
 type ToolExecHandle = tokio::task::JoinHandle<ToolExecResult>;
 type SimpleTaskHandle = tokio::task::JoinHandle<Result<String, AgentError>>;
 type SharedSimpleTask = Arc<tokio::sync::Mutex<Option<SimpleTaskHandle>>>;
+
+/// 子 agent 截断重试时的输出预算抬升目标（`None` → 本值）。
+///
+/// 与 [`AgentLooper`](super::agent_looper::AgentLooper) 的
+/// `LooperConfig::retry_output_budget` 默认值一致：deepseek 服务端默认输出上限
+/// 为 4096，推理 token 与可见输出**共用**这一预算 —— 重负载任务（如 `@memory`
+/// 的 `[ORGANIZE]` 扫描上百条文档）会把预算全耗在 reasoning 上，可见输出被挤成
+/// 空。抬到本值后模型有足够空间产出最终回答（实测同一模型可输出 > 7900 tokens）。
+const SUB_AGENT_TRUNCATION_RETRY_BUDGET: u32 = 32_768;
 
 // ============================================================================
 // SimpleAgentLooper — internal
@@ -144,6 +155,11 @@ impl SimpleAgentLooper {
             content: prompt.into(),
         }));
 
+        // 本轮请求的输出预算覆盖：截断重试时抬高（粘性到本轮结束）。
+        // 与 [`AgentLooper`](super::agent_looper::AgentLooper) 的 `budget_raised`
+        // 语义一致 —— 抬过一次后生效预算恒为该值，第二次截断不再重发（逐字节相同）。
+        let mut output_budget_override: Option<u32> = None;
+
         loop {
             // ── Check cancel ──────────────────────────────────────────────
             if self.cancel_flag.load(Ordering::Acquire) {
@@ -167,11 +183,63 @@ impl SimpleAgentLooper {
             let response = if let Some(ref executor) = self.tool_executor_override {
                 let tools = executor.definitions();
                 self.agent
-                    .generate_with_tools(self.messages.clone(), instructions, tools, None)
+                    .generate_with_tools(
+                        self.messages.clone(),
+                        instructions,
+                        tools,
+                        output_budget_override,
+                    )
                     .await?
             } else {
-                self.agent.generate_full(self.messages.clone()).await?
+                self.agent
+                    .generate_full(self.messages.clone(), output_budget_override)
+                    .await?
             };
+
+            // ── 状态收敛：Incomplete / Failed 都是异常终止 ──────────────────
+            // SimpleAgentLooper 是 batch-only，必须显式处理非 Completed 响应：
+            // 截断（Incomplete + MaxTokens）时可见输出常被 reasoning 挤空，
+            // 若直接按「无 tool_calls → 返回 text」处理，子 agent 会**静默返回
+            // 空串**（`@memory` `[ORGANIZE]` 的真实故障），既无重试也无归因。
+            if response.status != ResponseStatus::Completed {
+                // 截断重试：抬输出预算重发一次。仅在还有迭代余量时重发 ——
+                // 否则状态机刚回到循环顶就撞 MaxIterations，把「截断」这个
+                // 真实原因换成「超出迭代次数」，诊断反而变差。
+                if response.status == ResponseStatus::Incomplete
+                    && matches!(response.finish_reason, Some(FinishReason::MaxTokens))
+                    && output_budget_override.is_none()
+                    && self.react_loop_iteration < self.max_iterations
+                {
+                    tracing::warn!(
+                        truncated_output_tokens = response.usage.output_tokens,
+                        retry_output_budget = SUB_AGENT_TRUNCATION_RETRY_BUDGET,
+                        iteration = self.react_loop_iteration,
+                        "Sub-agent response truncated (max_tokens); retrying with raised output budget"
+                    );
+                    output_budget_override = Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET);
+                    continue;
+                }
+
+                let reason = response
+                    .finish_reason
+                    .map_or_else(|| "-".to_string(), |r| r.as_str().to_string());
+                let detail = response
+                    .error
+                    .as_ref()
+                    .map(|e| e.message.clone())
+                    .unwrap_or_else(|| "no error detail".to_string());
+                tracing::error!(
+                    status = ?response.status,
+                    finish_reason = %reason,
+                    output_tokens = response.usage.output_tokens,
+                    detail = %detail,
+                    "Sub-agent model response ended with non-completed status"
+                );
+                return Err(AgentError::AgentProtocol(format!(
+                    "model response not completed: status={:?}, finish_reason={}, detail={}",
+                    response.status, reason, detail
+                )));
+            }
 
             // Extract text + reasoning + tool calls from ordered output blocks.
             let mut text = String::new();
@@ -527,5 +595,191 @@ mod tests {
         };
         let result = handle.wait().await;
         assert!(result.is_err());
+    }
+
+    // ── 截断重试 / 异常收敛（batch-only run 循环）────────────────────────────
+
+    use model_provider::{
+        FinishReason, GenerateRequest, GenerateResult, GenerateStream, ProviderError,
+        ResponseStatus, Usage,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// 脚本化批量 provider：按顺序吐出预置响应，并记录每次请求收到的
+    /// `max_output_tokens`（用于断言截断重试确实抬了预算）。
+    struct ScriptedBatchProvider {
+        scripts: Mutex<VecDeque<GenerateResult>>,
+        budgets: Mutex<Vec<Option<u32>>>,
+    }
+
+    impl ScriptedBatchProvider {
+        fn new(scripts: Vec<GenerateResult>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts.into()),
+                budgets: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn budgets(&self) -> Vec<Option<u32>> {
+            self.budgets.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl model_provider::ModelProvider for ScriptedBatchProvider {
+        fn name(&self) -> &str {
+            "scripted-batch"
+        }
+
+        async fn generate_full(
+            &self,
+            request: &GenerateRequest,
+        ) -> Result<GenerateResult, ProviderError> {
+            self.budgets.lock().unwrap().push(request.max_output_tokens);
+            if let Some(r) = self.scripts.lock().unwrap().pop_front() {
+                return Ok(r);
+            }
+            // 脚本耗尽（不应发生）：返回一个正常完成的空响应。
+            Ok(GenerateResult {
+                id: "exhausted".into(),
+                output: vec![ContentBlock::Text {
+                    text: String::new(),
+                }],
+                usage: Usage::default(),
+                status: ResponseStatus::Completed,
+                finish_reason: Some(FinishReason::Stop),
+                error: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: &GenerateRequest,
+        ) -> Result<GenerateStream, ProviderError> {
+            Err(ProviderError::Request(
+                "stream not used in batch-only tests".into(),
+            ))
+        }
+    }
+
+    fn completed(text: &str) -> GenerateResult {
+        GenerateResult {
+            id: "r-completed".into(),
+            output: vec![ContentBlock::Text { text: text.into() }],
+            usage: Usage::default(),
+            status: ResponseStatus::Completed,
+            finish_reason: Some(FinishReason::Stop),
+            error: None,
+        }
+    }
+
+    /// 截断响应：只有 reasoning、可见输出为空，output 顶到 4096。
+    fn truncated() -> GenerateResult {
+        GenerateResult {
+            id: "r-truncated".into(),
+            output: vec![ContentBlock::Reasoning {
+                text: "long reasoning that consumed the whole budget".into(),
+            }],
+            usage: Usage {
+                output_tokens: 4096,
+                ..Default::default()
+            },
+            status: ResponseStatus::Incomplete,
+            finish_reason: Some(FinishReason::MaxTokens),
+            error: None,
+        }
+    }
+
+    fn scripted_agent(scripts: Vec<GenerateResult>) -> (Arc<Agent>, Arc<ScriptedBatchProvider>) {
+        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let provider = Arc::new(ScriptedBatchProvider::new(scripts));
+        let agent = Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::clone(&provider) as Arc<dyn model_provider::ModelProvider>,
+            crate::agent::ModelConfigBuilder::new()
+                .stream(false)
+                .build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        ));
+        (agent, provider)
+    }
+
+    /// 首次截断、重试成功：返回重试后的文本，且重试请求带抬高后的预算。
+    #[tokio::test]
+    async fn test_truncation_retries_with_raised_budget() {
+        let (agent, provider) = scripted_agent(vec![truncated(), completed("done")]);
+        let out = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await
+            .expect("retry should succeed");
+        assert_eq!(out, "done", "必须返回重试后的正文，而非被截断的空串");
+        assert_eq!(
+            provider.budgets(),
+            vec![None, Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET)],
+            "首次用默认预算，重试必须带上抬高的预算"
+        );
+    }
+
+    /// 连续两次截断：只重试一次（预算已抬高，再发逐字节相同），最终报错而非返回空串。
+    #[tokio::test]
+    async fn test_truncation_exhausted_returns_error() {
+        let (agent, provider) = scripted_agent(vec![truncated(), truncated()]);
+        let err = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await
+            .expect_err("二次截断必须报错");
+        assert!(
+            err.to_string().contains("not completed"),
+            "错误须指向响应未完成；实际 {err}"
+        );
+        assert_eq!(
+            provider.budgets(),
+            vec![None, Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET)],
+            "抬过一次后不得再重发"
+        );
+    }
+
+    /// `Incomplete` 但 `finish_reason` 缺失：不臆测成截断、不重试，直接报错。
+    #[tokio::test]
+    async fn test_incomplete_without_finish_reason_returns_error_no_retry() {
+        let mut r = truncated();
+        r.finish_reason = None;
+        let (agent, provider) = scripted_agent(vec![r]);
+        let res = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await;
+        assert!(res.is_err(), "无 finish_reason 不得静默返回");
+        assert_eq!(provider.budgets(), vec![None], "不得重试");
+    }
+
+    /// `Failed` 状态即便带了 partial 文本，也必须报错 —— 绝不把半截输出当成功。
+    #[tokio::test]
+    async fn test_failed_status_returns_error_not_partial_text() {
+        let mut r = completed("partial");
+        r.status = ResponseStatus::Failed;
+        r.finish_reason = Some(FinishReason::Error);
+        r.error = Some(model_provider::ResponseError {
+            code: None,
+            message: "upstream boom".into(),
+        });
+        let (agent, _provider) = scripted_agent(vec![r]);
+        let res = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await;
+        let err = res.expect_err("Failed 必须报错");
+        assert!(
+            err.to_string().contains("upstream boom"),
+            "错误须带上游 detail；实际 {err}"
+        );
     }
 }
