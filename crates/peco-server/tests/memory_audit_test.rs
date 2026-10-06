@@ -535,7 +535,7 @@ async fn test_restore_graph_fact_entity_row_rejected_without_pollution() {
 }
 
 // ============================================================================
-// 阶段二 B：restore 回滚契约（design §7）+ 审计历史面（§11）
+// 阶段二 B：restore 回滚契约 + 审计历史面
 // ============================================================================
 
 /// 写入一条记忆并返回 doc_id（内容哈希派生）。
@@ -583,7 +583,7 @@ async fn doc_exists(app: &TestApp, doc_id: &str) -> bool {
         .is_some()
 }
 
-/// 落一条 `reason='superseded'` 的 done 审计行（§7 链节点）。
+/// 落一条 `reason='superseded'` 的 done 审计行（链节点）。
 /// `content` 必须与 `add_memory` 时逐字一致 —— 回滚重放按内容哈希断言 doc_id。
 async fn seed_superseded_row(
     app: &TestApp,
@@ -698,7 +698,7 @@ async fn test_restore_long_chain_revives_root_retires_leaf() {
         .unwrap();
     assert!(row_b_db.restored_at.is_none(), "row_b 不在本次回滚范围");
 
-    // 退役 C 的新审计行：successor 指回 A（§7.3 nit7）、topic 继承、done
+    // 退役 C 的新审计行：successor 指回 A、topic 继承、done
     let audits = db::memory_audit::list_by_user(&app.state.db, &app.user_id, 200, 0)
         .await
         .unwrap();

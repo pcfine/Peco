@@ -546,7 +546,7 @@ pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
 ///
 /// 委托 [`list_documents_filtered`] 且 `source = None` ⇒ AST 与 v2 逐字相同
 /// （首步骤为 `NWhere.Eq:$label`，**无** `And` 包裹）—— 既有形状单测与线上行为
-/// 均不受 `source` 扩展影响（design §3.3-M11）。
+/// 均不受 `source` 扩展影响。
 pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Value {
     list_documents_filtered(schema, offset, limit, None)
 }
@@ -559,7 +559,7 @@ pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Valu
 ///
 /// `source = None` ⇒ 首步骤 `NWhere.Eq:$label`（与既有 `list_documents` 逐字相同）；
 /// `source = Some(s)` ⇒ 首步骤 `NWhere.And:[Eq:$label, Eq:source_path=s]`。
-/// 过滤在 `Skip`/`Limit` **之前**下推 ⇒ `offset` 是「过滤后的偏移」（design §3.2 E2）。
+/// 过滤在 `Skip`/`Limit` **之前**下推 ⇒ `offset` 是「过滤后的偏移」。
 pub fn list_documents_filtered(
     schema: &HelixSchema,
     offset: usize,
@@ -599,7 +599,7 @@ pub fn list_documents_filtered(
 ///
 /// 一次只读查询：`NWhere.Eq:$label` → `Limit` → `Project(id,title,source_path,content,metadata)`。
 /// **不做**分页 `Skip`，投影含 `content`（同 `get_document_by_id` 的正文属性口径）——
-/// 这是「中文全文索引不可用」的替代机制所需的取数原语（design §3.2 E4 / §3.3-M11）。
+/// 这是「中文全文索引不可用」的替代机制所需的取数原语。
 pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value {
     json!({
         "request_type": "read",
@@ -627,7 +627,7 @@ pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value 
 /// 这是「一次往返拿回 (nodes, edges)」的唯一构造 —— 任何拆成两条独立查询的
 /// 方案都会让「节点集」与「边集」来自不同快照，无法保证子图闭合。
 ///
-/// 形状（只读实测，design §3.2）：
+/// 形状（只读实测）：
 /// 1. `nodes` —— `NWhere{$label=<label>} → Project($id, id_property, name)`：
 ///    同时投影内部 `$id`（关联键）与稳定 `id_property`（对外身份）；
 /// 2. `edges` —— `NWhere{$label=<label>} → OutE:null → EdgeProperties:null`：
@@ -637,7 +637,7 @@ pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value 
 /// `EdgeProperties` 是终结步骤且不能在边流上 `Project`，故边的「标签 + 端点稳定
 /// id」必须靠调用方按内部 `$id` 关联两份结果 —— 与 `labeled_edge_batch` 同一技巧。
 /// 只发 `OutE` 一条：子图闭合要求两端皆该 label 的节点，而 `OutE` 从全部该 label
-/// 节点扇出即已覆盖全部两端命中的边，`InE` 冗余（design §3.2.3）。
+/// 节点扇出即已覆盖全部两端命中的边，`InE` 冗余。
 pub fn list_subgraph(schema: &HelixSchema, label: &str) -> Value {
     json!({
         "request_type": "read",
@@ -1684,7 +1684,7 @@ mod tests {
 
     /// `list_subgraph` 的 AST 形状 —— 一个 read batch、两个子查询、闭包所需的两份投影。
     ///
-    /// 与 design §3.2 只读实测逐字比对：`nodes` = `NWhere{$label} → Project($id, id, name)`；
+    /// 与只读实测逐字比对：`nodes` = `NWhere{$label} → Project($id, id, name)`；
     /// `edges` = `NWhere{$label} → OutE:null → EdgeProperties:null`。形状漂移会先在这里炸。
     #[test]
     fn list_subgraph_shape() {
@@ -1705,7 +1705,7 @@ mod tests {
             nsteps[0],
             json!({"NWhere": {"Eq": ["$label", {"String": "Entity"}]}})
         );
-        // 身份字段名硬编码为字面量 "id"（而非 `s.id_property`）：design §3.2 实测形状
+        // 身份字段名硬编码为字面量 "id"（而非 `s.id_property`）：实测形状
         // 就是 `id`，且 `id_property` 默认即 "id" —— 用同一表达式断言会恒真、锁不住
         // 「稳定 id(=id) ≠ 内部 $id」这条最易混的口径。改动 schema 默认即在此炸。
         assert_eq!(

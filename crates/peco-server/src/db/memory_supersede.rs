@@ -3,7 +3,7 @@
 // ============================================================================
 //
 // 只观测不动作：每轮提取后落一行「候选快照 + 提取事实 + 取代决策」，
-// 供效果门（design-v4 §10）离线标定。本表不参与任何检索/展示路径，
+// 供效果门离线标定。本表不参与任何检索/展示路径，
 // 本阶段无调度器接线 —— purge_shadow_older_than 只提供清理函数。
 
 use sqlx::SqlitePool;
@@ -64,7 +64,7 @@ pub async fn count_for_user(pool: &SqlitePool, user_id: &str) -> Result<i64, sql
 // memory_supersede_intent 表 DAO — 取代意图 WAL（outbox，阶段二）
 // ============================================================================
 //
-// 写路径定序（design-v4 §6.1）：① write_intent(pending) → ② add(new) →
+// 写路径定序：① write_intent(pending) → ② add(new) →
 // ③ delete_with_audit(old) → ④ CAS intent → done。任一环节崩溃残留的
 // pending 行由对账（reconcile）领取后幂等收口；本表不参与检索/展示面。
 
@@ -73,7 +73,7 @@ const INTENT_COLUMNS: &str = "id, user_id, kb_name, topic_key, old_doc_id, old_t
 
 /// 取代意图行（写入侧字段集）。
 ///
-/// **不存 `old_content`**（design-v4 §8）：旧条全量由退役时的
+/// **不存 `old_content`**：旧条全量由退役时的
 /// `memory_audit.content` 承载；对账需要旧条时 `get_document` 现取。
 #[derive(Debug, Clone)]
 pub struct IntentRow {
@@ -256,7 +256,7 @@ pub async fn release_to_pending(pool: &SqlitePool, id: i64, now: &str) -> Result
     Ok(())
 }
 
-/// health 计数（design-v4 §11 / `GET /memory/supersede/health`）。
+/// health 计数（`GET /memory/supersede/health`）。
 #[derive(Debug, Clone, Default)]
 pub struct SupersedeHealth {
     pub pending: i64,
@@ -286,7 +286,7 @@ pub async fn health_counts(
     })
 }
 
-/// 保留期清理（design-v4 §6.6）：`done` 早于 `cutoff_done`、
+/// 保留期清理：`done` 早于 `cutoff_done`、
 /// `failed/cancelled` 早于 `cutoff_failed`（按 `updated_at` = 落终态时刻）
 /// 物理清除；`pending/processing` 不清（对账未收口）。返回删除行数。
 pub async fn purge_intent_older_than(

@@ -305,7 +305,7 @@ impl IngestionPipeline {
     ///
     /// 纯透传给 [`DocumentStore::list_by_source`]：HelixDB 下推为 `NWhere.And`，
     /// 其余后端走可移植「先过滤后分页」兜底 —— 两者的 `offset` 语义一致
-    /// （过滤后的偏移，design §3.2 E2）。
+    /// （过滤后的偏移）。
     pub async fn list_documents_by_source(
         &self,
         offset: usize,
@@ -318,7 +318,7 @@ impl IngestionPipeline {
     /// 取回至多 `limit` 条文档（**含正文**），供 E4 全量扫描（M9）。
     ///
     /// 纯透传给 [`DocumentStore::list_all`]；**不掺入**检索语义
-    /// （匹配 / 片段 / 排序在 server 纯函数，design §3.3-M13）。
+    /// （匹配 / 片段 / 排序在 server 纯函数）。
     pub async fn list_all_documents(&self, limit: usize) -> Result<Vec<Document>, KnowledgeError> {
         self.doc_store.list_all(limit).await
     }

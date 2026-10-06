@@ -1,4 +1,4 @@
-// 记忆图谱视图 —— 取数 + dagre 布局 + 纯 SVG 渲染 + 选中 / 平移 / 缩放（design §3.5.3）
+// 记忆图谱视图 —— 取数 + dagre 布局 + 纯 SVG 渲染 + 选中 / 平移 / 缩放
 
 import {
   useCallback,

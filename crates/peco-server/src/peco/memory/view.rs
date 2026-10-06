@@ -4,21 +4,21 @@
 //! 不需要 Router / State / 网络。HTTP 薄壳留在 `peco/handler.rs`。
 //!
 //! 隔离缺口提醒：`build_graph` / `build_document_page` 只做响应整形，**不做**任何
-//! per-user / per-KB 过滤 —— 数据层没有可用的过滤键（design §3.4）。
+//! per-user / per-KB 过滤 —— 数据层没有可用的过滤键。
 
 use std::collections::HashSet;
 
 use knowledge_base::{Document, DocumentSummary, GraphNode, KnowledgeEdge};
 use serde::Serialize;
 
-/// E4 全量扫描的条数上限（design §3.2 E4 / §3.3-M13）。
+/// E4 全量扫描的条数上限。
 ///
 /// 取 `SCAN_LIMIT + 1` 条探测是否超限（同 E2 的 `limit+1` 范式）：返回行数 >
 /// `SCAN_LIMIT` ⇒ handler 返回 `500` + `warn!`，**不静默截断** —— 静默只扫前 N 条
 /// 会重演「明明有正文却报无匹配」。当前 N≈211 ≪ 2000，正常路径不触发。
 pub const SCAN_LIMIT: usize = 2000;
 
-/// snippet 命中点**单侧**字符数（design §3.3-M13）。
+/// snippet 命中点**单侧**字符数。
 pub const SNIPPET_PAD: usize = 40;
 
 /// 图谱响应里的一个实体节点。
@@ -72,7 +72,7 @@ pub struct MemoryDocumentPage {
 
 /// 组装图谱响应：稳定排序 → 截断节点 → **先按保留节点集过滤边** → 截断边。
 ///
-/// 顺序是关键（design §5.1 N-4）：
+/// 顺序是关键：
 /// 1. 节点按 `id` 稳定排序（同一输入两次调用逐字相同），再截断到 `node_limit`；
 /// 2. `edges` 先过滤掉**任一端点不在保留节点集**的边（子图闭合 + 不占名额），
 ///    再按 `edge_limit` 截断 —— 若先截断后过滤，`edge_limit` 会退化成「候选上限」，
@@ -145,7 +145,7 @@ pub fn build_graph(
 /// 组装文档列表响应：`limit+1` 探测 `has_more`。
 ///
 /// `rows` 由 handler 以 `limit + 1` 条请求得到 —— 返回行数 > `limit` 即还有下一页，
-/// 截断到 `limit`。无 count 端点也能翻页（design §3.1 E2）。
+/// 截断到 `limit`。无 count 端点也能翻页。
 pub fn build_document_page(
     rows: Vec<DocumentSummary>,
     offset: usize,
@@ -189,7 +189,7 @@ pub struct MemoryDocumentDetail {
 }
 
 /// `GET /api/peco/memory/search` 的一条命中（E4）。**无 `score`** ——
-/// 子串扫描无相关性信号，不承诺任何恒定量（design §1.2-#15）。
+/// 子串扫描无相关性信号，不承诺任何恒定量。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MemorySearchHit {
     pub id: String,
@@ -279,7 +279,7 @@ pub fn make_snippet(content: &str, query: &str) -> String {
 /// 按 `id` 升序 → 截断 `limit`。
 ///
 /// 每文档至多一条命中（以文档为单位扫描）⇒ **天然去重**，无 `dedup` 步骤。
-/// 排序用 `id`（唯一内容哈希）⇒ 确定全序、跨调用稳定（design §3.2 E4）。
+/// 排序用 `id`（唯一内容哈希）⇒ 确定全序、跨调用稳定。
 pub fn search_documents(
     docs: Vec<Document>,
     query: &str,

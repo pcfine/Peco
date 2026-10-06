@@ -1,5 +1,5 @@
 // MemoryPage 测试 —— 历史 tab 置顶 / 默认选中列表 / 待处理取代徽章 / 刷新接线
-// （design §11 展示分层 + TASK-S3b-UI Q1）
+// （展示分层 + TASK-S3b-UI Q1）
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";

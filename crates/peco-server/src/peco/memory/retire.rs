@@ -2,11 +2,11 @@
 // retire — 记忆删除共享原语（审计先行 outbox：pending → 删除 → done/cancelled）
 // ============================================================================
 //
-// 取代事务 §6.1 ③（hook）与巩固 worker（dedup/TTL）共用，自
+// 取代事务③（hook）与巩固 worker（dedup/TTL）共用，自
 // `ConsolidationWorker::delete_with_audit` 抽取。fail-closed：审计写不进 →
 // 在删除之前 return Err。文档已不在（delete 返回 NotFound）不产生
 // cancelled 行 — 审计行直接 done，返回 `AlreadyAbsent` 交调用方按
-// §6.4 ③c 视为成功。
+// ③c 视为成功。
 
 use sqlx::SqlitePool;
 
@@ -21,7 +21,7 @@ pub enum RetireOutcome {
     /// 文档已删除，审计行 pending → done。
     Deleted,
     /// 文档已不在 KB（delete 返回 NotFound）：目标已达成，审计行直接
-    /// done，不产生 cancelled 行 — 调用方按 §6.4 ③c 视为成功。
+    /// done，不产生 cancelled 行 — 调用方按 ③c 视为成功。
     AlreadyAbsent,
 }
 

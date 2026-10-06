@@ -1,4 +1,4 @@
-// 「记忆」页类型定义 —— 字段与后端 E1/E2 响应逐字对齐（design §3.1）
+// 「记忆」页类型定义 —— 字段与后端 E1/E2 响应逐字对齐
 // E1 `GET /peco/memory/graph`、E2 `GET /peco/memory/documents`
 
 /** 图谱节点。`id` 为稳定 id（`entity:Entity:<hash8>`），`name` 缺失时为 `""`。 */

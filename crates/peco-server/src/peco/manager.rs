@@ -268,7 +268,7 @@ fn claim_startup_purge() -> bool {
     STARTUP_PURGE.set(()).is_ok()
 }
 
-/// 三表保留期清理（§6.6 启动通道）：intent 按 done / failed+cancelled 分档，
+/// 三表保留期清理（启动通道）：intent 按 done / failed+cancelled 分档，
 /// shadow 单档，audit 按 reason 分档（superseded 独立档，pending 永不清）。
 /// 任一失败仅记日志 —— 清理非致命，下个进程周期重试。
 async fn purge_expired(db: &sqlx::SqlitePool, memory: &super::memory::MemoryConfig) {

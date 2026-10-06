@@ -190,7 +190,7 @@ pub trait GraphStore: Send + Sync {
 
     /// 取回某个 label 的**子图快照**：节点集 + 两端都在节点集内的边。
     ///
-    /// 语义（design §3.2.4）：
+    /// 语义：
     /// - **节点**：所有 label 等于 `label` 的节点；`GraphNode.id` 必须是**稳定 id**
     ///   （`schema.id_property`，`entity:Entity:<hash8>`），不是内部 `$id`；
     /// - **边**：只保留 `source_id` 与 `target_id` **都落在节点集内**的边（子图闭合）；

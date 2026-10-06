@@ -1,5 +1,5 @@
 // MemoryAuditList 组件测试 —— 被取代行渲染 / 回滚确认与失败提示 / 追加分页 / 空态
-// （design §11 历史 tab；裸数组分页）
+// （历史 tab；裸数组分页）
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createRef } from "react";

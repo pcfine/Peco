@@ -1,5 +1,5 @@
 // 记忆「历史」tab 列表 —— 被取代条目 + 后继 / 保留期 / 状态 + 回滚入口
-// （design §11 展示分层；裸数组分页，无 has_more 信封）
+// （展示分层；裸数组分页，无 has_more 信封）
 
 import { useCallback, useEffect, useImperativeHandle, useState } from "react";
 import axios from "axios";

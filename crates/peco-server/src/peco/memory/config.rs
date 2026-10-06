@@ -307,11 +307,11 @@ mod tests {
         assert_eq!(c.candidate_cap, 30);
         assert_eq!(c.candidate_text_cap, 200);
         assert_eq!(c.candidate_token_cap, 2000);
-        // 对齐 design-v4 §6.2（阶段一暂取 3，本轮统一为 5）
+        // 阶段一暂取 3，本轮统一为 5
         assert_eq!(c.supersede_per_turn_cap, 5);
         assert_eq!(c.shadow_scan_limit, 2000);
         assert_eq!(c.shadow_retention_days, 30);
-        // 阶段二：保留期 / 对账 / 收口阈值默认值（design-v4 §6.5/§6.6）
+        // 阶段二：保留期 / 对账 / 收口阈值默认值
         assert_eq!(c.superseded_retention_days, 30);
         assert_eq!(c.intent_done_retention_days, 7);
         assert_eq!(c.intent_failed_retention_days, 90);

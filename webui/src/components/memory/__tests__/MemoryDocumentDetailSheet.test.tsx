@@ -1,4 +1,4 @@
-// MemoryDocumentDetailSheet 组件测试 —— 打开即请求 / 四态 / 关闭不影响列表（design §5.3 F7）
+// MemoryDocumentDetailSheet 组件测试 —— 打开即请求 / 四态 / 关闭不影响列表
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, useState } from "react";

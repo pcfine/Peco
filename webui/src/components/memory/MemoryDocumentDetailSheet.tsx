@@ -1,4 +1,4 @@
-// 记忆文档详情右侧抽屉 —— 打开即请求，自带 loading / 成功 / 空正文 / 404 / 错误态（design §3.4.2 / §3.5）
+// 记忆文档详情右侧抽屉 —— 打开即请求，自带 loading / 成功 / 空正文 / 404 / 错误态
 
 import { useCallback, useEffect, useState } from "react";
 import axios from "axios";

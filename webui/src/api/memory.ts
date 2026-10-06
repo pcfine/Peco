@@ -1,4 +1,4 @@
-// 「记忆」页 API client —— 路径 / 查询参数与后端 E1/E2 逐字对齐（design §3.1）
+// 「记忆」页 API client —— 路径 / 查询参数与后端 E1/E2 逐字对齐
 
 import api from "./client";
 import type {

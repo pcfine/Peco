@@ -631,7 +631,7 @@ impl DocumentStore for HelixDbBackend {
     ///
     /// `source = None` ⇒ 退化为 [`Self::list`]（AST 与既有 `list_documents` 逐字相同）；
     /// `Some(s)` ⇒ `NWhere.And:[Eq:$label, Eq:source_path=s]` 在 `Skip`/`Limit` **之前**
-    /// 下推（design §3.2 E2 / §3.3-M11）。
+    /// 下推。
     async fn list_by_source(
         &self,
         offset: usize,
@@ -653,7 +653,7 @@ impl DocumentStore for HelixDbBackend {
     /// E4：**单次**只读查询取回至多 `limit` 条 `Document`（含正文 + metadata）。
     ///
     /// 覆写掉默认的 N+1 兜底（生产记忆 KB 恒为 HelixDB）。不做匹配/片段/排序 ——
-    /// 检索语义在 server 纯函数（design §3.3-M11 / M13）。
+    /// 检索语义在 server 纯函数。
     async fn list_all(&self, limit: usize) -> Result<Vec<Document>, KnowledgeError> {
         debug!(limit, "Listing all documents with content");
         let query = queries::list_documents_with_content(&self.schema, limit);

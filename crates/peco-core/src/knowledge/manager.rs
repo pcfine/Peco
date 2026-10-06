@@ -254,7 +254,7 @@ impl KnowledgeManager {
     /// [`KnowledgeModuleError::NotFound`]（REST 层 → 404）；其余变体（如 HelixDB
     /// 不可达的 `Internal`）经 [`map_open_kb_error`] **原样透传**为
     /// [`KnowledgeModuleError::Knowledge`]（REST 层 → 500）—— 与
-    /// [`Self::list_entity_graph`] 及 design §3.3 同语义，不把基础设施故障
+    /// [`Self::list_entity_graph`] 同语义，不把基础设施故障
     /// 伪装成「知识库不存在」。
     pub async fn list_memory_documents(
         &self,
@@ -318,7 +318,7 @@ impl KnowledgeManager {
     ///
     /// 与 [`Self::list_documents`] 同骨架：`ensure_loaded` + `open_kb` 门。KB 不存在时
     /// 返回 [`KnowledgeModuleError::NotFound`]，交由 REST 层映射为 404；其余打开失败
-    /// （如 HelixDB 不可达）**保留原始错误**，REST 层映射为 500（design §3.3）——
+    /// （如 HelixDB 不可达）**保留原始错误**，REST 层映射为 500——
     /// 不把基础设施故障伪装成「不存在」。
     pub async fn list_entity_graph(
         &self,
@@ -888,7 +888,7 @@ impl KnowledgeManager {
 /// 业务语义的 [`KnowledgeModuleError::NotFound`]（REST 层 → 404）；其余变体
 /// （如 HelixDB 不可达的 `KnowledgeError::Internal` / `GraphError`）**原样透传**
 /// 为 [`KnowledgeModuleError::Knowledge`]（REST 层 → 500），不把基础设施故障
-/// 伪装成「知识库不存在」（design §3.3）。
+/// 伪装成「知识库不存在」。
 fn map_open_kb_error(kb_name: &str, e: knowledge_base::KnowledgeError) -> KnowledgeModuleError {
     match e {
         knowledge_base::KnowledgeError::NotFound(_) => {

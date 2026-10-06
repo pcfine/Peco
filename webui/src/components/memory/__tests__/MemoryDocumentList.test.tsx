@@ -1,4 +1,4 @@
-// MemoryDocumentList 组件测试 —— 翻页 / 空态 / 错误重试 / 列渲染（design §5.3 F10）
+// MemoryDocumentList 组件测试 —— 翻页 / 空态 / 错误重试 / 列渲染
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createRef } from "react";

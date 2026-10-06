@@ -1,5 +1,5 @@
-// 「记忆」页骨架 —— 标题 / 刷新 / Tabs（design §3.5.2）
-// 历史 tab 置顶 + 待处理取代徽章：监管纠错为主用例（design §11 / Q1）
+// 「记忆」页骨架 —— 标题 / 刷新 / Tabs
+// 历史 tab 置顶 + 待处理取代徽章：监管纠错为主用例（Q1）
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";

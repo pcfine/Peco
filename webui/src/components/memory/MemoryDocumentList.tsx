@@ -1,5 +1,4 @@
 // 记忆文档列表视图 —— 取数 + 搜索 / 来源筛选 + 表格 + 翻页 + 详情抽屉 + 空 / 错状态
-// （design §3.4.1 / §3.5）
 
 import { useCallback, useEffect, useImperativeHandle, useState } from "react";
 import axios from "axios";

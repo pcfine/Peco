@@ -1033,7 +1033,7 @@ pub struct MemoryAuditItem {
     /// 后继 doc id（仅 superseded 行）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_doc_id: Option<String>,
-    /// 后继标题 — §11 两路解析（① 存活活条标题 ② 审计面最新 done 行标题）。
+    /// 后继标题 — 两路解析（① 存活活条标题 ② 审计面最新 done 行标题）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_title: Option<String>,
     /// superseded 保留期剩余天数（30d 档，下限 0）。
@@ -1125,9 +1125,9 @@ pub async fn list_memory_audit(
     Ok(Json(items))
 }
 
-/// §11 后继标题两路解析：① 后继仍存活 → 活条标题；② 已再次退役 → 该
+/// 后继标题两路解析：① 后继仍存活 → 活条标题；② 已再次退役 → 该
 /// doc_id 在审计面最新 `status='done'` 行的标题（先滤 done，防 cancelled
-/// 重复行顶替 — design nit10）。展示字段：任一路失败降级，不阻断列表。
+/// 重复行顶替）。展示字段：任一路失败降级，不阻断列表。
 async fn resolve_successor_title(
     db: &sqlx::SqlitePool,
     user_id: &str,
@@ -1157,7 +1157,7 @@ async fn resolve_successor_title(
     }
 }
 
-/// superseded 保留期剩余天数 = 档期 − 已过天数，下限 0（§11 / §6.6）。
+/// superseded 保留期剩余天数 = 档期 − 已过天数，下限 0。
 /// `deleted_at` 解析失败返回 None（不冒充 0）。
 fn retention_days_remaining(deleted_at: &str, retention_days: u64) -> Option<i64> {
     let deleted = chrono::DateTime::parse_from_rfc3339(deleted_at).ok()?;
@@ -1176,14 +1176,14 @@ pub struct RestoreMemoryResponse {
 /// 按审计行回滚一条记忆删除，成功后回填 restored_at / restored_doc_id：
 /// - `source == "graph_fact"`（图事实删除）→ 解析边快照，`read_fact` 存在性门后
 ///   重放 `add_facts`（事实仍在则跳过，不产生并行边）；实体级联行与损坏快照 409 拒绝。
-///   分支原样保留，**不做内容哈希断言**（§7.4 —— graph_fact 的 doc_id 不是内容哈希）。
-/// - 其余（文档删除）→ 三阶段回滚契约（§7）：① 全量校验零副作用 →
+///   分支原样保留，**不做内容哈希断言**（graph_fact 的 doc_id 不是内容哈希）。
+/// - 其余（文档删除）→ 三阶段回滚契约：① 全量校验零副作用 →
 ///   ② 沿 successor 链定位存活叶子（对环免疫 + 自身守门 + 跨槽 409）→
 ///   ③ 重放自身 → 退役叶子 → 回填。
 ///
 /// 取代行只重放不退役会让旧条与当前叶子两活（违反 I1）—— 叶子退役失败时
 /// 两活留存且 `restored_at` 仍为 NULL，**可再次发起 restore 收敛**
-/// （restore 路径无 intent，不经对账 —— §7.3 明文契约）。
+/// （restore 路径无 intent，不经对账 —— 明文契约）。
 ///
 /// 他人审计行与不存在的行一律 404 — 不泄露记录的存在性。
 pub async fn restore_memory_audit(
@@ -1212,7 +1212,7 @@ pub async fn restore_memory_audit(
         )));
     }
 
-    // ── 分流：graph_fact 原样走图路径（§7.4）；文本行走 §7 三阶段契约 ──
+    // ── 分流：graph_fact 原样走图路径；文本行走三阶段契约 ──
     // 图行不得进 add_text 路径 —— 把快照 JSON 当文档灌进 KB 是污染（假失败 + 垃圾文档）。
     let is_graph_fact = row.source == "graph_fact";
     let restored_doc_id = if is_graph_fact {
@@ -1286,7 +1286,7 @@ pub async fn restore_memory_audit(
     }))
 }
 
-/// 文本行的 §7 三阶段回滚，返回重放后的 doc_id。
+/// 文本行的三阶段回滚，返回重放后的 doc_id。
 ///
 /// 行存在 / 归属 / 状态 / 未回滚已在调用方校验；本函数负责 KB 校验、
 /// 叶子定位与写入序（replay → retire → 由调用方回填）。
@@ -1317,7 +1317,7 @@ async fn restore_text_row(
         }
     }
 
-    // ── 阶段2：定位叶子（§7.1，可能 ABORT，仍零副作用）──
+    // ── 阶段2：定位叶子（可能 ABORT，仍零副作用）──
     let max_hops = super::config::PecoConfig::default()
         .memory
         .restore_walk_max_hops;
@@ -1342,9 +1342,9 @@ async fn restore_text_row(
     }
     let restored_doc_id = doc.id;
 
-    // 退役当前叶子（链上还有存活后继时）：successor 指回 R（§7.3 nit7）。
+    // 退役当前叶子（链上还有存活后继时）：successor 指回 R。
     // 失败 → 两活、R.restored_at 仍 NULL —— 返回 5xx，可再次发起 restore 收敛
-    // （§7.3：不经对账，不计入有界收敛）。
+    // （不经对账，不计入有界收敛）。
     if let Some(leaf_doc) = leaf {
         let entry = MemoryAuditEntry {
             user_id: user_id.to_string(),
@@ -1369,10 +1369,10 @@ async fn restore_text_row(
     Ok(restored_doc_id)
 }
 
-/// §7.1 叶子定位：沿 successor 链找第一个存活者（即当前版本），对环免疫。
+/// 叶子定位：沿 successor 链找第一个存活者（即当前版本），对环免疫。
 ///
 /// - `visited` 单调增长 + 首存活即断 + `max_hops` 上限 → 必终止（A↔B 环可终止）；
-/// - 每跳经 §7.2 唯一选行取 successor，`topic_compatible` 不符 → 409 slot
+/// - 每跳经唯一选行取 successor，`topic_compatible` 不符 → 409 slot
 ///   mismatch（此时零副作用）；
 /// - 链回到 R 自身且自身存活 → 自身守门返回 `None`（只重放不退役，不得
 ///   zero-alive —— V4 Blocker1）；
@@ -1416,7 +1416,7 @@ async fn locate_restore_leaf(
                 )));
             }
         }
-        // §7.2 唯一选行：同 doc_id 的 done + 未回滚 superseded 行取最新一条
+        // 唯一选行：同 doc_id 的 done + 未回滚 superseded 行取最新一条
         let Some(next) =
             crate::db::memory_audit::latest_superseded_row(db, &row.user_id, &row.kb_name, &cur)
                 .await
@@ -1435,7 +1435,7 @@ async fn locate_restore_leaf(
     Ok(None)
 }
 
-/// §7.4 topic 一致性守卫：回滚方 topic 不可判（None）放行，否则必须与跳点相等。
+/// topic 一致性守卫：回滚方 topic 不可判（None）放行，否则必须与跳点相等。
 fn topic_compatible(r_topic: Option<&str>, hop_topic: Option<&str>) -> bool {
     r_topic.is_none() || r_topic == hop_topic
 }
@@ -1716,7 +1716,7 @@ pub async fn export_session(
 /// 私人记忆库名 —— 与 `MemoryConfig.kb_name` 的生产默认值一致（`peco/memory/config.rs`）。
 ///
 /// 就地定义而非提升为 `peco-core` 公共常量：为单个字符串引入跨 crate 依赖，收益
-/// （省一处字面量）小于成本（design §3.3）。
+/// （省一处字面量）小于成本。
 const PRIVATE_MEMORY_KB: &str = "@private_memory";
 
 /// 图谱端点查询参数。
@@ -1784,7 +1784,7 @@ fn clamp_search_limit(limit: i64) -> usize {
 
 /// 把 KB 定位失败映射到 [`ApiError`]：`NotFound` → 404，其余 → 500。
 ///
-/// 无 `From<KnowledgeModuleError> for ApiError`，逐处 `.map_err`（design §3.3）。
+/// 无 `From<KnowledgeModuleError> for ApiError`，逐处 `.map_err`。
 /// `op` 是 500 details 的操作前缀（`"failed to load memory graph"` /
 /// `"failed to load memory documents"`）。
 fn map_memory_kb_error(op: &str, e: KnowledgeModuleError) -> ApiError {
@@ -1798,7 +1798,7 @@ fn map_memory_kb_error(op: &str, e: KnowledgeModuleError) -> ApiError {
 
 /// `GET /api/peco/memory/graph` —— 当前用户 `@private_memory` 的实体子图。
 ///
-/// **隔离缺口（design §3.4）**：HelixDB 单一命名空间 + `Entity` 无 owner 字段 ⇒
+/// **隔离缺口**：HelixDB 单一命名空间 + `Entity` 无 owner 字段 ⇒
 /// 多用户部署下会返回该实例内所有用户写入的 Entity / 边；本轮接受现状、不加过滤。
 pub async fn get_memory_graph(
     AuthUser { user_id }: AuthUser,
@@ -1825,7 +1825,7 @@ pub async fn get_memory_graph(
 
 /// `GET /api/peco/memory/documents` —— 当前用户 `@private_memory` 的文档列表（分页）。
 ///
-/// **隔离缺口（design §3.4）**：同 `get_memory_graph` —— `Document` 不写 `kb_id`，
+/// **隔离缺口**：同 `get_memory_graph` —— `Document` 不写 `kb_id`，
 /// 多用户部署下会返回该实例内所有 KB 的文档；本轮接受现状、不加过滤。
 pub async fn list_memory_documents(
     AuthUser { user_id }: AuthUser,
@@ -1848,7 +1848,7 @@ pub async fn list_memory_documents(
     // `limit+1` 探测 `has_more`：多取一条，由 build_document_page 截断。
     // 用 `list_memory_documents`（而非 agent 工具复用的 `list_documents`）——
     // 后者会把 `open_kb` 的**全部**失败收敛为 `NotFound`，本次修复让 E2 与 E1
-    // 一致：只有 KB 真的不存在才 404，HelixDB 不可达等 → 500（design §3.3）。
+    // 一致：只有 KB 真的不存在才 404，HelixDB 不可达等 → 500。
     let rows = ws
         .knowledge_manager()
         .list_memory_documents(PRIVATE_MEMORY_KB, offset, limit + 1, source)
@@ -1863,7 +1863,7 @@ pub async fn list_memory_documents(
 /// 复用既有 `KnowledgeManager::get_document`（core/kb 层零新增能力）。文档不存在
 /// （`Ok(None)`）→ 404「文档不存在或已被删除」。
 ///
-/// **隔离缺口（design §3.4）**：同 E2 —— 多用户部署下会返回该 HelixDB 实例内
+/// **隔离缺口**：同 E2 —— 多用户部署下会返回该 HelixDB 实例内
 /// 所有 KB 的文档；本轮接受现状、不加过滤。
 pub async fn get_memory_document(
     AuthUser { user_id }: AuthUser,
@@ -1890,7 +1890,7 @@ pub async fn get_memory_document(
 /// 子串匹配并生成 snippet。命中数超 `SCAN_LIMIT` ⇒ 500 + `warn!`（**不静默截断**）。
 /// 检索语义（匹配/片段/排序）在 `view` 纯函数，core/kb 层只提供「取回全部文档」原语。
 ///
-/// **隔离缺口（design §3.4）**：同 E1/E2 —— 不加 per-user / per-KB 过滤。
+/// **隔离缺口**：同 E1/E2 —— 不加 per-user / per-KB 过滤。
 pub async fn search_memory_documents(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -1935,7 +1935,7 @@ pub async fn search_memory_documents(
     ))))
 }
 
-/// `GET /api/peco/memory/supersede/health` —— 取代对账健康计数（design §11）。
+/// `GET /api/peco/memory/supersede/health` —— 取代对账健康计数。
 ///
 /// `{pending, processing, failed}` 按用户从 intent 表聚合（done 是终态历史，
 /// 不入响应）；`degraded` / `last_converged_at` 是进程级内存态 —— 前者为
@@ -1948,7 +1948,7 @@ pub async fn supersede_health(
     supersede_health_response(&state, &user_id).await
 }
 
-/// 组装 §11 健康响应 —— `GET /memory/supersede/health` 与手动对账端点共用。
+/// 组装健康响应 —— `GET /memory/supersede/health` 与手动对账端点共用。
 async fn supersede_health_response(
     state: &AppState,
     user_id: &str,
@@ -1966,7 +1966,7 @@ async fn supersede_health_response(
     }))
 }
 
-/// `POST /api/peco/memory/supersede/reconcile` —— 手动触发一次对账（§6.5 ③）。
+/// `POST /api/peco/memory/supersede/reconcile` —— 手动触发一次对账。
 ///
 /// 与每轮 hook 收尾、进程启动同一条 `peco::memory::reconcile` 入口，幂等；
 /// **不新增开关、不改变默认行为**（门恒闭）。同步跑完后返回与
@@ -1986,7 +1986,7 @@ pub async fn supersede_reconcile(
     supersede_health_response(&state, &user_id).await
 }
 
-/// 取代对账健康响应（design §11）。
+/// 取代对账健康响应。
 #[derive(Debug, Serialize)]
 pub struct SupersedeHealthResponse {
     /// 待处理意图数。
@@ -2023,8 +2023,8 @@ pub struct SupersedeHealthResponse {
 /// - `GET /memory/documents` — 记忆文档列表（分页，可按 `source` 过滤）
 /// - `GET /memory/documents/{id}` — 记忆文档详情（全文 + 元数据）
 /// - `GET /memory/search` — 记忆内容检索（正文子串扫描，`?q=&limit[&source]`）
-/// - `GET /memory/supersede/health` — 取代对账健康计数（design §11）
-/// - `POST /memory/supersede/reconcile` — 手动触发一次取代对账（§6.5 ③）
+/// - `GET /memory/supersede/health` — 取代对账健康计数
+/// - `POST /memory/supersede/reconcile` — 手动触发一次取代对账
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/stream", get(stream_chat))

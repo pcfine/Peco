@@ -1,4 +1,4 @@
-// 记忆页 API client 契约测试 —— 路径 / 查询参数与后端 E1/E2 逐字对齐（design §5.3 F8）
+// 记忆页 API client 契约测试 —— 路径 / 查询参数与后端 E1/E2 逐字对齐
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import api from "../client";

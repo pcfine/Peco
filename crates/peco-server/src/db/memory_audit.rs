@@ -131,7 +131,7 @@ pub async fn list_by_user(
     list_by_user_reason(pool, user_id, None, limit, offset).await
 }
 
-/// 按用户分页列出审计行，可按 `reason` 过滤（design §11 历史 tab：
+/// 按用户分页列出审计行，可按 `reason` 过滤（历史 tab：
 /// `GET /memory/audit?reason=superseded`）。
 ///
 /// `reason = None` 时不过滤；排序保持 `deleted_at DESC, id DESC`。
@@ -156,11 +156,11 @@ pub async fn list_by_user_reason(
     .await
 }
 
-/// 某 doc_id 在审计面最新一条 `status='done'` 行的标题（§11 后继标题解析
+/// 某 doc_id 在审计面最新一条 `status='done'` 行的标题（后继标题解析
 /// 第二路 —— 后继已再次退役时取这里）。
 ///
 /// **必须先过滤 `status='done'`**：cancelled 重复行可能更新，不滤会顶替
-/// 正确标题（design nit10）。
+/// 正确标题。
 pub async fn latest_done_row_title(
     pool: &SqlitePool,
     user_id: &str,
@@ -181,7 +181,7 @@ pub async fn latest_done_row_title(
 
 /// 物理清除保留期之外的终态审计行（done / cancelled），返回删除行数。
 ///
-/// 按 reason 分档（design-v4 §6.6）：`superseded` 走 `superseded_cutoff`
+/// 按 reason 分档：`superseded` 走 `superseded_cutoff`
 /// （默认 30d），其余 reason 走 `cutoff`（默认 90d）。
 /// pending 视为未决（删除流程尚未收口），不在此清除 —
 /// 调用方应先让 outbox 行落到终态，再依赖保留期清理。
@@ -203,7 +203,7 @@ pub async fn purge_older_than(
     Ok(result.rows_affected())
 }
 
-/// 按 (user, kb, doc_id) 取唯一一条 unrestored + done 的 superseded 行（§7.2）。
+/// 按 (user, kb, doc_id) 取唯一一条 unrestored + done 的 superseded 行。
 ///
 /// 同 doc_id 多行只可能来自复活路径；`ORDER BY deleted_at DESC, id DESC LIMIT 1`
 /// 保证选行唯一。
@@ -226,7 +226,7 @@ pub async fn latest_superseded_row(
     .await
 }
 
-/// 扫超时的 pending superseded 行（对账收口用，§6.5-2）。
+/// 扫超时的 pending superseded 行（对账收口用）。
 ///
 /// 跨用户返回 — 调用方按 `user_id` 内存过滤（对账按用户收口，签名保持无 user 维度）。
 pub async fn list_pending_superseded_before(

@@ -1,4 +1,4 @@
-// MemoryGraphView 组件测试 —— 渲染 / 空态 / 错误重试 / 选中面板 / 单节点（design §5.3 F9）
+// MemoryGraphView 组件测试 —— 渲染 / 空态 / 错误重试 / 选中面板 / 单节点
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";

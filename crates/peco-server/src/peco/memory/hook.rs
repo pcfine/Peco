@@ -18,7 +18,7 @@
 // 绝不调用删除。
 //
 // 取代机制 · 阶段二（enforcement）：`supersede_enforce` 开启后，通过写前
-// 前置的 fact 走 §6.1 outbox 取代事务（intent WAL → add new → 删旧留审计
+// 前置的 fact 走 outbox 取代事务（intent WAL → add new → 删旧留审计
 // → CAS done），失败退化 append；对账（`reconcile`）在每轮 hook 收尾与
 // 进程启动时收口未完成意图。门闭时与阶段一逐字一致（fail-closed）。
 
@@ -658,13 +658,13 @@ impl MemoryExtractionHook {
         }
     }
 
-    /// 阶段二 enforcement：§6.2 写前前置 + §6.1 outbox 取代事务。
+    /// 阶段二 enforcement：写前前置 + outbox 取代事务。
     ///
     /// 返回被事务接管的 fact 下标 —— 这些 fact 的 `add(new)` 已在事务内完成
     /// （或已入 intent WAL），常规 append 循环必须跳过；未通过前置 / 门闭 /
     /// ①失败退化的 fact 不入集合，照旧走 append。
     ///
-    /// 六项前置（design-v4 §6.2，任一不满足即退化 append）：
+    /// 六项前置（任一不满足即退化 append）：
     /// ① victim 在候选白名单内；② 类目同槽；③ `new_doc_id != old_doc_id`；
     /// ④ `topic_key` 非空；⑤ 单条 fact 至多一个受害者；⑥ 单轮 ≤ cap（全有全无）。
     // 8 个参数是刻意的：六项前置各取一个输入，合并入参会把两条不相干的
@@ -726,7 +726,7 @@ impl MemoryExtractionHook {
             if old_doc.source_path != source_of(fact) {
                 continue;
             }
-            // 前置③：同内容同 id ⇒ 取代零活（§6.3），跳过
+            // 前置③：同内容同 id ⇒ 取代零活，跳过
             let new_doc_id = knowledge_base::text_doc_id(&fact.content);
             if new_doc_id == *victim_id {
                 continue;
@@ -766,12 +766,12 @@ impl MemoryExtractionHook {
         handled
     }
 
-    /// 执行单条 §6.1 outbox 事务：① `write_intent(pending)` → ② `add(new)` →
+    /// 执行单条 outbox 事务：① `write_intent(pending)` → ② `add(new)` →
     /// ③ `delete_with_audit(old)` → ④ CAS `done`。
     ///
     /// 只有 ① 失败返回 `Degraded`（不碰 KB、`degraded+1`）；① 落库后任何
     /// 失败都返回 `Handled` —— intent 已在 WAL，跳过常规 append，由对账
-    /// 幂等收口（§6.4 全表：②失败不删旧、③失败留 pending、④失败补 done）。
+    /// 幂等收口（全表：②失败不删旧、③失败留 pending、④失败补 done）。
     async fn supersede_one(
         km: &KnowledgeManager,
         db: &sqlx::SqlitePool,
@@ -845,7 +845,7 @@ impl MemoryExtractionHook {
         }
 
         // ③ 旧条退役 —— 先预检再调共享原语：
-        //   Ok(None)  = §6.4 ③c 旧已不在 → 显式视为成功（不调原语、不产生 cancelled 行）；
+        //   Ok(None)  = ③c 旧已不在 → 显式视为成功（不调原语、不产生 cancelled 行）；
         //   Err       = M1 后端故障 ≠ 已删 → 留 pending 重试，不得误判成功。
         match km.get_document(&config.kb_name, &item.old_doc_id).await {
             Ok(None) => {}
@@ -860,8 +860,8 @@ impl MemoryExtractionHook {
                     reason: "superseded".to_string(),
                     deleted_by: "hook:supersede".to_string(),
                     deleted_at: now.clone(),
-                    // M2（design-v4 §17）：topic_key 记**取代方（行凶者）fact 的 topic** —
-                    // §7.4 守卫与 §7.2 选行依赖此口径
+                    // M2：topic_key 记**取代方（行凶者）fact 的 topic** —
+                    // 守卫与选行依赖此口径
                     topic_key: Some(item.topic_key.clone()),
                     successor_doc_id: Some(item.new_doc_id.clone()),
                 };
@@ -897,7 +897,7 @@ impl MemoryExtractionHook {
 
 /// 领取后的失败路径：把 intent 释放回 `pending`，使对账可**即时**重领
 ///（否则停在 `processing` 需等 `reconcile_claim_timeout`(5min) 陈旧窗口，
-/// 违背 §6.4「③ 失败 → 对账重试」的即时性）。释放本身失败也仅告警 ——
+/// 违背「③ 失败 → 对账重试」的即时性）。释放本身失败也仅告警 ——
 /// 行仍可由陈旧回收兜住。
 async fn release_after_failure(db: &sqlx::SqlitePool, intent_id: i64, now: &str) {
     if let Err(e) = release_to_pending(db, intent_id, now).await {
@@ -910,11 +910,11 @@ fn source_of(fact: &MemoryFact) -> String {
     format!("ppa_{}", fact.category.as_str())
 }
 
-/// §11 `degraded`：① `write_intent` 失败退化为 append 的次数。
+/// `degraded`：① `write_intent` 失败退化为 append 的次数。
 /// 进程级累计（不按用户隔离），进程重启清零 —— health 端点回显。
 static DEGRADED_COUNT: AtomicI64 = AtomicI64::new(0);
 
-/// §11 `last_converged_at`：最近一次对账完整收口的时刻（RFC 3339）。
+/// `last_converged_at`：最近一次对账完整收口的时刻（RFC 3339）。
 /// 进程内存态（重启清空）；SQL 级错误的轮次不更新（口径见 `reconcile`）。
 static LAST_CONVERGED_AT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -931,7 +931,7 @@ pub fn last_converged_at() -> Option<String> {
         .clone()
 }
 
-/// 通过 §6.2 全部写前前置的单条取代计划。
+/// 通过全部写前前置的单条取代计划。
 struct SupersedePlanItem {
     /// 对应 `facts[]` 下标 — 返回给 append 循环跳过。
     fact_index: usize,
@@ -980,13 +980,13 @@ impl LooperHook for MemoryExtractionHook {
 
         tokio::spawn(async move {
             Self::run_extraction(&km, analyzer.as_ref(), &config, &db, &user_id, dialogue).await;
-            // §6.5 触发①：每轮 hook 收尾对账（门闭时 intent 表为空 → 幂等零副作用）
+            // 触发①：每轮 hook 收尾对账（门闭时 intent 表为空 → 幂等零副作用）
             reconcile(&db, &km, &config, &user_id).await;
         });
     }
 }
 
-/// 对账（design-v4 §6.5）：收口未完成的取代意图 + 超时的 audit pending 行。
+/// 对账：收口未完成的取代意图 + 超时的 audit pending 行。
 ///
 /// 触发点：① 每轮 hook 收尾（`on_turn_complete` 的 spawn 尾部）；② 进程启动
 /// （`PecoManager`，per-user OnceLock 守卫）。手动端点留 S3b。
@@ -1060,7 +1060,7 @@ pub async fn reconcile(
         }
     }
 
-    // ② audit pending 收口：超时且旧文档确认不在 KB → 补 done（§6.4 ③b）
+    // ② audit pending 收口：超时且旧文档确认不在 KB → 补 done（③b）
     let audit_cutoff =
         (now - chrono::Duration::seconds(config.audit_pending_timeout_secs as i64)).to_rfc3339();
     match list_pending_superseded_before(db, &audit_cutoff, config.reconcile_batch).await {
@@ -1097,7 +1097,7 @@ pub async fn reconcile(
     }
 }
 
-/// 单条意图的幂等重放（§6.4）：ensure-add new → 三分支删旧。
+/// 单条意图的幂等重放：ensure-add new → 三分支删旧。
 ///
 /// `Ok(())` 可安全 `mark_done`；`Err` 表示该环节不可重放成功，调用方释放
 /// pending 待下轮。`get_document(new)` 的 `Err` 同样上抛（KB 故障 ≠ 缺失）。
@@ -1137,7 +1137,7 @@ async fn reconcile_one(
                 reason: "superseded".to_string(),
                 deleted_by: "hook:supersede".to_string(),
                 deleted_at: chrono::Utc::now().to_rfc3339(),
-                // M2（design-v4 §17）：与写入处同口径 — 取代方 fact 的 topic
+                // M2：与写入处同口径 — 取代方 fact 的 topic
                 topic_key: intent.topic_key.clone(),
                 successor_doc_id: Some(intent.new_doc_id.clone()),
             };

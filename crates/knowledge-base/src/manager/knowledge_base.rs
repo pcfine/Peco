@@ -353,7 +353,7 @@ impl KnowledgeBase {
     ///
     /// `source = None` ⇒ 与 [`Self::list_documents`] 等价（HelixDB AST 逐字不变）；
     /// `Some(s)` ⇒ HelixDB 下推 `NWhere.And`，其余后端走可移植兜底；两种路径的
-    /// `offset` 均为「过滤后的偏移」（design §3.2 E2）。
+    /// `offset` 均为「过滤后的偏移」。
     pub async fn list_documents_by_source(
         &self,
         offset: usize,
