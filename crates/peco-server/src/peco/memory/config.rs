@@ -79,6 +79,88 @@ impl Default for ConsolidationConfig {
     }
 }
 
+// ── 自动整理的环境变量入口 ─────────────────────────────────────────────
+
+pub const ENV_CONSOLIDATION_ENABLED: &str = "PECO_MEMORY_CONSOLIDATION_ENABLED";
+pub const ENV_CONSOLIDATION_CRON: &str = "PECO_MEMORY_CONSOLIDATION_CRON";
+pub const ENV_CONSOLIDATION_BATCH_SIZE: &str = "PECO_MEMORY_CONSOLIDATION_BATCH_SIZE";
+pub const ENV_CONSOLIDATION_MAX_LLM_CALLS: &str = "PECO_MEMORY_CONSOLIDATION_MAX_LLM_CALLS";
+pub const ENV_CONSOLIDATION_IDLE_AFTER_SECS: &str = "PECO_MEMORY_CONSOLIDATION_IDLE_AFTER_SECS";
+pub const ENV_CONSOLIDATION_DEDUP_ENFORCE: &str = "PECO_MEMORY_CONSOLIDATION_DEDUP_ENFORCE";
+
+impl ConsolidationConfig {
+    /// 从环境变量读取，未设置的字段取 [`Self::default`]。
+    ///
+    /// 未经 env 暴露的字段（阈值、保留期等）只能改 `Default`。
+    pub fn from_env() -> Self {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::from_env`] 的内核：env 查找由调用方提供。
+    fn from_env_with<F: Fn(&str) -> Option<String>>(get: F) -> Self {
+        let default = Self::default();
+        Self {
+            enabled: env_bool(&get, ENV_CONSOLIDATION_ENABLED, default.enabled),
+            cron_expr: env_string(&get, ENV_CONSOLIDATION_CRON, default.cron_expr),
+            batch_size: env_parse(&get, ENV_CONSOLIDATION_BATCH_SIZE, default.batch_size),
+            max_llm_calls: env_parse(&get, ENV_CONSOLIDATION_MAX_LLM_CALLS, default.max_llm_calls),
+            idle_after_secs: env_parse(
+                &get,
+                ENV_CONSOLIDATION_IDLE_AFTER_SECS,
+                default.idle_after_secs,
+            ),
+            dedup_enforce: env_bool(&get, ENV_CONSOLIDATION_DEDUP_ENFORCE, default.dedup_enforce),
+            ..default
+        }
+    }
+}
+
+fn env_parse<T: std::str::FromStr, F: Fn(&str) -> Option<String>>(
+    get: &F,
+    name: &str,
+    default: T,
+) -> T {
+    match get(name) {
+        Some(raw) => match raw.trim().parse() {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!(
+                    variable = name,
+                    value = %raw,
+                    "Invalid numeric env var; using default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+fn env_string<F: Fn(&str) -> Option<String>>(get: &F, name: &str, default: String) -> String {
+    match get(name) {
+        Some(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+        _ => default,
+    }
+}
+
+fn env_bool<F: Fn(&str) -> Option<String>>(get: &F, name: &str, default: bool) -> bool {
+    match get(name) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            other => {
+                tracing::warn!(
+                    variable = name,
+                    value = %other,
+                    "Invalid boolean env var; using default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
 /// 记忆双路径配置。
 ///
 /// 存储载体是 workspace 内的 `@private_memory` 知识库（personal 模板
@@ -189,6 +271,20 @@ impl Default for MemoryConfig {
     }
 }
 
+impl MemoryConfig {
+    /// 在 [`Self::default`] 之上应用环境变量覆盖（目前只有 `consolidation` 子配置）。
+    pub fn from_env() -> Self {
+        Self::with_consolidation_config(ConsolidationConfig::from_env())
+    }
+
+    fn with_consolidation_config(consolidation: ConsolidationConfig) -> Self {
+        Self {
+            consolidation,
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +343,115 @@ mod tests {
         assert_eq!(c.audit_retention_days, 90);
         // shadow 优先 — 标定报告人工抽检通过前保持 false
         assert!(!c.dedup_enforce);
+    }
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn consolidation_from_env_unset_keeps_fail_closed_defaults() {
+        let c = ConsolidationConfig::from_env_with(env_of(&[]));
+        let d = ConsolidationConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.batch_size, d.batch_size);
+        assert_eq!(c.max_llm_calls, d.max_llm_calls);
+        assert_eq!(c.idle_after_secs, d.idle_after_secs);
+        assert_eq!(c.cron_expr, d.cron_expr);
+        assert!(!c.dedup_enforce);
+    }
+
+    #[test]
+    fn consolidation_from_env_reads_switch_and_tuning() {
+        let c = ConsolidationConfig::from_env_with(env_of(&[
+            (ENV_CONSOLIDATION_ENABLED, "true"),
+            (ENV_CONSOLIDATION_CRON, "0 */5 * * * *"),
+            (ENV_CONSOLIDATION_BATCH_SIZE, "20"),
+            (ENV_CONSOLIDATION_MAX_LLM_CALLS, "3"),
+            (ENV_CONSOLIDATION_IDLE_AFTER_SECS, "60"),
+            (ENV_CONSOLIDATION_DEDUP_ENFORCE, "1"),
+        ]));
+        assert!(c.enabled);
+        assert_eq!(c.cron_expr, "0 */5 * * * *");
+        assert_eq!(c.batch_size, 20);
+        assert_eq!(c.max_llm_calls, 3);
+        assert_eq!(c.idle_after_secs, 60);
+        assert!(c.dedup_enforce);
+        // 未暴露的标定字段不受 env 影响
+        assert!((c.min_cluster_cos - 0.79).abs() < f32::EPSILON);
+        assert!((c.dedup_cos - 0.88).abs() < f32::EPSILON);
+        assert_eq!(c.episodic_ttl_days, 60);
+        assert_eq!(c.audit_retention_days, 90);
+    }
+
+    #[test]
+    fn consolidation_from_env_bool_accepts_common_spellings() {
+        for truthy in ["true", "TRUE", " 1 ", "yes", "On"] {
+            let c =
+                ConsolidationConfig::from_env_with(env_of(&[(ENV_CONSOLIDATION_ENABLED, truthy)]));
+            assert!(c.enabled, "{truthy:?} 应解析为 true");
+        }
+        for falsy in ["false", "0", "no", "off"] {
+            let c =
+                ConsolidationConfig::from_env_with(env_of(&[(ENV_CONSOLIDATION_ENABLED, falsy)]));
+            assert!(!c.enabled, "{falsy:?} 应解析为 false");
+        }
+    }
+
+    #[test]
+    fn consolidation_from_env_invalid_value_falls_back_to_default() {
+        let c = ConsolidationConfig::from_env_with(env_of(&[
+            (ENV_CONSOLIDATION_BATCH_SIZE, "not-a-number"),
+            (ENV_CONSOLIDATION_MAX_LLM_CALLS, "-3"),
+            (ENV_CONSOLIDATION_DEDUP_ENFORCE, "maybe"),
+        ]));
+        let d = ConsolidationConfig::default();
+        assert_eq!(c.batch_size, d.batch_size);
+        assert_eq!(c.max_llm_calls, d.max_llm_calls);
+        assert!(!c.dedup_enforce);
+    }
+
+    #[test]
+    fn consolidation_from_env_blank_cron_falls_back() {
+        let c = ConsolidationConfig::from_env_with(env_of(&[(ENV_CONSOLIDATION_CRON, "   ")]));
+        assert_eq!(c.cron_expr, ConsolidationConfig::default().cron_expr);
+    }
+
+    #[test]
+    fn memory_from_env_propagates_consolidation_switch() {
+        let on =
+            MemoryConfig::with_consolidation_config(ConsolidationConfig::from_env_with(env_of(&[
+                (ENV_CONSOLIDATION_ENABLED, "true"),
+            ])));
+        assert!(on.consolidation.enabled);
+        assert_eq!(on.kb_name, "@private_memory");
+        assert!(on.enabled);
+
+        let off = MemoryConfig::with_consolidation_config(ConsolidationConfig::from_env_with(
+            env_of(&[]),
+        ));
+        assert!(!off.consolidation.enabled);
+    }
+
+    #[test]
+    fn consolidation_env_var_names_are_distinct_and_namespaced() {
+        let names = [
+            ENV_CONSOLIDATION_ENABLED,
+            ENV_CONSOLIDATION_CRON,
+            ENV_CONSOLIDATION_BATCH_SIZE,
+            ENV_CONSOLIDATION_MAX_LLM_CALLS,
+            ENV_CONSOLIDATION_IDLE_AFTER_SECS,
+            ENV_CONSOLIDATION_DEDUP_ENFORCE,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            assert!(name.starts_with("PECO_MEMORY_CONSOLIDATION_"), "{name}");
+            assert!(seen.insert(name), "重复的 env 变量名: {name}");
+        }
     }
 }

@@ -1534,7 +1534,9 @@ pub async fn consolidate_now(
     if !state.consolidation_enabled {
         return Ok(Json(ConsolidateResponse::Disabled {
             enabled: false,
-            message: "自动整理未开启（memory.consolidation.enabled = false）".into(),
+            message: "自动整理未开启：需以环境变量 \
+                      PECO_MEMORY_CONSOLIDATION_ENABLED=true 启动（读一次，改动需重启）"
+                .into(),
         })
         .into_response());
     }

@@ -48,7 +48,16 @@ pub async fn register(state: &Arc<AppState>) -> Result<(), JobSchedulerError> {
     }
 
     let memory = memory_config();
-    let cron_expr = memory.consolidation.cron_expr.clone();
+    let consolidation = &memory.consolidation;
+    let cron_expr = consolidation.cron_expr.clone();
+    tracing::info!(
+        cron = %cron_expr,
+        batch_size = consolidation.batch_size,
+        max_llm_calls = consolidation.max_llm_calls,
+        idle_after_secs = consolidation.idle_after_secs,
+        dedup_enforce = consolidation.dedup_enforce,
+        "Memory consolidation cron registered (server switch on)"
+    );
     state
         .cron_scheduler
         .add_job(

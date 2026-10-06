@@ -90,7 +90,7 @@ impl Default for PecoConfig {
             compaction_trigger_tokens: 256_000,
             compaction_keep_recent_tokens: 96_000,
             summarizer_model: "deepseek-v4-flash".to_string(),
-            memory: MemoryConfig::default(),
+            memory: MemoryConfig::from_env(),
             retry_limit: retry.retry_limit,
             retry_output_budget: retry.retry_output_budget,
             retry_base_delay_ms: retry.retry_base_delay_ms,
