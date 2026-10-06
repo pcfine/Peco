@@ -689,8 +689,8 @@ mod tests {
     #[test]
     fn v2_v3_clamp_degenerate_strip_bounds() {
         // env 路径的坏值在 from_env 已被钳掉，这里直接构造 —— V3 是对
-        // 程序化构造配置的兜底
-        let mut cfg = PecoConfig::default();
+        // 程序化构造配置的兜底；空 env 内核使结果不随宿主 PECO_* 漂移
+        let mut cfg = PecoConfig::from_env_with(env_of(&[]));
         cfg.strip.keep_recent_turns = 0;
         cfg.strip.tool_output_max_chars = 100;
         let violations = cfg.validate_compaction();
