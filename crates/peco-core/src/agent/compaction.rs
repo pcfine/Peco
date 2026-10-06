@@ -101,10 +101,12 @@ pub trait TurnSummarizer: Send + Sync {
 
 /// 元任务调用的输出预算。
 ///
-/// 摘要提示词要求 500 字符以内，但实测正文常到 1500–1900 字符（约 800–1300 token）——
-/// 1024 的旧值贴着真实输出长度，模型稍有超出即以 `Incomplete` 失败。4096 留足余量；
+/// 摘要提示词要求 500 字符以内，但实测正文常到 1500–1900 字符（约 800–1300 token）。
+/// 这里取过 1024 与 4096：前者贴着真实输出长度，后者则被实测撞顶 —— 转录较长时
+/// 模型会在预算内一路写满，响应成 `Incomplete`，而摘要链路把非 `Completed` 直接
+/// 判为失败，压缩从此永不推进。16384 与 provider 默认档一致，留足余量；
 /// 这是**上限**而非目标长度，超出提示词要求的部分照收。
-const SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 4096;
+const SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 16384;
 
 /// 基于 [`ModelProvider`] 的摘要器 — 复用主 Agent 的 provider，
 /// 用 Flash 档模型做低成本摘要。
@@ -878,8 +880,8 @@ mod tests {
         }
     }
 
-    /// 摘要请求的输出预算必须留出余量：实测摘要正文 1500–1900 字符（约 800–1300 token），
-    /// 贴着 1024 会被 max_tokens 截断成 `Incomplete`，压缩从此永不成功。
+    /// 摘要请求的输出预算必须留出余量：预算一旦被撞顶，响应即成 `Incomplete`，
+    /// 摘要链路据此判失败，压缩永不推进（实测 4096 已不足）。
     #[tokio::test]
     async fn test_summarizer_requests_full_output_budget() {
         let capture = Arc::new(CaptureProvider {
@@ -896,8 +898,8 @@ mod tests {
             "摘要请求必须带上摘要器的输出预算"
         );
         assert_eq!(
-            SUMMARIZER_MAX_OUTPUT_TOKENS, 4096,
-            "预算须显著高于实测摘要长度，1024 会让摘要长期贴顶被截断"
+            SUMMARIZER_MAX_OUTPUT_TOKENS, 16_384,
+            "预算须显著高于实测摘要长度，贴顶会让压缩长期失败"
         );
     }
 
