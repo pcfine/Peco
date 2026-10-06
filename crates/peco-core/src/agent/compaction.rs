@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use model_provider::{ContentBlock, GenerateRequest, InputItem, ReasoningConfig, Role};
+use tracing::warn;
 
 use super::context::{estimate_item_tokens, estimate_viewable_item_tokens};
 use super::error::AgentError;
@@ -108,6 +109,15 @@ pub trait TurnSummarizer: Send + Sync {
 /// 判为失败，压缩从此永不推进。16384 与 provider 默认档一致，留足余量；
 /// 这是**上限**而非目标长度，超出提示词要求的部分照收。
 const SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 16384;
+
+/// 摘要估算 token 的上界常量 —— 配置不变量 `k_recent + Σcap ≤ T` 中的 Σcap。
+///
+/// 推导：摘要正文由摘要器以 [`SUMMARIZER_MAX_OUTPUT_TOKENS`] 的输出预算生成，
+/// 本地估算器对非 CJK 文本按 0.3 token/字符计（provider 侧纯英文约 0.25），
+/// 同一正文本地估算最坏 `ceil(16384 × 0.3 / 0.25) = 19661` ⇒ 取整抬到 20_000。
+/// 启发式上界：依赖 provider 遵守输出预算；实际 pinned 越界时只能靠观测
+/// 事后校核（守卫折叠后「装得下」的声明同时失效）。
+pub const SUMMARY_TOKEN_CAP: usize = 20_000;
 
 /// 基于 [`ModelProvider`] 的摘要器 — 复用主 Agent 的 provider，
 /// 用 Flash 档模型做低成本摘要。
@@ -265,6 +275,14 @@ pub struct CompactionPolicy {
     pub trigger_tokens: usize,
     /// 压缩后 verbatim 保留区目标 token（从最新轮往回保留）。
     pub keep_recent_tokens: usize,
+    /// viewable 守卫阈值：committed 的 viewable token 超过该值时同样触发折叠。
+    /// `None` = 关（触发只有全量口径，legacy 行为）。私有 + builder：与
+    /// keep_view 配对装配，拆开单设只会造出半开的守卫状态。
+    view_guard_tokens: Option<usize>,
+    /// viewable 保留预算：保留区累计 viewable 越过该值即停（与全量预算取更紧者）。
+    /// `None` = 关（保留只按全量口径）。配置层保证守卫开启时它落在
+    /// `[guard/4, guard)` —— 为 0 会让保留退化成「只留最新 1 轮」每边界空转。
+    keep_view_tokens: Option<usize>,
     pub summarizer: Arc<dyn TurnSummarizer>,
     /// 跨 turn 边界累计的「摘要生成失败」计数，成功后清零。
     ///
@@ -379,6 +397,8 @@ impl CompactionPolicy {
         Self {
             trigger_tokens,
             keep_recent_tokens,
+            view_guard_tokens: None,
+            keep_view_tokens: None,
             summarizer,
             consecutive_summary_failures: Arc::new(AtomicU32::new(0)),
             strip: None,
@@ -391,6 +411,17 @@ impl CompactionPolicy {
     /// 未显式装配即完全不走扫描路径。
     pub fn with_strip(mut self, strip: StripPolicy) -> Self {
         self.strip = Some(strip);
+        self
+    }
+
+    /// 装配 viewable 守卫：`0` = 关（与 env 的 `0=off` 语义一致）。
+    ///
+    /// 守卫触发与全量触发取 OR，保留区在两个预算中取更紧的约束。
+    /// 守卫不得脱离削减单独启用 —— 它不减 viewable，比全量口径更早触发
+    /// 只会升频折叠；配置层用「守卫 ⇒ 削减生效」硬约束拦截。
+    pub fn with_view_guard(mut self, view_guard_tokens: usize, keep_view_tokens: usize) -> Self {
+        self.view_guard_tokens = (view_guard_tokens > 0).then_some(view_guard_tokens);
+        self.keep_view_tokens = (keep_view_tokens > 0).then_some(keep_view_tokens);
         self
     }
 
@@ -419,25 +450,56 @@ impl CompactionPolicy {
             })
             .collect();
         let total: usize = pinned_tokens + turn_tokens.iter().sum::<usize>();
+        let turn_view_tokens: Vec<usize> = turns
+            .iter()
+            .map(|turn| {
+                turn.iter()
+                    .map(|am| estimate_viewable_item_tokens(&am.message))
+                    .sum()
+            })
+            .collect();
+        let view_total: usize = turn_view_tokens.iter().sum();
 
-        // 未超阈值 — 不压缩
-        if total <= self.trigger_tokens {
+        // 触发（OR）：全量口径超阈值，或 viewable 守卫超限（守卫关闭时恒假）
+        let triggered = total > self.trigger_tokens
+            || self
+                .view_guard_tokens
+                .is_some_and(|guard| view_total > guard);
+        if !triggered {
             return Ok(None);
         }
 
-        // 从最新轮往回累计，确定 verbatim 保留区（至少保留 1 轮）
+        // 从最新轮往回整轮累计，确定 verbatim 保留区（至少保留 1 轮）：
+        // 再加一轮会越过全量预算或 viewable 预算即停 —— 两个约束取更紧的
         let mut keep_count = 0usize;
         let mut keep_tokens = 0usize;
-        for &t in turn_tokens.iter().rev() {
-            if keep_count > 0 && keep_tokens + t > self.keep_recent_tokens {
+        let mut keep_view_tokens = 0usize;
+        for (&t, &v) in turn_tokens.iter().zip(&turn_view_tokens).rev() {
+            if keep_count > 0
+                && (keep_tokens + t > self.keep_recent_tokens
+                    || self
+                        .keep_view_tokens
+                        .is_some_and(|budget| keep_view_tokens + v > budget))
+            {
                 break;
             }
             keep_count += 1;
             keep_tokens += t;
+            keep_view_tokens += v;
         }
         let evict_count = turn_tokens.len() - keep_count;
         if evict_count == 0 {
             return Ok(None);
+        }
+
+        // 单轮超保留预算的退化态：保留区恒留该轮，折叠后残留由它而非
+        // keep_recent_tokens 支配 —— 「装得下」的上界声明要打折扣，须留痕
+        if keep_tokens > self.keep_recent_tokens {
+            warn!(
+                keep_tokens,
+                keep_recent_tokens = self.keep_recent_tokens,
+                "Single turn over retain budget; residual bound degraded"
+            );
         }
 
         // 组装被驱逐轮次的纯文本转录（每条消息截断，防止超长 tool 输出撑爆摘要请求）
@@ -550,6 +612,23 @@ impl CompactionPolicy {
                 )
             });
 
+        // 守卫条件（post-strip、pre-fold）：守卫未启用时恒假。
+        // 记录的是条件成立与否 —— 与是否真的折叠正交（单轮超窗时条件成立
+        // 但无从驱逐）
+        let guard_triggered = self
+            .view_guard_tokens
+            .is_some_and(|guard| committed_view_tokens > guard);
+
+        // 摘要越出估算上界 ⇒ 折叠后「装得下」的 token 界失效（provider 不遵守
+        // 输出预算时发生）—— 只能留痕，无从硬截断
+        if pinned_tokens > SUMMARY_TOKEN_CAP {
+            warn!(
+                pinned_tokens,
+                cap = SUMMARY_TOKEN_CAP,
+                "Pinned summary over cap; residual bound degraded"
+            );
+        }
+
         // ③ 折叠（触发口径与签名不变 —— maybe_compact 是唯一的折叠实现）
         let compaction = self.maybe_compact(session).await?;
 
@@ -558,7 +637,7 @@ impl CompactionPolicy {
             pinned_tokens,
             committed_full_tokens,
             committed_view_tokens,
-            guard_triggered: false,
+            guard_triggered,
             strip,
             strip_evaluation,
             compaction,
@@ -1615,5 +1694,247 @@ mod tests {
             let _ = s.commit_turn().unwrap();
         }
         s
+    }
+
+    // ── Phase 3：viewable 守卫、配置不变量与快照上界 ─────────────────
+
+    /// 恰好估算为 `t` token 的 CJK 文本 —— 估算按 0.6 token/字符，
+    /// 取 `floor(t / 0.6)` 个字符使 `ceil(字符数 × 0.6) == t`。
+    fn cjk_tokens(t: usize) -> String {
+        "汉".repeat((t as f64 / 0.6).floor() as usize)
+    }
+
+    /// 推进一轮：User 文本计入 viewable；可选 reasoning 只撑大全量口径
+    /// （r = f̄/v̄ 由此配比构造）。
+    fn push_view_turn(session: &mut Session, view_tokens: usize, extra_tokens: usize) {
+        session.start_turn(cjk_tokens(view_tokens).into()).unwrap();
+        if extra_tokens > 0 {
+            session
+                .stage_item(
+                    MessageSource::ModelGeneration,
+                    InputItem::Reasoning {
+                        content: cjk_tokens(extra_tokens),
+                    },
+                )
+                .unwrap();
+        }
+        let _ = session.commit_turn().unwrap();
+    }
+
+    /// Σcap 必须罩住摘要器的输出预算：按本地估算最坏放大（0.3/0.25 = 1.2）
+    /// 取整后的值击穿 Σcap，则 `k_recent + Σcap ≤ T` 对真实 pinned 失效。
+    #[test]
+    fn test_summary_token_cap_covers_summarizer_budget() {
+        assert!(
+            SUMMARY_TOKEN_CAP * 5 >= SUMMARIZER_MAX_OUTPUT_TOKENS as usize * 6,
+            "Σcap 必须 ≥ 输出预算 × 1.2（本地估算最坏放大）"
+        );
+        assert!(
+            SUMMARY_TOKEN_CAP >= SUMMARIZER_MAX_OUTPUT_TOKENS as usize,
+            "Σcap 不得低于摘要器输出预算本身"
+        );
+    }
+
+    /// I5-residual：每次折叠之后 `pinned + F ≤ T`。
+    ///
+    /// 折叠不连续 —— 折叠后残留受保留循环支配，需再累积多个边界才二次触发，
+    /// 故循环推进到累计 3 次折叠（上界防死循环），逐次断言残留。
+    #[tokio::test]
+    async fn test_i5_residual_holds_after_every_fold() {
+        const T: usize = 100_000;
+        const K_RECENT: usize = 10_000;
+        const F_TURN: usize = 10_000;
+        const FOLDS_TARGET: usize = 3;
+        const BOUNDARY_CAP: usize = 40;
+
+        // V1′（参数自检）：Σcap + k_recent ≤ T —— 折叠残留「装得下」的前提
+        const { assert!(K_RECENT + SUMMARY_TOKEN_CAP <= T) };
+
+        let policy = CompactionPolicy::new(T, K_RECENT, Arc::new(MockSummarizer));
+        let mut session = Session::new("test".to_string(), "test".to_string());
+        let mut folds = 0usize;
+
+        for boundary in 1..=BOUNDARY_CAP {
+            push_view_turn(&mut session, F_TURN, 0);
+            let r = policy.apply_boundary(&mut session).await.unwrap();
+            if !r.folded() {
+                continue;
+            }
+            folds += 1;
+            let pinned = session
+                .pinned_summary()
+                .map(|am| estimate_item_tokens(&am.message))
+                .unwrap_or(0);
+            let full: usize = session
+                .committed_turns()
+                .iter()
+                .flatten()
+                .map(|am| estimate_item_tokens(&am.message))
+                .sum();
+            assert!(
+                pinned + full <= T,
+                "I5-residual：边界 {boundary} 折叠后 pinned({pinned}) + F({full}) 必须 ≤ T({T})"
+            );
+            if folds == FOLDS_TARGET {
+                break;
+            }
+        }
+        assert_eq!(
+            folds, FOLDS_TARGET,
+            "{BOUNDARY_CAP} 个边界内必须累计 {FOLDS_TARGET} 次折叠"
+        );
+    }
+
+    /// I5-snapshot：每边界（commit 后、fold 前）`pinned + F ≤ T + f_最新轮`。
+    ///
+    /// `r = f̄/v̄ ∈ {1,3,10}` 参数化 —— reasoning 撑大全量而不进 viewable，
+    /// 触发超冲时 `f_最新轮` 差异最大，界式必须对三种配比同成立。
+    #[tokio::test]
+    async fn test_i5_snapshot_bound_at_trigger_overshoot() {
+        const T: usize = 100_000;
+        const K_RECENT: usize = 30_000;
+        const VIEW_TURN: usize = 5_000;
+
+        for ratio in [1usize, 3, 10] {
+            let policy = CompactionPolicy::new(T, K_RECENT, Arc::new(MockSummarizer));
+            let mut session = Session::new("test".to_string(), "test".to_string());
+            let mut saw_trigger = false;
+            let mut saw_fold = false;
+
+            for boundary in 1..=30u32 {
+                push_view_turn(&mut session, VIEW_TURN, VIEW_TURN * (ratio - 1));
+                let f_latest: usize = session
+                    .committed_turns()
+                    .last()
+                    .expect("刚 commit 的轮必在")
+                    .iter()
+                    .map(|am| estimate_item_tokens(&am.message))
+                    .sum();
+                let r = policy.apply_boundary(&mut session).await.unwrap();
+                let pre = r.pinned_tokens + r.committed_full_tokens;
+                assert!(
+                    pre <= T + f_latest,
+                    "r={ratio} 边界 {boundary}：pre-fold {pre} 必须 ≤ T + f_latest = {}",
+                    T + f_latest
+                );
+                saw_trigger |= pre > T;
+                saw_fold |= r.folded();
+                if saw_trigger && saw_fold {
+                    break;
+                }
+            }
+            assert!(saw_trigger, "r={ratio} 必须推进到触发超冲边界");
+            assert!(saw_fold, "r={ratio} 触发超冲后必须发生折叠");
+        }
+    }
+
+    /// 守卫触发结算：条件 = committed viewable 超限，与是否折叠正交；
+    /// 守卫未启用时恒假（legacy 观测不变）。
+    #[tokio::test]
+    async fn test_apply_boundary_guard_triggered_tracks_view_over_guard() {
+        let guard = 1_000usize;
+        let policy = CompactionPolicy::new(usize::MAX, 500, Arc::new(MockSummarizer))
+            .with_view_guard(guard, guard / 2);
+
+        // view > guard：条件成立；单轮无从驱逐 ⇒ 不折叠
+        let mut over = Session::new("test".to_string(), "test".to_string());
+        push_view_turn(&mut over, guard + 100, 0);
+        let r = policy.apply_boundary(&mut over).await.unwrap();
+        assert!(r.guard_triggered, "view 超限必须记为守卫触发");
+        assert!(!r.folded(), "单轮死区：条件成立但 keep_count == len");
+
+        // view ≤ guard：条件不成立
+        let mut under = Session::new("test".to_string(), "test".to_string());
+        push_view_turn(&mut under, guard - 100, 0);
+        let r = policy.apply_boundary(&mut under).await.unwrap();
+        assert!(!r.guard_triggered);
+        assert!(!r.folded());
+
+        // 守卫关闭（0 = off）：与不装配行为一致，恒假
+        let off =
+            CompactionPolicy::new(usize::MAX, 500, Arc::new(MockSummarizer)).with_view_guard(0, 0);
+        let mut legacy = Session::new("test".to_string(), "test".to_string());
+        push_view_turn(&mut legacy, guard * 2, 0);
+        let r = off.apply_boundary(&mut legacy).await.unwrap();
+        assert!(!r.guard_triggered, "守卫关闭时触发口径与 legacy 一致");
+        assert!(!r.folded());
+    }
+
+    /// 死区机理（单轮）：保留循环恒留最新轮 ⇒ `evict_count == 0`，
+    /// 超窗轮无从折叠 —— `maybe_compact` 返回 `Ok(None)`。
+    #[tokio::test]
+    async fn test_guard_single_overwindow_turn_yields_no_fold() {
+        let guard = 1_000usize;
+        let policy = CompactionPolicy::new(usize::MAX, 500, Arc::new(MockSummarizer))
+            .with_view_guard(guard, guard / 2);
+        let mut session = Session::new("test".to_string(), "test".to_string());
+        push_view_turn(&mut session, guard + 100, 0);
+
+        assert!(
+            policy.maybe_compact(&mut session).await.unwrap().is_none(),
+            "单轮：keep_count == len == 1 ⇒ evict_count = 0"
+        );
+        assert_eq!(session.committed_turns().len(), 1);
+    }
+
+    /// 死区机理（多轮）：折叠驱逐更早轮，但超窗的最新轮被恒保留 ——
+    /// 该轮折叠后仍在 committed、仍超窗（有界瞬态，直到被新轮挤出保留区）。
+    #[tokio::test]
+    async fn test_guard_fold_evicts_earlier_but_keeps_overwindow_latest() {
+        let guard = 1_000usize;
+        let policy = CompactionPolicy::new(usize::MAX, 500, Arc::new(MockSummarizer))
+            .with_view_guard(guard, guard / 2);
+        let mut session = Session::new("test".to_string(), "test".to_string());
+        push_view_turn(&mut session, 500, 0);
+        push_view_turn(&mut session, guard + 100, 0);
+
+        let outcome = policy
+            .maybe_compact(&mut session)
+            .await
+            .unwrap()
+            .expect("多轮：evict_count ≥ 1 必须折叠");
+        assert!(outcome.evicted_turns >= 1);
+        let committed = session.committed_turns();
+        assert_eq!(committed.len(), 2 - outcome.evicted_turns);
+        let last_view: usize = committed
+            .last()
+            .expect("保留至少 1 轮")
+            .iter()
+            .map(|am| estimate_viewable_item_tokens(&am.message))
+            .sum();
+        assert!(
+            last_view > guard,
+            "超窗最新轮必须仍在 committed（仍在死区）"
+        );
+    }
+
+    /// 死区充分性：全部轮 view ≤ 窗口时，折叠后 viewable 总量落回窗口内。
+    #[tokio::test]
+    async fn test_guard_postfold_view_fits_window_when_turns_fit() {
+        let guard = 1_000usize;
+        let budget = guard / 2;
+        let policy = CompactionPolicy::new(usize::MAX, 500, Arc::new(MockSummarizer))
+            .with_view_guard(guard, budget);
+        let mut session = Session::new("test".to_string(), "test".to_string());
+        for _ in 0..3 {
+            push_view_turn(&mut session, 400, 0);
+        }
+
+        let outcome = policy
+            .maybe_compact(&mut session)
+            .await
+            .unwrap()
+            .expect("V = 1200 > guard = 1000 必须触发折叠");
+        assert!(outcome.evicted_turns >= 1);
+        let view: usize = session
+            .committed_turns()
+            .iter()
+            .flatten()
+            .map(|am| estimate_viewable_item_tokens(&am.message))
+            .sum();
+        assert!(
+            view <= guard,
+            "全部轮 fit 时折叠后 V'({view}) 必须 ≤ 窗口({guard})"
+        );
     }
 }

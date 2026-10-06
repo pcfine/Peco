@@ -14,12 +14,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use peco_agents::BuiltinTemplate;
 use peco_core::agent::{CompactionPolicy, ModelSummarizer, StripPolicy, TurnSummarizer};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
-use super::config::PecoConfig;
+use super::config::{PecoConfig, claim_compaction_config_log};
 use super::environment::EnvironmentInfo;
 
 /// Peco 永续对话管理器。
@@ -84,6 +84,26 @@ impl PecoManager {
             config.summarizer_model.clone(),
         ));
         let mut config = config;
+        // 配置不变量校验：违规值就地钳制（每请求必生效 —— 钳后值就是下方
+        // policy 的入参）；清单只进日志，经 OnceLock 每进程只打一次
+        let violations = config.validate_compaction();
+        if !violations.is_empty() && claim_compaction_config_log() {
+            for v in violations {
+                if v.is_error {
+                    error!(
+                        invariant = v.invariant,
+                        detail = %v.detail,
+                        "Compaction config invariant violated; clamped"
+                    );
+                } else {
+                    warn!(
+                        invariant = v.invariant,
+                        detail = %v.detail,
+                        "Compaction config invariant at risk"
+                    );
+                }
+            }
+        }
         config.epilogue = Some(Arc::clone(&summarizer));
         let mut policy = CompactionPolicy::new(
             config.compaction_trigger_tokens,
@@ -101,6 +121,12 @@ impl PecoManager {
                 enforce: config.strip.enforce,
             });
         }
+        // viewable 守卫：0 = 关（builder 内部映射为 None）；校验已保证
+        // 「守卫 ⇒ 削减生效」（V7），默认配置下触发口径与 legacy 一致
+        policy = policy.with_view_guard(
+            config.strip.view_guard_tokens,
+            config.strip.keep_view_tokens,
+        );
         config.compaction = Some(Arc::new(policy));
 
         // ── 5.5 记忆双路径（写 hook + 读 dynamic_context）────────────────
