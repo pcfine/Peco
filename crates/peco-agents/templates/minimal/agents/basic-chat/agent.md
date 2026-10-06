@@ -2,10 +2,12 @@
 agent:
   name: "basic-chat"
   description: "基础对话 Agent — 轻量对话，无知识库，无记忆"
+template_version: 1
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
   temperature: 0.7
+  max_tokens: 32768
   stream: true
 tools:
   - shell

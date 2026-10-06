@@ -171,3 +171,59 @@ fn memory_templates_declare_graph_delete_tools() {
         }
     }
 }
+
+/// 解析 agent.md frontmatter 的 `llm:` 块中的 `max_tokens:` 值。
+fn frontmatter_llm_max_tokens(path: &Path) -> Option<u64> {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let mut lines = content.lines();
+    assert_eq!(
+        lines.next().map(str::trim_end),
+        Some("---"),
+        "{} must open with frontmatter ---",
+        path.display()
+    );
+
+    let mut in_llm = false;
+    for line in lines {
+        if line.trim_end() == "---" {
+            break; // frontmatter 结束
+        }
+        if line.starts_with("llm:") {
+            in_llm = true;
+            continue;
+        }
+        if !in_llm {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("  ") {
+            // 仍在 llm 块内（两空格缩进）
+            if let Some(v) = rest.trim().strip_prefix("max_tokens:") {
+                return v.trim().parse::<u64>().ok();
+            }
+        } else if !line.trim().is_empty() {
+            in_llm = false; // 顶格 → 离开 llm 块
+        }
+    }
+    None
+}
+
+/// 防漂移：所有模板 agent.md 必须显式声明 `llm.max_tokens`——
+/// 落到服务端默认（约 4096）时，推理 token 与可见输出共用预算必然截断。
+#[test]
+fn template_agents_declare_explicit_max_tokens() {
+    const FLOOR: u64 = 16_384;
+    for md in all_template_agents() {
+        match frontmatter_llm_max_tokens(&md) {
+            None => panic!(
+                "{} does not declare llm.max_tokens — requests fall back to the server default (~4096)",
+                md.display()
+            ),
+            Some(v) => assert!(
+                v >= FLOOR,
+                "{} declares llm.max_tokens = {v}, below the {FLOOR} floor",
+                md.display()
+            ),
+        }
+    }
+}

@@ -2,11 +2,12 @@
 agent:
   name: "@assistant"
   description: "Peco — 工作空间的灵魂。我能创建和管理 Agent、Skill、Workflow、MCP、Knowledge Base，持续演化自己的能力边界。"
-template_version: 4
+template_version: 5
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
   temperature: 0.3
+  max_tokens: 393216
   stream: true
   reasoning_effort: "high"
 tools:

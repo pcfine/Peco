@@ -2,11 +2,12 @@
 agent:
   name: "@memory"
   description: "记忆管理 Agent — 在私人知识库中检索、存储、整理个人记忆"
-template_version: 5
+template_version: 6
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
   temperature: 0.1
+  max_tokens: 32768
   stream: false
 tools:
   - search_knowledge
