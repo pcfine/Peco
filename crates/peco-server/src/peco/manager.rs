@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use peco_agents::BuiltinTemplate;
-use peco_core::agent::{CompactionPolicy, ModelSummarizer, TurnSummarizer};
+use peco_core::agent::{CompactionPolicy, ModelSummarizer, StripPolicy, TurnSummarizer};
 use tracing::{debug, warn};
 
 use crate::error::ApiError;
@@ -85,11 +85,21 @@ impl PecoManager {
         ));
         let mut config = config;
         config.epilogue = Some(Arc::clone(&summarizer));
-        config.compaction = Some(Arc::new(CompactionPolicy::new(
+        let mut policy = CompactionPolicy::new(
             config.compaction_trigger_tokens,
             config.compaction_keep_recent_tokens,
             summarizer,
-        )));
+        );
+        // shadow 观测 gate：开启时装配削减策略（只评估不改写），
+        // 关闭时不扫描 —— 压缩路径与引入观测前逐字节一致
+        if config.strip.shadow {
+            policy = policy.with_strip(StripPolicy {
+                keep_recent_turns: config.strip.keep_recent_turns,
+                strip_reasoning: config.strip.strip_reasoning,
+                strip_tool_args: config.strip.strip_tool_args,
+            });
+        }
+        config.compaction = Some(Arc::new(policy));
 
         // ── 5.5 记忆双路径（写 hook + 读 dynamic_context）────────────────
         //
@@ -119,8 +129,9 @@ impl PecoManager {
             )));
         }
 
-        // ── 5.6 压缩日志钩子 ──────────────────────────────────────────────
-        //   每次滚动压缩成功后追加 peco_compaction_log 记录。
+        // ── 5.6 压缩日志钩子 + 边界观测钩子 ──────────────────────────────
+        //   折叠写 peco_compaction_log；每个边界写一行 peco_context_shadow
+        //   （gate 关时钩子首行返回，等价于未装配）。
         config
             .hooks
             .push(Arc::new(super::metrics::CompactionMetricsHook::new(
@@ -128,12 +139,27 @@ impl PecoManager {
                 user_id,
                 super::session::private_session_id(user_id),
             )));
+        config
+            .hooks
+            .push(Arc::new(super::metrics::ContextShadowHook::new(
+                state.db.clone(),
+                user_id,
+                super::session::private_session_id(user_id),
+                config.history_token_budget,
+                config.strip.shadow,
+            )));
 
         // ── 5.7 启动通道：每用户一次对账 + 每进程一次保留期清理 ─────────
         //
         // PecoManager 每次流连接都新建，两个静态闸门保证对账按用户、清理按
         // 进程各只跑一次；均为 fire-and-forget spawn，失败只记日志，不阻塞建连。
-        startup_housekeeping(&state.db, ws.knowledge_manager(), &config.memory, user_id);
+        startup_housekeeping(
+            &state.db,
+            ws.knowledge_manager(),
+            &config.memory,
+            &config.strip,
+            user_id,
+        );
 
         // ── 6. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
         //
@@ -226,7 +252,7 @@ static STARTUP_RECONCILED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 /// 进程级启动保留期清理闸门 —— 每进程一次。
 static STARTUP_PURGE: OnceLock<()> = OnceLock::new();
 
-/// 启动通道：未收口取代意图的对账 + 三表保留期清理。
+/// 启动通道：未收口取代意图的对账 + 四表保留期清理。
 ///
 /// 不依赖 `memory.enabled`：开关关闭时历史上开门期写入的 intent 仍需收口。
 /// 守卫判重抽成独立函数（[`claim_startup_reconcile`] / [`claim_startup_purge`]），
@@ -235,6 +261,7 @@ fn startup_housekeeping(
     db: &sqlx::SqlitePool,
     km: &Arc<peco_core::knowledge::KnowledgeManager>,
     memory: &super::memory::MemoryConfig,
+    strip: &super::config::CompactionStripConfig,
     user_id: &str,
 ) {
     if claim_startup_reconcile(user_id) {
@@ -249,7 +276,8 @@ fn startup_housekeeping(
     if claim_startup_purge() {
         let db = db.clone();
         let memory = memory.clone();
-        tokio::spawn(async move { purge_expired(&db, &memory).await });
+        let strip = strip.clone();
+        tokio::spawn(async move { purge_expired(&db, &memory, &strip).await });
     }
 }
 
@@ -268,10 +296,15 @@ fn claim_startup_purge() -> bool {
     STARTUP_PURGE.set(()).is_ok()
 }
 
-/// 三表保留期清理（启动通道）：intent 按 done / failed+cancelled 分档，
-/// shadow 单档，audit 按 reason 分档（superseded 独立档，pending 永不清）。
-/// 任一失败仅记日志 —— 清理非致命，下个进程周期重试。
-async fn purge_expired(db: &sqlx::SqlitePool, memory: &super::memory::MemoryConfig) {
+/// 四表保留期清理（启动通道）：intent 按 done / failed+cancelled 分档，
+/// shadow 单档，audit 按 reason 分档（superseded 独立档，pending 永不清），
+/// 边界观测按 strip 保留期单档。任一失败仅记日志 —— 清理非致命，
+/// 下个进程周期重试。
+async fn purge_expired(
+    db: &sqlx::SqlitePool,
+    memory: &super::memory::MemoryConfig,
+    strip: &super::config::CompactionStripConfig,
+) {
     let cutoff =
         |days: u64| (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
 
@@ -308,6 +341,12 @@ async fn purge_expired(db: &sqlx::SqlitePool, memory: &super::memory::MemoryConf
     {
         Ok(n) if n > 0 => debug!(purged = n, "Memory audit rows purged"),
         Err(e) => warn!("memory audit purge failed; {e}"),
+        _ => {}
+    }
+
+    match crate::db::context_shadow::purge_older_than(db, &cutoff(strip.retention_days)).await {
+        Ok(n) if n > 0 => debug!(purged = n, "Context shadow rows purged"),
+        Err(e) => warn!("context shadow purge failed; {e}"),
         _ => {}
     }
 }
@@ -417,6 +456,39 @@ mod tests {
         }
     }
 
+    /// 插入一条边界观测行（最小列集，其余列走 NOT NULL 默认之外的显式 0）。
+    async fn put_context_shadow(pool: &sqlx::SqlitePool, id: &str, ts: &str) {
+        crate::db::context_shadow::insert(
+            pool,
+            &crate::db::context_shadow::ContextShadowRow {
+                id: id.to_string(),
+                user_id: "purge-user".to_string(),
+                conversation_id: "purge-user-private-session".to_string(),
+                turn_index: 3,
+                created_at: ts.to_string(),
+                trigger_caliber: "full".to_string(),
+                pinned_tokens: 0,
+                committed_full_tokens: 0,
+                committed_view_tokens: 0,
+                view_window_tokens: 0,
+                fold_triggered: 0,
+                evicted_turns: None,
+                guard_triggered: 0,
+                strip_evaluated: 1,
+                strip_enforced: 0,
+                stripped_items: 0,
+                released_tokens: 0,
+                tool_output_items: 0,
+                tool_output_over_cap: 0,
+                image_output_items: 0,
+                image_base64_bytes: 0,
+                snapshot_json_bytes: 0,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn startup_purge_expired_rows_by_tier() {
         let dir = tempfile::tempdir().unwrap();
@@ -462,7 +534,16 @@ mod tests {
         )
         .await;
 
-        purge_expired(&pool, &crate::peco::memory::MemoryConfig::default()).await;
+        // 边界观测：超 30d 清、新鲜保留
+        put_context_shadow(&pool, "cs-old", &days_ago(31)).await;
+        put_context_shadow(&pool, "cs-new", &days_ago(1)).await;
+
+        purge_expired(
+            &pool,
+            &crate::peco::memory::MemoryConfig::default(),
+            &crate::peco::config::CompactionStripConfig::default(),
+        )
+        .await;
 
         let intents: Vec<String> = sqlx::query_scalar(
             "SELECT new_doc_id FROM memory_supersede_intent ORDER BY new_doc_id",
@@ -484,5 +565,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(audits, ["a-other-old", "a-sup-pending"]);
+
+        let shadows: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM peco_context_shadow ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(shadows, ["cs-new"], "超期边界观测行应被清理");
     }
 }

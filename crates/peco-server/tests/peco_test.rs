@@ -203,6 +203,14 @@ async fn test_session_snapshot_includes_context_metrics() {
     assert_eq!(metrics["compaction_trigger_tokens"], 384_000);
     // 尚无压缩发生
     assert_eq!(metrics["compaction_count"], 0);
+    // viewable 拆分字段：V + (F − V) == F − P（同遍计算的恒等式）
+    let backlog = metrics["viewable_backlog_tokens"].as_u64().unwrap();
+    let non_viewable = metrics["non_viewable_tokens"].as_u64().unwrap();
+    assert!(backlog > 0);
+    assert_eq!(
+        backlog + non_viewable,
+        total - metrics["pinned_summary_tokens"].as_u64().unwrap()
+    );
 }
 
 #[tokio::test]
@@ -437,6 +445,12 @@ async fn test_session_metrics_endpoint_returns_metrics_without_turns() {
     assert!(!metrics.is_null());
     assert_eq!(metrics["compaction_count"], 0);
     assert!(metrics["estimated_total_tokens"].as_u64().unwrap() > 0);
+    // 恒等式在轻量端点同样成立（共用 compute_context_metrics）
+    let total = metrics["estimated_total_tokens"].as_u64().unwrap();
+    let pinned = metrics["pinned_summary_tokens"].as_u64().unwrap();
+    let backlog = metrics["viewable_backlog_tokens"].as_u64().unwrap();
+    let non_viewable = metrics["non_viewable_tokens"].as_u64().unwrap();
+    assert_eq!(backlog + non_viewable, total - pinned);
 }
 
 #[tokio::test]

@@ -362,6 +362,30 @@ pub fn estimate_item_tokens(item: &InputItem) -> usize {
     estimate_str_tokens(&input_item_text(item))
 }
 
+/// 条目是否属于「viewable」—— 模型历史中真正可见的对话文本（User / Assistant 消息）。
+///
+/// 工具调用、工具输出与 reasoning 对模型历史不可见（模型不重发它们、摘要转录
+/// 跳过 reasoning、记忆提取只取对话文本），三方共用此谓词 —— 各自实现会随
+/// 协议演进漂移，口径一旦分叉，"无损削减"的前提就不成立了。
+pub fn is_viewable_item(item: &InputItem) -> bool {
+    matches!(
+        item,
+        InputItem::Message {
+            role: Role::User | Role::Assistant,
+            ..
+        }
+    )
+}
+
+/// viewable 条目的估算 token；非 viewable 条目恒为 0。
+pub fn estimate_viewable_item_tokens(item: &InputItem) -> usize {
+    if is_viewable_item(item) {
+        estimate_item_tokens(item)
+    } else {
+        0
+    }
+}
+
 /// 按「字符数」估算 token（同 [`estimate_item_tokens`] 的权重规则）。
 pub fn estimate_str_tokens(s: &str) -> usize {
     let mut cjk = 0usize;
@@ -615,5 +639,56 @@ mod tests {
             },
         ]));
         assert_eq!(estimate_tokens(&[parts_msg]), estimate_str_tokens(joined));
+    }
+
+    #[test]
+    fn test_viewable_predicate_and_image_parts_estimate() {
+        // viewable 谓词：只有 User / Assistant 的 Message 进入模型历史，
+        // 其余（reasoning / 工具调用与输出 / System）估算恒 0
+        assert!(is_viewable_item(&user("hi")));
+        assert!(is_viewable_item(&assistant("hi")));
+        assert!(!is_viewable_item(&InputItem::Reasoning {
+            content: "thinking".to_string(),
+        }));
+        assert!(!is_viewable_item(&InputItem::FunctionCall {
+            call_id: "c1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        }));
+        assert!(!is_viewable_item(&InputItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: "result".into(),
+        }));
+        assert_eq!(
+            estimate_viewable_item_tokens(&InputItem::Reasoning {
+                content: "thinking".to_string(),
+            }),
+            0
+        );
+
+        // 含图 Parts 与同文本 Text 的 token 估算相等（图片部件不产生 token），
+        // 但序列化字节更大 —— 观测表记字节、口径记 token，两者互补
+        let data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==".to_string();
+        let with_image = user(Content::Parts(vec![
+            ContentPart::Text {
+                text: "第一段".to_string(),
+            },
+            ContentPart::Image {
+                url: data_uri,
+                detail: None,
+            },
+            ContentPart::Text {
+                text: "第二段".to_string(),
+            },
+        ]));
+        let text_only = user("第一段\n第二段");
+        assert_eq!(
+            estimate_item_tokens(&with_image),
+            estimate_item_tokens(&text_only)
+        );
+        assert!(
+            serde_json::to_string(&with_image).unwrap().len()
+                > serde_json::to_string(&text_only).unwrap().len()
+        );
     }
 }

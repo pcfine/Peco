@@ -21,9 +21,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use model_provider::{ContentBlock, GenerateRequest, InputItem, ReasoningConfig, Role};
 
-use super::context::estimate_item_tokens;
+use super::context::{estimate_item_tokens, estimate_viewable_item_tokens};
 use super::error::AgentError;
-use crate::session::Session;
+pub use crate::session::StripEvaluation;
+use crate::session::{Session, StripCaps};
 
 /// 摘要定界标签 — pinned 消息的 content 恒被包裹其中，
 /// 合并时可据此剥离旧摘要的包装。
@@ -272,6 +273,8 @@ pub struct CompactionPolicy {
     /// 每个副本都从 0 开始，阈值永远够不着。私有字段：计数是策略内部状态，
     /// 调用方只能经 [`CompactionPolicy::new`] 构造（初始恒为 0）。
     consecutive_summary_failures: Arc<AtomicU32>,
+    /// 历史削减策略；`None` = 不扫描不改写（legacy 行为）。
+    strip: Option<StripPolicy>,
 }
 
 /// 一次压缩的结果。
@@ -292,6 +295,68 @@ pub struct CompactionOutcome {
     pub degraded: bool,
 }
 
+/// 一个 turn 边界的观测结算：token 口径、削减评估、折叠载荷的内存态汇总。
+///
+/// 不进快照 —— 观测数据由边界钩子送往服务端落库，会话本体只关心内容本身
+/// （加进快照就等于给持久化格式加字段，旧快照兼容成本全部转嫁给读侧）。
+#[derive(Debug, Clone)]
+pub struct BoundaryReduction {
+    /// 本边界的 turn 计数（历史累计，压缩不回退）。
+    pub turn_index: usize,
+    /// pinned 摘要估算 token（post-strip、pre-fold —— 即触发判定所见）。
+    pub pinned_tokens: usize,
+    /// 全部 committed 轮的全量估算 token（含 tool 输出与 reasoning，折叠触发口径）。
+    pub committed_full_tokens: usize,
+    /// 全部 committed 轮的 viewable 估算 token（非过滤窗口口径，观测用）。
+    pub committed_view_tokens: usize,
+    /// 本边界是否由 viewable 守卫触发（守卫未启用时恒假）。
+    pub guard_triggered: bool,
+    /// 削减评估值（只算不做）；未装配削减策略时为 `None`。
+    pub strip_evaluation: Option<StripEvaluation>,
+    /// 折叠载荷；未触发折叠时为 `None`。
+    pub compaction: Option<CompactionOutcome>,
+}
+
+impl BoundaryReduction {
+    /// 本边界是否发生了折叠（轮次被物理驱逐）。
+    pub fn folded(&self) -> bool {
+        self.compaction.is_some()
+    }
+
+    /// 本边界是否需要落盘 —— 只看**生效**值。
+    ///
+    /// 评估值（shadow 观测）不改任何会话内容，为其落盘纯属浪费 IO；
+    /// 折叠改变了 committed 与 pinned，必须落盘。
+    pub fn mutated(&self) -> bool {
+        self.compaction.is_some()
+    }
+}
+
+/// 历史削减（strip）参数 —— 与折叠正交的机械内容削减，边界上先削后折。
+///
+/// 削减对象是「模型永不重发、摘要也永不读取」的内容（历史 reasoning、工具调用
+/// 参数），削减让全量口径变轻从而降低折叠频率。评估与生效共用
+/// [`Session::strip_stale_content`] 的同一份扫描。未装配（`None`）时行为
+/// 与不引入削减的版本逐字节一致。
+#[derive(Debug, Clone)]
+pub struct StripPolicy {
+    /// 最近 N 轮已完成对话不参与削减 —— UI 默认页可见区恒无损。
+    pub keep_recent_turns: usize,
+    /// 删除历史 reasoning 条目。
+    pub strip_reasoning: bool,
+    /// 清空历史工具调用参数。
+    pub strip_tool_args: bool,
+}
+
+impl StripPolicy {
+    fn caps(&self) -> StripCaps {
+        StripCaps {
+            strip_reasoning: self.strip_reasoning,
+            strip_tool_args: self.strip_tool_args,
+        }
+    }
+}
+
 impl CompactionPolicy {
     pub fn new(
         trigger_tokens: usize,
@@ -303,7 +368,17 @@ impl CompactionPolicy {
             keep_recent_tokens,
             summarizer,
             consecutive_summary_failures: Arc::new(AtomicU32::new(0)),
+            strip: None,
         }
+    }
+
+    /// 装配历史削减：每个 turn 边界在折叠前先跑削减扫描。
+    ///
+    /// builder 而非改 `new` 签名 —— 既有调用点与测试不关心削减，
+    /// 未显式装配即完全不走扫描路径。
+    pub fn with_strip(mut self, strip: StripPolicy) -> Self {
+        self.strip = Some(strip);
+        self
     }
 
     /// 在 turn 边界检查并执行压缩（若有必要）。
@@ -412,6 +487,60 @@ impl CompactionPolicy {
             degraded,
         }))
     }
+
+    /// turn 边界编排入口：削减扫描 → 结算 token 口径 → 折叠。
+    ///
+    /// 返回观测结算与折叠载荷，调用方按 [`BoundaryReduction::mutated`] 决定
+    /// 落盘、按 `compaction` / `strip_evaluation` 分别通知钩子 —— 编排留在
+    /// core 一处，服务端只消费结果，口径不可能在两端各算一遍。
+    ///
+    /// 折叠失败按非致命上抛（`Err`），由调用方 `match` 记日志后继续 ——
+    /// 此处不用 `?` 向 looper 冒泡是有意的既有契约。
+    pub async fn apply_boundary(
+        &self,
+        session: &mut Session,
+    ) -> Result<BoundaryReduction, AgentError> {
+        // ① 削减扫描（先削后折：结算口径必须等于折叠触发所见）
+        let strip_evaluation = match &self.strip {
+            Some(strip) => Some(
+                session
+                    .strip_stale_content(strip.keep_recent_turns, strip.caps())
+                    .map_err(|e| {
+                        AgentError::Compaction(format!("strip stale content failed: {e}"))
+                    })?,
+            ),
+            None => None,
+        };
+
+        // ② 结算 token 口径（post-strip、pre-fold）
+        let pinned_tokens = session
+            .pinned_summary()
+            .map(|am| estimate_item_tokens(&am.message))
+            .unwrap_or(0);
+        let (committed_full_tokens, committed_view_tokens) = session
+            .committed_turns()
+            .iter()
+            .flat_map(|turn| turn.iter())
+            .fold((0usize, 0usize), |(full, view), am| {
+                (
+                    full + estimate_item_tokens(&am.message),
+                    view + estimate_viewable_item_tokens(&am.message),
+                )
+            });
+
+        // ③ 折叠（触发口径与签名不变 —— maybe_compact 是唯一的折叠实现）
+        let compaction = self.maybe_compact(session).await?;
+
+        Ok(BoundaryReduction {
+            turn_index: session.turn_index(),
+            pinned_tokens,
+            committed_full_tokens,
+            committed_view_tokens,
+            guard_triggered: false,
+            strip_evaluation,
+            compaction,
+        })
+    }
 }
 
 /// 机械摘要：摘要模型连续失败时，以被驱逐转录的前 [`DEGRADED_SUMMARY_MAX_CHARS`]
@@ -430,7 +559,10 @@ fn degraded_summary(transcript: &str, failures: u32) -> String {
 }
 
 /// 单条消息在转录中的最大字符数。
-const TRANSCRIPT_ITEM_MAX_CHARS: usize = 2000;
+///
+/// pub：服务端 shadow 观测以它为「单条输出是否超转录上限」的判据 ——
+/// 观测口径与转录实现必须是同一个数，各自定义一个 2000 迟早漂移。
+pub const TRANSCRIPT_ITEM_MAX_CHARS: usize = 2000;
 /// 整份转录的最大字符数（防止摘要请求本身超限）。
 const TRANSCRIPT_MAX_CHARS: usize = 60_000;
 
@@ -1090,5 +1222,130 @@ mod tests {
         // 逐字符相等即证明按字符边界截断：按字节切会 panic，丢弃式解码会出替换字符
         assert_eq!(head, expected_head, "降级摘要须为转录前 N 字符的精确前缀");
         assert_eq!(head.chars().count(), DEGRADED_SUMMARY_MAX_CHARS);
+    }
+
+    // ── apply_boundary（削减评估 → 折叠 → 结算）────────────────────────
+
+    fn strip_policy(keep_recent_turns: usize) -> StripPolicy {
+        StripPolicy {
+            keep_recent_turns,
+            strip_reasoning: true,
+            strip_tool_args: true,
+        }
+    }
+
+    /// 每轮 = 用户提问 + reasoning + 助手回答 —— 评估与两口径结算的共同夹具。
+    fn make_session_with_reasoning_turns(n: usize) -> Session {
+        let mut s = Session::new("test".to_string(), "test".to_string());
+        for i in 0..n {
+            s.start_turn(format!("这是第 {i} 轮的问题，内容足够长以产生 token 占用。").into())
+                .unwrap();
+            s.stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::Reasoning {
+                    content: format!("第 {i} 轮的推理，足够长以产生 token 占用。"),
+                },
+            )
+            .unwrap();
+            s.stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::Message {
+                    role: Role::Assistant,
+                    content: format!("这是第 {i} 轮的回答，同样足够长以产生 token 占用。").into(),
+                },
+            )
+            .unwrap();
+            let _ = s.commit_turn().unwrap();
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn test_apply_boundary_evaluates_strip_without_mutation() {
+        let policy = CompactionPolicy::new(usize::MAX, 1000, Arc::new(MockSummarizer))
+            .with_strip(strip_policy(1));
+        let mut session = make_session_with_reasoning_turns(3);
+        let before = serde_json::to_string(session.committed_turns()).unwrap();
+
+        let r = policy.apply_boundary(&mut session).await.unwrap();
+
+        let eval = r.strip_evaluation.expect("装配削减策略必须产出评估值");
+        // scope = 3 − 1 = 2 轮，每轮恰 1 条 reasoning
+        assert_eq!(eval.would_change_items, 2);
+        assert!(eval.would_release_tokens > 0);
+        assert_eq!(eval.skipped_turns, 0);
+
+        assert!(r.compaction.is_none());
+        assert!(!r.folded());
+        assert!(!r.mutated(), "评估值不得触发落盘");
+        assert!(!r.guard_triggered);
+
+        // 口径与独立重算一致 — 字段漏算或重复计数在这里现形
+        let full: usize = session
+            .committed_turns()
+            .iter()
+            .flatten()
+            .map(|am| estimate_item_tokens(&am.message))
+            .sum();
+        let view: usize = session
+            .committed_turns()
+            .iter()
+            .flatten()
+            .map(|am| estimate_viewable_item_tokens(&am.message))
+            .sum();
+        assert_eq!(r.committed_full_tokens, full);
+        assert_eq!(r.committed_view_tokens, view);
+        assert!(r.committed_view_tokens <= r.committed_full_tokens);
+        assert_eq!(r.pinned_tokens, 0);
+        assert_eq!(r.turn_index, 3);
+
+        assert_eq!(
+            serde_json::to_string(session.committed_turns()).unwrap(),
+            before,
+            "评估路径不得改写会话"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_boundary_records_prefold_caliber_when_folding() {
+        // 阈值 80 必然触发折叠；口径在折叠前结算 ⇒ 记录的是触发所见
+        let policy =
+            CompactionPolicy::new(80, 40, Arc::new(MockSummarizer)).with_strip(strip_policy(1));
+        let mut session = make_session_with_reasoning_turns(4);
+
+        let r = policy.apply_boundary(&mut session).await.unwrap();
+
+        let outcome = r.compaction.as_ref().expect("超阈值必须折叠");
+        assert!(r.folded());
+        assert!(r.mutated(), "折叠必须触发落盘");
+        assert!(outcome.evicted_turns >= 1);
+        assert!(
+            r.committed_full_tokens > policy.trigger_tokens,
+            "committed_full_tokens 必须是折叠前的触发对象"
+        );
+        assert_eq!(r.pinned_tokens, 0, "口径在折叠前结算，pinned 尚未写入");
+        assert!(r.strip_evaluation.is_some(), "评估先于折叠，不受折叠影响");
+
+        // 折叠后 committed 收缩 — 反证结算发生在折叠前
+        let full_after: usize = session
+            .committed_turns()
+            .iter()
+            .flatten()
+            .map(|am| estimate_item_tokens(&am.message))
+            .sum();
+        assert!(full_after < r.committed_full_tokens);
+    }
+
+    #[tokio::test]
+    async fn test_apply_boundary_without_strip_policy_skips_scan() {
+        let policy = CompactionPolicy::new(usize::MAX, 1000, Arc::new(MockSummarizer));
+        let mut session = make_session_with_reasoning_turns(2);
+
+        let r = policy.apply_boundary(&mut session).await.unwrap();
+
+        assert!(r.strip_evaluation.is_none(), "未装配削减策略不跑扫描");
+        assert!(!r.mutated());
+        assert!(r.committed_full_tokens > 0);
+        assert!(r.committed_view_tokens > 0);
     }
 }

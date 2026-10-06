@@ -23,7 +23,7 @@ pub mod types;
 // 公共 API 导出
 pub use error::SessionError;
 pub use metadata::SessionMeta;
-pub use session::Session;
+pub use session::{Session, StripCaps, StripEvaluation};
 pub use snapshot::{SessionSnapshot, TurnBoundaryToken};
 pub use types::{
     AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, strip_merge_markers,

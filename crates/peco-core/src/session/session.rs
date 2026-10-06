@@ -18,6 +18,7 @@ use super::types::{
     AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, merge_contents,
     unix_timestamp_ms, unix_timestamp_secs,
 };
+use crate::agent::estimate_item_tokens;
 
 /// 悬空 tool_call 的合成结果文案。
 ///
@@ -27,6 +28,33 @@ use super::types::{
 /// 所以必须带 `[interrupted]` 前缀；写成中性文案会被模型当作正常工具输出继续推理。
 pub(crate) const INTERRUPTED_TOOL_OUTPUT: &str =
     "[interrupted] tool execution was interrupted before completion";
+
+/// 削减（strip）范围内的内容开关 —— 保留范围（最近几轮不动）由调用方入参携带。
+///
+/// 前置判定统一在 [`Session::strip_stale_content`] 内完成，评估（只算）与
+/// 生效（就地改写）共用同一份扫描 —— 两条路径各自判断「该不该削」必然漂移，
+/// 而漂移的后果是 shadow 观测值与真实改写不一致，观测面直接失去意义。
+#[derive(Debug, Clone, Copy)]
+pub struct StripCaps {
+    /// 删除历史 reasoning 条目（模型不重发它，摘要转录也跳过它）。
+    pub strip_reasoning: bool,
+    /// 清空历史工具调用参数（参数同样不进模型历史）。
+    pub strip_tool_args: bool,
+}
+
+/// 削减的评估值（只算不做）。
+///
+/// shadow 观测用：记录「若执行将削减多少」。生效路径复用同一扫描后产出的
+/// 计数即实际生效值，二者天然同源，不存在对不上的可能。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StripEvaluation {
+    /// 若执行将被改写的条目数（删除或清空都算改写）。
+    pub would_change_items: usize,
+    /// 若执行将释放的估算 token。
+    pub would_release_tokens: usize,
+    /// 因「削减后每轮非空」保底而整轮跳过的轮数。
+    pub skipped_turns: usize,
+}
 
 /// 会话实体。
 ///
@@ -728,6 +756,68 @@ impl Session {
         Ok(evict_count)
     }
 
+    /// 评估历史削减（strip）：统计早于最近 `keep_recent_turns` 轮的已完成轮中
+    /// 可无损移除的零价值内容。**不改写任何内容**。
+    ///
+    /// 评估与生效共用本方法的同一份扫描 —— 生效路径届时在判定命中处就地改写，
+    /// 「该削什么、跳过哪轮」不可能出现两套逻辑。评估完成后会话逐字节不变
+    /// （无 IO、不动 pinned / staging / pending / 计数器），天然幂等。
+    ///
+    /// - 仅 `Idle` 可调（同 [`Self::compact`]：运行中的会话不可改写历史）
+    /// - 若某轮将被整轮删空（仅由 reasoning 构成），整轮跳过并计入
+    ///   `skipped_turns` —— committed 轮不保证以 User 开头，「每轮非空」是
+    ///   持久化与展示的底线
+    pub fn strip_stale_content(
+        &mut self,
+        keep_recent_turns: usize,
+        caps: StripCaps,
+    ) -> Result<StripEvaluation, SessionError> {
+        if self.state != SessionState::Idle {
+            return Err(SessionError::InvalidStateTransition {
+                current_state: self.state,
+                action: "strip_stale_content".to_string(),
+            });
+        }
+
+        let mut eval = StripEvaluation::default();
+        // 只削 scope 内的旧轮：最近 keep_recent_turns 轮是 UI 默认页可见区，恒不动
+        let scope_end = self.committed.len().saturating_sub(keep_recent_turns);
+        for turn in self.committed.turns()[..scope_end].iter() {
+            if turn.is_empty() {
+                continue;
+            }
+            let mut deletions = 0usize;
+            let mut changes = 0usize;
+            let mut released = 0usize;
+            for am in turn {
+                match am.message.as_ref() {
+                    InputItem::Reasoning { .. } if caps.strip_reasoning => {
+                        deletions += 1;
+                        changes += 1;
+                        released += estimate_item_tokens(&am.message);
+                    }
+                    InputItem::FunctionCall { arguments, .. }
+                        if caps.strip_tool_args && !arguments.is_empty() =>
+                    {
+                        changes += 1;
+                        // input_item_text 对 FunctionCall 只取 arguments，清空即全释放
+                        released += estimate_item_tokens(&am.message);
+                    }
+                    _ => {}
+                }
+            }
+            // 整轮皆为待删 reasoning ⇒ 删完即空，跳过以保住「每轮非空」。
+            // 不可用 changes == len 判空：清参保留条目，changes 可等于 len 而轮非空。
+            if deletions == turn.len() {
+                eval.skipped_turns += 1;
+                continue;
+            }
+            eval.would_change_items += changes;
+            eval.would_release_tokens += released;
+        }
+        Ok(eval)
+    }
+
     // ── Pending 队列（&mut self）──────────────────────────────────────
 
     /// 将用户输入加入 pending 队列。
@@ -878,6 +968,13 @@ mod tests {
             call_id: call_id.into(),
             name: name.into(),
             arguments: "{}".to_string(),
+        }
+    }
+    fn empty_args_call(call_id: impl Into<String>, name: impl Into<String>) -> InputItem {
+        InputItem::FunctionCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: String::new(),
         }
     }
 
@@ -2111,5 +2208,141 @@ mod tests {
             MessageSource::MergedPending,
             "多条合并才是 MergedPending"
         );
+    }
+
+    // ── strip_stale_content（评估：只算不改）───────────────────────────
+
+    fn reasoning(text: &str) -> InputItem {
+        InputItem::Reasoning {
+            content: text.to_string(),
+        }
+    }
+
+    /// 由轮内容直接构造 Idle 会话（绕过 staging —— 观测历史不需要走协议校验）。
+    fn session_with_turns(turns: Vec<Vec<InputItem>>) -> Session {
+        let mut committed = Vec::new();
+        let mut id = 0u64;
+        for (ti, items) in turns.into_iter().enumerate() {
+            let turn = items
+                .into_iter()
+                .map(|item| {
+                    let am =
+                        AnnotatedMessage::new(MessageId(id), ti, item, MessageSource::UserInput);
+                    id += 1;
+                    am
+                })
+                .collect();
+            committed.push(turn);
+        }
+        let turn_index = committed.len();
+        Session::from_snapshot(
+            "strip-id".to_string(),
+            "strip test".to_string(),
+            0,
+            SessionSnapshot {
+                committed_turns: committed,
+                turn_index,
+                total_usage: Usage::default(),
+                next_message_id: id,
+                pending_inputs: Vec::new(),
+                pinned_summary: None,
+            },
+        )
+    }
+
+    const ALL_CAPS: StripCaps = StripCaps {
+        strip_reasoning: true,
+        strip_tool_args: true,
+    };
+
+    #[test]
+    fn strip_evaluation_counts_scope_and_leaves_session_untouched() {
+        // scope = 早于最近 1 轮 ⇒ 只扫 turn 0/1，turn 2 的 reasoning 不计
+        let mut s = session_with_turns(vec![
+            vec![
+                user("你好"),
+                reasoning("深入思考"),
+                function_call("c1", "shell"),
+                tool("c1", "output"),
+            ],
+            vec![
+                user("继续"),
+                reasoning("深入思考"),
+                empty_args_call("c2", "fetch"),
+            ],
+            vec![user("最新"), reasoning("不计入")],
+        ]);
+
+        let before = serde_json::to_string(s.committed_turns()).unwrap();
+        let turn_index_before = s.turn_index();
+
+        let caps = ALL_CAPS;
+        let eval = s.strip_stale_content(1, caps).unwrap();
+        // turn0：reasoning + 非空参数 FC = 2 条；turn1：reasoning（空参 FC 不算改写）= 1 条
+        assert_eq!(eval.would_change_items, 3);
+        // 深入思考 = 4 CJK → ceil(2.4) = 3；"{}" → ceil(0.6) = 1
+        assert_eq!(eval.would_release_tokens, 3 + 1 + 3);
+        assert_eq!(eval.skipped_turns, 0);
+
+        // 评估不改任何内容 —— 会话逐字节不变
+        let after = serde_json::to_string(s.committed_turns()).unwrap();
+        assert_eq!(before, after, "评估不得改写会话内容");
+        assert_eq!(s.turn_index(), turn_index_before);
+        assert!(s.is_idle());
+        // 幂等：第二次评估得到同样的值（没有可削内容变化）
+        let eval2 = s.strip_stale_content(1, caps).unwrap();
+        assert_eq!(eval2, eval);
+    }
+
+    #[test]
+    fn strip_evaluation_skips_turn_that_would_become_empty() {
+        // turn0 仅由 reasoning 构成 —— 削完即空，整轮跳过（每轮非空底线）
+        let mut s = session_with_turns(vec![
+            vec![reasoning("唯一内容"), reasoning("也是唯一")],
+            vec![user("正常轮"), assistant("正常回答")],
+        ]);
+
+        let eval = s.strip_stale_content(1, ALL_CAPS).unwrap();
+        assert_eq!(eval.skipped_turns, 1);
+        assert_eq!(eval.would_change_items, 0);
+        assert_eq!(eval.would_release_tokens, 0);
+    }
+
+    #[test]
+    fn strip_evaluation_respects_caps_and_idle_guard() {
+        let mut s = session_with_turns(vec![vec![
+            user("问"),
+            reasoning("思考"),
+            function_call("c1", "shell"),
+        ]]);
+
+        // keep_recent=1 ⇒ 唯一一轮在保留窗内，什么都不扫
+        assert_eq!(
+            s.strip_stale_content(1, ALL_CAPS).unwrap(),
+            StripEvaluation::default()
+        );
+
+        // caps 关闭后零改写
+        let off = StripCaps {
+            strip_reasoning: false,
+            strip_tool_args: false,
+        };
+        assert_eq!(
+            s.strip_stale_content(0, off).unwrap(),
+            StripEvaluation::default()
+        );
+
+        // 只开 reasoning ⇒ 只计 reasoning 一条
+        let reasoning_only = StripCaps {
+            strip_reasoning: true,
+            strip_tool_args: false,
+        };
+        let eval = s.strip_stale_content(0, reasoning_only).unwrap();
+        assert_eq!(eval.would_change_items, 1);
+
+        // 非 Idle 拒绝 —— 运行中的会话不可改写历史
+        s.start_turn("q".into()).unwrap();
+        let err = s.strip_stale_content(0, ALL_CAPS).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidStateTransition { .. }));
     }
 }

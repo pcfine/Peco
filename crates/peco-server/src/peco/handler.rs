@@ -138,6 +138,10 @@ pub struct ContextMetrics {
     /// Verbatim 预算口径：历史轮中 viewable（User/Assistant 文本）条目的估算 token，
     /// 从最新轮往回整轮计入。与 `history_token_budget` 同口径可直接比较。
     pub estimated_view_tokens: usize,
+    /// 全部 committed 轮的 viewable 之和（V，不设窗口预算）。
+    pub viewable_backlog_tokens: usize,
+    /// 非 viewable 内容（tool 输出、工具调用参数、reasoning）之和（F − V）。
+    pub non_viewable_tokens: usize,
     pub pinned_summary_tokens: usize,
     pub history_token_budget: usize,
     pub compaction_trigger_tokens: usize,
@@ -636,6 +640,8 @@ async fn compute_context_metrics(
     ContextMetrics {
         estimated_total_tokens: est.total_tokens,
         estimated_view_tokens: est.view_tokens,
+        viewable_backlog_tokens: est.viewable_backlog_tokens,
+        non_viewable_tokens: est.non_viewable_tokens,
         pinned_summary_tokens: est.pinned_tokens,
         history_token_budget: peco_config.history_token_budget,
         compaction_trigger_tokens: peco_config.compaction_trigger_tokens,

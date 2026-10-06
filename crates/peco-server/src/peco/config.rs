@@ -47,6 +47,8 @@ pub struct PecoConfig {
     /// 撞上 `max_iterations` 时合成的收尾报告共用同一个模型 —— 两者都是「读一遍既有
     /// 内容、产出短文本」的元任务，只是提示词不同。
     pub summarizer_model: String,
+    /// 历史削减（strip）与边界观测配置。
+    pub strip: CompactionStripConfig,
     /// 记忆双路径配置（写路径提取 hook + 读路径召回）。
     pub memory: MemoryConfig,
     /// 统一重发上限（`0` = 关闭）。见 `LooperConfig::retry_limit`。
@@ -97,6 +99,50 @@ pub const ENV_COMPACTION_TRIGGER_TOKENS: &str = "PECO_COMPACTION_TRIGGER_TOKENS"
 /// 压缩后 verbatim 保留区目标（见 [`PecoConfig::compaction_keep_recent_tokens`]）。
 pub const ENV_COMPACTION_KEEP_RECENT_TOKENS: &str = "PECO_COMPACTION_KEEP_RECENT_TOKENS";
 
+// ── 历史削减（strip）与边界观测的环境变量入口 ─────────────────
+
+/// shadow 观测开关（见 [`CompactionStripConfig::shadow`]）。
+pub const ENV_COMPACTION_STRIP_SHADOW: &str = "PECO_COMPACTION_STRIP_SHADOW";
+/// 削减保留窗（见 [`CompactionStripConfig::keep_recent_turns`]）。
+pub const ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS: &str = "PECO_COMPACTION_STRIP_KEEP_RECENT_TURNS";
+/// 削减范围：reasoning（见 [`CompactionStripConfig::strip_reasoning`]）。
+pub const ENV_COMPACTION_STRIP_REASONING: &str = "PECO_COMPACTION_STRIP_REASONING";
+/// 削减范围：工具调用参数（见 [`CompactionStripConfig::strip_tool_args`]）。
+pub const ENV_COMPACTION_STRIP_TOOL_ARGS: &str = "PECO_COMPACTION_STRIP_TOOL_ARGS";
+/// 边界观测表保留期（见 [`CompactionStripConfig::retention_days`]）。
+pub const ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS: &str =
+    "PECO_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS";
+
+/// 历史削减与边界观测配置。
+///
+/// 默认只观测（`shadow`）不改写 —— 不装配削减策略时压缩路径与引入前
+/// 逐字节一致；生效开关随削减路径接入。
+#[derive(Debug, Clone)]
+pub struct CompactionStripConfig {
+    /// shadow 观测：每个边界评估「若执行将削减多少」并落观测表，不改写会话。
+    pub shadow: bool,
+    /// 削减保留窗：只有早于最近 N 轮的已完成轮才参与削减（UI 默认页可见区恒无损）。
+    pub keep_recent_turns: usize,
+    /// 削减范围：删除历史 reasoning 条目。
+    pub strip_reasoning: bool,
+    /// 削减范围：清空历史工具调用参数。
+    pub strip_tool_args: bool,
+    /// 边界观测表行保留期（天），过期行由启动清扫删除。
+    pub retention_days: u64,
+}
+
+impl Default for CompactionStripConfig {
+    fn default() -> Self {
+        Self {
+            shadow: true,
+            keep_recent_turns: 4,
+            strip_reasoning: true,
+            strip_tool_args: true,
+            retention_days: 30,
+        }
+    }
+}
+
 impl Default for PecoConfig {
     fn default() -> Self {
         Self::from_env()
@@ -125,6 +171,13 @@ impl PecoConfig {
                 128_000,
             ),
             summarizer_model: "deepseek-v4-flash".to_string(),
+            strip: CompactionStripConfig {
+                shadow: env_bool(&get, ENV_COMPACTION_STRIP_SHADOW, true),
+                keep_recent_turns: env_parse(&get, ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, 4),
+                strip_reasoning: env_bool(&get, ENV_COMPACTION_STRIP_REASONING, true),
+                strip_tool_args: env_bool(&get, ENV_COMPACTION_STRIP_TOOL_ARGS, true),
+                retention_days: env_parse(&get, ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS, 30),
+            },
             memory: MemoryConfig::from_env(),
             retry_limit: retry.retry_limit,
             retry_output_budget: retry.retry_output_budget,
@@ -188,6 +241,28 @@ fn env_parse<T: std::str::FromStr, F: Fn(&str) -> Option<String>>(
     }
 }
 
+/// 读一个布尔环境变量：缺失取默认值，写错告警后取默认值。
+///
+/// 与 `memory::config` 的同名辅助函数同语义 —— 解析失败不静默吞，
+/// 「值写错却看起来生效了」是最难查的配置问题。
+fn env_bool<F: Fn(&str) -> Option<String>>(get: &F, name: &str, default: bool) -> bool {
+    match get(name) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            other => {
+                tracing::warn!(
+                    variable = name,
+                    value = %other,
+                    "Invalid boolean env var; using default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +299,38 @@ mod tests {
     fn token_budget_invalid_env_falls_back_to_default() {
         let cfg = PecoConfig::from_env_with(env_of(&[(ENV_COMPACTION_TRIGGER_TOKENS, "abc")]));
         assert_eq!(cfg.compaction_trigger_tokens, 384_000);
+    }
+
+    #[test]
+    fn strip_defaults_are_shadow_only() {
+        let cfg = PecoConfig::from_env_with(env_of(&[]));
+        assert!(cfg.strip.shadow);
+        assert_eq!(cfg.strip.keep_recent_turns, 4);
+        assert!(cfg.strip.strip_reasoning);
+        assert!(cfg.strip.strip_tool_args);
+        assert_eq!(cfg.strip.retention_days, 30);
+    }
+
+    #[test]
+    fn strip_env_overrides_and_invalid_fall_back() {
+        let cfg = PecoConfig::from_env_with(env_of(&[
+            (ENV_COMPACTION_STRIP_SHADOW, "off"),
+            (ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, "8"),
+            (ENV_COMPACTION_STRIP_REASONING, "false"),
+            (ENV_COMPACTION_STRIP_TOOL_ARGS, "0"),
+            (ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS, "7"),
+        ]));
+        assert!(!cfg.strip.shadow);
+        assert_eq!(cfg.strip.keep_recent_turns, 8);
+        assert!(!cfg.strip.strip_reasoning);
+        assert!(!cfg.strip.strip_tool_args);
+        assert_eq!(cfg.strip.retention_days, 7);
+
+        let cfg = PecoConfig::from_env_with(env_of(&[
+            (ENV_COMPACTION_STRIP_SHADOW, "maybe"),
+            (ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, "abc"),
+        ]));
+        assert!(cfg.strip.shadow);
+        assert_eq!(cfg.strip.keep_recent_turns, 4);
     }
 }

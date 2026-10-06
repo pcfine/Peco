@@ -20,7 +20,8 @@ use super::types::AnnotatedMessage;
 
 /// 已确认的 turn 历史。
 ///
-/// 每条 turn 是一个 `Vec<AnnotatedMessage>`，以 User 消息开头。
+/// 每条 turn 是一个 `Vec<AnnotatedMessage>` — 不保证以 User 消息开头
+/// （如从快照灌入的在途轮可能以 assistant 片段起头），消费方不得依赖该顺序。
 /// 一旦 commit 就不可变（除非 rollback_to_turn 截断）。
 #[derive(Debug, Clone)]
 pub(crate) struct CommittedBuffer {

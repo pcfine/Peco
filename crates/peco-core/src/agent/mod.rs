@@ -23,10 +23,13 @@ pub use agent_looper::{
 pub use agent_manager::AgentManager;
 pub use agent_manager::AgentMeta;
 pub use compaction::{
-    CompactionOutcome, CompactionPolicy, ModelSummarizer, SUMMARY_CLOSE, SUMMARY_OPEN,
-    TurnSummarizer, strip_summary_wrapper,
+    BoundaryReduction, CompactionOutcome, CompactionPolicy, ModelSummarizer, SUMMARY_CLOSE,
+    SUMMARY_OPEN, StripEvaluation, StripPolicy, TRANSCRIPT_ITEM_MAX_CHARS, TurnSummarizer,
+    strip_summary_wrapper,
 };
-pub use context::{estimate_item_tokens, estimate_str_tokens};
+pub use context::{
+    estimate_item_tokens, estimate_str_tokens, estimate_viewable_item_tokens, is_viewable_item,
+};
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;
 pub use hooks::{HookAction, LooperHook, TokenBudgetHook, ToolAllowlistHook, ToolHookAction};

@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod compaction_log;
+pub mod context_shadow;
 pub mod conversations;
 pub mod documents;
 pub mod knowledge_bases;
@@ -338,6 +339,26 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 012 skipped: memory_supersede_intent table already exists");
     }
 
+    // ── Migration 013: 上下文压缩边界观测表 ───────────────────────────────
+    let has_context_shadow = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='peco_context_shadow'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_context_shadow {
+        run_migration(
+            pool,
+            "013",
+            include_str!("migrations/013_peco_context_shadow.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 013 completed");
+    } else {
+        tracing::debug!("Migration 013 skipped: peco_context_shadow table already exists");
+    }
+
     Ok(())
 }
 
@@ -616,5 +637,51 @@ mod tests {
             count, 1,
             "重跑迁移后表 memory_supersede_intent 不得重复创建"
         );
+    }
+
+    /// 迁移 013：首次执行建出边界观测表；已有数据在二次执行后保持不变。
+    #[tokio::test]
+    async fn migration_013_creates_table_once_and_survives_rerun() {
+        let (pool, _dir) = test_pool().await;
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("peco_context_shadow")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "表 peco_context_shadow 应已由迁移 013 创建");
+
+        sqlx::query(
+            "INSERT INTO peco_context_shadow \
+             (id, user_id, conversation_id, turn_index, created_at, trigger_caliber, \
+              pinned_tokens, committed_full_tokens, committed_view_tokens, view_window_tokens, \
+              fold_triggered, evicted_turns, guard_triggered, strip_evaluated, strip_enforced, \
+              stripped_items, released_tokens, tool_output_items, tool_output_over_cap, \
+              image_output_items, image_base64_bytes, snapshot_json_bytes) \
+             VALUES ('s-1', 'u1', 'u1-private-session', 3, '2026-10-01T00:00:00+00:00', 'full', \
+              100, 200, 150, 120, 1, 2, 0, 1, 0, 4, 50, 6, 2, 0, 0, 1024)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM peco_context_shadow")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "重跑迁移不得清空已有观测数据");
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
+        )
+        .bind("peco_context_shadow")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "重跑迁移后表 peco_context_shadow 不得重复创建");
     }
 }

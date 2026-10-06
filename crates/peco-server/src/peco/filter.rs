@@ -13,9 +13,8 @@
 //      轮内仅保留 User / Assistant 文本（丢弃 tool 过程与 reasoning）；
 //   3. 当前轮：完整保留（含 tool_call / tool_result / reasoning）。
 
-use model_provider::{InputItem, Role};
 use peco_core::agent::MessageFilter;
-use peco_core::agent::estimate_item_tokens;
+use peco_core::agent::{estimate_item_tokens, is_viewable_item};
 use peco_core::session::{AnnotatedMessage, MessageSource};
 
 /// Peco 永续对话专用上下文过滤器。
@@ -84,7 +83,7 @@ impl MessageFilter for PecoContextFilter {
             result.extend(
                 history_msgs[i]
                     .iter()
-                    .filter(|am| is_history_viewable(&am.message))
+                    .filter(|am| is_viewable_item(&am.message))
                     .cloned(),
             );
         }
@@ -112,7 +111,7 @@ pub(crate) fn select_history_turns(
     for (i, turn_msgs) in history_turns.iter().enumerate().rev() {
         let view_tokens: usize = turn_msgs
             .iter()
-            .filter(|am| is_history_viewable(&am.message))
+            .filter(|am| is_viewable_item(&am.message))
             .map(|am| estimate_item_tokens(&am.message))
             .sum();
         if view_tokens > remaining {
@@ -125,25 +124,10 @@ pub(crate) fn select_history_turns(
     (selected, budget - remaining)
 }
 
-/// 历史轮中可进入上下文的条目：User / Assistant 纯文本。
-///
-/// pinned 摘要（SystemInjection）已在切分阶段归入 pinned，不在此列。
-/// pub(crate)：可观测性指标（[`super::metrics`]）以同一谓词计算
-/// Verbatim 层口径，防两处漂移。
-pub(crate) fn is_history_viewable(item: &InputItem) -> bool {
-    matches!(
-        item,
-        InputItem::Message {
-            role: Role::User | Role::Assistant,
-            ..
-        }
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_provider::{Content, ContentPart};
+    use model_provider::{Content, ContentPart, InputItem, Role};
     use peco_core::agent::estimate_str_tokens;
     use peco_core::session::{MessageId, MessageSource};
 

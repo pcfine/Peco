@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use model_provider::{GenerateResult, InputItem, ToolCall, Usage};
 
 use super::agent_looper::{OuterState, ReActState, TurnFailureReason};
-use super::compaction::CompactionOutcome;
+use super::compaction::{BoundaryReduction, CompactionOutcome};
 use crate::session::Session;
 
 // ============================================================================
@@ -148,6 +148,15 @@ pub trait LooperHook: Send + Sync {
     /// 纯观察方法，返回值被忽略。实现方应自行保证失败不 panic、不阻塞 —
     /// 与其他 hook 相同，panic 会导致 looper task 终止。
     async fn on_context_compacted(&self, _outcome: &CompactionOutcome) {}
+
+    /// turn 边界结算完成后调用（削减评估、折叠、落盘全部结束之后）。
+    ///
+    /// 携带本边界的观测结算 —— token 口径、削减评估、折叠载荷。core 只定义
+    /// 数据结构，落库由服务端钩子完成；与 [`Self::on_context_compacted`] 相比
+    /// 多了「未折叠也要观测」的边界（shadow 需要每边界一行）。
+    ///
+    /// 纯观察方法，返回值被忽略；`apply_boundary` 报错的边界不发此钩子。
+    async fn on_boundary_reduction(&self, _session: &Session, _reduction: &BoundaryReduction) {}
 
     // ── 状态机 ────────────────────────────────────────────────────────────
 

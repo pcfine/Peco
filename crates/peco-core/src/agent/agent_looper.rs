@@ -27,7 +27,7 @@ type SharedModelTask = Arc<tokio::sync::Mutex<Option<ModelTaskHandle>>>;
 use serde::{Deserialize, Serialize};
 
 use super::agent::{Agent, MessageFilter, ModelResponse};
-use super::compaction::CompactionOutcome;
+use super::compaction::{BoundaryReduction, CompactionOutcome};
 use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
@@ -1336,6 +1336,16 @@ impl AgentLooper {
         }
     }
 
+    async fn invoke_on_boundary_reduction(
+        hooks: &[Arc<dyn LooperHook>],
+        session: &Session,
+        reduction: &BoundaryReduction,
+    ) {
+        for hook in hooks {
+            hook.on_boundary_reduction(session, reduction).await;
+        }
+    }
+
     /// 对照请求前的估算 token 与 API 返回的实际 input_tokens。
     ///
     /// 只在 debug 级别记录 — 数据用于长期观测估算器偏差，非运行时告警。
@@ -2008,50 +2018,66 @@ impl AgentLooper {
                 self.clear_inflight_checkpoint().await;
 
                 // ★ 上下文滚动压缩：turn 边界（提交并持久化后、pending 续接前）。
-                //   非致命：摘要模型失败只记日志，不影响会话继续。
+                //   编排（削减扫描 → 折叠 → 观测结算）在 apply_boundary 内完成；
+                //   非致命：失败只记日志，不影响会话继续（此处不能用 `?` —— 既有契约）。
                 if let Some(policy) = &self.config.compaction {
-                    match policy.maybe_compact(&mut self.session).await {
-                        Ok(Some(outcome)) => {
-                            // 降级摘要（摘要模型连续失败后的机械兜底）走 warn：
-                            // 驱逐照常发生，但 pinned 摘要已退化为转录碎片，必须能被看见。
-                            if outcome.degraded {
-                                warn!(
-                                    evicted_turns = outcome.evicted_turns,
-                                    tokens_before = outcome.estimated_tokens_before,
-                                    tokens_after = outcome.estimated_tokens_after,
-                                    degraded = outcome.degraded,
-                                    "Context compacted with degraded summary at turn boundary"
-                                );
-                            } else {
-                                info!(
-                                    evicted_turns = outcome.evicted_turns,
-                                    tokens_before = outcome.estimated_tokens_before,
-                                    tokens_after = outcome.estimated_tokens_after,
-                                    degraded = outcome.degraded,
-                                    "Context compacted at turn boundary"
-                                );
+                    match policy.apply_boundary(&mut self.session).await {
+                        Ok(r) => {
+                            // ① 折叠事件（折叠载荷来自本次折叠）
+                            if let Some(outcome) = &r.compaction {
+                                // 降级摘要（摘要模型连续失败后的机械兜底）走 warn：
+                                // 驱逐照常发生，但 pinned 摘要已退化为转录碎片，必须能被看见。
+                                if outcome.degraded {
+                                    warn!(
+                                        evicted_turns = outcome.evicted_turns,
+                                        tokens_before = outcome.estimated_tokens_before,
+                                        tokens_after = outcome.estimated_tokens_after,
+                                        degraded = outcome.degraded,
+                                        "Context compacted with degraded summary at turn boundary"
+                                    );
+                                } else {
+                                    info!(
+                                        evicted_turns = outcome.evicted_turns,
+                                        tokens_before = outcome.estimated_tokens_before,
+                                        tokens_after = outcome.estimated_tokens_after,
+                                        degraded = outcome.degraded,
+                                        "Context compacted at turn boundary"
+                                    );
+                                }
+                                Self::emit_event_guaranteed(
+                                    &self.event_speaker,
+                                    LooperEvent::ContextCompacted {
+                                        evicted_turns: outcome.evicted_turns,
+                                        summary: outcome.summary.clone(),
+                                        estimated_tokens_before: outcome.estimated_tokens_before,
+                                        estimated_tokens_after: outcome.estimated_tokens_after,
+                                    },
+                                )
+                                .await;
                             }
-                            Self::emit_event_guaranteed(
-                                &self.event_speaker,
-                                LooperEvent::ContextCompacted {
-                                    evicted_turns: outcome.evicted_turns,
-                                    summary: outcome.summary.clone(),
-                                    estimated_tokens_before: outcome.estimated_tokens_before,
-                                    estimated_tokens_after: outcome.estimated_tokens_after,
-                                },
+
+                            // ② 落盘：只看生效值（折叠改变了 committed 与 pinned；
+                            //    削减评估值不改会话，为其落盘纯属浪费 IO）
+                            if r.mutated() {
+                                let snapshot = self.session.snapshot(&_token);
+                                if let Err(e) = self.save_snapshot(&snapshot).await {
+                                    error!(error = %e, "Failed to persist session after compaction");
+                                }
+                            }
+
+                            // ③ 折叠钩子（持久化完成后通知，纯观察）
+                            if let Some(outcome) = &r.compaction {
+                                Self::invoke_on_context_compacted(&self.config.hooks, outcome)
+                                    .await;
+                            }
+                            // ④ 边界观测钩子（未折叠的边界也要发 — shadow 每边界一行）
+                            Self::invoke_on_boundary_reduction(
+                                &self.config.hooks,
+                                &self.session,
+                                &r,
                             )
                             .await;
-
-                            // 重新持久化：快照现在含 pinned 摘要 + 修剪后的历史
-                            let snapshot = self.session.snapshot(&_token);
-                            if let Err(e) = self.save_snapshot(&snapshot).await {
-                                error!(error = %e, "Failed to persist session after compaction");
-                            }
-
-                            // 持久化完成后通知 hooks（纯观察，失败不致命）
-                            Self::invoke_on_context_compacted(&self.config.hooks, &outcome).await;
                         }
-                        Ok(None) => {}
                         Err(e) => {
                             error!(error = %e, "Context compaction failed (non-fatal)");
                         }
@@ -4752,6 +4778,19 @@ mod tests {
         scripts: Vec<Script>,
         config: LooperConfig,
     ) -> (LooperHandle, Arc<ScriptedStreamProvider>) {
+        spawn_scripted_looper_with_persister(
+            scripts,
+            config,
+            Arc::new(crate::persistence::NullSessionPersister),
+        )
+    }
+
+    /// 同上，但落盘走注入的 persister —— 落盘时机类测试要数 save 次数。
+    fn spawn_scripted_looper_with_persister(
+        scripts: Vec<Script>,
+        config: LooperConfig,
+        persister: Arc<dyn crate::persistence::SessionPersister>,
+    ) -> (LooperHandle, Arc<ScriptedStreamProvider>) {
         let profile: crate::agent::AgentProfile = serde_yaml::from_str(
             "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
         )
@@ -4770,12 +4809,7 @@ mod tests {
             None,
         ));
         let session = Session::new("s1".to_string(), "d".to_string());
-        let handle = AgentLooper::spawn(
-            agent,
-            Box::new(session),
-            config,
-            Arc::new(crate::persistence::NullSessionPersister),
-        );
+        let handle = AgentLooper::spawn(agent, Box::new(session), config, persister);
         (handle, provider)
     }
 
@@ -6258,5 +6292,183 @@ mod tests {
                 std::env::remove_var(name);
             }
         }
+    }
+
+    // ── Done 分支的边界编排（apply_boundary → 落盘 → 钩子）──────────────
+
+    /// 边界钩子探针 —— Done 分支编排的唯一外部观察点。
+    #[derive(Default)]
+    struct BoundaryProbe {
+        boundary_calls: AtomicUsize,
+        boundary_folded: AtomicUsize,
+        boundary_evaluated: AtomicUsize,
+        compacted_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LooperHook for BoundaryProbe {
+        async fn on_boundary_reduction(&self, _session: &Session, reduction: &BoundaryReduction) {
+            self.boundary_calls.fetch_add(1, Ordering::SeqCst);
+            if reduction.folded() {
+                self.boundary_folded.fetch_add(1, Ordering::SeqCst);
+            }
+            if reduction.strip_evaluation.is_some() {
+                self.boundary_evaluated.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn on_context_compacted(&self, _outcome: &CompactionOutcome) {
+            self.compacted_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 固定短摘要的假摘要器 —— 折叠路径的最小驱动。
+    struct FixedSummarizer;
+
+    #[async_trait::async_trait]
+    impl super::super::compaction::TurnSummarizer for FixedSummarizer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _evicted: &str,
+        ) -> Result<String, AgentError> {
+            Ok(format!(
+                "{}早期历史{}",
+                super::super::compaction::SUMMARY_OPEN,
+                super::super::compaction::SUMMARY_CLOSE
+            ))
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            unimplemented!("boundary tests never compose turn epilogues")
+        }
+    }
+
+    fn boundary_probe_config(
+        policy: Arc<super::super::compaction::CompactionPolicy>,
+    ) -> (LooperConfig, Arc<BoundaryProbe>) {
+        let probe = Arc::new(BoundaryProbe::default());
+        let config = LooperConfig {
+            compaction: Some(policy),
+            hooks: vec![Arc::clone(&probe) as Arc<dyn LooperHook>],
+            ..Default::default()
+        };
+        (config, probe)
+    }
+
+    /// TurnComplete 已消费后，数到外层回 Idle 之间的折叠事件数 ——
+    /// TurnComplete 在压缩编排**之前**发出，不等 Idle 就断言会与在途钩子赛跑。
+    async fn drain_compacted_until_idle(h: &LooperHandle) -> usize {
+        let res = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut compacted = 0;
+            loop {
+                match h.recv_event().await {
+                    Some(LooperEvent::ContextCompacted { .. }) => compacted += 1,
+                    Some(LooperEvent::OuterStateChange {
+                        to: OuterState::Idle,
+                        ..
+                    }) => break compacted,
+                    Some(_) => continue,
+                    None => panic!("event channel closed before Idle"),
+                }
+            }
+        })
+        .await;
+        res.expect("timed out waiting for Idle after turn")
+    }
+
+    /// 不折叠的边界：钩子每边界恰一次，评估值不触发二次落盘，不发折叠事件。
+    #[tokio::test]
+    async fn test_boundary_hook_fires_without_fold_and_no_extra_persist() {
+        let policy = Arc::new(
+            super::super::compaction::CompactionPolicy::new(
+                usize::MAX,
+                1000,
+                Arc::new(FixedSummarizer),
+            )
+            .with_strip(super::super::compaction::StripPolicy {
+                keep_recent_turns: 1,
+                strip_reasoning: true,
+                strip_tool_args: true,
+            }),
+        );
+        let (config, probe) = boundary_probe_config(policy);
+        let persister = Arc::new(CountingPersister::default());
+        let (h, _provider) = spawn_scripted_looper_with_persister(
+            vec![completed("ok")],
+            config,
+            Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        );
+
+        h.send_query("hi".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok"),
+            other => panic!("expected success, got {other:?}"),
+        }
+        let compacted_events = drain_compacted_until_idle(&h).await;
+
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            probe.boundary_evaluated.load(Ordering::SeqCst),
+            1,
+            "装配削减策略的边界必须产出评估值"
+        );
+        assert_eq!(probe.boundary_folded.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.compacted_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(compacted_events, 0, "未折叠不得发 ContextCompacted");
+        assert_eq!(
+            persister.saves.load(Ordering::SeqCst),
+            1,
+            "评估值不改会话，不得触发二次落盘"
+        );
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 折叠的边界：折叠事件 + 折叠后二次落盘 + 两个压缩钩子都触发。
+    #[tokio::test]
+    async fn test_boundary_fold_emits_event_and_repersists() {
+        // trigger=0：任意非空上下文都超阈值；单轮被「至少保留 1 轮」保底拦下，
+        // 第二轮起才真正折叠 —— 顺带覆盖「保底不折叠」的分支。
+        let policy = Arc::new(
+            super::super::compaction::CompactionPolicy::new(0, 0, Arc::new(FixedSummarizer))
+                .with_strip(super::super::compaction::StripPolicy {
+                    keep_recent_turns: 1,
+                    strip_reasoning: true,
+                    strip_tool_args: true,
+                }),
+        );
+        let (config, probe) = boundary_probe_config(policy);
+        let persister = Arc::new(CountingPersister::default());
+        let (h, _provider) = spawn_scripted_looper_with_persister(
+            vec![completed("ok1"), completed("ok2")],
+            config,
+            Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        );
+
+        // 第 1 轮：唯一一轮被保底留住 ⇒ 不折叠，仅 commit 落盘
+        h.send_query("q1".into()).await.expect("looper alive");
+        recv_until_turn_complete(&h).await;
+        drain_compacted_until_idle(&h).await;
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.boundary_folded.load(Ordering::SeqCst), 0);
+        assert_eq!(persister.saves.load(Ordering::SeqCst), 1);
+
+        // 第 2 轮：2 轮超阈值 ⇒ 驱逐 1 轮 + pinned，commit 与折叠各落一次盘
+        h.send_query("q2".into()).await.expect("looper alive");
+        recv_until_turn_complete(&h).await;
+        let compacted_events = drain_compacted_until_idle(&h).await;
+
+        assert_eq!(compacted_events, 1, "折叠必须发 ContextCompacted");
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.boundary_folded.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.compacted_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            persister.saves.load(Ordering::SeqCst),
+            3,
+            "每轮 commit 落盘一次，折叠再生效一次"
+        );
+
+        h.shutdown().await.expect("clean shutdown");
     }
 }
