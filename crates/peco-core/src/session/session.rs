@@ -56,6 +56,45 @@ pub struct StripEvaluation {
     pub skipped_turns: usize,
 }
 
+/// 削减的生效值（`apply=true` 实际改写后的结算）。
+///
+/// 与 [`StripEvaluation`] 出自同一份扫描：边界编排在生效路径上由评估
+/// 计数转录而来，shadow 路径不产出本值。字段数值与评估值一一对应，
+/// 差别只在语义 —— 评估是「若执行将…」，生效是「已执行了…」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StripOutcome {
+    /// 实际被改写的条目数（删除或清空都算改写）。
+    pub changed_items: usize,
+    /// 实际释放的估算 token。
+    pub released_tokens: usize,
+    /// 因「削减后每轮非空」保底而整轮跳过的轮数。
+    pub skipped_turns: usize,
+}
+
+impl StripOutcome {
+    /// 是否真的改写了会话内容 —— 零改写不触发落盘。
+    pub fn mutated(&self) -> bool {
+        self.changed_items > 0
+    }
+}
+
+/// 删除类命中：该 reasoning 条目可无损移除。
+///
+/// 评估扫描与生效改写必须共用本谓词 —— 两套判定漂移会让 shadow 观测值
+/// 与真实改写对不上。
+fn hit_reasoning(item: &InputItem, caps: StripCaps) -> bool {
+    caps.strip_reasoning && matches!(item, InputItem::Reasoning { .. })
+}
+
+/// 改字段类命中：该函数调用参数可无损清空（转录行只含 name，不含 arguments）。
+fn hit_tool_args(item: &InputItem, caps: StripCaps) -> bool {
+    caps.strip_tool_args
+        && matches!(
+            item,
+            InputItem::FunctionCall { arguments, .. } if !arguments.is_empty()
+        )
+}
+
 /// 会话实体。
 ///
 /// # 并发模型
@@ -756,21 +795,26 @@ impl Session {
         Ok(evict_count)
     }
 
-    /// 评估历史削减（strip）：统计早于最近 `keep_recent_turns` 轮的已完成轮中
-    /// 可无损移除的零价值内容。**不改写任何内容**。
+    /// 评估并（可选）执行历史削减（strip）：处理早于最近 `keep_recent_turns`
+    /// 轮的已完成轮中可无损移除的零价值内容。
     ///
-    /// 评估与生效共用本方法的同一份扫描 —— 生效路径届时在判定命中处就地改写，
-    /// 「该削什么、跳过哪轮」不可能出现两套逻辑。评估完成后会话逐字节不变
-    /// （无 IO、不动 pinned / staging / pending / 计数器），天然幂等。
+    /// `apply=false` 只算不改 —— 会话逐字节不变（无 IO、不动 pinned / staging /
+    /// pending / 计数器）；`apply=true` 就地改写。两条路径共用同一份扫描与
+    /// 同一组命中谓词 —— 「该削什么、跳过哪轮」若分成两套逻辑必然漂移，
+    /// 而漂移的后果是 shadow 观测值与真实改写不一致，观测面直接失去意义。
+    /// 返回的评估计数在 `apply=true` 时即实际生效值，二次调用天然为零（幂等）。
     ///
     /// - 仅 `Idle` 可调（同 [`Self::compact`]：运行中的会话不可改写历史）
     /// - 若某轮将被整轮删空（仅由 reasoning 构成），整轮跳过并计入
     ///   `skipped_turns` —— committed 轮不保证以 User 开头，「每轮非空」是
     ///   持久化与展示的底线
+    /// - 改写只动 `message` 内容：条目 id / timestamp / source / turn_index
+    ///   与轮次结构（除被删条目外）保持不变
     pub fn strip_stale_content(
         &mut self,
         keep_recent_turns: usize,
         caps: StripCaps,
+        apply: bool,
     ) -> Result<StripEvaluation, SessionError> {
         if self.state != SessionState::Idle {
             return Err(SessionError::InvalidStateTransition {
@@ -782,28 +826,23 @@ impl Session {
         let mut eval = StripEvaluation::default();
         // 只削 scope 内的旧轮：最近 keep_recent_turns 轮是 UI 默认页可见区，恒不动
         let scope_end = self.committed.len().saturating_sub(keep_recent_turns);
-        for turn in self.committed.turns()[..scope_end].iter() {
+        for turn in self.committed.turns_mut()[..scope_end].iter_mut() {
             if turn.is_empty() {
                 continue;
             }
             let mut deletions = 0usize;
             let mut changes = 0usize;
             let mut released = 0usize;
-            for am in turn {
-                match am.message.as_ref() {
-                    InputItem::Reasoning { .. } if caps.strip_reasoning => {
-                        deletions += 1;
-                        changes += 1;
-                        released += estimate_item_tokens(&am.message);
-                    }
-                    InputItem::FunctionCall { arguments, .. }
-                        if caps.strip_tool_args && !arguments.is_empty() =>
-                    {
-                        changes += 1;
-                        // input_item_text 对 FunctionCall 只取 arguments，清空即全释放
-                        released += estimate_item_tokens(&am.message);
-                    }
-                    _ => {}
+            for am in turn.iter() {
+                let item = am.message.as_ref();
+                if hit_reasoning(item, caps) {
+                    deletions += 1;
+                    changes += 1;
+                    released += estimate_item_tokens(&am.message);
+                } else if hit_tool_args(item, caps) {
+                    changes += 1;
+                    // input_item_text 对 FunctionCall 只取 arguments，清空即全释放
+                    released += estimate_item_tokens(&am.message);
                 }
             }
             // 整轮皆为待删 reasoning ⇒ 删完即空，跳过以保住「每轮非空」。
@@ -814,6 +853,20 @@ impl Session {
             }
             eval.would_change_items += changes;
             eval.would_release_tokens += released;
+
+            if apply && changes > 0 {
+                if caps.strip_reasoning {
+                    turn.retain(|am| !hit_reasoning(am.message.as_ref(), caps));
+                }
+                for am in turn.iter_mut() {
+                    if hit_tool_args(am.message.as_ref(), caps)
+                        && let InputItem::FunctionCall { arguments, .. } =
+                            Arc::make_mut(&mut am.message)
+                    {
+                        arguments.clear();
+                    }
+                }
+            }
         }
         Ok(eval)
     }
@@ -2277,7 +2330,7 @@ mod tests {
         let turn_index_before = s.turn_index();
 
         let caps = ALL_CAPS;
-        let eval = s.strip_stale_content(1, caps).unwrap();
+        let eval = s.strip_stale_content(1, caps, false).unwrap();
         // turn0：reasoning + 非空参数 FC = 2 条；turn1：reasoning（空参 FC 不算改写）= 1 条
         assert_eq!(eval.would_change_items, 3);
         // 深入思考 = 4 CJK → ceil(2.4) = 3；"{}" → ceil(0.6) = 1
@@ -2290,7 +2343,7 @@ mod tests {
         assert_eq!(s.turn_index(), turn_index_before);
         assert!(s.is_idle());
         // 幂等：第二次评估得到同样的值（没有可削内容变化）
-        let eval2 = s.strip_stale_content(1, caps).unwrap();
+        let eval2 = s.strip_stale_content(1, caps, false).unwrap();
         assert_eq!(eval2, eval);
     }
 
@@ -2302,7 +2355,7 @@ mod tests {
             vec![user("正常轮"), assistant("正常回答")],
         ]);
 
-        let eval = s.strip_stale_content(1, ALL_CAPS).unwrap();
+        let eval = s.strip_stale_content(1, ALL_CAPS, false).unwrap();
         assert_eq!(eval.skipped_turns, 1);
         assert_eq!(eval.would_change_items, 0);
         assert_eq!(eval.would_release_tokens, 0);
@@ -2318,7 +2371,7 @@ mod tests {
 
         // keep_recent=1 ⇒ 唯一一轮在保留窗内，什么都不扫
         assert_eq!(
-            s.strip_stale_content(1, ALL_CAPS).unwrap(),
+            s.strip_stale_content(1, ALL_CAPS, false).unwrap(),
             StripEvaluation::default()
         );
 
@@ -2328,7 +2381,7 @@ mod tests {
             strip_tool_args: false,
         };
         assert_eq!(
-            s.strip_stale_content(0, off).unwrap(),
+            s.strip_stale_content(0, off, false).unwrap(),
             StripEvaluation::default()
         );
 
@@ -2337,12 +2390,159 @@ mod tests {
             strip_reasoning: true,
             strip_tool_args: false,
         };
-        let eval = s.strip_stale_content(0, reasoning_only).unwrap();
+        let eval = s.strip_stale_content(0, reasoning_only, false).unwrap();
         assert_eq!(eval.would_change_items, 1);
 
         // 非 Idle 拒绝 —— 运行中的会话不可改写历史
         s.start_turn("q".into()).unwrap();
-        let err = s.strip_stale_content(0, ALL_CAPS).unwrap_err();
+        let err = s.strip_stale_content(0, ALL_CAPS, false).unwrap_err();
         assert!(matches!(err, SessionError::InvalidStateTransition { .. }));
+        // apply=true 走同一守卫
+        let err = s.strip_stale_content(0, ALL_CAPS, true).unwrap_err();
+        assert!(matches!(err, SessionError::InvalidStateTransition { .. }));
+    }
+
+    // ── strip_stale_content（生效：apply=true 就地改写）───────────────────
+
+    #[test]
+    fn strip_apply_rewrites_scope_and_preserves_identity() {
+        let mut s = session_with_turns(vec![
+            vec![
+                user("你好"),
+                reasoning("深入思考"),
+                function_call("c1", "shell"),
+                tool("c1", "output"),
+                assistant("回答"),
+            ],
+            vec![user("最新"), reasoning("不计入")],
+        ]);
+
+        // I8 身份快照：存活条目的 id / timestamp / turn_index / source 改写前后必须一致
+        let identity: Vec<_> = s.committed_turns()[0]
+            .iter()
+            .map(|am| (am.id.0, am.timestamp_ms, am.turn_index, am.source.clone()))
+            .collect();
+        let turn_index_before = s.turn_index();
+        let in_scope_before = serde_json::to_string(&s.committed_turns()[0]).unwrap();
+        assert_ne!(
+            in_scope_before,
+            serde_json::to_string(&s.committed_turns()[1]).unwrap(),
+            "前置：两轮内容本就不同，避免恒真断言"
+        );
+        let out_of_scope_before = serde_json::to_string(&s.committed_turns()[1]).unwrap();
+
+        let eval = s.strip_stale_content(1, ALL_CAPS, true).unwrap();
+        // turn0：reasoning 删除 + 非空参数 FC 清空 = 2 条
+        assert_eq!(eval.would_change_items, 2);
+
+        let t0 = &s.committed_turns()[0];
+        assert_eq!(t0.len(), 4, "5 条里只删 reasoning，其余保留");
+        assert!(matches!(t0[0].message.as_ref(), InputItem::Message { .. }));
+        let InputItem::FunctionCall { arguments, .. } = t0[1].message.as_ref() else {
+            panic!("第 2 条应是清参后的 FunctionCall");
+        };
+        assert_eq!(arguments, "", "apply=true 必须真的清空参数");
+        assert!(
+            matches!(t0[2].message.as_ref(), InputItem::FunctionCallOutput { .. }),
+            "tool 输出不属 2a 削减对象"
+        );
+
+        // 身份不变：存活条目（reasoning 已删）逐条比对 id / timestamp / turn_index / source
+        let identity_after: Vec<_> = s.committed_turns()[0]
+            .iter()
+            .map(|am| (am.id.0, am.timestamp_ms, am.turn_index, am.source.clone()))
+            .collect();
+        let expected: Vec<_> = identity
+            .into_iter()
+            .filter(|(id, ..)| *id != 1) // id 1 是被删的 reasoning（构造时顺序分配）
+            .collect();
+        assert_eq!(identity_after, expected, "I8：身份保真");
+        assert_eq!(s.turn_index(), turn_index_before, "I3：轮次编号不变");
+        assert_eq!(s.committed_turns().len(), 2, "I1：不驱逐轮次");
+
+        // 保留窗外的轮逐字节不动
+        assert_eq!(
+            serde_json::to_string(&s.committed_turns()[1]).unwrap(),
+            out_of_scope_before,
+            "最近 keep_recent_turns 轮恒不动"
+        );
+
+        // 幂等：第二次 apply 零改写
+        let eval2 = s.strip_stale_content(1, ALL_CAPS, true).unwrap();
+        assert_eq!(eval2.would_change_items, 0);
+        assert_eq!(eval2.would_release_tokens, 0);
+        assert!(
+            eval2.skipped_turns <= eval.skipped_turns,
+            "幂等后不会新增跳过轮"
+        );
+
+        // caps 关闭时 apply=true 也不改写
+        let off = StripCaps {
+            strip_reasoning: false,
+            strip_tool_args: false,
+        };
+        let before = serde_json::to_string(s.committed_turns()).unwrap();
+        let eval3 = s.strip_stale_content(1, off, true).unwrap();
+        assert_eq!(eval3.would_change_items, 0);
+        assert_eq!(
+            serde_json::to_string(s.committed_turns()).unwrap(),
+            before,
+            "caps 关闭时生效路径零改写"
+        );
+    }
+
+    #[test]
+    fn strip_apply_skips_turn_that_would_become_empty() {
+        // turn0 仅由 reasoning 构成 —— apply=true 也必须整轮跳过，不能删成空轮
+        let mut s = session_with_turns(vec![
+            vec![reasoning("唯一内容"), reasoning("也是唯一")],
+            vec![user("正常轮"), assistant("正常回答")],
+        ]);
+        let before = serde_json::to_string(&s.committed_turns()[0]).unwrap();
+
+        let eval = s.strip_stale_content(1, ALL_CAPS, true).unwrap();
+        assert_eq!(eval.skipped_turns, 1);
+        assert_eq!(eval.would_change_items, 0);
+        assert_eq!(
+            serde_json::to_string(&s.committed_turns()[0]).unwrap(),
+            before,
+            "整轮跳过的轮在 apply 路径也逐字节不变"
+        );
+        assert!(!s.committed_turns()[0].is_empty(), "I4：每轮非空");
+    }
+
+    #[test]
+    fn strip_apply_keeps_hydrated_reasoning_only_turn_non_empty() {
+        // I4 反例：committed 轮不保证以 User 开头 —— hydrate_inflight 可把
+        // 仅含 Reasoning 的检查点轮直接灌进 committed，削减后必须仍然非空。
+        let mut s = make_session();
+        let am = AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            reasoning("崩溃前的思考"),
+            MessageSource::ModelGeneration,
+        );
+        assert_eq!(s.hydrate_inflight(vec![am]).unwrap(), 1);
+        s.commit_turn().unwrap();
+        assert_eq!(s.committed_turns().len(), 1);
+        assert!(
+            matches!(
+                s.committed_turns()[0][0].message.as_ref(),
+                InputItem::Reasoning { .. }
+            ),
+            "前置：committed 轮仅含 reasoning"
+        );
+
+        let eval = s.strip_stale_content(0, ALL_CAPS, true).unwrap();
+        assert_eq!(eval.skipped_turns, 1);
+        assert_eq!(eval.would_change_items, 0);
+        assert!(!s.committed_turns()[0].is_empty(), "I4：削减后仍非空");
+        assert!(
+            matches!(
+                s.committed_turns()[0][0].message.as_ref(),
+                InputItem::Reasoning { .. }
+            ),
+            "整轮跳过 ⇒ 条目原样保留"
+        );
     }
 }

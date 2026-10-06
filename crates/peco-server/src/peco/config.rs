@@ -109,6 +109,8 @@ pub const ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS: &str = "PECO_COMPACTION_STRIP_
 pub const ENV_COMPACTION_STRIP_REASONING: &str = "PECO_COMPACTION_STRIP_REASONING";
 /// 削减范围：工具调用参数（见 [`CompactionStripConfig::strip_tool_args`]）。
 pub const ENV_COMPACTION_STRIP_TOOL_ARGS: &str = "PECO_COMPACTION_STRIP_TOOL_ARGS";
+/// 生效开关（见 [`CompactionStripConfig::enforce`]）。
+pub const ENV_COMPACTION_STRIP_ENFORCE: &str = "PECO_COMPACTION_STRIP_ENFORCE";
 /// 边界观测表保留期（见 [`CompactionStripConfig::retention_days`]）。
 pub const ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS: &str =
     "PECO_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS";
@@ -127,6 +129,9 @@ pub struct CompactionStripConfig {
     pub strip_reasoning: bool,
     /// 削减范围：清空历史工具调用参数。
     pub strip_tool_args: bool,
+    /// 生效开关：`true` 时边界上就地改写历史；`false`（默认）只评估观测，
+    /// legacy 路径行为与不引入削减时逐字节一致。
+    pub enforce: bool,
     /// 边界观测表行保留期（天），过期行由启动清扫删除。
     pub retention_days: u64,
 }
@@ -138,6 +143,7 @@ impl Default for CompactionStripConfig {
             keep_recent_turns: 4,
             strip_reasoning: true,
             strip_tool_args: true,
+            enforce: false,
             retention_days: 30,
         }
     }
@@ -176,6 +182,7 @@ impl PecoConfig {
                 keep_recent_turns: env_parse(&get, ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, 4),
                 strip_reasoning: env_bool(&get, ENV_COMPACTION_STRIP_REASONING, true),
                 strip_tool_args: env_bool(&get, ENV_COMPACTION_STRIP_TOOL_ARGS, true),
+                enforce: env_bool(&get, ENV_COMPACTION_STRIP_ENFORCE, false),
                 retention_days: env_parse(&get, ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS, 30),
             },
             memory: MemoryConfig::from_env(),
@@ -308,6 +315,7 @@ mod tests {
         assert_eq!(cfg.strip.keep_recent_turns, 4);
         assert!(cfg.strip.strip_reasoning);
         assert!(cfg.strip.strip_tool_args);
+        assert!(!cfg.strip.enforce, "默认必须 legacy：只评估不改写");
         assert_eq!(cfg.strip.retention_days, 30);
     }
 
@@ -318,19 +326,23 @@ mod tests {
             (ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, "8"),
             (ENV_COMPACTION_STRIP_REASONING, "false"),
             (ENV_COMPACTION_STRIP_TOOL_ARGS, "0"),
+            (ENV_COMPACTION_STRIP_ENFORCE, "on"),
             (ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS, "7"),
         ]));
         assert!(!cfg.strip.shadow);
         assert_eq!(cfg.strip.keep_recent_turns, 8);
         assert!(!cfg.strip.strip_reasoning);
         assert!(!cfg.strip.strip_tool_args);
+        assert!(cfg.strip.enforce);
         assert_eq!(cfg.strip.retention_days, 7);
 
         let cfg = PecoConfig::from_env_with(env_of(&[
             (ENV_COMPACTION_STRIP_SHADOW, "maybe"),
             (ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, "abc"),
+            (ENV_COMPACTION_STRIP_ENFORCE, "maybe"),
         ]));
         assert!(cfg.strip.shadow);
         assert_eq!(cfg.strip.keep_recent_turns, 4);
+        assert!(!cfg.strip.enforce, "写错的布尔取默认 false");
     }
 }

@@ -23,8 +23,8 @@ use model_provider::{ContentBlock, GenerateRequest, InputItem, ReasoningConfig, 
 
 use super::context::{estimate_item_tokens, estimate_viewable_item_tokens};
 use super::error::AgentError;
-pub use crate::session::StripEvaluation;
 use crate::session::{Session, StripCaps};
+pub use crate::session::{StripEvaluation, StripOutcome};
 
 /// 摘要定界标签 — pinned 消息的 content 恒被包裹其中，
 /// 合并时可据此剥离旧摘要的包装。
@@ -311,6 +311,9 @@ pub struct BoundaryReduction {
     pub committed_view_tokens: usize,
     /// 本边界是否由 viewable 守卫触发（守卫未启用时恒假）。
     pub guard_triggered: bool,
+    /// 削减生效值；启用生效削减时为 `Some`（零改写则 `changed_items` 为 0），
+    /// shadow 观测路径恒 `None` —— 评估值不驱动任何落盘。
+    pub strip: Option<StripOutcome>,
     /// 削减评估值（只算不做）；未装配削减策略时为 `None`。
     pub strip_evaluation: Option<StripEvaluation>,
     /// 折叠载荷；未触发折叠时为 `None`。
@@ -326,9 +329,9 @@ impl BoundaryReduction {
     /// 本边界是否需要落盘 —— 只看**生效**值。
     ///
     /// 评估值（shadow 观测）不改任何会话内容，为其落盘纯属浪费 IO；
-    /// 折叠改变了 committed 与 pinned，必须落盘。
+    /// 实际改写与折叠都动了 committed / pinned，必须落盘。
     pub fn mutated(&self) -> bool {
-        self.compaction.is_some()
+        self.strip.as_ref().is_some_and(|s| s.mutated()) || self.compaction.is_some()
     }
 }
 
@@ -346,6 +349,10 @@ pub struct StripPolicy {
     pub strip_reasoning: bool,
     /// 清空历史工具调用参数。
     pub strip_tool_args: bool,
+    /// 生效开关：`true` 时就地改写历史，`false` 只评估不改写（shadow 观测）。
+    ///
+    /// 默认 `false` —— 未显式开启时边界结算与不引入削减的版本逐字节一致。
+    pub enforce: bool,
 }
 
 impl StripPolicy {
@@ -488,11 +495,14 @@ impl CompactionPolicy {
         }))
     }
 
-    /// turn 边界编排入口：削减扫描 → 结算 token 口径 → 折叠。
+    /// turn 边界编排入口：削减（enforce 时改写，否则只评估）→ 结算 token 口径 → 折叠。
     ///
     /// 返回观测结算与折叠载荷，调用方按 [`BoundaryReduction::mutated`] 决定
     /// 落盘、按 `compaction` / `strip_evaluation` 分别通知钩子 —— 编排留在
     /// core 一处，服务端只消费结果，口径不可能在两端各算一遍。
+    ///
+    /// 评估与生效是同一份扫描：`strip`（生效值）由 `strip_evaluation` 的
+    /// 计数直接转录，两条路径的数值不可能对不上。
     ///
     /// 折叠失败按非致命上抛（`Err`），由调用方 `match` 记日志后继续 ——
     /// 此处不用 `?` 向 looper 冒泡是有意的既有契约。
@@ -500,16 +510,22 @@ impl CompactionPolicy {
         &self,
         session: &mut Session,
     ) -> Result<BoundaryReduction, AgentError> {
-        // ① 削减扫描（先削后折：结算口径必须等于折叠触发所见）
-        let strip_evaluation = match &self.strip {
-            Some(strip) => Some(
-                session
-                    .strip_stale_content(strip.keep_recent_turns, strip.caps())
+        // ① 削减（先削后折：结算口径必须等于折叠触发所见）
+        let (strip_evaluation, strip) = match &self.strip {
+            Some(policy) => {
+                let eval = session
+                    .strip_stale_content(policy.keep_recent_turns, policy.caps(), policy.enforce)
                     .map_err(|e| {
                         AgentError::Compaction(format!("strip stale content failed: {e}"))
-                    })?,
-            ),
-            None => None,
+                    })?;
+                let outcome = policy.enforce.then_some(StripOutcome {
+                    changed_items: eval.would_change_items,
+                    released_tokens: eval.would_release_tokens,
+                    skipped_turns: eval.skipped_turns,
+                });
+                (Some(eval), outcome)
+            }
+            None => (None, None),
         };
 
         // ② 结算 token 口径（post-strip、pre-fold）
@@ -537,6 +553,7 @@ impl CompactionPolicy {
             committed_full_tokens,
             committed_view_tokens,
             guard_triggered: false,
+            strip,
             strip_evaluation,
             compaction,
         })
@@ -1226,11 +1243,12 @@ mod tests {
 
     // ── apply_boundary（削减评估 → 折叠 → 结算）────────────────────────
 
-    fn strip_policy(keep_recent_turns: usize) -> StripPolicy {
+    fn strip_policy(keep_recent_turns: usize, enforce: bool) -> StripPolicy {
         StripPolicy {
             keep_recent_turns,
             strip_reasoning: true,
             strip_tool_args: true,
+            enforce,
         }
     }
 
@@ -1263,7 +1281,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_boundary_evaluates_strip_without_mutation() {
         let policy = CompactionPolicy::new(usize::MAX, 1000, Arc::new(MockSummarizer))
-            .with_strip(strip_policy(1));
+            .with_strip(strip_policy(1, false));
         let mut session = make_session_with_reasoning_turns(3);
         let before = serde_json::to_string(session.committed_turns()).unwrap();
 
@@ -1278,6 +1296,7 @@ mod tests {
         assert!(r.compaction.is_none());
         assert!(!r.folded());
         assert!(!r.mutated(), "评估值不得触发落盘");
+        assert!(r.strip.is_none(), "shadow 路径不产出生效值");
         assert!(!r.guard_triggered);
 
         // 口径与独立重算一致 — 字段漏算或重复计数在这里现形
@@ -1309,8 +1328,8 @@ mod tests {
     #[tokio::test]
     async fn test_apply_boundary_records_prefold_caliber_when_folding() {
         // 阈值 80 必然触发折叠；口径在折叠前结算 ⇒ 记录的是触发所见
-        let policy =
-            CompactionPolicy::new(80, 40, Arc::new(MockSummarizer)).with_strip(strip_policy(1));
+        let policy = CompactionPolicy::new(80, 40, Arc::new(MockSummarizer))
+            .with_strip(strip_policy(1, false));
         let mut session = make_session_with_reasoning_turns(4);
 
         let r = policy.apply_boundary(&mut session).await.unwrap();
@@ -1344,8 +1363,172 @@ mod tests {
         let r = policy.apply_boundary(&mut session).await.unwrap();
 
         assert!(r.strip_evaluation.is_none(), "未装配削减策略不跑扫描");
+        assert!(r.strip.is_none(), "未装配削减策略不产出生效值");
         assert!(!r.mutated());
         assert!(r.committed_full_tokens > 0);
         assert!(r.committed_view_tokens > 0);
+    }
+
+    /// enforce 路径：边界真的改写历史，生效值与评估值同源，二次边界幂等。
+    #[tokio::test]
+    async fn test_apply_boundary_enforce_strips_and_reports_outcome() {
+        let policy = CompactionPolicy::new(usize::MAX, 1000, Arc::new(MockSummarizer))
+            .with_strip(strip_policy(1, true));
+        let mut session = make_session_with_reasoning_turns(3);
+        let before = serde_json::to_string(session.committed_turns()).unwrap();
+        let keep_window_before = serde_json::to_string(&session.committed_turns()[2..]).unwrap();
+
+        let r = policy.apply_boundary(&mut session).await.unwrap();
+
+        let strip = r.strip.expect("enforce 必须产出生效值");
+        let eval = r.strip_evaluation.expect("enforce 同时产出评估值");
+        // 同一份扫描：生效值与评估值逐字段一致
+        assert_eq!(strip.changed_items, eval.would_change_items);
+        assert_eq!(strip.released_tokens, eval.would_release_tokens);
+        // scope = 3 − 1 = 2 轮，每轮恰 1 条 reasoning
+        assert_eq!(strip.changed_items, 2);
+        assert!(strip.released_tokens > 0);
+        assert_eq!(strip.skipped_turns, 0);
+        assert!(strip.mutated());
+        assert!(r.mutated(), "生效改写必须触发落盘");
+
+        // 会话真的被改写了，且保留窗（最近 1 轮）逐字节未动
+        let committed = session.committed_turns();
+        assert_ne!(
+            serde_json::to_string(committed).unwrap(),
+            before,
+            "enforce 路径必须改写会话"
+        );
+        assert_eq!(
+            serde_json::to_string(&committed[2..]).unwrap(),
+            keep_window_before,
+            "保留窗轮不受削减影响"
+        );
+        // scope 内 reasoning 已删（I3：轮次结构与 turn_index 不变，只删条目）
+        assert!(
+            committed[0]
+                .iter()
+                .all(|am| !matches!(am.message.as_ref(), InputItem::Reasoning { .. })),
+            "scope 轮的 reasoning 必须被删除"
+        );
+        assert_eq!(committed.len(), 3, "I1：削减不驱逐轮次");
+
+        // 幂等：第二次边界零改写
+        let r2 = policy.apply_boundary(&mut session).await.unwrap();
+        let strip2 = r2.strip.expect("enforce 路径始终产出生效值");
+        assert_eq!(strip2.changed_items, 0, "幂等：二次边界零改写");
+        assert!(!strip2.mutated());
+        assert!(!r2.mutated(), "零改写 + 不折叠 ⇒ 不再落盘");
+    }
+
+    /// 无损不变式（分粒度）：
+    /// (a) 改字段类 —— 存活条目逐条 `trunc2000(transcript_line)` 前后相等；
+    /// (b) 删除类 —— 整轮 `build_transcript` 前后逐字节相等。
+    ///
+    /// 截断（`chars().take(TRANSCRIPT_ITEM_MAX_CHARS)`）在转录组装时发生，
+    /// 两条断言都对截断后的文本比对 —— 长 tool 输出在 2a 不被削减，
+    /// 长参数 FC 的转录行本就不含 arguments，削减后必然恒等。
+    #[test]
+    fn test_strip_apply_is_transcript_lossless() {
+        let mut s = make_session_with_mixed_turns(3);
+        let before: Vec<Vec<crate::session::AnnotatedMessage>> = s.committed_turns().to_vec();
+
+        let caps = StripCaps {
+            strip_reasoning: true,
+            strip_tool_args: true,
+        };
+        let eval = s.strip_stale_content(1, caps, true).unwrap();
+        // scope 2 轮 × (1 条 reasoning + 1 条非空参数 FC)
+        assert_eq!(eval.would_change_items, 4);
+        assert!(eval.would_release_tokens > 0);
+
+        let after = s.committed_turns();
+
+        // (b) turn 级：删除类（reasoning）与改字段类（清参）都不改变轮级转录
+        assert_eq!(
+            build_transcript(&before[..2]),
+            build_transcript(&after[..2]),
+            "削减不得改变 scope 轮的转录"
+        );
+        assert_eq!(
+            build_transcript(&before[2..]),
+            build_transcript(&after[2..]),
+            "保留窗轮的转录恒不变"
+        );
+
+        // (a) per-item：每个存活条目按 id 对齐，截断转录行前后相等
+        let trunc =
+            |line: &str| -> String { line.chars().take(TRANSCRIPT_ITEM_MAX_CHARS).collect() };
+        let before_items: Vec<&crate::session::AnnotatedMessage> =
+            before.iter().flatten().collect();
+        let mut survivors = 0usize;
+        for am in after.iter().flatten() {
+            let orig = before_items
+                .iter()
+                .find(|b| b.id == am.id)
+                .expect("存活条目必须能在削减前找到同 id 对应物");
+            assert_eq!(
+                trunc(&transcript_line(am).unwrap_or_default()),
+                trunc(&transcript_line(orig).unwrap_or_default()),
+                "item {} 的转录行经削减后必须一致",
+                am.id.0
+            );
+            survivors += 1;
+        }
+        // 生效性检查 —— 否则恒等断言在「什么都没削」时也空转通过
+        assert_eq!(
+            survivors,
+            before_items.len() - 2,
+            "scope 内恰删 2 条 reasoning"
+        );
+        let fc_args = after[0].iter().find_map(|am| match am.message.as_ref() {
+            InputItem::FunctionCall { arguments, .. } => Some(arguments.as_str()),
+            _ => None,
+        });
+        assert_eq!(fc_args, Some(""), "FC 参数必须真的被清空");
+    }
+
+    /// 含 reasoning / 长参数 FC / 长 tool 输出的多轮会话 —— 无损不变式夹具。
+    fn make_session_with_mixed_turns(n: usize) -> Session {
+        let mut s = Session::new("test".to_string(), "test".to_string());
+        for i in 0..n {
+            s.start_turn(format!("问题 {i}").into()).unwrap();
+            s.stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::Reasoning {
+                    content: format!("推理 {i}"),
+                },
+            )
+            .unwrap();
+            s.stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::FunctionCall {
+                    call_id: format!("c{i}"),
+                    name: "shell".to_string(),
+                    arguments: format!(r#"{{"cmd":"{}"}}"#, "x".repeat(3000)),
+                },
+            )
+            .unwrap();
+            s.stage_item(
+                MessageSource::ToolExecution {
+                    tool_name: "shell".to_string(),
+                },
+                InputItem::FunctionCallOutput {
+                    call_id: format!("c{i}"),
+                    output: format!("out {}", "y".repeat(3000)).into(),
+                },
+            )
+            .unwrap();
+            s.stage_item(
+                MessageSource::ModelGeneration,
+                InputItem::Message {
+                    role: Role::Assistant,
+                    content: format!("回答 {i}").into(),
+                },
+            )
+            .unwrap();
+            let _ = s.commit_turn().unwrap();
+        }
+        s
     }
 }

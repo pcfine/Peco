@@ -198,8 +198,9 @@ impl LooperHook for ContextShadowHook {
                 .map(|c| c.evicted_turns as i64),
             guard_triggered: reduction.guard_triggered as i64,
             strip_evaluated: strip_evaluated as i64,
-            // 生效削减接入前恒 0 —— shadow 只评估不改写
-            strip_enforced: 0,
+            // 生效值：只认实际改写（shadow 路径无 strip，恒 0）
+            strip_enforced: reduction.strip.as_ref().is_some_and(|s| s.mutated()) as i64,
+            // 评估值：若执行将削减的条数（enforce 时即生效值，同一份扫描）
             stripped_items: stripped_items as i64,
             released_tokens: released_tokens as i64,
             tool_output_items: tool_output_items as i64,
@@ -518,12 +519,25 @@ mod tests {
             committed_full_tokens: 500,
             committed_view_tokens: 120,
             guard_triggered: false,
+            strip: None,
             strip_evaluation: Some(peco_core::agent::StripEvaluation {
                 would_change_items: 3,
                 would_release_tokens: 42,
                 skipped_turns: 1,
             }),
             compaction: None,
+        }
+    }
+
+    /// enforce 生效时 `strip_enforced` 跟随生效值（实际改写才置 1）。
+    fn fixture_reduction_enforced(changed_items: usize) -> BoundaryReduction {
+        BoundaryReduction {
+            strip: Some(peco_core::agent::StripOutcome {
+                changed_items,
+                released_tokens: 42,
+                skipped_turns: 0,
+            }),
+            ..fixture_reduction()
         }
     }
 
@@ -590,6 +604,44 @@ mod tests {
         assert!(
             compaction_rows.is_empty(),
             "观测行不得写进 peco_compaction_log"
+        );
+    }
+
+    /// enforce 生效值：实际改写 → `strip_enforced=1`；零改写 → 0。
+    #[tokio::test]
+    async fn test_shadow_hook_strip_enforced_follows_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+
+        let hook = ContextShadowHook::new(pool.clone(), "u2", "u2-private-session", 12_000, true);
+        let session = shadow_fixture_session();
+        hook.on_boundary_reduction(&session, &fixture_reduction_enforced(3))
+            .await;
+        hook.on_boundary_reduction(&session, &fixture_reduction_enforced(0))
+            .await;
+
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let rows = crate::db::context_shadow::list_by_user(&pool, "u2")
+                    .await
+                    .unwrap();
+                if rows.len() >= 2 {
+                    break rows;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("two shadow rows should appear");
+        // 后台写入顺序不保证 —— 按 strip_enforced 值分类断言
+        let enforced: Vec<i64> = rows.iter().map(|r| r.strip_enforced).collect();
+        assert!(enforced.contains(&1), "实际改写必须置 strip_enforced=1");
+        assert!(enforced.contains(&0), "零改写保持 strip_enforced=0");
+        assert!(
+            rows.iter().all(|r| r.strip_evaluated == 1),
+            "enforce 路径同样产出评估值"
         );
     }
 

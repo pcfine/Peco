@@ -6390,6 +6390,7 @@ mod tests {
                 keep_recent_turns: 1,
                 strip_reasoning: true,
                 strip_tool_args: true,
+                enforce: false,
             }),
         );
         let (config, probe) = boundary_probe_config(policy);
@@ -6436,6 +6437,7 @@ mod tests {
                     keep_recent_turns: 1,
                     strip_reasoning: true,
                     strip_tool_args: true,
+                    enforce: false,
                 }),
         );
         let (config, probe) = boundary_probe_config(policy);
@@ -6470,5 +6472,192 @@ mod tests {
         );
 
         h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// BL-4：strip 生效但本轮不折叠 → `mutated()` → commit 之外二次落盘。
+    #[tokio::test]
+    async fn test_boundary_strip_enforce_repersists_without_fold() {
+        let policy = Arc::new(
+            super::super::compaction::CompactionPolicy::new(
+                usize::MAX,
+                1000,
+                Arc::new(FixedSummarizer),
+            )
+            .with_strip(super::super::compaction::StripPolicy {
+                keep_recent_turns: 1,
+                strip_reasoning: true,
+                strip_tool_args: true,
+                enforce: true,
+            }),
+        );
+        let (config, probe) = boundary_probe_config(policy);
+        let persister = Arc::new(CountingPersister::default());
+        let (h, _provider) = spawn_scripted_looper_with_persister(
+            vec![reasoning_then_text("想想", "ok1"), completed("ok2")],
+            config,
+            Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        );
+
+        // 第 1 轮：scope = 1 − 1 = 0 ⇒ 无可削，无折叠 ⇒ 仅 commit 落盘
+        h.send_query("q1".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok1"),
+            other => panic!("expected success, got {other:?}"),
+        }
+        drain_compacted_until_idle(&h).await;
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            persister.saves.load(Ordering::SeqCst),
+            1,
+            "零改写边界不得二次落盘"
+        );
+
+        // 第 2 轮：scope 覆盖 turn0（含 reasoning）⇒ 削减生效但不折叠 ⇒ 二次落盘
+        h.send_query("q2".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok2"),
+            other => panic!("expected success, got {other:?}"),
+        }
+        let compacted_events = drain_compacted_until_idle(&h).await;
+
+        assert_eq!(compacted_events, 0, "trigger=usize::MAX 不得折叠");
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.boundary_folded.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            probe.boundary_evaluated.load(Ordering::SeqCst),
+            2,
+            "enforce 同样产出评估值（同一份扫描）"
+        );
+        assert_eq!(
+            persister.saves.load(Ordering::SeqCst),
+            3,
+            "每轮 commit 一次 + 削减生效再生效一次"
+        );
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// BL-4：`maybe_compact` 返 Err → looper 不 panic、不额外落盘、
+    /// 仅走 error! 分支，会话照常接下一轮。
+    #[tokio::test]
+    async fn test_boundary_compaction_error_is_nonfatal_no_persist() {
+        let policy = Arc::new(super::super::compaction::CompactionPolicy::new(
+            0,
+            0,
+            Arc::new(FailingBoundarySummarizer),
+        ));
+        let (config, probe) = boundary_probe_config(policy);
+        let persister = Arc::new(CountingPersister::default());
+        let (h, _provider) = spawn_scripted_looper_with_persister(
+            vec![completed("ok1"), completed("ok2"), completed("ok3")],
+            config,
+            Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        );
+
+        // 第 1 轮：evict=0（保底）⇒ Ok(None) ⇒ 钩子照发、无额外落盘
+        h.send_query("q1".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok1"),
+            other => panic!("expected success, got {other:?}"),
+        }
+        drain_compacted_until_idle(&h).await;
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(persister.saves.load(Ordering::SeqCst), 1);
+
+        // 第 2 轮：evict=1 ⇒ 摘要失败（failures=1 < 3）⇒ apply_boundary Err
+        // ⇒ 不 panic、不落盘、不发边界钩子
+        h.send_query("q2".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok2"),
+            other => panic!("expected success, got {other:?}"),
+        }
+        let compacted_events = drain_compacted_until_idle(&h).await;
+        assert_eq!(compacted_events, 0, "折叠失败不得发折叠事件");
+        assert_eq!(
+            probe.boundary_calls.load(Ordering::SeqCst),
+            1,
+            "Err 分支不发边界钩子"
+        );
+        assert_eq!(
+            persister.saves.load(Ordering::SeqCst),
+            2,
+            "折叠失败不得二次落盘（每轮仅 commit 一次）"
+        );
+
+        // 第 3 轮：会话照常继续（failures=2 仍 < 3，依然 Err，依然非致命）
+        h.send_query("q3".into()).await.expect("looper alive");
+        match recv_until_turn_complete(&h).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "ok3"),
+            other => panic!("session must continue after boundary error, got {other:?}"),
+        }
+        drain_compacted_until_idle(&h).await;
+        assert_eq!(persister.saves.load(Ordering::SeqCst), 3);
+        assert_eq!(probe.boundary_calls.load(Ordering::SeqCst), 1);
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// reasoning 块 + 文本块的脚本 —— 给 committed 轮灌入可削减的 Reasoning 条目。
+    fn reasoning_then_text(reason: &str, text: &str) -> Script {
+        Script::Chunks(vec![
+            StreamChunk::BlockStart {
+                index: 0,
+                block_type: model_provider::BlockType::Reasoning,
+            },
+            StreamChunk::ReasoningDelta {
+                index: 0,
+                delta: reason.to_string(),
+            },
+            StreamChunk::BlockEnd {
+                index: 0,
+                block: ContentBlock::Reasoning {
+                    text: reason.to_string(),
+                },
+            },
+            StreamChunk::BlockStart {
+                index: 1,
+                block_type: model_provider::BlockType::Text,
+            },
+            StreamChunk::TextDelta {
+                index: 1,
+                delta: text.to_string(),
+            },
+            StreamChunk::BlockEnd {
+                index: 1,
+                block: ContentBlock::Text {
+                    text: text.to_string(),
+                },
+            },
+            StreamChunk::Usage {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    total_tokens: 30,
+                },
+            },
+            StreamChunk::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])
+    }
+
+    /// 恒失败摘要器 —— 驱动 `maybe_compact` 返 Err（连续失败 < 3 次的窗口）。
+    struct FailingBoundarySummarizer;
+
+    #[async_trait::async_trait]
+    impl super::super::compaction::TurnSummarizer for FailingBoundarySummarizer {
+        async fn summarize(
+            &self,
+            _previous: Option<&str>,
+            _evicted: &str,
+        ) -> Result<String, AgentError> {
+            Err(AgentError::Compaction(
+                "summary generation failed".to_string(),
+            ))
+        }
+
+        async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
+            unimplemented!("boundary tests never compose turn epilogues")
+        }
     }
 }

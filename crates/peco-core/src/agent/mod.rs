@@ -24,8 +24,8 @@ pub use agent_manager::AgentManager;
 pub use agent_manager::AgentMeta;
 pub use compaction::{
     BoundaryReduction, CompactionOutcome, CompactionPolicy, ModelSummarizer, SUMMARY_CLOSE,
-    SUMMARY_OPEN, StripEvaluation, StripPolicy, TRANSCRIPT_ITEM_MAX_CHARS, TurnSummarizer,
-    strip_summary_wrapper,
+    SUMMARY_OPEN, StripEvaluation, StripOutcome, StripPolicy, TRANSCRIPT_ITEM_MAX_CHARS,
+    TurnSummarizer, strip_summary_wrapper,
 };
 pub use context::{
     estimate_item_tokens, estimate_str_tokens, estimate_viewable_item_tokens, is_viewable_item,

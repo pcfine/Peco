@@ -90,13 +90,14 @@ impl PecoManager {
             config.compaction_keep_recent_tokens,
             summarizer,
         );
-        // shadow 观测 gate：开启时装配削减策略（只评估不改写），
-        // 关闭时不扫描 —— 压缩路径与引入观测前逐字节一致
-        if config.strip.shadow {
+        // shadow 或 enforce 任一开启即装配削减策略（shadow 只评估、enforce 就地改写），
+        // 两者都关时不扫描 —— 压缩路径与引入观测前逐字节一致
+        if config.strip.shadow || config.strip.enforce {
             policy = policy.with_strip(StripPolicy {
                 keep_recent_turns: config.strip.keep_recent_turns,
                 strip_reasoning: config.strip.strip_reasoning,
                 strip_tool_args: config.strip.strip_tool_args,
+                enforce: config.strip.enforce,
             });
         }
         config.compaction = Some(Arc::new(policy));
@@ -146,7 +147,8 @@ impl PecoManager {
                 user_id,
                 super::session::private_session_id(user_id),
                 config.history_token_budget,
-                config.strip.shadow,
+                // enforce 生效时同样要落观测行（生效值随行入库）
+                config.strip.shadow || config.strip.enforce,
             )));
 
         // ── 5.7 启动通道：每用户一次对账 + 每进程一次保留期清理 ─────────
