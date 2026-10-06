@@ -202,12 +202,18 @@ impl SimpleAgentLooper {
             // 若直接按「无 tool_calls → 返回 text」处理，子 agent 会**静默返回
             // 空串**（`@memory` `[ORGANIZE]` 的真实故障），既无重试也无归因。
             if response.status != ResponseStatus::Completed {
-                // 截断重试：抬输出预算重发一次。仅在还有迭代余量时重发 ——
-                // 否则状态机刚回到循环顶就撞 MaxIterations，把「截断」这个
-                // 真实原因换成「超出迭代次数」，诊断反而变差。
+                // 截断重试：抬输出预算重发一次。两个前提缺一不可——
+                // ① 「抬得动」：当前生效预算（一次性覆盖 → agent 配置 → 未设按 0）
+                //    已达抬升目标时，重发与上一次逐字节相同，必然同样截断，纯白烧
+                //    一次调用。判据与 `AgentLooper::can_retry` 第 4 条一致。
+                // ② 还有迭代余量：否则状态机刚回到循环顶就撞 MaxIterations，把
+                //    「截断」这个真实原因换成「超出迭代次数」，诊断反而变差。
+                let effective_budget = output_budget_override
+                    .or(self.agent.model_config().max_tokens)
+                    .unwrap_or(0);
                 if response.status == ResponseStatus::Incomplete
                     && matches!(response.finish_reason, Some(FinishReason::MaxTokens))
-                    && output_budget_override.is_none()
+                    && effective_budget < SUB_AGENT_TRUNCATION_RETRY_BUDGET
                     && self.react_loop_iteration < self.max_iterations
                 {
                     tracing::warn!(
@@ -692,6 +698,14 @@ mod tests {
     }
 
     fn scripted_agent(scripts: Vec<GenerateResult>) -> (Arc<Agent>, Arc<ScriptedBatchProvider>) {
+        scripted_agent_with_max_tokens(scripts, None)
+    }
+
+    /// 同 [`scripted_agent`]，但给 agent 的 `llm:` 显式配置 `max_tokens`。
+    fn scripted_agent_with_max_tokens(
+        scripts: Vec<GenerateResult>,
+        max_tokens: Option<u32>,
+    ) -> (Arc<Agent>, Arc<ScriptedBatchProvider>) {
         let profile: crate::agent::AgentProfile = serde_yaml::from_str(
             "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
         )
@@ -699,14 +713,16 @@ mod tests {
         let executor: Arc<dyn crate::tools::ToolExecutor> =
             Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
         let provider = Arc::new(ScriptedBatchProvider::new(scripts));
+        let mut llm = crate::agent::ModelConfigBuilder::new().stream(false);
+        if let Some(tokens) = max_tokens {
+            llm = llm.max_tokens(tokens);
+        }
         let agent = Arc::new(Agent::from_parts(
             std::path::PathBuf::from("/tmp/agent.md"),
             profile,
             "sys".to_string(),
             Arc::clone(&provider) as Arc<dyn model_provider::ModelProvider>,
-            crate::agent::ModelConfigBuilder::new()
-                .stream(false)
-                .build(),
+            llm.build(),
             Arc::clone(&executor),
             Arc::new(crate::mcp::McpManager::empty(executor)),
             None,
@@ -746,6 +762,29 @@ mod tests {
             provider.budgets(),
             vec![None, Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET)],
             "抬过一次后不得再重发"
+        );
+    }
+
+    /// agent 自身已配置 `max_tokens` ≥ 抬升目标：抬不动 ⇒ 不重发（逐字节相同），
+    /// 首次截断即报错，且只发生一次模型调用。镜像 `AgentLooper::can_retry` 第 4 条。
+    #[tokio::test]
+    async fn test_truncation_no_retry_when_budget_at_ceiling() {
+        let (agent, provider) = scripted_agent_with_max_tokens(
+            vec![truncated()],
+            Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET),
+        );
+        let err = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await
+            .expect_err("预算已到抬升目标，抬不动，必须直接报错");
+        assert!(
+            err.to_string().contains("not completed"),
+            "错误须指向响应未完成；实际 {err}"
+        );
+        assert_eq!(
+            provider.budgets(),
+            vec![Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET)],
+            "预算已达抬升目标，不得重发（否则请求逐字节相同、白烧一次调用）"
         );
     }
 
