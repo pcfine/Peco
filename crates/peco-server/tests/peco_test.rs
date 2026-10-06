@@ -200,7 +200,7 @@ async fn test_session_snapshot_includes_context_metrics() {
     assert!(metrics["pinned_summary_tokens"].as_u64().unwrap() > 0);
     // 阈值口径：与默认配置一致
     assert_eq!(metrics["history_token_budget"], 128_000);
-    assert_eq!(metrics["compaction_trigger_tokens"], 256_000);
+    assert_eq!(metrics["compaction_trigger_tokens"], 384_000);
     // 尚无压缩发生
     assert_eq!(metrics["compaction_count"], 0);
 }

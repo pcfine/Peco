@@ -27,14 +27,20 @@ pub struct PecoConfig {
     ///
     /// 取代早期的 `max_history_messages` 消息条数窗口 — 中文场景下
     /// 按条数截断的 token 波动过大，预算控制必须基于校准 token 估算。
+    ///
+    /// 默认值可用 env `PECO_HISTORY_TOKEN_BUDGET` 覆盖（[`Self::from_env`]）。
     pub history_token_budget: usize,
     /// 上下文滚动压缩触发阈值（估算 token）。
     ///
     /// 口径：pinned 摘要 + 全部 committed 轮的**全量** token
     /// （含 tool 输出与 reasoning）。与 [`Self::history_token_budget`]
     /// 的「仅 viewable 文本」口径不同。
+    ///
+    /// 默认值可用 env `PECO_COMPACTION_TRIGGER_TOKENS` 覆盖（[`Self::from_env`]）。
     pub compaction_trigger_tokens: usize,
     /// 压缩后 verbatim 保留区目标 token。
+    ///
+    /// 默认值可用 env `PECO_COMPACTION_KEEP_RECENT_TOKENS` 覆盖（[`Self::from_env`]）。
     pub compaction_keep_recent_tokens: usize,
     /// 摘要模型名（Flash 档，低延迟低成本）。
     ///
@@ -80,15 +86,44 @@ pub struct PecoConfig {
     pub hooks: Vec<Arc<dyn LooperHook>>,
 }
 
+// ── 三个 token 预算的环境变量入口 ─────────────────────────────
+//
+// 未暴露给 env 的字段（`event_buffer` / `summarizer_model`）只能改默认值。
+
+/// 历史轮 verbatim 保留区预算（见 [`PecoConfig::history_token_budget`]）。
+pub const ENV_HISTORY_TOKEN_BUDGET: &str = "PECO_HISTORY_TOKEN_BUDGET";
+/// 上下文滚动压缩触发阈值（见 [`PecoConfig::compaction_trigger_tokens`]）。
+pub const ENV_COMPACTION_TRIGGER_TOKENS: &str = "PECO_COMPACTION_TRIGGER_TOKENS";
+/// 压缩后 verbatim 保留区目标（见 [`PecoConfig::compaction_keep_recent_tokens`]）。
+pub const ENV_COMPACTION_KEEP_RECENT_TOKENS: &str = "PECO_COMPACTION_KEEP_RECENT_TOKENS";
+
 impl Default for PecoConfig {
     fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl PecoConfig {
+    /// 从环境变量读取三个 token 预算，未设置的字段取本文件中的字面默认。
+    ///
+    /// 与 `ConsolidationConfig::from_env` 同范式：读取内核可注入，
+    /// 便于在不触碰进程 env 的前提下单测。
+    pub fn from_env() -> Self {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+
+    fn from_env_with<F: Fn(&str) -> Option<String>>(get: F) -> Self {
         // 重试四字段的默认值委托 from_env —— env 读取单点在 peco-core。
         let retry = LooperConfig::from_env();
         Self {
             event_buffer: 256,
-            history_token_budget: 128_000,
-            compaction_trigger_tokens: 256_000,
-            compaction_keep_recent_tokens: 96_000,
+            history_token_budget: env_parse(&get, ENV_HISTORY_TOKEN_BUDGET, 128_000),
+            compaction_trigger_tokens: env_parse(&get, ENV_COMPACTION_TRIGGER_TOKENS, 384_000),
+            compaction_keep_recent_tokens: env_parse(
+                &get,
+                ENV_COMPACTION_KEEP_RECENT_TOKENS,
+                128_000,
+            ),
             summarizer_model: "deepseek-v4-flash".to_string(),
             memory: MemoryConfig::from_env(),
             retry_limit: retry.retry_limit,
@@ -125,5 +160,69 @@ impl PecoConfig {
             retry_max_delay_ms: self.retry_max_delay_ms,
             ..LooperConfig::from_env()
         }
+    }
+}
+
+/// 读一个数值环境变量：缺失取默认值，写错告警后取默认值。
+///
+/// 与 `memory::config` 的同名辅助函数同语义 —— 解析失败不静默吞，
+/// 「值写错却看起来生效了」是最难查的配置问题。
+fn env_parse<T: std::str::FromStr, F: Fn(&str) -> Option<String>>(
+    get: &F,
+    name: &str,
+    default: T,
+) -> T {
+    match get(name) {
+        Some(raw) => match raw.trim().parse() {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!(
+                    variable = name,
+                    value = %raw,
+                    "Invalid numeric env var; using default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn token_budgets_use_defaults_when_env_absent() {
+        let cfg = PecoConfig::from_env_with(env_of(&[]));
+        assert_eq!(cfg.history_token_budget, 128_000);
+        assert_eq!(cfg.compaction_trigger_tokens, 384_000);
+        assert_eq!(cfg.compaction_keep_recent_tokens, 128_000);
+    }
+
+    #[test]
+    fn token_budgets_read_env_overrides() {
+        let cfg = PecoConfig::from_env_with(env_of(&[
+            (ENV_HISTORY_TOKEN_BUDGET, "200000"),
+            (ENV_COMPACTION_TRIGGER_TOKENS, "500000"),
+            (ENV_COMPACTION_KEEP_RECENT_TOKENS, "150000"),
+        ]));
+        assert_eq!(cfg.history_token_budget, 200_000);
+        assert_eq!(cfg.compaction_trigger_tokens, 500_000);
+        assert_eq!(cfg.compaction_keep_recent_tokens, 150_000);
+    }
+
+    #[test]
+    fn token_budget_invalid_env_falls_back_to_default() {
+        let cfg = PecoConfig::from_env_with(env_of(&[(ENV_COMPACTION_TRIGGER_TOKENS, "abc")]));
+        assert_eq!(cfg.compaction_trigger_tokens, 384_000);
     }
 }
