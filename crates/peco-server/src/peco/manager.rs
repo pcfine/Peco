@@ -97,6 +97,7 @@ impl PecoManager {
                 keep_recent_turns: config.strip.keep_recent_turns,
                 strip_reasoning: config.strip.strip_reasoning,
                 strip_tool_args: config.strip.strip_tool_args,
+                tool_output_max_chars: config.strip.tool_output_max_chars,
                 enforce: config.strip.enforce,
             });
         }
@@ -149,6 +150,8 @@ impl PecoManager {
                 config.history_token_budget,
                 // enforce 生效时同样要落观测行（生效值随行入库）
                 config.strip.shadow || config.strip.enforce,
+                // 超限观测与削减同用配置的截断上限
+                config.strip.tool_output_max_chars,
             )));
 
         // ── 5.7 启动通道：每用户一次对账 + 每进程一次保留期清理 ─────────

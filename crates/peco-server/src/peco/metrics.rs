@@ -15,9 +15,7 @@
 use async_trait::async_trait;
 use model_provider::{Content, ContentPart, InputItem};
 use peco_core::agent::hooks::LooperHook;
-use peco_core::agent::{
-    BoundaryReduction, CompactionOutcome, TRANSCRIPT_ITEM_MAX_CHARS, estimate_item_tokens,
-};
+use peco_core::agent::{BoundaryReduction, CompactionOutcome, estimate_item_tokens};
 use peco_core::session::{Session, SessionSnapshot};
 use sqlx::SqlitePool;
 use tracing::warn;
@@ -95,6 +93,8 @@ pub struct ContextShadowHook {
     conversation_id: String,
     history_token_budget: usize,
     enabled: bool,
+    /// 工具输出截断上限（与削减同源的配置值）；`0` = 关闭，超限计数恒 0。
+    tool_output_max_chars: usize,
 }
 
 impl ContextShadowHook {
@@ -103,12 +103,14 @@ impl ContextShadowHook {
     /// * `history_token_budget` — 与 filter 同源的 Verbatim 窗口预算
     ///   （`view_window_tokens` 列 = 该预算下的连续窗口 view 口径）
     /// * `enabled` — shadow gate；`false` 时钩子不写任何行
+    /// * `tool_output_max_chars` — 「超上限输出」计数的判据，与削减同一配置值
     pub fn new(
         pool: SqlitePool,
         user_id: impl Into<String>,
         conversation_id: impl Into<String>,
         history_token_budget: usize,
         enabled: bool,
+        tool_output_max_chars: usize,
     ) -> Self {
         Self {
             pool,
@@ -116,6 +118,7 @@ impl ContextShadowHook {
             conversation_id: conversation_id.into(),
             history_token_budget,
             enabled,
+            tool_output_max_chars,
         }
     }
 }
@@ -141,7 +144,9 @@ impl LooperHook for ContextShadowHook {
             for am in turn {
                 if let InputItem::FunctionCallOutput { output, .. } = am.message.as_ref() {
                     tool_output_items += 1;
-                    if output.text_view().chars().count() > TRANSCRIPT_ITEM_MAX_CHARS {
+                    if self.tool_output_max_chars > 0
+                        && output.text_view().chars().count() > self.tool_output_max_chars
+                    {
                         tool_output_over_cap += 1;
                     }
                     if matches!(output, Content::Parts(_)) && !output.is_plain_text() {
@@ -285,6 +290,7 @@ pub fn estimate_session_context(
 mod tests {
     use super::*;
     use model_provider::{Content, ContentPart, InputItem, Role};
+    use peco_core::agent::TRANSCRIPT_ITEM_MAX_CHARS;
     use peco_core::session::{AnnotatedMessage, MessageId, MessageSource};
 
     fn annotated(turn: usize, item: InputItem) -> AnnotatedMessage {
@@ -549,7 +555,14 @@ mod tests {
         let pool = crate::db::connect(&url).await.unwrap();
         crate::db::run_migrations(&pool).await.unwrap();
 
-        let hook = ContextShadowHook::new(pool.clone(), "u1", "u1-private-session", 12_000, true);
+        let hook = ContextShadowHook::new(
+            pool.clone(),
+            "u1",
+            "u1-private-session",
+            12_000,
+            true,
+            TRANSCRIPT_ITEM_MAX_CHARS,
+        );
         let session = shadow_fixture_session();
         hook.on_boundary_reduction(&session, &fixture_reduction())
             .await;
@@ -585,7 +598,7 @@ mod tests {
         assert_eq!(row.strip_enforced, 0, "shadow 只评估不改写");
         assert_eq!(row.stripped_items, 3);
         assert_eq!(row.released_tokens, 42);
-        // tool 观测：2 条输出，其中 2500 字符的一条超 2000 上限
+        // tool 观测：2 条输出，其中 2500 字符的一条超配置上限（此处传 2000）
         assert_eq!(row.tool_output_items, 2);
         assert_eq!(row.tool_output_over_cap, 1);
         // 图片观测：1 条 Parts 含图，data URI 15 字节
@@ -615,7 +628,14 @@ mod tests {
         let pool = crate::db::connect(&url).await.unwrap();
         crate::db::run_migrations(&pool).await.unwrap();
 
-        let hook = ContextShadowHook::new(pool.clone(), "u2", "u2-private-session", 12_000, true);
+        let hook = ContextShadowHook::new(
+            pool.clone(),
+            "u2",
+            "u2-private-session",
+            12_000,
+            true,
+            TRANSCRIPT_ITEM_MAX_CHARS,
+        );
         let session = shadow_fixture_session();
         hook.on_boundary_reduction(&session, &fixture_reduction_enforced(3))
             .await;
@@ -645,6 +665,38 @@ mod tests {
         );
     }
 
+    /// 上限 0（关闭）时超限计数恒 0 —— 观测口径与削减开关一致。
+    #[tokio::test]
+    async fn test_shadow_hook_tool_output_cap_off_counts_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+
+        let hook =
+            ContextShadowHook::new(pool.clone(), "u3", "u3-private-session", 12_000, true, 0);
+        let session = shadow_fixture_session();
+        hook.on_boundary_reduction(&session, &fixture_reduction())
+            .await;
+
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let rows = crate::db::context_shadow::list_by_user(&pool, "u3")
+                    .await
+                    .unwrap();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shadow row should appear in background");
+        // 夹具仍有 2 条输出，但上限关闭 ⇒ 超限计数恒 0
+        assert_eq!(rows[0].tool_output_items, 2);
+        assert_eq!(rows[0].tool_output_over_cap, 0, "cap=0 ⇒ 超限计数关闭");
+    }
+
     /// gate 关闭时不落任何观测行。
     #[tokio::test]
     async fn test_shadow_hook_gate_off_writes_nothing() {
@@ -653,7 +705,14 @@ mod tests {
         let pool = crate::db::connect(&url).await.unwrap();
         crate::db::run_migrations(&pool).await.unwrap();
 
-        let hook = ContextShadowHook::new(pool.clone(), "u1", "u1-private-session", 12_000, false);
+        let hook = ContextShadowHook::new(
+            pool.clone(),
+            "u1",
+            "u1-private-session",
+            12_000,
+            false,
+            TRANSCRIPT_ITEM_MAX_CHARS,
+        );
         let session = shadow_fixture_session();
         hook.on_boundary_reduction(&session, &fixture_reduction())
             .await;

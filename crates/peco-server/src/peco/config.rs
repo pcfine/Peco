@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use peco_core::agent::hooks::LooperHook;
 use peco_core::agent::{
-    CompactionPolicy, DynamicContext, LooperConfig, MessageFilter, TurnSummarizer,
+    CompactionPolicy, DynamicContext, LooperConfig, MessageFilter, TRANSCRIPT_ITEM_MAX_CHARS,
+    TRANSCRIPT_TOOL_OUTPUT_MIN_CAP, TurnSummarizer,
 };
+use tracing::warn;
 
 use super::memory::MemoryConfig;
 
@@ -109,6 +111,9 @@ pub const ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS: &str = "PECO_COMPACTION_STRIP_
 pub const ENV_COMPACTION_STRIP_REASONING: &str = "PECO_COMPACTION_STRIP_REASONING";
 /// 削减范围：工具调用参数（见 [`CompactionStripConfig::strip_tool_args`]）。
 pub const ENV_COMPACTION_STRIP_TOOL_ARGS: &str = "PECO_COMPACTION_STRIP_TOOL_ARGS";
+/// 工具输出截断上限（见 [`CompactionStripConfig::tool_output_max_chars`]）。
+pub const ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS: &str =
+    "PECO_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS";
 /// 生效开关（见 [`CompactionStripConfig::enforce`]）。
 pub const ENV_COMPACTION_STRIP_ENFORCE: &str = "PECO_COMPACTION_STRIP_ENFORCE";
 /// 边界观测表保留期（见 [`CompactionStripConfig::retention_days`]）。
@@ -129,6 +134,11 @@ pub struct CompactionStripConfig {
     pub strip_reasoning: bool,
     /// 削减范围：清空历史工具调用参数。
     pub strip_tool_args: bool,
+    /// 历史工具输出截断上限（字符数）：`0` = 关闭。
+    ///
+    /// 非 0 时不小于转录下界（削后行才不短于单条上限），违规值在读取端
+    /// 回退默认。
+    pub tool_output_max_chars: usize,
     /// 生效开关：`true` 时边界上就地改写历史；`false`（默认）只评估观测，
     /// legacy 路径行为与不引入削减时逐字节一致。
     pub enforce: bool,
@@ -143,6 +153,7 @@ impl Default for CompactionStripConfig {
             keep_recent_turns: 4,
             strip_reasoning: true,
             strip_tool_args: true,
+            tool_output_max_chars: TRANSCRIPT_ITEM_MAX_CHARS,
             enforce: false,
             retention_days: 30,
         }
@@ -182,6 +193,11 @@ impl PecoConfig {
                 keep_recent_turns: env_parse(&get, ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, 4),
                 strip_reasoning: env_bool(&get, ENV_COMPACTION_STRIP_REASONING, true),
                 strip_tool_args: env_bool(&get, ENV_COMPACTION_STRIP_TOOL_ARGS, true),
+                tool_output_max_chars: clamp_tool_output_cap(env_parse(
+                    &get,
+                    ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
+                    TRANSCRIPT_ITEM_MAX_CHARS,
+                )),
                 enforce: env_bool(&get, ENV_COMPACTION_STRIP_ENFORCE, false),
                 retention_days: env_parse(&get, ENV_COMPACTION_CONTEXT_SHADOW_RETENTION_DAYS, 30),
             },
@@ -270,6 +286,22 @@ fn env_bool<F: Fn(&str) -> Option<String>>(get: &F, name: &str, default: bool) -
     }
 }
 
+/// 校验工具输出截断上限：`0` = 关闭（合法）；非 0 必须不小于转录下界 ——
+/// 低于下界时削后转录行短于单条上限、无损等式失配，回退默认。
+fn clamp_tool_output_cap(value: usize) -> usize {
+    if value != 0 && value < TRANSCRIPT_TOOL_OUTPUT_MIN_CAP {
+        warn!(
+            variable = ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
+            value,
+            min = TRANSCRIPT_TOOL_OUTPUT_MIN_CAP,
+            "Tool output strip cap below transcript bound; using default"
+        );
+        TRANSCRIPT_ITEM_MAX_CHARS
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,8 +347,52 @@ mod tests {
         assert_eq!(cfg.strip.keep_recent_turns, 4);
         assert!(cfg.strip.strip_reasoning);
         assert!(cfg.strip.strip_tool_args);
+        assert_eq!(
+            cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS,
+            "默认上限与转录单条上限同源"
+        );
         assert!(!cfg.strip.enforce, "默认必须 legacy：只评估不改写");
         assert_eq!(cfg.strip.retention_days, 30);
+    }
+
+    #[test]
+    fn strip_tool_output_cap_clamps_below_bound() {
+        // 显式关闭合法
+        let cfg =
+            PecoConfig::from_env_with(env_of(&[(ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS, "0")]));
+        assert_eq!(cfg.strip.tool_output_max_chars, 0);
+
+        // 合法放大：≥ 下界即通过
+        let cfg = PecoConfig::from_env_with(env_of(&[(
+            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
+            "4000",
+        )]));
+        assert_eq!(cfg.strip.tool_output_max_chars, 4000);
+
+        // 恰在下界：通过
+        let bound = TRANSCRIPT_TOOL_OUTPUT_MIN_CAP.to_string();
+        let cfg = PecoConfig::from_env_with(env_of(&[(
+            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
+            bound.as_str(),
+        )]));
+        assert_eq!(
+            cfg.strip.tool_output_max_chars,
+            TRANSCRIPT_TOOL_OUTPUT_MIN_CAP
+        );
+
+        // 低于下界：回退默认（非 0 保底）
+        let cfg = PecoConfig::from_env_with(env_of(&[(
+            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
+            "100",
+        )]));
+        assert_eq!(cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS);
+
+        // 写错取默认
+        let cfg = PecoConfig::from_env_with(env_of(&[(
+            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
+            "abc",
+        )]));
+        assert_eq!(cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS);
     }
 
     #[test]

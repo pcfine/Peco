@@ -6390,6 +6390,7 @@ mod tests {
                 keep_recent_turns: 1,
                 strip_reasoning: true,
                 strip_tool_args: true,
+                tool_output_max_chars: 0,
                 enforce: false,
             }),
         );
@@ -6437,6 +6438,7 @@ mod tests {
                     keep_recent_turns: 1,
                     strip_reasoning: true,
                     strip_tool_args: true,
+                    tool_output_max_chars: 0,
                     enforce: false,
                 }),
         );
@@ -6487,6 +6489,7 @@ mod tests {
                 keep_recent_turns: 1,
                 strip_reasoning: true,
                 strip_tool_args: true,
+                tool_output_max_chars: 0,
                 enforce: true,
             }),
         );

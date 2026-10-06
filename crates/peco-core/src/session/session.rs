@@ -18,7 +18,7 @@ use super::types::{
     AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, merge_contents,
     unix_timestamp_ms, unix_timestamp_secs,
 };
-use crate::agent::estimate_item_tokens;
+use crate::agent::{estimate_item_tokens, estimate_str_tokens};
 
 /// 悬空 tool_call 的合成结果文案。
 ///
@@ -40,6 +40,11 @@ pub struct StripCaps {
     pub strip_reasoning: bool,
     /// 清空历史工具调用参数（参数同样不进模型历史）。
     pub strip_tool_args: bool,
+    /// 历史工具输出截断上限（字符数）；`0` = 关闭。
+    ///
+    /// 只截 `Content::Text`：`Content::Parts`（图文混排）整条跳过 ——
+    /// `text_view` 拼接出的视图无法无损写回 Parts 原结构。
+    pub tool_output_max_chars: usize,
 }
 
 /// 削减的评估值（只算不做）。
@@ -48,7 +53,7 @@ pub struct StripCaps {
 /// 计数即实际生效值，二者天然同源，不存在对不上的可能。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StripEvaluation {
-    /// 若执行将被改写的条目数（删除或清空都算改写）。
+    /// 若执行将被改写的条目数（删除、清空或截断都算改写）。
     pub would_change_items: usize,
     /// 若执行将释放的估算 token。
     pub would_release_tokens: usize,
@@ -63,7 +68,7 @@ pub struct StripEvaluation {
 /// 差别只在语义 —— 评估是「若执行将…」，生效是「已执行了…」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StripOutcome {
-    /// 实际被改写的条目数（删除或清空都算改写）。
+    /// 实际被改写的条目数（删除、清空或截断都算改写）。
     pub changed_items: usize,
     /// 实际释放的估算 token。
     pub released_tokens: usize,
@@ -93,6 +98,26 @@ fn hit_tool_args(item: &InputItem, caps: StripCaps) -> bool {
             item,
             InputItem::FunctionCall { arguments, .. } if !arguments.is_empty()
         )
+}
+
+/// 改字段类命中：该工具输出文本超出截断上限，可截到上限。
+///
+/// 只对 `Content::Text` 命中 —— `Content::Parts` 的 `text_view` 拼接视图
+/// 无法无损写回原结构，整条跳过。
+fn hit_tool_output(item: &InputItem, caps: StripCaps) -> bool {
+    caps.tool_output_max_chars > 0
+        && matches!(
+            item,
+            InputItem::FunctionCallOutput {
+                output: Content::Text(text),
+                ..
+            } if text.chars().count() > caps.tool_output_max_chars
+        )
+}
+
+/// 按字符截到上限 —— 与转录逐条截断（`chars().take`）同一单位。
+fn truncate_tool_output(text: &str, cap: usize) -> String {
+    text.chars().take(cap).collect()
 }
 
 /// 会话实体。
@@ -808,6 +833,8 @@ impl Session {
     /// - 若某轮将被整轮删空（仅由 reasoning 构成），整轮跳过并计入
     ///   `skipped_turns` —— committed 轮不保证以 User 开头，「每轮非空」是
     ///   持久化与展示的底线
+    /// - 工具输出只截 `Content::Text` 且只在超上限时截；`Content::Parts`
+    ///   整条跳过 —— 文本视图无法无损写回 Parts 原结构
     /// - 改写只动 `message` 内容：条目 id / timestamp / source / turn_index
     ///   与轮次结构（除被删条目外）保持不变
     pub fn strip_stale_content(
@@ -843,6 +870,17 @@ impl Session {
                     changes += 1;
                     // input_item_text 对 FunctionCall 只取 arguments，清空即全释放
                     released += estimate_item_tokens(&am.message);
+                } else if hit_tool_output(item, caps) {
+                    changes += 1;
+                    // 只释放被截掉的尾部：input_item_text 对该条取 output 全文
+                    if let InputItem::FunctionCallOutput {
+                        output: Content::Text(text),
+                        ..
+                    } = item
+                    {
+                        let kept = truncate_tool_output(text, caps.tool_output_max_chars);
+                        released += estimate_str_tokens(text) - estimate_str_tokens(&kept);
+                    }
                 }
             }
             // 整轮皆为待删 reasoning ⇒ 删完即空，跳过以保住「每轮非空」。
@@ -864,6 +902,14 @@ impl Session {
                             Arc::make_mut(&mut am.message)
                     {
                         arguments.clear();
+                    }
+                    if hit_tool_output(am.message.as_ref(), caps)
+                        && let InputItem::FunctionCallOutput {
+                            output: Content::Text(text),
+                            ..
+                        } = Arc::make_mut(&mut am.message)
+                    {
+                        *text = truncate_tool_output(text, caps.tool_output_max_chars);
                     }
                 }
             }
@@ -2306,6 +2352,8 @@ mod tests {
     const ALL_CAPS: StripCaps = StripCaps {
         strip_reasoning: true,
         strip_tool_args: true,
+        // 全能力含输出截断；夹具的输出都短于上限，不触发截断
+        tool_output_max_chars: crate::agent::TRANSCRIPT_ITEM_MAX_CHARS,
     };
 
     #[test]
@@ -2379,6 +2427,7 @@ mod tests {
         let off = StripCaps {
             strip_reasoning: false,
             strip_tool_args: false,
+            tool_output_max_chars: 0,
         };
         assert_eq!(
             s.strip_stale_content(0, off, false).unwrap(),
@@ -2389,6 +2438,7 @@ mod tests {
         let reasoning_only = StripCaps {
             strip_reasoning: true,
             strip_tool_args: false,
+            tool_output_max_chars: 0,
         };
         let eval = s.strip_stale_content(0, reasoning_only, false).unwrap();
         assert_eq!(eval.would_change_items, 1);
@@ -2444,7 +2494,7 @@ mod tests {
         assert_eq!(arguments, "", "apply=true 必须真的清空参数");
         assert!(
             matches!(t0[2].message.as_ref(), InputItem::FunctionCallOutput { .. }),
-            "tool 输出不属 2a 削减对象"
+            "短 tool 输出不超截断上限，条目原样保留"
         );
 
         // 身份不变：存活条目（reasoning 已删）逐条比对 id / timestamp / turn_index / source
@@ -2480,6 +2530,7 @@ mod tests {
         let off = StripCaps {
             strip_reasoning: false,
             strip_tool_args: false,
+            tool_output_max_chars: 0,
         };
         let before = serde_json::to_string(s.committed_turns()).unwrap();
         let eval3 = s.strip_stale_content(1, off, true).unwrap();
@@ -2544,5 +2595,130 @@ mod tests {
             ),
             "整轮跳过 ⇒ 条目原样保留"
         );
+    }
+
+    // ── strip_stale_content（工具输出截断）─────────────────────────────
+
+    /// 超上限的 `Content::Text` 工具输出：评估先于改写、截到上限后幂等，
+    /// 头部内容与条目身份不变。
+    #[test]
+    fn strip_apply_truncates_long_tool_output_and_stays_idempotent() {
+        let mut s = session_with_turns(vec![
+            vec![
+                user("查日志"),
+                tool("c1", format!("HEAD{}", "甲".repeat(2500))),
+                assistant("看完了"),
+            ],
+            vec![user("最新"), assistant("不动")],
+        ]);
+        let output_only = StripCaps {
+            strip_reasoning: false,
+            strip_tool_args: false,
+            tool_output_max_chars: 2000,
+        };
+        let identity = (
+            s.committed_turns()[0][1].id.0,
+            s.committed_turns()[0][1].turn_index,
+        );
+        let out_of_scope_before = serde_json::to_string(&s.committed_turns()[1]).unwrap();
+
+        // 评估路径：只算不改
+        let before = serde_json::to_string(s.committed_turns()).unwrap();
+        let eval = s.strip_stale_content(1, output_only, false).unwrap();
+        assert_eq!(eval.would_change_items, 1, "超上限输出恰 1 条");
+        assert!(eval.would_release_tokens > 0, "被截掉的尾部必须计入释放");
+        assert_eq!(
+            serde_json::to_string(s.committed_turns()).unwrap(),
+            before,
+            "评估不得改写会话内容"
+        );
+
+        // 生效路径：截到上限
+        let eval = s.strip_stale_content(1, output_only, true).unwrap();
+        assert_eq!(eval.would_change_items, 1);
+        let OutputProbe {
+            text,
+            id,
+            turn_index,
+        } = probe_scope_output(&s);
+        assert_eq!(text.chars().count(), 2000, "必须恰好截到上限");
+        assert!(text.starts_with("HEAD"), "头部内容必须保留");
+        assert_eq!((id, turn_index), identity, "I8：身份保真");
+        assert_eq!(
+            serde_json::to_string(&s.committed_turns()[1]).unwrap(),
+            out_of_scope_before,
+            "保留窗轮恒不动"
+        );
+        assert_eq!(s.committed_turns().len(), 2, "I1：不驱逐轮次");
+
+        // 幂等：二次 apply 零改写
+        let eval2 = s.strip_stale_content(1, output_only, true).unwrap();
+        assert_eq!(eval2.would_change_items, 0);
+        assert_eq!(eval2.would_release_tokens, 0);
+    }
+
+    /// `Content::Parts`（图文混排）整条跳过 —— 文本视图无法无损写回原结构。
+    #[test]
+    fn strip_apply_skips_tool_output_parts_whole() {
+        let parts = Content::Parts(vec![
+            ContentPart::Text {
+                text: "丙".repeat(2500),
+            },
+            ContentPart::Image {
+                url: "data:image/png;base64,QUJD".to_string(),
+                detail: None,
+            },
+        ]);
+        let mut s = session_with_turns(vec![
+            vec![
+                user("带图结果"),
+                tool("c1", parts.clone()),
+                assistant("看图"),
+            ],
+            vec![user("最新"), assistant("不动")],
+        ]);
+        let caps = StripCaps {
+            strip_reasoning: false,
+            strip_tool_args: false,
+            tool_output_max_chars: 2000,
+        };
+        let before = serde_json::to_string(s.committed_turns()).unwrap();
+
+        let eval = s.strip_stale_content(1, caps, true).unwrap();
+        assert_eq!(
+            eval.would_change_items, 0,
+            "Parts 即便文本部件超上限也不命中"
+        );
+        assert_eq!(
+            serde_json::to_string(s.committed_turns()).unwrap(),
+            before,
+            "Parts 必须逐字节原样"
+        );
+    }
+
+    /// 取 scope 轮里的工具输出 —— 输出截断断言的探针。
+    struct OutputProbe {
+        text: String,
+        id: u64,
+        turn_index: usize,
+    }
+
+    fn probe_scope_output(s: &Session) -> OutputProbe {
+        let am = s.committed_turns()[0]
+            .iter()
+            .find(|am| matches!(am.message.as_ref(), InputItem::FunctionCallOutput { .. }))
+            .expect("夹具必须含工具输出");
+        let InputItem::FunctionCallOutput {
+            output: Content::Text(text),
+            ..
+        } = am.message.as_ref()
+        else {
+            panic!("夹具的工具输出必须是纯文本");
+        };
+        OutputProbe {
+            text: text.clone(),
+            id: am.id.0,
+            turn_index: am.turn_index,
+        }
     }
 }

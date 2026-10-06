@@ -349,6 +349,11 @@ pub struct StripPolicy {
     pub strip_reasoning: bool,
     /// 清空历史工具调用参数。
     pub strip_tool_args: bool,
+    /// 历史工具输出截断上限（字符数）：`0` = 关闭。
+    ///
+    /// 非 0 时不小于 [`TRANSCRIPT_TOOL_OUTPUT_MIN_CAP`] —— 配置层校验，
+    /// 违规值在读取端回退默认。
+    pub tool_output_max_chars: usize,
     /// 生效开关：`true` 时就地改写历史，`false` 只评估不改写（shadow 观测）。
     ///
     /// 默认 `false` —— 未显式开启时边界结算与不引入削减的版本逐字节一致。
@@ -360,6 +365,7 @@ impl StripPolicy {
         StripCaps {
             strip_reasoning: self.strip_reasoning,
             strip_tool_args: self.strip_tool_args,
+            tool_output_max_chars: self.tool_output_max_chars,
         }
     }
 }
@@ -577,11 +583,22 @@ fn degraded_summary(transcript: &str, failures: u32) -> String {
 
 /// 单条消息在转录中的最大字符数。
 ///
-/// pub：服务端 shadow 观测以它为「单条输出是否超转录上限」的判据 ——
-/// 观测口径与转录实现必须是同一个数，各自定义一个 2000 迟早漂移。
+/// pub：工具输出截断的默认上限与下界（[`TRANSCRIPT_TOOL_OUTPUT_MIN_CAP`]）
+/// 都从它派生 —— 削减口径与转录实现必须是同一个数，各自定义一个 2000
+/// 迟早漂移。
 pub const TRANSCRIPT_ITEM_MAX_CHARS: usize = 2000;
 /// 整份转录的最大字符数（防止摘要请求本身超限）。
 const TRANSCRIPT_MAX_CHARS: usize = 60_000;
+/// tool 输出的转录行前缀（[`transcript_line`] 拼接用）。
+const TRANSCRIPT_TOOL_OUTPUT_PREFIX: &str = "[tool output] ";
+
+/// 历史工具输出截断上限的下界（字符数）。
+///
+/// 削到 S 字符后行 = `前缀 + S`；per-item 截断等式要求削后行不短于单条
+/// 上限，否则取到的是削后整行而非与原行相同的前缀片段 —— 前缀 14 字符
+/// ⇒ 下界 1986。
+pub const TRANSCRIPT_TOOL_OUTPUT_MIN_CAP: usize =
+    TRANSCRIPT_ITEM_MAX_CHARS - TRANSCRIPT_TOOL_OUTPUT_PREFIX.len();
 
 /// 把一条消息格式化为转录行；不构成转录内容的消息（如 `Reasoning`）返回 `None`。
 fn transcript_line(am: &crate::session::AnnotatedMessage) -> Option<String> {
@@ -591,9 +608,10 @@ fn transcript_line(am: &crate::session::AnnotatedMessage) -> Option<String> {
             Some(format!("{}: {}", role_label(*role), content.text_view()))
         }
         InputItem::FunctionCall { name, .. } => Some(format!("[tool call {name}]")),
-        InputItem::FunctionCallOutput { output, .. } => {
-            Some(format!("[tool output] {}", output.text_view()))
-        }
+        InputItem::FunctionCallOutput { output, .. } => Some(format!(
+            "{TRANSCRIPT_TOOL_OUTPUT_PREFIX}{}",
+            output.text_view()
+        )),
         InputItem::Reasoning { .. } => None,
         _ => None,
     }
@@ -1248,6 +1266,8 @@ mod tests {
             keep_recent_turns,
             strip_reasoning: true,
             strip_tool_args: true,
+            // 本组测试不涉工具输出截断 —— 输出截断由独立用例覆盖
+            tool_output_max_chars: 0,
             enforce,
         }
     }
@@ -1426,8 +1446,8 @@ mod tests {
     /// (b) 删除类 —— 整轮 `build_transcript` 前后逐字节相等。
     ///
     /// 截断（`chars().take(TRANSCRIPT_ITEM_MAX_CHARS)`）在转录组装时发生，
-    /// 两条断言都对截断后的文本比对 —— 长 tool 输出在 2a 不被削减，
-    /// 长参数 FC 的转录行本就不含 arguments，削减后必然恒等。
+    /// 两条断言都对截断后的文本比对 —— 清参的 FC 转录行本就不含 arguments；
+    /// 长 tool 输出削到单条上限后行仍满 2000，逐条截断后同为原行前 2000 字符。
     #[test]
     fn test_strip_apply_is_transcript_lossless() {
         let mut s = make_session_with_mixed_turns(3);
@@ -1436,15 +1456,16 @@ mod tests {
         let caps = StripCaps {
             strip_reasoning: true,
             strip_tool_args: true,
+            tool_output_max_chars: TRANSCRIPT_ITEM_MAX_CHARS,
         };
         let eval = s.strip_stale_content(1, caps, true).unwrap();
-        // scope 2 轮 × (1 条 reasoning + 1 条非空参数 FC)
-        assert_eq!(eval.would_change_items, 4);
+        // scope 2 轮 × (1 条 reasoning + 1 条非空参数 FC + 1 条超上限输出)
+        assert_eq!(eval.would_change_items, 6);
         assert!(eval.would_release_tokens > 0);
 
         let after = s.committed_turns();
 
-        // (b) turn 级：删除类（reasoning）与改字段类（清参）都不改变轮级转录
+        // (b) turn 级：删除类（reasoning）与改字段类（清参、截断到单条上限）都不改变轮级转录
         assert_eq!(
             build_transcript(&before[..2]),
             build_transcript(&after[..2]),
@@ -1486,6 +1507,70 @@ mod tests {
             _ => None,
         });
         assert_eq!(fc_args, Some(""), "FC 参数必须真的被清空");
+        // 生效性：长 tool 输出真的被截到上限（否则恒等断言在「没截」时也空转通过）
+        let out_len = after[0].iter().find_map(|am| match am.message.as_ref() {
+            InputItem::FunctionCallOutput {
+                output: model_provider::Content::Text(t),
+                ..
+            } => Some(t.chars().count()),
+            _ => None,
+        });
+        assert_eq!(
+            out_len,
+            Some(TRANSCRIPT_ITEM_MAX_CHARS),
+            "长 tool 输出必须真的被截到上限"
+        );
+    }
+
+    /// tool 输出截断下界的来源：`"[tool output] "` 前缀 14 字符 ⇒ 削到
+    /// S 字符后行仍满单条上限才保 per-item 等式 ⇒ S ≥ 1986。
+    ///
+    /// 1986 恒等、1985 不成立 —— 下界两侧的失败模式各由断言钉死：
+    /// 低于下界时削后行变短，截断后取到的是整条削后行而非与原行相同的前缀片段。
+    #[test]
+    fn test_tool_output_strip_threshold_bounds_lossless_invariant() {
+        let trunc =
+            |line: &str| -> String { line.chars().take(TRANSCRIPT_ITEM_MAX_CHARS).collect() };
+        let scope_output = |s: &Session| -> String {
+            transcript_line(
+                s.committed_turns()[0]
+                    .iter()
+                    .find(|am| matches!(am.message.as_ref(), InputItem::FunctionCallOutput { .. }))
+                    .expect("夹具必须含工具输出"),
+            )
+            .expect("工具输出必有转录行")
+        };
+
+        for (cap, expect_lossless) in [
+            (TRANSCRIPT_TOOL_OUTPUT_MIN_CAP, true),
+            (TRANSCRIPT_TOOL_OUTPUT_MIN_CAP - 1, false),
+        ] {
+            let mut s = make_session_with_mixed_turns(2);
+            let before_line = scope_output(&s);
+            let eval = s
+                .strip_stale_content(
+                    1,
+                    StripCaps {
+                        strip_reasoning: false,
+                        strip_tool_args: false,
+                        tool_output_max_chars: cap,
+                    },
+                    true,
+                )
+                .unwrap();
+            assert_eq!(eval.would_change_items, 1, "cap={cap} 时输出必须命中截断");
+            let after_line = scope_output(&s);
+            assert!(
+                after_line.chars().count() < before_line.chars().count(),
+                "cap={cap} 时截断必须真的发生"
+            );
+            assert_eq!(
+                trunc(&after_line) == trunc(&before_line),
+                expect_lossless,
+                "cap={cap}（下界 {}）时 per-item 等式应为 {expect_lossless}",
+                TRANSCRIPT_TOOL_OUTPUT_MIN_CAP
+            );
+        }
     }
 
     /// 含 reasoning / 长参数 FC / 长 tool 输出的多轮会话 —— 无损不变式夹具。
