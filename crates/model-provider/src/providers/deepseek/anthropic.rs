@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use tracing::{Instrument, warn};
 
 use crate::logging;
-use crate::providers::chat_common::strip_image_parts;
+use crate::providers::chat_common::strip_tool_output_images;
 use crate::response::{
     BlockType, Content, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
     ResponseError, ResponseStatus, Role, SERVER_TOOL_WEB_SEARCH, StreamChunk,
@@ -255,18 +255,21 @@ fn merge_user_content(message: &mut Value, incoming: Value) {
     }
 }
 
-/// user 内容编码：纯文本 → 裸字符串；部件数组 → text 块数组（图片已被剥离）。
+/// user 内容编码：纯文本 → 裸字符串；部件数组 → text / image 块数组。
+///
+/// 图片部件直通为 Anthropic `image` 块：`data:<media_type>;base64,<data>`
+/// 形态用 `base64` 源，其余 URL 用 `url` 源（由服务端抓取）。
 fn user_content_value(content: &Content) -> Value {
     match content {
         Content::Text(text) => Value::String(text.clone()),
         Content::Parts(parts) => {
             let blocks: Vec<Value> = parts
                 .iter()
-                .filter_map(|part| match part {
+                .map(|part| match part {
                     crate::response::ContentPart::Text { text } => {
-                        Some(serde_json::json!({ "type": "text", "text": text }))
+                        serde_json::json!({ "type": "text", "text": text })
                     }
-                    _ => None,
+                    crate::response::ContentPart::Image { url, .. } => image_block(url),
                 })
                 .collect();
             if blocks.is_empty() {
@@ -276,6 +279,34 @@ fn user_content_value(content: &Content) -> Value {
             }
         }
     }
+}
+
+/// 图片部件 → Anthropic `image` 块。
+///
+/// data URI 走 `base64` 源：本机自托管的上传图片没有可被服务端抓取的 URL，
+/// 实测 `url` 源对 data URI 报 `invalid url`、对公网 URL 抓取亦不可靠。
+fn image_block(url: &str) -> Value {
+    match parse_base64_data_uri(url) {
+        Some((media_type, data)) => serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data },
+        }),
+        None => serde_json::json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        }),
+    }
+}
+
+/// 解析 `data:<media_type>;base64,<data>` 形态；非 base64 data URI 返回 `None`
+/// （交由 `url` 源处理）。
+fn parse_base64_data_uri(url: &str) -> Option<(&str, &str)> {
+    let (meta, data) = url.strip_prefix("data:")?.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    if media_type.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
 }
 
 /// 把 FunctionCall 的 raw `arguments` 字符串解析成对象（失败回退 `{}` 并 warn）。
@@ -382,16 +413,17 @@ fn build_request_body(
     stream: bool,
     strict: bool,
 ) -> Result<Vec<u8>, ProviderError> {
-    let (stripped_input, images_dropped) = strip_image_parts(&request.input, strict)?;
-    if images_dropped > 0 {
+    // 用户消息图片映射为 image 块直通；仅工具输出图片剥离并计数。
+    let (input, tool_images_dropped) = strip_tool_output_images(&request.input, strict)?;
+    if tool_images_dropped > 0 {
         warn!(
             target: "model_provider::deepseek",
-            images = images_dropped,
-            "deepseek anthropic does not support image input; image parts stripped (text kept)"
+            images = tool_images_dropped,
+            "deepseek anthropic: tool output images stripped (text kept)"
         );
     }
     let (system, messages) =
-        input_items_to_anthropic_messages(&stripped_input, request.instructions.as_deref());
+        input_items_to_anthropic_messages(&input, request.instructions.as_deref());
 
     let mut body = Map::new();
     body.insert("model".into(), serde_json::json!(request.model));
@@ -1149,6 +1181,10 @@ impl ModelProvider for DeepSeekAnthropicAdapter {
         true
     }
 
+    fn supports_image_input(&self) -> bool {
+        true
+    }
+
     async fn generate_full(
         &self,
         request: &GenerateRequest,
@@ -1726,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_image_parts_stripped_leniently() {
+    fn test_user_image_data_uri_maps_to_base64_source() {
         let mut request = make_request();
         request.input = Arc::from([Arc::new(InputItem::Message {
             role: Role::User,
@@ -1735,16 +1771,81 @@ mod tests {
                     text: "看这张图".to_string(),
                 },
                 ContentPart::Image {
-                    url: "https://example.com/a.png".to_string(),
+                    url: "data:image/png;base64,AAAA".to_string(),
                     detail: None,
                 },
             ]),
         })]);
         let json = build_body(&request, false);
-        assert_eq!(json["messages"][0]["content"], "看这张图");
+        assert_eq!(
+            json["messages"][0]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "看这张图"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ])
+        );
+        // 用户图片已是受支持输入，严格模式不再拒绝。
+        assert!(build_request_body(&request, false, true).is_ok());
+    }
 
-        // 严格模式直接报错。
+    #[test]
+    fn test_user_image_http_url_maps_to_url_source() {
+        let mut request = make_request();
+        request.input = Arc::from([Arc::new(InputItem::Message {
+            role: Role::User,
+            content: Content::Parts(vec![ContentPart::Image {
+                url: "https://example.com/a.png".to_string(),
+                detail: None,
+            }]),
+        })]);
+        let json = build_body(&request, false);
+        assert_eq!(
+            json["messages"][0]["content"],
+            serde_json::json!([
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tool_output_image_stripped_leniently() {
+        let mut request = make_request();
+        request.input = Arc::from([
+            Arc::new(InputItem::FunctionCall {
+                call_id: "c1".to_string(),
+                name: "f".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            Arc::new(InputItem::FunctionCallOutput {
+                call_id: "c1".to_string(),
+                output: Content::Parts(vec![
+                    ContentPart::Text {
+                        text: "截图".to_string(),
+                    },
+                    ContentPart::Image {
+                        url: "data:image/png;base64,BBBB".to_string(),
+                        detail: None,
+                    },
+                ]),
+            }),
+        ]);
+        let json = build_body(&request, false);
+        assert_eq!(json["messages"][1]["content"][0]["content"], "截图");
+
+        // 工具图仍被严格模式拒绝。
         assert!(build_request_body(&request, false, true).is_err());
+    }
+
+    #[test]
+    fn test_parse_base64_data_uri() {
+        assert_eq!(
+            parse_base64_data_uri("data:image/jpeg;base64,QQ=="),
+            Some(("image/jpeg", "QQ=="))
+        );
+        assert_eq!(parse_base64_data_uri("https://e.com/a.png"), None);
+        assert_eq!(parse_base64_data_uri("data:image/png,raw"), None);
+        assert_eq!(parse_base64_data_uri("data:;base64,QQ=="), None);
+        assert_eq!(parse_base64_data_uri("data:"), None);
     }
 
     // ── 非流式解析 ──

@@ -14,8 +14,9 @@
 //! 3. 非流式 `generate_full()` 调用
 //! 4. 流式 `generate_stream()` 调用，逐条输出增量内容
 //!
-//! 不支持图片输入的适配器（DeepSeek 等）会剥离图片部件并 `warn!` ——
-//! 换成 `DeepSeek::from_env()?` 即可观察该行为。
+//! DeepSeek 的用户图片支持仅落在 anthropic 兼容端点（`DeepSeekAnthropicAdapter`，
+//! data URI 走 base64 源）；`DeepSeek` / `DeepSeekResponsesAdapter` 仍剥离图片
+//! 部件并 `warn!` —— 换成它们即可观察该行为。
 
 #![allow(unused_crate_dependencies)]
 
