@@ -39,8 +39,26 @@ export async function clearPecoSession(): Promise<{
   return resp.data;
 }
 
-export function pecoStreamUrl(message: string): string {
-  return `${SSE_BASE}/stream?message=${encodeURIComponent(message)}`;
+/** 上传一张随消息发送的图片，返回引用 id 与渲染 URL。 */
+export async function uploadPecoImage(
+  file: File,
+): Promise<{ id: string; url: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const resp = await api.post<{ id: string; url: string }>(
+    `${PATH}/images`,
+    form,
+    { headers: { "Content-Type": "multipart/form-data" } },
+  );
+  return resp.data;
+}
+
+export function pecoStreamUrl(
+  message: string,
+  imageIds: string[] = [],
+): string {
+  const ids = imageIds.length > 0 ? `&image_ids=${imageIds.join(",")}` : "";
+  return `${SSE_BASE}/stream?message=${encodeURIComponent(message)}${ids}`;
 }
 
 /** 纯附着模式：无 message 参数，接上当前用户进行中的任务流。 */

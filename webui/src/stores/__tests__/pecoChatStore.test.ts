@@ -9,8 +9,10 @@ import { snapshotToMessages } from "../../components/chat/ChatView";
 import { useAuthStore } from "../../stores/authStore";
 
 vi.mock("@/api/peco", () => ({
-  pecoStreamUrl: (m: string) =>
-    `/api/peco/stream?message=${encodeURIComponent(m)}`,
+  pecoStreamUrl: (m: string, ids: string[] = []) =>
+    `/api/peco/stream?message=${encodeURIComponent(m)}` +
+    (ids.length > 0 ? `&image_ids=${ids.join(",")}` : ""),
+  uploadPecoImage: vi.fn(),
   pecoAttachUrl: () => "/api/peco/stream",
   queryPecoStream: vi.fn(async () => undefined),
   cancelPecoStream: vi.fn(async () => ({ success: true })),
@@ -199,6 +201,46 @@ describe("pecoChatStore 常驻连接", () => {
     // 关键回归断言：仍然只有一条 SSE 连接，第二条消息经控制通道投递
     expect(streamCalls()).toHaveLength(1);
     expect(queryPecoStream).toHaveBeenCalledWith("第二条");
+  });
+
+  it("带图消息开新流并在 URL 携带 image_ids（不经 POST 控制通道）", async () => {
+    global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
+
+    await usePecoChatStore.getState().sendMessage("看这张图", "test-token", [
+      { id: "a.png", url: "/uploads/chat/u/a.png" },
+    ]);
+
+    // 图片无法经控制通道投递 —— 不得走 POST 复用路径
+    expect(queryPecoStream).not.toHaveBeenCalled();
+    const calls = streamCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("image_ids=a.png");
+
+    // 乐观用户消息携带渲染 URL
+    const lastUser = [...usePecoChatStore.getState().messages]
+      .reverse()
+      .find((m) => m.role === "user");
+    expect(lastUser?.images).toEqual(["/uploads/chat/u/a.png"]);
+  });
+
+  it("存在活连接时，带图消息仍开新流而非复用 POST", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+
+    await usePecoChatStore.getState().sendMessage("第一条", "test-token");
+    s.push(turnCompleteFrame("第一条"));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().isStreaming).toBe(false),
+    );
+    expect(streamCalls()).toHaveLength(1);
+
+    global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
+    await usePecoChatStore.getState().sendMessage("看图", "test-token", [
+      { id: "b.png", url: "/uploads/chat/u/b.png" },
+    ]);
+
+    expect(queryPecoStream).not.toHaveBeenCalled();
+    expect(streamCalls()).toHaveLength(1);
   });
 
   it("同一条连接上的增量只应用一次（不成对重复）", async () => {

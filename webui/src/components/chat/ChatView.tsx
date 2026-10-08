@@ -93,8 +93,11 @@ export interface ChatViewProps {
    * 消息从 initialMessages prop 读取，发送/停止委托给外部。
    * @default "internal" */
   mode?: "internal" | "external";
-  /** [mode="external" 必需] 外部发送回调 */
-  onExternalSend?: (text: string) => void;
+  /** [mode="external" 必需] 外部发送回调；images 为待发送图片（无图时为空数组）。 */
+  onExternalSend?: (
+    text: string,
+    images: { id: string; url: string }[],
+  ) => void;
   /** [mode="external" 必需] 外部停止回调 */
   onExternalStop?: () => void;
   /** [mode="external" 必需] 外部流式状态 */
@@ -337,7 +340,9 @@ export function ChatView({
       return;
     setInput("");
     if (onExternalSendRef.current) {
-      onExternalSendRef.current(currentInput);
+      const images = pendingImagesRef.current;
+      setPendingImages([]);
+      onExternalSendRef.current(currentInput, images);
     } else {
       await sendMessage(currentInput);
     }
@@ -351,7 +356,7 @@ export function ChatView({
     if (initialQuery && !hasSentInitialRef.current && tok) {
       hasSentInitialRef.current = true;
       if (onExternalSendRef.current) {
-        onExternalSendRef.current(initialQuery);
+        onExternalSendRef.current(initialQuery, []);
       } else {
         sendMessage(initialQuery);
       }

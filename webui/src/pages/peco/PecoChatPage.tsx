@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { ChatView } from "@/components/chat/ChatView";
-import { pecoStreamUrl } from "@/api/peco";
+import { getAgent, listAgents } from "@/api/agents";
+import { pecoStreamUrl, uploadPecoImage } from "@/api/peco";
 import { usePecoChatStore } from "@/stores/pecoChatStore";
 import { useAuthStore } from "@/stores/authStore";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
@@ -26,10 +27,30 @@ export function PecoChatPage() {
   const loadingEarlier = usePecoChatStore((s) => s.loadingEarlier);
   const loadEarlier = usePecoChatStore((s) => s.loadEarlier);
   const token = useAuthStore((s) => s.token);
+  const [supportsImages, setSupportsImages] = useState(false);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // @assistant 的 provider 是否支持用户图片输入 —— 决定附件入口可用性。
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const all = await listAgents();
+        const match = all.find((a) => a.name === "@assistant");
+        if (!match) return;
+        const detail = await getAgent(match.id);
+        if (!cancelled) setSupportsImages(detail.supports_images);
+      } catch {
+        // 取不到能力信息时保持禁用附件入口
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 切回标签页 / 窗口获焦时追平会话（多窗口最终一致）：
   // 重拉快照恢复已提交轮次，并检测服务端进行中的任务重新附着。
@@ -70,9 +91,11 @@ export function PecoChatPage() {
       key={sessionKey}
       mode="external"
       streamUrl={pecoStreamUrl}
+      supportsImages={supportsImages}
+      uploadImage={(file) => uploadPecoImage(file)}
       initialMessages={messages}
-      onExternalSend={(text) => {
-        sendMessage(text, token ?? "");
+      onExternalSend={(text, images) => {
+        sendMessage(text, token ?? "", images);
       }}
       onExternalStop={abortStream}
       externalIsStreaming={isStreaming}

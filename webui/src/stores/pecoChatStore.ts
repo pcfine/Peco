@@ -461,15 +461,21 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
 
   // ── sendMessage ──────────────────────────────────────────────────────
 
-  sendMessage: async (text: string, token: string) => {
+  sendMessage: async (
+    text: string,
+    token: string,
+    images?: { id: string; url: string }[],
+  ) => {
     const state = get();
-    if (state.isStreaming || !text.trim() || !token) return;
+    const hasImages = !!images && images.length > 0;
+    if (state.isStreaming || (!text.trim() && !hasImages) || !token) return;
 
     // Append user message + empty assistant placeholder.
     const userMsg: ChatMessage = {
       role: "user",
       content: text,
       turnIndex: 0,
+      images: hasImages ? images.map((i) => i.url) : undefined,
     };
     const assistantMsg: ChatMessage = {
       role: "assistant",
@@ -484,8 +490,9 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     // 用户主动发起 → 重新武装一次性自愈
     selfHealUsed = false;
 
-    // 已有活连接：复用（POST 投递），事件仍从这条连接回来
-    if (conn && !conn.terminal) {
+    // 已有活连接：复用（POST 投递），事件仍从这条连接回来。
+    // 带图时必须走开流路径 —— POST 控制通道只承载文本。
+    if (conn && !conn.terminal && !hasImages) {
       try {
         await queryPecoStream(text);
         return;
@@ -512,7 +519,16 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
 
     // 无活连接（首条消息 / 连接已收尾 / POST 404）：带 message 开流，
     // 服务端自行决定附着到已有 run 还是新建。
-    openStream(pecoStreamUrl(text), token, set, get, { replace: true });
+    openStream(
+      pecoStreamUrl(
+        text,
+        images?.map((i) => i.id) ?? [],
+      ),
+      token,
+      set,
+      get,
+      { replace: true },
+    );
   },
 
   // ── abortStream ──────────────────────────────────────────────────────
@@ -622,7 +638,11 @@ interface PecoChatState {
 
   /** Start an SSE streaming request. The async fetch runs inside the store
    *  and is NOT tied to any React component lifecycle. */
-  sendMessage: (text: string, token: string) => Promise<void>;
+  sendMessage: (
+    text: string,
+    token: string,
+    images?: { id: string; url: string }[],
+  ) => Promise<void>;
 
   /** Abort the currently running SSE stream (server-side cancel + local). */
   abortStream: () => void;
