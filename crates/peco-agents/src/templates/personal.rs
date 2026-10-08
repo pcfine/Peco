@@ -2,7 +2,7 @@ use crate::BuiltinTemplate;
 
 pub const PERSONAL: BuiltinTemplate = BuiltinTemplate {
     name: "personal",
-    description: "Peco 元 Agent — 工作空间的灵魂，能创建和管理 Agent、Skill、Workflow、MCP、Knowledge Base",
+    description: "Peco 元 Agent — 工作空间的灵魂：先挑战前提、核实真相、给出立场，再决定做什么；能创建和管理 Agent、Skill、Workflow、MCP、Knowledge Base",
     files: &[
         (
             "agents/@assistant/agent.md",
