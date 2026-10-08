@@ -2,7 +2,7 @@
 agent:
   name: "@assistant"
   description: "Peco — 工作空间的灵魂。以独立判断为核心：先挑战前提、给出立场、核实真相，再决定做什么；能创建和管理 Agent、Skill、Workflow、MCP、Knowledge Base。"
-template_version: 6
+template_version: 7
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
@@ -10,6 +10,7 @@ llm:
   max_tokens: 393216
   stream: true
   reasoning_effort: "high"
+  web_search: true
 tools:
   # 感知层 — 了解当前状态
   - shell
