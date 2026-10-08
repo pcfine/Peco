@@ -412,6 +412,8 @@ pin_project! {
         url: String,
         body: Vec<u8>,
         auth_header: String,
+        // 每次连接/重连都要携带的附加请求头（如 Anthropic 协议的 anthropic-version）。
+        extra_headers: Vec<(http::HeaderName, http::HeaderValue)>,
         retry_policy: R,
         last_event_id: Option<String>,
         allow_missing_content_type: bool,
@@ -432,6 +434,31 @@ impl StreamingEventSource {
     pub fn new(client: reqwest::Client, url: String, body: Vec<u8>, auth_header: String) -> Self {
         Self::with_retry_policy(client, url, body, auth_header, DEFAULT_RETRY)
     }
+
+    /// 使用默认重试策略，并在每次连接/重连时携带附加请求头。
+    pub fn with_extra_headers(
+        client: reqwest::Client,
+        url: String,
+        body: Vec<u8>,
+        auth_header: String,
+        extra_headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    ) -> Self {
+        let response_future =
+            create_response_future(&client, &url, &body, &auth_header, None, &extra_headers);
+
+        Self {
+            client,
+            url,
+            body,
+            auth_header,
+            extra_headers,
+            retry_policy: DEFAULT_RETRY,
+            last_event_id: None,
+            allow_missing_content_type: false,
+            skipped_parse_errors: 0,
+            state: SseState::Connecting { response_future },
+        }
+    }
 }
 
 impl<R: RetryPolicy> StreamingEventSource<R> {
@@ -443,13 +470,14 @@ impl<R: RetryPolicy> StreamingEventSource<R> {
         auth_header: String,
         retry_policy: R,
     ) -> Self {
-        let response_future = create_response_future(&client, &url, &body, &auth_header, None);
+        let response_future = create_response_future(&client, &url, &body, &auth_header, None, &[]);
 
         Self {
             client,
             url,
             body,
             auth_header,
+            extra_headers: Vec::new(),
             retry_policy,
             last_event_id: None,
             allow_missing_content_type: false,
@@ -491,6 +519,7 @@ fn create_response_future(
     body: &[u8],
     auth_header: &str,
     last_event_id: Option<&str>,
+    extra_headers: &[(http::HeaderName, http::HeaderValue)],
 ) -> ResponseFuture {
     let mut request_builder = client
         .post(url)
@@ -505,6 +534,10 @@ fn create_response_future(
     {
         request_builder =
             request_builder.header(http::HeaderName::from_static("last-event-id"), val);
+    }
+
+    for (name, value) in extra_headers {
+        request_builder = request_builder.header(name.clone(), value.clone());
     }
 
     let request = match request_builder.build() {
@@ -762,6 +795,7 @@ impl<R: RetryPolicy> Stream for StreamingEventSource<R> {
                                 this.body,
                                 this.auth_header,
                                 this.last_event_id.as_deref(),
+                                this.extra_headers,
                             );
                             this.state.set(SseState::Reconnecting {
                                 response_future,

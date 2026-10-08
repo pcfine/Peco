@@ -53,7 +53,8 @@ use async_trait::async_trait;
 pub use error::{ApiErrorKind, ClassifiedError, ProviderError, classify_api_error};
 pub use generate_stream::GenerateStream;
 pub use providers::deepseek::{
-    DEEPSEEK_API_BASE_URL, DeepSeek, DeepSeekChatCompletionsAdapter, DeepSeekResponsesAdapter,
+    DEEPSEEK_API_BASE_URL, DeepSeek, DeepSeekAnthropicAdapter, DeepSeekChatCompletionsAdapter,
+    DeepSeekResponsesAdapter,
 };
 pub use providers::openai::{
     OPENAI_API_BASE_URL, OPENAI_GPT5_1, OPENAI_GPT5_2, OPENAI_GPT5_MINI, OpenAI,
