@@ -181,6 +181,7 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
         max_tokens: req.max_tokens,
         stream: req.stream,
         reasoning_effort: req.reasoning_effort.clone(),
+        web_search: None,
         tools: req.tools.clone(),
         mcp_servers: req.mcp_servers.clone(),
         skills: req.skills.clone(),
@@ -231,6 +232,8 @@ fn merge_agent_profile(
             &req.reasoning_effort,
             old_llm.and_then(|l| l.reasoning_effort.clone()),
         ),
+        // 请求体未暴露该字段：编辑时保留旧值，避免静默丢失
+        web_search: old_llm.and_then(|l| l.web_search),
         tools: req
             .tools
             .clone()

@@ -339,6 +339,8 @@ fn block_kinds_of(blocks: &[ContentBlock]) -> Vec<&'static str> {
             ContentBlock::Text { .. } => "text",
             ContentBlock::Reasoning { .. } => "reasoning",
             ContentBlock::ToolCall { .. } => "tool_call",
+            ContentBlock::ServerToolUse { .. } => "server_tool_use",
+            ContentBlock::ServerToolResult { .. } => "server_tool_result",
             _ => "other",
         };
         if !kinds.contains(&kind) {
@@ -482,6 +484,18 @@ pub enum LooperEvent {
         name: String,
         result: String,
         images: Vec<String>,
+    },
+    /// 服务端工具调用（模型发起，provider 侧执行，不在客户端执行）
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    /// 服务端工具结果
+    ServerToolResult {
+        id: String,
+        name: String,
+        content: String,
     },
     /// 模型调用 token 用量
     ModelUsage {
@@ -2635,6 +2649,35 @@ impl AgentLooper {
         // 同时更新 assistant_text / assistant_reasoning）。
         self.stage_output_blocks(&response.output);
 
+        // 服务端工具块只通知前端展示（与流式路径一致），不进 pending_tool_calls
+        for block in &response.output {
+            match block {
+                ContentBlock::ServerToolUse {
+                    call_id,
+                    name,
+                    input,
+                } => {
+                    self.emit_event(LooperEvent::ServerToolUse {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+                ContentBlock::ServerToolResult {
+                    call_id,
+                    name,
+                    content,
+                } => {
+                    self.emit_event(LooperEvent::ServerToolResult {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        content: content.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
         // 状态收敛：Failed 与 Incomplete 都视为异常终止（partial_text 已回填）
         if response.status != ResponseStatus::Completed {
             // ★ 截断重试，判据与流式路径完全一致：`Incomplete` 且
@@ -2800,10 +2843,35 @@ impl AgentLooper {
                         });
                     }
 
-                    StreamChunk::BlockEnd { .. } => {
-                        // 块已由 assembler 折叠；ToolCallStart 统一在 execute_tools_step
-                        // 的 spawn 阶段发出，避免流式路径下重复发送 ToolCallStart。
-                    }
+                    StreamChunk::BlockEnd { block, .. } => match block {
+                        // 服务端工具块只通知前端展示，不进 pending_tool_calls
+                        // （provider 侧已执行完毕，客户端无可执行之物）。
+                        ContentBlock::ServerToolUse {
+                            call_id,
+                            name,
+                            input,
+                        } => {
+                            self.emit_event(LooperEvent::ServerToolUse {
+                                id: call_id,
+                                name,
+                                input,
+                            });
+                        }
+                        ContentBlock::ServerToolResult {
+                            call_id,
+                            name,
+                            content,
+                        } => {
+                            self.emit_event(LooperEvent::ServerToolResult {
+                                id: call_id,
+                                name,
+                                content,
+                            });
+                        }
+                        // 其余块已由 assembler 折叠；ToolCallStart 统一在
+                        // execute_tools_step 的 spawn 阶段发出，避免流式路径下重复发送。
+                        _ => {}
+                    },
 
                     StreamChunk::Usage { usage } => {
                         self.emit_event(LooperEvent::ModelUsage {
@@ -3020,6 +3088,8 @@ impl AgentLooper {
                         },
                     );
                 }
+                // 服务端工具块不入 session 历史：回放可省略，省上下文
+                ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => {}
                 _ => {}
             }
         }
@@ -4768,6 +4838,213 @@ mod tests {
             .await
             .expect("looper 侧仍在监听");
         let _ = tokio::time::timeout(Duration::from_secs(5), h.looper.run(listener)).await;
+    }
+
+    // ── 服务端工具块（web_search）tests ───────────────────────────────────
+
+    /// 服务端 web_search 一次完整流：发起 → 结果 → 可见文本。
+    fn server_web_search_chunks() -> Script {
+        Script::Chunks(vec![
+            StreamChunk::BlockStart {
+                index: 0,
+                block_type: model_provider::BlockType::ServerToolUse,
+            },
+            StreamChunk::BlockEnd {
+                index: 0,
+                block: ContentBlock::ServerToolUse {
+                    call_id: "srv_1".to_string(),
+                    name: "web_search".to_string(),
+                    input: r#"{"query":"rust async"}"#.to_string(),
+                },
+            },
+            StreamChunk::BlockStart {
+                index: 1,
+                block_type: model_provider::BlockType::ServerToolResult,
+            },
+            StreamChunk::BlockEnd {
+                index: 1,
+                block: ContentBlock::ServerToolResult {
+                    call_id: "srv_1".to_string(),
+                    name: "web_search".to_string(),
+                    content: r#"{"results":["a","b"]}"#.to_string(),
+                },
+            },
+            StreamChunk::BlockStart {
+                index: 2,
+                block_type: model_provider::BlockType::Text,
+            },
+            StreamChunk::TextDelta {
+                index: 2,
+                delta: "答案".to_string(),
+            },
+            StreamChunk::BlockEnd {
+                index: 2,
+                block: ContentBlock::Text {
+                    text: "答案".to_string(),
+                },
+            },
+            StreamChunk::Usage {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    total_tokens: 30,
+                },
+            },
+            StreamChunk::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_server_tool_emits_events_and_skips_client_execution() {
+        let mut h = retry_harness(vec![server_web_search_chunks()], LooperConfig::default());
+
+        drive_query(&mut h).await;
+
+        let events = h.drain_events();
+
+        let uses: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                LooperEvent::ServerToolUse { id, name, input } => {
+                    Some((id.as_str(), name.as_str(), input.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uses,
+            vec![("srv_1", "web_search", r#"{"query":"rust async"}"#)],
+            "必须恰好发出一次 ServerToolUse"
+        );
+
+        let results: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                LooperEvent::ServerToolResult { id, name, content } => {
+                    Some((id.as_str(), name.as_str(), content.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("srv_1", "web_search", r#"{"results":["a","b"]}"#)],
+            "必须恰好发出一次 ServerToolResult"
+        );
+
+        assert!(
+            !events.iter().any(|ev| matches!(
+                ev,
+                LooperEvent::ToolCallStart { id, .. } | LooperEvent::ToolCallDelta { id, .. }
+                    if id == "srv_1"
+            )),
+            "服务端工具不得触发客户端工具执行事件"
+        );
+
+        let outcomes: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                LooperEvent::TurnComplete { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 1, "必须恰好收尾一次");
+        match &outcomes[0] {
+            TurnOutcome::Success { text, .. } => assert_eq!(text, "答案"),
+            other => panic!("预期 Success，实际 {other:?}"),
+        }
+
+        // 服务端工具块不入 session 历史 —— 提交后的轮次里不得有对应 FunctionCall。
+        let committed = h.looper.session().committed_turns();
+        assert_eq!(committed.len(), 1);
+        let has_function_call = committed[0].iter().any(|am| {
+            matches!(
+                am.message.as_ref(),
+                InputItem::FunctionCall { call_id, .. } if call_id == "srv_1"
+            )
+        });
+        assert!(!has_function_call, "服务端工具块不得写入 session 历史");
+        let text = committed[0]
+            .iter()
+            .find_map(|am| match am.message.as_ref() {
+                InputItem::Message {
+                    role: Role::Assistant,
+                    content,
+                } => Some(content.text_view().to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(text, "答案");
+    }
+
+    #[tokio::test]
+    async fn test_batch_server_tool_emits_events() {
+        let mut h = batch_retry_harness(
+            vec![Script::Batch(Box::new(model_provider::GenerateResult {
+                id: "r".to_string(),
+                output: vec![
+                    ContentBlock::ServerToolUse {
+                        call_id: "srv_1".to_string(),
+                        name: "web_search".to_string(),
+                        input: r#"{"query":"rust"}"#.to_string(),
+                    },
+                    ContentBlock::ServerToolResult {
+                        call_id: "srv_1".to_string(),
+                        name: "web_search".to_string(),
+                        content: r#"{"results":[]}"#.to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "答案".to_string(),
+                    },
+                ],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    total_tokens: 30,
+                },
+                status: ResponseStatus::Completed,
+                finish_reason: Some(FinishReason::Stop),
+                error: None,
+            }))],
+            LooperConfig::default(),
+        );
+
+        drive_query(&mut h).await;
+
+        let events = h.drain_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev, LooperEvent::ServerToolUse { .. }))
+                .count(),
+            1,
+            "批量路径同样发出 ServerToolUse"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|ev| matches!(ev, LooperEvent::ServerToolResult { .. }))
+                .count(),
+            1,
+            "批量路径同样发出 ServerToolResult"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, LooperEvent::ToolCallStart { id, .. } if id == "srv_1")),
+            "批量路径的服务端工具也不得触发客户端工具事件"
+        );
+        let committed = h.looper.session().committed_turns();
+        assert_eq!(committed.len(), 1);
+        assert!(
+            !committed[0].iter().any(|am| matches!(
+                am.message.as_ref(),
+                InputItem::FunctionCall { call_id, .. } if call_id == "srv_1"
+            )),
+            "服务端工具块不得写入 session 历史"
+        );
     }
 
     // ── 暂停/恢复（UserMsg 带内控制）tests ────────────────────────────────

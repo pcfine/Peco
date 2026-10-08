@@ -264,6 +264,8 @@ impl SimpleAgentLooper {
                         name.clone(),
                         arguments.clone(),
                     )),
+                    // 服务端工具由 provider 执行完毕，不并入 text/reasoning/tool_calls
+                    ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => {}
                     _ => {}
                 }
             }

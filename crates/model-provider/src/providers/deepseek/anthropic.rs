@@ -1145,6 +1145,10 @@ impl ModelProvider for DeepSeekAnthropicAdapter {
         "deepseek-anthropic"
     }
 
+    fn supports_server_web_search(&self) -> bool {
+        true
+    }
+
     async fn generate_full(
         &self,
         request: &GenerateRequest,
@@ -1388,6 +1392,21 @@ mod tests {
     fn test_name_reports_deepseek_anthropic() {
         let client = DeepSeekAnthropicAdapter::new("sk-test").unwrap();
         assert_eq!(client.name(), "deepseek-anthropic");
+    }
+
+    #[test]
+    fn test_server_web_search_capability_matrix() {
+        use crate::providers::deepseek::{DeepSeek, DeepSeekResponsesAdapter};
+
+        let anthropic = DeepSeekAnthropicAdapter::new("sk").unwrap();
+        assert!(anthropic.supports_server_web_search());
+        // legacy 适配器逐字节不变：默认不支持，引擎不会注入标记。
+        assert!(
+            !DeepSeekResponsesAdapter::new("sk")
+                .unwrap()
+                .supports_server_web_search()
+        );
+        assert!(!DeepSeek::new("sk").unwrap().supports_server_web_search());
     }
 
     // ── 请求体 ──

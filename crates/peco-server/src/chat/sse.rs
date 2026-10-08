@@ -376,6 +376,23 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
+        // 服务端工具复用前端既有工具卡片渲染（零前端改动）：
+        // input 即发起时的原始 JSON 入参，content 即 provider 回填的结果。
+        LooperEvent::ServerToolUse { id, name, input } => Some(ChatSseEvent::ToolCallStart {
+            id,
+            name,
+            arguments: input,
+            conversation_id: cid,
+        }),
+
+        LooperEvent::ServerToolResult { id, name, content } => Some(ChatSseEvent::ToolResult {
+            id,
+            name,
+            result: content,
+            images: Vec::new(),
+            conversation_id: cid,
+        }),
+
         LooperEvent::TurnComplete { outcome, usage, .. } => match outcome {
             TurnOutcome::Success { text } => Some(ChatSseEvent::TurnComplete {
                 text,
@@ -626,6 +643,56 @@ mod tests {
         // 重复剥离是幂等的：第二次不再匹配
         strip_suffix(&mut acc, "残句");
         assert_eq!(acc, "前言");
+    }
+
+    #[test]
+    fn server_tool_events_map_to_existing_tool_cards() {
+        // 服务端工具复用前端既有工具卡片：use → tool_call_start，result → tool_result。
+        let event = map_looper_event(
+            LooperEvent::ServerToolUse {
+                id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                input: r#"{"query":"rust async"}"#.to_string(),
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::ToolCallStart {
+            id,
+            name,
+            arguments,
+            conversation_id,
+        }) = event
+        else {
+            panic!("ServerToolUse 必须映射为 ToolCallStart，实际 {event:?}");
+        };
+        assert_eq!(id, "srv_1");
+        assert_eq!(name, "web_search");
+        assert_eq!(arguments, r#"{"query":"rust async"}"#);
+        assert_eq!(conversation_id, "conv-1");
+
+        let event = map_looper_event(
+            LooperEvent::ServerToolResult {
+                id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                content: r#"{"results":["a"]}"#.to_string(),
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::ToolResult {
+            id,
+            name,
+            result,
+            images,
+            conversation_id,
+        }) = event
+        else {
+            panic!("ServerToolResult 必须映射为 ToolResult，实际 {event:?}");
+        };
+        assert_eq!(id, "srv_1");
+        assert_eq!(name, "web_search");
+        assert_eq!(result, r#"{"results":["a"]}"#);
+        assert!(images.is_empty(), "服务端工具无客户端图片输出");
+        assert_eq!(conversation_id, "conv-1");
     }
 
     #[test]

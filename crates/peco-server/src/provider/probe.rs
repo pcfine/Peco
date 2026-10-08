@@ -92,6 +92,7 @@ pub async fn run_probe(target: ProbeTarget) -> ProbeOutcome {
         max_tokens: None,
         stream: None,
         reasoning_effort: None,
+        web_search: None,
     };
 
     // 2. 与对话路径同一分派：适配器 + api 风格 + base_url + key 解析

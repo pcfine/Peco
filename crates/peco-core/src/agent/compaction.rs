@@ -187,6 +187,8 @@ impl ModelSummarizer {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
+                // 服务端工具块是检索原始结果，不构成摘要正文
+                ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => None,
                 _ => None,
             })
             .collect::<Vec<_>>()

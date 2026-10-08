@@ -9,9 +9,10 @@ use crate::agent::agent_config::{
 };
 use crate::agent::error::AgentError;
 use model_provider::{
-    DeepSeek, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult, GenerateStream, InputItem,
-    ModelProvider, OpenAI, OpenAiResponsesAdapter, QwenChatCompletionsAdapter,
-    QwenResponsesAdapter, ReasoningConfig, ReasoningEffort, ToolChoice, ToolDefinition, Usage,
+    DeepSeek, DeepSeekAnthropicAdapter, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult,
+    GenerateStream, InputItem, ModelProvider, OpenAI, OpenAiResponsesAdapter,
+    QwenChatCompletionsAdapter, QwenResponsesAdapter, ReasoningConfig, ReasoningEffort,
+    SERVER_TOOL_WEB_SEARCH, ToolChoice, ToolDefinition, Usage,
 };
 
 use serde::{Deserialize, Serialize};
@@ -314,9 +315,16 @@ impl Agent {
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
-        tools: Vec<ToolDefinition>,
+        mut tools: Vec<ToolDefinition>,
         max_output_tokens: Option<u32>,
     ) -> GenerateRequest {
+        if self.model_config.web_search == Some(true) && self.model.supports_server_web_search() {
+            tools.push(ToolDefinition {
+                name: SERVER_TOOL_WEB_SEARCH.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            });
+        }
         GenerateRequest {
             model: self.model_config.model_name.clone().unwrap_or_default(),
             instructions,
@@ -442,6 +450,9 @@ pub fn build_model_config_with_user(
         if let Some(ref e) = llm.reasoning_effort {
             builder = builder.reasoning_effort(e.clone());
         }
+        if let Some(w) = llm.web_search {
+            builder = builder.web_search(w);
+        }
     }
 
     let model_config = builder.build();
@@ -521,34 +532,44 @@ pub fn build_provider_with_user(
     match entry.provider_type.as_str() {
         "deepseek" => {
             // 按 `api` 字段选择适配器：默认（含 None）→ 原生 /responses，
+            // `"anthropic"` → Anthropic 兼容端点（服务端 web_search），
             // `"chat"` → chat completions，`"responses"` → 原生 /responses，
             // 其它值显式报错，避免拼写错误静默落到 responses 难排错。
-            let api_mode = api_mode_of(entry);
-
-            let use_responses = match api_mode {
-                Some(api) if api.eq_ignore_ascii_case("chat") => false,
-                Some(api) if api.eq_ignore_ascii_case("responses") => true,
-                None => true,
+            let mode = match api_mode_of(entry) {
+                Some(api) if api.eq_ignore_ascii_case("anthropic") => "anthropic",
+                Some(api) if api.eq_ignore_ascii_case("chat") => "chat",
+                Some(api) if api.eq_ignore_ascii_case("responses") => "responses",
+                None => "responses",
                 Some(other) => {
                     return Err(AgentError::Config(format!(
                         "unsupported api mode '{other}' for provider '{provider_name}'. \
-                         Expected 'chat' or 'responses'"
+                         Expected 'anthropic', 'chat' or 'responses'"
                     )));
                 }
             };
 
-            if use_responses {
-                let mut provider = DeepSeekResponsesAdapter::new(api_key)?;
-                if let Some(ref url) = entry.base_url {
-                    provider = provider.with_base_url(url.clone());
+            match mode {
+                "anthropic" => {
+                    let mut provider = DeepSeekAnthropicAdapter::new(api_key)?;
+                    if let Some(ref url) = entry.base_url {
+                        provider = provider.with_base_url(url.clone());
+                    }
+                    Ok(Arc::new(provider))
                 }
-                Ok(Arc::new(provider))
-            } else {
-                let mut provider = DeepSeek::new(api_key)?;
-                if let Some(ref url) = entry.base_url {
-                    provider = provider.with_base_url(url.clone());
+                "chat" => {
+                    let mut provider = DeepSeek::new(api_key)?;
+                    if let Some(ref url) = entry.base_url {
+                        provider = provider.with_base_url(url.clone());
+                    }
+                    Ok(Arc::new(provider))
                 }
-                Ok(Arc::new(provider))
+                _ => {
+                    let mut provider = DeepSeekResponsesAdapter::new(api_key)?;
+                    if let Some(ref url) = entry.base_url {
+                        provider = provider.with_base_url(url.clone());
+                    }
+                    Ok(Arc::new(provider))
+                }
             }
         }
         "qwen" => {
@@ -734,6 +755,7 @@ mod tests {
             max_tokens: None,
             stream: None,
             reasoning_effort: None,
+            web_search: None,
         }
     }
 
@@ -976,5 +998,135 @@ mod tests {
             msg.contains("Currently supported: deepseek, qwen, openai"),
             "unexpected message: {msg}"
         );
+    }
+
+    // ── DeepSeek Anthropic 端点分派 ────────────────────────────────────────
+
+    #[test]
+    fn test_deepseek_branch_builds_anthropic_adapter() {
+        let config = user_config("deepseek", entry_of("deepseek", Some("anthropic")));
+        let provider = build_provider_with_user(&model_config("deepseek"), &config)
+            .expect("anthropic api mode must dispatch");
+        assert_eq!(provider.name(), "deepseek-anthropic");
+        assert!(provider.supports_server_web_search());
+    }
+
+    #[test]
+    fn test_deepseek_branch_defaults_stay_responses() {
+        let config = user_config("deepseek", entry_of("deepseek", None));
+        let provider = build_provider_with_user(&model_config("deepseek"), &config)
+            .expect("default must dispatch");
+        assert_eq!(provider.name(), "deepseek-responses");
+        assert!(!provider.supports_server_web_search());
+    }
+
+    #[test]
+    fn test_deepseek_branch_rejects_unknown_api_mode() {
+        let config = user_config("deepseek", entry_of("deepseek", Some("bogus")));
+        let err = build_provider_with_user(&model_config("deepseek"), &config)
+            .err()
+            .expect("unknown api mode must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Expected 'anthropic', 'chat' or 'responses'"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    // ── 服务端 web_search 标记注入 ─────────────────────────────────────────
+
+    /// 用指定 provider 与 `web_search` 开关构造 Agent（只测请求构建，无 I/O）。
+    fn web_search_agent(provider: Arc<dyn ModelProvider>, web_search: Option<bool>) -> Agent {
+        let profile: AgentProfile =
+            serde_yaml::from_str("agent:\n  name: t\n  description: d\n").unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let mut builder = ModelConfigBuilder::new();
+        if let Some(w) = web_search {
+            builder = builder.web_search(w);
+        }
+        Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            provider,
+            builder.build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_web_search_marker_injection() {
+        let shell = || ToolDefinition {
+            name: "shell".to_string(),
+            description: "d".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+
+        // provider 支持 + 开关 true → 注入标记
+        let agent = web_search_agent(
+            Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()),
+            Some(true),
+        );
+        let request = agent.build_generate_request(vec![], None, vec![shell()], None);
+        let markers: Vec<_> = request
+            .tools
+            .iter()
+            .filter(|t| t.name == SERVER_TOOL_WEB_SEARCH)
+            .collect();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].description, "");
+        assert_eq!(markers[0].parameters, serde_json::json!({"type": "object"}));
+
+        // 开关缺省 / 显式 false → 不注入
+        for flag in [None, Some(false)] {
+            let agent =
+                web_search_agent(Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()), flag);
+            let request = agent.build_generate_request(vec![], None, vec![shell()], None);
+            assert!(
+                request
+                    .tools
+                    .iter()
+                    .all(|t| t.name != SERVER_TOOL_WEB_SEARCH),
+                "flag={flag:?} 应不注入标记"
+            );
+        }
+
+        // provider 不支持 → 开关打开也不注入（legacy 路径逐字节不变）
+        let agent = web_search_agent(
+            Arc::new(DeepSeekResponsesAdapter::new("sk").unwrap()),
+            Some(true),
+        );
+        let request = agent.build_generate_request(vec![], None, vec![shell()], None);
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|t| t.name != SERVER_TOOL_WEB_SEARCH),
+            "不支持的 provider 不得注入标记"
+        );
+    }
+
+    // ── agent.md web_search 配置透传 ───────────────────────────────────────
+
+    #[test]
+    fn test_build_model_config_carries_web_search() {
+        let config = user_config("deepseek", entry_of("deepseek", None));
+
+        let profile: AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: a\n  description: d\nllm:\n  provider: deepseek\n  web_search: true\n",
+        )
+        .unwrap();
+        let model_config = build_model_config_with_user(&profile, &config);
+        assert_eq!(model_config.web_search, Some(true));
+
+        let profile: AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: a\n  description: d\nllm:\n  provider: deepseek\n",
+        )
+        .unwrap();
+        let model_config = build_model_config_with_user(&profile, &config);
+        assert_eq!(model_config.web_search, None);
     }
 }

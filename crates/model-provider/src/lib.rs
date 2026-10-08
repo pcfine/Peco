@@ -93,6 +93,14 @@ pub trait ModelProvider: Send + Sync {
         false
     }
 
+    /// 是否支持服务端 `web_search` 工具（Anthropic 兼容端点）。
+    ///
+    /// 为 true 时，引擎在请求工具列表里追加以 [`SERVER_TOOL_WEB_SEARCH`] 命名的
+    /// 标记 `ToolDefinition`，由适配器翻译成服务端工具声明。
+    fn supports_server_web_search(&self) -> bool {
+        false
+    }
+
     /// 发送中立非流式生成请求。
     ///
     /// 返回有序 [`ContentBlock`] 列表 + 状态 + 用量。

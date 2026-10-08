@@ -40,7 +40,7 @@ pub const PROVIDER_TYPES: &[ProviderTypeMeta] = &[
         provider_type: "deepseek",
         display_name: "DeepSeek",
         default_base_url: DEEPSEEK_API_BASE_URL,
-        api_modes: &["responses", "chat"],
+        api_modes: &["anthropic", "responses", "chat"],
         suggested_models: &[DEEPSEEK_V4_FLASH],
         default_model: DEEPSEEK_V4_FLASH,
     },
@@ -113,6 +113,7 @@ mod tests {
                 max_tokens: None,
                 stream: None,
                 reasoning_effort: None,
+                web_search: None,
             };
 
             let built = crate::agent::build_provider_with_user(&model_config, &user_config);
@@ -131,6 +132,54 @@ mod tests {
         assert!(provider_type_meta("anthropic").is_none());
         assert!(!is_supported_provider_type("ollama"));
         assert!(is_supported_provider_type("DeepSeek"));
+    }
+
+    /// deepseek 目录声明的每个 api 模式都必须能分派构建。
+    #[test]
+    fn deepseek_api_modes_are_all_dispatchable() {
+        use crate::config::{McpConfig, ProviderEntry, ProvidersConfig, UserConfig};
+        use std::collections::HashMap;
+
+        let meta = provider_type_meta("deepseek").expect("deepseek 目录必须存在");
+        assert_eq!(meta.api_modes, &["anthropic", "responses", "chat"]);
+
+        for api in meta.api_modes {
+            let mut providers = HashMap::new();
+            providers.insert(
+                "deepseek".to_string(),
+                ProviderEntry {
+                    provider_type: "deepseek".to_string(),
+                    api_key: Some("sk-test".to_string()),
+                    base_url: None,
+                    api: Some(api.to_string()),
+                    default: None,
+                },
+            );
+            let user_config = UserConfig {
+                providers: ProvidersConfig {
+                    default_provider: "deepseek".to_string(),
+                    providers,
+                    web_search: None,
+                },
+                mcp: McpConfig::empty(),
+            };
+            let model_config = crate::agent::ModelConfig {
+                provider_name: Some("deepseek".to_string()),
+                model_name: Some(meta.default_model.to_string()),
+                temperature: None,
+                max_tokens: None,
+                stream: None,
+                reasoning_effort: None,
+                web_search: None,
+            };
+            let built = crate::agent::build_provider_with_user(&model_config, &user_config);
+            assert!(
+                built.is_ok(),
+                "api mode '{}' 无法分派：{:?}",
+                api,
+                built.err()
+            );
+        }
     }
 
     /// 目录默认模型必须落在各自类型的建议模型列表内（UI 预填值可选）。

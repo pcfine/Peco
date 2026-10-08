@@ -107,6 +107,10 @@ pub struct LlmConfig {
     /// 推理力度（可选，如 "low", "medium", "high"）。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+
+    /// 启用服务端 web 搜索（仅支持该能力的端点生效，如 deepseek anthropic）。
+    #[serde(default)]
+    pub web_search: Option<bool>,
 }
 
 // ── ModelConfig — Agent 级别的模型参数配置 ───────────────────────────────────────
@@ -123,6 +127,8 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
     pub stream: Option<bool>,
     pub reasoning_effort: Option<String>,
+    /// 服务端 web 搜索开关，仅 agent.md 可配（providers.toml 无对应默认项）。
+    pub web_search: Option<bool>,
 }
 
 impl ModelConfig {
@@ -146,6 +152,7 @@ impl ModelConfig {
                 .reasoning_effort
                 .clone()
                 .or_else(|| defaults.reasoning_effort.clone()),
+            web_search: self.web_search,
         }
     }
 }
@@ -170,6 +177,7 @@ pub struct ModelConfigBuilder {
     max_tokens: Option<u32>,
     stream: Option<bool>,
     reasoning_effort: Option<String>,
+    web_search: Option<bool>,
 }
 
 impl ModelConfigBuilder {
@@ -182,6 +190,7 @@ impl ModelConfigBuilder {
             max_tokens: None,
             stream: None,
             reasoning_effort: None,
+            web_search: None,
         }
     }
 
@@ -221,6 +230,12 @@ impl ModelConfigBuilder {
         self
     }
 
+    /// 设置服务端 web 搜索开关。
+    pub fn web_search(mut self, enabled: bool) -> Self {
+        self.web_search = Some(enabled);
+        self
+    }
+
     /// 消费 Builder 并构建 [`ModelConfig`]。
     pub fn build(self) -> ModelConfig {
         ModelConfig {
@@ -230,6 +245,7 @@ impl ModelConfigBuilder {
             max_tokens: self.max_tokens,
             stream: self.stream,
             reasoning_effort: self.reasoning_effort,
+            web_search: self.web_search,
         }
     }
 }
@@ -257,6 +273,7 @@ pub struct AssembleAgentMdParams {
     pub max_tokens: Option<u32>,
     pub stream: Option<bool>,
     pub reasoning_effort: Option<String>,
+    pub web_search: Option<bool>,
     pub tools: Vec<String>,
     pub mcp_servers: Vec<String>,
     pub skills: Vec<String>,
@@ -320,6 +337,9 @@ pub fn assemble_agent_md(params: &AssembleAgentMdParams) -> String {
     }
     if let Some(ref e) = params.reasoning_effort {
         yaml.push_str(&format!("  reasoning_effort: \"{}\"\n", yaml_escape(e)));
+    }
+    if let Some(w) = params.web_search {
+        yaml.push_str(&format!("  web_search: {}\n", w));
     }
 
     // tools（加引号防止 YAML 保留字如 true/false/null 被误解析）
@@ -523,6 +543,7 @@ mod tests {
             max_tokens: Some(4096),
             stream: Some(true),
             reasoning_effort: Some("high".into()),
+            web_search: Some(true),
             tools: vec!["shell".into(), "fetch".into()],
             mcp_servers: vec!["filesystem".into()],
             skills: vec!["code-review".into()],
@@ -549,6 +570,7 @@ mod tests {
         assert_eq!(llm.max_tokens, Some(4096));
         assert_eq!(llm.stream, Some(true));
         assert_eq!(llm.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(llm.web_search, Some(true));
 
         // 验证列表
         assert_eq!(profile.tools, vec!["shell", "fetch"]);
@@ -572,6 +594,7 @@ mod tests {
             max_tokens: None,
             stream: None,
             reasoning_effort: None,
+            web_search: None,
             tools: vec![],
             mcp_servers: vec![],
             skills: vec![],
@@ -593,6 +616,7 @@ mod tests {
         assert!(llm.max_tokens.is_none());
         assert!(llm.stream.is_none());
         assert!(llm.reasoning_effort.is_none());
+        assert!(llm.web_search.is_none());
 
         assert!(profile.tools.is_empty());
         assert!(profile.mcp.is_empty());
@@ -612,6 +636,7 @@ mod tests {
             max_tokens: None,
             stream: None,
             reasoning_effort: None,
+            web_search: None,
             tools: vec!["shell".into()],
             mcp_servers: vec![],
             skills: vec![],
@@ -645,5 +670,47 @@ mod tests {
         let bad = "no frontmatter here\njust text";
         let result = parse_agent_md(bad);
         assert!(result.is_err());
+    }
+
+    // ── web_search 配置 ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_agent_md_web_search() {
+        let md = "---\nagent:\n  name: a\n  description: d\nllm:\n  provider: deepseek\n  web_search: true\n---\nbody";
+        let (profile, _) = parse_agent_md(md).unwrap();
+        assert_eq!(profile.llm.as_ref().unwrap().web_search, Some(true));
+
+        let md = "---\nagent:\n  name: a\n  description: d\nllm:\n  provider: deepseek\n---\nbody";
+        let (profile, _) = parse_agent_md(md).unwrap();
+        assert_eq!(profile.llm.as_ref().unwrap().web_search, None);
+    }
+
+    #[test]
+    fn test_model_config_builder_web_search_roundtrip() {
+        let config = ModelConfigBuilder::new().web_search(true).build();
+        assert_eq!(config.web_search, Some(true));
+
+        let config = ModelConfigBuilder::new().build();
+        assert_eq!(config.web_search, None);
+    }
+
+    #[test]
+    fn test_merge_defaults_keeps_web_search() {
+        // web_search 无 provider 默认项，合并前后保持原值
+        let defaults = LlmApiParams {
+            model: "m".into(),
+            temperature: Some(0.5),
+            max_tokens: Some(1000),
+            stream: Some(true),
+            reasoning_effort: None,
+        };
+        let config = ModelConfigBuilder::new().web_search(true).build();
+        assert_eq!(
+            config.merge_defaults(Some(&defaults)).web_search,
+            Some(true)
+        );
+
+        let config = ModelConfigBuilder::new().build();
+        assert_eq!(config.merge_defaults(Some(&defaults)).web_search, None);
     }
 }
