@@ -40,7 +40,7 @@ pub const PROVIDER_TYPES: &[ProviderTypeMeta] = &[
         provider_type: "deepseek",
         display_name: "DeepSeek",
         default_base_url: DEEPSEEK_API_BASE_URL,
-        api_modes: &["anthropic", "responses", "chat"],
+        api_modes: &["responses", "anthropic", "chat"],
         suggested_models: &[DEEPSEEK_V4_FLASH],
         default_model: DEEPSEEK_V4_FLASH,
     },
@@ -141,7 +141,7 @@ mod tests {
         use std::collections::HashMap;
 
         let meta = provider_type_meta("deepseek").expect("deepseek 目录必须存在");
-        assert_eq!(meta.api_modes, &["anthropic", "responses", "chat"]);
+        assert_eq!(meta.api_modes, &["responses", "anthropic", "chat"]);
 
         for api in meta.api_modes {
             let mut providers = HashMap::new();
