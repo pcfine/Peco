@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use model_provider::Content;
 use peco_core::agent::LooperEvent;
 use tokio::sync::{Notify, broadcast, mpsc};
 
@@ -29,7 +30,8 @@ use tokio::sync::{Notify, broadcast, mpsc};
 #[derive(Debug)]
 pub enum ControlCommand {
     /// 排队一条用户消息（looper Active 时自动入 pending 队列，当前轮结束后续接）。
-    Query(String),
+    /// 纯文本为 `Content::Text`，携带图片时为 `Content::Parts`。
+    Query(Content),
     /// 取消在途轮次（looper 在下个检查点收尾并退出）。
     Cancel,
 }
@@ -163,16 +165,16 @@ impl PecoActiveRuns {
         map.get(user_id).map(|entry| entry.event_tx.subscribe())
     }
 
-    /// 向活跃 run 排队一条用户消息。
+    /// 向活跃 run 排队一条用户消息（`Content::Text` 纯文本 / `Content::Parts` 带图片）。
     ///
     /// 退出码见 [`EnqueueOutcome`]：`NoRun` 与否决式失败都要求调用方改走
     /// 新建路径，`Backpressure` 则是瞬时积压。
-    pub fn enqueue_query(&self, user_id: &str, text: String) -> EnqueueOutcome {
+    pub fn enqueue_query(&self, user_id: &str, content: Content) -> EnqueueOutcome {
         let map = self.inner.lock().unwrap();
         let Some(entry) = map.get(user_id) else {
             return EnqueueOutcome::NoRun;
         };
-        match entry.control_tx.try_send(ControlCommand::Query(text)) {
+        match entry.control_tx.try_send(ControlCommand::Query(content)) {
             Ok(()) => EnqueueOutcome::Enqueued,
             // Full 把消息原样退回，Closed 说明 runner 正在退出 —— 都不算投递成功。
             Err(mpsc::error::TrySendError::Full(_)) => EnqueueOutcome::Backpressure,
@@ -340,12 +342,12 @@ mod tests {
         let mut reg = registry.try_register("u1").expect("register");
 
         assert_eq!(
-            registry.enqueue_query("u2", "hi".into()),
+            registry.enqueue_query("u2", Content::Text("hi".into())),
             EnqueueOutcome::NoRun,
             "无 run 入队失败"
         );
         assert_eq!(
-            registry.enqueue_query("u1", "hi".into()),
+            registry.enqueue_query("u1", Content::Text("hi".into())),
             EnqueueOutcome::Enqueued
         );
         assert!(registry.cancel("u1"));
@@ -353,12 +355,39 @@ mod tests {
 
         assert!(matches!(
             reg.control_rx.recv().await,
-            Some(ControlCommand::Query(text)) if text == "hi"
+            Some(ControlCommand::Query(Content::Text(text))) if text == "hi"
         ));
         assert!(matches!(
             reg.control_rx.recv().await,
             Some(ControlCommand::Cancel)
         ));
+    }
+
+    #[tokio::test]
+    async fn enqueue_delivers_image_parts_verbatim() {
+        let registry = PecoActiveRuns::new();
+        let mut reg = registry.try_register("u1").expect("register");
+
+        let content = Content::Parts(vec![
+            model_provider::ContentPart::Text {
+                text: "看这张图".into(),
+            },
+            model_provider::ContentPart::Image {
+                url: "data:image/png;base64,AAAA".into(),
+                detail: None,
+            },
+        ]);
+        assert_eq!(
+            registry.enqueue_query("u1", content.clone()),
+            EnqueueOutcome::Enqueued
+        );
+        assert!(
+            matches!(
+                reg.control_rx.recv().await,
+                Some(ControlCommand::Query(c)) if c == content
+            ),
+            "图片部件应原样入队"
+        );
     }
 
     #[tokio::test]
@@ -369,12 +398,12 @@ mod tests {
         // 不排空 control_rx：灌满容量为 32 的通道，第 33 条必须是背压而非「无 run」
         for _ in 0..32 {
             assert_eq!(
-                registry.enqueue_query("u1", "x".into()),
+                registry.enqueue_query("u1", Content::Text("x".into())),
                 EnqueueOutcome::Enqueued
             );
         }
         assert_eq!(
-            registry.enqueue_query("u1", "x".into()),
+            registry.enqueue_query("u1", Content::Text("x".into())),
             EnqueueOutcome::Backpressure,
             "满队列不能误报成无 run"
         );

@@ -43,26 +43,20 @@ pub struct ConversationImageResponse {
     pub url: String,
 }
 
-/// 会话图片存储目录：`{data_dir}/uploads/chat/{user_id}/`。
-fn chat_upload_dir(data_dir: &StdPath, user_id: &str) -> PathBuf {
+/// 会话图片存储目录：`{data_dir}/uploads/chat/{user_id}/`（chat 与 peco 上传共用）。
+pub(crate) fn chat_upload_dir(data_dir: &StdPath, user_id: &str) -> PathBuf {
     data_dir.join("uploads").join("chat").join(user_id)
 }
 
-/// `POST /api/chat/{agentId}/conversations/{id}/images`
+/// multipart 校验 + 落盘（chat / peco 上传端点共用）。
 ///
-/// 接受 multipart form-data，字段名 `file`。会话归属校验通过后
-/// 保存图片并返回引用 id 与访问 URL。
-pub async fn upload_conversation_image(
-    AuthUser { user_id }: AuthUser,
-    State(state): State<Arc<AppState>>,
-    Path((_agent_id, conv_id)): Path<(String, String)>,
+/// 字段名 `file`，MIME/大小校验通过后写入该用户的上传目录，
+/// 返回 `(文件名, 访问 URL, 字节数)`。
+pub(crate) async fn store_uploaded_image(
+    state: &AppState,
+    user_id: &str,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<ConversationImageResponse>), ApiError> {
-    // 会话归属校验：仅对话所有者可向其上传图片
-    conversations::find_by_id_and_user(&state.db, &conv_id, &user_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
-
+) -> Result<(String, String, usize), ApiError> {
     let mut content_type: Option<String> = None;
     let mut data: Vec<u8> = Vec::new();
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -102,7 +96,7 @@ pub async fn upload_conversation_image(
         _ => "bin",
     };
     let filename = format!("{}.{ext}", Uuid::new_v4());
-    let dir = chat_upload_dir(&state.data_dir, &user_id);
+    let dir = chat_upload_dir(&state.data_dir, user_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to create upload dir: {e}")))?;
@@ -111,11 +105,30 @@ pub async fn upload_conversation_image(
         .map_err(|e| ApiError::Internal(format!("failed to write uploaded file: {e}")))?;
 
     let url = format!("/uploads/chat/{user_id}/{filename}");
+    Ok((filename, url, data.len()))
+}
+
+/// `POST /api/chat/{agentId}/conversations/{id}/images`
+///
+/// 接受 multipart form-data，字段名 `file`。会话归属校验通过后
+/// 保存图片并返回引用 id 与访问 URL。
+pub async fn upload_conversation_image(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path((_agent_id, conv_id)): Path<(String, String)>,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<ConversationImageResponse>), ApiError> {
+    // 会话归属校验：仅对话所有者可向其上传图片
+    conversations::find_by_id_and_user(&state.db, &conv_id, &user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
+
+    let (filename, url, size) = store_uploaded_image(&state, &user_id, multipart).await?;
     tracing::info!(
         user_id = %user_id,
         conversation_id = %conv_id,
         %url,
-        size = data.len(),
+        size,
         "Conversation image uploaded"
     );
 

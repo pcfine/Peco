@@ -16,6 +16,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use model_provider::Content;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -492,14 +493,17 @@ fn match_user(stem: &str, users: &[(String, String)]) -> UserMatch {
 
 /// 投递启动消息：已有 run 就排队，否则抢注并新建 run。
 async fn deliver(state: &Arc<AppState>, user_id: &str, text: String) -> Result<(), String> {
-    match state.peco_runs.enqueue_query(user_id, text.clone()) {
+    match state
+        .peco_runs
+        .enqueue_query(user_id, Content::Text(text.clone()))
+    {
         EnqueueOutcome::Enqueued => Ok(()),
         EnqueueOutcome::Backpressure => Err("peco control queue full".to_string()),
         EnqueueOutcome::NoRun => {
             let Some(registration) = state.peco_runs.try_register(user_id) else {
                 return Err("peco run registry busy (concurrent registration)".to_string());
             };
-            spawn_peco_run(state, user_id, text, registration)
+            spawn_peco_run(state, user_id, Content::Text(text), registration)
                 .await
                 .map_err(|e| e.message().to_string())
         }

@@ -756,10 +756,13 @@ async fn test_stream_attaches_and_enqueues_into_active_run() {
         .await
         .expect("消息应在超时前排入控制通道")
         .expect("控制通道不应关闭");
-    let peco_server::peco::active::ControlCommand::Query(text) = cmd else {
+    let peco_server::peco::active::ControlCommand::Query(content) = cmd else {
         panic!("应为 Query 命令，实际 {cmd:?}");
     };
-    assert_eq!(text, "hello");
+    assert!(
+        matches!(&content, model_provider::Content::Text(t) if t == "hello"),
+        "纯文本应入队为 Content::Text，实际 {content:?}"
+    );
 }
 
 // ── POST /api/peco/stream/query（常驻连接复用，不新开 SSE） ────────────────
@@ -783,10 +786,10 @@ async fn test_query_endpoint_enqueues_into_active_run() {
         .await
         .expect("消息应在超时前排入控制通道")
         .expect("控制通道不应关闭");
-    let peco_server::peco::active::ControlCommand::Query(text) = cmd else {
+    let peco_server::peco::active::ControlCommand::Query(content) = cmd else {
         panic!("应为 Query 命令，实际 {cmd:?}");
     };
-    assert_eq!(text, "第二条消息", "入队前应 trim");
+    assert_eq!(content.text_view(), "第二条消息", "入队前应 trim");
 }
 
 #[tokio::test]
@@ -887,7 +890,7 @@ async fn test_attach_then_query_delivers_exactly_once() {
         .expect("控制通道不应关闭");
     assert!(matches!(
         cmd,
-        peco_server::peco::active::ControlCommand::Query(ref t) if t == "second"
+        peco_server::peco::active::ControlCommand::Query(ref t) if t.text_view() == "second"
     ));
 
     // 不得重复投递

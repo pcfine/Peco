@@ -6,6 +6,7 @@
 //   - GET  /api/peco/stream?message=xxx   SSE 流式对话（无 message 时为纯附着模式）
 //   - POST /api/peco/stream/query         向已注册的 run 排队消息（不新开连接）
 //   - POST /api/peco/stream/cancel        取消进行中的任务
+//   - POST /api/peco/images               上传图片（随 stream 的 image_ids 发送）
 //   - GET  /api/peco/session               会话快照
 //   - DELETE /api/peco/session              清除/重置会话
 //   - GET  /api/peco/memory/audit           记忆删除审计（分页）
@@ -33,14 +34,16 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use axum_extra::extract::Multipart;
 use futures::stream::Stream;
-use model_provider::InputItem;
+use model_provider::{Content, ContentPart, InputItem};
 use peco_core::agent::{AgentLooper, LooperEvent, LooperHandle, OuterState, strip_summary_wrapper};
 use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
 use peco_core::persistence::SessionPersister;
@@ -80,6 +83,9 @@ const CLEAR_RUN_WAIT: Duration = Duration::from_secs(10);
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
     pub message: Option<String>,
+    /// 逗号分隔的图片引用 id（上传端点返回）；随 message 解析为图片部件。
+    #[serde(default)]
+    pub image_ids: Option<String>,
 }
 
 /// 简单成功响应。
@@ -211,6 +217,46 @@ impl Drop for WatcherGuard {
 
 // ── Handler: GET /api/peco/stream ────────────────────────────────────────
 
+/// 解析 `image_ids` 查询参数（逗号分隔、trim、去空）。
+fn parse_image_ids(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 组装本轮用户输入：无图 → `Content::Text`；有图 → `Content::Parts`（文本 ++ 图片）。
+///
+/// `message` 缺省（纯附着）→ `None`，此时 `image_ids` 无语义；带 image_ids
+/// 却没有 message 时拒绝 —— 图片必须随文本一起进入本轮输入。
+async fn build_query_content(
+    state: &AppState,
+    user_id: &str,
+    message: Option<String>,
+    image_ids_raw: Option<&str>,
+) -> Result<Option<Content>, ApiError> {
+    let Some(text) = message else {
+        if !parse_image_ids(image_ids_raw).is_empty() {
+            return Err(ApiError::BadRequest(
+                "message is required（image_ids 需随 message 一起发送）".into(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    let image_ids = parse_image_ids(image_ids_raw);
+    let image_parts = crate::chat::images::resolve_image_parts(state, user_id, &image_ids).await?;
+    if image_parts.is_empty() {
+        return Ok(Some(Content::Text(text)));
+    }
+    let mut parts = Vec::with_capacity(1 + image_parts.len());
+    parts.push(ContentPart::Text { text });
+    parts.extend(image_parts);
+    Ok(Some(Content::Parts(parts)))
+}
+
 /// SSE 流式对话。
 ///
 /// 语义四象限（按是否有活跃 run / 是否携带 message）：
@@ -231,14 +277,18 @@ pub async fn stream_chat(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
 
+    // ── 解析本轮输入（图片引用非法 / 跨用户一律 4xx，先于附着与新建）──
+    let content =
+        build_query_content(&state, &user_id, message, params.image_ids.as_deref()).await?;
+
     for _ in 0..3 {
         // ── 尝试附着到已有 run ─────────────────────────────────────────
         if let Some(rx) = state.peco_runs.subscribe(&user_id) {
-            match message
+            match content
                 .as_ref()
                 // 先 subscribe 再 enqueue：持有一个 receiver 后 run 不可能被
                 // 回收（try_reclaim 要求订阅者数为 0），消息必然送达。
-                .map(|text| state.peco_runs.enqueue_query(&user_id, text.clone()))
+                .map(|c| state.peco_runs.enqueue_query(&user_id, c.clone()))
             {
                 // 纯附着，或消息已入队 → 桥接事件流
                 None | Some(EnqueueOutcome::Enqueued) => {
@@ -261,7 +311,7 @@ pub async fn stream_chat(
         }
 
         // ── 无 run：新建需要 message ───────────────────────────────────
-        let Some(text) = message.clone() else {
+        let Some(initial) = content.clone() else {
             return Err(ApiError::BadRequest(
                 "message is required（当前无进行中的任务可附着）".into(),
             ));
@@ -280,7 +330,7 @@ pub async fn stream_chat(
 
         // 注册产物所有权移交 spawn_peco_run → runner 任务；其内部任一步
         // 失败时 registration 在该函数帧内 drop → guard 清理注册表。
-        spawn_peco_run(&state, &user_id, text, registration).await?;
+        spawn_peco_run(&state, &user_id, initial, registration).await?;
         return Ok(bridge_sse_response(Arc::clone(&state), user_id.clone(), rx));
     }
 
@@ -348,7 +398,7 @@ async fn load_or_new_session(
 pub(crate) async fn spawn_peco_run(
     state: &Arc<AppState>,
     user_id: &str,
-    message: String,
+    message: Content,
     registration: RunRegistration,
 ) -> Result<(), ApiError> {
     // ── 1. PecoManager（重活：模板幂等安装 + @assistant 加载 + 记忆/压缩装配）──
@@ -418,10 +468,10 @@ async fn runner_loop(
     _guard: RunGuard,
     runs: Arc<crate::peco::active::PecoActiveRuns>,
     user_id: String,
-    initial_message: String,
+    initial_message: Content,
 ) {
     // 初始消息由 runner 发送：此处 looper 必为 Idle，直通开启新一轮。
-    if let Err(e) = handle.send_query(initial_message).await {
+    if let Err(e) = handle.send_query_content(initial_message).await {
         warn!(user_id = %user_id, error = %e, "Failed to send initial query; runner exiting");
         return;
     }
@@ -462,8 +512,8 @@ async fn runner_loop(
                 None => break,
             },
             cmd = control_rx.recv() => match cmd {
-                Some(ControlCommand::Query(text)) => {
-                    if let Err(e) = handle.send_query(text).await {
+                Some(ControlCommand::Query(content)) => {
+                    if let Err(e) = handle.send_query_content(content).await {
                         warn!(user_id = %user_id, error = %e, "Failed to enqueue user query");
                     }
                 }
@@ -594,7 +644,7 @@ pub async fn query_stream(
         return Err(ApiError::BadRequest("message is required".into()));
     }
 
-    match state.peco_runs.enqueue_query(&user_id, text) {
+    match state.peco_runs.enqueue_query(&user_id, Content::Text(text)) {
         EnqueueOutcome::Enqueued => {
             info!(user_id = %user_id, "Peco query enqueued into active run");
             Ok(Json(SuccessResponse {
@@ -607,6 +657,33 @@ pub async fn query_stream(
             "peco control queue full（待处理消息积压）".into(),
         )),
     }
+}
+
+// ── Handler: POST /api/peco/images ──────────────────────────────────────
+
+/// 上传一张随消息发送的图片。
+///
+/// peco 是用户级永续会话，没有 conversation 归属校验；存储目录与 chat
+/// 上传共用（`{data_dir}/uploads/chat/{user_id}/`），`resolve_image_parts`
+/// 直接可解析。
+pub async fn upload_peco_image(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<
+    (
+        StatusCode,
+        Json<crate::chat::images::ConversationImageResponse>,
+    ),
+    ApiError,
+> {
+    let (filename, url, size) =
+        crate::chat::images::store_uploaded_image(&state, &user_id, multipart).await?;
+    info!(user_id = %user_id, %url, size, "Peco image uploaded");
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::chat::images::ConversationImageResponse { id: filename, url }),
+    ))
 }
 
 // ── Handler: GET /api/peco/session ──────────────────────────────────────
@@ -2013,6 +2090,7 @@ pub struct SupersedeHealthResponse {
 /// - `GET /stream` — SSE 流式对话（无 message 时为纯附着模式）
 /// - `POST /stream/query` — 向已注册的 run 排队一条消息（不新开连接）
 /// - `POST /stream/cancel` — 取消进行中的任务
+/// - `POST /images` — 上传图片（multipart 字段 `file`，随 `image_ids` 发送）
 /// - `GET /session` — 获取会话快照（`?turns=&before=` 分 turn 分页）
 /// - `GET /session/metrics` — 上下文指标轻量端点
 /// - `DELETE /session` — 清除会话（默认先归档，`?archive=false` 硬删除）
@@ -2036,6 +2114,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/stream", get(stream_chat))
         .route("/stream/query", post(query_stream))
         .route("/stream/cancel", post(cancel_stream))
+        .route(
+            "/images",
+            // layer 加在 MethodRouter 上，只作用于本路由 —— 否则 2MB 默认
+            // body 限制会让 10MB 图片校验永远不可达
+            post(upload_peco_image).layer(DefaultBodyLimit::max(
+                crate::chat::images::MAX_UPLOAD_BODY_BYTES,
+            )),
+        )
         .route("/session", get(get_session_snapshot).delete(clear_session))
         .route("/session/metrics", get(get_session_metrics))
         .route("/session/export", get(export_session))
@@ -2065,11 +2151,145 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
 
+    use crate::config::ServerConfig;
+    use crate::workflow::scheduler::CronScheduler;
+
     async fn status_and_json(resp: Response) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json = serde_json::from_slice(&bytes).unwrap();
         (status, json)
+    }
+
+    /// 构造测试用 AppState（临时 DB + 临时数据目录）。
+    async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            database_url: url,
+            jwt_secret: "test-secret-key-do-not-use-in-production".to_string(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let scheduler = Arc::new(CronScheduler::new().await.unwrap());
+        let state = AppState::new(&config, pool, scheduler).await;
+        (Arc::new(state), dir)
+    }
+
+    /// 向指定用户的上传目录写一张测试图片。
+    async fn put_image(state: &AppState, user_id: &str, filename: &str) {
+        let dir = crate::chat::images::chat_upload_dir(&state.data_dir, user_id);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(filename), b"\x89PNG fake")
+            .await
+            .unwrap();
+    }
+
+    // ── image_ids 解析（build_query_content）────────────────────────────
+
+    /// 无图（image_ids 缺省或空）→ `Content::Text`，与改动前逐字节等价。
+    #[tokio::test]
+    async fn build_query_content_plain_text_without_images() {
+        let (state, _dir) = test_state().await;
+
+        for raw in [None, Some(""), Some(" , ,")] {
+            let content = build_query_content(&state, "u1", Some("你好".into()), raw)
+                .await
+                .unwrap();
+            assert_eq!(content, Some(Content::Text("你好".into())), "raw={raw:?}");
+        }
+    }
+
+    /// 有图 → `Content::Parts`：文本部件在前，图片部件随后（data URI）。
+    #[tokio::test]
+    async fn build_query_content_resolves_images_to_parts() {
+        let (state, _dir) = test_state().await;
+        put_image(&state, "u1", "a.png").await;
+
+        let content =
+            build_query_content(&state, "u1", Some("看看这张图".into()), Some(" a.png ,"))
+                .await
+                .unwrap();
+        let Some(Content::Parts(parts)) = content else {
+            panic!("应为 Content::Parts，实际 {content:?}");
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            ContentPart::Text {
+                text: "看看这张图".into()
+            }
+        );
+        match &parts[1] {
+            ContentPart::Image { url, .. } => {
+                assert!(url.starts_with("data:image/png;base64,"), "url={url}");
+            }
+            other => panic!("第二部件应为图片，实际 {other:?}"),
+        }
+    }
+
+    /// 非法 id（路径穿越）→ 400；不存在 / 属于他人目录 → 404。
+    #[tokio::test]
+    async fn build_query_content_rejects_illegal_and_missing_ids() {
+        let (state, _dir) = test_state().await;
+        put_image(&state, "u1", "a.png").await;
+
+        let err = build_query_content(&state, "u1", Some("hi".into()), Some("../a.png"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "路径穿越应 400：{err:?}"
+        );
+
+        let err = build_query_content(&state, "u1", Some("hi".into()), Some("missing.png"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::NotFound(_)),
+            "不存在应 404：{err:?}"
+        );
+
+        let err = build_query_content(&state, "u2", Some("hi".into()), Some("a.png"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::NotFound(_)),
+            "引用他人目录的图片应 404：{err:?}"
+        );
+    }
+
+    /// 纯附着（message 缺省）→ `None`；此时携带 image_ids 无语义、直接 400。
+    #[tokio::test]
+    async fn build_query_content_attach_has_no_image_semantics() {
+        let (state, _dir) = test_state().await;
+        put_image(&state, "u1", "a.png").await;
+
+        let content = build_query_content(&state, "u1", None, None).await.unwrap();
+        assert_eq!(content, None, "纯附着不组装任何输入");
+
+        let err = build_query_content(&state, "u1", None, Some("a.png"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "image_ids 必须随 message 发送：{err:?}"
+        );
+    }
+
+    /// `parse_image_ids`：逗号分隔、trim、去空。
+    #[test]
+    fn parse_image_ids_trims_and_drops_blanks() {
+        assert!(parse_image_ids(None).is_empty());
+        assert!(parse_image_ids(Some(" , ,")).is_empty());
+        assert_eq!(
+            parse_image_ids(Some(" a.png ,, b.jpg ,")),
+            vec!["a.png".to_string(), "b.jpg".to_string()]
+        );
     }
 
     /// E1 404：KB 不存在 ⇒ `NotFound` ⇒ 404 `{"error":"not_found", ...}`。
