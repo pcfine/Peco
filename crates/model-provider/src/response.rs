@@ -18,7 +18,8 @@ use crate::types::{ToolDefinition, Usage};
 // ContentBlock — 内容块（顺序敏感）
 // ============================================================================
 
-/// 中立内容块。`Text` / `Reasoning` / `ToolCall` 各自独立成块，顺序即语义。
+/// 中立内容块。`Text` / `Reasoning` / `ToolCall` 各自独立成块，顺序即语义；
+/// `ServerToolUse` / `ServerToolResult` 为 provider 侧执行的服务端工具，不进客户端执行循环。
 ///
 /// 采用 serde 外部标记（默认），JSON 自描述、可扩展。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,7 +35,23 @@ pub enum ContentBlock {
         name: String,
         arguments: String,
     },
+    /// 服务端工具调用：由 provider 侧执行（如 web_search），不进客户端工具执行循环。
+    /// `input` 为 raw JSON 字符串。
+    ServerToolUse {
+        call_id: String,
+        name: String,
+        input: String,
+    },
+    /// 服务端工具结果：provider 侧回填。`content` 为工具原始 JSON 结果字符串。
+    ServerToolResult {
+        call_id: String,
+        name: String,
+        content: String,
+    },
 }
+
+/// 引擎在请求工具列表中追加以此命名的 `ToolDefinition`，表示启用服务端 web 搜索。
+pub const SERVER_TOOL_WEB_SEARCH: &str = "__server_tool_web_search__";
 
 // ============================================================================
 // Content — 消息 / 工具输出内容（string | parts[]）
@@ -220,6 +237,8 @@ pub enum BlockType {
     Text,
     Reasoning,
     ToolCall,
+    ServerToolUse,
+    ServerToolResult,
 }
 
 /// 结束原因（`#[non_exhaustive]` 可扩展数据模型）。
@@ -522,6 +541,77 @@ mod tests {
         );
         let back: ContentBlock = serde_json::from_str(&json).unwrap();
         assert_eq!(back, block);
+    }
+
+    #[test]
+    fn server_tool_block_serde_roundtrip_external_tag() {
+        let use_block = ContentBlock::ServerToolUse {
+            call_id: "srv_1".to_string(),
+            name: "web_search".to_string(),
+            input: r#"{"query":"rust async"}"#.to_string(),
+        };
+        let json = serde_json::to_string(&use_block).unwrap();
+        assert_eq!(
+            json,
+            r#"{"ServerToolUse":{"call_id":"srv_1","name":"web_search","input":"{\"query\":\"rust async\"}"}}"#
+        );
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, use_block);
+
+        let result_block = ContentBlock::ServerToolResult {
+            call_id: "srv_1".to_string(),
+            name: "web_search".to_string(),
+            content: r#"[{"type":"web_search_result","url":"https://example.com"}]"#.to_string(),
+        };
+        let json = serde_json::to_string(&result_block).unwrap();
+        assert_eq!(
+            json,
+            r#"{"ServerToolResult":{"call_id":"srv_1","name":"web_search","content":"[{\"type\":\"web_search_result\",\"url\":\"https://example.com\"}]"}}"#
+        );
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, result_block);
+    }
+
+    #[test]
+    fn server_tool_web_search_marker_value_is_stable() {
+        // 标记值会随请求体落向 wire（被适配器按名字识别），变更即破坏互通。
+        assert_eq!(SERVER_TOOL_WEB_SEARCH, "__server_tool_web_search__");
+    }
+
+    #[test]
+    fn assembler_places_server_tool_blocks_via_block_end() {
+        // BlockAssembler 的落位与块类型无关：server 块经 BlockEnd 归位，
+        // 未闭合时 finish 的降级告警同样适用。
+        let mut a = BlockAssembler::new();
+        a.push(StreamChunk::BlockStart {
+            index: 0,
+            block_type: BlockType::ServerToolUse,
+        });
+        a.push(StreamChunk::BlockEnd {
+            index: 0,
+            block: ContentBlock::ServerToolUse {
+                call_id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                input: "{}".to_string(),
+            },
+        });
+        a.push(StreamChunk::Finish {
+            reason: FinishReason::Stop,
+        });
+        let (blocks, _, status, err) = a.finish();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(blocks[0], ContentBlock::ServerToolUse { .. }));
+        assert_eq!(status, ResponseStatus::Completed);
+        assert!(err.is_none());
+
+        let mut a = BlockAssembler::new();
+        a.push(StreamChunk::BlockStart {
+            index: 0,
+            block_type: BlockType::ServerToolResult,
+        });
+        let (blocks, _, status, _) = a.finish();
+        assert!(blocks.is_empty());
+        assert_eq!(status, ResponseStatus::Incomplete);
     }
 
     #[test]

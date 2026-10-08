@@ -83,6 +83,8 @@ pub(crate) fn summarize_blocks(blocks: &[ContentBlock]) -> BlockSummary {
             ContentBlock::Text { .. } => s.text += 1,
             ContentBlock::Reasoning { .. } => s.reasoning += 1,
             ContentBlock::ToolCall { .. } => s.tool_calls += 1,
+            // 服务端工具块不进这里的历史日志口径，由适配器按 usage 单独打点
+            ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => {}
         }
     }
     s
@@ -521,5 +523,26 @@ mod tests {
         assert_eq!(s.text, 1);
         assert_eq!(s.reasoning, 1);
         assert_eq!(s.tool_calls, 1);
+
+        // 服务端工具块不影响既有计数口径
+        let blocks = [
+            ContentBlock::ServerToolUse {
+                call_id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                input: "{}".to_string(),
+            },
+            ContentBlock::ServerToolResult {
+                call_id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                content: "[]".to_string(),
+            },
+            ContentBlock::Text {
+                text: "hi".to_string(),
+            },
+        ];
+        let s = summarize_blocks(&blocks);
+        assert_eq!(s.text, 1);
+        assert_eq!(s.reasoning, 0);
+        assert_eq!(s.tool_calls, 0);
     }
 }

@@ -589,20 +589,25 @@ fn response_item_to_block(item: &Value) -> Option<ContentBlock> {
 /// 非流式块序归一：Reasoning → Text → ToolCall（类内相对顺序保持）。
 ///
 /// 与 chat 适配器的产出顺序一致，下游消费方按此顺序处理；流式路径按
-/// `output_index` 实时产出，不做重排。
+/// `output_index` 实时产出，不做重排。服务端工具块尾随 —— 本适配器不产出该类块。
 fn reorder_blocks(blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
     let mut reasoning = Vec::new();
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut server = Vec::new();
     for block in blocks {
         match block {
             ContentBlock::Reasoning { .. } => reasoning.push(block),
             ContentBlock::Text { .. } => text.push(block),
             ContentBlock::ToolCall { .. } => tool_calls.push(block),
+            ContentBlock::ServerToolUse { .. } | ContentBlock::ServerToolResult { .. } => {
+                server.push(block)
+            }
         }
     }
     reasoning.extend(text);
     reasoning.extend(tool_calls);
+    reasoning.extend(server);
     reasoning
 }
 

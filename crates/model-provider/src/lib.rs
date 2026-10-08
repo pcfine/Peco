@@ -66,7 +66,7 @@ pub use providers::qwen::{
 pub use response::{
     BlockAssembler, BlockType, Content, ContentBlock, ContentPart, FinishReason, GenerateRequest,
     GenerateResult, ImageDetail, InputItem, ReasoningConfig, ReasoningEffort, ResponseError,
-    ResponseStatus, Role, StreamChunk, TextConfig, TextFormat, ToolChoice,
+    ResponseStatus, Role, SERVER_TOOL_WEB_SEARCH, StreamChunk, TextConfig, TextFormat, ToolChoice,
 };
 pub use types::{ToolCall, ToolCallFunction, ToolDefinition, Usage};
 
