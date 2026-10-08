@@ -487,15 +487,20 @@ fn api_mode_of(entry: &ProviderEntry) -> Option<&str> {
 /// 解析 provider（未实例化）的用户消息图片输入能力。
 ///
 /// 与 [`build_provider_with_user`] 的适配器分派同源：openai 两 API 皆支持；
-/// qwen 仅 chat completions（responses 保守剥离）；deepseek 不支持；
-/// 未知 provider 名或类型不支持。仅反映用户消息维度 — 工具输出图片
-/// 是另一维度，各适配器另有矩阵。
+/// qwen 仅 chat completions；deepseek 仅 anthropic 兼容端点
+///（responses / chat 保守剥离）；未知 provider 名或类型不支持。
+/// 仅反映用户消息维度 — 工具输出图片是另一维度，各适配器另有矩阵。
+///
+/// 注意：本判定落在 provider + API 风格这一层，不含模型能力。文本模态模型
+///（如 `deepseek-v4-pro`）走 anthropic 端点时同样返回 true，图片会被服务端
+/// 忽略而非报错。部署所用 `deepseek-flash` / `deepseek-v4-flash` 均为视觉模型。
 pub fn supports_image_input_for(user_config: &UserConfig, provider_name: Option<&str>) -> bool {
     let provider_name = provider_name.unwrap_or_else(|| user_config.default_provider_name());
     match user_config.provider_entry(Some(provider_name)) {
         Some(entry) => match entry.provider_type.as_str() {
             "openai" => true,
             "qwen" => api_mode_of(entry).is_some_and(|a| a.eq_ignore_ascii_case("chat")),
+            "deepseek" => api_mode_of(entry).is_some_and(|a| a.eq_ignore_ascii_case("anthropic")),
             _ => false,
         },
         None => false,
@@ -798,6 +803,20 @@ mod tests {
 
         let chat = user_config("qwen", entry_of("qwen", Some("chat")));
         assert!(supports_image_input_for(&chat, Some("qwen")));
+    }
+
+    #[test]
+    fn test_supports_image_input_deepseek_anthropic_only() {
+        // 仅 anthropic 兼容端点支持用户图片；responses / chat / 缺省一律不支持。
+        for api in [None, Some("responses"), Some("chat")] {
+            let config = user_config("deepseek", entry_of("deepseek", api));
+            assert!(
+                !supports_image_input_for(&config, Some("deepseek")),
+                "deepseek api={api:?} 不应支持用户图片输入"
+            );
+        }
+        let anthropic = user_config("deepseek", entry_of("deepseek", Some("anthropic")));
+        assert!(supports_image_input_for(&anthropic, Some("deepseek")));
     }
 
     #[test]
