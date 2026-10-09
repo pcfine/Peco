@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ChatView } from "@/components/chat/ChatView";
-import { getAgent, listAgents } from "@/api/agents";
+import { getAssistantSupportsImages } from "@/api/agents";
 import { pecoStreamUrl, uploadPecoImage } from "@/api/peco";
 import { usePecoChatStore } from "@/stores/pecoChatStore";
 import { useAuthStore } from "@/stores/authStore";
@@ -34,19 +34,16 @@ export function PecoChatPage() {
   }, [load]);
 
   // @assistant 的 provider 是否支持用户图片输入 —— 决定附件入口可用性。
+  // 能力值静态、进程内 memo（见 api/agents），路由往返与 StrictMode 双跑各只探一次。
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const all = await listAgents();
-        const match = all.find((a) => a.name === "@assistant");
-        if (!match) return;
-        const detail = await getAgent(match.id);
-        if (!cancelled) setSupportsImages(detail.supports_images);
-      } catch {
+    getAssistantSupportsImages()
+      .then((supported) => {
+        if (!cancelled) setSupportsImages(supported);
+      })
+      .catch(() => {
         // 取不到能力信息时保持禁用附件入口
-      }
-    })();
+      });
     return () => {
       cancelled = true;
     };
