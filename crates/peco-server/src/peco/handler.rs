@@ -7,6 +7,7 @@
 //   - POST /api/peco/stream/query         向已注册的 run 排队消息（不新开连接）
 //   - POST /api/peco/stream/cancel        取消进行中的任务
 //   - POST /api/peco/images               上传图片（随 stream 的 image_ids 发送）
+//   - POST /api/peco/files                上传图片/文档（按扩展名分类，随 file_ids 发送）
 //   - GET  /api/peco/session               会话快照
 //   - DELETE /api/peco/session              清除/重置会话
 //   - GET  /api/peco/memory/audit           记忆删除审计（分页）
@@ -78,14 +79,19 @@ const CLEAR_RUN_WAIT: Duration = Duration::from_secs(10);
 
 /// SSE 流式查询参数。
 ///
-/// `message` 缺省时为纯附着模式：接上当前用户进行中的任务流
-/// （重开页面的场景）；无进行中任务时返回 400。
+/// `message` 与附件 id 均缺省时为纯附着模式：接上当前用户进行中的任务流
+/// （重开页面的场景）；无进行中任务时返回 400。只有附件没有 `message` 时
+/// 照常组装本轮输入（附件即输入）。
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
     pub message: Option<String>,
     /// 逗号分隔的图片引用 id（上传端点返回）；随 message 解析为图片部件。
     #[serde(default)]
     pub image_ids: Option<String>,
+    /// 逗号分隔的附件引用 id（`POST /api/peco/files` 返回）；图片与文档
+    /// 均可，文档在服务端解析为附件部件。
+    #[serde(default)]
+    pub file_ids: Option<String>,
 }
 
 /// 简单成功响应。
@@ -217,8 +223,8 @@ impl Drop for WatcherGuard {
 
 // ── Handler: GET /api/peco/stream ────────────────────────────────────────
 
-/// 解析 `image_ids` 查询参数（逗号分隔、trim、去空）。
-fn parse_image_ids(raw: Option<&str>) -> Vec<String> {
+/// 解析逗号分隔的 id 列表（trim、去空）。
+fn parse_id_list(raw: Option<&str>) -> Vec<String> {
     raw.unwrap_or("")
         .split(',')
         .map(str::trim)
@@ -227,33 +233,59 @@ fn parse_image_ids(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// 组装本轮用户输入：无图 → `Content::Text`；有图 → `Content::Parts`（文本 ++ 图片）。
+/// 组装本轮用户输入。
 ///
-/// `message` 缺省（纯附着）→ `None`，此时 `image_ids` 无语义；带 image_ids
-/// 却没有 message 时拒绝 —— 图片必须随文本一起进入本轮输入。
+/// - 无 message 且无附件 → `None`（纯附着，保持既有语义）。
+/// - 无附件 → `Content::Text`（纯文本路径与改动前逐字节等价）。
+/// - 有附件 → `Content::Parts`：文本部件（message 缺省则不加）+ 附件部件，
+///   附件按 `image_ids ++ file_ids` 合并去重后的顺序解析。
+///
+/// 附件总数（合并去重后）超上限 → 400。
 async fn build_query_content(
     state: &AppState,
     user_id: &str,
     message: Option<String>,
     image_ids_raw: Option<&str>,
+    file_ids_raw: Option<&str>,
 ) -> Result<Option<Content>, ApiError> {
-    let Some(text) = message else {
-        if !parse_image_ids(image_ids_raw).is_empty() {
-            return Err(ApiError::BadRequest(
-                "message is required（image_ids 需随 message 一起发送）".into(),
-            ));
+    // 合并两路 id：image_ids 在前、file_ids 在后，去重保序
+    let mut ids: Vec<String> = Vec::new();
+    for id in parse_id_list(image_ids_raw)
+        .into_iter()
+        .chain(parse_id_list(file_ids_raw))
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
         }
-        return Ok(None);
+    }
+    if ids.len() > super::files::MAX_FILES_PER_TURN {
+        return Err(ApiError::BadRequest(format!(
+            "单轮附件最多 {} 个",
+            super::files::MAX_FILES_PER_TURN
+        )));
+    }
+
+    let attachments = if ids.is_empty() {
+        Vec::new()
+    } else {
+        super::files::resolve_file_parts(state, user_id, &ids).await?
     };
 
-    let image_ids = parse_image_ids(image_ids_raw);
-    let image_parts = crate::chat::images::resolve_image_parts(state, user_id, &image_ids).await?;
-    if image_parts.is_empty() {
+    let Some(text) = message else {
+        // 无 message：有附件则附件即输入，否则纯附着
+        return if attachments.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Content::Parts(attachments)))
+        };
+    };
+
+    if attachments.is_empty() {
         return Ok(Some(Content::Text(text)));
     }
-    let mut parts = Vec::with_capacity(1 + image_parts.len());
+    let mut parts = Vec::with_capacity(1 + attachments.len());
     parts.push(ContentPart::Text { text });
-    parts.extend(image_parts);
+    parts.extend(attachments);
     Ok(Some(Content::Parts(parts)))
 }
 
@@ -277,9 +309,15 @@ pub async fn stream_chat(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
 
-    // ── 解析本轮输入（图片引用非法 / 跨用户一律 4xx，先于附着与新建）──
-    let content =
-        build_query_content(&state, &user_id, message, params.image_ids.as_deref()).await?;
+    // ── 解析本轮输入（附件引用非法 / 跨用户一律 4xx，先于附着与新建）──
+    let content = build_query_content(
+        &state,
+        &user_id,
+        message,
+        params.image_ids.as_deref(),
+        params.file_ids.as_deref(),
+    )
+    .await?;
 
     for _ in 0..3 {
         // ── 尝试附着到已有 run ─────────────────────────────────────────
@@ -684,6 +722,29 @@ pub async fn upload_peco_image(
         StatusCode::CREATED,
         Json(crate::chat::images::ConversationImageResponse { id: filename, url }),
     ))
+}
+
+// ── Handler: POST /api/peco/files ──────────────────────────────────────
+
+/// 上传一个随消息发送的附件（图片或文档）。
+///
+/// 按扩展名白名单分类：图片复用 chat 上传目录并返回 `url`；文档落
+/// `peco-files/{user_id}/`（不进静态目录），原始文件名只存 sidecar。
+/// 随 `GET /stream?file_ids=` 发送，文档在发送时解析为附件部件。
+pub async fn upload_peco_file(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<super::files::UploadedFile>), ApiError> {
+    let file = super::files::store_uploaded_file(&state, &user_id, multipart).await?;
+    info!(
+        user_id = %user_id,
+        id = %file.id,
+        kind = ?file.kind,
+        size = file.size,
+        "Peco file uploaded"
+    );
+    Ok((StatusCode::CREATED, Json(file)))
 }
 
 // ── Handler: GET /api/peco/session ──────────────────────────────────────
@@ -2091,6 +2152,7 @@ pub struct SupersedeHealthResponse {
 /// - `POST /stream/query` — 向已注册的 run 排队一条消息（不新开连接）
 /// - `POST /stream/cancel` — 取消进行中的任务
 /// - `POST /images` — 上传图片（multipart 字段 `file`，随 `image_ids` 发送）
+/// - `POST /files` — 上传附件（图片/文档，multipart 字段 `file`，随 `file_ids` 发送）
 /// - `GET /session` — 获取会话快照（`?turns=&before=` 分 turn 分页）
 /// - `GET /session/metrics` — 上下文指标轻量端点
 /// - `DELETE /session` — 清除会话（默认先归档，`?archive=false` 硬删除）
@@ -2121,6 +2183,10 @@ pub fn router() -> Router<Arc<AppState>> {
             post(upload_peco_image).layer(DefaultBodyLimit::max(
                 crate::chat::images::MAX_UPLOAD_BODY_BYTES,
             )),
+        )
+        .route(
+            "/files",
+            post(upload_peco_file).layer(DefaultBodyLimit::max(super::files::MAX_FILE_BODY_BYTES)),
         )
         .route("/session", get(get_session_snapshot).delete(clear_session))
         .route("/session/metrics", get(get_session_metrics))
@@ -2189,18 +2255,27 @@ mod tests {
             .unwrap();
     }
 
-    // ── image_ids 解析（build_query_content）────────────────────────────
+    // ── 附件 id 解析（build_query_content）──────────────────────────────
 
-    /// 无图（image_ids 缺省或空）→ `Content::Text`，与改动前逐字节等价。
+    /// 无附件（id 缺省或空）→ `Content::Text`，与改动前逐字节等价。
     #[tokio::test]
-    async fn build_query_content_plain_text_without_images() {
+    async fn build_query_content_plain_text_without_attachments() {
         let (state, _dir) = test_state().await;
 
-        for raw in [None, Some(""), Some(" , ,")] {
-            let content = build_query_content(&state, "u1", Some("你好".into()), raw)
+        for (images, files) in [
+            (None, None),
+            (Some(""), None),
+            (Some(" , ,"), Some("")),
+            (None, Some(" , ,")),
+        ] {
+            let content = build_query_content(&state, "u1", Some("你好".into()), images, files)
                 .await
                 .unwrap();
-            assert_eq!(content, Some(Content::Text("你好".into())), "raw={raw:?}");
+            assert_eq!(
+                content,
+                Some(Content::Text("你好".into())),
+                "images={images:?} files={files:?}"
+            );
         }
     }
 
@@ -2210,10 +2285,15 @@ mod tests {
         let (state, _dir) = test_state().await;
         put_image(&state, "u1", "a.png").await;
 
-        let content =
-            build_query_content(&state, "u1", Some("看看这张图".into()), Some(" a.png ,"))
-                .await
-                .unwrap();
+        let content = build_query_content(
+            &state,
+            "u1",
+            Some("看看这张图".into()),
+            Some(" a.png ,"),
+            None,
+        )
+        .await
+        .unwrap();
         let Some(Content::Parts(parts)) = content else {
             panic!("应为 Content::Parts，实际 {content:?}");
         };
@@ -2238,7 +2318,7 @@ mod tests {
         let (state, _dir) = test_state().await;
         put_image(&state, "u1", "a.png").await;
 
-        let err = build_query_content(&state, "u1", Some("hi".into()), Some("../a.png"))
+        let err = build_query_content(&state, "u1", Some("hi".into()), Some("../a.png"), None)
             .await
             .unwrap_err();
         assert!(
@@ -2246,7 +2326,7 @@ mod tests {
             "路径穿越应 400：{err:?}"
         );
 
-        let err = build_query_content(&state, "u1", Some("hi".into()), Some("missing.png"))
+        let err = build_query_content(&state, "u1", Some("hi".into()), Some("missing.png"), None)
             .await
             .unwrap_err();
         assert!(
@@ -2254,7 +2334,7 @@ mod tests {
             "不存在应 404：{err:?}"
         );
 
-        let err = build_query_content(&state, "u2", Some("hi".into()), Some("a.png"))
+        let err = build_query_content(&state, "u2", Some("hi".into()), Some("a.png"), None)
             .await
             .unwrap_err();
         assert!(
@@ -2263,31 +2343,113 @@ mod tests {
         );
     }
 
-    /// 纯附着（message 缺省）→ `None`；此时携带 image_ids 无语义、直接 400。
+    /// 向指定用户的文档目录写一个可解析的测试文档（不写 sidecar）。
+    async fn put_document(state: &AppState, user_id: &str, filename: &str, body: &str) {
+        let dir = crate::peco::files::document_dir(&state.data_dir, user_id);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(filename), body).await.unwrap();
+    }
+
+    /// document + image 混排：文本在前，附件按 `image_ids ++ file_ids` 顺序。
     #[tokio::test]
-    async fn build_query_content_attach_has_no_image_semantics() {
+    async fn build_query_content_keeps_image_then_document_order() {
         let (state, _dir) = test_state().await;
         put_image(&state, "u1", "a.png").await;
+        put_document(&state, "u1", "n.txt", "正文").await;
 
-        let content = build_query_content(&state, "u1", None, None).await.unwrap();
-        assert_eq!(content, None, "纯附着不组装任何输入");
-
-        let err = build_query_content(&state, "u1", None, Some("a.png"))
-            .await
-            .unwrap_err();
+        let content = build_query_content(
+            &state,
+            "u1",
+            Some("对比一下".into()),
+            Some("a.png"),
+            Some("n.txt"),
+        )
+        .await
+        .unwrap();
+        let Some(Content::Parts(parts)) = content else {
+            panic!("应为 Content::Parts，实际 {content:?}");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text == "对比一下"));
         assert!(
-            matches!(err, ApiError::BadRequest(_)),
-            "image_ids 必须随 message 发送：{err:?}"
+            matches!(&parts[1], ContentPart::Image { .. }),
+            "image_ids 在前"
+        );
+        assert!(
+            matches!(&parts[2], ContentPart::Document { name, .. } if name == "n.txt"),
+            "file_ids 在后"
         );
     }
 
-    /// `parse_image_ids`：逗号分隔、trim、去空。
+    /// 纯附着（message 与附件均缺省）→ `None`。
+    #[tokio::test]
+    async fn build_query_content_attach_is_bare() {
+        let (state, _dir) = test_state().await;
+
+        let content = build_query_content(&state, "u1", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(content, None, "纯附着不组装任何输入");
+    }
+
+    /// 仅附件、无 message → `Content::Parts`（附件即输入，D7）。
+    #[tokio::test]
+    async fn build_query_content_attachments_without_message() {
+        let (state, _dir) = test_state().await;
+        put_image(&state, "u1", "a.png").await;
+
+        let content = build_query_content(&state, "u1", None, None, Some("a.png"))
+            .await
+            .unwrap();
+        let Some(Content::Parts(parts)) = content else {
+            panic!("仅附件应为 Content::Parts，实际 {content:?}");
+        };
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], ContentPart::Image { .. }));
+    }
+
+    /// 附件合并去重后超过上限 → 400。
+    #[tokio::test]
+    async fn build_query_content_rejects_too_many_attachments() {
+        let (state, _dir) = test_state().await;
+        for i in 0..9 {
+            put_image(&state, "u1", &format!("f{i}.png")).await;
+        }
+        let all = (0..9)
+            .map(|i| format!("f{i}.png"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let err = build_query_content(&state, "u1", Some("hi".into()), Some(&all), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+
+        // 两路 id 合并去重后同样受限（重复 id 不重复计数）
+        let dup = format!("{all},{all}");
+        let err = build_query_content(&state, "u1", Some("hi".into()), Some(&dup), Some(&all))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+
+        // 恰好 8 个放行
+        let ok = (0..8)
+            .map(|i| format!("f{i}.png"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let content = build_query_content(&state, "u1", Some("hi".into()), Some(&ok), None)
+            .await
+            .unwrap();
+        assert!(matches!(content, Some(Content::Parts(_))));
+    }
+
+    /// `parse_id_list`：逗号分隔、trim、去空。
     #[test]
-    fn parse_image_ids_trims_and_drops_blanks() {
-        assert!(parse_image_ids(None).is_empty());
-        assert!(parse_image_ids(Some(" , ,")).is_empty());
+    fn parse_id_list_trims_and_drops_blanks() {
+        assert!(parse_id_list(None).is_empty());
+        assert!(parse_id_list(Some(" , ,")).is_empty());
         assert_eq!(
-            parse_image_ids(Some(" a.png ,, b.jpg ,")),
+            parse_id_list(Some(" a.png ,, b.jpg ,")),
             vec!["a.png".to_string(), "b.jpg".to_string()]
         );
     }

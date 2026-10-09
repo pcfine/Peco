@@ -9,6 +9,7 @@ pub mod active;
 pub mod boot;
 pub mod config;
 pub mod environment;
+pub mod files;
 pub mod filter;
 pub mod handler;
 pub mod manager;

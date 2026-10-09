@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use model_provider::{InputItem, Role, ToolCall};
+use model_provider::{Content, ContentPart, InputItem, Role, ToolCall};
 use peco_core::session::{AnnotatedMessage, MessageSource, strip_merge_markers};
 use serde::Serialize;
 
@@ -61,6 +61,8 @@ pub struct GroupedMessage {
     pub content: Option<String>,
     /// 用户消息携带的图片部件 URL（含 data URI），其余角色恒为空。
     pub images: Vec<String>,
+    /// 用户消息携带的文档附件名（正文不下发，仅 chip 展示）。
+    pub attachments: Vec<AttachmentData>,
     pub tool_calls: Vec<ToolCall>,
     pub reasoning_content: Option<String>,
     pub tool_call_id: Option<String>,
@@ -90,6 +92,7 @@ impl AssistantBuilder {
             role: "assistant",
             content: self.content,
             images: Vec::new(),
+            attachments: Vec::new(),
             tool_calls: self.tool_calls,
             reasoning_content: self.reasoning_content,
             tool_call_id: None,
@@ -128,6 +131,7 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
                         role: "system",
                         content: Some(content.text_view().into_owned()),
                         images: Vec::new(),
+                        attachments: Vec::new(),
                         tool_calls: Vec::new(),
                         reasoning_content: None,
                         tool_call_id: None,
@@ -143,18 +147,31 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
                         .into_iter()
                         .map(str::to_string)
                         .collect();
+                    // 文档附件只下发名称：正文留在模型侧，不进气泡。
+                    let attachments = content
+                        .document_parts()
+                        .filter_map(|p| match p {
+                            ContentPart::Document { name, .. } => {
+                                Some(AttachmentData { name: name.clone() })
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    // 展示用正文只取 Text 部件 —— 附件正文不进气泡。
+                    let plain = content.text_view_plain();
                     // MergedPending（pending 批量合并）的 user 消息带 ---
                     // 分隔标记，模型侧原样保留，展示前按来源剥离 —— 用户
                     // 自己输入的 --- 行不在此列（source != MergedPending）。
                     let text = if matches!(view.source, MessageSource::MergedPending) {
-                        strip_merge_markers(content)
+                        strip_merge_markers(&Content::Text(plain.into_owned()))
                     } else {
-                        content.text_view().into_owned()
+                        plain.into_owned()
                     };
                     messages.push(GroupedMessage {
                         role: "user",
                         content: Some(text),
                         images,
+                        attachments,
                         tool_calls: Vec::new(),
                         reasoning_content: None,
                         tool_call_id: None,
@@ -221,6 +238,7 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
                     role: "tool",
                     content: Some(output.text_view().into_owned()),
                     images: Vec::new(),
+                    attachments: Vec::new(),
                     tool_calls: Vec::new(),
                     reasoning_content: None,
                     tool_call_id: Some(call_id.clone()),
@@ -242,6 +260,12 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
 // 快照 DTO 类型（TurnData / MessageData / ToolCallData）
 // ============================================================================
 
+/// 文档附件展示条目：只带原始文件名，正文不下发。
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentData {
+    pub name: String,
+}
+
 /// 工具调用简化格式（前端友好）。
 #[derive(Debug, Serialize)]
 pub struct ToolCallData {
@@ -259,6 +283,9 @@ pub struct MessageData {
     /// 用户消息携带的图片部件 URL（含 data URI），无图时不序列化。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// 用户消息携带的文档附件名，无附件时不序列化。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,6 +331,7 @@ pub fn turns_to_dto(committed: &[Vec<AnnotatedMessage>], window: Range<usize>) -
                         role: msg.role.to_string(),
                         content: msg.content,
                         images: msg.images,
+                        attachments: msg.attachments,
                         tool_calls: if msg.tool_calls.is_empty() {
                             None
                         } else {
@@ -372,6 +400,33 @@ mod tests {
         assert_eq!(grouped[0].content.as_deref(), Some("看看这张图"));
     }
 
+    /// 含 Document 的 user 消息：正文只取 Text 部件（附件正文不进气泡），
+    /// `attachments` 带原名，`images` 不受影响（M1 修复）。
+    #[test]
+    fn user_message_with_document_excludes_body_but_lists_name() {
+        let grouped = group(vec![InputItem::Message {
+            role: Role::User,
+            content: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "总结这个文档".to_string(),
+                },
+                ContentPart::Image {
+                    url: "data:image/png;base64,QUJD".to_string(),
+                    detail: None,
+                },
+                ContentPart::Document {
+                    name: "季度报告.pdf".to_string(),
+                    text: "这是不应出现在气泡里的附件正文".to_string(),
+                },
+            ]),
+        }]);
+
+        assert_eq!(grouped[0].content.as_deref(), Some("总结这个文档"));
+        assert_eq!(grouped[0].images, vec!["data:image/png;base64,QUJD"]);
+        assert_eq!(grouped[0].attachments.len(), 1);
+        assert_eq!(grouped[0].attachments[0].name, "季度报告.pdf");
+    }
+
     #[test]
     fn text_only_user_message_has_empty_images() {
         let grouped = group(vec![InputItem::Message {
@@ -412,6 +467,32 @@ mod tests {
                 .iter()
                 .all(|m| m.role == "user" || m.images.is_empty())
         );
+    }
+
+    /// `MessageData` 序列化：有附件带 `attachments`，无附件不出现该字段。
+    #[test]
+    fn message_data_serializes_attachments_only_when_present() {
+        let base = MessageData {
+            role: "user".to_string(),
+            content: Some("hi".to_string()),
+            images: Vec::new(),
+            attachments: Vec::new(),
+            tool_calls: None,
+            reasoning_content: None,
+            tool_call_id: None,
+            timestamp_ms: 1,
+        };
+        let json = serde_json::to_value(&base).unwrap();
+        assert!(json.get("attachments").is_none(), "{json}");
+
+        let with = MessageData {
+            attachments: vec![AttachmentData {
+                name: "a.txt".to_string(),
+            }],
+            ..base
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["attachments"], serde_json::json!([{"name": "a.txt"}]));
     }
 
     // ── 中断轮标记 ────────────────────────────────────────────────────

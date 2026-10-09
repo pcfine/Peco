@@ -26,10 +26,11 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 /// 允许上传的图片 MIME 类型。
-const ALLOWED_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+pub(crate) const ALLOWED_MIME_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// 单张图片大小上限：10 MB。
-const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// 上传请求体上限：图片本身 10 MB，另留 multipart 编码边界等开销。
 /// 路由层用 `DefaultBodyLimit` 抬高 axum multipart 默认的 2 MB body 限制，
@@ -139,7 +140,7 @@ pub async fn upload_conversation_image(
 }
 
 /// 校验图片引用文件名（uuid 文件名字符集），拒绝路径遍历。
-fn validate_image_id(id: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_image_id(id: &str) -> Result<(), ApiError> {
     let safe = !id.is_empty()
         && !id.contains("..")
         && id
@@ -183,7 +184,7 @@ pub(crate) async fn resolve_image_parts(
     Ok(parts)
 }
 
-fn mime_from_extension(filename: &str) -> &'static str {
+pub(crate) fn mime_from_extension(filename: &str) -> &'static str {
     match filename
         .rsplit('.')
         .next()
