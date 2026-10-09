@@ -824,11 +824,12 @@ fn event_type(data: &Value, fallback: &str) -> String {
 /// 处理 Anthropic 语义 SSE 流，产出中立 [`StreamChunk`]。
 ///
 /// 事件 → chunk 映射：
-/// - `content_block_start` → `BlockStart`（按 content_block.type 映射）；客户端
-///   `tool_use` 同时发 `ToolCallDelta{name}`（与 responses 适配器一致）
+/// - `content_block_start` → 工具类立即发 `BlockStart`（`tool_use` 同时发
+///   `ToolCallDelta{name}`，与 responses 适配器一致）；`text`/`thinking` 只登记
+///   pending，`BlockStart` 推迟到首个非空 delta —— 空块零 chunk、不产生孤儿
 /// - `text_delta`/`thinking_delta` → `TextDelta`/`ReasoningDelta`
 /// - `input_json_delta` → 累积；客户端工具附带 `ToolCallDelta{arguments}`，服务端工具不发
-/// - `content_block_stop` → `BlockEnd`（完整块）
+/// - `content_block_stop` → `BlockEnd`（完整块；空块经 `into_block()==None` 不发）
 /// - `message_start`/`message_delta` → 累计 usage 与 stop_reason
 /// - `message_stop` → `Usage` + `Finish`；`ping` 忽略
 fn process_anthropic_sse_stream(
@@ -839,6 +840,8 @@ fn process_anthropic_sse_stream(
 ) -> GenerateStream {
     let stream = stream! {
         let mut pending: HashMap<usize, PendingBlock> = HashMap::new();
+        // `text`/`thinking` 的 BlockStart 已发去重集（假设 anthropic index 单调不复用）
+        let mut lazy_started: HashSet<usize> = HashSet::new();
         let mut usage_accum = UsageAccum::default();
         let mut stop_reason: Option<String> = None;
         let mut terminated_with_error = false;
@@ -928,11 +931,9 @@ fn process_anthropic_sse_stream(
                     match cb_type {
                         "text" => {
                             pending.insert(index, PendingBlock::Text(String::new()));
-                            yield Ok(StreamChunk::BlockStart { index, block_type: BlockType::Text });
                         }
                         "thinking" => {
                             pending.insert(index, PendingBlock::Thinking(String::new()));
-                            yield Ok(StreamChunk::BlockStart { index, block_type: BlockType::Reasoning });
                         }
                         "tool_use" => {
                             let call_id = cb.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -998,8 +999,13 @@ fn process_anthropic_sse_stream(
                             if !text.is_empty() {
                                 text_bytes_total += text.len();
                                 first_chunk_at.get_or_insert_with(std::time::Instant::now);
+                                let mut fresh_start = false;
                                 if let Some(PendingBlock::Text(buf)) = pending.get_mut(&index) {
+                                    fresh_start = lazy_started.insert(index);
                                     buf.push_str(text);
+                                }
+                                if fresh_start {
+                                    yield Ok(StreamChunk::BlockStart { index, block_type: BlockType::Text });
                                 }
                                 yield Ok(StreamChunk::TextDelta { index, delta: text.to_string() });
                             }
@@ -1009,8 +1015,13 @@ fn process_anthropic_sse_stream(
                             if !text.is_empty() {
                                 reasoning_bytes_total += text.len();
                                 first_chunk_at.get_or_insert_with(std::time::Instant::now);
+                                let mut fresh_start = false;
                                 if let Some(PendingBlock::Thinking(buf)) = pending.get_mut(&index) {
+                                    fresh_start = lazy_started.insert(index);
                                     buf.push_str(text);
+                                }
+                                if fresh_start {
+                                    yield Ok(StreamChunk::BlockStart { index, block_type: BlockType::Reasoning });
                                 }
                                 yield Ok(StreamChunk::ReasoningDelta { index, delta: text.to_string() });
                             }
@@ -1056,6 +1067,8 @@ fn process_anthropic_sse_stream(
                         malformed_event_count += 1;
                         continue;
                     };
+                    // 收尾即释放去重标记，防止集合随块数膨胀
+                    lazy_started.remove(&index);
                     if let Some(block) = pending.remove(&index).and_then(PendingBlock::into_block) {
                         yield Ok(StreamChunk::BlockEnd { index, block });
                     }
@@ -2237,6 +2250,55 @@ mod tests {
             ),
             "unexpected chunks: {chunks:#?}"
         );
+    }
+
+    /// 零 delta 空块（空 thinking + 空 text）：无孤儿 BlockStart，整链收敛为 Completed。
+    #[tokio::test]
+    async fn test_stream_zero_delta_blocks_leave_no_orphan_block_start() {
+        let base = spawn_sse_server(sse_events(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":3}}}"#,
+            // index 0：thinking 开始后直接 stop，零 delta
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            // index 1：text 开始后直接 stop，零 delta
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            // index 2：正常非空 text，Start 随首个 delta 懒发出
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"text"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"你好"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]))
+        .await;
+        let client = DeepSeekAnthropicAdapter::new("sk-test")
+            .unwrap()
+            .with_base_url(base);
+        let chunks = collect_stream(&client, &make_request()).await;
+
+        // 空块零 chunk（无 Start 也无 End），非空块序列 Start 先于首个 delta
+        assert!(
+            matches!(
+                &chunks[..],
+                [
+                    Ok(StreamChunk::BlockStart { index: 2, block_type: BlockType::Text }),
+                    Ok(StreamChunk::TextDelta { index: 2, delta }),
+                    Ok(StreamChunk::BlockEnd { index: 2, block: ContentBlock::Text { text } }),
+                    Ok(StreamChunk::Usage { .. }),
+                    Ok(StreamChunk::Finish { reason: FinishReason::Stop }),
+                ]
+                if delta == "你好" && text == "你好"
+            ),
+            "unexpected chunks: {chunks:#?}"
+        );
+
+        // 整链折叠：无孤儿 open 残留 → Finish{Stop} 后保持 Completed
+        let mut assembler = crate::BlockAssembler::new();
+        for chunk in chunks.into_iter().flatten() {
+            assembler.push(chunk);
+        }
+        let (_, _, status, _) = assembler.finish();
+        assert_eq!(status, crate::ResponseStatus::Completed);
     }
 
     /// 截断（max_tokens）时未闭合工具块不回放 —— 与 responses 适配器丢弃语义一致。

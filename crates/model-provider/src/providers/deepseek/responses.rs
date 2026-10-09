@@ -613,11 +613,12 @@ fn parse_usage_from_response(resp: &Value) -> Option<Usage> {
 /// 处理 Responses 语义 SSE 流，产出中立 [`StreamChunk`]。
 ///
 /// 语义事件 → chunk 映射：
-/// - `output_item.added` → `BlockStart`（按 item 类型）+ 函数调用 `ToolCallDelta{name}`
+/// - `output_item.added` → `function_call` 发 `BlockStart` + `ToolCallDelta{name}`；
+///   `message`/`reasoning` 只登记 buffer，`BlockStart` 推迟到首个非空 delta
 /// - `output_text.delta` → `TextDelta`
 /// - `reasoning_text.delta` → `ReasoningDelta`
 /// - `function_call_arguments.delta` → `ToolCallDelta{arguments}`
-/// - `output_item.done` → `BlockEnd`
+/// - `output_item.done` → `BlockEnd`（映射 None 时回退累积 buffer，双空则不发）
 /// - `completed`/`incomplete` → `Usage` + `Finish`
 /// - `failed` → 错误（嵌套于 `response.error`，非顶层 `error`）
 ///
@@ -727,21 +728,9 @@ fn process_responses_sse_stream(
 
                     match item_type {
                         "message" => {
-                            if started.insert(output_index) {
-                                yield Ok(StreamChunk::BlockStart {
-                                    index: output_index,
-                                    block_type: BlockType::Text,
-                                });
-                            }
                             text_buffers.entry(output_index).or_default();
                         }
                         "reasoning" => {
-                            if started.insert(output_index) {
-                                yield Ok(StreamChunk::BlockStart {
-                                    index: output_index,
-                                    block_type: BlockType::Reasoning,
-                                });
-                            }
                             reasoning_buffers.entry(output_index).or_default();
                         }
                         "function_call" => {
@@ -791,6 +780,12 @@ fn process_responses_sse_stream(
                         text_bytes_total += delta.len();
                         first_chunk_at.get_or_insert_with(std::time::Instant::now);
                         text_buffers.entry(output_index).or_default().push_str(delta);
+                        if started.insert(output_index) {
+                            yield Ok(StreamChunk::BlockStart {
+                                index: output_index,
+                                block_type: BlockType::Text,
+                            });
+                        }
                         yield Ok(StreamChunk::TextDelta { index: output_index, delta: delta.to_string() });
                     }
                 }
@@ -807,6 +802,12 @@ fn process_responses_sse_stream(
                         reasoning_bytes_total += delta.len();
                         first_chunk_at.get_or_insert_with(std::time::Instant::now);
                         reasoning_buffers.entry(output_index).or_default().push_str(delta);
+                        if started.insert(output_index) {
+                            yield Ok(StreamChunk::BlockStart {
+                                index: output_index,
+                                block_type: BlockType::Reasoning,
+                            });
+                        }
                         yield Ok(StreamChunk::ReasoningDelta { index: output_index, delta: delta.to_string() });
                     }
                 }
@@ -836,7 +837,8 @@ fn process_responses_sse_stream(
                         continue;
                     };
                     let item = event.get("item");
-                    let block = match item.and_then(|i| i.get("type")).and_then(Value::as_str) {
+                    let item_type = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+                    let block = match item_type {
                         Some("function_call") => {
                             let call_id = item
                                 .and_then(|i| i.get("call_id"))
@@ -862,6 +864,19 @@ fn process_responses_sse_stream(
                         }
                         _ => item.and_then(response_item_to_block),
                     };
+                    // 映射 None 时回退累积 buffer：item 权威，但直接 remove 会丢掉
+                    // delta 已累积的内容并留下孤儿 Start
+                    let block = block.or_else(|| match item_type {
+                        Some("message") => text_buffers
+                            .get(&output_index)
+                            .filter(|t| !t.is_empty())
+                            .map(|t| ContentBlock::Text { text: t.clone() }),
+                        Some("reasoning") => reasoning_buffers
+                            .get(&output_index)
+                            .filter(|r| !r.is_empty())
+                            .map(|r| ContentBlock::Reasoning { text: r.clone() }),
+                        _ => None,
+                    });
                     if let Some(block) = block {
                         yield Ok(StreamChunk::BlockEnd { index: output_index, block });
                     }
@@ -1897,5 +1912,137 @@ mod tests {
         let types: Vec<&str> = input.iter().map(|v| v["type"].as_str().unwrap()).collect();
         assert_eq!(types, vec!["function_call", "function_call_output"]);
         assert_eq!(input[1]["output"], "截图结果");
+    }
+
+    // ── 流式 SSE 测试 ──
+
+    fn sse_events(datas: &[&str]) -> String {
+        datas
+            .iter()
+            .map(|d| format!("data: {d}\n\n"))
+            .collect::<String>()
+    }
+
+    /// 启动一个返回固定 SSE 响应的一次性本地 HTTP 服务，返回其 base URL。
+    async fn spawn_sse_server(sse_body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::AsyncWriteExt;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// 消费完整的流，返回全部 chunk（含错误）。
+    async fn collect_stream(
+        client: &DeepSeekResponsesAdapter,
+        request: &GenerateRequest,
+    ) -> Vec<Result<StreamChunk, ProviderError>> {
+        let mut stream = client.generate_stream(request).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+        chunks
+    }
+
+    fn assemble(
+        chunks: &[Result<StreamChunk, ProviderError>],
+    ) -> (Vec<ContentBlock>, crate::ResponseStatus) {
+        let mut assembler = crate::BlockAssembler::new();
+        for chunk in chunks.iter().flatten() {
+            assembler.push(chunk.clone());
+        }
+        let (blocks, _, status, _) = assembler.finish();
+        (blocks, status)
+    }
+
+    /// done 映射为 None（summary-only）时回退 buffer：内容不丢、无孤儿 Start。
+    #[tokio::test]
+    async fn test_stream_done_none_falls_back_to_reasoning_buffer() {
+        let base = spawn_sse_server(sse_events(&[
+            r#"{"type":"response.created","response":{"id":"r1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}"#,
+            r#"{"type":"response.reasoning_text.delta","output_index":0,"delta":"思考中"}"#,
+            // done 只有 summary、无 content → 映射 None，回退 buffer（delta 承载 content）
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[{"type":"summary_text","text":"摘要"}]}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"你好"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好"}]}}"#,
+            r#"{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":6,"output_tokens":4,"total_tokens":10}}}"#,
+        ]))
+        .await;
+        let client = DeepSeekResponsesAdapter::new("sk-test-key")
+            .unwrap()
+            .with_base_url(base);
+        let chunks = collect_stream(&client, &make_request()).await;
+
+        assert!(
+            matches!(
+                &chunks[..],
+                [
+                    Ok(StreamChunk::BlockStart { index: 0, block_type: BlockType::Reasoning }),
+                    Ok(StreamChunk::ReasoningDelta { index: 0, delta }),
+                    Ok(StreamChunk::BlockEnd { index: 0, block: ContentBlock::Reasoning { text } }),
+                    Ok(StreamChunk::BlockStart { index: 1, block_type: BlockType::Text }),
+                    Ok(StreamChunk::TextDelta { index: 1, .. }),
+                    Ok(StreamChunk::BlockEnd { index: 1, block: ContentBlock::Text { .. } }),
+                    Ok(StreamChunk::Usage { .. }),
+                    Ok(StreamChunk::Finish { reason: FinishReason::Stop }),
+                ]
+                if delta == "思考中" && text == "思考中"
+            ),
+            "unexpected chunks: {chunks:#?}"
+        );
+
+        let (blocks, status) = assemble(&chunks);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(status, crate::ResponseStatus::Completed);
+    }
+
+    /// 零 delta 空 item：无孤儿 BlockStart，整链收敛为 Completed。
+    #[tokio::test]
+    async fn test_stream_zero_delta_empty_items_leave_no_orphan() {
+        let base = spawn_sse_server(sse_events(&[
+            r#"{"type":"response.created","response":{"id":"r1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning"}}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","summary":[]}}"#,
+            r#"{"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}"#,
+        ]))
+        .await;
+        let client = DeepSeekResponsesAdapter::new("sk-test-key")
+            .unwrap()
+            .with_base_url(base);
+        let chunks = collect_stream(&client, &make_request()).await;
+
+        // 空 item 零 chunk：无 BlockStart 也无 BlockEnd
+        assert!(
+            !chunks.iter().any(|c| matches!(
+                c,
+                Ok(StreamChunk::BlockStart { .. }) | Ok(StreamChunk::BlockEnd { .. })
+            )),
+            "empty items must emit no block chunks: {chunks:#?}"
+        );
+        assert!(matches!(
+            chunks.last(),
+            Some(Ok(StreamChunk::Finish {
+                reason: FinishReason::Stop
+            }))
+        ));
+
+        let (_, status) = assemble(&chunks);
+        assert_eq!(status, crate::ResponseStatus::Completed);
     }
 }

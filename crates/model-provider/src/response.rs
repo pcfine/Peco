@@ -470,6 +470,8 @@ pub struct BlockAssembler {
     usage: Usage,
     status: ResponseStatus,
     error: Option<ResponseError>,
+    /// 收到的终态 `Finish` 原因；`None` = Finish 缺席（drop-warn 需要 reason 字段）。
+    finish_reason: Option<FinishReason>,
 }
 
 impl Default for BlockAssembler {
@@ -487,6 +489,7 @@ impl BlockAssembler {
             usage: Usage::default(),
             status: ResponseStatus::Completed,
             error: None,
+            finish_reason: None,
         }
     }
 
@@ -511,30 +514,34 @@ impl BlockAssembler {
             StreamChunk::Usage { usage } => {
                 self.usage = usage;
             }
-            StreamChunk::Finish { reason } => match reason {
-                // `ToolCalls` 与 `Stop` 同归 `Completed` — 引擎判定是否继续 ReAct
-                // 只看 `output` 是否含 `ToolCall` 块，`ToolCalls` 变体仅为对齐 wire 语义。
-                FinishReason::Stop | FinishReason::ToolCalls => {}
-                // 未闭合的 ToolCall 不会产出块（隐式丢弃）；已 `BlockEnd` 的完整块保留。
-                FinishReason::MaxTokens => {
-                    self.status = ResponseStatus::Incomplete;
+            StreamChunk::Finish { reason } => {
+                // 全部变体都记录，finish() 据此区分 Finish 缺席与正常收尾
+                self.finish_reason = Some(reason);
+                match reason {
+                    // `ToolCalls` 与 `Stop` 同归 `Completed` — 引擎判定是否继续 ReAct
+                    // 只看 `output` 是否含 `ToolCall` 块，`ToolCalls` 变体仅为对齐 wire 语义。
+                    FinishReason::Stop | FinishReason::ToolCalls => {}
+                    // 未闭合的 ToolCall 不会产出块（隐式丢弃）；已 `BlockEnd` 的完整块保留。
+                    FinishReason::MaxTokens => {
+                        self.status = ResponseStatus::Incomplete;
+                    }
+                    FinishReason::Aborted | FinishReason::Error | FinishReason::ContentFilter => {
+                        self.status = ResponseStatus::Failed;
+                        self.error = Some(ResponseError {
+                            code: None,
+                            message: reason.as_str().to_string(),
+                        });
+                    }
                 }
-                FinishReason::Aborted | FinishReason::Error | FinishReason::ContentFilter => {
-                    self.status = ResponseStatus::Failed;
-                    self.error = Some(ResponseError {
-                        code: None,
-                        message: reason.as_str().to_string(),
-                    });
-                }
-            },
+            }
         }
     }
 
     /// 流结束时收敛为 `(有序块, 用量, 状态, 错误)`，与 [`GenerateResult`] 的 status/error 同构。
     ///
     /// - `BTreeMap` 按 index 升序迭代，乱序 `BlockEnd` 自动归位；
-    /// - 若流结束时仍存在「已 `BlockStart` 未 `BlockEnd`」的块（连接中断、provider 异常），
-    ///   至少把 status 降级为 `Incomplete`，不得静默丢弃。
+    /// - open 残留：Finish 缺席 → 降级 `Incomplete`（流中断）；正常收尾 →
+    ///   保持 `Completed`、丢弃残留。
     pub fn finish(
         self,
     ) -> (
@@ -545,15 +552,32 @@ impl BlockAssembler {
     ) {
         let mut status = self.status;
         if !self.open.is_empty() && status == ResponseStatus::Completed {
-            // 「回答莫名截断」的直接证据：适配器发了 BlockStart 却没有对应的 BlockEnd。
-            tracing::warn!(
-                target: "model_provider::response",
-                open_indices = ?self.open.keys().collect::<Vec<_>>(),
-                open_types = ?self.open.values().collect::<Vec<_>>(),
-                blocks = self.blocks.len(),
-                "stream ended with unclosed content blocks; status downgraded to Incomplete"
-            );
-            status = ResponseStatus::Incomplete;
+            match self.finish_reason {
+                // Finish 缺席 + open 残留 = 语义流没收尾，流被掐断的直接证据
+                None => {
+                    tracing::warn!(
+                        target: "model_provider::response",
+                        open_indices = ?self.open.keys().collect::<Vec<_>>(),
+                        open_types = ?self.open.values().collect::<Vec<_>>(),
+                        blocks = self.blocks.len(),
+                        finish_reason = "<missing>",
+                        "stream ended with unclosed content blocks; status downgraded to Incomplete"
+                    );
+                    status = ResponseStatus::Incomplete;
+                }
+                // 此分支 finish_reason 只可能是 Stop|ToolCalls（其余变体已改 status）：
+                // 语义流正常收尾，残留是簿记缺口而非传输中断 —— warn 留作回归探测器
+                Some(reason) => {
+                    tracing::warn!(
+                        target: "model_provider::response",
+                        open_indices = ?self.open.keys().collect::<Vec<_>>(),
+                        open_types = ?self.open.values().collect::<Vec<_>>(),
+                        blocks = self.blocks.len(),
+                        finish_reason = reason.as_str(),
+                        "unclosed blocks after normal finish; dropping"
+                    );
+                }
+            }
         }
         (
             self.blocks.into_values().collect(),
@@ -951,5 +975,26 @@ mod tests {
         let (blocks, _, status, _) = a.finish();
         assert!(blocks.is_empty());
         assert_eq!(status, ResponseStatus::Incomplete);
+    }
+
+    #[test]
+    fn assembler_normal_finish_drops_open_residue() {
+        // 语义流已正常收尾（Finish{ToolCalls}）后的 open 残留是适配器簿记缺口
+        // （零内容块只发了 BlockStart），不是传输中断 —— 不得降级误杀整轮。
+        let mut a = BlockAssembler::new();
+        a.push(StreamChunk::BlockStart {
+            index: 0,
+            block_type: BlockType::Reasoning,
+        });
+        a.push(StreamChunk::BlockEnd {
+            index: 1,
+            block: text_block("answer"),
+        });
+        a.push(StreamChunk::Finish {
+            reason: FinishReason::ToolCalls,
+        });
+        let (blocks, _, status, _) = a.finish();
+        assert_eq!(blocks, vec![text_block("answer")]);
+        assert_eq!(status, ResponseStatus::Completed);
     }
 }
