@@ -36,14 +36,14 @@ async function render(props: Partial<ComponentProps<typeof ChatView>> = {}) {
     root.render(
       <TooltipProvider>
         <ChatView
-        mode="external"
-        streamUrl={(m) => `/api/peco/stream?message=${encodeURIComponent(m)}`}
-        supportsImages
-        uploadImage={async () => UPLOADED}
-        initialMessages={[]}
-        onExternalSend={() => {}}
-        onExternalStop={() => {}}
-        externalIsStreaming={false}
+          mode="external"
+          streamUrl={(m) => `/api/peco/stream?message=${encodeURIComponent(m)}`}
+          supportsImages
+          uploadImage={async () => UPLOADED}
+          initialMessages={[]}
+          onExternalSend={() => {}}
+          onExternalStop={() => {}}
+          externalIsStreaming={false}
           {...props}
         />
       </TooltipProvider>,
@@ -93,17 +93,15 @@ describe("ChatView external 图片通路", () => {
 
     await chooseFile("a.png");
     await typeText("看这张图");
-    expect(
-      container.querySelectorAll('img[alt="待发送图片"]').length,
-    ).toBe(1);
+    expect(container.querySelectorAll('img[alt="待发送图片"]').length).toBe(1);
 
     clickSend();
 
     expect(onExternalSend).toHaveBeenCalledTimes(1);
-    expect(onExternalSend).toHaveBeenCalledWith("看这张图", [UPLOADED]);
-    expect(
-      container.querySelectorAll('img[alt="待发送图片"]').length,
-    ).toBe(0);
+    expect(onExternalSend).toHaveBeenCalledWith("看这张图", [
+      { ...UPLOADED, kind: "image", name: "a.png" },
+    ]);
+    expect(container.querySelectorAll('img[alt="待发送图片"]').length).toBe(0);
   });
 
   it("无图时 onExternalSend 收到空数组", async () => {

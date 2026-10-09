@@ -200,6 +200,8 @@ export interface MessageData {
   content?: string;
   /** 用户消息携带的图片（data URI），无图时缺省 */
   images?: string[];
+  /** 用户消息携带的文档附件名（附件正文不进展示层），无文档时缺省 */
+  attachments?: { name: string }[];
   tool_calls?: ToolCallData[];
   reasoning_content?: string;
   tool_call_id?: string;

@@ -9,9 +9,10 @@ import { snapshotToMessages } from "../../components/chat/ChatView";
 import { useAuthStore } from "../../stores/authStore";
 
 vi.mock("@/api/peco", () => ({
-  pecoStreamUrl: (m: string, ids: string[] = []) =>
+  pecoStreamUrl: (m: string, imageIds: string[] = [], fileIds: string[] = []) =>
     `/api/peco/stream?message=${encodeURIComponent(m)}` +
-    (ids.length > 0 ? `&image_ids=${ids.join(",")}` : ""),
+    (imageIds.length > 0 ? `&image_ids=${imageIds.join(",")}` : "") +
+    (fileIds.length > 0 ? `&file_ids=${fileIds.join(",")}` : ""),
   uploadPecoImage: vi.fn(),
   pecoAttachUrl: () => "/api/peco/stream",
   queryPecoStream: vi.fn(async () => undefined),
@@ -206,9 +207,16 @@ describe("pecoChatStore 常驻连接", () => {
   it("带图消息开新流并在 URL 携带 image_ids（不经 POST 控制通道）", async () => {
     global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
 
-    await usePecoChatStore.getState().sendMessage("看这张图", "test-token", [
-      { id: "a.png", url: "/uploads/chat/u/a.png" },
-    ]);
+    await usePecoChatStore
+      .getState()
+      .sendMessage("看这张图", "test-token", [
+        {
+          id: "a.png",
+          kind: "image",
+          name: "a.png",
+          url: "/uploads/chat/u/a.png",
+        },
+      ]);
 
     // 图片无法经控制通道投递 —— 不得走 POST 复用路径
     expect(queryPecoStream).not.toHaveBeenCalled();
@@ -235,9 +243,16 @@ describe("pecoChatStore 常驻连接", () => {
     expect(streamCalls()).toHaveLength(1);
 
     global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
-    await usePecoChatStore.getState().sendMessage("看图", "test-token", [
-      { id: "b.png", url: "/uploads/chat/u/b.png" },
-    ]);
+    await usePecoChatStore
+      .getState()
+      .sendMessage("看图", "test-token", [
+        {
+          id: "b.png",
+          kind: "image",
+          name: "b.png",
+          url: "/uploads/chat/u/b.png",
+        },
+      ]);
 
     expect(queryPecoStream).not.toHaveBeenCalled();
     expect(streamCalls()).toHaveLength(1);
@@ -537,7 +552,11 @@ const turn = (turn_index: number, text: string) => ({
   turn_index,
   messages: [
     { role: "user", content: text, timestamp_ms: turn_index * 10 },
-    { role: "assistant", content: `${text}-答`, timestamp_ms: turn_index * 10 + 1 },
+    {
+      role: "assistant",
+      content: `${text}-答`,
+      timestamp_ms: turn_index * 10 + 1,
+    },
   ],
 });
 
@@ -786,7 +805,9 @@ describe("pecoChatStore 分页", () => {
 
     await usePecoChatStore.getState().load();
     expect(
-      usePecoChatStore.getState().messages.filter((m) => m.id === "pinned-summary"),
+      usePecoChatStore
+        .getState()
+        .messages.filter((m) => m.id === "pinned-summary"),
     ).toHaveLength(1);
 
     // 窗口获焦追平：再次 refreshSession 走「保留旧页」分支
@@ -868,9 +889,13 @@ describe("pecoChatStore 分页", () => {
 
     const messages = usePecoChatStore.getState().messages;
     // 刚发的那轮只由尾部窗口权威提供一份 —— 本地残留必须被丢弃
-    expect(messages.filter((m) => m.content === "我刚发的问题")).toHaveLength(1);
+    expect(messages.filter((m) => m.content === "我刚发的问题")).toHaveLength(
+      1,
+    );
     // 本地残留的 assistant 文本必须消失（快照权威版本是「我刚发的问题-答」）
-    expect(messages.filter((m) => m.content === "我刚得到的回答")).toHaveLength(0);
+    expect(messages.filter((m) => m.content === "我刚得到的回答")).toHaveLength(
+      0,
+    );
     // 且必须落在尾部（turnIndex 6），不得错位到更早轮之前
     const idx = messages.findIndex((m) => m.content === "我刚发的问题");
     expect(messages[idx].turnIndex).toBe(6);

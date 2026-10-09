@@ -12,9 +12,10 @@ const PATH = "/peco";
 // Native fetch() doesn't use axios baseURL — use the full path.
 const SSE_BASE = "/api/peco";
 
-export async function getPecoSession(
-  params?: { turns?: number; before?: number },
-): Promise<SessionSnapshotResponse> {
+export async function getPecoSession(params?: {
+  turns?: number;
+  before?: number;
+}): Promise<SessionSnapshotResponse> {
   const resp = await api.get<SessionSnapshotResponse>(`${PATH}/session`, {
     params,
   });
@@ -23,9 +24,7 @@ export async function getPecoSession(
 
 /** 上下文指标轻量端点：只回 `context_metrics`，不拖全量 turn 历史。 */
 export async function getPecoSessionMetrics(): Promise<SessionMetricsResponse> {
-  const resp = await api.get<SessionMetricsResponse>(
-    `${PATH}/session/metrics`,
-  );
+  const resp = await api.get<SessionMetricsResponse>(`${PATH}/session/metrics`);
   return resp.data;
 }
 
@@ -53,12 +52,39 @@ export async function uploadPecoImage(
   return resp.data;
 }
 
+/** 统一附件端点的上传响应：服务端按扩展名分类，`url` 仅图片有。 */
+export interface PecoUploadedFile {
+  id: string;
+  kind: "image" | "document";
+  /** 原始文件名 */
+  name: string;
+  size: number;
+  /** 图片的渲染 URL；文档缺省（不进静态目录） */
+  url?: string;
+}
+
+/**
+ * 上传一个随消息发送的附件（图片或文档），随 `file_ids` 发送。
+ *
+ * 服务端按扩展名白名单分类；文档不返回 url，原始名只随 `name` 回传。
+ */
+export async function uploadPecoFile(file: File): Promise<PecoUploadedFile> {
+  const form = new FormData();
+  form.append("file", file);
+  const resp = await api.post<PecoUploadedFile>(`${PATH}/files`, form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+  return resp.data;
+}
+
 export function pecoStreamUrl(
   message: string,
   imageIds: string[] = [],
+  fileIds: string[] = [],
 ): string {
-  const ids = imageIds.length > 0 ? `&image_ids=${imageIds.join(",")}` : "";
-  return `${SSE_BASE}/stream?message=${encodeURIComponent(message)}${ids}`;
+  const images = imageIds.length > 0 ? `&image_ids=${imageIds.join(",")}` : "";
+  const files = fileIds.length > 0 ? `&file_ids=${fileIds.join(",")}` : "";
+  return `${SSE_BASE}/stream?message=${encodeURIComponent(message)}${images}${files}`;
 }
 
 /** 纯附着模式：无 message 参数，接上当前用户进行中的任务流。 */

@@ -14,7 +14,7 @@ import {
   reduceStreamEvent,
   isStreamTerminalEvent,
 } from "@/components/chat/ChatView";
-import type { ChatMessage } from "@/components/chat/ChatView";
+import type { ChatAttachment, ChatMessage } from "@/components/chat/ChatView";
 import type {
   ChatSseEvent,
   SessionSnapshotResponse,
@@ -261,7 +261,11 @@ async function refreshSession(
       ? lastCommittedUser !== localUser.content
       : snap.turn_in_flight === true);
 
-  if (revisionChanged || get().oldestLoadedTurn === null || tailStart === null) {
+  if (
+    revisionChanged ||
+    get().oldestLoadedTurn === null ||
+    tailStart === null
+  ) {
     // 首载 / 历史版本变化（compaction）/ 快照无轮：丢弃旧页，只留尾部窗口。
     messages = tailWindow;
     oldestLoadedTurn = tailStart;
@@ -279,7 +283,8 @@ async function refreshSession(
     // 再整体前置 —— 否则更早的已加载轮会插到它前面，分隔线错位到列表中间。
     const prevOldest = get().oldestLoadedTurn;
     const head = get().messages.filter(
-      (m) => m.id !== undefined && !isPinnedNotice(m) && m.turnIndex < tailStart,
+      (m) =>
+        m.id !== undefined && !isPinnedNotice(m) && m.turnIndex < tailStart,
     );
     const pinned =
       tailWindow.length > 0 && isPinnedNotice(tailWindow[0])
@@ -301,7 +306,9 @@ async function refreshSession(
   // 而快照只含 committed_turns —— 不补这一条，用户刚发的 query 会一直消失到
   // 本轮落盘为止。有本地副本时 keepLocal 已覆盖（二者互斥），内容已在快照里时
   // 由上面的去重判定丢弃，故此注入不会与既有来源重复。
-  const inflightQuery = snap.turn_in_flight ? snap.inflight_user_input : undefined;
+  const inflightQuery = snap.turn_in_flight
+    ? snap.inflight_user_input
+    : undefined;
   if (
     !keepLocal &&
     inflightQuery !== undefined &&
@@ -336,7 +343,9 @@ async function refreshSession(
     const cur = get().messages;
     const last = cur[cur.length - 1];
     const hasPlaceholder =
-      last?.id === undefined && last.role === "assistant" && last.content === "";
+      last?.id === undefined &&
+      last.role === "assistant" &&
+      last.content === "";
     set({
       messages: hasPlaceholder
         ? cur
@@ -469,18 +478,29 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   sendMessage: async (
     text: string,
     token: string,
-    images?: { id: string; url: string }[],
+    attachments?: ChatAttachment[],
   ) => {
     const state = get();
-    const hasImages = !!images && images.length > 0;
-    if (state.isStreaming || (!text.trim() && !hasImages) || !token) return;
+    const hasAttachments = !!attachments && attachments.length > 0;
+    if (state.isStreaming || (!text.trim() && !hasAttachments) || !token)
+      return;
+
+    const imageUrls =
+      attachments
+        ?.filter((a) => a.kind === "image" && a.url)
+        .map((a) => a.url as string) ?? [];
+    const docNames =
+      attachments
+        ?.filter((a) => a.kind === "document")
+        .map((a) => ({ name: a.name })) ?? [];
 
     // Append user message + empty assistant placeholder.
     const userMsg: ChatMessage = {
       role: "user",
       content: text,
       turnIndex: 0,
-      images: hasImages ? images.map((i) => i.url) : undefined,
+      images: imageUrls.length > 0 ? imageUrls : undefined,
+      attachments: docNames.length > 0 ? docNames : undefined,
     };
     const assistantMsg: ChatMessage = {
       role: "assistant",
@@ -496,8 +516,8 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     selfHealUsed = false;
 
     // 已有活连接：复用（POST 投递），事件仍从这条连接回来。
-    // 带图时必须走开流路径 —— POST 控制通道只承载文本。
-    if (conn && !conn.terminal && !hasImages) {
+    // 带附件时必须走开流路径 —— POST 控制通道只承载文本，附件会静默丢失。
+    if (conn && !conn.terminal && !hasAttachments) {
       try {
         await queryPecoStream(text);
         return;
@@ -523,11 +543,14 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     }
 
     // 无活连接（首条消息 / 连接已收尾 / POST 404）：带 message 开流，
-    // 服务端自行决定附着到已有 run 还是新建。
+    // 服务端自行决定附着到已有 run 还是新建。附件按图片/文档分路携带：
+    // `image_ids`（data URI 部件）与 `file_ids`（服务端解析为附件部件）。
     openStream(
       pecoStreamUrl(
         text,
-        images?.map((i) => i.id) ?? [],
+        attachments?.filter((a) => a.kind === "image").map((a) => a.id) ?? [],
+        attachments?.filter((a) => a.kind === "document").map((a) => a.id) ??
+          [],
       ),
       token,
       set,
@@ -648,7 +671,7 @@ interface PecoChatState {
   sendMessage: (
     text: string,
     token: string,
-    images?: { id: string; url: string }[],
+    attachments?: ChatAttachment[],
   ) => Promise<void>;
 
   /** Abort the currently running SSE stream (server-side cancel + local). */

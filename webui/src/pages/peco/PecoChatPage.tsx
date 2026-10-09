@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ChatView } from "@/components/chat/ChatView";
 import { getAssistantSupportsImages } from "@/api/agents";
-import { pecoStreamUrl, uploadPecoImage } from "@/api/peco";
+import { pecoStreamUrl, uploadPecoFile, uploadPecoImage } from "@/api/peco";
 import { usePecoChatStore } from "@/stores/pecoChatStore";
 import { useAuthStore } from "@/stores/authStore";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
@@ -33,8 +33,9 @@ export function PecoChatPage() {
     load();
   }, [load]);
 
-  // @assistant 的 provider 是否支持用户图片输入 —— 决定附件入口可用性。
-  // 能力值静态、进程内 memo（见 api/agents），路由往返与 StrictMode 双跑各只探一次。
+  // @assistant 的 provider 是否支持用户图片输入 —— 只决定图片文件能否发送
+  // （文档不依赖视觉能力，附件入口始终可用）。能力值静态、进程内 memo
+  // （见 api/agents），路由往返与 StrictMode 双跑各只探一次。
   useEffect(() => {
     let cancelled = false;
     getAssistantSupportsImages()
@@ -42,7 +43,7 @@ export function PecoChatPage() {
         if (!cancelled) setSupportsImages(supported);
       })
       .catch(() => {
-        // 取不到能力信息时保持禁用附件入口
+        // 取不到能力信息时按不支持图片处理（文档附件不受影响）
       });
     return () => {
       cancelled = true;
@@ -90,9 +91,10 @@ export function PecoChatPage() {
       streamUrl={pecoStreamUrl}
       supportsImages={supportsImages}
       uploadImage={(file) => uploadPecoImage(file)}
+      uploadFile={uploadPecoFile}
       initialMessages={messages}
-      onExternalSend={(text, images) => {
-        sendMessage(text, token ?? "", images);
+      onExternalSend={(text, attachments) => {
+        sendMessage(text, token ?? "", attachments);
       }}
       onExternalStop={abortStream}
       externalIsStreaming={isStreaming}
