@@ -349,6 +349,9 @@ async function refreshSession(
 
 // 焦点刷新的在途去重：visibilitychange 与 focus 可能同刻触发两次
 let refreshInFlight = false;
+// 首载在途去重：StrictMode 开发态把挂载 effect 跑两遍，首次 load 尚未置
+// loaded=true 时第二次调用会再打一次快照 —— 用在途标志挡掉重复首载。
+let loadInFlight = false;
 
 export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   loaded: false,
@@ -365,13 +368,15 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   loadingEarlier: false,
 
   load: async () => {
-    if (get().loaded) return;
+    if (get().loaded || loadInFlight) return;
+    loadInFlight = true;
     set({ loading: true, error: null });
     try {
       await refreshSession(set, get);
     } catch {
       // 快照拉取失败：静默 — 首载无历史可显示，用户发消息即触发服务端构建
     } finally {
+      loadInFlight = false;
       set({ loading: false });
     }
   },
@@ -552,6 +557,8 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
 export function __resetPecoStreamForTests(): void {
   closeStream();
   selfHealUsed = false;
+  loadInFlight = false;
+  refreshInFlight = false;
 }
 
 // ── SSE Event Handler (store version) ────────────────────────────────────
