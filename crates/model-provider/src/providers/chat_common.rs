@@ -78,7 +78,9 @@ pub(crate) enum WireUserContent<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum WireContentPart<'a> {
-    Text { text: &'a str },
+    // Cow：文本部件零拷贝借用；附件（Document）的「【附件 …】」渲染是
+    // owned，`&'a str` 承载不了。序列化形状与裸字符串一致。
+    Text { text: Cow<'a, str> },
     ImageUrl { image_url: WireImageUrl<'a> },
 }
 
@@ -179,7 +181,9 @@ pub(crate) fn input_items_to_wire_messages<'a>(
                             let wire_parts: Vec<WireContentPart<'_>> = parts
                                 .iter()
                                 .map(|part| match part {
-                                    ContentPart::Text { text } => WireContentPart::Text { text },
+                                    ContentPart::Text { text } => WireContentPart::Text {
+                                        text: Cow::Borrowed(text),
+                                    },
                                     ContentPart::Image { url, detail } => {
                                         WireContentPart::ImageUrl {
                                             image_url: WireImageUrl {
@@ -188,6 +192,10 @@ pub(crate) fn input_items_to_wire_messages<'a>(
                                             },
                                         }
                                     }
+                                    // 附件降级为文本部件（wire 无 document 概念）
+                                    ContentPart::Document { .. } => WireContentPart::Text {
+                                        text: part.as_text().unwrap_or_default(),
+                                    },
                                 })
                                 .collect();
                             if wire_parts.is_empty() {
@@ -417,6 +425,33 @@ pub(crate) fn strip_tool_output_images<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_user_parts_render_document_as_text_part() {
+        let items = vec![Arc::new(InputItem::Message {
+            role: Role::User,
+            content: Content::Parts(vec![
+                ContentPart::Text {
+                    text: "看这个".to_string(),
+                },
+                ContentPart::Document {
+                    name: "a.txt".to_string(),
+                    text: "正文".to_string(),
+                },
+            ]),
+        })];
+        let msgs = input_items_to_wire_messages(&items);
+        assert_eq!(
+            serde_json::to_value(&msgs).unwrap(),
+            serde_json::json!([{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "看这个" },
+                    { "type": "text", "text": "【附件 a.txt】\n正文" }
+                ]
+            }])
+        );
+    }
 
     /// 构造含图工具输出条目。
     fn tool_output_with_image() -> Arc<InputItem> {

@@ -84,6 +84,11 @@ pub enum ContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
     },
+    /// 服务端解析出的文档附件正文（模型侧以文本呈现）。
+    Document {
+        name: String,
+        text: String,
+    },
 }
 
 /// 图片细节档位（透传语义，由适配器按 wire 协议映射）。
@@ -95,9 +100,47 @@ pub enum ImageDetail {
     High,
 }
 
+impl ContentPart {
+    /// 文本/附件部件的文本渲染（Document 带附件名标识）；Image 返回 None。
+    ///
+    /// 全项目唯一的 Document 文本降级落点：适配器编码、token 估算、展示收窄
+    /// 都经此取文本，避免各处漂移出不同的附件呈现。
+    pub fn as_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            ContentPart::Text { text } => Some(Cow::Borrowed(text)),
+            ContentPart::Document { name, text } => {
+                Some(Cow::Owned(format!("【附件 {name}】\n{text}")))
+            }
+            ContentPart::Image { .. } => None,
+        }
+    }
+}
+
 impl Content {
-    /// 统一文本视图：`Text` → 原文；`Parts` → text 部件以 "\n" 连接（图片跳过）。
+    /// 统一文本视图：`Text` → 原文；`Parts` → 各部件经
+    /// [`ContentPart::as_text`] 取文本后以 "\n" 连接（图片跳过，
+    /// **附件正文计入** —— token 估算/压缩口径）。
     pub fn text_view(&self) -> Cow<'_, str> {
+        match self {
+            Content::Text(s) => Cow::Borrowed(s),
+            Content::Parts(parts) => {
+                let mut joined = String::new();
+                for part in parts {
+                    if let Some(text) = part.as_text() {
+                        if !joined.is_empty() {
+                            joined.push('\n');
+                        }
+                        joined.push_str(&text);
+                    }
+                }
+                Cow::Owned(joined)
+            }
+        }
+    }
+
+    /// 仅 Text 部件的文本视图（**跳过** Document/Image）—— 展示层用作
+    /// 「用户发言」，附件正文另经 [`Self::document_parts`] 渲染为 chip。
+    pub fn text_view_plain(&self) -> Cow<'_, str> {
         match self {
             Content::Text(s) => Cow::Borrowed(s),
             Content::Parts(parts) => {
@@ -144,6 +187,14 @@ impl Content {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Document 部件迭代（DTO 渲染 chip 用）。
+    pub fn document_parts(&self) -> impl Iterator<Item = &ContentPart> {
+        self.as_parts()
+            .into_iter()
+            .flatten()
+            .filter(|p| matches!(p, ContentPart::Document { .. }))
     }
 
     fn as_parts(&self) -> Option<&[ContentPart]> {
@@ -735,6 +786,7 @@ mod tests {
             match part {
                 ContentPart::Text { .. } => "text",
                 ContentPart::Image { .. } => "image",
+                ContentPart::Document { .. } => "document",
             }
         }
         assert_eq!(
@@ -743,6 +795,56 @@ mod tests {
             }),
             "text"
         );
+    }
+
+    #[test]
+    fn as_text_covers_three_branches() {
+        assert_eq!(
+            ContentPart::Text {
+                text: "hi".to_string()
+            }
+            .as_text(),
+            Some(Cow::Borrowed("hi"))
+        );
+        let doc = ContentPart::Document {
+            name: "a.txt".to_string(),
+            text: "body".to_string(),
+        };
+        assert_eq!(doc.as_text().as_deref(), Some("【附件 a.txt】\nbody"));
+        assert_eq!(
+            ContentPart::Image {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+            }
+            .as_text(),
+            None
+        );
+    }
+
+    #[test]
+    fn text_view_includes_documents_while_plain_excludes_them() {
+        let content = Content::Parts(vec![
+            ContentPart::Text {
+                text: "读一下".to_string(),
+            },
+            ContentPart::Document {
+                name: "note.md".to_string(),
+                text: "# 标题".to_string(),
+            },
+            ContentPart::Image {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+            },
+        ]);
+        assert_eq!(content.text_view(), "读一下\n【附件 note.md】\n# 标题");
+        assert_eq!(content.text_view_plain(), "读一下");
+        assert_eq!(content.document_parts().count(), 1);
+        assert_eq!(content.image_count(), 1);
+        // 含附件与含图一致：非全 Text 即非纯文本（不为 Document 改语义）。
+        assert!(!content.is_plain_text());
+
+        let plain = Content::Text("纯文本".to_string());
+        assert_eq!(plain.text_view(), plain.text_view_plain());
     }
 
     #[test]

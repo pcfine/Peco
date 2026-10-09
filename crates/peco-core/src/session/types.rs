@@ -257,16 +257,20 @@ impl PendingInput {
 ///   **纯文本分支与含图分支产出的 wire 文本一致**（`---\nA\n---\nB`：
 ///   chat 序列化将相邻文本部件直传拼接，标记部件自带换行、条目间补 `\n`）；
 ///   含图形态经 `text_view()` 会多出空行，展示层由 [`strip_merge_markers`] 归一。
-/// - 图片部件不丢：任一条含图片时整体转 `Parts`，文本与图片部件按原顺序
-///   穿插，分隔标记以 `Text` 部件插入。
+/// - 图片/附件部件不丢：任一条含非 Text 部件时整体转 `Parts`，文本与
+///   图片/附件部件按原顺序穿插，分隔标记以 `Text` 部件插入。
 pub fn merge_contents(items: Vec<Content>) -> Content {
     debug_assert!(!items.is_empty(), "merge_contents called with empty input");
     if items.len() == 1 {
         return items.into_iter().next().unwrap();
     }
 
-    let has_image = items.iter().any(|c| c.image_count() > 0);
-    if !has_image {
+    // 图片与附件都必须保住部件形态：文档正文一旦被折进纯文本，展示层
+    // （text_view_plain）就再也分不出「用户发言」与附件正文。
+    let has_structured = items
+        .iter()
+        .any(|c| c.image_count() > 0 || c.document_parts().next().is_some());
+    if !has_structured {
         // 全纯文本：字符串拼接，每条前置 --- 标记行
         let mut out = String::new();
         for item in items {
@@ -278,7 +282,7 @@ pub fn merge_contents(items: Vec<Content>) -> Content {
         return Content::Text(out);
     }
 
-    // 含图片：部件形态拼接，图片原顺序保留。
+    // 含图片/附件：部件形态拼接，部件原顺序保留。
     // 标记部件自带 "\n"、条目间补 "\n" 部件 —— wire 侧相邻文本部件
     // 直传拼接后与纯文本分支逐字一致（见 doc）。
     let mut parts: Vec<ContentPart> = Vec::new();

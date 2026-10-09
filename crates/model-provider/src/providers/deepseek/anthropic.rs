@@ -270,6 +270,11 @@ fn user_content_value(content: &Content) -> Value {
                         serde_json::json!({ "type": "text", "text": text })
                     }
                     crate::response::ContentPart::Image { url, .. } => image_block(url),
+                    // Anthropic 端点无 document 块通路：附件降级为文本块
+                    crate::response::ContentPart::Document { .. } => serde_json::json!({
+                        "type": "text",
+                        "text": part.as_text().unwrap_or_default(),
+                    }),
                 })
                 .collect();
             if blocks.is_empty() {
@@ -1375,6 +1380,19 @@ mod tests {
 
     use super::*;
     use crate::response::{Content, ContentPart, ReasoningConfig};
+
+    #[test]
+    fn user_content_value_encodes_document_as_text_block() {
+        // Anthropic 端点无 document 块通路：附件降级为带标识的文本块。
+        let content = Content::Parts(vec![ContentPart::Document {
+            name: "note.md".to_string(),
+            text: "# 标题".to_string(),
+        }]);
+        assert_eq!(
+            user_content_value(&content),
+            serde_json::json!([{ "type": "text", "text": "【附件 note.md】\n# 标题" }])
+        );
+    }
 
     fn make_request() -> GenerateRequest {
         GenerateRequest {

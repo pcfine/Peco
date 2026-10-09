@@ -154,6 +154,11 @@ fn function_call_output_item(call_id: &str, output: &Content) -> Value {
                     ContentPart::Image { url, .. } => {
                         serde_json::json!({ "type": "output_image", "image_url": url })
                     }
+                    // 附件降级为文本（wire 无 document 块）
+                    ContentPart::Document { .. } => serde_json::json!({
+                        "type": "output_text",
+                        "text": part.as_text().unwrap_or_default(),
+                    }),
                 })
                 .collect::<Vec<_>>()
         ),
@@ -240,6 +245,11 @@ fn user_message_item(content: &Content) -> Value {
                         }
                         v
                     }
+                    // 附件降级为文本（wire 无 document 块）
+                    ContentPart::Document { .. } => serde_json::json!({
+                        "type": "input_text",
+                        "text": part.as_text().unwrap_or_default(),
+                    }),
                 })
                 .collect();
             serde_json::json!({
@@ -1317,6 +1327,30 @@ mod tests {
 
     use super::*;
     use crate::response::ImageDetail;
+
+    #[test]
+    fn responses_encode_document_parts_as_text() {
+        let content = Content::Parts(vec![ContentPart::Document {
+            name: "a.txt".to_string(),
+            text: "正文".to_string(),
+        }]);
+        assert_eq!(
+            user_message_item(&content),
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "【附件 a.txt】\n正文" }]
+            })
+        );
+        assert_eq!(
+            function_call_output_item("c1", &content),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": [{ "type": "output_text", "text": "【附件 a.txt】\n正文" }]
+            })
+        );
+    }
 
     fn make_request() -> GenerateRequest {
         GenerateRequest {
