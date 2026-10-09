@@ -161,7 +161,10 @@ impl DocumentFormat {
 // 辅助函数
 // ---------------------------------------------------------------------------
 
-/// 清理文本：合并多余空白、去除控制字符、统一换行。
+/// 清理文本：去除控制字符、统一换行、合并连续空行、裁掉行尾空白。
+///
+/// **保留行首空白**：缩进对代码、YAML/TOML、以及 Markdown 缩进代码块等内容有语义，
+/// 只有行尾空白与连续空行才是可安全合并的噪声。
 pub fn clean_text(text: &str) -> String {
     let mut cleaned = String::with_capacity(text.len());
     for c in text.chars() {
@@ -177,7 +180,7 @@ pub fn clean_text(text: &str) -> String {
     // 合并连续空白行
     let result = cleaned
         .lines()
-        .map(|l| l.trim())
+        .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n");
     // 合并多个连续空行
@@ -250,7 +253,11 @@ pub fn make_parser_for_format(
             // DOCX 解析器目前返回友好的错误提示，完整实现将在后续版本提供
             Ok(Box::new(crate::parsers::docx::DocxParser::new()))
         }
-        DocumentFormat::Txt | DocumentFormat::Code { .. } | DocumentFormat::Unknown => {
+        DocumentFormat::Code { .. } => {
+            // 代码/结构化文本原样保留（缩进、空行有语义，不经 clean_text 清洗）。
+            Ok(Box::new(crate::parsers::code::CodeFileParser::new()))
+        }
+        DocumentFormat::Txt | DocumentFormat::Unknown => {
             Ok(Box::new(crate::parsers::txt::TextParser::new()))
         }
     }
@@ -333,6 +340,37 @@ mod tests {
         let output = clean_text(input);
         let blank_count = output.lines().filter(|l| l.is_empty()).count();
         assert!(blank_count <= 1);
+    }
+
+    /// 代码文件走 `CodeFileParser`，缩进原样保留（回归：曾被路由到 TextParser 压平）。
+    #[tokio::test]
+    async fn code_files_keep_indentation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        tokio::fs::write(&path, "root:\n  child: 1\n  items:\n    - a\n")
+            .await
+            .unwrap();
+        let parser = make_parser(&path).unwrap();
+        let doc = parser.parse_file(&path).await.unwrap();
+        assert!(
+            doc.content.contains("  child: 1"),
+            "缩进丢失：{:?}",
+            doc.content
+        );
+        assert!(
+            doc.content.contains("    - a"),
+            "缩进丢失：{:?}",
+            doc.content
+        );
+    }
+
+    /// `clean_text` 裁行尾空白，但保留行首缩进（缩进有语义）。
+    #[test]
+    fn clean_text_preserves_leading_indentation() {
+        let out = clean_text("a   \n    indented\n\tb\n");
+        assert!(out.contains("    indented"), "{out:?}");
+        assert!(out.contains("\tb"), "{out:?}");
+        assert!(!out.contains("a   "), "行尾空白应裁掉：{out:?}");
     }
 
     #[test]

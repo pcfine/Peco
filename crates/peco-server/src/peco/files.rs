@@ -619,6 +619,23 @@ mod tests {
         assert!(text.starts_with('汉'));
     }
 
+    /// 代码/结构化文件（YAML）经解析链必须原样保留缩进。
+    #[tokio::test]
+    async fn resolve_document_preserves_code_indentation() {
+        let (state, _dir) = test_state().await;
+        let id = "cfg.yaml";
+        put_document(&state, "u1", id, b"root:\n  child: 1\n  items:\n    - a\n").await;
+
+        let parts = resolve_file_parts(&state, "u1", &[id.to_string()])
+            .await
+            .unwrap();
+        let ContentPart::Document { text, .. } = &parts[0] else {
+            panic!("应为 Document：{:?}", parts[0]);
+        };
+        assert!(text.contains("  child: 1"), "缩进丢失：{text:?}");
+        assert!(text.contains("    - a"), "缩进丢失：{text:?}");
+    }
+
     /// sidecar 缺失时回退为引用 id（D4：不因缺 sidecar 失败）。
     #[tokio::test]
     async fn resolve_without_sidecar_falls_back_to_id() {
