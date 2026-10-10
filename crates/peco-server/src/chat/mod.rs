@@ -2,6 +2,7 @@
 // Chat 模块 — Agent 作用域对话管理 + SSE 流式聊天
 // ============================================================================
 
+pub(crate) mod active;
 pub(crate) mod conversation;
 pub(crate) mod handler;
 pub(crate) mod images;
@@ -46,6 +47,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/{agentId}/conversations/{id}/stream",
             get(handler::stream_chat),
+        )
+        .route(
+            "/{agentId}/conversations/{id}/pause",
+            post(handler::pause_chat),
+        )
+        .route(
+            "/{agentId}/conversations/{id}/resume",
+            post(handler::resume_chat),
         )
         .route(
             "/{agentId}/conversations/{id}/export",

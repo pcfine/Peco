@@ -11,6 +11,8 @@ import {
   deleteConversation as deleteConversationApi,
   createConversation,
   uploadConversationImage,
+  pauseConversation,
+  resumeConversation,
 } from "@/api/conversations";
 import { getAgent, listAgents } from "@/api/agents";
 import type { AgentDetail } from "@/types/agent";
@@ -480,6 +482,32 @@ export function AgentChatPage() {
     [handleSend],
   );
 
+  // ── 暂停 / 恢复 ────────────────────────────────────────────────────────
+
+  const handlePause = useCallback(
+    async (convId: string) => {
+      if (!agentId) return;
+      try {
+        await pauseConversation(agentId, convId);
+      } catch {
+        toast.error("暂停失败");
+      }
+    },
+    [agentId],
+  );
+
+  const handleResume = useCallback(
+    async (convId: string) => {
+      if (!agentId) return;
+      try {
+        await resumeConversation(agentId, convId);
+      } catch {
+        toast.error("恢复失败");
+      }
+    },
+    [agentId],
+  );
+
   // ── Unread handler ─────────────────────────────────────────────────────
 
   const handleUnread = useCallback((convId: string, count: number) => {
@@ -639,6 +667,8 @@ export function AgentChatPage() {
                 `/api/chat/${encodeURIComponent(agentId ?? "")}/conversations/${convId}/stream?message=${encodeURIComponent(msg)}` +
                 (imageIds.length > 0 ? `&image_ids=${imageIds.join(",")}` : "")
               }
+              onPause={() => handlePause(convId)}
+              onResume={() => handleResume(convId)}
               supportsImages={agent?.supports_images ?? false}
               uploadImage={
                 agentId && convId

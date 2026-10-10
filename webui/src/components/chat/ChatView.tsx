@@ -21,7 +21,7 @@ import type {
   TurnData,
   UsageData,
 } from "@/types/chat";
-import { Send, Square, Paperclip, X, FileText } from "lucide-react";
+import { Send, Square, Paperclip, X, FileText, Pause, Play } from "lucide-react";
 import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
@@ -159,6 +159,15 @@ export interface ChatViewProps {
   externalIsStreaming?: boolean;
   /** [mode="external"] 外部提供的当前 token 用量（驱动底部用量圆环）。 */
   externalUsage?: UsageData | null;
+  /**
+   * [可选] 暂停当前运行中的 looper。与 `onResume` **同时提供**时才出现入口，
+   * 且只在流式进行中展示（`ExternalIsStreaming ?? streaming`）。
+   *
+   * 暂停在下一个步进边界才生效，按钮状态以 SSE `looper_state` 事件为准。
+   */
+  onPause?: () => void;
+  /** [可选] 恢复已暂停的 looper（与 `onPause` 成对提供）。 */
+  onResume?: () => void;
   /** [mode="external" 可选] 拉取更早一页对话的回调（顶部按钮触发）。 */
   onLoadEarlier?: () => void;
   /** [mode="external" 可选] 是否还有更早的轮可加载（决定按钮显隐）。 */
@@ -190,6 +199,8 @@ export function ChatView({
   onExternalStop,
   externalIsStreaming,
   externalUsage = null,
+  onPause,
+  onResume,
   onLoadEarlier,
   hasMore = false,
   loadingEarlier = false,
@@ -206,6 +217,8 @@ export function ChatView({
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  /** looper 是否处于 Paused（由 SSE `looper_state` 事件驱动，权威状态） */
+  const [paused, setPaused] = useState(false);
   const [usage, setUsage] = useState<UsageData | null>(null);
   /** 已上传待发送的附件（图片 + 文档） */
   const [pendingAttachments, setPendingAttachments] = useState<
@@ -292,6 +305,7 @@ export function ChatView({
     };
     setMessages((prev) => [...prev, userMsg]);
     setStreaming(true);
+    setPaused(false);
     setPendingAttachments([]);
 
     const assistantMsg: ChatMessage = {
@@ -341,7 +355,7 @@ export function ChatView({
                 output_tokens: event.data.output_tokens,
               });
             }
-            handleSSEEvent(event, setMessages, setStreaming, () => {
+            handleSSEEvent(event, setMessages, setStreaming, setPaused, () => {
               if (!visibleRef.current && onUnreadRef.current) {
                 unreadCountRef.current += 1;
                 // Debounce: each text_delta fires this callback, which can be
@@ -364,6 +378,7 @@ export function ChatView({
       toast.error("连接中断");
     } finally {
       setStreaming(false);
+      setPaused(false);
       abortRef.current = null;
     }
   }, []);
@@ -620,7 +635,8 @@ export function ChatView({
       ? [...IMAGE_FILE_EXTS, ...DOC_FILE_EXTS].map((e) => `.${e}`).join(",")
       : "image/png,image/jpeg,image/gif,image/webp");
 
-  const isInputDisabled = (externalIsStreaming ?? streaming) || !visible;
+  const isStreaming = externalIsStreaming ?? streaming;
+  const isInputDisabled = isStreaming || !visible;
 
   // ── Render ──────────────────────────────────────────────────────────────
 
@@ -778,7 +794,26 @@ export function ChatView({
                 outputTokens={effectiveUsage?.output_tokens}
                 contextWindow={contextWindowTokens}
               />
-              {(externalIsStreaming ?? streaming) ? (
+              {isStreaming && onPause && onResume && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={paused ? onResume : onPause}
+                      aria-label={paused ? "恢复" : "暂停"}
+                    >
+                      {paused ? (
+                        <Play className="h-4 w-4" />
+                      ) : (
+                        <Pause className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{paused ? "恢复" : "暂停"}</TooltipContent>
+                </Tooltip>
+              )}
+              {isStreaming ? (
                 <Button variant="destructive" size="sm" onClick={handleStop}>
                   <Square className="h-4 w-4" />
                 </Button>
@@ -1020,6 +1055,7 @@ export function reduceStreamEvent(
     case "turn_complete":
     case "done":
     case "usage":
+    case "looper_state":
       return messages;
     case "context_compacted":
       // 更早的对话已被归档为结构化摘要 — 以居中分隔线提示（hover 可看摘要正文）
@@ -1091,10 +1127,16 @@ function handleSSEEvent(
   event: ChatSseEvent,
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
   setStreaming: React.Dispatch<React.SetStateAction<boolean>>,
+  setPaused?: React.Dispatch<React.SetStateAction<boolean>>,
   onTextDelta?: () => void,
 ) {
   if (event.event === "text_delta") {
     onTextDelta?.();
+  }
+
+  // 暂停态只认服务端事件：POST /pause 的返回不代表已暂停（步进边界才生效）
+  if (event.event === "looper_state") {
+    setPaused?.(event.data.paused);
   }
 
   setMessages((prev) => reduceStreamEvent(event, prev));

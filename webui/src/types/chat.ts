@@ -37,6 +37,7 @@ export type ChatSseEvent =
   | { event: "usage"; data: UsageEventData }
   | { event: "context_compacted"; data: ContextCompactedData }
   | { event: "truncation_retry"; data: TruncationRetryData }
+  | { event: "looper_state"; data: LooperStateData }
   | { event: "error"; data: ErrorData };
 
 export interface TextDeltaData {
@@ -123,6 +124,17 @@ export interface TruncationRetryData {
   retry_budget: number;
   /** 重发原因：truncated（截断抬预算）| transient（限流/网络/5xx 退避重发）。可选以兼容旧后端。 */
   reason?: string;
+  conversation_id: string;
+}
+
+/**
+ * looper 外层暂停状态变化（进入 / 离开 Paused）。
+ *
+ * 暂停在下一个步进边界才生效，故 POST /pause 的 200 只表示「请求已收到」——
+ * 这条事件才是按钮状态的权威来源。
+ */
+export interface LooperStateData {
+  paused: boolean;
   conversation_id: string;
 }
 

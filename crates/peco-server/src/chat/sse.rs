@@ -5,7 +5,8 @@
 use axum::response::sse::Event;
 use model_provider::Usage;
 use peco_core::agent::{
-    LooperEvent, RetryNoticeReason, TurnFailureReason, TurnOutcome, strip_summary_wrapper,
+    LooperEvent, OuterState, RetryNoticeReason, TurnFailureReason, TurnOutcome,
+    strip_summary_wrapper,
 };
 use serde::Serialize;
 
@@ -148,6 +149,16 @@ pub enum ChatSseEvent {
         reason: String,
         conversation_id: String,
     },
+
+    /// looper 外层暂停状态变化（进入或离开 `Paused`）。
+    ///
+    /// 前端据此在「暂停 / 恢复」按钮间切换：暂停在下一个步进边界才生效
+    /// （可能迟于请求返回），故这条事件是唯一的权威状态来源。
+    #[serde(rename = "looper_state")]
+    LooperState {
+        paused: bool,
+        conversation_id: String,
+    },
 }
 
 /// Token 用量数据（精简版，供前端展示）。
@@ -183,6 +194,7 @@ impl ChatSseEvent {
             ChatSseEvent::Usage { .. } => "usage",
             ChatSseEvent::ContextCompacted { .. } => "context_compacted",
             ChatSseEvent::TruncationRetry { .. } => "truncation_retry",
+            ChatSseEvent::LooperState { .. } => "looper_state",
         };
         Ok(Event::default().event(event_name).data(data))
     }
@@ -458,10 +470,25 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
+        // looper 外层状态**跨越** `Paused` —— 暂停/恢复的唯一权威来源。
+        //
+        // 只下发跨越 Paused 的转换；Idle↔RunningInnerLoop 等正常轮转不下发。
+        LooperEvent::OuterStateChange { from, to } => {
+            let was_paused = matches!(from, OuterState::Paused);
+            let now_paused = matches!(to, OuterState::Paused);
+            if was_paused == now_paused {
+                None
+            } else {
+                Some(ChatSseEvent::LooperState {
+                    paused: now_paused,
+                    conversation_id: cid,
+                })
+            }
+        }
+
         // 以下事件不产生面向客户端的 SSE 事件
         LooperEvent::ToolCallDelta { .. }
         | LooperEvent::ReactStateChange { .. }
-        | LooperEvent::OuterStateChange { .. }
         | LooperEvent::TurnStart { .. }
         | _ => None,
     }
@@ -713,5 +740,52 @@ mod tests {
         };
         assert!(message.contains("取消"));
         assert!(message.contains("部分输出已展示"));
+    }
+
+    #[test]
+    fn pause_transition_maps_to_looper_state() {
+        let event = map_looper_event(
+            LooperEvent::OuterStateChange {
+                from: OuterState::RunningInnerLoop,
+                to: OuterState::Paused,
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::LooperState {
+            paused,
+            conversation_id,
+        }) = event
+        else {
+            panic!("进入 Paused 必须映射为 LooperState，实际 {event:?}");
+        };
+        assert!(paused);
+        assert_eq!(conversation_id, "conv-1");
+    }
+
+    #[test]
+    fn resume_transition_maps_to_looper_state() {
+        let event = map_looper_event(
+            LooperEvent::OuterStateChange {
+                from: OuterState::Paused,
+                to: OuterState::RunningInnerLoop,
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::LooperState { paused, .. }) = event else {
+            panic!("离开 Paused 必须映射为 LooperState，实际 {event:?}");
+        };
+        assert!(!paused);
+    }
+
+    #[test]
+    fn non_pause_outer_transition_is_not_forwarded() {
+        let event = map_looper_event(
+            LooperEvent::OuterStateChange {
+                from: OuterState::Idle,
+                to: OuterState::RunningInnerLoop,
+            },
+            "conv-1",
+        );
+        assert!(event.is_none(), "未跨越 Paused 的外层转换不下发");
     }
 }

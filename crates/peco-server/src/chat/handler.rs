@@ -31,6 +31,7 @@ use crate::session_dto::{
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
 
+use super::active::ChatControl;
 use super::conversation::auto_archive_oldest_if_needed;
 use super::sse::{
     ChatSseEvent, SubAgentInfo, UsageData, extract_sub_agent_result, map_looper_event,
@@ -418,7 +419,13 @@ pub async fn stream_chat(
     let user_id_for_bg = user_id.clone();
 
     // ── 5. 后台执行 AgentLooper ──────────────────────────────────────────
+    // 控制通道先于任务注册：否则「任务已在跑、注册表尚无条目」的窗口里
+    // 暂停请求会被误判为无在途运行。
+    let (mut control_rx, run_guard) = state.chat_runs.register(&conv_id);
     tokio::spawn(async move {
+        // 持有至任务结束：守卫 drop 才移除注册表条目（见 `chat::active`）。
+        let _run_guard = run_guard;
+
         let persister: Arc<dyn SessionPersister> =
             Arc::new(SqliteSessionPersister::new(db_for_bg.clone()));
 
@@ -474,7 +481,13 @@ pub async fn stream_chat(
         };
 
         loop {
-            match handle.recv_event().await {
+            // 三路复用：looper 事件 / 暂停恢复控制 / 客户端断连。
+            //
+            // 断连一路不可省 —— chat 链路没有 peco runner 那样的桥接任务，
+            // 少了它，停靠（尤其暂停）中的 looper 会随无人观看的连接一直挂着。
+            // axum 的 SSE keep-alive 写入失败后响应体被 drop，`closed()` 随即就绪。
+            tokio::select! {
+                event = handle.recv_event() => match event {
                 Some(LooperEvent::TextDelta { delta }) => {
                     assistant_text.push_str(&delta);
                     if let Some(sse_ev) =
@@ -653,6 +666,31 @@ pub async fn stream_chat(
                 }
 
                 None => break,
+                },
+
+                // 暂停/恢复：来自 `POST .../pause` / `.../resume`。控制通道关闭
+                // 说明本流已被同会话的新 stream 顶替，退出让位。
+                cmd = control_rx.recv() => match cmd {
+                    Some(ChatControl::Pause) => {
+                        if let Err(e) = handle.pause().await {
+                            tracing::warn!(
+                                conversation_id = %conv_id_for_bg,
+                                error = %e,
+                                "Failed to deliver pause"
+                            );
+                        }
+                    }
+                    Some(ChatControl::Resume) => {
+                        if let Err(e) = handle.resume().await {
+                            tracing::warn!(
+                                conversation_id = %conv_id_for_bg,
+                                error = %e,
+                                "Failed to deliver resume"
+                            );
+                        }
+                    }
+                    None => break,
+                },
             }
         }
 
@@ -665,6 +703,58 @@ pub async fn stream_chat(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+// ── 暂停 / 恢复 ──────────────────────────────────────────────────────────────
+
+/// 校验会话归属（不存在 / 非本人一律 404，不泄露他人会话是否存在）。
+async fn require_owned_conversation(
+    state: &AppState,
+    user_id: &str,
+    conv_id: &str,
+) -> Result<(), ApiError> {
+    conversations::find_by_id_and_user(&state.db, conv_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
+    Ok(())
+}
+
+/// `POST /api/chat/:agentId/conversations/:id/pause`
+///
+/// 请求暂停该会话在途的 ReAct 轮。**暂停在下一个步进边界生效**（流式=单
+/// chunk、工具=≤200ms 轮询、batch=整段生成），因此本接口只表示「已收到请求」；
+/// 实际状态经 SSE `looper_state` 事件下发。无在途运行时返回 409。
+pub async fn pause_chat(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path((_agent_name, conv_id)): Path<(String, String)>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    require_owned_conversation(&state, &user_id, &conv_id).await?;
+    if state.chat_runs.pause(&conv_id) {
+        Ok(Json(SuccessResponse { success: true }))
+    } else {
+        Err(ApiError::Conflict(format!(
+            "no running task for conversation '{conv_id}'"
+        )))
+    }
+}
+
+/// `POST /api/chat/:agentId/conversations/:id/resume`
+///
+/// 请求恢复该会话被暂停的 ReAct 轮；幂等（未暂停时由 looper 侧忽略）。
+pub async fn resume_chat(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path((_agent_name, conv_id)): Path<(String, String)>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    require_owned_conversation(&state, &user_id, &conv_id).await?;
+    if state.chat_runs.resume(&conv_id) {
+        Ok(Json(SuccessResponse { success: true }))
+    } else {
+        Err(ApiError::Conflict(format!(
+            "no running task for conversation '{conv_id}'"
+        )))
+    }
 }
 
 // ── Session Snapshot Handler ────────────────────────────────────────────────

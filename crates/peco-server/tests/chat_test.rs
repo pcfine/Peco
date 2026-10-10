@@ -241,3 +241,55 @@ async fn test_sse_stream_requires_auth() {
 
     assert_eq!(resp.status(), 401);
 }
+
+// ── 暂停 / 恢复 ─────────────────────────────────────────────────────────────
+
+/// 暂停/恢复端点：鉴权 → 会话归属 → 是否有在途运行，三级判定各返回对应状态码。
+#[tokio::test]
+async fn test_pause_resume_requires_owned_conversation_with_running_task() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/conversations")
+        .json(&json!({ "title": "暂停测试", "agent_name": "unknown" }))
+        .send()
+        .await
+        .unwrap();
+    let conv: serde_json::Value = resp.json().await.unwrap();
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    // 未认证 → 401
+    let resp = app
+        .client
+        .post(format!(
+            "{}/api/chat/unknown/conversations/{conv_id}/pause",
+            app.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 会话存在但无在途运行 → 409（不是 404：会话本身没问题）
+    let resp = app
+        .post(&format!("/api/chat/unknown/conversations/{conv_id}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    let resp = app
+        .post(&format!("/api/chat/unknown/conversations/{conv_id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // 会话不存在 → 404
+    let resp = app
+        .post("/api/chat/unknown/conversations/no-such-conv/pause")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}

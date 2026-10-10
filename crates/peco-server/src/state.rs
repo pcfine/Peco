@@ -13,6 +13,7 @@ use sqlx::SqlitePool;
 use peco_core::workflow::WorkflowEvent;
 use tokio::sync::broadcast;
 
+use crate::chat::active::ChatActiveRuns;
 use crate::config::ServerConfig;
 use crate::peco::active::PecoActiveRuns;
 use crate::workflow::WorkflowEventSource;
@@ -38,6 +39,10 @@ pub struct AppState {
     // ── Peco 子系统 ──────────────────────────────────────────────────
     /// 活跃 Peco 运行注册表（runner 与 SSE 连接解耦的枢纽）。
     pub peco_runs: Arc<PecoActiveRuns>,
+
+    // ── Agent 对话子系统 ─────────────────────────────────────────────
+    /// 活跃 chat 运行的控制注册表（暂停/恢复从另一条请求触达在途 looper）。
+    pub chat_runs: Arc<ChatActiveRuns>,
     /// 自动整理总开关（`memory.consolidation.enabled` 的构造期快照）。
     ///
     /// 同时也是活动时间戳的采集开关 —— 关闭时 `record_activity` 直接返回，
@@ -101,6 +106,7 @@ impl AppState {
             workspace_manager,
             cron_scheduler,
             peco_runs: Arc::new(PecoActiveRuns::new()),
+            chat_runs: Arc::new(ChatActiveRuns::new()),
             consolidation_enabled: crate::peco::config::PecoConfig::default()
                 .memory
                 .consolidation

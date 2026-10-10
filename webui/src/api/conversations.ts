@@ -77,6 +77,33 @@ export async function getMessages(
   return res.data;
 }
 
+/**
+ * 请求暂停该对话在途的 ReAct 轮。
+ *
+ * 暂停在下一个步进边界生效，故 200 只表示「请求已收到」；实际状态由 SSE
+ * `looper_state` 事件下发。
+ */
+export async function pauseConversation(
+  agentId: string,
+  convId: string,
+): Promise<SuccessResponse> {
+  const res = await api.post<SuccessResponse>(
+    `${chatBase(agentId)}/${convId}/pause`,
+  );
+  return res.data;
+}
+
+/** 请求恢复该对话被暂停的 ReAct 轮（幂等）。 */
+export async function resumeConversation(
+  agentId: string,
+  convId: string,
+): Promise<SuccessResponse> {
+  const res = await api.post<SuccessResponse>(
+    `${chatBase(agentId)}/${convId}/resume`,
+  );
+  return res.data;
+}
+
 export async function getSessionSnapshot(
   agentId: string,
   convId: string,
