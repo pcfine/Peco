@@ -8,6 +8,8 @@ pub(crate) mod handler;
 pub(crate) mod images;
 pub(crate) mod sse;
 
+pub use active::ChatControl;
+
 use std::sync::Arc;
 
 use axum::Router;

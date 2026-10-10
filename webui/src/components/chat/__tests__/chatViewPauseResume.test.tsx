@@ -87,6 +87,21 @@ describe("ChatView 暂停/恢复入口", () => {
     expect(stopBtn()).not.toBeNull();
   });
 
+  it("只提供 onPause 时不出现入口（需成对提供）", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+    const onPause = vi.fn();
+
+    await render({ initialQuery: "你好", onPause });
+    s.push(frame("text_delta", { content: "…", conversation_id: "c" }));
+    await act(async () => {});
+
+    expect(pauseBtn()).toBeNull();
+    expect(resumeBtn()).toBeNull();
+    // 流式仍在进行 —— 缺入口是回调不齐备所致，而非未流式
+    expect(stopBtn()).not.toBeNull();
+  });
+
   it("提供回调但非流式时不出现入口", async () => {
     const onPause = vi.fn();
     const onResume = vi.fn();

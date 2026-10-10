@@ -5,6 +5,7 @@
 mod common;
 
 use common::TestApp;
+use peco_server::chat::ChatControl;
 use serde_json::json;
 
 // ── 创建对话 ───────────────────────────────────────────────────────────────────
@@ -312,7 +313,8 @@ async fn test_pause_resume_returns_200_with_running_task() {
     let conv_id = conv["id"].as_str().unwrap().to_string();
 
     // guard 必须保持存活，否则条目在注册后立即被清理。
-    let (_rx, guard) = app.state.chat_runs.register(&conv_id);
+    // 接收端核对端点投递的命令身份：`ChatControl` 由 `chat` 模块 re-export。
+    let (mut rx, guard) = app.state.chat_runs.register(&conv_id);
 
     let resp = app
         .post(&format!("/api/chat/unknown/conversations/{conv_id}/pause"))
@@ -322,6 +324,7 @@ async fn test_pause_resume_returns_200_with_running_task() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["success"], true);
+    assert_eq!(rx.recv().await, Some(ChatControl::Pause));
 
     let resp = app
         .post(&format!("/api/chat/unknown/conversations/{conv_id}/resume"))
@@ -331,6 +334,7 @@ async fn test_pause_resume_returns_200_with_running_task() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["success"], true);
+    assert_eq!(rx.recv().await, Some(ChatControl::Resume));
 
     // 守卫 drop → 运行结束条目移除 → 无在途运行 409
     drop(guard);
