@@ -94,11 +94,6 @@ impl ChatActiveRuns {
         map.get(conversation_id)
             .is_some_and(|entry| entry.tx.try_send(cmd).is_ok())
     }
-
-    /// 该会话当前是否注册了在途运行。
-    pub fn is_active(&self, conversation_id: &str) -> bool {
-        self.inner.lock().unwrap().contains_key(conversation_id)
-    }
 }
 
 /// 注册表条目的生命周期守卫 —— 随 SSE 任务 drop 时移除。
@@ -131,11 +126,11 @@ mod tests {
     fn register_is_exclusive_and_guard_cleans_up() {
         let registry = ChatActiveRuns::new();
         let (_rx, guard) = registry.register("c1");
-        assert!(registry.is_active("c1"));
+        assert!(registry.pause("c1"), "已注册条目可接收控制");
 
         drop(guard);
-        assert!(!registry.is_active("c1"), "守卫 drop 清理条目");
-        assert!(!registry.is_active("c2"), "其他会话不受影响");
+        assert!(!registry.pause("c1"), "守卫 drop 清理条目");
+        assert!(!registry.pause("c2"), "其他会话不受影响");
     }
 
     #[tokio::test]
@@ -170,9 +165,7 @@ mod tests {
         let (mut new_rx, _new_guard) = registry.register("c1");
 
         drop(old_guard);
-        assert!(registry.is_active("c1"), "旧守卫不得删除新条目");
-
-        assert!(registry.resume("c1"));
+        assert!(registry.resume("c1"), "旧守卫不得删除新条目");
         assert_eq!(new_rx.recv().await, Some(ChatControl::Resume));
     }
 }
