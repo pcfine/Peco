@@ -293,3 +293,51 @@ async fn test_pause_resume_requires_owned_conversation_with_running_task() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+/// 有在途运行时：pause / resume 均返回 200，条目随守卫 drop 消失后回到 409。
+///
+/// 假 run 直连 `state.chat_runs` 注册 —— 真 looper 由 SSE 请求任务独占，
+/// 测试里无法用 HTTP 造出在途运行。
+#[tokio::test]
+async fn test_pause_resume_returns_200_with_running_task() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/conversations")
+        .json(&json!({ "title": "暂停成功", "agent_name": "unknown" }))
+        .send()
+        .await
+        .unwrap();
+    let conv: serde_json::Value = resp.json().await.unwrap();
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    // guard 必须保持存活，否则条目在注册后立即被清理。
+    let (_rx, guard) = app.state.chat_runs.register(&conv_id);
+
+    let resp = app
+        .post(&format!("/api/chat/unknown/conversations/{conv_id}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    let resp = app
+        .post(&format!("/api/chat/unknown/conversations/{conv_id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+
+    // 守卫 drop → 运行结束条目移除 → 无在途运行 409
+    drop(guard);
+    let resp = app
+        .post(&format!("/api/chat/unknown/conversations/{conv_id}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+}

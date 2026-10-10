@@ -54,6 +54,7 @@ function controllableStream() {
 
 const pauseBtn = () => container.querySelector('button[aria-label="暂停"]');
 const resumeBtn = () => container.querySelector('button[aria-label="恢复"]');
+const stopBtn = () => container.querySelector('button[aria-label="停止"]');
 
 async function render(
   props: Partial<ComponentProps<typeof ChatView>> = {},
@@ -83,9 +84,18 @@ describe("ChatView 暂停/恢复入口", () => {
     expect(pauseBtn()).toBeNull();
     expect(resumeBtn()).toBeNull();
     // 停止按钮在流式中照常出现 —— 门控只作用于新增入口
-    expect(
-      container.querySelector('button[aria-label="暂停"]'),
-    ).toBeNull();
+    expect(stopBtn()).not.toBeNull();
+  });
+
+  it("提供回调但非流式时不出现入口", async () => {
+    const onPause = vi.fn();
+    const onResume = vi.fn();
+
+    await render({ onPause, onResume, externalIsStreaming: false });
+
+    expect(pauseBtn()).toBeNull();
+    expect(resumeBtn()).toBeNull();
+    expect(stopBtn()).toBeNull();
   });
 
   it("流式进行中才出现；点击触发 onPause", async () => {

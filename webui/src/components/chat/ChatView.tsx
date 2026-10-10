@@ -814,7 +814,12 @@ export function ChatView({
                 </Tooltip>
               )}
               {isStreaming ? (
-                <Button variant="destructive" size="sm" onClick={handleStop}>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  aria-label="停止"
+                  onClick={handleStop}
+                >
                   <Square className="h-4 w-4" />
                 </Button>
               ) : (
