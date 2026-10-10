@@ -487,6 +487,8 @@ pub async fn stream_chat(
             // 少了它，停靠（尤其暂停）中的 looper 会随无人观看的连接一直挂着。
             // axum 的 SSE keep-alive 写入失败后响应体被 drop，`closed()` 随即就绪。
             tokio::select! {
+                _ = sse_tx.closed() => break,
+
                 event = handle.recv_event() => match event {
                 Some(LooperEvent::TextDelta { delta }) => {
                     assistant_text.push_str(&delta);
