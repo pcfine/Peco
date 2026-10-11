@@ -29,6 +29,7 @@ import {
   FileText,
   Pause,
   Play,
+  Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
@@ -232,6 +233,8 @@ export function ChatView({
   const [streaming, setStreaming] = useState(false);
   /** internal 模式的暂停态（由本地 SSE `looper_state` 事件驱动） */
   const [paused, setPaused] = useState(false);
+  /** 已点暂停、服务端尚未挂起（流式在途）时的暂态提示 */
+  const [pausePending, setPausePending] = useState(false);
   const [usage, setUsage] = useState<UsageData | null>(null);
   /** 已上传待发送的附件（图片 + 文档） */
   const [pendingAttachments, setPendingAttachments] = useState<
@@ -654,6 +657,21 @@ export function ChatView({
   const effectivePaused = isExternalMode ? externalPaused : paused;
   const isInputDisabled = isStreaming || !visible;
 
+  // 暂态的两个解除点：服务端确认挂起，或本轮结束（按钮随门控消失）
+  useEffect(() => {
+    if (effectivePaused || !isStreaming) setPausePending(false);
+  }, [effectivePaused, isStreaming]);
+
+  // 暂态期间再点一次 = 撤回尚未落地的暂停
+  const handlePause = useCallback(() => {
+    if (pausePending || effectivePaused) {
+      onResume?.();
+    } else {
+      setPausePending(true);
+      onPause?.();
+    }
+  }, [pausePending, effectivePaused, onPause, onResume]);
+
   // ── Render ──────────────────────────────────────────────────────────────
 
   return (
@@ -816,10 +834,18 @@ export function ChatView({
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={effectivePaused ? onResume : onPause}
-                      aria-label={effectivePaused ? "恢复" : "暂停"}
+                      onClick={handlePause}
+                      aria-label={
+                        pausePending
+                          ? "暂停中…"
+                          : effectivePaused
+                            ? "恢复"
+                            : "暂停"
+                      }
                     >
-                      {effectivePaused ? (
+                      {pausePending ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : effectivePaused ? (
                         <Play className="h-4 w-4" />
                       ) : (
                         <Pause className="h-4 w-4" />
@@ -827,7 +853,11 @@ export function ChatView({
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>
-                    {effectivePaused ? "恢复" : "暂停"}
+                    {pausePending
+                      ? "暂停中…"
+                      : effectivePaused
+                        ? "恢复"
+                        : "暂停"}
                   </TooltipContent>
                 </Tooltip>
               )}

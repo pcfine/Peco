@@ -32,6 +32,8 @@ afterEach(() => {
 });
 
 const pauseBtn = () => container.querySelector('button[aria-label="暂停"]');
+const pendingBtn = () =>
+  container.querySelector('button[aria-label="暂停中…"]');
 const resumeBtn = () => container.querySelector('button[aria-label="恢复"]');
 
 async function render(props: Partial<ComponentProps<typeof ChatView>> = {}) {
@@ -119,5 +121,75 @@ describe("ChatView external 模式暂停/恢复入口", () => {
 
     expect(pauseBtn()).toBeNull();
     expect(resumeBtn()).toBeNull();
+  });
+
+  it("点击暂停进入「暂停中…」，服务端挂起后切「恢复」", async () => {
+    const pause = onPause();
+    const resume = onResume();
+    const props = {
+      externalIsStreaming: true,
+      externalPaused: false,
+      onPause: pause,
+      onResume: resume,
+    };
+
+    await render(props);
+    await act(async () => {
+      (pauseBtn() as HTMLButtonElement).click();
+    });
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(pendingBtn()).not.toBeNull();
+    expect(pauseBtn()).toBeNull();
+
+    // 服务端确认挂起 → 暂态清除，入口切「恢复」
+    await render({ ...props, externalPaused: true });
+    expect(resumeBtn()).not.toBeNull();
+    expect(pendingBtn()).toBeNull();
+  });
+
+  it("暂态期间再点一次撤回待办，触发 onResume", async () => {
+    const pause = onPause();
+    const resume = onResume();
+    await render({
+      externalIsStreaming: true,
+      externalPaused: false,
+      onPause: pause,
+      onResume: resume,
+    });
+
+    await act(async () => {
+      (pauseBtn() as HTMLButtonElement).click();
+    });
+    await act(async () => {
+      (pendingBtn() as HTMLButtonElement).click();
+    });
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it("isStreaming 转 false 时清除待生效暂态", async () => {
+    const pause = onPause();
+    const resume = onResume();
+    const props = {
+      externalIsStreaming: true,
+      externalPaused: false,
+      onPause: pause,
+      onResume: resume,
+    };
+
+    await render(props);
+    await act(async () => {
+      (pauseBtn() as HTMLButtonElement).click();
+    });
+    expect(pendingBtn()).not.toBeNull();
+
+    await render({ ...props, externalIsStreaming: false });
+    expect(container.querySelector('button[aria-label="暂停"]')).toBeNull();
+    expect(pendingBtn()).toBeNull();
+
+    // 重新进入流式：暂态已被清除，回到「暂停」
+    await render(props);
+    expect(pauseBtn()).not.toBeNull();
+    expect(pendingBtn()).toBeNull();
   });
 });
