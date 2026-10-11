@@ -661,6 +661,92 @@ async fn test_cancel_without_run_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
+/// 暂停/恢复端点：鉴权缺失 → 401；无在途轮次 → 409。
+#[tokio::test]
+async fn test_pause_resume_rejects_without_in_flight_turn() {
+    let app = TestApp::new().await;
+
+    // 未认证 → 401
+    let resp = app
+        .client
+        .post(format!("{}/api/peco/stream/pause", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    let resp = app
+        .client
+        .post(format!("{}/api/peco/stream/resume", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // 无 run → 409
+    let resp = app.post("/api/peco/stream/pause").send().await.unwrap();
+    assert_eq!(resp.status(), 409);
+    let resp = app.post("/api/peco/stream/resume").send().await.unwrap();
+    assert_eq!(resp.status(), 409);
+}
+
+/// 有在途轮次时 pause/resume 均 200，且命令身份投递到控制通道；轮次收尾后回到 409。
+#[tokio::test]
+async fn test_pause_resume_returns_200_with_in_flight_turn() {
+    let app = TestApp::new().await;
+    let mut registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+    app.state.peco_runs.set_turn_in_flight(&app.user_id, true);
+
+    let resp = app.post("/api/peco/stream/pause").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    let cmd = tokio::time::timeout(Duration::from_secs(2), registration.control_rx.recv())
+        .await
+        .expect("暂停命令应在超时前送达")
+        .expect("控制通道不应关闭");
+    assert!(matches!(
+        cmd,
+        peco_server::peco::active::ControlCommand::Pause
+    ));
+
+    let resp = app.post("/api/peco/stream/resume").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let cmd = tokio::time::timeout(Duration::from_secs(2), registration.control_rx.recv())
+        .await
+        .expect("恢复命令应在超时前送达")
+        .expect("控制通道不应关闭");
+    assert!(matches!(
+        cmd,
+        peco_server::peco::active::ControlCommand::Resume
+    ));
+
+    // runner 上报停靠（Idle）→ 无在途轮次 → 409
+    app.state.peco_runs.set_turn_in_flight(&app.user_id, false);
+    let resp = app.post("/api/peco/stream/pause").send().await.unwrap();
+    assert_eq!(resp.status(), 409);
+}
+
+/// 暂停/恢复按用户隔离：不得投递到他人的 run。
+#[tokio::test]
+async fn test_pause_resume_is_user_scoped() {
+    let app = TestApp::new().await;
+    let (_uid2, token2) = app.register_user2().await;
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+
+    let resp = app
+        .post_as("/api/peco/stream/pause", &token2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "不得暂停他人的 run");
+    let resp = app
+        .post_as("/api/peco/stream/resume", &token2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "不得恢复他人的 run");
+}
+
 #[tokio::test]
 async fn test_registered_run_lifecycle_via_endpoints() {
     let app = TestApp::new().await;

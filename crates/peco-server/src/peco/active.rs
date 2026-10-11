@@ -34,6 +34,10 @@ pub enum ControlCommand {
     Query(Content),
     /// 取消在途轮次（looper 在下个检查点收尾并退出）。
     Cancel,
+    /// 请求暂停：looper 进入 `Paused`，在步进边界生效。
+    Pause,
+    /// 请求恢复：looper 离开 `Paused`，回到暂停前的外层状态。
+    Resume,
 }
 
 /// `enqueue_query` 的结果。
@@ -189,6 +193,34 @@ impl PecoActiveRuns {
             Some(entry) => entry.control_tx.try_send(ControlCommand::Cancel).is_ok(),
             None => false,
         }
+    }
+
+    /// 请求暂停活跃 run 的在途轮次；无 run / 无在途轮次返回 false。
+    ///
+    /// `true` 只表示控制命令已投递 —— 暂停在步进边界才生效，实际状态经
+    /// SSE `looper_state` 下发给前端。
+    pub fn pause(&self, user_id: &str) -> bool {
+        self.send_control(user_id, ControlCommand::Pause)
+    }
+
+    /// 请求恢复被暂停的在途轮次；语义同 [`Self::pause`]。
+    pub fn resume(&self, user_id: &str) -> bool {
+        self.send_control(user_id, ControlCommand::Resume)
+    }
+
+    /// 仅在途轮次存在时投递控制命令，否则返回 false。
+    ///
+    /// 停靠在 Idle 等输入的 run 虽「已注册」却无轮次可暂停/恢复 —— 调用方
+    /// 据此回 409，与 chat 侧对齐。
+    fn send_control(&self, user_id: &str, cmd: ControlCommand) -> bool {
+        let map = self.inner.lock().unwrap();
+        let Some(entry) = map.get(user_id) else {
+            return false;
+        };
+        if !entry.turn_in_flight.load(Ordering::Relaxed) {
+            return false;
+        }
+        entry.control_tx.try_send(cmd).is_ok()
     }
 
     /// 取消并轮询等待 run 退出。
@@ -361,6 +393,36 @@ mod tests {
             reg.control_rx.recv().await,
             Some(ControlCommand::Cancel)
         ));
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_deliver_only_with_in_flight_turn() {
+        let registry = PecoActiveRuns::new();
+        assert!(!registry.pause("u1"), "无 run 暂停失败");
+        assert!(!registry.resume("u1"), "无 run 恢复失败");
+
+        let mut reg = registry.try_register("u1").expect("register");
+        assert!(registry.pause("u1"));
+        assert!(matches!(
+            reg.control_rx.recv().await,
+            Some(ControlCommand::Pause)
+        ));
+        assert!(registry.resume("u1"));
+        assert!(matches!(
+            reg.control_rx.recv().await,
+            Some(ControlCommand::Resume)
+        ));
+
+        // 轮次收尾（Idle 停靠）后无在途轮次：暂停/恢复不再被接受，且不投递命令
+        registry.set_turn_in_flight("u1", false);
+        assert!(!registry.pause("u1"), "无在途轮次暂停失败");
+        assert!(!registry.resume("u1"), "无在途轮次恢复失败");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reg.control_rx.recv())
+                .await
+                .is_err(),
+            "无在途轮次不得投递命令"
+        );
     }
 
     #[tokio::test]

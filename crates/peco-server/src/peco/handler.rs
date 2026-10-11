@@ -6,6 +6,8 @@
 //   - GET  /api/peco/stream?message=xxx   SSE 流式对话（无 message 时为纯附着模式）
 //   - POST /api/peco/stream/query         向已注册的 run 排队消息（不新开连接）
 //   - POST /api/peco/stream/cancel        取消进行中的任务
+//   - POST /api/peco/stream/pause         暂停在途 ReAct 轮
+//   - POST /api/peco/stream/resume        恢复被暂停的 ReAct 轮
 //   - POST /api/peco/images               上传图片（随 stream 的 image_ids 发送）
 //   - POST /api/peco/files                上传图片/文档（按扩展名分类，随 file_ids 发送）
 //   - GET  /api/peco/session               会话快照
@@ -560,6 +562,16 @@ async fn runner_loop(
                         warn!(user_id = %user_id, error = %e, "Failed to deliver cancel");
                     }
                 }
+                Some(ControlCommand::Pause) => {
+                    if let Err(e) = handle.pause().await {
+                        warn!(user_id = %user_id, error = %e, "Failed to deliver pause");
+                    }
+                }
+                Some(ControlCommand::Resume) => {
+                    if let Err(e) = handle.resume().await {
+                        warn!(user_id = %user_id, error = %e, "Failed to deliver resume");
+                    }
+                }
                 None => break,
             },
             _ = reclaim_notify.notified() => {
@@ -656,6 +668,45 @@ pub async fn cancel_stream(
     Ok(Json(SuccessResponse {
         success: true,
         message: Some("cancellation requested".to_string()),
+    }))
+}
+
+/// POST /api/peco/stream/pause — 请求暂停当前用户进行中的 ReAct 轮。
+///
+/// **暂停在下一个步进边界生效**（流式=单 chunk、工具=≤200ms 轮询、batch=整段
+/// 生成），故 200 只表示「请求已收到」；实际状态经 SSE `looper_state{paused}`
+/// 事件下发（由共享的 `map_looper_event` 在主对话侧同样生效）。无在途轮次时
+/// 409 —— 与 chat 侧对齐（cancel_stream 用 404，但暂停/恢复要求确有轮次可操作）。
+pub async fn pause_stream(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    if !state.peco_runs.pause(&user_id) {
+        return Err(ApiError::Conflict("no in-flight peco turn".into()));
+    }
+    info!(user_id = %user_id, "Peco run pause requested");
+    Ok(Json(SuccessResponse {
+        success: true,
+        message: Some("pause requested".to_string()),
+    }))
+}
+
+/// POST /api/peco/stream/resume — 请求恢复被暂停的 ReAct 轮。
+///
+/// 与 [`pause_stream`] 同为「请求已收到」语义，实际状态经 SSE
+/// `looper_state{paused:false}` 下发。无在途轮次时 409；未暂停时的重复恢复
+/// 由 looper 侧按幂等忽略。
+pub async fn resume_stream(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    if !state.peco_runs.resume(&user_id) {
+        return Err(ApiError::Conflict("no in-flight peco turn".into()));
+    }
+    info!(user_id = %user_id, "Peco run resume requested");
+    Ok(Json(SuccessResponse {
+        success: true,
+        message: Some("resume requested".to_string()),
     }))
 }
 
@@ -2151,6 +2202,8 @@ pub struct SupersedeHealthResponse {
 /// - `GET /stream` — SSE 流式对话（无 message 时为纯附着模式）
 /// - `POST /stream/query` — 向已注册的 run 排队一条消息（不新开连接）
 /// - `POST /stream/cancel` — 取消进行中的任务
+/// - `POST /stream/pause` — 暂停在途 ReAct 轮
+/// - `POST /stream/resume` — 恢复被暂停的 ReAct 轮
 /// - `POST /images` — 上传图片（multipart 字段 `file`，随 `image_ids` 发送）
 /// - `POST /files` — 上传附件（图片/文档，multipart 字段 `file`，随 `file_ids` 发送）
 /// - `GET /session` — 获取会话快照（`?turns=&before=` 分 turn 分页）
@@ -2176,6 +2229,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/stream", get(stream_chat))
         .route("/stream/query", post(query_stream))
         .route("/stream/cancel", post(cancel_stream))
+        .route("/stream/pause", post(pause_stream))
+        .route("/stream/resume", post(resume_stream))
         .route(
             "/images",
             // layer 加在 MethodRouter 上，只作用于本路由 —— 否则 2MB 默认
