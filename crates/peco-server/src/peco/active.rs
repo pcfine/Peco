@@ -34,7 +34,7 @@ pub enum ControlCommand {
     Query(Content),
     /// 取消在途轮次（looper 在下个检查点收尾并退出）。
     Cancel,
-    /// 请求暂停：looper 进入 `Paused`，在步进边界生效。
+    /// 请求暂停：looper 进入 `Paused`；流式在途时延迟到本次模型调用收尾生效。
     Pause,
     /// 请求恢复：looper 离开 `Paused`，回到暂停前的外层状态。
     Resume,
@@ -202,8 +202,8 @@ impl PecoActiveRuns {
 
     /// 请求暂停活跃 run 的在途轮次；无 run / 无在途轮次返回 false。
     ///
-    /// `true` 只表示控制命令已投递 —— 暂停在步进边界才生效，实际状态经
-    /// SSE `looper_state` 下发给前端。
+    /// `true` 只表示控制命令已投递 —— 暂停在步进边界（流式在途时为本次模型
+    /// 调用收尾）才生效，实际状态经 SSE `looper_state` 下发给前端。
     pub fn pause(&self, user_id: &str) -> bool {
         self.send_control(user_id, ControlCommand::Pause)
     }

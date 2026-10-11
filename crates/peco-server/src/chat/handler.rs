@@ -723,8 +723,8 @@ async fn require_owned_conversation(
 
 /// `POST /api/chat/:agentId/conversations/:id/pause`
 ///
-/// 请求暂停该会话在途的 ReAct 轮。**暂停在下一个步进边界生效**（流式=单
-/// chunk、工具=≤200ms 轮询、batch=整段生成），因此本接口只表示「已收到请求」；
+/// 请求暂停该会话在途的 ReAct 轮。**暂停在下一个步进边界生效**（流式在途时为
+/// 本次模型调用收尾、工具=≤200ms 轮询、batch=整段生成），因此本接口只表示「已收到请求」；
 /// 实际状态经 SSE `looper_state` 事件下发。无在途运行时返回 409。
 pub async fn pause_chat(
     AuthUser { user_id }: AuthUser,

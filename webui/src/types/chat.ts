@@ -130,8 +130,8 @@ export interface TruncationRetryData {
 /**
  * looper 外层暂停状态变化（进入 / 离开 Paused）。
  *
- * 暂停在下一个步进边界才生效，故 POST /pause 的 200 只表示「请求已收到」——
- * 这条事件才是按钮状态的权威来源。
+ * 暂停在下一个步进边界（流式在途时为本次模型调用收尾）才生效，故 POST /pause
+ * 的 200 只表示「请求已收到」—— 这条事件才是按钮状态的权威来源。
  */
 export interface LooperStateData {
   paused: boolean;

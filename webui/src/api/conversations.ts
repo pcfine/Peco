@@ -80,8 +80,8 @@ export async function getMessages(
 /**
  * 请求暂停该对话在途的 ReAct 轮。
  *
- * 暂停在下一个步进边界生效，故 200 只表示「请求已收到」；实际状态由 SSE
- * `looper_state` 事件下发。
+ * 暂停在下一个步进边界（流式在途时为本次模型调用收尾）生效，故 200 只表示
+ * 「请求已收到」；实际状态由 SSE `looper_state` 事件下发。
  */
 export async function pauseConversation(
   agentId: string,

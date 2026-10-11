@@ -581,8 +581,9 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   // ── pause / resume ───────────────────────────────────────────────────
   //
   // 与 abortStream 的差别：不断连、不动 isStreaming —— 暂停不等于取消，
-  // 轮次仍在途，只等 looper 在步进边界停步。fire-and-forget：暂停/恢复的
-  // 权威状态经 SSE `looper_state` 回填（applyStreamEvent），此处不乐观置位。
+  // 轮次仍在途，只等 looper 停步（流式在途时为本次模型调用收尾）。
+  // fire-and-forget：暂停/恢复的权威状态经 SSE `looper_state` 回填
+  //（applyStreamEvent），此处不乐观置位。
 
   pause: () => {
     void pausePecoStream().catch(() => {});

@@ -679,8 +679,8 @@ pub async fn cancel_stream(
 
 /// POST /api/peco/stream/pause — 请求暂停当前用户进行中的 ReAct 轮。
 ///
-/// **暂停在下一个步进边界生效**（流式=单 chunk、工具=≤200ms 轮询、batch=整段
-/// 生成），故 200 只表示「请求已收到」；实际状态经 SSE `looper_state{paused}`
+/// **暂停在下一个步进边界生效**（流式在途时为本次模型调用收尾、工具=≤200ms
+/// 轮询、batch=整段生成），故 200 只表示「请求已收到」；实际状态经 SSE `looper_state{paused}`
 /// 事件下发（由共享的 `map_looper_event` 在主对话侧同样生效）。无在途轮次时
 /// 409 —— 与 chat 侧对齐（cancel_stream 用 404，但暂停/恢复要求确有轮次可操作）。
 pub async fn pause_stream(

@@ -176,7 +176,8 @@ export interface ChatViewProps {
    * [可选] 暂停当前运行中的 looper。与 `onResume` **同时提供**时才出现入口，
    * 且只在流式进行中展示（`ExternalIsStreaming ?? streaming`）。
    *
-   * 暂停在下一个步进边界才生效，按钮状态以 SSE `looper_state` 事件为准。
+   * 暂停在下一个步进边界生效（流式在途时为本次模型调用收尾），按钮状态以
+   * SSE `looper_state` 事件为准。
    */
   onPause?: () => void;
   /** [可选] 恢复已暂停的 looper（与 `onPause` 成对提供）。 */
@@ -1189,7 +1190,8 @@ function handleSSEEvent(
     onTextDelta?.();
   }
 
-  // 暂停态只认服务端事件：POST /pause 的返回不代表已暂停（步进边界才生效）
+  // 暂停态只认服务端事件：POST /pause 的返回不代表已暂停
+  //（流式在途时模型调用收尾才生效）
   if (event.event === "looper_state") {
     setPaused?.(event.data.paused);
   }

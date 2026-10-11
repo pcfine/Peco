@@ -1458,8 +1458,9 @@ impl AgentLooper {
     /// ```
     ///
     /// 不用 `select!` 抢占：控制消息只在 ① 消费，在途 future（commit→save、prepare
-    /// 重发、工具 poll 回收）永不被消息丢弃，故消息在**步进边界**生效（流式=单
-    /// chunk、工具=≤200ms、batch=整段生成）。
+    /// 重发、工具 poll 回收）永不被消息丢弃，故消息在**步进边界**生效（工具=≤200ms、
+    /// batch=整段生成）。**例外**：流式在途的 `Pause` 不落在此边界 —— 延迟到本次
+    /// 模型调用收尾才落地（见 [`Self::apply_deferred_pause`]），取消仍在 chunk 边界生效。
     ///
     /// **不空转不变量**：每轮迭代要么在 ① 阻塞，要么严格推进一个状态 ——
     /// `has_pending_work` 的每个「非阻塞」触发点都有消解者（`cancel_flag` /
@@ -1697,7 +1698,8 @@ impl AgentLooper {
 
     /// 把在途模型调用收尾时记下的暂停请求落地。
     ///
-    /// 只在流成功收敛后调用：失败与重发早退时待办保留，等重试那次调用收尾。
+    /// 只在流成功收敛后调用。两条重发早退（截断 / 流被掐断）刻意不落地，待办保留
+    /// 等重试那次调用收尾；终局失败则由 [`Self::finalize_failure`] 丢弃待办。
     fn apply_deferred_pause(&mut self) {
         if !self.pause_pending || matches!(self.outer_state, OuterState::Paused) {
             return;
@@ -1779,6 +1781,8 @@ impl AgentLooper {
     /// [`Self::compose_epilogue_if_needed`]）—— 唯一的 `.await` 落点：`plan_failure`
     /// 是同步自由函数，而收尾文本必须赶在它之前备好。
     async fn finalize_failure(&mut self) {
+        // 终局失败：该轮已判死、无可暂停对象，用户的暂停意图就此丢弃。若此时
+        // session 里已排了 Query，失败收尾回到 Idle 后 ③ 会**不带暂停**地起下一轮。
         self.pause_pending = false;
         let reason = self
             .failure_reason

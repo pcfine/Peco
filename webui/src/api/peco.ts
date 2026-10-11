@@ -116,8 +116,8 @@ export async function cancelPecoStream(): Promise<{
 /**
  * 请求暂停当前用户进行中的 ReAct 轮（无在途轮次时服务端返回 409）。
  *
- * 暂停在步进边界才生效，本调用只表示「请求已收到」；实际暂停态以 SSE
- * `looper_state` 事件为准，调用方不得据返回值乐观置位。
+ * 暂停在步进边界（流式在途时为本次模型调用收尾）才生效，本调用只表示
+ * 「请求已收到」；实际暂停态以 SSE `looper_state` 事件为准，调用方不得据返回值乐观置位。
  */
 export async function pausePecoStream(): Promise<{
   success: boolean;
