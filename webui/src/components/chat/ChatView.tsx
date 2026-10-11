@@ -839,7 +839,7 @@ export function ChatView({
                       onClick={handlePause}
                       aria-label={
                         pausePending
-                          ? "暂停中…"
+                          ? "取消暂停"
                           : effectivePaused
                             ? "恢复"
                             : "暂停"

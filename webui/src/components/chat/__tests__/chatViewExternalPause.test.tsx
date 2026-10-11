@@ -33,7 +33,7 @@ afterEach(() => {
 
 const pauseBtn = () => container.querySelector('button[aria-label="暂停"]');
 const pendingBtn = () =>
-  container.querySelector('button[aria-label="暂停中…"]');
+  container.querySelector('button[aria-label="取消暂停"]');
 const resumeBtn = () => container.querySelector('button[aria-label="恢复"]');
 
 async function render(props: Partial<ComponentProps<typeof ChatView>> = {}) {
