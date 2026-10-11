@@ -647,13 +647,16 @@ impl RetryCause {
 /// 阻塞在 `recv()` 上的 looper（flag 做不到）。
 ///
 /// 消息在**步进边界**消费：`react_step()` 在途时不抢占、不丢弃 future ——
-/// `run()` 循环顶先非阻塞排空通道，再推进一步（流式粒度=单 chunk、
-/// 工具=≤200ms 轮询、batch=整段生成）。
+/// `run()` 循环顶先非阻塞排空通道，再推进一步（工具=≤200ms 轮询、
+/// batch=整段生成）。流式在途时 `Pause` 不落在此边界，见 [`UserMsg::Pause`]。
 #[derive(Debug, Clone)]
 pub enum UserMsg {
     /// 用户查询（纯文本或文本 + 图片部件混排）
     Query(Content),
-    /// 请求暂停：looper 进入 `Paused`，挂起 ReAct 循环
+    /// 请求暂停：looper 进入 `Paused`，挂起 ReAct 循环。
+    ///
+    /// 模型调用在途（`Streaming`）时不立即挂起 —— 只记待办，本次调用收尾
+    /// 才落地，避免冻结活着的上游连接；其余状态立即挂起。待办可被 `Resume` 撤回。
     Pause,
     /// 请求恢复：解除 `Paused`，回到暂停前的外层状态
     Resume,
@@ -814,9 +817,10 @@ impl LooperHandle {
 
     /// 请求暂停：向 looper 发送 [`UserMsg::Pause`]。
     ///
-    /// 暂停在当前步进完成后生效（与 `send_query` 同通道 FIFO，交错语义
-    /// 确定）；暂停期间 `send_query` 的消息进入 pending 队列，恢复时若
-    /// looper 停靠在 Idle 会立即续接。调用 [`Self::resume`] 恢复。
+    /// 模型调用在途时不立即挂起，待本次调用收尾才生效；其余时刻随步进边界
+    /// 生效（与 `send_query` 同通道 FIFO，交错语义确定）。暂停期间 `send_query`
+    /// 的消息进入 pending 队列，恢复时若 looper 停靠在 Idle 会立即续接。
+    /// 调用 [`Self::resume`] 恢复。
     /// 返回 `Err` 表示 looper 已结束（channel 关闭）。
     pub async fn pause(&self) -> Result<(), tokio::sync::mpsc::error::SendError<UserMsg>> {
         self.user_speaker.send(UserMsg::Pause).await
@@ -998,6 +1002,9 @@ pub struct AgentLooper {
     /// 进入 `Paused` 状态前的外层状态，用于 resume 时恢复。
     pre_pause_state: Option<OuterState>,
 
+    /// 模型调用在途时收到的暂停请求，待本次调用收尾落地（见 [`UserMsg::Pause`]）。
+    pause_pending: bool,
+
     // ── pending 调度 ──
     /// pending 队列是否「现在该跑」—— 由用户意图驱动，与「有没有 pending」正交。
     /// `Resume` / 新 `Query` 置位，`Cancel` 收尾与启动一轮后清零，初值 `true`。
@@ -1103,6 +1110,7 @@ impl AgentLooper {
             failure_reason: None,
             react_loop_iteration: 0,
             pre_pause_state: None,
+            pause_pending: false,
             pending_armed: true,
             shutdown_requested: false,
             event_speaker,
@@ -1649,8 +1657,11 @@ impl AgentLooper {
                 ReadDirective::Continue
             }
             UserMsg::Pause => {
-                // ★ 进入 Paused：记录暂停前状态，挂起循环（已暂停则幂等忽略）
-                if !matches!(self.outer_state, OuterState::Paused) {
+                if matches!(self.react_state, ReActState::Streaming) {
+                    // 模型调用在途：不冻结活着的上游连接，留待收尾落地
+                    self.pause_pending = true;
+                } else if !matches!(self.outer_state, OuterState::Paused) {
+                    // ★ 进入 Paused：记录暂停前状态，挂起循环
                     let old = self.outer_state;
                     self.pre_pause_state = Some(old);
                     self.outer_state = OuterState::Paused;
@@ -1660,8 +1671,10 @@ impl AgentLooper {
                 ReadDirective::Continue
             }
             UserMsg::Resume => {
-                // 未处于 Paused — 幂等忽略
-                if matches!(self.outer_state, OuterState::Paused) {
+                if self.pause_pending {
+                    // 撤回尚未落地的暂停；不改 `outer_state`
+                    self.pause_pending = false;
+                } else if matches!(self.outer_state, OuterState::Paused) {
                     self.pending_armed = true;
                     // **只清镜像，不还原 outer_state**：排队输入要由 ③ 一次发出
                     // Paused→RunningInnerLoop。若此处还原成 Idle，中途的 to=Idle 会被
@@ -1680,6 +1693,21 @@ impl AgentLooper {
                 ReadDirective::StopReading
             }
         }
+    }
+
+    /// 把在途模型调用收尾时记下的暂停请求落地。
+    ///
+    /// 只在流成功收敛后调用：失败与重发早退时待办保留，等重试那次调用收尾。
+    fn apply_deferred_pause(&mut self) {
+        if !self.pause_pending || matches!(self.outer_state, OuterState::Paused) {
+            return;
+        }
+        self.pause_pending = false;
+        let old = self.outer_state;
+        self.pre_pause_state = Some(old);
+        self.outer_state = OuterState::Paused;
+        self.pause_flag.store(true, Ordering::Release);
+        self.emit_outer_state_change(old, OuterState::Paused);
     }
 
     /// 还原暂停 —— `outer_state` / `pause_flag` / `pre_pause_state` 三处镜像集中
@@ -1735,6 +1763,7 @@ impl AgentLooper {
         self.pending_armed = false;
         self.cancel_flag.store(false, Ordering::Release); // 一次性，否则回到 Idle 会反复命中
         self.pre_pause_state = None;
+        self.pause_pending = false;
         self.pause_flag.store(false, Ordering::Release);
         if !matches!(self.outer_state, OuterState::Idle) {
             let old = self.outer_state;
@@ -1750,6 +1779,7 @@ impl AgentLooper {
     /// [`Self::compose_epilogue_if_needed`]）—— 唯一的 `.await` 落点：`plan_failure`
     /// 是同步自由函数，而收尾文本必须赶在它之前备好。
     async fn finalize_failure(&mut self) {
+        self.pause_pending = false;
         let reason = self
             .failure_reason
             .take()
@@ -2148,6 +2178,7 @@ impl AgentLooper {
         self.budget_raised = false;
         self.retry_deadline = None;
         self.dynamic_context_resolved = false;
+        self.pause_pending = false;
     }
 
     /// 本用户轮已实际发起的模型调用次数（含刚失败的这次）。
@@ -3047,6 +3078,9 @@ impl AgentLooper {
                 .collect();
             self.react_state = ReActState::ExecutingTools;
         }
+
+        // 本次模型调用已收尾 —— 在途时记下的暂停请求此刻落地
+        self.apply_deferred_pause();
     }
 
     /// 将有序 output 块回填到 session staging：`Text→Message{Assistant}`、
@@ -5373,6 +5407,331 @@ mod tests {
         assert_eq!(reason, "done", "正常收尾不应报失败原因，实际 {reason}");
 
         run_task.await.unwrap().unwrap();
+    }
+
+    // ── 暂停延迟到模型调用边界（流式在途）tests ──────────────────────────
+
+    type ChunkSender =
+        tokio::sync::mpsc::UnboundedSender<Result<StreamChunk, model_provider::ProviderError>>;
+
+    /// 可控慢流 provider：每次 `generate_stream` 把发送端交回测试，由测试
+    /// 决定 chunk 投放时机，从而把 looper 确定地停在 `Streaming`。
+    struct ControllableStreamProvider {
+        senders: tokio::sync::mpsc::UnboundedSender<ChunkSender>,
+    }
+
+    #[async_trait::async_trait]
+    impl model_provider::ModelProvider for ControllableStreamProvider {
+        fn name(&self) -> &str {
+            "controllable-stream"
+        }
+
+        async fn generate_full(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<model_provider::GenerateResult, model_provider::ProviderError> {
+            panic!("controllable provider is streaming-only; test harness misconfigured")
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: &model_provider::GenerateRequest,
+        ) -> Result<GenerateStream, model_provider::ProviderError> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            self.senders
+                .send(tx)
+                .expect("test dropped the chunk-sender inbox");
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            Ok(GenerateStream::new(Box::pin(stream)))
+        }
+    }
+
+    /// spawn 一个可控慢流 looper，返回句柄与「流发送端收件箱」。
+    fn spawn_controllable_looper() -> (
+        LooperHandle,
+        tokio::sync::mpsc::UnboundedReceiver<ChunkSender>,
+    ) {
+        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider = Arc::new(ControllableStreamProvider { senders: tx });
+        let agent = Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::clone(&provider) as Arc<dyn model_provider::ModelProvider>,
+            crate::agent::ModelConfigBuilder::new().stream(true).build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        ));
+        let session = Session::new("s1".to_string(), "d".to_string());
+        let handle = AgentLooper::spawn(
+            agent,
+            Box::new(session),
+            LooperConfig::default(),
+            Arc::new(crate::persistence::NullSessionPersister),
+        );
+        (handle, rx)
+    }
+
+    fn text_start() -> StreamChunk {
+        StreamChunk::BlockStart {
+            index: 0,
+            block_type: model_provider::BlockType::Text,
+        }
+    }
+
+    fn text_delta(delta: &str) -> StreamChunk {
+        StreamChunk::TextDelta {
+            index: 0,
+            delta: delta.to_string(),
+        }
+    }
+
+    fn text_end(text: &str) -> StreamChunk {
+        StreamChunk::BlockEnd {
+            index: 0,
+            block: ContentBlock::Text {
+                text: text.to_string(),
+            },
+        }
+    }
+
+    fn stream_usage() -> StreamChunk {
+        StreamChunk::Usage {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+                total_tokens: 30,
+            },
+        }
+    }
+
+    fn stream_finish() -> StreamChunk {
+        StreamChunk::Finish {
+            reason: FinishReason::Stop,
+        }
+    }
+
+    /// 收事件直到出现指定文本的 `TextDelta`，全程累积到 `events`。
+    async fn drain_until_text_delta(h: &LooperHandle, events: &mut Vec<LooperEvent>, want: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(e) => {
+                        let hit = matches!(&e, LooperEvent::TextDelta { delta } if delta == want);
+                        events.push(e);
+                        if hit {
+                            break;
+                        }
+                    }
+                    None => panic!("event channel closed before TextDelta {want:?}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for TextDelta");
+    }
+
+    fn is_paused_event(e: &LooperEvent) -> bool {
+        matches!(
+            e,
+            LooperEvent::OuterStateChange {
+                to: OuterState::Paused,
+                ..
+            }
+        )
+    }
+
+    /// 收事件直到外层状态迁到 Paused，返回该事件在 `events` 中的下标。
+    async fn drain_until_paused(h: &LooperHandle, events: &mut Vec<LooperEvent>) -> usize {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(e) => {
+                        let paused = is_paused_event(&e);
+                        events.push(e);
+                        if paused {
+                            break;
+                        }
+                    }
+                    None => panic!("event channel closed before to=Paused"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for to=Paused");
+        events.len() - 1
+    }
+
+    /// 收事件直到 `TurnComplete`，全程累积到 `events`，避免把中间事件丢弃。
+    async fn drain_until_turn_complete(
+        h: &LooperHandle,
+        events: &mut Vec<LooperEvent>,
+    ) -> TurnOutcome {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(e) => {
+                        let outcome = match &e {
+                            LooperEvent::TurnComplete { outcome, .. } => Some(outcome.clone()),
+                            _ => None,
+                        };
+                        events.push(e);
+                        if let Some(outcome) = outcome {
+                            break outcome;
+                        }
+                    }
+                    None => panic!("event channel closed before TurnComplete"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for TurnComplete")
+    }
+
+    /// 流式在途收到 Pause：不立即挂起，本次模型调用收尾才进入 Paused；
+    /// Resume 之后才提交并完成本轮。去掉 Streaming 特判本测试必红。
+    #[tokio::test]
+    async fn test_pause_during_stream_defers_to_call_boundary() {
+        let (h, mut senders) = spawn_controllable_looper();
+        h.send_query("q".into()).await.expect("looper alive");
+        let tx = senders
+            .recv()
+            .await
+            .expect("provider should start a stream");
+
+        tx.send(Ok(text_start())).unwrap();
+        tx.send(Ok(text_delta("hel"))).unwrap();
+
+        let mut events = Vec::new();
+        drain_until_text_delta(&h, &mut events, "hel").await;
+
+        // 模型调用在途：此刻发 Pause，再等过 `STEP_POLL`，确保 looper 已回到循环顶
+        // 消费过 Pause（长等待只会加强断言）
+        h.pause().await.expect("looper alive");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        events.extend(h.drain_events());
+
+        assert!(!h.is_paused(), "流式在途的暂停不得立即生效");
+        assert!(
+            !events.iter().any(is_paused_event),
+            "流未收尾前不得出现 to=Paused"
+        );
+
+        // 收尾本次调用
+        tx.send(Ok(text_delta("lo"))).unwrap();
+        tx.send(Ok(text_end("hello"))).unwrap();
+        tx.send(Ok(stream_usage())).unwrap();
+        tx.send(Ok(stream_finish())).unwrap();
+
+        let paused_idx = drain_until_paused(&h, &mut events).await;
+        let last_text_idx = events
+            .iter()
+            .rposition(|e| matches!(e, LooperEvent::TextDelta { .. }))
+            .expect("there should be TextDelta events");
+        assert!(
+            paused_idx > last_text_idx,
+            "to=Paused 必须晚于最后一个 TextDelta（流已读完）"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, LooperEvent::TurnComplete { .. })),
+            "暂停落地后本轮尚未提交，不应有 TurnComplete"
+        );
+
+        h.resume().await.expect("looper alive");
+        match drain_until_turn_complete(&h, &mut events).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "hello"),
+            other => panic!("恢复后应正常完成，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 流结束前 Resume 撤回待办：事件流里从不出现 to=Paused，本轮照常完成。
+    /// 去掉 Resume 里清 `pause_pending` 那两行本测试必红。
+    #[tokio::test]
+    async fn test_resume_before_stream_end_retracts_pending_pause() {
+        let (h, mut senders) = spawn_controllable_looper();
+        h.send_query("q".into()).await.expect("looper alive");
+        let tx = senders
+            .recv()
+            .await
+            .expect("provider should start a stream");
+
+        tx.send(Ok(text_start())).unwrap();
+        tx.send(Ok(text_delta("hel"))).unwrap();
+
+        let mut events = Vec::new();
+        drain_until_text_delta(&h, &mut events, "hel").await;
+
+        // 在途暂停后立刻恢复 —— 待办被撤回，流收尾时不得挂起
+        h.pause().await.expect("looper alive");
+        h.resume().await.expect("looper alive");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        tx.send(Ok(text_delta("lo"))).unwrap();
+        tx.send(Ok(text_end("hello"))).unwrap();
+        tx.send(Ok(stream_usage())).unwrap();
+        tx.send(Ok(stream_finish())).unwrap();
+
+        let outcome = drain_until_turn_complete(&h, &mut events).await;
+        assert!(
+            !events.iter().any(is_paused_event),
+            "被撤回的暂停不得在事件流中出现 to=Paused"
+        );
+        assert!(!h.is_paused(), "撤回后不得残留暂停态");
+        match outcome {
+            TurnOutcome::Success { text } => assert_eq!(text, "hello"),
+            other => panic!("撤回暂停后本轮应正常完成，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 流式在途的 Pause 只记待办、不改外层状态。
+    #[tokio::test]
+    async fn test_streaming_pause_records_pending_without_pausing() {
+        let mut h = failure_looper_harness(false, false, false);
+        h.looper.react_state = ReActState::Streaming;
+        h.looper.outer_state = OuterState::RunningInnerLoop;
+
+        let _ = h.looper.handle_user_msg(UserMsg::Pause);
+
+        assert!(
+            matches!(h.looper.outer_state, OuterState::RunningInnerLoop),
+            "流式在途的暂停不得改动外层状态，实际={:?}",
+            h.looper.outer_state
+        );
+        assert!(h.looper.pause_pending, "流式在途的暂停必须记为待办");
+        assert!(
+            !h.looper.pause_flag.load(Ordering::Acquire),
+            "待办阶段不得置暂停镜像"
+        );
+    }
+
+    /// Resume 撤回尚未落地的待办暂停。
+    #[tokio::test]
+    async fn test_resume_retracts_pending_pause() {
+        let mut h = failure_looper_harness(false, false, false);
+        h.looper.react_state = ReActState::Streaming;
+        h.looper.outer_state = OuterState::RunningInnerLoop;
+        let _ = h.looper.handle_user_msg(UserMsg::Pause);
+
+        let _ = h.looper.handle_user_msg(UserMsg::Resume);
+
+        assert!(!h.looper.pause_pending, "Resume 必须撤回待办暂停");
+        assert!(matches!(h.looper.outer_state, OuterState::RunningInnerLoop));
+        assert!(!h.looper.pause_flag.load(Ordering::Acquire));
     }
 
     #[tokio::test]
