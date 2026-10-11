@@ -70,6 +70,10 @@ struct ActiveEntry {
     /// 与 `turn_in_flight` 同寿命。快照端点据此让「整页刷新」后仍能显示刚发出、
     /// 尚未落盘的那句 query（快照只含 committed_turns，不含在途轮）。
     inflight_input: Option<String>,
+    /// 在途轮是否被暂停。
+    ///
+    /// 暂停不产生新的 `looper_state` 事件，重连后无从经 SSE 得知，故随快照下发。
+    paused: Arc<AtomicBool>,
 }
 
 /// runner 退出 / 构建失败 / panic unwind 时自清理注册表的守卫。
@@ -150,6 +154,7 @@ impl PecoActiveRuns {
                 reclaim_notify: Arc::clone(&reclaim_notify),
                 turn_in_flight: Arc::new(AtomicBool::new(true)),
                 inflight_input: None,
+                paused: Arc::new(AtomicBool::new(false)),
             },
         );
         Some(RunRegistration {
@@ -212,6 +217,9 @@ impl PecoActiveRuns {
     ///
     /// 停靠在 Idle 等输入的 run 虽「已注册」却无轮次可暂停/恢复 —— 调用方
     /// 据此回 409，与 chat 侧对齐。
+    ///
+    /// 控制通道背压（已满或已关闭）同样折叠为 false，调用方一并回 409：
+    /// 暂停/恢复不是高频命令，409 已足以表达「此刻不可用」。
     fn send_control(&self, user_id: &str, cmd: ControlCommand) -> bool {
         let map = self.inner.lock().unwrap();
         let Some(entry) = map.get(user_id) else {
@@ -317,6 +325,23 @@ impl PecoActiveRuns {
         let mut map = self.inner.lock().unwrap();
         if let Some(entry) = map.get_mut(user_id) {
             entry.inflight_input = input;
+        }
+    }
+
+    /// 该用户是否有在途轮处于暂停态（runner 上报，无 run 时为 false）。
+    pub fn paused(&self, user_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(user_id)
+            .is_some_and(|entry| entry.paused.load(Ordering::Relaxed))
+    }
+
+    /// 由 runner 在 `OuterStateChange` 时上报暂停态；无 run 时为 no-op。
+    pub fn set_paused(&self, user_id: &str, paused: bool) {
+        let map = self.inner.lock().unwrap();
+        if let Some(entry) = map.get(user_id) {
+            entry.paused.store(paused, Ordering::Relaxed);
         }
     }
 }
@@ -512,6 +537,27 @@ mod tests {
 
         drop(reg);
         assert_eq!(registry.inflight_input("u1"), None, "条目移除后回落 None");
+    }
+
+    #[test]
+    fn paused_tracks_registration_and_runner_reports() {
+        let registry = PecoActiveRuns::new();
+        assert!(!registry.paused("u1"), "无 run 时非暂停");
+
+        let reg = registry.try_register("u1").expect("register");
+        assert!(!registry.paused("u1"), "抢注时未暂停");
+
+        registry.set_paused("u1", true);
+        assert!(registry.paused("u1"), "runner 上报暂停");
+
+        registry.set_paused("u1", false);
+        assert!(!registry.paused("u1"), "runner 上报恢复");
+
+        registry.set_paused("ghost", true); // 无 run：no-op 不 panic
+        assert!(!registry.paused("ghost"));
+
+        drop(reg);
+        assert!(!registry.paused("u1"), "条目移除后回落为 false");
     }
 
     #[tokio::test]

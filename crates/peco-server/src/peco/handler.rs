@@ -178,6 +178,10 @@ pub struct SessionSnapshotResponse {
     /// 与 `is_running` 的区别只在停靠态：run 已注册但当前无轮次在跑时
     /// 该字段为 false，前端不应附着（否则会挂出一条永不填充的空占位）。
     pub turn_in_flight: bool,
+    /// 在途轮是否被暂停 —— 前端刷新/重连后据此直接呈现「恢复」入口。
+    ///
+    /// 暂停不产生新的 `looper_state` 事件，重连后无从经 SSE 得知，故随快照下发。
+    pub paused: bool,
     /// 在途轮的用户输入文本（无在途轮时缺省）。
     ///
     /// 快照只含已 committed 的轮，在途轮不在其中。整页刷新后前端内存全清，仅凭
@@ -528,6 +532,8 @@ async fn runner_loop(
                             looper_idle = matches!(to, OuterState::Idle);
                             // 停靠态 = 无轮次在途；附着方据此判断要不要补占位气泡
                             runs.set_turn_in_flight(&user_id, !looper_idle);
+                            // 快照端点据此恢复暂停态：重连没有「跨越 Paused 的转换」事件可依赖
+                            runs.set_paused(&user_id, matches!(to, OuterState::Paused));
                             // 收尾即清空在途 query —— 与 turn_in_flight 同寿命
                             if looper_idle {
                                 runs.set_inflight_input(&user_id, None);
@@ -926,6 +932,7 @@ pub async fn get_session_snapshot(
         total_usage: usage,
         is_running: state.peco_runs.is_running(&user_id),
         turn_in_flight: state.peco_runs.turn_in_flight(&user_id),
+        paused: state.peco_runs.paused(&user_id),
         inflight_user_input: state.peco_runs.inflight_input(&user_id),
         pinned_summary,
         context_metrics,

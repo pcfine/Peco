@@ -1032,4 +1032,32 @@ describe("pecoChatStore 暂停/恢复", () => {
     expect(usePecoChatStore.getState().paused).toBe(false);
     expect(usePecoChatStore.getState().error).toBeNull();
   });
+
+  it("刷新/重附着从快照恢复 paused，直接呈现恢复入口", async () => {
+    // 服务端暂停后在途轮仍在：快照 paused=true 且 turn_in_flight=true
+    vi.mocked(getPecoSession).mockResolvedValue({
+      ...snapshot(true),
+      paused: true,
+    } as never);
+    global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
+
+    await usePecoChatStore.getState().load();
+
+    // 重连没有「跨越 Paused 的转换」事件，快照是暂停态的唯一来源
+    expect(usePecoChatStore.getState().paused).toBe(true);
+    expect(usePecoChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it("快照 paused=false 时不残留暂停态", async () => {
+    vi.mocked(getPecoSession).mockResolvedValue({
+      ...snapshot(true),
+      paused: false,
+    } as never);
+    global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
+
+    await usePecoChatStore.getState().load();
+
+    expect(usePecoChatStore.getState().paused).toBe(false);
+    expect(usePecoChatStore.getState().isStreaming).toBe(true);
+  });
 });

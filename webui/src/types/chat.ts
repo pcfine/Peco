@@ -175,6 +175,13 @@ export interface SessionSnapshotResponse {
    */
   turn_in_flight?: boolean;
   /**
+   * 在途轮是否被暂停 —— 刷新/重连后据此直接呈现「恢复」入口。
+   *
+   * 暂停不产生新的 SSE `looper_state` 事件，重连后无从得知，故随快照下发。
+   * chat 侧不返回该字段。
+   */
+  paused?: boolean;
+  /**
    * 在途轮的用户输入文本（无在途轮时缺省）。
    *
    * 快照只含已 committed 的轮，在途轮不在其中 —— 整页刷新后前端内存全清，

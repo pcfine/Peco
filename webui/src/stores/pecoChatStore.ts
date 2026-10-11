@@ -322,9 +322,12 @@ async function refreshSession(
     ];
   }
 
+  // 暂停不产生新的 `looper_state` 事件，重连/刷新无从经 SSE 得知，
+  // 只能据快照回填。
   set({
     messages,
     loaded: true,
+    paused: snap.paused === true,
     oldestLoadedTurn,
     hasMore,
     totalTurns: snap.total_turns ?? snap.turns.length,

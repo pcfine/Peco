@@ -747,6 +747,35 @@ async fn test_pause_resume_is_user_scoped() {
     assert_eq!(resp.status(), 409, "不得恢复他人的 run");
 }
 
+/// 快照下发暂停态：无 run 时 false，runner 上报暂停后 true —— 重连/刷新据此恢复按钮。
+#[tokio::test]
+async fn test_session_snapshot_reports_paused_state() {
+    let app = TestApp::new().await;
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["paused"], false, "无 run 时暂停态为 false");
+
+    let _registration = app.state.peco_runs.try_register(&app.user_id).unwrap();
+    app.state.peco_runs.set_paused(&app.user_id, true);
+
+    let body: serde_json::Value = app
+        .get("/api/peco/session")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["paused"], true, "runner 上报暂停后快照回 true");
+}
+
 #[tokio::test]
 async fn test_registered_run_lifecycle_via_endpoints() {
     let app = TestApp::new().await;
