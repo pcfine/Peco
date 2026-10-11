@@ -662,9 +662,11 @@ export function ChatView({
     if (effectivePaused || !isStreaming) setPausePending(false);
   }, [effectivePaused, isStreaming]);
 
-  // 暂态期间再点一次 = 撤回尚未落地的暂停
+  // 暂态期间再点一次 = 撤回尚未落地的暂停；撤回后清本地暂态，
+  // 否则该轮内按钮会一直停在暂态、无法再次发起暂停
   const handlePause = useCallback(() => {
     if (pausePending || effectivePaused) {
+      setPausePending(false);
       onResume?.();
     } else {
       setPausePending(true);

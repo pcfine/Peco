@@ -147,7 +147,7 @@ describe("ChatView external 模式暂停/恢复入口", () => {
     expect(pendingBtn()).toBeNull();
   });
 
-  it("暂态期间再点一次撤回待办，触发 onResume", async () => {
+  it("暂态期间再点一次撤回待办：触发 onResume 并复位，可再次暂停", async () => {
     const pause = onPause();
     const resume = onResume();
     await render({
@@ -165,6 +165,18 @@ describe("ChatView external 模式暂停/恢复入口", () => {
     });
     expect(pause).toHaveBeenCalledTimes(1);
     expect(resume).toHaveBeenCalledTimes(1);
+
+    // 撤回后必须回到「暂停」入口，而不是卡在暂态（服务端从不挂起 →
+    // useEffect 的两条清除路径都不触发）
+    expect(pauseBtn()).not.toBeNull();
+    expect(pendingBtn()).toBeNull();
+
+    // 且能在本轮内再次发起暂停
+    await act(async () => {
+      (pauseBtn() as HTMLButtonElement).click();
+    });
+    expect(pause).toHaveBeenCalledTimes(2);
+    expect(pendingBtn()).not.toBeNull();
   });
 
   it("isStreaming 转 false 时清除待生效暂态", async () => {
