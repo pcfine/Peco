@@ -113,6 +113,33 @@ export async function cancelPecoStream(): Promise<{
   return resp.data;
 }
 
+/**
+ * 请求暂停当前用户进行中的 ReAct 轮（无在途轮次时服务端返回 409）。
+ *
+ * 暂停在步进边界才生效，本调用只表示「请求已收到」；实际暂停态以 SSE
+ * `looper_state` 事件为准，调用方不得据返回值乐观置位。
+ */
+export async function pausePecoStream(): Promise<{
+  success: boolean;
+  message?: string;
+}> {
+  const resp = await api.post<{ success: boolean; message?: string }>(
+    `${PATH}/stream/pause`,
+  );
+  return resp.data;
+}
+
+/** 恢复被暂停的 ReAct 轮（无在途轮次时服务端返回 409）。 */
+export async function resumePecoStream(): Promise<{
+  success: boolean;
+  message?: string;
+}> {
+  const resp = await api.post<{ success: boolean; message?: string }>(
+    `${PATH}/stream/resume`,
+  );
+  return resp.data;
+}
+
 // ── 记忆自动整理（consolidation）────────────────────────────────────────────
 
 /** `GET/PUT /memory/consolidation/optin` 响应：用户级 opt-in 意愿。 */

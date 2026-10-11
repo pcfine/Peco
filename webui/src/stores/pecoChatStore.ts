@@ -3,6 +3,8 @@ import {
   getPecoSession,
   clearPecoSession,
   cancelPecoStream,
+  pausePecoStream,
+  resumePecoStream,
   pecoStreamUrl,
   pecoAttachUrl,
   queryPecoStream,
@@ -155,7 +157,7 @@ async function readStream(
     // 已被替换或关闭：不碰新连接的状态
     if (conn?.gen !== gen) return;
     conn = null;
-    set({ isStreaming: false });
+    set({ isStreaming: false, paused: false });
 
     // 未收到 done 的收尾属意外断流（服务端重启 / 网络抖动）→ 一次性重附着，
     // 由快照决定是接上在途轮次还是只重建历史。
@@ -368,6 +370,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   messages: [],
   sessionKey: 0,
   isStreaming: false,
+  paused: false,
   error: null,
   usage: null,
   oldestLoadedTurn: null,
@@ -421,6 +424,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       messages: [],
       loaded: false,
       isStreaming: false,
+      paused: false,
       usage: null,
       sessionKey: s.sessionKey + 1,
       oldestLoadedTurn: null,
@@ -568,7 +572,21 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     // 若在此期间用户已开始下一轮，它会把新一轮的门控关掉。事件不带
     // 轮次标识，无法区分归属，断连是唯一干净的取舍（与取消前语义一致）。
     closeStream();
-    set({ isStreaming: false });
+    set({ isStreaming: false, paused: false });
+  },
+
+  // ── pause / resume ───────────────────────────────────────────────────
+  //
+  // 与 abortStream 的差别：不断连、不动 isStreaming —— 暂停不等于取消，
+  // 轮次仍在途，只等 looper 在步进边界停步。fire-and-forget：暂停/恢复的
+  // 权威状态经 SSE `looper_state` 回填（applyStreamEvent），此处不乐观置位。
+
+  pause: () => {
+    void pausePecoStream().catch(() => {});
+  },
+
+  resume: () => {
+    void resumePecoStream().catch(() => {});
   },
 
   clearError: () => {
@@ -605,6 +623,11 @@ function applyStreamEvent(
   // 追加进本窗口最后一条已完成的 assistant 气泡，或污染下一轮。
   if (!get().isStreaming) return;
 
+  // `looper_state` 是跨 Paused 的唯一权威来源，同受上面门控：无在途轮次时
+  // 暂停入口本就不显示，据它置位只会留下残留。
+  const pausedUpdate =
+    event.event === "looper_state" ? { paused: event.data.paused } : {};
+
   const newMessages = reduceStreamEvent(event, get().messages);
 
   // 捕获 ModelUsage 事件驱动用量圆环。仅 `usage` 事件携带「当前上下文
@@ -621,13 +644,19 @@ function applyStreamEvent(
   // Eagerly clear isStreaming on terminal events so the UI flips from
   // stop→send button immediately.
   if (isStreamTerminalEvent(event)) {
+    // 终态即本轮收尾 —— 暂停态随之复位，避免「恢复」按钮残留。
     set({
       messages: newMessages,
       isStreaming: false,
+      paused: false,
       ...(usage ? { usage } : {}),
     });
   } else {
-    set({ messages: newMessages, ...(usage ? { usage } : {}) });
+    set({
+      messages: newMessages,
+      ...pausedUpdate,
+      ...(usage ? { usage } : {}),
+    });
   }
 }
 
@@ -640,6 +669,9 @@ interface PecoChatState {
   // Streaming state — managed by the store so it survives route navigation.
   // 语义是「本窗口领有一个在途轮次」，同时充当增量门控；不是「连接存在」。
   isStreaming: boolean;
+
+  /** 在途轮次是否被暂停（由 SSE `looper_state` 事件驱动，权威状态）。 */
+  paused: boolean;
 
   // Last error message from the streaming request (null when no error).
   error: string | null;
@@ -676,6 +708,12 @@ interface PecoChatState {
 
   /** Abort the currently running SSE stream (server-side cancel + local). */
   abortStream: () => void;
+
+  /** 请求暂停在途轮次（不停连接、不改 isStreaming，状态经 SSE 回填）。 */
+  pause: () => void;
+
+  /** 请求恢复被暂停的在途轮次（语义同 `pause`）。 */
+  resume: () => void;
 
   /** Clear the error state (call after displaying to user). */
   clearError: () => void;

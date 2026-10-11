@@ -15,12 +15,15 @@ export function PecoChatPage() {
   const loaded = usePecoChatStore((s) => s.loaded);
   const sessionKey = usePecoChatStore((s) => s.sessionKey);
   const isStreaming = usePecoChatStore((s) => s.isStreaming);
+  const paused = usePecoChatStore((s) => s.paused);
   const usage = usePecoChatStore((s) => s.usage);
   const load = usePecoChatStore((s) => s.load);
   const refresh = usePecoChatStore((s) => s.refresh);
   const clear = usePecoChatStore((s) => s.clear);
   const sendMessage = usePecoChatStore((s) => s.sendMessage);
   const abortStream = usePecoChatStore((s) => s.abortStream);
+  const pause = usePecoChatStore((s) => s.pause);
+  const resume = usePecoChatStore((s) => s.resume);
   const error = usePecoChatStore((s) => s.error);
   const clearError = usePecoChatStore((s) => s.clearError);
   const hasMore = usePecoChatStore((s) => s.hasMore);
@@ -99,6 +102,9 @@ export function PecoChatPage() {
       onExternalStop={abortStream}
       externalIsStreaming={isStreaming}
       externalUsage={usage}
+      externalPaused={paused}
+      onPause={pause}
+      onResume={resume}
       onLoadEarlier={loadEarlier}
       hasMore={hasMore}
       loadingEarlier={loadingEarlier}

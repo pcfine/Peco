@@ -17,11 +17,19 @@ vi.mock("@/api/peco", () => ({
   pecoAttachUrl: () => "/api/peco/stream",
   queryPecoStream: vi.fn(async () => undefined),
   cancelPecoStream: vi.fn(async () => ({ success: true })),
+  pausePecoStream: vi.fn(async () => ({ success: true })),
+  resumePecoStream: vi.fn(async () => ({ success: true })),
   clearPecoSession: vi.fn(async () => ({ success: true })),
   getPecoSession: vi.fn(),
 }));
 
-import { getPecoSession, cancelPecoStream, queryPecoStream } from "@/api/peco";
+import {
+  getPecoSession,
+  cancelPecoStream,
+  queryPecoStream,
+  pausePecoStream,
+  resumePecoStream,
+} from "@/api/peco";
 
 function frame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -102,6 +110,7 @@ const resetStore = () => {
     messages: [],
     sessionKey: 0,
     isStreaming: false,
+    paused: false,
     error: null,
     usage: null,
     oldestLoadedTurn: null,
@@ -207,16 +216,14 @@ describe("pecoChatStore 常驻连接", () => {
   it("带图消息开新流并在 URL 携带 image_ids（不经 POST 控制通道）", async () => {
     global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
 
-    await usePecoChatStore
-      .getState()
-      .sendMessage("看这张图", "test-token", [
-        {
-          id: "a.png",
-          kind: "image",
-          name: "a.png",
-          url: "/uploads/chat/u/a.png",
-        },
-      ]);
+    await usePecoChatStore.getState().sendMessage("看这张图", "test-token", [
+      {
+        id: "a.png",
+        kind: "image",
+        name: "a.png",
+        url: "/uploads/chat/u/a.png",
+      },
+    ]);
 
     // 图片无法经控制通道投递 —— 不得走 POST 复用路径
     expect(queryPecoStream).not.toHaveBeenCalled();
@@ -243,16 +250,14 @@ describe("pecoChatStore 常驻连接", () => {
     expect(streamCalls()).toHaveLength(1);
 
     global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
-    await usePecoChatStore
-      .getState()
-      .sendMessage("看图", "test-token", [
-        {
-          id: "b.png",
-          kind: "image",
-          name: "b.png",
-          url: "/uploads/chat/u/b.png",
-        },
-      ]);
+    await usePecoChatStore.getState().sendMessage("看图", "test-token", [
+      {
+        id: "b.png",
+        kind: "image",
+        name: "b.png",
+        url: "/uploads/chat/u/b.png",
+      },
+    ]);
 
     expect(queryPecoStream).not.toHaveBeenCalled();
     expect(streamCalls()).toHaveLength(1);
@@ -936,5 +941,91 @@ describe("pecoChatStore 分页", () => {
     const state = usePecoChatStore.getState();
     expect(state.oldestLoadedTurn).toBe(0);
     expect(state.hasMore).toBe(false);
+  });
+});
+
+describe("pecoChatStore 暂停/恢复", () => {
+  it("looper_state 事件置位/复位 paused，终态事件复位", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+
+    await usePecoChatStore.getState().sendMessage("问", "test-token");
+    expect(usePecoChatStore.getState().paused).toBe(false);
+
+    // 服务端在步进边界进入 Paused → 事件回填
+    s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().paused).toBe(true),
+    );
+
+    // 恢复
+    s.push(frame("looper_state", { paused: false, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().paused).toBe(false),
+    );
+
+    // 暂停后再收尾：终态事件必须复位 paused，避免「恢复」按钮残留
+    s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().paused).toBe(true),
+    );
+    s.push(turnCompleteFrame("答"));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().isStreaming).toBe(false),
+    );
+    expect(usePecoChatStore.getState().paused).toBe(false);
+  });
+
+  it("非流式时 looper_state 不改 paused（门控与增量一致）", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+
+    await usePecoChatStore.getState().sendMessage("问", "test-token");
+    s.push(turnCompleteFrame("答"));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().isStreaming).toBe(false),
+    );
+
+    // 其他窗口的 run 状态事件：本窗口无在途轮次，不得置位
+    s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(usePecoChatStore.getState().paused).toBe(false);
+  });
+
+  it("pause()/resume() 调对应 API 且不断连、不改 isStreaming", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+
+    await usePecoChatStore.getState().sendMessage("问", "test-token");
+    expect(usePecoChatStore.getState().isStreaming).toBe(true);
+
+    usePecoChatStore.getState().pause();
+    expect(pausePecoStream).toHaveBeenCalledTimes(1);
+    // 暂停不等于取消：连接与在途态保持
+    expect(cancelPecoStream).not.toHaveBeenCalled();
+    expect(usePecoChatStore.getState().isStreaming).toBe(true);
+    expect(streamCalls()[0].init?.signal?.aborted).toBe(false);
+    // 不乐观置位 —— 只认 SSE 事件
+    expect(usePecoChatStore.getState().paused).toBe(false);
+
+    usePecoChatStore.getState().resume();
+    expect(resumePecoStream).toHaveBeenCalledTimes(1);
+    expect(usePecoChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it("服务端拒绝（409）时静默，不影响在途态", async () => {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+
+    await usePecoChatStore.getState().sendMessage("问", "test-token");
+    vi.mocked(pausePecoStream).mockRejectedValueOnce({
+      response: { status: 409 },
+    });
+
+    usePecoChatStore.getState().pause();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(usePecoChatStore.getState().isStreaming).toBe(true);
+    expect(usePecoChatStore.getState().paused).toBe(false);
+    expect(usePecoChatStore.getState().error).toBeNull();
   });
 });

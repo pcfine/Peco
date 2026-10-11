@@ -21,7 +21,15 @@ import type {
   TurnData,
   UsageData,
 } from "@/types/chat";
-import { Send, Square, Paperclip, X, FileText, Pause, Play } from "lucide-react";
+import {
+  Send,
+  Square,
+  Paperclip,
+  X,
+  FileText,
+  Pause,
+  Play,
+} from "lucide-react";
 import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
@@ -159,6 +167,10 @@ export interface ChatViewProps {
   externalIsStreaming?: boolean;
   /** [mode="external"] 外部提供的当前 token 用量（驱动底部用量圆环）。 */
   externalUsage?: UsageData | null;
+  /** [mode="external"] 外部提供的暂停态 —— external 模式下 SSE 由 store 管理，
+   *  本地循环收不到 `looper_state`，故以本 prop 为权威值。缺省按 false 处理；
+   *  internal 模式忽略本 prop。 */
+  externalPaused?: boolean;
   /**
    * [可选] 暂停当前运行中的 looper。与 `onResume` **同时提供**时才出现入口，
    * 且只在流式进行中展示（`ExternalIsStreaming ?? streaming`）。
@@ -199,6 +211,7 @@ export function ChatView({
   onExternalStop,
   externalIsStreaming,
   externalUsage = null,
+  externalPaused = false,
   onPause,
   onResume,
   onLoadEarlier,
@@ -217,7 +230,7 @@ export function ChatView({
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
-  /** looper 是否处于 Paused（由 SSE `looper_state` 事件驱动，权威状态） */
+  /** internal 模式的暂停态（由本地 SSE `looper_state` 事件驱动） */
   const [paused, setPaused] = useState(false);
   const [usage, setUsage] = useState<UsageData | null>(null);
   /** 已上传待发送的附件（图片 + 文档） */
@@ -636,6 +649,9 @@ export function ChatView({
       : "image/png,image/jpeg,image/gif,image/webp");
 
   const isStreaming = externalIsStreaming ?? streaming;
+  // external 模式的 SSE 由 store 管理，本地循环收不到 `looper_state`，
+  // 故以父组件传入的 externalPaused 为权威；internal 模式仍认本地事件。
+  const effectivePaused = isExternalMode ? externalPaused : paused;
   const isInputDisabled = isStreaming || !visible;
 
   // ── Render ──────────────────────────────────────────────────────────────
@@ -800,17 +816,19 @@ export function ChatView({
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={paused ? onResume : onPause}
-                      aria-label={paused ? "恢复" : "暂停"}
+                      onClick={effectivePaused ? onResume : onPause}
+                      aria-label={effectivePaused ? "恢复" : "暂停"}
                     >
-                      {paused ? (
+                      {effectivePaused ? (
                         <Play className="h-4 w-4" />
                       ) : (
                         <Pause className="h-4 w-4" />
                       )}
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>{paused ? "恢复" : "暂停"}</TooltipContent>
+                  <TooltipContent>
+                    {effectivePaused ? "恢复" : "暂停"}
+                  </TooltipContent>
                 </Tooltip>
               )}
               {isStreaming ? (
