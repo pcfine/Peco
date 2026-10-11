@@ -1698,8 +1698,8 @@ impl AgentLooper {
 
     /// 把在途模型调用收尾时记下的暂停请求落地。
     ///
-    /// 只在流成功收敛后调用。两条重发早退（截断 / 流被掐断）刻意不落地，待办保留
-    /// 等重试那次调用收尾；终局失败则由 [`Self::finalize_failure`] 丢弃待办。
+    /// 只在流成功收敛后调用。重发早退（请求失败、流中断、截断）刻意不落地，
+    /// 待办留到重发收尾；终局失败则由 [`Self::finalize_failure`] 丢弃待办。
     fn apply_deferred_pause(&mut self) {
         if !self.pause_pending || matches!(self.outer_state, OuterState::Paused) {
             return;
@@ -2172,8 +2172,8 @@ impl AgentLooper {
     /// 新一轮对话开始时重置「本用户轮」的运行时状态。
     ///
     /// `react_loop_iteration`、`retries_used`、`budget_raised`、
-    /// `retry_deadline` 与 `dynamic_context_resolved` 的生命周期都恰好是
-    /// 一个用户轮 —— 抽成方法就是为了让这条不变量无法被单独违反。
+    /// `retry_deadline`、`dynamic_context_resolved` 与 `pause_pending` 的
+    /// 生命周期都恰好是一个用户轮 —— 抽成方法就是为了让这条不变量无法被单独违反。
     /// `budget_raised` 尤其不能跨轮：粘性一旦泄漏，下一轮的截断重试会
     /// 被第 4 条判据误拦（生效预算看似已抬过）。
     fn reset_iteration_counters(&mut self) {
