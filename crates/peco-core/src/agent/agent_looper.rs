@@ -5504,6 +5504,17 @@ mod tests {
         }
     }
 
+    fn tool_call_end(call_id: &str, name: &str, arguments: &str) -> StreamChunk {
+        StreamChunk::BlockEnd {
+            index: 1,
+            block: ContentBlock::ToolCall {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
     fn stream_usage() -> StreamChunk {
         StreamChunk::Usage {
             usage: Usage {
@@ -5598,7 +5609,7 @@ mod tests {
     }
 
     /// 流式在途收到 Pause：不立即挂起，本次模型调用收尾才进入 Paused；
-    /// Resume 之后才提交并完成本轮。去掉 Streaming 特判本测试必红。
+    /// Resume 之后才提交并完成本轮。
     #[tokio::test]
     async fn test_pause_during_stream_defers_to_call_boundary() {
         let (h, mut senders) = spawn_controllable_looper();
@@ -5658,7 +5669,6 @@ mod tests {
     }
 
     /// 流结束前 Resume 撤回待办：事件流里从不出现 to=Paused，本轮照常完成。
-    /// 去掉 Resume 里清 `pause_pending` 那两行本测试必红。
     #[tokio::test]
     async fn test_resume_before_stream_end_retracts_pending_pause() {
         let (h, mut senders) = spawn_controllable_looper();
@@ -5732,6 +5742,140 @@ mod tests {
         assert!(!h.looper.pause_pending, "Resume 必须撤回待办暂停");
         assert!(matches!(h.looper.outer_state, OuterState::RunningInnerLoop));
         assert!(!h.looper.pause_flag.load(Ordering::Acquire));
+    }
+
+    /// 暂停的落地早于工具执行：收尾（内含工具调用）后先挂起，resume 才启动工具。
+    #[tokio::test]
+    async fn test_deferred_pause_lands_before_tool_execution() {
+        let (h, mut senders) = spawn_controllable_looper();
+        h.send_query("q".into()).await.expect("looper alive");
+        let tx = senders
+            .recv()
+            .await
+            .expect("provider should start a stream");
+
+        tx.send(Ok(text_start())).unwrap();
+        tx.send(Ok(text_delta("hel"))).unwrap();
+
+        let mut events = Vec::new();
+        drain_until_text_delta(&h, &mut events, "hel").await;
+
+        h.pause().await.expect("looper alive");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        tx.send(Ok(text_delta("lo"))).unwrap();
+        tx.send(Ok(text_end("hello"))).unwrap();
+        tx.send(Ok(tool_call_end("call-1", "unknown_tool", "{}")))
+            .unwrap();
+        tx.send(Ok(stream_usage())).unwrap();
+        tx.send(Ok(stream_finish())).unwrap();
+
+        let paused_idx = drain_until_paused(&h, &mut events).await;
+        assert!(
+            !events[..=paused_idx]
+                .iter()
+                .any(|e| matches!(e, LooperEvent::ToolCallStart { .. })),
+            "暂停落地前不得启动工具"
+        );
+
+        h.resume().await.expect("looper alive");
+
+        // resume 之后才启动工具
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match h.recv_event().await {
+                    Some(e) => {
+                        let hit = matches!(e, LooperEvent::ToolCallStart { .. });
+                        events.push(e);
+                        if hit {
+                            break;
+                        }
+                    }
+                    None => panic!("event channel closed before ToolCallStart"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for ToolCallStart");
+
+        // 工具执行后本轮会再发起一次模型调用：喂一个能收尾的流，避免悬挂
+        let tx2 = senders
+            .recv()
+            .await
+            .expect("provider should start a follow-up stream");
+        tx2.send(Ok(text_start())).unwrap();
+        tx2.send(Ok(text_delta("done"))).unwrap();
+        tx2.send(Ok(text_end("done"))).unwrap();
+        tx2.send(Ok(stream_usage())).unwrap();
+        tx2.send(Ok(stream_finish())).unwrap();
+
+        match drain_until_turn_complete(&h, &mut events).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "done"),
+            other => panic!("工具轮收尾后应正常完成，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
+    }
+
+    /// 待办暂停跨重试保留：首次瞬时失败不落地，重试那次调用收尾才落地。
+    #[tokio::test]
+    async fn test_deferred_pause_survives_transient_retry() {
+        let (h, mut senders) = spawn_controllable_looper();
+        h.send_query("q".into()).await.expect("looper alive");
+        let tx = senders
+            .recv()
+            .await
+            .expect("provider should start a stream");
+
+        tx.send(Ok(text_start())).unwrap();
+        tx.send(Ok(text_delta("hel"))).unwrap();
+
+        let mut events = Vec::new();
+        drain_until_text_delta(&h, &mut events, "hel").await;
+
+        h.pause().await.expect("looper alive");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        tx.send(Err(model_provider::ProviderError::Stream(
+            "transient blip".into(),
+        )))
+        .unwrap();
+
+        // 退避后重发：拿到重试那次调用的流
+        let tx2 = tokio::time::timeout(Duration::from_secs(5), senders.recv())
+            .await
+            .expect("timed out waiting for the retry stream")
+            .expect("provider should start a retry stream");
+
+        events.extend(h.drain_events());
+        assert!(
+            !events.iter().any(is_paused_event),
+            "首次失败（重发早退）时不得落地待办暂停"
+        );
+
+        tx2.send(Ok(text_start())).unwrap();
+        tx2.send(Ok(text_delta("hello"))).unwrap();
+        tx2.send(Ok(text_end("hello"))).unwrap();
+        tx2.send(Ok(stream_usage())).unwrap();
+        tx2.send(Ok(stream_finish())).unwrap();
+
+        let paused_idx = drain_until_paused(&h, &mut events).await;
+        let last_text_idx = events
+            .iter()
+            .rposition(|e| matches!(e, LooperEvent::TextDelta { .. }))
+            .expect("there should be TextDelta events");
+        assert!(
+            paused_idx > last_text_idx,
+            "to=Paused 必须晚于重试调用的最后一个 TextDelta"
+        );
+
+        h.resume().await.expect("looper alive");
+        match drain_until_turn_complete(&h, &mut events).await {
+            TurnOutcome::Success { text } => assert_eq!(text, "hello"),
+            other => panic!("重试收尾恢复后应正常完成，实际 {other:?}"),
+        }
+
+        h.shutdown().await.expect("clean shutdown");
     }
 
     #[tokio::test]
