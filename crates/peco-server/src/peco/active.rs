@@ -34,9 +34,10 @@ pub enum ControlCommand {
     Query(Content),
     /// 取消在途轮次（looper 在下个检查点收尾并退出）。
     Cancel,
-    /// 请求暂停：looper 进入 `Paused`；流式在途时延迟到本次模型调用收尾生效。
+    /// 请求暂停：looper 在边界检查点落地暂停（请求发出前 / 工具执行前）；
+    /// 流式在途时延迟到本次模型调用收尾。
     Pause,
-    /// 请求恢复：looper 离开 `Paused`，回到暂停前的外层状态。
+    /// 请求恢复：looper 离开暂停态，单次迁移到变体编码的恢复位置。
     Resume,
 }
 
@@ -62,11 +63,11 @@ struct ActiveEntry {
     reclaim_notify: Arc<Notify>,
     /// 是否有轮次在途（区别于「run 已注册」）。
     ///
-    /// 由 runner 在 `OuterStateChange` 时更新，读侧无需取锁。
+    /// 由 runner 在 `StateChange` 时更新，读侧无需取锁。
     turn_in_flight: Arc<AtomicBool>,
     /// 在途轮的用户输入文本。
     ///
-    /// 由 runner 在 `TurnStart` 时上报、`OuterStateChange → Idle` 时清空 ——
+    /// 由 runner 在 `TurnStart` 时上报、`StateChange → Idle` 时清空 ——
     /// 与 `turn_in_flight` 同寿命。快照端点据此让「整页刷新」后仍能显示刚发出、
     /// 尚未落盘的那句 query（快照只含 committed_turns，不含在途轮）。
     inflight_input: Option<String>,
@@ -202,8 +203,8 @@ impl PecoActiveRuns {
 
     /// 请求暂停活跃 run 的在途轮次；无 run / 无在途轮次返回 false。
     ///
-    /// `true` 只表示控制命令已投递 —— 暂停在步进边界（流式在途时为本次模型
-    /// 调用收尾）才生效，实际状态经 SSE `looper_state` 下发给前端。
+    /// `true` 只表示控制命令已投递 —— 暂停在边界检查点（请求发出前 / 工具
+    /// 执行前）才生效，实际状态经 SSE `looper_state` 下发给前端。
     pub fn pause(&self, user_id: &str) -> bool {
         self.send_control(user_id, ControlCommand::Pause)
     }
@@ -300,7 +301,7 @@ impl PecoActiveRuns {
             .is_some_and(|entry| entry.turn_in_flight.load(Ordering::Relaxed))
     }
 
-    /// 由 runner 在 `OuterStateChange` 时上报轮次在途状态；无 run 时为 no-op。
+    /// 由 runner 在 `StateChange` 时上报轮次在途状态；无 run 时为 no-op。
     pub fn set_turn_in_flight(&self, user_id: &str, in_flight: bool) {
         let map = self.inner.lock().unwrap();
         if let Some(entry) = map.get(user_id) {
@@ -337,7 +338,7 @@ impl PecoActiveRuns {
             .is_some_and(|entry| entry.paused.load(Ordering::Relaxed))
     }
 
-    /// 由 runner 在 `OuterStateChange` 时上报暂停态；无 run 时为 no-op。
+    /// 由 runner 在 `StateChange` 时上报暂停态；无 run 时为 no-op。
     pub fn set_paused(&self, user_id: &str, paused: bool) {
         let map = self.inner.lock().unwrap();
         if let Some(entry) = map.get(user_id) {

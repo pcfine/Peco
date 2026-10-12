@@ -19,7 +19,7 @@ WorkSpace（用户隔离核心）
 
 ```
 外部代码 → AgentExecutor ─┬─→ AgentLooper （多轮，完整事件系统 + streaming + hook + session）
-                          │     └─ 双层状态机：OuterState（用户交互）+ ReActState（推理-执行）
+                          │     └─ 单一状态机 LooperState（空闲/推理-执行/暂停收敛为一个权威枚举）
                           └─→ SimpleAgentLooper （单轮，batch-only，无 streaming/hook/session）
                                 └─ 轻量 ReAct 循环，专用于子 Agent 一次性任务
 ```
@@ -127,15 +127,15 @@ agent.md
 | `AgentLooper` | [agent_looper.rs](src/agent/agent_looper.rs) | 多轮对话、交互式 REPL | ✅ | ✅ | ✅ | ✅ |
 | `SimpleAgentLooper` | [simple_looper.rs](src/agent/simple_looper.rs) | 子 Agent 一次性任务 | ❌ | ❌ | ❌ | ❌ |
 
-[`AgentLooper`](src/agent/agent_looper.rs) 实现双层状态机驱动的 ReAct 循环（外层用户交互 + 内层推理-执行），是驱动多轮 Agent 的主引擎：
+[`AgentLooper`](src/agent/agent_looper.rs) 由单一权威状态机 `LooperState` 驱动 ReAct 循环，是驱动多轮 Agent 的主引擎：
 
 ```
-外层: Idle ↔ Paused / RunningInnerLoop
-               │
-内层: PreparingRequest ──→ [batch] AwaitingModel → ResolvingResponse
-                      ──→ [stream] Streaming
-                      ──→ ExecutingTools ──→ (循环回 PreparingRequest)
-                      ──→ Done / Failed
+Idle ──→ PreparingRequest ──→ [batch] ResolvingResponse
+                           ──→ [stream] Streaming
+                           ──→ ExecutingTools ──→ (循环回 PreparingRequest)
+                           ──→ Done / Failed ──→ Idle
+任意非暂停态 ──(Pause 落地点 A/B)──→ PausedBeforeRequest / PausedDuringTools
+Paused* ──(Resume)──→ 恢复被打断的运行位
 ```
 
 外部不直接操作，而是通过 [`AgentExecutor`](src/executor/mod.rs) 外观层使用。
@@ -451,7 +451,7 @@ src/
 ├── agent/
 │   ├── agent.rs            # Agent 组装（from_file → ModelProvider + ToolExecutor + McpManager）
 │   ├── agent_config.rs     # AgentProfile、ModelConfig、agent.md YAML + Markdown 解析/序列化
-│   ├── agent_looper.rs     # 双层状态机 ReAct 循环（AgentLooper + LooperHandle + LooperEvent）
+│   ├── agent_looper.rs     # 单状态机 ReAct 循环（LooperState + AgentLooper + LooperHandle + LooperEvent）
 │   ├── context.rs          # 上下文构建策略（FullHistory / SlidingWindow）
 │   ├── dynamic_context.rs  # DynamicContext trait — 根据 query 动态注入上下文
 │   ├── hooks.rs            # LooperHook trait + 内置 hook（TokenBudgetHook、ToolAllowlistHook）

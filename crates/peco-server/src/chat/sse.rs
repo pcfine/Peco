@@ -5,8 +5,7 @@
 use axum::response::sse::Event;
 use model_provider::Usage;
 use peco_core::agent::{
-    LooperEvent, OuterState, RetryNoticeReason, TurnFailureReason, TurnOutcome,
-    strip_summary_wrapper,
+    LooperEvent, RetryNoticeReason, TurnFailureReason, TurnOutcome, strip_summary_wrapper,
 };
 use serde::Serialize;
 
@@ -150,10 +149,10 @@ pub enum ChatSseEvent {
         conversation_id: String,
     },
 
-    /// looper 外层暂停状态变化（进入或离开 `Paused`）。
+    /// looper 暂停状态变化（进入或离开暂停态）。
     ///
-    /// 前端据此在「暂停 / 恢复」按钮间切换：暂停在下一个步进边界（流式在途时
-    /// 为本次模型调用收尾）才生效，可能迟于请求返回，故这条事件是唯一的权威状态来源。
+    /// 前端据此在「暂停 / 恢复」按钮间切换：暂停在边界检查点（请求发出前 /
+    /// 工具执行前）才生效，可能迟于请求返回，故这条事件是唯一的权威状态来源。
     #[serde(rename = "looper_state")]
     LooperState {
         paused: bool,
@@ -470,12 +469,12 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
-        // looper 外层状态**跨越** `Paused` —— 暂停/恢复的唯一权威来源。
+        // looper 状态**跨越** 暂停态 —— 暂停/恢复的唯一权威来源。
         //
-        // 只下发跨越 Paused 的转换；Idle↔RunningInnerLoop 等正常轮转不下发。
-        LooperEvent::OuterStateChange { from, to } => {
-            let was_paused = matches!(from, OuterState::Paused);
-            let now_paused = matches!(to, OuterState::Paused);
+        // 只下发跨越暂停态的转换；Idle↔运行位等正常轮转不下发。
+        LooperEvent::StateChange { from, to } => {
+            let was_paused = from.is_paused();
+            let now_paused = to.is_paused();
             if was_paused == now_paused {
                 None
             } else {
@@ -487,16 +486,14 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
         }
 
         // 以下事件不产生面向客户端的 SSE 事件
-        LooperEvent::ToolCallDelta { .. }
-        | LooperEvent::ReactStateChange { .. }
-        | LooperEvent::TurnStart { .. }
-        | _ => None,
+        LooperEvent::ToolCallDelta { .. } | LooperEvent::TurnStart { .. } | _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peco_core::agent::LooperState;
 
     #[test]
     fn success_outcome_maps_to_turn_complete() {
@@ -745,9 +742,9 @@ mod tests {
     #[test]
     fn pause_transition_maps_to_looper_state() {
         let event = map_looper_event(
-            LooperEvent::OuterStateChange {
-                from: OuterState::RunningInnerLoop,
-                to: OuterState::Paused,
+            LooperEvent::StateChange {
+                from: LooperState::Streaming,
+                to: LooperState::PausedDuringTools,
             },
             "conv-1",
         );
@@ -756,7 +753,7 @@ mod tests {
             conversation_id,
         }) = event
         else {
-            panic!("进入 Paused 必须映射为 LooperState，实际 {event:?}");
+            panic!("进入暂停态必须映射为 LooperState，实际 {event:?}");
         };
         assert!(paused);
         assert_eq!(conversation_id, "conv-1");
@@ -765,27 +762,27 @@ mod tests {
     #[test]
     fn resume_transition_maps_to_looper_state() {
         let event = map_looper_event(
-            LooperEvent::OuterStateChange {
-                from: OuterState::Paused,
-                to: OuterState::RunningInnerLoop,
+            LooperEvent::StateChange {
+                from: LooperState::PausedBeforeRequest,
+                to: LooperState::PreparingRequest,
             },
             "conv-1",
         );
         let Some(ChatSseEvent::LooperState { paused, .. }) = event else {
-            panic!("离开 Paused 必须映射为 LooperState，实际 {event:?}");
+            panic!("离开暂停态必须映射为 LooperState，实际 {event:?}");
         };
         assert!(!paused);
     }
 
     #[test]
-    fn non_pause_outer_transition_is_not_forwarded() {
+    fn non_pause_transition_is_not_forwarded() {
         let event = map_looper_event(
-            LooperEvent::OuterStateChange {
-                from: OuterState::Idle,
-                to: OuterState::RunningInnerLoop,
+            LooperEvent::StateChange {
+                from: LooperState::Idle,
+                to: LooperState::PreparingRequest,
             },
             "conv-1",
         );
-        assert!(event.is_none(), "未跨越 Paused 的外层转换不下发");
+        assert!(event.is_none(), "未跨越暂停态的转换不下发");
     }
 }

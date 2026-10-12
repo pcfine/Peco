@@ -1,7 +1,7 @@
 // ChatView 暂停/恢复入口 —— 只在流式进行中、且父组件提供回调时出现
 //
 // 回归重点：① 入口受「运行中 + 回调齐备」双重门控；② 暂停态只认服务端
-// `looper_state` 事件（POST 的 200 不代表已暂停，步进边界才生效），故按钮
+// `looper_state` 事件（POST 的 200 不代表已暂停，边界检查点落地才生效），故按钮
 // 在事件到达前保持「暂停」、到达后才切「恢复」。
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -140,7 +140,7 @@ describe("ChatView 暂停/恢复入口", () => {
     await render({ initialQuery: "你好", onPause, onResume });
     await vi.waitFor(() => expect(pauseBtn()).not.toBeNull());
 
-    // 事件到达前：仍是「暂停」（步进边界未到）
+    // 事件到达前：仍是「暂停」（暂停尚未落地）
     await act(async () => {
       s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
     });

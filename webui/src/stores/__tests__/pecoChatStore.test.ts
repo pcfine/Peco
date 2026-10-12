@@ -956,7 +956,7 @@ describe("pecoChatStore 暂停/恢复", () => {
     await usePecoChatStore.getState().sendMessage("问", "test-token");
     expect(usePecoChatStore.getState().paused).toBe(false);
 
-    // 服务端在步进边界进入 Paused → 事件回填
+    // 服务端在边界检查点落地暂停 → 事件回填
     s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
     await vi.waitFor(() =>
       expect(usePecoChatStore.getState().paused).toBe(true),

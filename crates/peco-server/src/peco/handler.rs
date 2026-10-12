@@ -47,7 +47,9 @@ use axum::routing::{get, post, put};
 use axum_extra::extract::Multipart;
 use futures::stream::Stream;
 use model_provider::{Content, ContentPart, InputItem};
-use peco_core::agent::{AgentLooper, LooperEvent, LooperHandle, OuterState, strip_summary_wrapper};
+use peco_core::agent::{
+    AgentLooper, LooperEvent, LooperHandle, LooperState, strip_summary_wrapper,
+};
 use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::{Session, SessionSnapshot};
@@ -487,7 +489,7 @@ pub(crate) async fn spawn_peco_run(
 /// runner 任务：独占 LooperHandle，驱动 looper 并向订阅者广播事件。
 ///
 /// 三路 select：
-/// - looper 事件 → 广播；`Shutdown` 结束；`OuterStateChange → Idle` 且无订阅者
+/// - looper 事件 → 广播；`Shutdown` 结束；`StateChange → Idle` 且无订阅者
 ///   → 回收退出
 /// - 控制命令 → `Query` 排队消息 / `Cancel` 取消在途轮次（不 break，继续转发
 ///   收尾事件让附着端看到 error）
@@ -498,7 +500,7 @@ pub(crate) async fn spawn_peco_run(
 /// 条 query。
 ///
 /// `to=Idle` 的回收窗口在续接轮之间也存在（一轮 Done 后先发 `Idle`，下一轮才由
-/// looper 发出 `Idle→RunningInnerLoop`）：无订阅者时会把本该续接的排队轮一并回收 ——
+/// looper 发出 `Idle→PreparingRequest`）：无订阅者时会把本该续接的排队轮一并回收 ——
 /// 用户已离开，不替他跑是合理取舍。
 ///
 /// 退出即 drop handle：user_speaker 消亡使停靠的 looper 在 `Idle` 上经 `recv()` 返回
@@ -520,7 +522,7 @@ async fn runner_loop(
         return;
     }
 
-    // 首个 OuterStateChange 事件之前保守不回收（looper 启动期不属于停靠态）
+    // 首个 StateChange 事件之前保守不回收（looper 启动期不属于停靠态）
     let mut looper_idle = false;
 
     loop {
@@ -528,12 +530,12 @@ async fn runner_loop(
             event = handle.recv_event() => match event {
                 Some(ev) => {
                     match &ev {
-                        LooperEvent::OuterStateChange { to, .. } => {
-                            looper_idle = matches!(to, OuterState::Idle);
+                        LooperEvent::StateChange { to, .. } => {
+                            looper_idle = matches!(to, LooperState::Idle);
                             // 停靠态 = 无轮次在途；附着方据此判断要不要补占位气泡
                             runs.set_turn_in_flight(&user_id, !looper_idle);
-                            // 快照端点据此恢复暂停态：重连没有「跨越 Paused 的转换」事件可依赖
-                            runs.set_paused(&user_id, matches!(to, OuterState::Paused));
+                            // 快照端点据此恢复暂停态：重连没有「跨越暂停态的转换」事件可依赖
+                            runs.set_paused(&user_id, to.is_paused());
                             // 收尾即清空在途 query —— 与 turn_in_flight 同寿命
                             if looper_idle {
                                 runs.set_inflight_input(&user_id, None);
@@ -679,9 +681,10 @@ pub async fn cancel_stream(
 
 /// POST /api/peco/stream/pause — 请求暂停当前用户进行中的 ReAct 轮。
 ///
-/// **暂停在下一个步进边界生效**（流式在途时为本次模型调用收尾、工具=≤200ms
-/// 轮询、batch=整段生成），故 200 只表示「请求已收到」；实际状态经 SSE `looper_state{paused}`
-/// 事件下发（由共享的 `map_looper_event` 在主对话侧同样生效）。无在途轮次时
+/// **暂停在边界检查点生效**（请求发出前 / 工具执行前：流式在途时等本次模型
+/// 调用收尾、工具执行中等本批跑完），故 200 只表示「请求已收到」；实际状态经
+/// SSE `looper_state{paused}` 事件下发（由共享的 `map_looper_event` 在主对话侧同样生效）。
+/// 无在途轮次时
 /// 409 —— 与 chat 侧对齐（cancel_stream 用 404，但暂停/恢复要求确有轮次可操作）。
 pub async fn pause_stream(
     AuthUser { user_id }: AuthUser,
