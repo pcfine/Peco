@@ -48,6 +48,19 @@ impl MemoryCategory {
     }
 }
 
+/// 记忆事实附带的可选实体三元组 —— KB 图双写的数据载体。
+///
+/// 一条 fact 至多一个 triple（与 `supersedes` 只取首个的风格一致）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryTriple {
+    /// 主体实体名（最短稳定写法，用户为「用户」）。
+    pub subject: String,
+    /// 中文关系词（如 原名、喜欢、任职于）。
+    pub predicate: String,
+    /// 客体实体名。
+    pub object: String,
+}
+
 /// 一条提取出的记忆。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryFact {
@@ -59,6 +72,9 @@ pub struct MemoryFact {
     /// 候选集中被本事实更正/推进的既有记忆 id（**至多 1 个**，
     /// `parse_facts` 只保留第一个非空 id）。
     pub supersedes: Vec<String>,
+    /// 可选实体三元组：三字段 trim 后任一为空即 `None`
+    /// （`parse_facts` 组装；旧格式无此三字段同样 `None`）。
+    pub triple: Option<MemoryTriple>,
 }
 
 /// 供提取 prompt 展示的既有记忆候选。
@@ -105,8 +121,17 @@ Rules:
 7. When there is nothing worth extracting, output {"facts": []}.
 8. Output JSON only, with no other text or markdown code fence markers.
 
+Relation triple (optional): when the fact states a relationship between two entities, or an
+attribute of one named entity, ALSO fill "subject", "predicate" and "object". Otherwise leave
+them empty.
+- subject / object: the shortest stable entity name (real name where known, e.g. "陈晨"; use
+  "用户" for the user). Never a sentence or a descriptive phrase.
+- predicate: a short stable relation word in Chinese (e.g. 原名, 喜欢, 使用, 任职于).
+- At most ONE triple per fact — pick the most important relation.
+- Never invent entities that this turn does not mention.
+
 Output format:
-{"facts": [{"category": "profile|semantic|episodic", "content": "one-sentence fact", "topic": "short_key", "supersedes": ["existing_memory_id"]}]}"#;
+{"facts": [{"category": "profile|semantic|episodic", "content": "one-sentence fact", "topic": "short_key", "supersedes": ["existing_memory_id"], "subject": "entity_name", "predicate": "relation_word", "object": "entity_name"}]}"#;
 
 /// 基于 [`model_provider::ModelProvider`] 的提取器。
 pub struct ModelTurnAnalyzer {
@@ -120,9 +145,10 @@ impl ModelTurnAnalyzer {
         Self {
             provider,
             model: model.into(),
-            // 512 会让“话痨轮”的 JSON 撞顶截断（实测约 18% 轮次），
-            // 截断即丢样本、系统性偏置效果门 —— 提到 2048 覆盖多事实轮。
-            max_output_tokens: 2048,
+            // 输出预算：JSON 撞顶截断即丢样本、系统性偏置效果门。三元组
+            // 三个字段让每 fact 约增 40–60 token，2048 在多事实轮有截断
+            // 风险 —— 提到 4096。
+            max_output_tokens: 4096,
         }
     }
 }
@@ -232,11 +258,34 @@ fn parse_facts(raw: &str) -> Vec<MemoryFact> {
                     .map(|id| id.trim().to_string())
                     .into_iter()
                     .collect();
+                // 三元组：三字段 trim 后任一为空 → None（旧格式三字段全缺同归 None）。
+                // 字段值非字符串（数字/数组/对象）→ 同归 None —— 只丢这条
+                // triple，fact 本体照留（不因一个坏字段丢整轮）
+                let non_empty = |v: Option<serde_json::Value>| match v {
+                    Some(serde_json::Value::String(s)) => {
+                        let t = s.trim().to_string();
+                        (!t.is_empty()).then_some(t)
+                    }
+                    _ => None,
+                };
+                let triple = match (
+                    non_empty(f.subject),
+                    non_empty(f.predicate),
+                    non_empty(f.object),
+                ) {
+                    (Some(subject), Some(predicate), Some(object)) => Some(MemoryTriple {
+                        subject,
+                        predicate,
+                        object,
+                    }),
+                    _ => None,
+                };
                 Some(MemoryFact {
                     category,
                     content,
                     topic,
                     supersedes,
+                    triple,
                 })
             })
             .collect(),
@@ -258,6 +307,15 @@ struct RawFact {
     topic: Option<String>,
     #[serde(default)]
     supersedes: Vec<String>,
+    // 三元组三字段容忍任意 JSON：模型偶发把其中一个输出成数字/数组/对象，
+    // 定成 Option<String> 会让 serde 整体反序列化失败 → 该轮全部 facts 被丢。
+    // Option<Value> 保住解析，取值时再按 String 变体过滤（见 parse_facts）。
+    #[serde(default)]
+    subject: Option<serde_json::Value>,
+    #[serde(default)]
+    predicate: Option<serde_json::Value>,
+    #[serde(default)]
+    object: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -275,10 +333,88 @@ mod tests {
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].category, MemoryCategory::Profile);
         assert_eq!(facts[0].content, "用户偏好中文交流");
-        // 旧格式（无 topic/supersedes 字段）→ 默认空
+        // 旧格式（无 topic/supersedes/triple 字段）→ 默认空
         assert!(facts[0].topic.is_none());
         assert!(facts[0].supersedes.is_empty());
+        assert!(facts[0].triple.is_none());
         assert_eq!(facts[1].category, MemoryCategory::Semantic);
+        assert!(facts[1].triple.is_none());
+    }
+
+    #[test]
+    fn test_parse_triple() {
+        let facts = parse_facts(
+            r#"{"facts": [
+                {"category": "profile", "content": "用户的原名是陈晨",
+                 "subject": " 用户 ", "predicate": "原名", "object": "陈晨"}
+            ]}"#,
+        );
+        assert_eq!(facts.len(), 1);
+        let triple = facts[0].triple.as_ref().expect("三字段齐全应产出 triple");
+        // trim 后落库
+        assert_eq!(triple.subject, "用户");
+        assert_eq!(triple.predicate, "原名");
+        assert_eq!(triple.object, "陈晨");
+    }
+
+    #[test]
+    fn test_parse_triple_requires_all_three_fields() {
+        // 缺 object → None
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "x",
+                 "subject": "用户", "predicate": "喜欢"}]}"#,
+        );
+        assert!(facts[0].triple.is_none());
+
+        // 缺 predicate → None
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "x",
+                 "subject": "用户", "object": "Rust"}]}"#,
+        );
+        assert!(facts[0].triple.is_none());
+
+        // 三字段全缺（旧格式）→ None
+        let facts = parse_facts(r#"{"facts": [{"category": "profile", "content": "x"}]}"#);
+        assert!(facts[0].triple.is_none());
+
+        // 任一字段空白 → None
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "x",
+                 "subject": "用户", "predicate": "  ", "object": "Rust"}]}"#,
+        );
+        assert!(facts[0].triple.is_none());
+    }
+
+    #[test]
+    fn test_parse_non_string_triple_field_drops_triple_not_fact() {
+        // subject 是数字 → 该字段取不到字符串 → triple None，但 fact 本体保留
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "x",
+                 "subject": 42, "predicate": "原名", "object": "陈晨"}]}"#,
+        );
+        assert_eq!(facts.len(), 1, "坏字段只丢 triple，不得丢整条 fact");
+        assert!(facts[0].triple.is_none());
+
+        // predicate 是对象（更极端的坏值）→ 同样只丢 triple
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "semantic", "content": "y",
+                 "subject": "用户", "predicate": {"a": 1}, "object": "Rust"}]}"#,
+        );
+        assert_eq!(facts.len(), 1, "坏字段只丢 triple，不得丢整条 fact");
+        assert!(facts[0].triple.is_none());
+
+        // 同一轮里好 fact 不受坏字段连累
+        let facts = parse_facts(
+            r#"{"facts": [
+                {"category": "profile", "content": "bad",
+                 "subject": ["数组"], "predicate": "喜欢", "object": "Rust"},
+                {"category": "profile", "content": "good",
+                 "subject": "用户", "predicate": "原名", "object": "陈晨"}
+            ]}"#,
+        );
+        assert_eq!(facts.len(), 2);
+        assert!(facts[0].triple.is_none());
+        assert!(facts[1].triple.is_some());
     }
 
     #[test]

@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
+use knowledge_base::Fact;
 use model_provider::{InputItem, Role, Usage};
 use peco_core::agent::{LooperHook, TurnFailureReason, estimate_str_tokens};
 use peco_core::knowledge::KnowledgeManager;
@@ -402,6 +403,7 @@ impl MemoryExtractionHook {
                 content: fact.content.clone(),
                 topic: fact.topic.clone(),
                 supersedes: kept,
+                triple: fact.triple.clone(),
             });
         }
 
@@ -655,6 +657,76 @@ impl MemoryExtractionHook {
                     warn!(error = %e, kb = %config.kb_name, "Memory write failed (non-fatal)");
                 }
             }
+        }
+
+        // 图双写在文档循环之后、对全部 facts 一遍 —— 与 dedup/supersede 门控
+        // 正交（图是 add-only，无「重复文档」概念），限制见 write_graph_facts
+        Self::write_graph_facts(km, config, &facts).await;
+    }
+
+    /// 图双写：把带三元组的 fact 追加进 KB 图（文档面之外的第二条写入路径，
+    /// 与文档面同源不同库）。`index_text=false` —— 事实文本已由文档面写入
+    /// 全文索引，不重复索引。失败仅 warn，不影响文档面与主流程。
+    ///
+    /// **幂等守卫**：逐条 `read_fact` 查同 `(subject, predicate, object)`，
+    /// 已在图中即跳过 —— 否则同一事实每被提取一轮就在图上多一条平行边
+    /// （`add_facts` 只在单次调用内按 fact id 去重，跨轮累积挡不住）。读
+    /// 失败按「宁可多写不丢」放行，仅记日志。
+    ///
+    /// 已知限制：
+    /// 1. **append-only，不做取代** —— `supersede` 只作用于文档面，同一槽位
+    ///    的新旧值（如「部署状态 A→B」）会在图里并存两条边；
+    /// 2. **图事实无审计/回滚** —— `memory_audit` 不覆盖图，删除只能靠
+    ///    `delete_fact`；
+    /// 3. **实体名漂移** —— 同一实体的不同写法会分裂成平行节点（prompt 已
+    ///    约束取最短稳定名，未做归一化）；
+    /// 4. **幂等有边界** —— 图写入只挡「同值重复追加」：(a) 旧值 vs 新值
+    ///    仍并存（见第 1 条）；(b) 守卫是「读后写」，不覆盖并发/多实例
+    ///    竞争窗口；(c) 守卫生效前已产生的重复边不会被自动回收，需人工
+    ///    `delete_fact` 清理。
+    async fn write_graph_facts(km: &KnowledgeManager, config: &MemoryConfig, facts: &[MemoryFact]) {
+        if !config.graph_write {
+            return;
+        }
+        let mut triples: Vec<Fact> = Vec::new();
+        for fact in facts {
+            let Some(t) = fact.triple.as_ref() else {
+                continue;
+            };
+            // 幂等守卫：同值边已在图中 → 跳过；读失败放行（非致命纪律）
+            match km
+                .read_fact(&config.kb_name, &t.subject, &t.predicate, &t.object)
+                .await
+            {
+                Ok(existing) if !existing.is_empty() => continue,
+                Ok(_) => {}
+                Err(e) => debug!(
+                    error = %e,
+                    kb = %config.kb_name,
+                    "Graph idempotency check failed; writing anyway"
+                ),
+            }
+            let mut f = Fact::new(
+                t.subject.as_str(),
+                t.predicate.as_str(),
+                t.object.as_str(),
+                GRAPH_FACT_CONFIDENCE,
+            );
+            f.source = source_of(fact);
+            f.metadata
+                .insert("origin".to_string(), "memory_turn_extract".to_string());
+            triples.push(f);
+        }
+        if triples.is_empty() {
+            return;
+        }
+        if let Err(e) = km.add_facts_to_kb(&config.kb_name, &triples, false).await {
+            warn!(
+                error = %e,
+                kb = %config.kb_name,
+                fact_count = triples.len(),
+                "Memory graph write failed (non-fatal)"
+            );
         }
     }
 
@@ -910,6 +982,9 @@ fn source_of(fact: &MemoryFact) -> String {
     format!("ppa_{}", fact.category.as_str())
 }
 
+/// 图事实的固定置信度 —— 与 `add_facts_to_knowledge_base` 工具默认一致。
+const GRAPH_FACT_CONFIDENCE: f32 = 0.8;
+
 /// `degraded`：① `write_intent` 失败退化为 append 的次数。
 /// 进程级累计（不按用户隔离），进程重启清零 —— health 端点回显。
 static DEGRADED_COUNT: AtomicI64 = AtomicI64::new(0);
@@ -1152,7 +1227,7 @@ async fn reconcile_one(
 
 #[cfg(test)]
 mod tests {
-    use super::super::analyzer::{MemoryCategory, MemoryFact};
+    use super::super::analyzer::{MemoryCategory, MemoryFact, MemoryTriple};
     use super::*;
     use knowledge_base::{BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig};
     use peco_core::session::{MessageSource, Session};
@@ -1364,6 +1439,7 @@ mod tests {
     async fn test_extracts_and_writes_to_kb() {
         let km = make_km().await;
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户偏好简洁的回答风格".to_string(),
             topic: None,
@@ -1471,6 +1547,7 @@ mod tests {
 
     fn near_dup_facts() -> Vec<MemoryFact> {
         vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: NEAR_DUP.to_string(),
             topic: None,
@@ -1530,6 +1607,7 @@ mod tests {
         let km = make_km_with_existing("memory_1000_0", EXISTING, "ppa_profile").await;
         // 同样的文本但归为 episodic → 与既有 ppa_profile 不同类目，不判重
         let analyzer = Arc::new(MockAnalyzer::ok(vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Episodic,
             content: NEAR_DUP.to_string(),
             topic: None,
@@ -1574,12 +1652,14 @@ mod tests {
         let km = make_km().await;
         let facts = vec![
             MemoryFact {
+                triple: None,
                 category: MemoryCategory::Profile,
                 content: NEAR_DUP.to_string(),
                 topic: None,
                 supersedes: vec![],
             },
             MemoryFact {
+                triple: None,
                 category: MemoryCategory::Semantic,
                 content: "The user's primary programming language is Rust.".to_string(),
                 topic: None,
@@ -1641,6 +1721,7 @@ mod tests {
             .id
             .clone();
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户现在偏好详尽的回答".to_string(),
             topic: Some("answer_style".to_string()),
@@ -1692,6 +1773,7 @@ mod tests {
     async fn shadow_drops_supersede_outside_candidates() {
         let km = make_km().await;
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Semantic,
             content: "项目切换到新架构".to_string(),
             topic: Some("project_phase".to_string()),
@@ -1737,6 +1819,7 @@ mod tests {
     async fn shadow_disabled_writes_no_row() {
         let km = make_km().await;
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户偏好简洁的回答风格".to_string(),
             topic: None,
@@ -1790,6 +1873,7 @@ mod tests {
     async fn shadow_write_failure_does_not_block_kb_write() {
         let km = make_km().await;
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户偏好简洁的回答风格".to_string(),
             topic: None,
@@ -2222,6 +2306,7 @@ mod tests {
             .id
             .clone();
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户现在偏好详尽的回答".to_string(),
             topic: Some("answer_style".to_string()),
@@ -2259,6 +2344,7 @@ mod tests {
         let new_id = knowledge_base::text_doc_id(new_content);
         let candidates = vec![cand(&victim, "ppa_profile")];
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: new_content.to_string(),
             topic: Some("answer_style".to_string()),
@@ -2332,6 +2418,7 @@ mod tests {
             .id
             .clone();
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户现在偏好详尽的回答".to_string(),
             topic: Some("answer_style".to_string()),
@@ -2370,6 +2457,7 @@ mod tests {
         // 白名单只有 decoy —— victim 不在其中
         let candidates = vec![cand("decoy-doc", "ppa_profile")];
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户现在偏好详尽的回答".to_string(),
             topic: Some("answer_style".to_string()),
@@ -2415,6 +2503,7 @@ mod tests {
         let (pool, _dir) = migrated_pool().await;
         let candidates = vec![cand(&victim, "ppa_profile")];
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: EXISTING.to_string(),
             topic: Some("answer_style".to_string()),
@@ -2463,6 +2552,7 @@ mod tests {
         let new_id = knowledge_base::text_doc_id(new_content);
         let candidates = vec![cand(&v1, "ppa_profile"), cand(&v2, "ppa_profile")];
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: new_content.to_string(),
             topic: Some("answer_style".to_string()),
@@ -2535,12 +2625,14 @@ mod tests {
         let candidates = vec![cand(&victim, "ppa_profile")];
         let facts = vec![
             MemoryFact {
+                triple: None,
                 category: MemoryCategory::Profile,
                 content: "事实一：topic 为 None".to_string(),
                 topic: None,
                 supersedes: vec![victim.clone()],
             },
             MemoryFact {
+                triple: None,
                 category: MemoryCategory::Profile,
                 content: "事实二：topic 全空白".to_string(),
                 topic: Some("   ".to_string()),
@@ -2588,12 +2680,14 @@ mod tests {
         let candidates = vec![cand(&v1, "ppa_profile"), cand(&v2, "ppa_profile")];
         let facts = vec![
             MemoryFact {
+                triple: None,
                 category: MemoryCategory::Profile,
                 content: "新记忆 A 内容。".to_string(),
                 topic: Some("topic_a".to_string()),
                 supersedes: vec![v1.clone()],
             },
             MemoryFact {
+                triple: None,
                 category: MemoryCategory::Profile,
                 content: "新记忆 B 内容。".to_string(),
                 topic: Some("topic_b".to_string()),
@@ -2660,6 +2754,7 @@ mod tests {
         let new_id = knowledge_base::text_doc_id(new_content);
         let candidates = vec![cand(&victim, "ppa_profile")];
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: new_content.to_string(),
             topic: Some("answer_style".to_string()),
@@ -2719,6 +2814,7 @@ mod tests {
             .id
             .clone();
         let facts = vec![MemoryFact {
+            triple: None,
             category: MemoryCategory::Profile,
             content: "用户现在偏好详尽的回答".to_string(),
             topic: Some("answer_style".to_string()),
@@ -3051,5 +3147,177 @@ mod tests {
         assert_eq!(health.pending, 0, "failed 后不应再 pending");
         assert_eq!(health.failed, 1, "超上界应转 failed 并在 health 可见");
         assert_eq!(intent_status(&pool).await.as_deref(), Some("failed"));
+    }
+
+    // ── 图双写（记忆事实 → KB 图）─────────────────────────────────────────
+
+    /// 带 triple 的提取产物（其余字段口径同 `make_config` 下的常规提取）。
+    fn fact_with_triple() -> MemoryFact {
+        MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户的原名是陈晨".to_string(),
+            topic: None,
+            supersedes: vec![],
+            triple: Some(MemoryTriple {
+                subject: "用户".to_string(),
+                predicate: "原名".to_string(),
+                object: "陈晨".to_string(),
+            }),
+        }
+    }
+
+    fn graph_session() -> Session {
+        make_session_with_turn(
+            "请记住我身份证上的名字是陈晨，以后都这么称呼我",
+            "好的，已记住你的名字是陈晨。",
+        )
+    }
+
+    /// 端到端：带 triple 的 fact → 文档面 + 图边同轮落库；边携带
+    /// source（ppa_*）、origin 与固定置信度 0.8。
+    #[tokio::test]
+    async fn graph_write_persists_triple_edge() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![fact_with_triple()]));
+        let (hook, _pool, _dir) = make_hook(Arc::clone(&km), analyzer, make_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+
+        // 图写入排在文档写入之后 —— 轮询等边出现，两面同轮齐活
+        for _ in 0..100 {
+            let edges = km
+                .read_fact("@private_memory", "用户", "原名", "陈晨")
+                .await
+                .unwrap();
+            if !edges.is_empty() {
+                assert_eq!(doc_count(&km).await, 1, "文档面应同轮写入");
+                let edge = &edges[0];
+                assert_eq!(
+                    edge.properties.get("source").map(String::as_str),
+                    Some("ppa_profile")
+                );
+                assert_eq!(
+                    edge.properties.get("origin").map(String::as_str),
+                    Some("memory_turn_extract")
+                );
+                assert!(
+                    (edge.weight - 0.8).abs() < f32::EPSILON,
+                    "置信度应为 0.8，实为 {}",
+                    edge.weight
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("图边应在超时前写入");
+    }
+
+    /// `graph_write=false` → 图无该边，文档面照写。
+    #[tokio::test]
+    async fn graph_write_disabled_keeps_document_only() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![fact_with_triple()]));
+        let config = MemoryConfig {
+            analyze_min_chars: 10,
+            extraction_top_k: 3,
+            graph_write: false,
+            ..MemoryConfig::default()
+        };
+        let (hook, _pool, _dir) = make_hook(Arc::clone(&km), analyzer, config).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+
+        wait_for_doc_count(&km, 1).await;
+        // 图写入点紧随文档循环之后 —— 留窗口让它（若门未生效）暴露
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let (nodes, edges) = km.list_entity_graph("@private_memory").await.unwrap();
+        assert!(nodes.is_empty(), "graph_write=false 不得写实体节点");
+        assert!(edges.is_empty(), "graph_write=false 不得写图边");
+        // 双保险：子图快照之外，按读接口再断言这条边不存在（与正测同口径）
+        let found = km
+            .read_fact("@private_memory", "用户", "原名", "陈晨")
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "graph_write=false 不得写该图边");
+    }
+
+    /// 跨轮幂等：同一 triple 连走两轮 `on_turn_complete` → 图边恰 1 条
+    /// （幂等守卫挡掉第二轮的平行追加），文档面同为 1（第二轮同文近重复
+    /// 被 dedup enforce 拦下；图写入独立于 dedup 门控 —— 第二轮仍会尝试
+    /// 写图，只是被守卫跳过）。
+    #[tokio::test]
+    async fn graph_write_same_triple_across_turns_stays_single_edge() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![fact_with_triple()]));
+        let (hook, pool, _dir) =
+            make_hook(Arc::clone(&km), analyzer.clone(), dedup_config(true)).await;
+
+        // 第 1 轮：文档面 + 图边各落 1 条
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+        wait_for_doc_count(&km, 1).await;
+        let mut first_edge_seen = false;
+        for _ in 0..100 {
+            let edges = km
+                .read_fact("@private_memory", "用户", "原名", "陈晨")
+                .await
+                .unwrap();
+            if edges.len() == 1 {
+                first_edge_seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(first_edge_seen, "第一轮图边应在超时前写入");
+
+        // 第 2 轮：同一 triple 再提取一遍 —— 文档写入被 dedup 拦下，
+        // 图写入照常尝试（m5：独立于 dedup），由幂等守卫收口
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+        // shadow 行 = 第 2 轮提取完成信号；随后的写路径留窗口跑完
+        for _ in 0..100 {
+            if analyzer.calls.lock().unwrap().len() >= 2 && shadow_count(&pool).await == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let edges = km
+            .read_fact("@private_memory", "用户", "原名", "陈晨")
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1, "同一 triple 第二轮不得追加平行边");
+        assert_eq!(
+            doc_count(&km).await,
+            1,
+            "第二轮同文被 dedup 拦下，文档面同为 1"
+        );
+    }
+
+    /// 无 triple 的 fact → 不写图、不报错，文档面照写。
+    #[tokio::test]
+    async fn fact_without_triple_writes_no_edge() {
+        let km = make_km().await;
+        let facts = vec![MemoryFact {
+            category: MemoryCategory::Profile,
+            content: "用户偏好简洁的回答风格".to_string(),
+            topic: None,
+            supersedes: vec![],
+            triple: None,
+        }];
+        let analyzer = Arc::new(MockAnalyzer::ok(facts));
+        let (hook, _pool, _dir) = make_hook(Arc::clone(&km), analyzer, make_config()).await;
+
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+
+        wait_for_doc_count(&km, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let (nodes, edges) = km.list_entity_graph("@private_memory").await.unwrap();
+        assert!(nodes.is_empty(), "无 triple 不得写实体节点");
+        assert!(edges.is_empty(), "无 triple 不得写图边");
     }
 }

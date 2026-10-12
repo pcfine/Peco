@@ -88,6 +88,10 @@ pub const ENV_CONSOLIDATION_MAX_LLM_CALLS: &str = "PECO_MEMORY_CONSOLIDATION_MAX
 pub const ENV_CONSOLIDATION_IDLE_AFTER_SECS: &str = "PECO_MEMORY_CONSOLIDATION_IDLE_AFTER_SECS";
 pub const ENV_CONSOLIDATION_DEDUP_ENFORCE: &str = "PECO_MEMORY_CONSOLIDATION_DEDUP_ENFORCE";
 
+// ── 图双写的环境变量入口 ───────────────────────────────────────────────
+
+pub const ENV_GRAPH_WRITE: &str = "PECO_MEMORY_GRAPH_WRITE";
+
 impl ConsolidationConfig {
     /// 从环境变量读取，未设置的字段取 [`Self::default`]。
     ///
@@ -191,6 +195,11 @@ pub struct MemoryConfig {
     pub recall_half_life_days: u64,
     /// 自动整理（巩固流水线）配置。
     pub consolidation: ConsolidationConfig,
+    /// 记忆事实图双写开关（写路径）。
+    ///
+    /// `true`（默认）时提取产出的实体三元组随文档面追加进 KB 图；
+    /// `false` 时完全不写图，文档面不受影响。env：`PECO_MEMORY_GRAPH_WRITE`。
+    pub graph_write: bool,
 
     // ── 取代机制 · 阶段一（在线 shadow：只观测，不删除）────────────────
     /// 是否写 shadow 观测行（效果门数据源）。
@@ -250,6 +259,7 @@ impl Default for MemoryConfig {
             analyzer_timeout_secs: 10,
             recall_half_life_days: 30,
             consolidation: ConsolidationConfig::default(),
+            graph_write: true,
             supersede_shadow: true,
             supersede_enforce: false,
             candidate_recent_per_category: 10,
@@ -272,14 +282,19 @@ impl Default for MemoryConfig {
 }
 
 impl MemoryConfig {
-    /// 在 [`Self::default`] 之上应用环境变量覆盖（目前只有 `consolidation` 子配置）。
+    /// 在 [`Self::default`] 之上应用环境变量覆盖（consolidation 子配置 +
+    /// 图双写开关）。
     pub fn from_env() -> Self {
-        Self::with_consolidation_config(ConsolidationConfig::from_env())
+        Self::from_env_with(|name| std::env::var(name).ok())
     }
 
-    fn with_consolidation_config(consolidation: ConsolidationConfig) -> Self {
+    /// [`Self::from_env`] 的内核：env 查找由调用方提供（测试注入，零 env 副作用）。
+    fn from_env_with<F: Fn(&str) -> Option<String>>(get: F) -> Self {
         Self {
-            consolidation,
+            consolidation: ConsolidationConfig::from_env_with(&get),
+            // bool 开关照 consolidation.enabled 走 env_bool —— env_parse 只认
+            // 字面 "true"/"false"，运维惯用的 "0" 会解析失败回落默认值（关不掉）
+            graph_write: env_bool(&get, ENV_GRAPH_WRITE, Self::default().graph_write),
             ..Self::default()
         }
     }
@@ -300,6 +315,8 @@ mod tests {
         assert_eq!(c.recall_top_k, 5);
         assert_eq!(c.injection_token_cap, 1000);
         assert_eq!(c.recall_half_life_days, 30);
+        // 图双写默认开
+        assert!(c.graph_write);
         // 取代机制 · 阶段一：shadow 开、enforce 关（fail-closed）
         assert!(c.supersede_shadow);
         assert!(!c.supersede_enforce);
@@ -424,18 +441,39 @@ mod tests {
 
     #[test]
     fn memory_from_env_propagates_consolidation_switch() {
-        let on =
-            MemoryConfig::with_consolidation_config(ConsolidationConfig::from_env_with(env_of(&[
-                (ENV_CONSOLIDATION_ENABLED, "true"),
-            ])));
+        let on = MemoryConfig::from_env_with(env_of(&[(ENV_CONSOLIDATION_ENABLED, "true")]));
         assert!(on.consolidation.enabled);
         assert_eq!(on.kb_name, "@private_memory");
         assert!(on.enabled);
 
-        let off = MemoryConfig::with_consolidation_config(ConsolidationConfig::from_env_with(
-            env_of(&[]),
-        ));
+        let off = MemoryConfig::from_env_with(env_of(&[]));
         assert!(!off.consolidation.enabled);
+    }
+
+    #[test]
+    fn graph_write_env_switch() {
+        // 未设置 → 默认开
+        assert!(MemoryConfig::from_env_with(env_of(&[])).graph_write);
+
+        for falsy in ["false", "FALSE", " 0 ", "no", "off"] {
+            let c = MemoryConfig::from_env_with(env_of(&[(ENV_GRAPH_WRITE, falsy)]));
+            assert!(!c.graph_write, "{falsy:?} 应解析为 false");
+        }
+        for truthy in ["true", "1", "yes", "on"] {
+            let c = MemoryConfig::from_env_with(env_of(&[(ENV_GRAPH_WRITE, truthy)]));
+            assert!(c.graph_write, "{truthy:?} 应解析为 true");
+        }
+
+        // 非法值回落默认（开），不误关
+        let c = MemoryConfig::from_env_with(env_of(&[(ENV_GRAPH_WRITE, "maybe")]));
+        assert!(c.graph_write);
+        // 两个开关互不串扰
+        let c = MemoryConfig::from_env_with(env_of(&[
+            (ENV_CONSOLIDATION_ENABLED, "true"),
+            (ENV_GRAPH_WRITE, "false"),
+        ]));
+        assert!(c.consolidation.enabled);
+        assert!(!c.graph_write);
     }
 
     #[test]
