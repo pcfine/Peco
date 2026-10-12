@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use model_provider::{GenerateResult, InputItem, ToolCall, Usage};
 
-use super::agent_looper::{OuterState, ReActState, TurnFailureReason};
+use super::agent_looper::{LooperState, TurnFailureReason};
 use super::compaction::{BoundaryReduction, CompactionOutcome};
 use crate::session::Session;
 
@@ -129,7 +129,7 @@ pub trait LooperHook: Send + Sync {
 
     /// Turn 完成时调用（Done 或 Failed 状态转移的收尾阶段）。
     ///
-    /// `failure: None` 表示正常完成（`ReActState::Done`）；
+    /// `failure: None` 表示正常完成（`LooperState::Done`）；
     /// `failure: Some(...)` 携带具体的 [`TurnFailureReason`]。
     /// `session` 提供对当前对话消息的只读访问。
     async fn on_turn_complete(
@@ -160,11 +160,12 @@ pub trait LooperHook: Send + Sync {
 
     // ── 状态机 ────────────────────────────────────────────────────────────
 
-    /// ReAct 内层状态转换时调用。
-    async fn on_react_state_change(&self, _turn_index: usize, _from: ReActState, _to: ReActState) {}
-
-    /// 外层状态转换时调用。
-    async fn on_outer_state_change(&self, _from: OuterState, _to: OuterState) {}
+    /// 状态迁移时调用（`react_step` 步内有迁移、或失败收尾归位 Idle）。
+    ///
+    /// `from == to` 只可能出现在失败收尾的无条件归位处；事件面
+    /// （`LooperEvent::StateChange`）在 `from == to` 时不发，两者口径
+    /// 刻意不同 —— 钩子是观察点，不是事件转发。
+    async fn on_state_change(&self, _from: LooperState, _to: LooperState) {}
 }
 
 // ============================================================================

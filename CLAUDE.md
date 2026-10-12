@@ -79,12 +79,11 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - `MessageFilter` trait：上下文组装后的钩子，可在消息列表发送给 LLM 之前对其进行转换（如脱敏、注入）。
 
 **AgentLooper**（[crates/peco-core/src/agent/agent_looper.rs](crates/peco-core/src/agent/agent_looper.rs)）：
-- 双层状态机驱动 ReAct 循环：
-  - **外层**：`Idle ↔ Paused` / `RunningInnerLoop`
-  - **内层**：`PreparingRequest → [batch] AwaitingModel → ResolvingResponse` 或 `[stream] Streaming → ExecutingTools →（循环回）→ Done / Failed`
-- **主循环四步**：`run()` 每轮只做四件事 —— ① 取消息（`has_pending_work()` 为真时只非阻塞排空，否则阻塞 `recv()` 等一条再补排空同批）→ ② 收尾（`is_cancelled()` 走 `finalize_cancel`，否则 `react_state == Failed` 走 `finalize_failure`，互斥）→ ③ 启动 pending 轮（**唯一的「pending → turn」入口**）→ ④ 推进一步 `react_step()`（仅 `RunningInnerLoop`）。
-- **不空转不变量**：每一轮迭代要么在 ① 阻塞、要么严格推进一个状态。`has_pending_work` 的四个非阻塞触发点（`RunningInnerLoop` / `cancel_flag` / `Failed` / `armed && has_pending`）各自有明确消解者，**新增触发点必须同时给出消解者**，否则热自旋。
-- **取消 = 中止当前 ReAct 轮，looper 不退出**（`Cancel` 只置 `cancel_flag`，收尾在 ② 完成）：`finalize_cancel` 按内层状态回收在途资源（`Streaming` 丢 `active_stream`、`ExecutingTools` 走 `abort_inflight_tools`）→ 冻结 + **强制落盘**（`force_persist`，取消不丢 pending）→ 归位到干净 Idle。`cancel_flag` 是**一次性**的，收尾后必须复位。`Cancel` / `Shutdown` 都返回 `ReadDirective::StopReading`（丢弃同批后续消息），但只有 `Shutdown` 置 `shutdown_requested` 退出循环。
+- **单一状态机** `LooperState`（9 变体，权威字段 `state` 单字段，写点收敛为 `set` / `set_quiet`）驱动 ReAct 循环：`Idle / PreparingRequest / ResolvingResponse / Streaming / ExecutingTools / Done / Failed / PausedDuringTools / PausedBeforeRequest`。`is_paused()` = 两个 `Paused*`，`is_active()` = 非 Idle 且非 `Paused*`。`set` 内「写状态 → 同步 `pause_mirror` → 发 `StateChange` 事件」三步同帧有序 —— 外部收到 `StateChange{to: 暂停态}` 时 `is_paused()` 已为 true。
+- **挂起意图 `pause_pending`**（不是状态、不进 `has_pending_work`）：`Pause` 只在两个落地点消费 —— **落地点 A**（`react_step` 的 `PreparingRequest` 入口，覆盖首开发前 / 瞬时重发前 / 工具批完成后下一次请求前）落 `PausedBeforeRequest`；**落地点 B**（`ExecutingTools` 的 spawn 阶段前，`active_tool_tasks.is_none()`）落 `PausedDuringTools`。清零点：两个落地点消费、`finalize_cancel`、`finalize_failure`、`reset_iteration_counters`（轮起点，先于 `set(PreparingRequest)`）；流收敛无 tool_calls 时暂停被**轮次完成吸收**（意图不清、留到下一轮复位）。空闲态 `Pause` 是**无操作**；非暂停态的 `Resume` 则**撤回**尚未落地的暂停意图（清 `pause_pending`）。
+- **主循环四步**：`run()` 每轮只做四件事 —— ① 取消息（`has_pending_work()` 为真时只非阻塞排空，否则阻塞 `recv()` 等一条再补排空同批；通道关且暂停中先走 `finalize_cancel`，然后 `Idle` 才 break，排队 pending 不补跑）→ ② 收尾（`is_cancelled()` 走 `finalize_cancel`，否则 `state == Failed` 走 `finalize_failure`，互斥）→ ③ 启动 pending 轮（**唯一的「pending → turn」入口**，仅放行 `Idle`）→ ④ 推进一步 `react_step()`（仅 `is_active()`）。
+- **不空转不变量**：每一轮迭代要么在 ① 阻塞、要么严格推进一个状态。`has_pending_work` 的非阻塞触发点（运行位含 `Failed` → ④ 步进或 ② 收尾消解；`Idle` 的 `is_cancelled` → ② 消解；`Idle` 的 `armed && has_pending` → ③ 消解；两个 `Paused*` 恒为 `false`）各自有明确消解者，**新增触发点必须同时给出消解者**，否则热自旋。
+- **取消 = 中止当前 ReAct 轮，looper 不退出**（`Cancel` 只置 `cancel_flag`，收尾在 ② 完成）：`finalize_cancel` 按状态回收在途资源（`Streaming` 丢 `active_stream`、`ExecutingTools` 走 `abort_inflight_tools`、两个 `Paused*` 无在途资源）→ 冻结 + **强制落盘**（`force_persist`，取消不丢 pending）→ 归位到干净 Idle。`cancel_flag` 是**一次性**的，收尾后必须复位。`Cancel` / `Shutdown` 都返回 `ReadDirective::StopReading`（丢弃同批后续消息），但只有 `Shutdown` 置 `shutdown_requested` 退出循环。
 - **`pending_armed`** 区分「有待处理输入」与「这些输入现在该不该跑」：`Resume` / 新 `Query` 置位，`Cancel` 收尾与启动轮后清零。取消后不自动开新轮，pending 保留并随快照落盘。
 - **步进上界 `STEP_POLL`（200ms）**：流式等 chunk、工具 poll、退避切片三处共用的唯一数字，同时是**取消的最坏生效延迟**。**batch 路径（`stream: false`）没有步进边界** —— 该轮取消延迟 = 整段生成时间。looper 无整轮看门狗，唯一的中止入口是取消。
 - 工具执行分两阶段：**spawn 阶段**（将所有工具调用启动到 `JoinSet` 中），然后 **poll 阶段**（以 `STEP_POLL` 超时贪婪排空结果，每完成一个即发出事件）。
@@ -103,7 +102,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
   - **统一退避**：`base * 2^(n-1)` 截断到上限，`retry_base_delay_ms` 默认 500 / `retry_max_delay_ms` 默认 5000，截断重发同样走退避。退避在 `prepare_and_send_request` 入口以可取消切片 sleep 等待（只读 deadline 不 `take()`，见 `wait_retry_backoff`），不阻塞取消。
   - **残片只丢弃不归还**：被回退的截断文本不进历史（`rollback_attempt` 的 `discarded_text` 是发给前端/落库的**丢弃指令**，随 `TruncationRetry` 事件即发即弃）。但 `plan_failure` 保留了**轮次存活桩** —— 重试后失败且新尝试零产出时补一条 `[response discarded after retry]` 的 assistant 消息，否则 `interrupt_turn` 见 staging 为空会退化成 `rollback_turn`，用户提问整轮从历史消失。
   - 四个 env 的读取**下沉到 `LooperConfig::from_env()`**（`PECO_RETRY_LIMIT` / `PECO_RETRY_OUTPUT_BUDGET` / `PECO_RETRY_BASE_DELAY_MS` / `PECO_RETRY_MAX_DELAY_MS`），`PecoConfig`、`chat/handler.rs`、`peco-cli` 三个构造点统一委托 —— 旧版本里后两者无视 env 是既有 bug。
-- `LooperHook` trait：8 个拦截点（`on_before_request`、`on_after_response`、`on_text_delta`、`on_before_tool`、`on_after_tool`、`on_turn_complete`、`on_react_state_change`、`on_outer_state_change`）。内置钩子：`ToolAllowlistHook`、`TokenBudgetHook`。
+- `LooperHook` trait：9 个拦截点（`on_before_request`、`on_after_response`、`on_text_delta`、`on_before_tool`、`on_after_tool`、`on_turn_complete`、`on_context_compacted`、`on_boundary_reduction`、`on_state_change(from, to: LooperState)` —— 原 `on_react_state_change` / `on_outer_state_change` 合并为后者）。内置钩子：`ToolAllowlistHook`、`TokenBudgetHook`。
 
 **SimpleAgentLooper**（[crates/peco-core/src/agent/simple_looper.rs](crates/peco-core/src/agent/simple_looper.rs)）：
 - 最小化的纯 batch 变体，由 `DelegateSubAgent` 和 `RunParallelSubAgents` 使用。
@@ -198,7 +197,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 
 **Chat/SSE**（[crates/peco-server/src/chat/](crates/peco-server/src/chat/)）：
 - `GET /api/conversations/:id/stream` — SSE 端点。创建 `AgentLooper`，在 tokio 任务中启动它，并将 `LooperEvent` 桥接到 SSE 事件流。
-- SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`error`、`done`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`ReactStateChange` 被过滤掉，不发送给客户端；`TruncationRetry` 的 `discarded_text` 字段同样不下发 —— 它只服务 `chat` 模块落库累加器的后缀剥离。）
+- SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`error`、`done`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`StateChange` 被过滤掉，不发送给客户端 —— `StateChange` 只在跨暂停转换时转化为 `looper_state` 布尔事件；`TruncationRetry` 的 `discarded_text` 字段同样不下发 —— 它只服务 `chat` 模块落库累加器的后缀剥离。）
 - `truncation_retry` 是**纯通知**，不含撤销语义：重发回退的是 `Session`（staging）而非传输层，前端不删除已收到的增量，只在当前轮气泡**之前**插一条居中横幅解释残句；重载从快照恢复后残句与横幅一并消失。CLI 同路线（打一行提示，保留残句）。`reason` 字段区分两种重发：`truncated`（截断抬预算）与 `transient`（限流/网络/5xx 退避重发），缺省按截断展示以兼容旧后端。
 - 失败轮的 `error` 事件文案由 `format_failure_message` 生成：类型化失败原因（限流/网络/鉴权/额度/上下文/过滤）输出「中文分类前缀 + provider 原始 msg」，分类给结论、原文保留诊断。
 - 子 Agent 调用（`delegate_sub_agent` / `run_parallel_sub_agents`）通过按 tool_call_id 映射的 `SubAgentInfo` 注册表追踪，生成 `agent_call_start`/`agent_call_end` SSE 事件供前端可视化。

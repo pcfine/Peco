@@ -176,8 +176,9 @@ export interface ChatViewProps {
    * [可选] 暂停当前运行中的 looper。与 `onResume` **同时提供**时才出现入口，
    * 且只在流式进行中展示（`ExternalIsStreaming ?? streaming`）。
    *
-   * 暂停在下一个步进边界生效（流式在途时为本次模型调用收尾），按钮状态以
-   * SSE `looper_state` 事件为准。
+   * 暂停在边界检查点落地：请求发出前，或工具批执行前。请求在途时须等本次模型调用
+   * 收尾；工具批执行中不打断，批跑完才停；无工具调用的轮次暂停被吸收。按钮状态
+   * 以 SSE `looper_state` 事件为准。
    */
   onPause?: () => void;
   /** [可选] 恢复已暂停的 looper（与 `onPause` 成对提供）。 */
