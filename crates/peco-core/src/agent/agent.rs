@@ -307,16 +307,16 @@ impl Agent {
     ///
     /// `instructions` 承载 system prompt（含动态上下文），`input` 为历史 [`InputItem`]。
     ///
-    /// `max_output_tokens` 为**本次请求的一次性覆盖**：`None` = 沿用
-    /// [`ModelConfig::max_tokens`]（其自身为 `None` 时交由 provider 服务端默认）。
-    /// 用于截断重试时抬高输出预算 —— 推理 token 与可见输出共用这一个预算，
-    /// 预算不足时推理会把可见输出挤没（见 `AgentLooper::finish_stream` 的失败日志字段）。
+    /// `customize` 在请求构建完成后应用，可修改 [`GenerateRequest`] 的任意字段
+    /// （temperature、reasoning 等）—— 需求字段增长时调用方传不同的闭包，
+    /// 此处签名不再随字段扩张。不需修改时传 `|_| {}`；输出预算的一次性覆盖
+    /// 见 [`override_output_budget`]。
     fn build_generate_request(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
         mut tools: Vec<ToolDefinition>,
-        max_output_tokens: Option<u32>,
+        customize: impl FnOnce(&mut GenerateRequest),
     ) -> GenerateRequest {
         if self.model_config.web_search == Some(true) && self.model.supports_server_web_search() {
             tools.push(ToolDefinition {
@@ -325,7 +325,7 @@ impl Agent {
                 parameters: serde_json::json!({"type": "object"}),
             });
         }
-        GenerateRequest {
+        let mut request = GenerateRequest {
             model: self.model_config.model_name.clone().unwrap_or_default(),
             instructions,
             input: input.into(),
@@ -333,42 +333,39 @@ impl Agent {
             tool_choice: Some(ToolChoice::Auto),
             temperature: self.model_config.temperature.map(|t| t as f64),
             top_p: None,
-            max_output_tokens: max_output_tokens.or(self.model_config.max_tokens),
+            max_output_tokens: self.model_config.max_tokens,
             reasoning: reasoning_effort_to_config(self.model_config.reasoning_effort.as_deref()),
             text: None,
             additional_params: None,
-        }
+        };
+        customize(&mut request);
+        request
     }
 
     /// 发送非流式生成请求。
     ///
     /// 调用方提供历史 `input`（不含 system prompt）；system prompt 由
     /// `self.system_prompt()` 承载为 `instructions`。
-    ///
-    /// `max_output_tokens` 为本次请求的一次性覆盖（`None` = 用 `ModelConfig` 的值），
-    /// 供 [`SimpleAgentLooper`](super::simple_looper::SimpleAgentLooper) 在截断重试时抬高预算。
     pub(crate) async fn generate_full(
         &self,
         input: Vec<Arc<InputItem>>,
-        max_output_tokens: Option<u32>,
+        customize: impl FnOnce(&mut GenerateRequest),
     ) -> Result<GenerateResult, AgentError> {
         let tools = self.tool_executor.definitions();
         let instructions = Some(self.system_prompt());
-        let request = self.build_generate_request(input, instructions, tools, max_output_tokens);
+        let request = self.build_generate_request(input, instructions, tools, customize);
         Ok(self.model.generate_full(&request).await?)
     }
 
     /// 发送流式生成请求。
-    ///
-    /// `max_output_tokens` 为本次请求的一次性覆盖（`None` = 用 `ModelConfig` 的值）。
     pub(crate) async fn generate_stream(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
-        max_output_tokens: Option<u32>,
+        customize: impl FnOnce(&mut GenerateRequest),
     ) -> Result<GenerateStream, AgentError> {
         let tools = self.tool_executor.definitions();
-        let request = self.build_generate_request(input, instructions, tools, max_output_tokens);
+        let request = self.build_generate_request(input, instructions, tools, customize);
         Ok(self.model.generate_stream(&request).await?)
     }
 
@@ -376,17 +373,29 @@ impl Agent {
     ///
     /// 由 `SimpleAgentLooper` 在 tool_executor_override 场景下使用，
     /// 允许调用方提供自定义 tool 列表（如包含 `__submit_output__`）。
-    ///
-    /// `max_output_tokens` 为本次请求的一次性覆盖（`None` = 用 `ModelConfig` 的值）。
     pub(crate) async fn generate_with_tools(
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
         tools: Vec<ToolDefinition>,
-        max_output_tokens: Option<u32>,
+        customize: impl FnOnce(&mut GenerateRequest),
     ) -> Result<GenerateResult, AgentError> {
-        let request = self.build_generate_request(input, instructions, tools, max_output_tokens);
+        let request = self.build_generate_request(input, instructions, tools, customize);
         Ok(self.model.generate_full(&request).await?)
+    }
+}
+
+/// 生成「一次性覆盖输出预算」的请求定制闭包：`Some(b)` 时覆写
+/// [`GenerateRequest::max_output_tokens`]，`None` = 不修改（沿用
+/// [`ModelConfig::max_tokens`]，其自身为 `None` 时交由 provider 服务端默认）。
+///
+/// 用于截断重试时抬高输出预算 —— 推理 token 与可见输出共用这一个预算，
+/// 预算不足时推理会把可见输出挤没（见 `AgentLooper::finish_stream` 的失败日志字段）。
+pub(crate) fn override_output_budget(budget: Option<u32>) -> impl FnOnce(&mut GenerateRequest) {
+    move |request| {
+        if let Some(b) = budget {
+            request.max_output_tokens = Some(b);
+        }
     }
 }
 
@@ -1089,7 +1098,7 @@ mod tests {
             Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()),
             Some(true),
         );
-        let request = agent.build_generate_request(vec![], None, vec![shell()], None);
+        let request = agent.build_generate_request(vec![], None, vec![shell()], |_| {});
         let markers: Vec<_> = request
             .tools
             .iter()
@@ -1103,7 +1112,7 @@ mod tests {
         for flag in [None, Some(false)] {
             let agent =
                 web_search_agent(Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()), flag);
-            let request = agent.build_generate_request(vec![], None, vec![shell()], None);
+            let request = agent.build_generate_request(vec![], None, vec![shell()], |_| {});
             assert!(
                 request
                     .tools
@@ -1118,7 +1127,7 @@ mod tests {
             Arc::new(DeepSeekResponsesAdapter::new("sk").unwrap()),
             Some(true),
         );
-        let request = agent.build_generate_request(vec![], None, vec![shell()], None);
+        let request = agent.build_generate_request(vec![], None, vec![shell()], |_| {});
         assert!(
             request
                 .tools

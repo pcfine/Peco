@@ -28,7 +28,7 @@ type ModelTaskHandle = tokio::task::JoinHandle<Result<ModelResponse, AgentError>
 type SharedModelTask = Arc<tokio::sync::Mutex<Option<ModelTaskHandle>>>;
 use serde::{Deserialize, Serialize};
 
-use super::agent::{Agent, MessageFilter, ModelResponse};
+use super::agent::{Agent, MessageFilter, ModelResponse, override_output_budget};
 use super::compaction::{BoundaryReduction, CompactionOutcome};
 use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
@@ -2560,7 +2560,11 @@ impl AgentLooper {
             let budget = self.max_output_tokens_override();
             match self
                 .agent
-                .generate_stream(session_messages, Some(effective_prompt), budget)
+                .generate_stream(
+                    session_messages,
+                    Some(effective_prompt),
+                    override_output_budget(budget),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -2595,7 +2599,12 @@ impl AgentLooper {
             let budget = self.max_output_tokens_override();
             match self
                 .agent
-                .generate_with_tools(session_messages, Some(effective_prompt), tools, budget)
+                .generate_with_tools(
+                    session_messages,
+                    Some(effective_prompt),
+                    tools,
+                    override_output_budget(budget),
+                )
                 .await
             {
                 Ok(response) => {

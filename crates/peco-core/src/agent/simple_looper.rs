@@ -20,7 +20,7 @@ use model_provider::{
     Content, ContentBlock, FinishReason, InputItem, ResponseStatus, Role, ToolCall,
 };
 
-use super::agent::Agent;
+use super::agent::{Agent, override_output_budget};
 use super::error::AgentError;
 use crate::tools::ToolExecutor;
 
@@ -187,12 +187,15 @@ impl SimpleAgentLooper {
                         self.messages.clone(),
                         instructions,
                         tools,
-                        output_budget_override,
+                        override_output_budget(output_budget_override),
                     )
                     .await?
             } else {
                 self.agent
-                    .generate_full(self.messages.clone(), output_budget_override)
+                    .generate_full(
+                        self.messages.clone(),
+                        override_output_budget(output_budget_override),
+                    )
                     .await?
             };
 
