@@ -14,6 +14,9 @@ pub mod types;
 // 核心类型
 pub use types::*;
 
+// 隔离维度与图谱节点 label 的单源定义 —— 下游（如 peco-core）直接复用，避免各写一份
+pub use types::{DEFAULT_SCOPE, ENTITY_NODE_LABEL, namespace_for};
+
 // 错误
 pub use error::KnowledgeError;
 

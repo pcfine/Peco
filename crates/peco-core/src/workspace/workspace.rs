@@ -108,7 +108,7 @@ impl WorkSpace {
         };
 
         let kb_dir = root.join("knowledge");
-        let knowledge_manager = Arc::new(KnowledgeManager::new(kb_dir));
+        let knowledge_manager = Arc::new(KnowledgeManager::with_scope(kb_dir, user_id.clone()));
 
         let agents_dir = root.join("agents");
         let mcp_config_store = McpConfigStore::new(config.mcp.clone());

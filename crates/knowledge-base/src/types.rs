@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::KnowledgeError;
+
 // ---------------------------------------------------------------------------
 // 类型别名
 // ---------------------------------------------------------------------------
@@ -200,6 +202,29 @@ pub fn compute_entity_id(entity_name: &str, entity_type: &str) -> String {
     let hash = sha2::Sha256::digest(input.as_bytes());
     format!("entity:{}:{}", entity_type, hex::encode(&hash[..8]))
 }
+
+/// 图谱（实体）节点的 label —— 写入（`add_facts`）与查询、遍历、删除必须同口径。
+///
+/// HelixDB 要求每个节点有且只有一个 label，写侧与读侧各取一套会让同 id 的节点
+/// 写读错位：`node_exists` 守卫漏选后重复建点，读侧再按另一套 label 取不到。
+pub const ENTITY_NODE_LABEL: &str = "Entity";
+
+/// 知识库命名空间键 `{scope}::{kb_name}` —— 行级隔离的唯一拼装点。
+///
+/// `scope` 去空白后为空即报错：所有库共享同一命名空间会让隔离静默失效，
+/// 宁可 fail loud 也不退化成空前缀。
+pub fn namespace_for(scope: &str, kb_name: &str) -> Result<String, KnowledgeError> {
+    let scope = scope.trim();
+    if scope.is_empty() {
+        return Err(KnowledgeError::InvalidInput(
+            "知识库命名空间需要非空的 scope（工作区/用户标识）".into(),
+        ));
+    }
+    Ok(format!("{scope}::{kb_name}"))
+}
+
+/// 保留旧签名的构造入口（`load` / `new` / `with_config`）注入的默认隔离维度。
+pub const DEFAULT_SCOPE: &str = "default";
 
 /// 文本内容 → 文档 ID（内容寻址：sha256(content) 前 8 字节 → 16 hex 字符）。
 ///
@@ -502,6 +527,18 @@ mod tests {
         let id1 = Fact::compute_id("用户", "prefers", "Rust");
         let id2 = Fact::compute_id("用户", "prefers", "Go");
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn namespace_for_joins_scope_and_kb() {
+        assert_eq!(
+            namespace_for(" user-1 ", "工作记录").unwrap(),
+            "user-1::工作记录"
+        );
+        for blank in ["", "   ", "\t"] {
+            let err = namespace_for(blank, "工作记录").unwrap_err();
+            assert!(matches!(err, KnowledgeError::InvalidInput(_)), "{err:?}");
+        }
     }
 
     #[test]

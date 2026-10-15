@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use super::types::HelixSchema;
+use crate::error::KnowledgeError;
 use crate::traits::combined_search::CombinedQuery;
 use crate::types::{Chunk, Document, SearchFilters};
 
@@ -51,12 +52,79 @@ fn prop_i64(v: i64) -> Value {
     json!({"Value": {"I64": v}})
 }
 
+// ── 隔离谓词 ──────────────────────────────────────────────────────────────
+
+/// `$label` 谓词 —— 节点身份由 id 与 label 共同确定，缺 label 会跨 label 误选。
+fn eq_label(label: &str) -> Value {
+    json!({"Eq": ["$label", {"String": label}]})
+}
+
+/// `ns` 谓词 —— 隔离边界。schema 未绑定命名空间时不产谓词。
+fn eq_ns(ns: Option<&str>) -> Option<Value> {
+    ns.map(|n| json!({"Eq": ["ns", {"String": n}]}))
+}
+
+/// 字符串属性的等值谓词：`id_property` 或任意字符串属性名。
+fn eq_id(id_property: &str, id: &str) -> Value {
+    json!({"Eq": [id_property, {"String": id}]})
+}
+
+/// 合取谓词：单个直接返回该谓词，多个包 `And`（HelixDB 不接受空 `And`，调用方至少给一个）。
+fn and_all(mut predicates: Vec<Value>) -> Value {
+    match predicates.len() {
+        1 => predicates.swap_remove(0),
+        _ => json!({"And": predicates}),
+    }
+}
+
+/// 按 `$label` + `ns` + id 选中节点。
+fn node_by_id(schema: &HelixSchema, label: &str, id: &str) -> Value {
+    let mut predicates = vec![eq_label(label)];
+    predicates.extend(eq_ns(schema.ns.as_deref()));
+    predicates.push(eq_id(&schema.id_property, id));
+    and_all(predicates)
+}
+
+/// 按 `$label` + `ns` 选中一整类节点。
+fn nodes_by_label(schema: &HelixSchema, label: &str) -> Value {
+    let mut predicates = vec![eq_label(label)];
+    predicates.extend(eq_ns(schema.ns.as_deref()));
+    and_all(predicates)
+}
+
+/// 图谱（实体）节点按 id 选中 —— label 与写侧同源于 `schema.graph_node_label`。
+fn graph_node_by_id(schema: &HelixSchema, id: &str) -> Value {
+    node_by_id(schema, &schema.graph_node_label, id)
+}
+
+/// 按 `ns` + id 选中节点，**不**限定 `$label`。
+///
+/// 供边写入的端点选点使用：端点 id 由调用方给出，其 label（实体、文档、分块……）
+/// 这里判不出来。带上 `$label` 一旦与实际端点不符就会选空该端，`AddE` 随即因无源
+/// 顶点报错 —— 事实谓词恰与 `schema.related_edge` 同名时即踩中。
+pub(crate) fn node_by_ns_and_id(schema: &HelixSchema, id: &str) -> Value {
+    let mut predicates: Vec<Value> = eq_ns(schema.ns.as_deref()).into_iter().collect();
+    predicates.push(eq_id(&schema.id_property, id));
+    and_all(predicates)
+}
+
+/// `In` 之后的 `ns` 过滤步骤：`In` 得到的父节点集不继承命中行的过滤条件。
+fn ns_where_step(schema: &HelixSchema) -> Option<Value> {
+    eq_ns(schema.ns.as_deref()).map(|predicate| json!({"Where": predicate}))
+}
+
 // ── 属性构建器 ────────────────────────────────────────────────────────────
 
 /// 构建文档属性数组（v2 AddN `properties` 格式）。
 ///
 /// 返回 `[["key", PropertyValue], ...]` 的元组数组。
-fn document_props(doc: &Document, metadata_json: &str, embedding: &[f32]) -> Value {
+/// `ns` 是隔离键，随节点落库（schema 未绑定命名空间时不写）。
+fn document_props(
+    doc: &Document,
+    metadata_json: &str,
+    embedding: &[f32],
+    ns: Option<&str>,
+) -> Value {
     let mut props: Vec<Value> = vec![
         json!(["id", prop_str(&doc.id)]),
         json!(["title", prop_str(&doc.title)]),
@@ -64,6 +132,10 @@ fn document_props(doc: &Document, metadata_json: &str, embedding: &[f32]) -> Val
         json!(["content", prop_str(&doc.content)]),
         json!(["metadata", prop_str(metadata_json)]),
     ];
+
+    if let Some(ns) = ns {
+        props.push(json!(["ns", prop_str(ns)]));
+    }
 
     // embedding 是可选的 —— 非 Full 存储模式下传入空向量，此时必须整体省略
     // 该属性。空 F32Array 会被向量索引按 0 维处理并拒绝
@@ -76,7 +148,7 @@ fn document_props(doc: &Document, metadata_json: &str, embedding: &[f32]) -> Val
 }
 
 /// 构建分块属性数组（v2 AddN `properties` 格式）。
-fn chunk_props(chunk: &Chunk) -> Value {
+fn chunk_props(chunk: &Chunk, ns: Option<&str>) -> Value {
     let metadata = json!({
         "start_char": chunk.metadata.start_char,
         "end_char": chunk.metadata.end_char,
@@ -90,6 +162,10 @@ fn chunk_props(chunk: &Chunk) -> Value {
         json!(["sequence_index", prop_i64(chunk.sequence_index as i64)]),
         json!(["metadata", prop_str(&metadata.to_string())]),
     ];
+
+    if let Some(ns) = ns {
+        props.push(json!(["ns", prop_str(ns)]));
+    }
 
     // embedding 是可选的 — 非 Full 存储模式（graph_only / text_only）下传入空
     // 向量，此时必须整体省略该属性。空 F32Array 会被向量索引按 0 维处理并拒绝
@@ -108,29 +184,55 @@ fn chunk_props(chunk: &Chunk) -> Value {
 
 // ── 搜索过滤 Where 步骤 ──────────────────────────────────────────────────
 
-/// 构建搜索过滤器 Where 步骤（如果有过滤器）。
-fn filter_step(filters: Option<&SearchFilters>) -> Option<Value> {
-    let f = filters?;
-    let mut predicates = Vec::new();
+/// 构建搜索管道的过滤步骤：`ns` 边界谓词与调用方过滤谓词合取。
+///
+/// `ns` 与过滤谓词都没有时不产步骤 —— 搜索构造器默认返回全量命中。
+/// `file_types` 在 HelixDB 上无对应 AST 原语（镜像不支持 `IsIn`），且全仓库无
+/// 生产者：静默丢弃它会让调用方拿到未过滤的结果，因此显式失败。
+fn filter_step(
+    schema: &HelixSchema,
+    filters: Option<&SearchFilters>,
+) -> Result<Option<Value>, KnowledgeError> {
+    let mut predicates: Vec<Value> = eq_ns(schema.ns.as_deref()).into_iter().collect();
 
-    if let Some(ref doc_ids) = f.document_ids {
-        let ids: Vec<Value> = doc_ids.iter().map(|id| json!({"String": id})).collect();
-        predicates.push(json!({"IsIn": ["document_id", ids]}));
+    if let Some(f) = filters {
+        if let Some(ref doc_ids) = f.document_ids {
+            if doc_ids.is_empty() {
+                return Err(KnowledgeError::InvalidInput(
+                    "document_ids 为空时无法构造过滤谓词".into(),
+                ));
+            }
+            let mut id_predicates: Vec<Value> =
+                doc_ids.iter().map(|id| eq_id("document_id", id)).collect();
+            predicates.push(match id_predicates.len() {
+                1 => id_predicates.swap_remove(0),
+                _ => json!({"Or": id_predicates}),
+            });
+        }
+
+        if f.file_types.is_some() {
+            return Err(KnowledgeError::InvalidInput(
+                "HelixDB 后端不支持 file_types 过滤".into(),
+            ));
+        }
     }
 
-    if let Some(ref file_types) = f.file_types {
-        let types: Vec<Value> = file_types.iter().map(|ft| json!({"String": ft})).collect();
-        // 文件类型存储在 metadata JSON 中 — 此处用简单的相等检查
-        predicates.push(json!({"IsIn": ["metadata", types]}));
-    }
+    Ok(match predicates.len() {
+        0 => None,
+        _ => Some(json!({"Where": and_all(predicates)})),
+    })
+}
 
-    if predicates.is_empty() {
-        None
-    } else if predicates.len() == 1 {
-        Some(json!({"Where": predicates.remove(0)}))
-    } else {
-        Some(json!({"Where": {"And": predicates}}))
+/// 把过滤步骤追加进搜索管道，把 [`filter_step`] 的错误上抛给调用方。
+fn push_filter_step(
+    steps: &mut Vec<Value>,
+    schema: &HelixSchema,
+    filters: Option<&SearchFilters>,
+) -> Result<(), KnowledgeError> {
+    if let Some(step) = filter_step(schema, filters)? {
+        steps.push(step);
     }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -155,7 +257,12 @@ pub fn create_document_node(
                 {"Query": {"name": "doc", "steps": [
                     {"AddN": {
                         "label": schema.content_node_label,
-                        "properties": document_props(doc, metadata_json, embedding)
+                        "properties": document_props(
+                            doc,
+                            metadata_json,
+                            embedding,
+                            schema.ns.as_deref()
+                        )
                     }},
                     {"Project": [{"source": "$id", "alias": "id"}]}
                 ], "condition": null}}
@@ -176,7 +283,7 @@ pub fn create_chunk_node(schema: &HelixSchema, chunk: &Chunk) -> Value {
                 {"Query": {"name": "chunk", "steps": [
                     {"AddN": {
                         "label": schema.fragment_node_label,
-                        "properties": chunk_props(chunk)
+                        "properties": chunk_props(chunk, schema.ns.as_deref())
                     }},
                     {"Project": [{"source": "$id", "alias": "id"}]}
                 ], "condition": null}}
@@ -190,14 +297,20 @@ pub fn create_chunk_node(schema: &HelixSchema, chunk: &Chunk) -> Value {
 ///
 /// `id_property` 承载节点 ID；`properties` 中的其余条目原样写入，
 /// 与 `id_property` 同名的键忽略 —— ID 是节点身份，不允许被普通属性覆盖。
+/// `ns` 同理只认 schema：隔离键不能由调用方伪造，也不能重复写入。
 fn node_props(schema: &HelixSchema, node_id: &str, properties: &HashMap<String, String>) -> Value {
+    let ns = schema.ns.as_deref();
     let mut props: Vec<Value> = vec![json!([schema.id_property, prop_str(node_id)])];
 
     for (key, value) in properties {
-        if key == &schema.id_property {
+        if key == &schema.id_property || (key.as_str() == "ns" && ns.is_some()) {
             continue;
         }
         props.push(json!([key, prop_str(value)]));
+    }
+
+    if let Some(ns) = ns {
+        props.push(json!(["ns", prop_str(ns)]));
     }
 
     Value::Array(props)
@@ -205,13 +318,13 @@ fn node_props(schema: &HelixSchema, node_id: &str, properties: &HashMap<String, 
 
 /// 创建节点（v2 AddN 对象格式），供 `GraphStore::upsert_node` 使用。
 ///
-/// HelixDB 的每个节点只有一个 label（无多标签集），因此 `label` 取
-/// `GraphNode.labels` 的首项。
+/// HelixDB 的每个节点只有一个 label，一律取 `schema.graph_node_label`：
+/// 与读侧（按 id 选点、遍历起点、边两端）同源，否则同 id 的节点写读错位，
+/// `node_exists` 守卫漏选后重复建点。图谱节点只此一类，文档/分块各有专用构造器。
 ///
 /// 写响应的 `$id` 投影同样无人消费（`upsert_node` 丢弃写入返回值），保留原样。
 pub fn create_node(
     schema: &HelixSchema,
-    label: &str,
     node_id: &str,
     properties: &HashMap<String, String>,
 ) -> Value {
@@ -221,7 +334,7 @@ pub fn create_node(
             "queries": [
                 {"Query": {"name": "node", "steps": [
                     {"AddN": {
-                        "label": label,
+                        "label": schema.graph_node_label,
                         "properties": node_props(schema, node_id, properties)
                     }},
                     {"Project": [{"source": "$id", "alias": "id"}]}
@@ -234,15 +347,17 @@ pub fn create_node(
 
 /// 创建 Document → Chunk 的 CONTAINS 边（v2 AddE 对象格式）。
 pub fn create_contains_edge(schema: &HelixSchema, doc_id: &str, chunk_id: &str) -> Value {
+    let doc_match = node_by_id(schema, &schema.content_node_label, doc_id);
+    let chunk_match = node_by_id(schema, &schema.fragment_node_label, chunk_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "doc", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": doc_id}]}}
+                    {"NWhere": doc_match}
                 ], "condition": null}},
                 {"Query": {"name": "chunk", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": chunk_id}]}}
+                    {"NWhere": chunk_match}
                 ], "condition": null}},
                 {"Query": {"name": "edge", "steps": [
                     {"N": {"Var": "doc"}},
@@ -261,15 +376,17 @@ pub fn create_contains_edge(schema: &HelixSchema, doc_id: &str, chunk_id: &str) 
 
 /// 创建 NEXT_CHUNK 边（v2 AddE 对象格式）。
 pub fn create_next_chunk_edge(schema: &HelixSchema, chunk_a_id: &str, chunk_b_id: &str) -> Value {
+    let a_match = node_by_id(schema, &schema.fragment_node_label, chunk_a_id);
+    let b_match = node_by_id(schema, &schema.fragment_node_label, chunk_b_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "a", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": chunk_a_id}]}}
+                    {"NWhere": a_match}
                 ], "condition": null}},
                 {"Query": {"name": "b", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": chunk_b_id}]}}
+                    {"NWhere": b_match}
                 ], "condition": null}},
                 {"Query": {"name": "edge", "steps": [
                     {"N": {"Var": "a"}},
@@ -286,28 +403,34 @@ pub fn create_next_chunk_edge(schema: &HelixSchema, chunk_a_id: &str, chunk_b_id
     })
 }
 
-/// 创建 RELATED_TO 边（v2 AddE 对象格式）。
-pub fn create_related_to_edge(
+/// 创建一条带 weight 的边，两端按 `ns` + id 选点（与 label 无关）。
+///
+/// 端点 id 由调用方语义决定其 label（实体、文档……），本构造器无从判断，
+/// 因此不能加 `$label` 谓词 —— 加错会选空端点，`AddE` 随即因无源顶点报错。
+pub(crate) fn create_labeled_edge(
     schema: &HelixSchema,
-    doc_id: &str,
-    other_id: &str,
+    from_id: &str,
+    to_id: &str,
+    label: &str,
     weight: f64,
 ) -> Value {
+    let from_match = node_by_ns_and_id(schema, from_id);
+    let to_match = node_by_ns_and_id(schema, to_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
-                {"Query": {"name": "doc", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": doc_id}]}}
+                {"Query": {"name": "src", "steps": [
+                    {"NWhere": from_match}
                 ], "condition": null}},
-                {"Query": {"name": "other", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": other_id}]}}
+                {"Query": {"name": "tgt", "steps": [
+                    {"NWhere": to_match}
                 ], "condition": null}},
                 {"Query": {"name": "edge", "steps": [
-                    {"N": {"Var": "doc"}},
+                    {"N": {"Var": "src"}},
                     {"AddE": {
-                        "label": schema.related_edge,
-                        "to": {"Var": "other"},
+                        "label": label,
+                        "to": {"Var": "tgt"},
                         "properties": [["weight", prop_f64(weight)]]
                     }},
                     {"Count": null}
@@ -318,14 +441,25 @@ pub fn create_related_to_edge(
     })
 }
 
+/// 创建 RELATED_TO 边（v2 AddE 对象格式）。
+pub fn create_related_to_edge(
+    schema: &HelixSchema,
+    from_id: &str,
+    to_id: &str,
+    weight: f64,
+) -> Value {
+    create_labeled_edge(schema, from_id, to_id, &schema.related_edge, weight)
+}
+
 /// 级联删除文档及其所有分块和关联边。
 pub fn delete_document_cascade(schema: &HelixSchema, doc_id: &str) -> Value {
+    let doc_match = node_by_id(schema, &schema.content_node_label, doc_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "doc", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": doc_id}]}}
+                    {"NWhere": doc_match}
                 ], "condition": null}},
                 {"Query": {"name": "chunks", "steps": [
                     {"N": {"Var": "doc"}},
@@ -349,12 +483,13 @@ pub fn delete_document_cascade(schema: &HelixSchema, doc_id: &str) -> Value {
 
 /// 通过 ID 删除单个 Chunk 节点。
 pub fn delete_chunk_by_id(schema: &HelixSchema, chunk_id: &str) -> Value {
+    let chunk_match = node_by_id(schema, &schema.fragment_node_label, chunk_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "dropped", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": chunk_id}]}},
+                    {"NWhere": chunk_match},
                     {"Drop": null},
                     {"Count": null}
                 ], "condition": null}}
@@ -369,12 +504,13 @@ pub fn delete_chunk_by_id(schema: &HelixSchema, chunk_id: &str) -> Value {
 /// SetProperty 在 v2 中仍为 `[prop_name, PropertyValue]` 二元数组，
 /// 但值须包装为 `{"Value": {...}}` 格式。
 pub fn update_chunk_embedding(schema: &HelixSchema, chunk_id: &str, embedding: &[f32]) -> Value {
+    let chunk_match = node_by_id(schema, &schema.fragment_node_label, chunk_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "updated", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": chunk_id}]}},
+                    {"NWhere": chunk_match},
                     {"SetProperty": [schema.fragment_vector_property, prop_f32_array(embedding)]},
                     {"Count": null}
                 ], "condition": null}}
@@ -394,9 +530,9 @@ pub fn vector_search_chunks(
     query_vec: &[f32],
     top_k: u32,
     filters: Option<&SearchFilters>,
-) -> Value {
-    let steps = build_vector_search_steps(schema, query_vec, top_k, filters);
-    json!({
+) -> Result<Value, KnowledgeError> {
+    let steps = build_vector_search_steps(schema, query_vec, top_k, filters)?;
+    Ok(json!({
         "request_type": "read",
         "query": {
             "queries": [
@@ -404,16 +540,19 @@ pub fn vector_search_chunks(
             ],
             "returns": ["results"]
         }
-    })
+    }))
 }
 
 /// 构建向量搜索步骤列表。
+///
+/// 向量检索不认过滤条件，命中集必须在检索步骤之后按 `ns` 与调用方过滤谓词收窄
+/// 一次，否则跨库命中会直接进入结果。
 fn build_vector_search_steps(
     schema: &HelixSchema,
     query_vec: &[f32],
     top_k: u32,
     filters: Option<&SearchFilters>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, KnowledgeError> {
     let mut steps: Vec<Value> = vec![json!({
         "VectorSearchNodes": {
             "label": schema.fragment_node_label,
@@ -423,9 +562,7 @@ fn build_vector_search_steps(
         }
     })];
 
-    if let Some(filter_step) = filter_step(filters) {
-        steps.push(filter_step);
-    }
+    push_filter_step(&mut steps, schema, filters)?;
 
     // `chunk_id` 这里是**内部** `$id`，刻意不取 `id_property`：它只在引擎内部
     // 流转，交给 `GraphStore::expand` 做 `N: {"Ids": [...]}` 定位，而 `Ids` 只
@@ -438,16 +575,18 @@ fn build_vector_search_steps(
         {"source": "$distance", "alias": "score"}
     ]}));
 
-    steps
+    Ok(steps)
 }
 
 /// 全文搜索分块（v2 TextSearchNodes 对象格式）。
+///
+/// 命中集同样在检索步骤之后按 `ns` 与过滤谓词收窄。
 pub fn text_search_chunks(
     schema: &HelixSchema,
     query_text: &str,
     top_k: u32,
     filters: Option<&SearchFilters>,
-) -> Value {
+) -> Result<Value, KnowledgeError> {
     let mut steps: Vec<Value> = vec![json!({
         "TextSearchNodes": {
             "label": schema.fragment_node_label,
@@ -457,9 +596,7 @@ pub fn text_search_chunks(
         }
     })];
 
-    if let Some(filter_step) = filter_step(filters) {
-        steps.push(filter_step);
-    }
+    push_filter_step(&mut steps, schema, filters)?;
 
     // `chunk_id` 同为内部 `$id`，理由见 `build_vector_search_steps`。
     steps.push(json!({"Project": [
@@ -469,7 +606,7 @@ pub fn text_search_chunks(
         {"source": "$distance", "alias": "score"}
     ]}));
 
-    json!({
+    Ok(json!({
         "request_type": "read",
         "query": {
             "queries": [
@@ -477,7 +614,7 @@ pub fn text_search_chunks(
             ],
             "returns": ["results"]
         }
-    })
+    }))
 }
 
 /// 按 ID 获取文档。
@@ -486,12 +623,13 @@ pub fn text_search_chunks(
 /// `delete_document_cascade` / `delete_chunk_by_id` 的匹配口径保持一致 ——
 /// 否则读回来的 `Document.id` 是内部自增整数，回传给删除接口必然 `NotFound`。
 pub fn get_document_by_id(schema: &HelixSchema, doc_id: &str) -> Value {
+    let doc_match = node_by_id(schema, &schema.content_node_label, doc_id);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "doc", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": doc_id}]}},
+                    {"NWhere": doc_match},
                     {"Project": [
                         {"source": schema.id_property, "alias": "id"},
                         {"source": "title", "alias": "title"},
@@ -517,12 +655,13 @@ pub fn get_document_by_id(schema: &HelixSchema, doc_id: &str) -> Value {
 /// 那两处的 id 供 `GraphStore::expand` 做 `N: {"Ids": [...]}` 定位，**必须**
 /// 是内部 `$id`。
 pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
+    let doc_match = node_by_id(schema, &schema.content_node_label, doc_id);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "doc", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": doc_id}]}}
+                    {"NWhere": doc_match}
                 ], "condition": null}},
                 {"Query": {"name": "chunks", "steps": [
                     {"N": {"Var": "doc"}},
@@ -544,9 +683,7 @@ pub fn get_document_chunks(schema: &HelixSchema, doc_id: &str) -> Value {
 
 /// 分页列出文档（v2: NWithLabel → NWhere + $label 等式）。
 ///
-/// 委托 [`list_documents_filtered`] 且 `source = None` ⇒ AST 与 v2 逐字相同
-/// （首步骤为 `NWhere.Eq:$label`，**无** `And` 包裹）—— 既有形状单测与线上行为
-/// 均不受 `source` 扩展影响。
+/// 委托 [`list_documents_filtered`] 且 `source = None`。
 pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Value {
     list_documents_filtered(schema, offset, limit, None)
 }
@@ -557,22 +694,20 @@ pub fn list_documents(schema: &HelixSchema, offset: usize, limit: usize) -> Valu
 /// 与 `get_document_by_id` / `delete_document_cascade` 的匹配口径保持一致 ——
 /// 否则列表返回的 ID 无法回传给删除接口。
 ///
-/// `source = None` ⇒ 首步骤 `NWhere.Eq:$label`（与既有 `list_documents` 逐字相同）；
-/// `source = Some(s)` ⇒ 首步骤 `NWhere.And:[Eq:$label, Eq:source_path=s]`。
-/// 过滤在 `Skip`/`Limit` **之前**下推 ⇒ `offset` 是「过滤后的偏移」。
+/// 首步骤按 `$label`（绑定命名空间时再加 `ns`）选文档，`source = Some(s)` 追加
+/// `source_path` 等式。过滤在 `Skip`/`Limit` **之前**下推 ⇒ `offset` 是「过滤后的偏移」。
 pub fn list_documents_filtered(
     schema: &HelixSchema,
     offset: usize,
     limit: usize,
     source: Option<&str>,
 ) -> Value {
-    let node_match = match source {
-        None => json!({"Eq": ["$label", {"String": schema.content_node_label}]}),
-        Some(s) => json!({"And": [
-            {"Eq": ["$label", {"String": schema.content_node_label}]},
-            {"Eq": ["source_path", {"String": s}]}
-        ]}),
-    };
+    let mut predicates = vec![eq_label(&schema.content_node_label)];
+    predicates.extend(eq_ns(schema.ns.as_deref()));
+    if let Some(s) = source {
+        predicates.push(eq_id("source_path", s));
+    }
+    let node_match = and_all(predicates);
 
     json!({
         "request_type": "read",
@@ -597,16 +732,17 @@ pub fn list_documents_filtered(
 
 /// 全量扫描文档（E4）：取回至多 `limit` 条 `Document`（**含正文 + metadata**）。
 ///
-/// 一次只读查询：`NWhere.Eq:$label` → `Limit` → `Project(id,title,source_path,content,metadata)`。
+/// 一次只读查询：`NWhere($label[, ns])` → `Limit` → `Project(id,title,source_path,content,metadata)`。
 /// **不做**分页 `Skip`，投影含 `content`（同 `get_document_by_id` 的正文属性口径）——
 /// 这是「中文全文索引不可用」的替代机制所需的取数原语。
 pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value {
+    let doc_match = nodes_by_label(schema, &schema.content_node_label);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "docs", "steps": [
-                    {"NWhere": {"Eq": ["$label", {"String": schema.content_node_label}]}},
+                    {"NWhere": doc_match},
                     {"Limit": limit},
                     {"Project": [
                         {"source": schema.id_property, "alias": "id"},
@@ -628,9 +764,9 @@ pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value 
 /// 方案都会让「节点集」与「边集」来自不同快照，无法保证子图闭合。
 ///
 /// 形状（只读实测）：
-/// 1. `nodes` —— `NWhere{$label=<label>} → Project($id, id_property, name)`：
+/// 1. `nodes` —— `NWhere{$label=<label>[, ns]} → Project($id, id_property, name)`：
 ///    同时投影内部 `$id`（关联键）与稳定 `id_property`（对外身份）；
-/// 2. `edges` —— `NWhere{$label=<label>} → OutE:null → EdgeProperties:null`：
+/// 2. `edges` —— `NWhere{$label=<label>[, ns]} → OutE:null → EdgeProperties:null`：
 ///    从**全部命中节点**扇出（`NWhere` 多命中的既定语义），返回每条出边的
 ///    `$label` 与端点内部 `$id`。
 ///
@@ -639,12 +775,13 @@ pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value 
 /// 只发 `OutE` 一条：子图闭合要求两端皆该 label 的节点，而 `OutE` 从全部该 label
 /// 节点扇出即已覆盖全部两端命中的边，`InE` 冗余。
 pub fn list_subgraph(schema: &HelixSchema, label: &str) -> Value {
+    let node_match = nodes_by_label(schema, label);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "nodes", "steps": [
-                    {"NWhere": {"Eq": ["$label", {"String": label}]}},
+                    {"NWhere": node_match},
                     {"Project": [
                         {"source": "$id", "alias": "internal_id"},
                         {"source": schema.id_property, "alias": "node_id"},
@@ -652,7 +789,7 @@ pub fn list_subgraph(schema: &HelixSchema, label: &str) -> Value {
                     ]}
                 ], "condition": null}},
                 {"Query": {"name": "edges", "steps": [
-                    {"NWhere": {"Eq": ["$label", {"String": label}]}},
+                    {"NWhere": node_match},
                     {"OutE": null},
                     {"EdgeProperties": null}
                 ], "condition": null}}
@@ -666,13 +803,16 @@ pub fn list_subgraph(schema: &HelixSchema, label: &str) -> Value {
 ///
 /// 投影 `id_property` 而非内置 `$id`，与 `upsert_node` 写入的 ID 口径一致。
 /// 仅投影 `name` —— HelixDB 的投影需要显式列名，无法在此投影未知的属性集合。
+///
+/// `$label` 取 `schema.graph_node_label`：与写侧同源，否则 id 相同也会读不到。
 pub fn get_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
+    let node_match = graph_node_by_id(schema, node_id);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "node", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": node_id}]}},
+                    {"NWhere": node_match},
                     {"Limit": 1},
                     {"Project": [
                         {"source": schema.id_property, "alias": "id"},
@@ -689,13 +829,16 @@ pub fn get_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
 /// 按 ID 统计节点数量 —— `node_exists` 的存在性探针。
 ///
 /// 用 Count 而非投影，避免为了判断存在而取回节点属性。
+///
+/// `$label` 同 [`get_node_by_id`]，取 `schema.graph_node_label`。
 pub fn count_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
+    let node_match = graph_node_by_id(schema, node_id);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "count", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": node_id}]}},
+                    {"NWhere": node_match},
                     {"Count": null}
                 ], "condition": null}}
             ],
@@ -704,14 +847,15 @@ pub fn count_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
     })
 }
 
-/// 统计节点数量（v2: NWithLabel → NWhere + $label 等式）。
-pub fn count_nodes(_schema: &HelixSchema, label: &str) -> Value {
+/// 统计节点数量（v2: NWithLabel → NWhere + $label 等式），只数当前命名空间。
+pub fn count_nodes(schema: &HelixSchema, label: &str) -> Value {
+    let node_match = nodes_by_label(schema, label);
     json!({
         "request_type": "read",
         "query": {
             "queries": [
                 {"Query": {"name": "count", "steps": [
-                    {"NWhere": {"Eq": ["$label", {"String": label}]}},
+                    {"NWhere": node_match},
                     {"Count": null}
                 ], "condition": null}}
             ],
@@ -740,6 +884,9 @@ pub fn count_nodes(_schema: &HelixSchema, label: &str) -> Value {
 /// 它到起点的最短跳数。所有层装在**同一个 read batch** 里，不增加 HTTP 往返次数，
 /// 代价是同批 N 条子查询（N = `max_depth`，实际通常 2~3）。
 ///
+/// 起点按 `$label`（`schema.graph_node_label`）+ `ns` + id 选中，避免同 id 的
+/// 跨库节点被一起遍历。
+///
 /// 起点内联在每条层查询里（不再单发 `start` 查询）；`emit: "All"` 会把起点自己
 /// 也放进每一层，由解析侧按 `start_node_id` 过滤。
 pub fn traverse_graph(
@@ -759,13 +906,14 @@ pub fn traverse_graph(
         _ => json!({"Out": label}),
     };
 
+    let start_match = graph_node_by_id(schema, start_node_id);
     let mut queries = Vec::with_capacity(max_depth as usize);
     let mut returns = Vec::with_capacity(max_depth as usize);
     for depth in 1..=max_depth {
         let name = depth_query_name(depth);
         returns.push(name.clone());
         queries.push(json!({"Query": {"name": name, "steps": [
-            {"NWhere": {"Eq": [schema.id_property, {"String": start_node_id}]}},
+            {"NWhere": start_match.clone()},
             {"Repeat": {
                 "traversal": {"steps": [dir_step.clone()]},
                 "max_depth": depth,
@@ -850,6 +998,7 @@ fn labeled_edge_batch(
     node_step: &str,
     edge_label: Option<&str>,
 ) -> Value {
+    let start_match = graph_node_by_id(schema, start_node_id);
     let label = match edge_label {
         Some(l) => json!(l),
         None => Value::Null,
@@ -859,7 +1008,7 @@ fn labeled_edge_batch(
         "query": {
             "queries": [
                 {"Query": {"name": "start", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": start_node_id}]}}
+                    {"NWhere": start_match}
                 ], "condition": null}},
                 {"Query": {"name": "edges", "steps": [
                     {"N": {"Var": "start"}},
@@ -887,7 +1036,8 @@ fn labeled_edge_batch(
 /// 删除 `from_id` 沿 `label` 指向 `to_id` 的一条边（同一标签的并行边**全部**删除）。
 ///
 /// 这是 HelixDB 上唯一「单轮往返、且无需预先知道任何内部 id」的删边形式：
-/// `s` / `t` 都由 `NWhere` 按稳定内容哈希 id 选中，与 `compute_entity_id` 直接对接。
+/// `s` / `t` 都由 `NWhere` 按 `$label`（`schema.graph_node_label`）+ `ns` + 稳定内容
+/// 哈希 id 选中，与 `compute_entity_id` 直接对接。
 ///
 /// ## 为什么不用写响应的 `Count`
 ///
@@ -906,15 +1056,17 @@ fn labeled_edge_batch(
 /// 且它**不能**作为源步骤（`Invalid source step`），前面必须先是 `N(Var)`。
 /// 目标不存在时是静默 no-op（不会退化成通配误删）。
 pub fn drop_edge_between(schema: &HelixSchema, from_id: &str, to_id: &str, label: &str) -> Value {
+    let from_match = graph_node_by_id(schema, from_id);
+    let to_match = graph_node_by_id(schema, to_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "s", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": from_id}]}}
+                    {"NWhere": from_match}
                 ], "condition": null}},
                 {"Query": {"name": "t", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": to_id}]}}
+                    {"NWhere": to_match}
                 ], "condition": null}},
                 {"Query": {"name": "d", "steps": [
                     {"N": {"Var": "s"}},
@@ -927,7 +1079,7 @@ pub fn drop_edge_between(schema: &HelixSchema, from_id: &str, to_id: &str, label
     })
 }
 
-/// 删除单个节点（`NWhere(id) → Drop`）。
+/// 删除单个节点（`NWhere($label + ns + id) → Drop`）。
 ///
 /// HelixDB 的 `Drop` **自动级联删除该节点双向的全部关联边**，无需先删边；响应
 /// `count` 恒为 `0`（节点被删后流为空），因此删除数同样只能由调用方「删前先读」
@@ -936,12 +1088,13 @@ pub fn drop_edge_between(schema: &HelixSchema, from_id: &str, to_id: &str, label
 /// `NWhere` 命中同 id 的多个重复顶点时会**全部**删除（`AddN` 无 MERGE 语义，
 /// 同 id 多顶点是已知现象）。
 pub fn remove_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
+    let node_match = graph_node_by_id(schema, node_id);
     json!({
         "request_type": "write",
         "query": {
             "queries": [
                 {"Query": {"name": "d", "steps": [
-                    {"NWhere": {"Eq": [schema.id_property, {"String": node_id}]}},
+                    {"NWhere": node_match},
                     {"Drop": null},
                     {"Count": null}
                 ], "condition": null}}
@@ -956,6 +1109,8 @@ pub fn remove_node_by_id(schema: &HelixSchema, node_id: &str) -> Value {
 /// 分块 ID 是 HelixDB 内部 `$id`（自增整数，以数字字符串形式传入）。
 /// 使用 `N: {"Ids": [id1, id2, ...]}` 一步选中所有分块节点，
 /// 然后沿 CONTAINS 入边找到各自的父文档，再做图扩展。
+///
+/// `In` 之后的流不继承命中行的过滤条件，父文档集必须再按 `ns` 滤一次。
 pub fn expand_from_chunks(
     schema: &HelixSchema,
     chunk_ids: &[String],
@@ -972,8 +1127,9 @@ pub fn expand_from_chunks(
     let mut steps: Vec<Value> = vec![
         json!({"N": {"Ids": chunk_i64_ids}}),
         json!({"In": schema.contains_edge}),
-        json!({"Dedup": null}),
     ];
+    steps.extend(ns_where_step(schema));
+    steps.push(json!({"Dedup": null}));
 
     // 在父文档之间做图扩展
     if max_depth > 0 && !edge_labels.is_empty() {
@@ -1026,7 +1182,10 @@ pub fn expand_from_chunks(
 /// 2. `text_path` — 全文搜索 → 找父文档 → 图扩展
 ///
 /// 每条管道自包含，不跨 varAs 引用。
-pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Value {
+pub fn combined_search_query(
+    schema: &HelixSchema,
+    query: &CombinedQuery,
+) -> Result<Value, KnowledgeError> {
     let graph_depth = query.graph_expansion_depth;
     let related = &schema.related_edge;
     let belongs = &schema.belongs_to_edge;
@@ -1041,11 +1200,7 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
         }
     })];
 
-    if let Some(ref f) = query.filters
-        && let Some(filter_step) = filter_step(Some(f))
-    {
-        vector_steps.push(filter_step);
-    }
+    push_filter_step(&mut vector_steps, schema, query.filters.as_ref())?;
 
     // 投影命中分块（`chunk_id` 仅作「这一行是命中行」的判别位，取内部 `$id`
     // 与本路径其余分块 id 口径一致）
@@ -1069,11 +1224,7 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
         }
     })];
 
-    if let Some(ref f) = query.filters
-        && let Some(filter_step) = filter_step(Some(f))
-    {
-        text_steps.push(filter_step);
-    }
+    push_filter_step(&mut text_steps, schema, query.filters.as_ref())?;
 
     // 投影命中分块（同上，`chunk_id` 仅作判别位）
     text_steps.push(json!({"Project": [
@@ -1086,7 +1237,7 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
     // In CONTAINS → 找父文档 → 图扩展
     add_graph_expansion_steps(&mut text_steps, schema, graph_depth, related, belongs);
 
-    json!({
+    Ok(json!({
         "request_type": "read",
         "query_name": "combined_search",
         "query": {
@@ -1096,7 +1247,7 @@ pub fn combined_search_query(schema: &HelixSchema, query: &CombinedQuery) -> Val
             ],
             "returns": ["vector_path", "text_path"]
         }
-    })
+    }))
 }
 
 /// 向管道追加「In CONTAINS → 去重 → Repeat 图扩展 → 去重 → 投影文档字段」步骤。
@@ -1109,6 +1260,8 @@ fn add_graph_expansion_steps(
 ) {
     // In CONTAINS: 从命中分块沿入边找到父文档
     steps.push(json!({"In": schema.contains_edge}));
+    // `In` 之后的流不继承命中行的过滤条件，父文档集必须再按 `ns` 滤一次
+    steps.extend(ns_where_step(schema));
     steps.push(json!({"Dedup": null}));
 
     // 如果 depth > 0，做多跳图扩展
@@ -1140,6 +1293,56 @@ fn add_graph_expansion_steps(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 构造器名册
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 产 AST（`Value`）的查询构造器 —— 每个都必须带 `ns` 隔离谓词或 `ns` 节点属性。
+///
+/// 单测据此逐构造器断言，并与源码里的 `^pub fn` 双向对齐：新增、改名或漏登记
+/// 构造器都会让 T1 变红。
+#[cfg(test)]
+pub const QUERY_CONSTRUCTORS: &[&str] = &[
+    "create_document_node",
+    "create_chunk_node",
+    "create_node",
+    "create_contains_edge",
+    "create_next_chunk_edge",
+    "create_related_to_edge",
+    "delete_document_cascade",
+    "delete_chunk_by_id",
+    "update_chunk_embedding",
+    "vector_search_chunks",
+    "text_search_chunks",
+    "get_document_by_id",
+    "get_document_chunks",
+    "list_documents",
+    "list_documents_filtered",
+    "list_documents_with_content",
+    "list_subgraph",
+    "get_node_by_id",
+    "count_node_by_id",
+    "count_nodes",
+    "traverse_graph",
+    "adjacent_labeled_nodes",
+    "edges_between_nodes",
+    "drop_edge_between",
+    "remove_node_by_id",
+    "expand_from_chunks",
+    "combined_search_query",
+];
+
+/// 不产 AST 的公开函数。
+#[cfg(test)]
+pub const NON_QUERY_CONSTRUCTORS: &[&str] = &["depth_query_name"];
+
+/// 允许不带 `ns` 的函数及理由 —— 恰好等于 [`NON_QUERY_CONSTRUCTORS`]。
+#[cfg(test)]
+pub const NO_NS_REASON: &[(&str, &str)] = &[(
+    "depth_query_name",
+    "只返回层名 `d{n}` 字符串，不产查询、不触库",
+)];
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 测试
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1155,7 +1358,7 @@ mod tests {
 
     #[test]
     fn build_vector_search_query() {
-        let q = vector_search_chunks(&test_schema(), &[0.1, 0.2, 0.3], 10, None);
+        let q = vector_search_chunks(&test_schema(), &[0.1, 0.2, 0.3], 10, None).unwrap();
         assert_eq!(q["request_type"], "read");
         let queries = q["query"]["queries"].as_array().unwrap();
         assert_eq!(queries.len(), 1);
@@ -1175,7 +1378,7 @@ mod tests {
 
     #[test]
     fn build_text_search_query() {
-        let q = text_search_chunks(&test_schema(), "test query", 5, None);
+        let q = text_search_chunks(&test_schema(), "test query", 5, None).unwrap();
         assert_eq!(q["request_type"], "read");
         let steps = q["query"]["queries"][0]["Query"]["steps"]
             .as_array()
@@ -1199,7 +1402,7 @@ mod tests {
             fusion: RrfConfig::default(),
             filters: None,
         };
-        let q = combined_search_query(&test_schema(), &cq);
+        let q = combined_search_query(&test_schema(), &cq).unwrap();
         assert_eq!(q["request_type"], "read");
         assert_eq!(q["query_name"], "combined_search");
         let queries = q["query"]["queries"].as_array().unwrap();
@@ -1233,7 +1436,7 @@ mod tests {
             fusion: RrfConfig::default(),
             filters: None,
         };
-        let q = combined_search_query(&test_schema(), &cq);
+        let q = combined_search_query(&test_schema(), &cq).unwrap();
         let vsteps = q["query"]["queries"][0]["Query"]["steps"]
             .as_array()
             .unwrap();
@@ -1266,6 +1469,26 @@ mod tests {
         // delete cascade
         let q = delete_document_cascade(&s, "doc-1");
         assert_eq!(q["request_type"], "write");
+    }
+
+    /// 结构边（`CONTAINS` / `NEXT_CHUNK`）两端 label 不同，端点选点必须与 label 无关：
+    /// 带上 `$label` 会把另一端的节点选空，`AddE` 随即报「requires at least one
+    /// source vertex」。
+    #[test]
+    fn node_by_ns_and_id_ignores_label() {
+        assert_eq!(
+            node_by_ns_and_id(&scoped_schema(), "doc-1"),
+            json!({"And": [
+                {"Eq": ["ns", {"String": SENTINEL_NS}]},
+                {"Eq": ["id", {"String": "doc-1"}]}
+            ]})
+        );
+
+        // 未绑定命名空间时退化为单谓词，与隔离前的形状一致。
+        assert_eq!(
+            node_by_ns_and_id(&test_schema(), "doc-1"),
+            json!({"Eq": ["id", {"String": "doc-1"}]})
+        );
     }
 
     #[test]
@@ -1364,20 +1587,31 @@ mod tests {
             document_ids: Some(vec!["doc-a".into(), "doc-b".into()]),
             file_types: None,
         };
-        let step = filter_step(Some(&filters));
-        assert!(step.is_some());
-        let step_val = step.unwrap();
-        assert!(step_val.as_object().unwrap().contains_key("Where"));
+        let step = filter_step(&test_schema(), Some(&filters))
+            .expect("多元素只是 Or，不是错误")
+            .expect("有过滤谓词就应有 Where");
+        assert_eq!(
+            step,
+            json!({"Where": {"Or": [
+                {"Eq": ["document_id", {"String": "doc-a"}]},
+                {"Eq": ["document_id", {"String": "doc-b"}]}
+            ]}})
+        );
     }
 
     #[test]
     fn filter_none_returns_none() {
-        assert!(filter_step(None).is_none());
+        assert!(filter_step(&test_schema(), None).unwrap().is_none());
     }
 
     #[test]
     fn filter_empty_returns_none() {
-        assert!(filter_step(Some(&SearchFilters::default())).is_none());
+        let filters = SearchFilters::default();
+        assert!(
+            filter_step(&test_schema(), Some(&filters))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// ④ 空 embedding（graph_only / text_only 存储模式）必须整体省略该属性 ——
@@ -1569,13 +1803,13 @@ mod tests {
         assert_eq!(project[0]["source"], "doc_id");
     }
 
-    /// ① `upsert_node` 的建节点查询：v2 AddN 对象格式、label 显式给出、
+    /// ① `upsert_node` 的建节点查询：v2 AddN 对象格式、label 取自 schema、
     /// `id_property` 承载节点 ID。
     #[test]
     fn create_node_uses_v2_addn_with_id_property() {
         let s = test_schema();
         let props = HashMap::from([("name".to_string(), "小C".to_string())]);
-        let q = create_node(&s, "Entity", "entity:Entity:abcd1234", &props);
+        let q = create_node(&s, "entity:Entity:abcd1234", &props);
         assert_eq!(q["request_type"], "write");
 
         let addn = &q["query"]["queries"][0]["Query"]["steps"][0]["AddN"];
@@ -1595,6 +1829,21 @@ mod tests {
         assert_eq!(name[1]["Value"]["String"], "小C");
     }
 
+    /// ① label 与读侧同源：`create_node` 恒取 `schema.graph_node_label`。
+    ///
+    /// 把 label 写死成常量（如 `"Entity"`）会让自定义 label 的 schema 写读错位，
+    /// 本断言正是该回归的守卫。
+    #[test]
+    fn create_node_label_comes_from_schema() {
+        let s = HelixSchema {
+            graph_node_label: "Person".into(),
+            ..HelixSchema::default()
+        };
+        let q = create_node(&s, "entity:Person:abcd1234", &HashMap::new());
+        let addn = &q["query"]["queries"][0]["Query"]["steps"][0]["AddN"];
+        assert_eq!(addn["label"], "Person");
+    }
+
     /// ① 属性里出现与 `id_property` 同名的键时，不允许覆盖节点身份。
     #[test]
     fn create_node_id_property_cannot_be_overridden() {
@@ -1603,7 +1852,7 @@ mod tests {
             ("id".to_string(), "伪造的-id".to_string()),
             ("name".to_string(), "小C".to_string()),
         ]);
-        let q = create_node(&s, "Entity", "entity:Entity:abcd1234", &props);
+        let q = create_node(&s, "entity:Entity:abcd1234", &props);
         let pairs = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
             .as_array()
             .unwrap()
@@ -1625,8 +1874,12 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(
-            steps[0]["NWhere"]["Eq"][0], "id",
-            "应按 id_property 匹配而非内置 $id"
+            steps[0]["NWhere"],
+            json!({"And": [
+                {"Eq": ["$label", {"String": "Entity"}]},
+                {"Eq": ["id", {"String": "entity:Entity:abcd1234"}]}
+            ]}),
+            "应按 id_property 匹配而非内置 $id，且 label 与写侧同源"
         );
         let project = steps
             .iter()
@@ -1638,7 +1891,13 @@ mod tests {
         let steps = q["query"]["queries"][0]["Query"]["steps"]
             .as_array()
             .unwrap();
-        assert_eq!(steps[0]["NWhere"]["Eq"][0], "id");
+        assert_eq!(
+            steps[0]["NWhere"],
+            json!({"And": [
+                {"Eq": ["$label", {"String": "Entity"}]},
+                {"Eq": ["id", {"String": "entity:Entity:abcd1234"}]}
+            ]})
+        );
         assert!(
             steps
                 .iter()
@@ -1676,7 +1935,10 @@ mod tests {
             assert_eq!(query["Query"]["name"], depth_query_name(depth));
             assert_eq!(
                 query["Query"]["steps"][0],
-                json!({"NWhere": {"Eq": ["id", {"String": "entity:Entity:abc"}]}})
+                json!({"NWhere": {"And": [
+                    {"Eq": ["$label", {"String": "Entity"}]},
+                    {"Eq": ["id", {"String": "entity:Entity:abc"}]}
+                ]}})
             );
             assert_eq!(query["Query"]["steps"][1]["Repeat"]["max_depth"], depth);
         }
@@ -1733,5 +1995,632 @@ mod tests {
         );
         assert_eq!(esteps[1], json!({"OutE": null}), "null 才是通配，空串不是");
         assert_eq!(esteps[2], json!({"EdgeProperties": null}));
+    }
+    // ── T1：逐构造器隔离断言 ────────────────────────────────────────────────
+
+    /// T1 的哨兵命名空间：非空，且与任何默认值都不同。
+    const SENTINEL_NS: &str = "sentinel::ns";
+
+    fn scoped_schema() -> HelixSchema {
+        HelixSchema {
+            ns: Some(SENTINEL_NS.into()),
+            ..HelixSchema::default()
+        }
+    }
+
+    fn sample_doc() -> Document {
+        Document {
+            id: "doc-1".into(),
+            kb_id: None,
+            title: "标题".into(),
+            source_path: "ppa_profile".into(),
+            content: "正文".into(),
+            metadata: Default::default(),
+        }
+    }
+
+    fn sample_chunk() -> Chunk {
+        Chunk {
+            id: "chunk-1".into(),
+            document_id: "doc-1".into(),
+            text: "分块".into(),
+            sequence_index: 0,
+            page_number: None,
+            embedding: vec![0.1],
+            metadata: ChunkMetadata::default(),
+        }
+    }
+
+    fn sample_combined_query() -> CombinedQuery {
+        CombinedQuery {
+            query_text: "q".into(),
+            query_vector: vec![0.1, 0.2],
+            vector_top_k: 5,
+            text_top_k: 5,
+            graph_expansion_depth: 1,
+            graph_edge_types: vec![],
+            fusion: RrfConfig::default(),
+            filters: None,
+        }
+    }
+
+    /// `ns` 应当落在 AST 的哪一类位置上。
+    #[derive(Clone, Copy)]
+    enum NsPlace {
+        /// 每个 `NWhere` 的谓词都要含 `ns`（按 id / 按 label 选点）。
+        NWhere,
+        /// 这些标记步骤之后要出现带 `ns` 的 `Where`。
+        After(&'static [&'static str]),
+        /// `AddN` 的节点属性里要含 `ns`（写入类）。
+        Property,
+    }
+
+    struct Fixture {
+        name: &'static str,
+        /// 每个元素是该构造器的一种输入形态（两分支的构造器给出两条）。
+        build: fn(&HelixSchema) -> Vec<Value>,
+        ns_place: NsPlace,
+        /// 期望出现在 `Eq $label` 里的节点标签；空 ⇒ 该构造器不按 `$label` 选点。
+        labels: &'static [&'static str],
+    }
+
+    /// 逐构造器 fixture —— [`fixtures_cover_every_constructor`] 保证与名册一一对应。
+    fn fixtures() -> Vec<Fixture> {
+        vec![
+            Fixture {
+                name: "create_document_node",
+                build: |s| vec![create_document_node(s, &sample_doc(), "{}", &[0.1, 0.2])],
+                ns_place: NsPlace::Property,
+                labels: &[],
+            },
+            Fixture {
+                name: "create_chunk_node",
+                build: |s| vec![create_chunk_node(s, &sample_chunk())],
+                ns_place: NsPlace::Property,
+                labels: &[],
+            },
+            Fixture {
+                name: "create_node",
+                build: |s| {
+                    vec![create_node(
+                        s,
+                        "entity:Entity:abc",
+                        &HashMap::from([("name".to_string(), "小C".to_string())]),
+                    )]
+                },
+                ns_place: NsPlace::Property,
+                labels: &[],
+            },
+            Fixture {
+                name: "create_contains_edge",
+                build: |s| vec![create_contains_edge(s, "doc-1", "chunk-1")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document", "Chunk"],
+            },
+            Fixture {
+                name: "create_next_chunk_edge",
+                build: |s| vec![create_next_chunk_edge(s, "chunk-1", "chunk-2")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Chunk"],
+            },
+            Fixture {
+                name: "create_related_to_edge",
+                build: |s| vec![create_related_to_edge(s, "doc-1", "doc-2", 0.5)],
+                ns_place: NsPlace::NWhere,
+                labels: &[],
+            },
+            Fixture {
+                name: "delete_document_cascade",
+                build: |s| vec![delete_document_cascade(s, "doc-1")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "delete_chunk_by_id",
+                build: |s| vec![delete_chunk_by_id(s, "chunk-1")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Chunk"],
+            },
+            Fixture {
+                name: "update_chunk_embedding",
+                build: |s| vec![update_chunk_embedding(s, "chunk-1", &[0.1])],
+                ns_place: NsPlace::NWhere,
+                labels: &["Chunk"],
+            },
+            Fixture {
+                name: "vector_search_chunks",
+                build: |s| vec![vector_search_chunks(s, &[0.1, 0.2], 5, None).unwrap()],
+                ns_place: NsPlace::After(&["VectorSearchNodes"]),
+                labels: &[],
+            },
+            Fixture {
+                name: "text_search_chunks",
+                build: |s| vec![text_search_chunks(s, "q", 5, None).unwrap()],
+                ns_place: NsPlace::After(&["TextSearchNodes"]),
+                labels: &[],
+            },
+            Fixture {
+                name: "get_document_by_id",
+                build: |s| vec![get_document_by_id(s, "doc-1")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "get_document_chunks",
+                build: |s| vec![get_document_chunks(s, "doc-1")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "list_documents",
+                build: |s| vec![list_documents(s, 0, 10)],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "list_documents_filtered",
+                build: |s| {
+                    vec![
+                        list_documents_filtered(s, 0, 10, None),
+                        list_documents_filtered(s, 0, 10, Some("ppa_profile")),
+                    ]
+                },
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "list_documents_with_content",
+                build: |s| vec![list_documents_with_content(s, 100)],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "list_subgraph",
+                build: |s| vec![list_subgraph(s, "Entity")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "get_node_by_id",
+                build: |s| vec![get_node_by_id(s, "entity:Entity:abc")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "count_node_by_id",
+                build: |s| vec![count_node_by_id(s, "entity:Entity:abc")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "count_nodes",
+                build: |s| vec![count_nodes(s, "Document")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Document"],
+            },
+            Fixture {
+                name: "traverse_graph",
+                build: |s| vec![traverse_graph(s, "entity:Entity:abc", None, "Both", 2)],
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "adjacent_labeled_nodes",
+                build: |s| {
+                    vec![adjacent_labeled_nodes(
+                        s,
+                        "entity:Entity:abc",
+                        "OutE",
+                        "OutN",
+                    )]
+                },
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "edges_between_nodes",
+                build: |s| {
+                    vec![edges_between_nodes(
+                        s,
+                        "entity:Entity:abc",
+                        "OutE",
+                        "OutN",
+                        None,
+                    )]
+                },
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "drop_edge_between",
+                build: |s| {
+                    vec![drop_edge_between(
+                        s,
+                        "entity:Entity:a",
+                        "entity:Entity:b",
+                        "朋友",
+                    )]
+                },
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "remove_node_by_id",
+                build: |s| vec![remove_node_by_id(s, "entity:Entity:a")],
+                ns_place: NsPlace::NWhere,
+                labels: &["Entity"],
+            },
+            Fixture {
+                name: "expand_from_chunks",
+                build: |s| vec![expand_from_chunks(s, &["7".into()], &["rel".into()], 1)],
+                ns_place: NsPlace::After(&["In"]),
+                labels: &[],
+            },
+            Fixture {
+                name: "combined_search_query",
+                build: |s| vec![combined_search_query(s, &sample_combined_query()).unwrap()],
+                ns_place: NsPlace::After(&["VectorSearchNodes", "TextSearchNodes", "In"]),
+                labels: &[],
+            },
+        ]
+    }
+
+    /// 谓词本身（`Eq` 直连或 `And` 元素）是否就是哨兵 `ns` 等式。
+    fn predicate_has_ns(predicate: &Value) -> bool {
+        let is_ns_eq = predicate
+            .get("Eq")
+            .and_then(Value::as_array)
+            .is_some_and(|eq| {
+                eq.len() == 2 && eq[0] == "ns" && eq[1] == json!({"String": SENTINEL_NS})
+            });
+        if is_ns_eq {
+            return true;
+        }
+        predicate
+            .get("And")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(predicate_has_ns))
+    }
+
+    fn collect_key<'a>(value: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if k == key {
+                        out.push(v);
+                    }
+                    collect_key(v, key, out);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect_key(item, key, out)),
+            _ => {}
+        }
+    }
+
+    fn check_every_nwhere_has_ns(name: &str, ast: &Value) -> Result<(), String> {
+        let mut nwheres = Vec::new();
+        collect_key(ast, "NWhere", &mut nwheres);
+        if nwheres.is_empty() {
+            return Err(format!("{name}: AST 里没有 NWhere"));
+        }
+        for nwhere in nwheres {
+            if !predicate_has_ns(nwhere) {
+                return Err(format!("{name}: NWhere 缺 ns 谓词: {nwhere}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_ns_after_markers(name: &str, ast: &Value, markers: &[&str]) -> Result<(), String> {
+        let mut arrays = Vec::new();
+        collect_key(ast, "steps", &mut arrays);
+
+        let mut checked = 0;
+        for array in arrays {
+            let steps = array
+                .as_array()
+                .ok_or_else(|| format!("{name}: steps 不是数组: {array}"))?;
+            for (index, step) in steps.iter().enumerate() {
+                if !markers.iter().any(|marker| step.get(*marker).is_some()) {
+                    continue;
+                }
+                let has_ns_after = steps[index + 1..]
+                    .iter()
+                    .any(|later| later.get("Where").is_some_and(predicate_has_ns));
+                if !has_ns_after {
+                    return Err(format!("{name}: {markers:?} 之后缺 ns 过滤步骤: {steps:?}"));
+                }
+                checked += 1;
+            }
+        }
+
+        if checked == 0 {
+            return Err(format!("{name}: AST 里没有 {markers:?} 步骤"));
+        }
+        Ok(())
+    }
+
+    fn assert_ns_property(name: &str, ast: &Value) -> Result<(), String> {
+        let mut add_nodes = Vec::new();
+        collect_key(ast, "AddN", &mut add_nodes);
+        if add_nodes.is_empty() {
+            return Err(format!("{name}: AST 里没有 AddN"));
+        }
+        for add_node in add_nodes {
+            let props = add_node
+                .get("properties")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{name}: AddN 缺 properties"))?;
+            let has_ns = props.iter().any(|pair| {
+                pair.as_array().is_some_and(|kv| {
+                    kv.len() == 2 && kv[0] == "ns" && kv[1]["Value"]["String"] == SENTINEL_NS
+                })
+            });
+            if !has_ns {
+                return Err(format!("{name}: 节点属性缺 ns: {props:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_ns_present(name: &str, ast: &Value, place: NsPlace) -> Result<(), String> {
+        match place {
+            NsPlace::NWhere => check_every_nwhere_has_ns(name, ast),
+            NsPlace::After(markers) => check_ns_after_markers(name, ast, markers),
+            NsPlace::Property => assert_ns_property(name, ast),
+        }
+    }
+
+    fn assert_labels(name: &str, ast: &Value, expected: &[&str]) -> Result<(), String> {
+        let mut eqs = Vec::new();
+        collect_key(ast, "Eq", &mut eqs);
+        let found: Vec<&str> = eqs
+            .iter()
+            .filter_map(|eq| eq.as_array())
+            .filter(|eq| eq.len() == 2 && eq[0] == "$label")
+            .filter_map(|eq| eq[1]["String"].as_str())
+            .collect();
+
+        if expected.is_empty() {
+            return if found.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{name}: 该类构造器不按 $label 选点，却出现 {found:?}"
+                ))
+            };
+        }
+        for label in expected {
+            if !found.contains(label) {
+                return Err(format!("{name}: 期望 $label {expected:?}，实际 {found:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `["ns", …]` 形态的谓词或属性项（`Eq` 的两元素、属性二元组共用此形状）。
+    fn is_ns_term(value: &Value) -> bool {
+        value
+            .as_array()
+            .is_some_and(|pair| pair.len() == 2 && pair[0] == "ns")
+    }
+
+    /// 剥掉 AST 里的 `ns` 谓词与 `ns` 属性 —— 等价于「源码里删掉该构造器的 ns」。
+    fn strip_ns(value: &Value) -> Value {
+        match value {
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .filter(|item| !is_ns_term(item))
+                    .map(strip_ns)
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(_, v)| !is_ns_term(v))
+                    .map(|(k, v)| (k.clone(), strip_ns(v)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// fixture 表必须与名册一一对应，否则「逐构造器断言」会漏项。
+    #[test]
+    fn fixtures_cover_every_constructor() {
+        let mut names: Vec<&str> = fixtures().iter().map(|f| f.name).collect();
+        names.sort_unstable();
+
+        let mut roster = QUERY_CONSTRUCTORS.to_vec();
+        roster.sort_unstable();
+
+        assert_eq!(names, roster, "fixture 必须覆盖且只覆盖产 AST 的构造器");
+    }
+
+    /// T1：正向断言每个构造器都带 `ns`（位置按类别）且 `$label` 正确；
+    /// 反向断言「剥掉 ns 后同一检查器必红」—— 即删任一处 `Eq ns` 都会让 T1 变红。
+    #[test]
+    fn scoped_constructors_carry_namespace() {
+        let schema = scoped_schema();
+
+        for fixture in fixtures() {
+            let asts = (fixture.build)(&schema);
+            assert!(!asts.is_empty(), "{} 没有 fixture 形态", fixture.name);
+            for (index, ast) in asts.into_iter().enumerate() {
+                let case = format!("{}#{index}", fixture.name);
+                if let Err(e) = assert_ns_present(&case, &ast, fixture.ns_place) {
+                    panic!("{e}");
+                }
+                if let Err(e) = assert_labels(&case, &ast, fixture.labels) {
+                    panic!("{e}");
+                }
+
+                let stripped = strip_ns(&ast);
+                assert_ne!(stripped, ast, "{case}: AST 里根本没有 ns 谓词/属性");
+                assert!(
+                    assert_ns_present(&case, &stripped, fixture.ns_place).is_err(),
+                    "{case}: 剥掉 ns 后检查器仍通过 —— 该断言锁不住 ns"
+                );
+            }
+        }
+    }
+
+    /// 名册 ↔ 源码 `^pub fn` 双向对齐：漏登记或幽灵项都会红。
+    #[test]
+    fn constructor_rosters_match_source() {
+        assert_eq!(QUERY_CONSTRUCTORS.len(), 27, "产 AST 的构造器基数");
+
+        let source = include_str!("queries.rs");
+        let mut declared: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub fn "))
+            .map(|rest| rest.split('(').next().unwrap_or_default().trim())
+            .collect();
+        declared.sort_unstable();
+
+        let mut registered: Vec<&str> = QUERY_CONSTRUCTORS
+            .iter()
+            .chain(NON_QUERY_CONSTRUCTORS)
+            .copied()
+            .collect();
+        registered.sort_unstable();
+
+        assert_eq!(declared, registered);
+    }
+
+    /// 豁免面必须显式且最小：只有不产 AST 的函数可以不带 `ns`。
+    #[test]
+    fn no_ns_exemptions_are_explicit() {
+        let exempted: Vec<&str> = NO_NS_REASON.iter().map(|(name, _)| *name).collect();
+        assert_eq!(exempted, NON_QUERY_CONSTRUCTORS);
+        for name in QUERY_CONSTRUCTORS {
+            assert!(!exempted.contains(name), "{name} 不得豁免 ns 断言");
+        }
+        for (name, reason) in NO_NS_REASON {
+            assert!(!reason.is_empty(), "{name} 的豁免理由不能为空");
+        }
+    }
+
+    /// T2：过滤谓词必须是等值/析取 —— `IsIn` 会让整条查询在镜像上 400。
+    #[test]
+    fn filter_step_uses_equality_not_isin() {
+        let schema = test_schema();
+
+        let single = SearchFilters {
+            document_ids: Some(vec!["doc-a".into()]),
+            ..SearchFilters::default()
+        };
+        let step = filter_step(&schema, Some(&single))
+            .unwrap()
+            .expect("单元素 ⇒ Eq 谓词");
+        assert_eq!(
+            step,
+            json!({"Where": {"Eq": ["document_id", {"String": "doc-a"}]}})
+        );
+
+        let multi = SearchFilters {
+            document_ids: Some(vec!["a".into(), "b".into()]),
+            ..SearchFilters::default()
+        };
+        let step = filter_step(&schema, Some(&multi)).unwrap().unwrap();
+        assert!(
+            !step.to_string().contains("IsIn"),
+            "产物不得含 IsIn: {step}"
+        );
+        assert_eq!(
+            step,
+            json!({"Where": {"Or": [
+                {"Eq": ["document_id", {"String": "a"}]},
+                {"Eq": ["document_id", {"String": "b"}]}
+            ]}})
+        );
+    }
+
+    /// 空的 `document_ids` 是调用方的 bug（「筛 0 个文档」应直接不查），
+    /// 返回 `{"Or": []}` 会被 HelixDB 视为恒真/非法谓词，须显式失败。
+    #[test]
+    fn filter_step_fails_loud_on_empty_document_ids() {
+        let filters = SearchFilters {
+            document_ids: Some(vec![]),
+            ..SearchFilters::default()
+        };
+        let err = filter_step(&test_schema(), Some(&filters)).unwrap_err();
+        assert!(matches!(err, KnowledgeError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// `file_types` 没有任何可用的 AST 原语，必须显式失败而不是静默丢弃。
+    #[test]
+    fn filter_step_fails_loud_on_file_types() {
+        let filters = SearchFilters {
+            file_types: Some(vec!["md".into()]),
+            ..SearchFilters::default()
+        };
+        let err = filter_step(&test_schema(), Some(&filters)).unwrap_err();
+        assert!(matches!(err, KnowledgeError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// 搜索/图扩展的过滤步骤里，`ns` 与调用方过滤谓词合取成一个 `Where`。
+    #[test]
+    fn filter_step_merges_namespace_with_filters() {
+        let schema = scoped_schema();
+
+        assert_eq!(
+            filter_step(&schema, None).unwrap(),
+            Some(json!({"Where": {"Eq": ["ns", {"String": SENTINEL_NS}]}}))
+        );
+
+        let filters = SearchFilters {
+            document_ids: Some(vec!["a".into()]),
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            filter_step(&schema, Some(&filters)).unwrap(),
+            Some(json!({"Where": {"And": [
+                {"Eq": ["ns", {"String": SENTINEL_NS}]},
+                {"Eq": ["document_id", {"String": "a"}]}
+            ]}}))
+        );
+    }
+
+    /// 写入类构造器把 `ns` 落成节点属性（而非谓词），未绑定命名空间时不写。
+    #[test]
+    fn write_constructors_embed_namespace_property() {
+        let scoped = scoped_schema();
+        let plain = test_schema();
+
+        let scoped_props =
+            create_document_node(&scoped, &sample_doc(), "{}", &[])["query"]["queries"][0]["Query"]
+                ["steps"][0]["AddN"]["properties"]
+                .as_array()
+                .unwrap()
+                .clone();
+        assert!(scoped_props.iter().any(|p| p[0] == "ns"));
+
+        let plain_props =
+            create_document_node(&plain, &sample_doc(), "{}", &[])["query"]["queries"][0]["Query"]
+                ["steps"][0]["AddN"]["properties"]
+                .as_array()
+                .unwrap()
+                .clone();
+        assert!(
+            !plain_props.iter().any(|p| p[0] == "ns"),
+            "未绑定命名空间的 schema 不得写入 ns: {plain_props:?}"
+        );
+    }
+
+    /// 调用方自带的 `ns` 属性不得覆盖 schema 的命名空间（隔离键不可伪造）。
+    #[test]
+    fn create_node_namespace_property_cannot_be_overridden() {
+        let scoped = scoped_schema();
+        let props = HashMap::from([("ns".to_string(), "伪造::ns".to_string())]);
+        let q = create_node(&scoped, "entity:Entity:abc", &props);
+        let pairs = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+
+        let ns_pairs: Vec<_> = pairs.iter().filter(|p| p[0] == "ns").collect();
+        assert_eq!(ns_pairs.len(), 1, "ns 只应出现一次: {pairs:?}");
+        assert_eq!(ns_pairs[0][1]["Value"]["String"], SENTINEL_NS);
     }
 }

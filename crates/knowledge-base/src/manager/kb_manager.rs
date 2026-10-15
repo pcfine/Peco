@@ -17,7 +17,7 @@
 //! `load()` 扫描 `knowledge/*/kb_config.json` 子目录来发现知识库。
 //! 已弃用的中心化 `kb_configs.json` 格式在 `load()` 时自动迁移。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::error::KnowledgeError;
-use crate::types::SearchResult;
+use crate::types::{DEFAULT_SCOPE, SearchResult};
 
 use super::KnowledgeBase;
 use super::config::{BackendType, KbConfig, KbInfo};
@@ -49,14 +49,31 @@ pub struct KnowledgeBaseManager {
     configs: RwLock<HashMap<String, KbConfig>>,
     /// 数据根目录（knowledge/）
     base_dir: PathBuf,
+    /// 隔离维度（工作区/用户标识）—— 与各 KB 名构成命名空间。
+    scope: String,
 }
 
 impl KnowledgeBaseManager {
-    /// 从指定目录加载所有知识库配置。
+    /// 从指定目录加载所有知识库配置（等价于 scope 为 `"default"`）。
     ///
     /// 扫描 `knowledge/*/kb_config.json` 子目录来发现知识库。
     /// 若旧的中心化 `kb_configs.json` 仍存在，会自动迁移到各 KB 目录。
     pub async fn load(base_dir: &Path) -> Result<Self, KnowledgeError> {
+        Self::load_with_scope(base_dir, DEFAULT_SCOPE).await
+    }
+
+    /// 从指定目录加载所有知识库配置，并绑定隔离维度 `scope`。
+    ///
+    /// `scope` 去空白后为空即报错：所有库共享同一命名空间会让隔离静默失效，
+    /// 宁可 fail loud 也不退化成空前缀。
+    pub async fn load_with_scope(base_dir: &Path, scope: &str) -> Result<Self, KnowledgeError> {
+        let scope = scope.trim();
+        if scope.is_empty() {
+            return Err(KnowledgeError::InvalidInput(
+                "知识库命名空间需要非空的 scope（工作区/用户标识）".into(),
+            ));
+        }
+
         tokio::fs::create_dir_all(base_dir).await.map_err(|e| {
             KnowledgeError::InvalidInput(format!("Failed to create directory: {e}"))
         })?;
@@ -136,6 +153,7 @@ impl KnowledgeBaseManager {
             instances: RwLock::new(HashMap::new()),
             configs: RwLock::new(config_map),
             base_dir: base_dir.to_path_buf(),
+            scope: scope.to_string(),
         })
     }
 
@@ -154,7 +172,7 @@ impl KnowledgeBaseManager {
         }
 
         // 构建知识库实例
-        let kb = KnowledgeBase::build(&self.base_dir, &config).await?;
+        let kb = KnowledgeBase::build(&self.base_dir, &config, &self.scope).await?;
 
         // 将配置写入 KB 目录自身的 kb_config.json
         let kb_dir = self.base_dir.join(crate::sanitize_kb_name(&name));
@@ -194,7 +212,7 @@ impl KnowledgeBaseManager {
             })?
         };
 
-        let kb = KnowledgeBase::build(&self.base_dir, &config).await?;
+        let kb = KnowledgeBase::build(&self.base_dir, &config, &self.scope).await?;
         let kb = Arc::new(kb);
         {
             let mut instances = self.instances.write().await;
@@ -298,7 +316,12 @@ impl KnowledgeBaseManager {
         let mut results = Vec::new();
         for result in futures::future::join_all(futures).await {
             match result {
-                Ok(Some(entry)) => results.push(entry),
+                Ok(Some((name, hits))) => {
+                    let hits = dedup_hits(hits);
+                    if !hits.is_empty() {
+                        results.push((name, hits));
+                    }
+                }
                 Ok(None) => { /* 空结果，跳过 */ }
                 Err(e) => {
                     warn!(error = %e, "Failed to search knowledge base concurrently, skipping");
@@ -307,6 +330,16 @@ impl KnowledgeBaseManager {
         }
         results
     }
+}
+
+/// 同一 KB 内按 `(document_id, snippet)` 去重 —— 融合检索可能对同一分块重复报条目。
+///
+/// 跨 KB 的同名文档由库名区分、且分属不同命名空间，不在此处合并。
+fn dedup_hits(hits: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut seen = HashSet::new();
+    hits.into_iter()
+        .filter(|h| seen.insert((h.document_id.clone(), h.snippet.clone())))
+        .collect()
 }
 
 // ============================================================================
@@ -361,5 +394,64 @@ fn backend_type_str(bt: &BackendType) -> String {
         BackendType::LanceDb => "LanceDB".into(),
         #[cfg(feature = "helixdb")]
         BackendType::HelixDb => "HelixDB".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空白 scope fail loud：所有库共享同一命名空间会让隔离静默失效，
+    /// 因此宁可报错，也不退化成空前缀。
+    #[tokio::test]
+    async fn load_with_scope_rejects_blank_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        for blank in ["", "   ", "\t\n"] {
+            match KnowledgeBaseManager::load_with_scope(tmp.path(), blank).await {
+                Err(KnowledgeError::InvalidInput(_)) => {}
+                Ok(_) => panic!("空白 scope ({blank:?}) 不应加载成功"),
+                Err(e) => panic!("空白 scope ({blank:?}) 应为 InvalidInput，实际 {e:?}"),
+            }
+        }
+    }
+
+    fn hit(doc_id: &str, snippet: &str, score: f32) -> SearchResult {
+        SearchResult {
+            document_id: doc_id.to_string(),
+            title: "t".into(),
+            snippet: snippet.to_string(),
+            score,
+            source_path: "s".into(),
+            match_sources: vec![crate::types::MatchSource::Text],
+            confidence: crate::types::ConfidenceLevel::Medium,
+            diagnostic: None,
+        }
+    }
+
+    /// 去重只吃「同文档 + 同片段」的重复条目：不同片段、不同文档一律保留，
+    /// 且保留首次出现的那条（首位分数最高，误删会丢掉更好的结果）。
+    #[test]
+    fn dedup_hits_keeps_first_of_identical_doc_and_snippet() {
+        let hits = vec![
+            hit("d1", "s1", 0.9),
+            hit("d1", "s2", 0.8),
+            hit("d1", "s1", 0.7),
+            hit("d2", "s1", 0.6),
+            hit("d1", "s2", 0.5),
+        ];
+
+        let got: Vec<(String, String, f32)> = dedup_hits(hits)
+            .into_iter()
+            .map(|h| (h.document_id, h.snippet, h.score))
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("d1".to_string(), "s1".to_string(), 0.9),
+                ("d1".to_string(), "s2".to_string(), 0.8),
+                ("d2".to_string(), "s1".to_string(), 0.6),
+            ]
+        );
     }
 }

@@ -16,12 +16,14 @@ use crate::types::*;
 
 use super::config::{BackendType, KbConfig};
 
-/// 事实类实体的 `entity_type` —— 写入（`add_facts`）与查询、删除必须同口径。
+/// 实体的哈希口径：把命名空间并入 `compute_entity_id` 的 `entity_type` 输入。
 ///
-/// `compute_entity_id(name, entity_type)` 是 sha256 截断，`entity_type` 只是哈希
-/// 的一个输入，**口径一旦漂移，删除会静默失效**（HelixDB 删不存在的节点/边一律是
-/// HTTP 200 的 no-op）。因此全文件只此一处字面量。
-const ENTITY_TYPE: &str = "Entity";
+/// 该函数只服务实体 id 的计算，不产节点 label —— label 恒为
+/// [`ENTITY_NODE_LABEL`]。并入 ns 是为了让跨命名空间的同名实体得到不同 id：
+/// 否则 `node_exists` 会静默跳过建点，事实边也会挂到别的命名空间去。
+fn entity_type_for(ns: &str) -> String {
+    format!("{ENTITY_NODE_LABEL}::{ns}")
+}
 
 /// 存储后端组件：(文档存储, 向量索引, 全文索引, 图存储)
 type BackendComponents = (
@@ -65,17 +67,14 @@ pub(crate) fn resolve_helix_url(configured: Option<&str>) -> String {
 async fn build_helix_components(
     config: &KbConfig,
     ndims: usize,
+    scope: &str,
 ) -> Result<BackendComponents, KnowledgeError> {
     let url = resolve_helix_url(config.helix_url.as_deref());
     info!(kb = %config.name, %url, ndims, "Connecting to HelixDB backend");
 
+    let schema = crate::backends::helixdb::HelixSchema::for_namespace(scope, &config.name)?;
     let be = Arc::new(
-        crate::backends::helixdb::HelixDbBackend::connect_with_schema(
-            &url,
-            ndims,
-            crate::backends::helixdb::HelixSchema::default(),
-        )
-        .await?,
+        crate::backends::helixdb::HelixDbBackend::connect_with_schema(&url, ndims, schema).await?,
     );
     be.init_schema().await?;
 
@@ -118,11 +117,25 @@ pub struct KnowledgeBase {
     search_engine: HybridSearchEngine,
     pub(super) graph_store: Option<Arc<dyn GraphStore>>,
     pub(super) fulltext_index: Option<Arc<dyn FullTextIndex>>,
+    /// 命名空间键 `{scope}::{kb_name}` —— 实体 id 哈希的隔离维度。
+    ns: String,
 }
 
 impl KnowledgeBase {
     /// 根据配置构建知识库实例。
-    pub(super) async fn build(base_dir: &Path, config: &KbConfig) -> Result<Self, KnowledgeError> {
+    ///
+    /// `scope` 是隔离维度（工作区/用户标识）：与 KB 名一起构成命名空间，
+    /// 并由此注入 schema 与实体 id 口径。
+    pub(super) async fn build(
+        base_dir: &Path,
+        config: &KbConfig,
+        scope: &str,
+    ) -> Result<Self, KnowledgeError> {
+        let scope = scope.trim();
+        // 命名空间键与实体 id 口径共用同一拼装/校验，后端无关（`HelixSchema`
+        // 只在 helixdb feature 下可用）。
+        let ns = namespace_for(scope, &config.name)?;
+
         let kb_dir = base_dir.join(crate::sanitize_kb_name(&config.name));
         tokio::fs::create_dir_all(&kb_dir).await.map_err(|e| {
             KnowledgeError::InvalidInput(format!("Failed to create directory: {e}"))
@@ -170,7 +183,7 @@ impl KnowledgeBase {
                     )
                 }
                 #[cfg(feature = "helixdb")]
-                BackendType::HelixDb => build_helix_components(config, ndims).await?,
+                BackendType::HelixDb => build_helix_components(config, ndims, scope).await?,
             };
 
         #[cfg(not(feature = "lancedb"))]
@@ -186,7 +199,7 @@ impl KnowledgeBase {
                     )
                 }
                 #[cfg(feature = "helixdb")]
-                BackendType::HelixDb => build_helix_components(config, ndims).await?,
+                BackendType::HelixDb => build_helix_components(config, ndims, scope).await?,
                 _ => {
                     return Err(KnowledgeError::InvalidInput(
                         "LanceDB feature is not enabled".into(),
@@ -219,6 +232,7 @@ impl KnowledgeBase {
             search_engine,
             graph_store,
             fulltext_index,
+            ns,
         })
     }
 
@@ -404,14 +418,14 @@ impl KnowledgeBase {
                 continue;
             }
 
-            let subject_id = compute_entity_id(&fact.subject, ENTITY_TYPE);
-            let object_id = compute_entity_id(&fact.object, ENTITY_TYPE);
+            let subject_id = compute_entity_id(&fact.subject, &entity_type_for(&self.ns));
+            let object_id = compute_entity_id(&fact.object, &entity_type_for(&self.ns));
 
             // 确保实体节点存在
             if !gs.node_exists(&subject_id).await.unwrap_or(false) {
                 gs.upsert_node(GraphNode {
                     id: subject_id.clone(),
-                    labels: vec![ENTITY_TYPE.into()],
+                    labels: vec![ENTITY_NODE_LABEL.into()],
                     properties: {
                         let mut props = HashMap::new();
                         props.insert("name".into(), fact.subject.clone());
@@ -424,7 +438,7 @@ impl KnowledgeBase {
             if !gs.node_exists(&object_id).await.unwrap_or(false) {
                 gs.upsert_node(GraphNode {
                     id: object_id.clone(),
-                    labels: vec![ENTITY_TYPE.into()],
+                    labels: vec![ENTITY_NODE_LABEL.into()],
                     properties: {
                         let mut props = HashMap::new();
                         props.insert("name".into(), fact.object.clone());
@@ -517,15 +531,23 @@ impl KnowledgeBase {
 
     // ==================== 图谱查询 ====================
 
+    /// 一个实体在本库命名空间下的节点 id。
+    ///
+    /// `compute_entity_id` 的口径收敛在 manager 内部：调用方按字面量 `"Entity"`
+    /// 自行复算会与本库写入侧漂移，而漂移的表现是静默 no-op 而非报错。
+    pub fn entity_id(&self, entity_name: &str) -> String {
+        compute_entity_id(entity_name, &entity_type_for(&self.ns))
+    }
+
     /// 查询与指定实体相关的所有事实（遍历相邻边）。
     ///
-    /// `entity_type` 默认为 `"Entity"`，与 [`add_facts`] 保持一致。
+    /// 实体口径与 [`add_facts`] 同源（命名空间化），见 [`Self::entity_id`]。
     pub async fn query_entity_facts(
         &self,
         entity_name: &str,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        self.query_entity_facts_with_type(entity_name, ENTITY_TYPE, max_depth)
+        self.query_entity_facts_with_type(entity_name, &entity_type_for(&self.ns), max_depth)
             .await
     }
 
@@ -547,8 +569,8 @@ impl KnowledgeBase {
 
     /// 列出「记忆图谱」子图 —— `Entity` label 的节点集 + 两端皆实体的边。
     ///
-    /// 与 [`Self::query_entity_facts`] 同层：二者都以 `ENTITY_TYPE` 为唯一实体口径，
-    /// 故本方法不暴露 label 参数 —— 「记忆图谱 = 实体子图」是既定范围决策。
+    /// 与 [`Self::query_entity_facts`] 同层：二者都以 [`ENTITY_NODE_LABEL`] 为唯一
+    /// 实体 label，故本方法不暴露 label 参数 —— 「记忆图谱 = 实体子图」是既定范围决策。
     /// 语义与子图闭合规则见 [`GraphStore::list_subgraph`]。
     pub async fn list_entity_graph(
         &self,
@@ -557,18 +579,18 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        gs.list_subgraph(ENTITY_TYPE).await
+        gs.list_subgraph(ENTITY_NODE_LABEL).await
     }
 
     /// 查询两个实体间的关系路径。
     ///
-    /// `entity_type` 默认为 `"Entity"`，与 [`add_facts`] 保持一致。
+    /// 实体口径与 [`add_facts`] 同源（命名空间化），见 [`Self::entity_id`]。
     pub async fn query_relation_path(
         &self,
         from_entity: &str,
         to_entity: &str,
     ) -> Result<Option<Vec<TraversalStep>>, KnowledgeError> {
-        self.query_relation_path_with_type(from_entity, to_entity, ENTITY_TYPE)
+        self.query_relation_path_with_type(from_entity, to_entity, &entity_type_for(&self.ns))
             .await
     }
 
@@ -604,8 +626,8 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let subject_id = compute_entity_id(subject, ENTITY_TYPE);
-        let object_id = compute_entity_id(object, ENTITY_TYPE);
+        let subject_id = compute_entity_id(subject, &entity_type_for(&self.ns));
+        let object_id = compute_entity_id(object, &entity_type_for(&self.ns));
         let edge_type = EdgeType::Custom(predicate.to_string());
 
         gs.edges_between(&subject_id, &object_id, Some(&edge_type))
@@ -632,8 +654,8 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let subject_id = compute_entity_id(subject, ENTITY_TYPE);
-        let object_id = compute_entity_id(object, ENTITY_TYPE);
+        let subject_id = compute_entity_id(subject, &entity_type_for(&self.ns));
+        let object_id = compute_entity_id(object, &entity_type_for(&self.ns));
         let edge_type = EdgeType::Custom(predicate.to_string());
 
         gs.remove_edges_between(&subject_id, &object_id, Some(&edge_type))
@@ -666,7 +688,7 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let entity_id = compute_entity_id(entity_name, ENTITY_TYPE);
+        let entity_id = compute_entity_id(entity_name, &entity_type_for(&self.ns));
         let node = gs.get_node(&entity_id).await?;
 
         let steps = gs
@@ -701,7 +723,7 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let entity_id = compute_entity_id(entity_name, ENTITY_TYPE);
+        let entity_id = compute_entity_id(entity_name, &entity_type_for(&self.ns));
         let removed_edges = gs.remove_node(&entity_id, cascade).await?;
         Ok((removed_edges, 1))
     }

@@ -40,14 +40,7 @@ use crate::traits::*;
 use crate::types::*;
 
 use client::HelixDbClient;
-use queries::prop_f64;
 pub use types::{HelixIndexSpec, HelixSchema, IndexType};
-
-/// `GraphNode.labels` 为空时的兜底节点标签。
-///
-/// `KnowledgeBase::add_facts` 写入的实体节点用 `"Entity"`，HelixDB 又要求
-/// 每个节点有且只有一个 label，因此这里以它作为缺省值。
-const DEFAULT_NODE_LABEL: &str = "Entity";
 
 /// `EdgeType::Mentions` 对应的边标签 —— 该类型没有 schema 字段。
 const MENTIONS_EDGE: &str = "MENTIONS";
@@ -755,7 +748,7 @@ impl VectorIndex for HelixDbBackend {
         // 而是调用方的 bug。
         self.ensure_dims(&self.schema.fragment_node_label, query_vec)?;
 
-        let query = queries::vector_search_chunks(&self.schema, query_vec, top_k as u32, filters);
+        let query = queries::vector_search_chunks(&self.schema, query_vec, top_k as u32, filters)?;
         let response = self.client.execute_read(query).await?;
 
         let hits = extract_properties(&response, "results")
@@ -817,7 +810,7 @@ impl FullTextIndex for HelixDbBackend {
         top_k: usize,
         filters: Option<&SearchFilters>,
     ) -> Result<Vec<FullTextHit>, KnowledgeError> {
-        let query_json = queries::text_search_chunks(&self.schema, query, top_k as u32, filters);
+        let query_json = queries::text_search_chunks(&self.schema, query, top_k as u32, filters)?;
         let response = self.client.execute_read(query_json).await?;
 
         let hits = extract_properties(&response, "results")
@@ -883,43 +876,28 @@ impl GraphStore for HelixDbBackend {
 
     async fn add_edges(&self, edges: &[KnowledgeEdge]) -> Result<(), KnowledgeError> {
         for edge in edges {
-            let edge_label = self.edge_label(&edge.edge_type);
-            let query = queries::create_related_to_edge(
-                &self.schema,
-                &edge.source_id,
-                &edge.target_id,
-                edge.weight as f64,
-            );
-            // 如果边标签不是 RELATED_TO，需要构建对应的查询
-            if edge_label != self.schema.related_edge {
-                // 使用通用 create_contains_edge 的模式构建自定义边
-                let custom_query = serde_json::json!({
-                    "request_type": "write",
-                    "query": {
-                        "queries": [
-                            {"Query": {"name": "src", "steps": [
-                                {"NWhere": {"Eq": [self.schema.id_property, {"String": edge.source_id}]}}
-                            ], "condition": null}},
-                            {"Query": {"name": "tgt", "steps": [
-                                {"NWhere": {"Eq": [self.schema.id_property, {"String": edge.target_id}]}}
-                            ], "condition": null}},
-                            {"Query": {"name": "edge", "steps": [
-                                {"N": {"Var": "src"}},
-                                {"AddE": {
-                                    "label": edge_label,
-                                    "to": {"Var": "tgt"},
-                                    "properties": [["weight", prop_f64(edge.weight as f64)]]
-                                }},
-                                {"Count": null}
-                            ], "condition": null}}
-                        ],
-                        "returns": ["edge"]
-                    }
-                });
-                self.client.execute_write(custom_query).await?;
-            } else {
-                self.client.execute_write(query).await?;
-            }
+            // 端点一律按 id 选点（label 无关）：边两端可能是实体、文档或分块，
+            // 钉死任何 `$label` 都会在标签与实际不符时把该端选空、`AddE` 报无源顶点。
+            //
+            // 分派按**类型**而非标签字符串 —— `add_facts` 的谓词是模型自由文本，
+            // 恰取 `schema.related_edge` 同名值时，按字符串分派会把它误当文档间
+            // 相关边，用文档 label 选实体端点而建边失败。
+            let query = match &edge.edge_type {
+                EdgeType::RelatedTo => queries::create_related_to_edge(
+                    &self.schema,
+                    &edge.source_id,
+                    &edge.target_id,
+                    edge.weight as f64,
+                ),
+                other => queries::create_labeled_edge(
+                    &self.schema,
+                    &edge.source_id,
+                    &edge.target_id,
+                    &self.edge_label(other),
+                    edge.weight as f64,
+                ),
+            };
+            self.client.execute_write(query).await?;
         }
         Ok(())
     }
@@ -1053,14 +1031,10 @@ impl GraphStore for HelixDbBackend {
             return Ok(());
         }
 
-        let label = node
-            .labels
-            .first()
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_NODE_LABEL.to_string());
-        let query = queries::create_node(&self.schema, &label, &node.id, &node.properties);
+        // label 由 `create_node` 与读侧同源取自 schema，忽略 `node.labels`。
+        let query = queries::create_node(&self.schema, &node.id, &node.properties);
         self.client.execute_write(query).await?;
-        debug!(node_id = %node.id, %label, "Node inserted");
+        debug!(node_id = %node.id, "Node inserted");
         Ok(())
     }
 
@@ -1242,9 +1216,8 @@ impl GraphStore for HelixDbBackend {
         info!(%from, %to, "Computing shortest path (application-level BFS)");
 
         // 检查终点是否存在。这里必须问「节点」而非「文档」：`to` 是
-        // `compute_entity_id(...)` 的内容哈希实体 id，`get_document_by_id` 按
-        // `id_property` 匹配但不按 label 过滤，拿实体 id 去问会命中实体顶点，
-        // 属于巧合式放行。`node_exists` 才是语义正确的存在性判定。
+        // `compute_entity_id(...)` 的内容哈希实体 id，只有 `node_exists` 才是
+        // 针对该节点的存在性判定。
         if !self.node_exists(to).await? {
             return Ok(None);
         }
@@ -1350,7 +1323,7 @@ impl CombinedSearch for HelixDbBackend {
         self.ensure_dims(&self.schema.fragment_node_label, &query.query_vector)?;
 
         // 1. 构建并发送单次 readBatch
-        let batch = queries::combined_search_query(&self.schema, query);
+        let batch = queries::combined_search_query(&self.schema, query)?;
         let response = self.client.execute_read(batch).await?;
 
         // 2. 解析 vector_path
@@ -1819,7 +1792,10 @@ mod tests {
             assert_eq!(query["Query"]["name"], queries::depth_query_name(depth));
             assert_eq!(
                 query["Query"]["steps"][0],
-                serde_json::json!({"NWhere": {"Eq": ["id", {"String": "entity:Entity:abc"}]}})
+                serde_json::json!({"NWhere": {"And": [
+                    {"Eq": ["$label", {"String": schema.graph_node_label}]},
+                    {"Eq": [schema.id_property, {"String": "entity:Entity:abc"}]}
+                ]}})
             );
             assert_eq!(query["Query"]["steps"][1]["Repeat"]["max_depth"], depth);
         }
@@ -1882,7 +1858,10 @@ mod tests {
         let start_steps = &queries_arr[0]["Query"]["steps"];
         assert_eq!(
             start_steps[0],
-            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "entity:Entity:abc"}]}})
+            serde_json::json!({"NWhere": {"And": [
+                {"Eq": ["$label", {"String": schema.graph_node_label}]},
+                {"Eq": [schema.id_property, {"String": "entity:Entity:abc"}]}
+            ]}})
         );
 
         // edges：边流以 EdgeProperties 终结，拿 $label/$from/$to
@@ -2037,7 +2016,8 @@ mod tests {
                 fusion: crate::traits::combined_search::RrfConfig::default(),
                 filters: None,
             },
-        );
+        )
+        .unwrap();
         for path in ["vector_path", "text_path"] {
             let source = projected_source(&combined, path, "document_id");
             assert_eq!(source, schema.id_property, "{path} 的 document_id 口径");
@@ -2139,11 +2119,17 @@ mod tests {
 
         assert_eq!(
             queries_arr[0]["Query"]["steps"][0],
-            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "src-stable"}]}})
+            serde_json::json!({"NWhere": {"And": [
+                {"Eq": ["$label", {"String": schema.graph_node_label}]},
+                {"Eq": [schema.id_property, {"String": "src-stable"}]}
+            ]}})
         );
         assert_eq!(
             queries_arr[1]["Query"]["steps"][0],
-            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "tgt-stable"}]}})
+            serde_json::json!({"NWhere": {"And": [
+                {"Eq": ["$label", {"String": schema.graph_node_label}]},
+                {"Eq": [schema.id_property, {"String": "tgt-stable"}]}
+            ]}})
         );
     }
 
@@ -2160,7 +2146,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             steps[0],
-            serde_json::json!({"NWhere": {"Eq": [schema.id_property, {"String": "entity:Entity:a"}]}})
+            serde_json::json!({"NWhere": {"And": [
+                {"Eq": ["$label", {"String": schema.graph_node_label}]},
+                {"Eq": [schema.id_property, {"String": "entity:Entity:a"}]}
+            ]}})
         );
         assert_eq!(steps[1], serde_json::json!({"Drop": null}));
         assert_eq!(steps[2], serde_json::json!({"Count": null}));
@@ -2281,10 +2270,10 @@ mod tests {
     fn search_hit_chunk_id_stays_internal() {
         let schema = HelixSchema::default();
 
-        let vec_q = queries::vector_search_chunks(&schema, &[0.1, 0.2], 5, None);
+        let vec_q = queries::vector_search_chunks(&schema, &[0.1, 0.2], 5, None).unwrap();
         assert_eq!(projected_source(&vec_q, "results", "chunk_id"), "$id");
 
-        let txt_q = queries::text_search_chunks(&schema, "q", 5, None);
+        let txt_q = queries::text_search_chunks(&schema, "q", 5, None).unwrap();
         assert_eq!(projected_source(&txt_q, "results", "chunk_id"), "$id");
     }
 }

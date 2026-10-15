@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use knowledge_base::DEFAULT_SCOPE;
+
 use super::config::KnowledgeConfig;
 use super::error::KnowledgeModuleError;
 use super::hash_manifest::{self, FileEntry, FileHashManifest};
@@ -32,6 +34,8 @@ use super::sync::SyncReport;
 pub struct KnowledgeManager {
     /// 数据根目录
     base_dir: PathBuf,
+    /// 隔离维度（工作区/用户标识）—— 与各 KB 名构成命名空间。
+    scope: String,
     /// 模块配置
     config: KnowledgeConfig,
     /// 延迟加载的底层 knowledge-base 管理器
@@ -43,23 +47,33 @@ pub struct KnowledgeManager {
 impl KnowledgeManager {
     // ── 构造 ────────────────────────────────────────────────────────────────
 
-    /// 同步构造（不加载任何知识库实例，仅初始化结构）。
+    /// 同步构造（不加载任何知识库实例，仅初始化结构；等价于 scope 为 `"default"`）。
     ///
     /// 实际的知识库加载由 [`ensure_loaded`](Self::ensure_loaded) 延迟完成。
     pub fn new(base_dir: PathBuf) -> Self {
+        Self::with_scope(base_dir, DEFAULT_SCOPE)
+    }
+
+    /// 带配置的同步构造（scope 为 `"default"`）。
+    pub fn with_config(base_dir: PathBuf, config: KnowledgeConfig) -> Self {
         Self {
             base_dir,
-            config: KnowledgeConfig::default(),
+            scope: DEFAULT_SCOPE.to_string(),
+            config,
             underlying: Mutex::new(None),
             auto_sync_done: AtomicBool::new(false),
         }
     }
 
-    /// 带配置的同步构造。
-    pub fn with_config(base_dir: PathBuf, config: KnowledgeConfig) -> Self {
+    /// 绑定隔离维度 `scope`（工作区/用户标识）的同步构造。
+    ///
+    /// scope 的合法性在加载时校验（见 [`ensure_loaded`](Self::ensure_loaded)）：
+    /// 构造保持同步且不返回错误，调用方可直接 `Arc::new` 包装。
+    pub fn with_scope(base_dir: PathBuf, scope: impl Into<String>) -> Self {
         Self {
             base_dir,
-            config,
+            scope: scope.into(),
+            config: KnowledgeConfig::default(),
             underlying: Mutex::new(None),
             auto_sync_done: AtomicBool::new(false),
         }
@@ -71,7 +85,9 @@ impl KnowledgeManager {
     pub async fn ensure_loaded(&self) -> Result<(), KnowledgeModuleError> {
         let mut guard = self.underlying.lock().await;
         if guard.is_none() {
-            let mgr = knowledge_base::KnowledgeBaseManager::load(&self.base_dir).await?;
+            let mgr =
+                knowledge_base::KnowledgeBaseManager::load_with_scope(&self.base_dir, &self.scope)
+                    .await?;
             *guard = Some(mgr);
         }
         Ok(())
@@ -564,9 +580,8 @@ impl KnowledgeManager {
 
     /// 删除一条结构化事实，返回删除前观测到的匹配边数（下界）。
     ///
-    /// 实体 id 口径由 `KnowledgeBase` 内部统一走
-    /// `compute_entity_id(name, "Entity")`，与 `add_facts` 同源，
-    /// 调用方不得自行计算。
+    /// 实体 id 口径由 `KnowledgeBase` 内部统一计算（命名空间化，同
+    /// `add_facts`），调用方不得自行计算。
     pub async fn delete_fact(
         &self,
         kb_name: &str,

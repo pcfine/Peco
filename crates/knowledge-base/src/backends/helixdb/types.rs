@@ -3,6 +3,8 @@
 //! 定义知识图谱的节点标签、边标签和索引目标，
 //! 使 `HelixDbBackend` 能适应不同的 AI Agent 场景。
 
+use crate::error::KnowledgeError;
+
 // ---------------------------------------------------------------------------
 // IndexType
 // ---------------------------------------------------------------------------
@@ -102,6 +104,17 @@ pub struct HelixSchema {
 
     /// 额外索引列表（除了上述内置索引之外的自定义索引）。
     pub extra_indexes: Vec<HelixIndexSpec>,
+
+    /// 行级命名空间（`{owner_scope}::{kb_name}`）。
+    ///
+    /// `Some` ⇒ 每条查询都带 `ns` 谓词 / 每个节点都写 `ns` 属性，隔离才成立；
+    /// `None`（`Default`）⇒ 不产 `ns` 谓词，仅测试与本地连通性检查走这条路。
+    pub ns: Option<String>,
+    /// 图谱（实体）节点的 label。
+    ///
+    /// 写侧（`upsert_node`）与读侧（按 id 选点、遍历起点、边两端）必须同源，
+    /// 否则 id 相同的节点会因 label 不一致而被漏选，出现重复 `AddN`。
+    pub graph_node_label: String,
 }
 
 impl Default for HelixSchema {
@@ -119,7 +132,22 @@ impl Default for HelixSchema {
             belongs_to_edge: "BELONGS_TO".into(),
             id_property: "id".into(),
             extra_indexes: vec![],
+            ns: None,
+            graph_node_label: crate::types::ENTITY_NODE_LABEL.into(),
         }
+    }
+}
+
+impl HelixSchema {
+    /// 构造绑定单个知识库命名空间的 schema。
+    ///
+    /// 命名空间键的拼装与校验统一走 [`crate::types::namespace_for`]：
+    /// 隔离维度由单一实现决定，schema 与实体 id 口径不会各拼一套而漂移。
+    pub fn for_namespace(scope: &str, kb_name: &str) -> Result<Self, KnowledgeError> {
+        Ok(Self {
+            ns: Some(crate::types::namespace_for(scope, kb_name)?),
+            ..Self::default()
+        })
     }
 }
 
@@ -139,6 +167,20 @@ mod tests {
         assert_eq!(s.contains_edge, "CONTAINS");
         assert_eq!(s.related_edge, "RELATED_TO");
         assert!(s.extra_indexes.is_empty());
+        assert!(s.ns.is_none(), "默认 schema 不绑定命名空间");
+        assert_eq!(s.graph_node_label, "Entity");
+    }
+
+    #[test]
+    fn for_namespace_scopes_to_scope_and_kb() {
+        let s = HelixSchema::for_namespace(" user-1 ", "工作记录").unwrap();
+        assert_eq!(s.ns.as_deref(), Some("user-1::工作记录"));
+        assert_eq!(s.graph_node_label, "Entity", "其余字段沿用默认");
+
+        for blank in ["", "   ", "\t"] {
+            let err = HelixSchema::for_namespace(blank, "工作记录").unwrap_err();
+            assert!(matches!(err, KnowledgeError::InvalidInput(_)), "{err:?}");
+        }
     }
 
     #[test]

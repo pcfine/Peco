@@ -125,7 +125,7 @@ mod tests {
 
         // 验证能遍历到客体节点
         let node_ids: Vec<&str> = results.iter().map(|s| s.node.id.as_str()).collect();
-        let entity_id = compute_entity_id("Axum", "Entity");
+        let entity_id = kb.entity_id("Axum");
         assert!(
             node_ids.contains(&entity_id.as_str()),
             "Should find Axum entity: {node_ids:?}"
@@ -158,8 +158,8 @@ mod tests {
         // 先读：确认按 (subject, predicate, object) 能读到，且带真实 weight
         let found = kb.read_fact("小C", "朋友", "chen").await.unwrap();
         assert_eq!(found.len(), 1, "读取必须命中 add_facts 写入的那条边");
-        assert_eq!(found[0].source_id, compute_entity_id("小C", "Entity"));
-        assert_eq!(found[0].target_id, compute_entity_id("chen", "Entity"));
+        assert_eq!(found[0].source_id, kb.entity_id("小C"));
+        assert_eq!(found[0].target_id, kb.entity_id("chen"));
         assert_eq!(found[0].edge_type, EdgeType::Custom("朋友".into()));
         assert!((found[0].weight - 0.95).abs() < 1e-6, "必须携带真实 weight");
 
@@ -200,7 +200,7 @@ mod tests {
             .await
             .unwrap();
 
-        let chen_id = compute_entity_id("chen", "Entity");
+        let chen_id = kb.entity_id("chen");
         let before: Vec<String> = kb
             .query_entity_facts("小C", 1)
             .await
@@ -272,7 +272,7 @@ mod tests {
         let graph = kb.graph_store.as_ref().unwrap();
         assert!(
             graph
-                .get_node(&compute_entity_id("小C", "Entity"))
+                .get_node(&kb.entity_id("小C"))
                 .await
                 .unwrap()
                 .is_none()
@@ -286,8 +286,8 @@ mod tests {
         let kb = mgr.create_kb(make_kb_config("entity-test")).await.unwrap();
 
         // 添加实体（使用统一的 "Entity" 类型以匹配 add_facts）
-        let person_id = compute_entity_id("张三", "Entity");
-        let dept_id = compute_entity_id("技术部", "Entity");
+        let person_id = kb.entity_id("张三");
+        let dept_id = kb.entity_id("技术部");
 
         let entities = vec![
             Entity {

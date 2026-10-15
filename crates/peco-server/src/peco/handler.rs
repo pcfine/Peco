@@ -2002,9 +2002,6 @@ fn map_memory_kb_error(op: &str, e: KnowledgeModuleError) -> ApiError {
 }
 
 /// `GET /api/peco/memory/graph` —— 当前用户 `@private_memory` 的实体子图。
-///
-/// **隔离缺口**：HelixDB 单一命名空间 + `Entity` 无 owner 字段 ⇒
-/// 多用户部署下会返回该实例内所有用户写入的 Entity / 边；本轮接受现状、不加过滤。
 pub async fn get_memory_graph(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -2029,9 +2026,6 @@ pub async fn get_memory_graph(
 }
 
 /// `GET /api/peco/memory/documents` —— 当前用户 `@private_memory` 的文档列表（分页）。
-///
-/// **隔离缺口**：同 `get_memory_graph` —— `Document` 不写 `kb_id`，
-/// 多用户部署下会返回该实例内所有 KB 的文档；本轮接受现状、不加过滤。
 pub async fn list_memory_documents(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -2067,9 +2061,6 @@ pub async fn list_memory_documents(
 ///
 /// 复用既有 `KnowledgeManager::get_document`（core/kb 层零新增能力）。文档不存在
 /// （`Ok(None)`）→ 404「文档不存在或已被删除」。
-///
-/// **隔离缺口**：同 E2 —— 多用户部署下会返回该 HelixDB 实例内
-/// 所有 KB 的文档；本轮接受现状、不加过滤。
 pub async fn get_memory_document(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -2094,8 +2085,6 @@ pub async fn get_memory_document(
 /// 一次只读查询取回至多 `SCAN_LIMIT + 1` 条文档（含正文），Rust 侧做大小写不敏感
 /// 子串匹配并生成 snippet。命中数超 `SCAN_LIMIT` ⇒ 500 + `warn!`（**不静默截断**）。
 /// 检索语义（匹配/片段/排序）在 `view` 纯函数，core/kb 层只提供「取回全部文档」原语。
-///
-/// **隔离缺口**：同 E1/E2 —— 不加 per-user / per-KB 过滤。
 pub async fn search_memory_documents(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,

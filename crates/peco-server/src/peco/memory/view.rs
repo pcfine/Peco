@@ -3,8 +3,8 @@
 //! 单测直接构造 `GraphNode` / `KnowledgeEdge` / `DocumentSummary` 断言纯函数行为，
 //! 不需要 Router / State / 网络。HTTP 薄壳留在 `peco/handler.rs`。
 //!
-//! 隔离缺口提醒：`build_graph` / `build_document_page` 只做响应整形，**不做**任何
-//! per-user / per-KB 过滤 —— 数据层没有可用的过滤键。
+//! 隔离边界：`build_graph` / `build_document_page` 只做响应整形，**不做**任何
+//! per-user / per-KB 过滤 —— 过滤由数据层查询（HelixDB 后端的 `ns` 谓词）承担。
 
 use std::collections::HashSet;
 
