@@ -702,14 +702,9 @@ impl DocumentStore for HelixDbBackend {
     async fn stats(&self) -> Result<StoreStats, KnowledgeError> {
         debug!("Getting storage stats");
 
-        let doc_count = self
-            .count_nodes(&self.schema.content_node_label)
-            .await
-            .unwrap_or(0);
-        let chunk_count = self
-            .count_nodes(&self.schema.fragment_node_label)
-            .await
-            .unwrap_or(0);
+        // 计数失败必须上报：降级成 0 会让「后端异常」在 UI 上冒充「空库」。
+        let doc_count = self.count_nodes(&self.schema.content_node_label).await?;
+        let chunk_count = self.count_nodes(&self.schema.fragment_node_label).await?;
 
         Ok(StoreStats {
             document_count: doc_count,

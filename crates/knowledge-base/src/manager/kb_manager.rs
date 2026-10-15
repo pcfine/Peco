@@ -250,19 +250,27 @@ impl KnowledgeBaseManager {
     }
 
     /// 列出所有已配置的知识库。
+    ///
+    /// 计数取自真实后端，故对尚未打开的库按需 [`open_kb`](Self::open_kb)（随后被
+    /// 缓存）——只看 `instances` 会让重启后未被访问过的库一律误报 0 篇/0 块。
     pub async fn list_kbs(&self) -> Result<Vec<KbInfo>, KnowledgeError> {
-        let configs = self.configs.read().await;
-        let instances = self.instances.read().await;
+        // 先克隆配置再释放读锁：`open_kb` 要取实例写锁，持读锁调用会自锁。
+        let configs: Vec<KbConfig> = self.configs.read().await.values().cloned().collect();
 
-        let mut infos = Vec::new();
-        for cfg in configs.values() {
-            let (doc_count, chunk_count) = if let Some(kb) = instances.get(&cfg.name) {
-                match kb.stats().await {
+        let mut infos = Vec::with_capacity(configs.len());
+        for cfg in configs {
+            let (doc_count, chunk_count) = match self.open_kb(&cfg.name).await {
+                Ok(kb) => match kb.stats().await {
                     Ok(s) => (s.document_count, s.chunk_count),
-                    Err(_) => (0, 0),
+                    Err(e) => {
+                        warn!(kb = %cfg.name, error = %e, "读取知识库统计失败，计数降级为 0");
+                        (0, 0)
+                    }
+                },
+                Err(e) => {
+                    warn!(kb = %cfg.name, error = %e, "打开知识库失败，计数降级为 0");
+                    (0, 0)
                 }
-            } else {
-                (0, 0)
             };
 
             infos.push(KbInfo {
@@ -413,6 +421,51 @@ mod tests {
                 Err(e) => panic!("空白 scope ({blank:?}) 应为 InvalidInput，实际 {e:?}"),
             }
         }
+    }
+
+    /// 计数必须来自真实后端：未打开的库（如服务重启后）不得误报 0。
+    ///
+    /// 用落盘的 LanceDB 造出「配置在、数据在、实例未加载」的初始态。
+    #[cfg(feature = "lancedb")]
+    #[tokio::test]
+    async fn list_kbs_reports_counts_for_unopened_instance() {
+        use crate::manager::config::{ChunkingStrategySerde, FastembedModelTypeSerde};
+
+        fn lancedb_config(name: &str) -> KbConfig {
+            KbConfig {
+                name: name.into(),
+                description: "计数回归".into(),
+                embedding_model: FastembedModelTypeSerde::AllMiniLML6V2Q,
+                chunking: ChunkingStrategySerde::FixedSize { size: 100 },
+                backend: BackendType::LanceDb,
+                storage_path: None,
+                default_storage_mode: Default::default(),
+                helix_url: None,
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 建库并落盘一份文档 —— 此时实例在内存中，计数本来就是对。
+        {
+            let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+            let kb = mgr.create_kb(lancedb_config("count-kb")).await.unwrap();
+            kb.add_text("Test", "Rust is a systems programming language.", "test")
+                .await
+                .unwrap();
+            let infos = mgr.list_kbs().await.unwrap();
+            assert_eq!(infos[0].document_count, 1);
+        }
+
+        // 重新加载（等价于服务重启）：configs 从磁盘恢复，instances 为空。
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let infos = mgr.list_kbs().await.unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].document_count, 1,
+            "未打开的库也必须给出真实计数，不得降级为 0"
+        );
+        assert!(infos[0].chunk_count >= 1);
     }
 
     fn hit(doc_id: &str, snippet: &str, score: f32) -> SearchResult {
