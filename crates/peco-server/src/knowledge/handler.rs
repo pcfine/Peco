@@ -256,8 +256,8 @@ pub async fn create_knowledge_base(
     Json(req): Json<CreateKbRequest>,
 ) -> Result<(StatusCode, Json<KnowledgeBaseResponse>), ApiError> {
     let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return Err(ApiError::BadRequest("name is required".into()));
+    if let Err(msg) = knowledge_base::validate_kb_name(&name) {
+        return Err(ApiError::BadRequest(msg));
     }
 
     // 检查同名知识库是否已存在

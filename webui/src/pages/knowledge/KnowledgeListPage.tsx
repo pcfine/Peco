@@ -22,12 +22,34 @@ import {
 import type { KnowledgeBase, CreateKbRequest } from "@/types/knowledge";
 import { Plus, Trash2, BookOpen } from "lucide-react";
 import { toast } from "sonner";
+import axios from "axios";
+import { kbNameSchema } from "@/lib/validators";
+
+// 后端错误体为 { error, details }
+function getApiErrorMessage(err: unknown): string | undefined {
+  if (axios.isAxiosError(err)) {
+    if (err.response?.data?.details) return String(err.response.data.details);
+    if (err.response?.data?.message) return String(err.response.data.message);
+    if (err.message) return err.message;
+  }
+  if (err instanceof Error) return err.message;
+  return undefined;
+}
 
 export function KnowledgeListPage() {
   const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ name: "", description: "" });
+
+  // 空串只禁用提交，不显示错误
+  const trimmedName = form.name.trim();
+  const nameResult = kbNameSchema.safeParse(trimmedName);
+  const nameValid = nameResult.success;
+  const nameError =
+    !nameResult.success && trimmedName !== ""
+      ? nameResult.error.issues[0]?.message
+      : null;
 
   const load = () => {
     listKnowledgeBases()
@@ -50,8 +72,8 @@ export function KnowledgeListPage() {
       setOpen(false);
       setForm({ name: "", description: "" });
       load();
-    } catch {
-      toast.error("创建失败");
+    } catch (err) {
+      toast.error(getApiErrorMessage(err) ?? "创建失败");
     }
   };
 
@@ -87,8 +109,17 @@ export function KnowledgeListPage() {
                 <Label>名称</Label>
                 <Input
                   value={form.name}
+                  placeholder="例如 my-kb-01"
+                  aria-invalid={!!nameError}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                 />
+                <p className="text-xs text-muted-foreground">
+                  以字母或数字开头，仅可包含字母、数字、.、_、-，最多 64
+                  个字符（不能以 @ 开头）
+                </p>
+                {nameError && (
+                  <p className="text-sm text-destructive">{nameError}</p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label>描述</Label>
@@ -101,7 +132,7 @@ export function KnowledgeListPage() {
               </div>
               <Button
                 onClick={handleCreate}
-                disabled={!form.name.trim()}
+                disabled={!nameValid}
                 className="w-full"
               >
                 创建

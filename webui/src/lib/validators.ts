@@ -29,7 +29,17 @@ export const agentSchema = z.object({
   max_iterations: z.number().positive().optional(),
 });
 
+// 与后端 validate_kb_name 对齐
+export const kbNameSchema = z
+  .string()
+  .min(1, "请输入知识库名称")
+  .max(64, "名称最多 64 个字符")
+  .regex(
+    /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/,
+    "名称需以字母或数字开头和结尾，且只能包含字母、数字、.、_、-（不能以 @ 开头）",
+  );
+
 export const knowledgeBaseSchema = z.object({
-  name: z.string().min(1, "请输入知识库名称"),
+  name: kbNameSchema,
   description: z.string().optional().default(""),
 });

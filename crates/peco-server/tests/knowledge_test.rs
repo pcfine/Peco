@@ -16,7 +16,7 @@ async fn test_create_knowledge_base() {
     let resp = app
         .post("/api/knowledge")
         .json(&json!({
-            "name": "技术文档",
+            "name": "tech-docs",
             "description": "公司内部技术文档库"
         }))
         .send()
@@ -25,9 +25,87 @@ async fn test_create_knowledge_base() {
 
     assert_eq!(resp.status(), 201);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["name"], "技术文档");
+    assert_eq!(body["name"], "tech-docs");
     assert_eq!(body["description"], "公司内部技术文档库");
     assert!(body["id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_create_knowledge_base_rejects_non_ascii_name() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/knowledge")
+        .json(&json!({ "name": "技术文档" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["details"].as_str().is_some_and(|d| !d.is_empty()));
+}
+
+#[tokio::test]
+async fn test_create_knowledge_base_rejects_reserved_prefix() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/knowledge")
+        .json(&json!({ "name": "@private_memory" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["details"].as_str().is_some_and(|d| d.contains('@')),
+        "details 应说明 @ 为保留前缀: {}",
+        body["details"]
+    );
+}
+
+#[tokio::test]
+async fn test_create_knowledge_base_rejects_overlong_name() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/knowledge")
+        .json(&json!({ "name": "a".repeat(65) }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn test_create_knowledge_base_rejects_trailing_dot_name() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/knowledge")
+        .json(&json!({ "name": "kb." }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn test_create_knowledge_base_accepts_symbol_name() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/knowledge")
+        .json(&json!({ "name": "kb_01.v2-test" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 201);
 }
 
 #[tokio::test]
