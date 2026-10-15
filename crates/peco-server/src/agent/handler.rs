@@ -172,6 +172,8 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
     AssembleAgentMdParams {
         name: req.name.trim().to_string(),
         description: req.description.trim().to_string(),
+        // 全新 agent 无模板版本
+        template_version: None,
         provider: req.provider.clone().unwrap_or_else(|| "deepseek".into()),
         model: req
             .model
@@ -222,6 +224,8 @@ fn merge_agent_profile(
             .description
             .clone()
             .unwrap_or_else(|| old_profile.agent.description.clone()),
+        // 请求体不暴露该字段，原样透传；丢失则下次重启被模板覆盖
+        template_version: old_profile.template_version,
         provider: merge_opt(&req.provider, old_llm.and_then(|l| l.provider.clone()))
             .unwrap_or_default(),
         model: merge_opt(&req.model, old_llm.and_then(|l| l.model.clone())).unwrap_or_default(),
@@ -692,4 +696,92 @@ pub async fn delete(
     );
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个「由模板衍生」的 agent.md：带 template_version。
+    const TEMPLATE_DERIVED_MD: &str = r#"---
+agent:
+  name: "@assistant"
+  description: "Peco"
+template_version: 7
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+tools:
+  - "shell"
+knowledge_bases: ["@private_memory"]
+---
+
+body
+"#;
+    fn empty_update_request() -> UpdateAgentRequest {
+        UpdateAgentRequest {
+            name: None,
+            description: None,
+            system_prompt: None,
+            model: None,
+            provider: None,
+            icon: None,
+            background_color: None,
+            tools: None,
+            mcp_servers: None,
+            skills: None,
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            reasoning_effort: None,
+            max_iterations: None,
+            knowledge_bases: None,
+        }
+    }
+
+    /// 回归（本缺陷根因）：UI 保存（PATCH）必须保留 `template_version`，否则下次重启被模板覆盖。
+    #[test]
+    fn update_preserves_template_version() {
+        let (old_profile, old_body) = agent_config::parse_agent_md(TEMPLATE_DERIVED_MD).unwrap();
+        assert_eq!(old_profile.template_version, Some(7));
+
+        let mut req = empty_update_request();
+        req.knowledge_bases = Some(vec![
+            "@private_memory".into(),
+            "work_records".into(),
+            "daily_jokes".into(),
+        ]);
+
+        let merged = merge_agent_profile(&old_profile, &old_body, &req);
+        assert_eq!(merged.template_version, Some(7));
+
+        let md = agent_config::assemble_agent_md(&merged);
+        let (reparsed, _) = agent_config::parse_agent_md(&md).unwrap();
+        assert_eq!(
+            reparsed.template_version,
+            Some(7),
+            "round-trip 后 template_version 必须保持，否则重启会被模板覆盖"
+        );
+        assert_eq!(
+            reparsed.knowledge_bases,
+            vec!["@private_memory", "work_records", "daily_jokes"]
+        );
+    }
+
+    /// 无模板版本的文件（用户手写）保存后不应凭空获得版本号。
+    #[test]
+    fn update_of_handwritten_agent_keeps_no_version() {
+        let md = "---\nagent:\n  name: \"handwritten\"\n  description: \"d\"\nllm:\n  provider: \"deepseek\"\n---\n\nbody\n";
+        let (old_profile, old_body) = agent_config::parse_agent_md(md).unwrap();
+        assert_eq!(old_profile.template_version, None);
+
+        let mut req = empty_update_request();
+        req.description = Some("new desc".into());
+
+        let merged = merge_agent_profile(&old_profile, &old_body, &req);
+        assert_eq!(merged.template_version, None);
+
+        let out = agent_config::assemble_agent_md(&merged);
+        assert!(!out.contains("template_version"), "手写文件不应获得版本号");
+    }
 }

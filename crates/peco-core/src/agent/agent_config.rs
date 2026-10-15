@@ -267,6 +267,9 @@ impl Default for ModelConfigBuilder {
 pub struct AssembleAgentMdParams {
     pub name: String,
     pub description: String,
+    /// 模板版本号；由模板衍生的 agent.md 保存时必须原样透传，否则下次重启会被
+    /// `init_from_template` 整体覆盖。
+    pub template_version: Option<u32>,
     pub provider: String,
     pub model: String,
     pub temperature: Option<f64>,
@@ -293,6 +296,7 @@ pub struct AssembleAgentMdParams {
 /// let params = AssembleAgentMdParams {
 ///     name: "my-agent".into(),
 ///     description: "A helpful agent".into(),
+///     template_version: None,
 ///     provider: "deepseek".into(),
 ///     model: "deepseek-v4-flash".into(),
 ///     temperature: None,
@@ -318,6 +322,11 @@ pub fn assemble_agent_md(params: &AssembleAgentMdParams) -> String {
         "  description: \"{}\"\n",
         yaml_escape(&params.description)
     ));
+
+    // None 不写出：无版本 = 手写文件
+    if let Some(v) = params.template_version {
+        yaml.push_str(&format!("template_version: {v}\n"));
+    }
 
     // llm 段
     yaml.push_str("llm:\n");
@@ -537,6 +546,7 @@ mod tests {
         let params = AssembleAgentMdParams {
             name: "test-agent".into(),
             description: "A test agent for round-trip verification".into(),
+            template_version: Some(7),
             provider: "deepseek".into(),
             model: "deepseek-v4-pro".into(),
             temperature: Some(0.7),
@@ -561,6 +571,8 @@ mod tests {
             profile.agent.description,
             "A test agent for round-trip verification"
         );
+
+        assert_eq!(profile.template_version, Some(7));
 
         // 验证 llm 配置
         let llm = profile.llm.expect("llm section should be present");
@@ -588,6 +600,7 @@ mod tests {
         let params = AssembleAgentMdParams {
             name: "minimal".into(),
             description: "Minimal config".into(),
+            template_version: None,
             provider: "deepseek".into(),
             model: "deepseek-v4-flash".into(),
             temperature: None,
@@ -608,6 +621,8 @@ mod tests {
 
         assert_eq!(profile.agent.name, "minimal");
         assert_eq!(profile.agent.description, "Minimal config");
+
+        assert!(profile.template_version.is_none());
 
         let llm = profile.llm.expect("llm section should be present");
         assert_eq!(llm.provider.as_deref(), Some("deepseek"));
@@ -630,6 +645,7 @@ mod tests {
         let params = AssembleAgentMdParams {
             name: "struct-test".into(),
             description: "Test structure".into(),
+            template_version: None,
             provider: "openai".into(),
             model: "gpt-4".into(),
             temperature: None,
