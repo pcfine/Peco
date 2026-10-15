@@ -116,7 +116,7 @@ export function KnowledgeListPage() {
       ) : (
         <div className="grid gap-3 md:grid-cols-2">
           {kbs.map((kb) => (
-            <Link key={kb.id} to={`/knowledge/${kb.id}`}>
+            <Link key={kb.id} to={`/workspace/knowledge/${kb.id}`}>
               <Card className="group hover:bg-accent/50 transition-colors">
                 <CardHeader className="flex flex-row items-center justify-between p-4">
                   <div className="min-w-0 flex-1">
