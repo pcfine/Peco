@@ -11,9 +11,11 @@ use axum_extra::extract::Multipart;
 use knowledge_base::manager::config::{
     BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
 };
+use peco_core::knowledge::hash_manifest::is_supported_extension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::reconcile;
 use crate::auth::AuthUser;
 use crate::db::{documents, knowledge_bases};
 use crate::error::ApiError;
@@ -124,6 +126,21 @@ fn default_limit() -> i64 {
 
 // ── 辅助函数 ─────────────────────────────────────────────────────────────────
 
+/// `KbInfo` 不可得时回退的展示标签，取值与 REST 建库默认后端/模型一致。
+const DEFAULT_BACKEND_LABEL: &str = "HelixDB";
+const DEFAULT_EMBEDDING_LABEL: &str = "BGEBaseZHV15";
+
+/// 从 `KbInfo` 取展示用 `(backend, embedding_model)`；不可得时用回退常量。
+fn kb_labels(info: Option<&knowledge_base::KbInfo>) -> (String, String) {
+    match info {
+        Some(info) => (info.backend.clone(), info.embedding_model.clone()),
+        None => (
+            DEFAULT_BACKEND_LABEL.to_string(),
+            DEFAULT_EMBEDDING_LABEL.to_string(),
+        ),
+    }
+}
+
 /// 解析嵌入模型字符串为 FastembedModelTypeSerde。
 fn parse_embedding_model(s: Option<&str>) -> FastembedModelTypeSerde {
     match s {
@@ -178,12 +195,27 @@ fn build_kb_config(
     }
 }
 
-/// 允许上传的 MIME 类型。
+/// 上传被接受 ⟺ 会被摄入：文件名合法，且 MIME 与扩展名都命中摄入集合。
+///
+/// 隐藏文件与含路径分隔符的名字既不被扫描收录，还可能写到 `docs/` 之外。
+fn is_supported_upload(mime: &str, filename: &str) -> bool {
+    // 此处 `Path` 是 axum 的提取器，故用全限定名指 std 的路径类型
+    is_allowed_mime(mime)
+        && is_supported_extension(std::path::Path::new(filename))
+        && is_acceptable_upload_name(filename)
+}
+
+/// 文件名是否可用作 `relative_path`：非空、非隐藏、不含路径分隔符。
+fn is_acceptable_upload_name(filename: &str) -> bool {
+    let name = filename.trim();
+    !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\\')
+}
+
+/// 允许上传的 MIME 类型。`.docx` 不在其中（解析器未实现）。
 fn is_allowed_mime(mime: &str) -> bool {
     matches!(
         mime,
         "application/pdf"
-            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             | "text/html"
             | "text/markdown"
             | "text/plain"
@@ -215,27 +247,26 @@ pub async fn list_knowledge_bases(
 ) -> Result<Json<Vec<KnowledgeBaseResponse>>, ApiError> {
     let rows = knowledge_bases::list_by_user(&state.db, &user_id).await?;
 
+    let infos = match get_user_km(&state, &user_id) {
+        Ok(km) => km.list_kbs().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
     let mut responses = Vec::with_capacity(rows.len());
     for row in &rows {
-        // 尝试获取知识库统计信息
-        let (doc_count, chunk_count) = match get_user_km(&state, &user_id) {
-            Ok(km) => match km.list_kbs().await {
-                Ok(infos) => {
-                    let info = infos.iter().find(|i| i.name == row.name);
-                    info.map(|i| (i.document_count, i.chunk_count))
-                        .unwrap_or((0, 0))
-                }
-                Err(_) => (0, 0),
-            },
-            Err(_) => (0, 0),
-        };
+        // 真实后端 / 嵌入模型来自 KbInfo（kb_config.json），不再硬编码
+        let info = infos.iter().find(|i| i.name == row.name);
+        let (backend, embedding_model) = kb_labels(info);
+        let (doc_count, chunk_count) = info
+            .map(|i| (i.document_count, i.chunk_count))
+            .unwrap_or((0, 0));
 
         responses.push(KnowledgeBaseResponse {
             id: row.id.clone(),
             name: row.name.clone(),
             description: row.description.clone(),
-            backend: "LanceDB".to_string(),
-            embedding_model: "BGEBaseZHV15".to_string(),
+            backend,
+            embedding_model,
             document_count: doc_count,
             chunk_count,
             created_at: row.created_at.clone(),
@@ -298,7 +329,8 @@ pub async fn create_knowledge_base(
         chunking,
     );
 
-    km.create_kb(kb_config)
+    let info = km
+        .create_kb(kb_config)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to create knowledge base: {e}")))?;
 
@@ -306,8 +338,8 @@ pub async fn create_knowledge_base(
         id: kb_id,
         name,
         description: req.description,
-        backend: "HelixDB".to_string(),
-        embedding_model: "BGEBaseZHV15".to_string(),
+        backend: info.backend,
+        embedding_model: info.embedding_model,
         document_count: 0,
         chunk_count: 0,
         created_at: String::new(), // 由 DB 填充
@@ -336,25 +368,23 @@ pub async fn get_knowledge_base(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
-    let (doc_count, chunk_count) = match get_user_km(&state, &user_id) {
-        Ok(km) => match km.list_kbs().await {
-            Ok(infos) => {
-                let info = infos.iter().find(|i| i.name == row.name);
-                info.map(|i| (i.document_count, i.chunk_count))
-                    .unwrap_or((0, 0))
-            }
-            Err(_) => (0, 0),
-        },
-        Err(_) => (0, 0),
+    let infos = match get_user_km(&state, &user_id) {
+        Ok(km) => km.list_kbs().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
     };
+    let info = infos.iter().find(|i| i.name == row.name);
+    let (backend, embedding_model) = kb_labels(info);
+    let (doc_count, chunk_count) = info
+        .map(|i| (i.document_count, i.chunk_count))
+        .unwrap_or((0, 0));
 
     info!(user_id = %user_id, kb_id = %kb_id, name = %row.name, "Knowledge base fetched");
     Ok(Json(KnowledgeBaseResponse {
         id: row.id,
         name: row.name,
         description: row.description,
-        backend: "LanceDB".to_string(),
-        embedding_model: "BGEBaseZHV15".to_string(),
+        backend,
+        embedding_model,
         document_count: doc_count,
         chunk_count,
         created_at: row.created_at,
@@ -364,7 +394,9 @@ pub async fn get_knowledge_base(
 
 /// `DELETE /api/knowledge/:id`
 ///
-/// 删除知识库及其所有数据（SQLite 记录 + 磁盘文件 + LanceDB 数据）。
+/// 删除知识库（SQLite 记录 + 磁盘上的 KB 目录）。
+///
+/// KB 后端的向量/图谱数据不在此清理。
 pub async fn delete_knowledge_base(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -386,7 +418,7 @@ pub async fn delete_knowledge_base(
     // 2. 删除知识库的 SQLite 记录
     knowledge_bases::delete(&state.db, &kb_id).await?;
 
-    // 3. 通过 KnowledgeBaseManager 删除知识库（含磁盘 + LanceDB 数据）
+    // 3. 通过 KnowledgeBaseManager 删除知识库目录（含 kb_config.json 与其下数据文件）
     if let Ok(km) = get_user_km(&state, &user_id)
         && let Err(e) = km.delete_kb(&kb_name).await
     {
@@ -464,6 +496,7 @@ pub async fn upload_document(
 
     let kb_name = kb_row.name.clone();
     let kb_name_for_bg = kb_name.clone();
+    let kb_id_for_bg = kb_id.clone();
     let user_id_for_bg = user_id.clone();
     let db_for_bg = state.db.clone();
     let wsm_for_bg = state.workspace_manager.clone();
@@ -492,23 +525,17 @@ pub async fn upload_document(
     let filename = filename.ok_or_else(|| ApiError::BadRequest("file field is required".into()))?;
     let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // 验证 MIME 类型
-    if !is_allowed_mime(&mime_type) {
+    // 验证文件名与类型：只有会被摄入的文件才接受
+    if !is_supported_upload(&mime_type, &filename) {
         return Err(ApiError::BadRequest(format!(
-            "unsupported file type: {mime_type}"
+            "file cannot be ingested (invalid name or unsupported type): {filename} ({mime_type})"
         )));
     }
 
     let file_size = data.len() as i64;
 
     // 保存文件到磁盘
-    let sanitized = knowledge_base::sanitize_kb_name(&kb_name);
-    let docs_dir = state
-        .workspace_manager
-        .workspace_dir(&user_id)
-        .join("knowledge")
-        .join(sanitized)
-        .join("docs");
+    let docs_dir = reconcile::docs_dir(&state.workspace_manager.workspace_dir(&user_id), &kb_name);
     tokio::fs::create_dir_all(&docs_dir)
         .await
         .map_err(|e| ApiError::Internal(format!("failed to create docs directory: {e}")))?;
@@ -518,17 +545,16 @@ pub async fn upload_document(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to save file: {e}")))?;
 
-    // 写入 documents 表（status=pending）
-    let doc_id = Uuid::new_v4().to_string();
-    documents::insert(
+    // 用返回的行 id 回写状态：重复上传时它可能与新建的候选 id 不同。
+    let doc_id = documents::upsert_pending(
         &state.db,
         &documents::CreateDocumentParams {
-            id: doc_id.clone(),
             kb_id: kb_id.clone(),
             filename: filename.clone(),
             filepath: filepath.to_string_lossy().to_string(),
             file_size,
             mime_type: mime_type.clone(),
+            relative_path: filename.clone(),
         },
     )
     .await?;
@@ -541,9 +567,29 @@ pub async fn upload_document(
 
         match wsm_for_bg.get(&user_id_for_bg) {
             Ok(ws) => match ws.knowledge_manager().sync_kb(&kb_name_for_bg).await {
-                Ok(_report) => {
-                    let _ =
-                        documents::update_status(&db_for_bg, &doc_id_for_bg, "ready", None).await;
+                Ok(report) => {
+                    // 终态由 manifest 投影决定，解析失败的文件不能被无条件标成 ready
+                    let docs_dir = reconcile::docs_dir(
+                        &wsm_for_bg.workspace_dir(&user_id_for_bg),
+                        &kb_name_for_bg,
+                    );
+                    if let Err(e) = reconcile::reconcile_documents(
+                        &db_for_bg,
+                        ws.knowledge_manager(),
+                        &kb_id_for_bg,
+                        &kb_name_for_bg,
+                        &docs_dir,
+                        &report,
+                    )
+                    .await
+                    {
+                        warn!(
+                            doc_id = %doc_id_for_bg,
+                            kb = %kb_name_for_bg,
+                            error = %e,
+                            "Document reconciliation failed"
+                        );
+                    }
                     info!(
                         doc_id = %doc_id_for_bg,
                         kb = %kb_name_for_bg,
@@ -610,6 +656,10 @@ pub async fn sync_knowledge_base(
         .await
         .map_err(|e| ApiError::Internal(format!("sync failed: {e}")))?;
 
+    // 同步结果投影到 documents 表，让 REST 面与 KB 后端一致
+    let docs_dir = reconcile::docs_dir(&state.workspace_manager.workspace_dir(&user_id), &row.name);
+    reconcile::reconcile_documents(&state.db, &km, &kb_id, &row.name, &docs_dir, &report).await?;
+
     // 更新 KB 时间戳
     let _ = knowledge_bases::touch(&state.db, &kb_id).await;
 
@@ -627,7 +677,7 @@ pub async fn sync_knowledge_base(
 
 /// `DELETE /api/knowledge/:id/documents/:doc_id`
 ///
-/// 删除单个文档（SQLite 记录 + 磁盘文件 + 向量数据）。
+/// 删除单个文档（SQLite 记录 + 磁盘文件）。
 pub async fn delete_document(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -674,6 +724,42 @@ pub async fn delete_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上传准入必须与摄入扫描的扩展名集合一致，否则会被接受却永不被索引。
+    #[test]
+    fn upload_gate_matches_ingestion_extension_set() {
+        for (mime, filename) in [("text/markdown", "a.md"), ("application/pdf", "a.pdf")] {
+            assert!(is_supported_upload(mime, filename), "{filename} 应被接受");
+        }
+
+        // docx 解析器未实现（Phase 2），准入必须同样拒绝
+        assert!(
+            !is_supported_upload(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "a.docx"
+            ),
+            ".docx 解析器未实现，上传必须被拒绝"
+        );
+
+        assert!(
+            !is_supported_upload("text/plain", "server.log"),
+            ".log 不会被摄入，必须在入口拒绝"
+        );
+    }
+
+    /// 隐藏文件与含路径分隔符的名字必须在入口拒绝。
+    #[test]
+    fn upload_rejects_hidden_and_path_like_filenames() {
+        for filename in [".hidden.md", "sub/a.md", "../a.md", "sub\\a.md", "   "] {
+            assert!(
+                !is_supported_upload("text/markdown", filename),
+                "{filename} 不应被接受"
+            );
+        }
+
+        assert!(is_supported_upload("text/markdown", "a.md"));
+        assert!(is_supported_upload("application/pdf", "a.pdf"));
+    }
 
     /// REST 建库路径默认走 HelixDB 后端。
     ///

@@ -5294,6 +5294,7 @@ dependencies = [
  "jsonwebtoken",
  "knowledge-base",
  "lru",
+ "mime_guess",
  "model-provider",
  "notify",
  "peco-agents",

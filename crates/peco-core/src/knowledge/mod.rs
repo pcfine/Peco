@@ -14,5 +14,6 @@ pub mod sync;
 
 pub use config::KnowledgeConfig;
 pub use error::KnowledgeModuleError;
+pub use hash_manifest::FileHashManifest;
 pub use manager::KnowledgeManager;
 pub use sync::SyncReport;

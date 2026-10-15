@@ -359,6 +359,27 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 013 skipped: peco_context_shadow table already exists");
     }
 
+    // ── Migration 014: documents 表 manifest 投影列 + 唯一索引 ─────────────
+    // 门控查 relative_path（ALTER ADD COLUMN 不可重复执行）。
+    let documents_has_relative_path = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('documents') WHERE name = 'relative_path'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !documents_has_relative_path {
+        run_migration(
+            pool,
+            "014",
+            include_str!("migrations/014_documents_manifest.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 014 completed");
+    } else {
+        tracing::debug!("Migration 014 skipped: documents.relative_path already exists");
+    }
+
     Ok(())
 }
 
@@ -637,6 +658,155 @@ mod tests {
             count, 1,
             "重跑迁移后表 memory_supersede_intent 不得重复创建"
         );
+    }
+
+    /// 迁移 014：补齐投影列与唯一索引；旧库升级后仍可启动且不丢存量行。
+    #[tokio::test]
+    async fn migration_014_upgrades_legacy_documents_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/legacy.db?mode=rwc", dir.path().display());
+        let pool = connect(&url).await.unwrap();
+
+        // 造一个投影列之前的旧库，含一行 upload 记录
+        sqlx::raw_sql(
+            "CREATE TABLE documents (\
+               id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, filename TEXT NOT NULL, \
+               filepath TEXT NOT NULL, file_size INTEGER NOT NULL DEFAULT 0, \
+               mime_type TEXT NOT NULL DEFAULT 'application/octet-stream', \
+               status TEXT NOT NULL DEFAULT 'pending', error_msg TEXT, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (id, kb_id, filename, filepath) \
+             VALUES ('d1', 'kb1', 'a.md', '/x/a.md')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        for col in ["relative_path", "doc_id"] {
+            let n = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pragma_table_info('documents') WHERE name = ?",
+            )
+            .bind(col)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "迁移 014 后 documents 应含列 {col}");
+        }
+        let idx = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_documents_kb_relative'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            idx, 1,
+            "迁移 014 后应存在唯一索引 idx_documents_kb_relative"
+        );
+
+        let rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "迁移不得删除存量 documents 行");
+    }
+
+    /// 迁移 014：存量行以 filename 回填自然键并去重，否则首次 reconcile 会重复插行。
+    #[tokio::test]
+    async fn migration_014_backfills_natural_key_and_dedups_legacy_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let url = format!("sqlite:{}/legacy014.db?mode=rwc", workspace.display());
+        let pool = connect(&url).await.unwrap();
+
+        // 旧库：同一 (kb_id, filename) 存了两行
+        sqlx::raw_sql(
+            "CREATE TABLE documents (\
+               id TEXT PRIMARY KEY, kb_id TEXT NOT NULL, filename TEXT NOT NULL, \
+               filepath TEXT NOT NULL, file_size INTEGER NOT NULL DEFAULT 0, \
+               mime_type TEXT NOT NULL DEFAULT 'application/octet-stream', \
+               status TEXT NOT NULL DEFAULT 'pending', error_msg TEXT, \
+               created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for id in ["d1", "d2"] {
+            sqlx::query(
+                "INSERT INTO documents (id, kb_id, filename, filepath) \
+                 VALUES (?, 'kb1', 'a.md', '/x/a.md')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_migrations(&pool).await.unwrap();
+
+        // 回填 + 去重后只剩一行（保留最新 rowid）
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, relative_path FROM documents WHERE kb_id = 'kb1'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "同组存量行应去重为一行");
+        assert_eq!(rows[0].0, "d2");
+        assert_eq!(rows[0].1, "a.md", "存量行自然键回填为 filename");
+
+        let idx = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+             AND name='idx_documents_kb_relative'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx, 1, "唯一索引应已建成");
+
+        // 迁移 + reconcile 后不得再增行，状态 ready
+        let kb_name = "recon";
+        let knowledge_root = workspace.join("knowledge");
+        let km = peco_core::knowledge::KnowledgeManager::new(knowledge_root.clone());
+        km.ensure_loaded().await.unwrap();
+        let kb_dir = knowledge_root.join(knowledge_base::sanitize_kb_name(kb_name));
+        tokio::fs::create_dir_all(kb_dir.join("docs"))
+            .await
+            .unwrap();
+        let mut manifest = peco_core::knowledge::FileHashManifest::default();
+        manifest.files.insert(
+            "a.md".into(),
+            peco_core::knowledge::hash_manifest::FileEntry {
+                hash: "h".into(),
+                size: 3,
+                doc_id: "backend-doc".into(),
+                ingested_at: "2026-01-01T00:00:00+00:00".into(),
+            },
+        );
+        manifest.save(&kb_dir).await.unwrap();
+
+        let docs = crate::knowledge::reconcile::docs_dir(&workspace, kb_name);
+        let report = peco_core::knowledge::SyncReport::new(kb_name);
+        crate::knowledge::reconcile::reconcile_documents(
+            &pool, &km, "kb1", kb_name, &docs, &report,
+        )
+        .await
+        .unwrap();
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, status FROM documents WHERE kb_id = 'kb1'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "reconcile 不得为已存在的自然键再插一行");
+        assert_eq!(rows[0].1, "ready");
     }
 
     /// 迁移 013：首次执行建出边界观测表；已有数据在二次执行后保持不变。

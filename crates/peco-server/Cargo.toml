@@ -59,6 +59,9 @@ governor = "0.8"
 # File watcher
 notify = { workspace = true }
 
+# MIME 推断（documents 投影按扩展名回填 mime_type）
+mime_guess = { workspace = true }
+
 # Utils
 chrono = { workspace = true }
 anyhow = { workspace = true }

@@ -162,7 +162,7 @@ pub async fn run(
                         debug!(action = ?action, "File watcher: config already applied, skipping reload");
                         continue;
                     }
-                    execute_action(&ws, action).await;
+                    execute_action(&ws, action, db.as_ref(), &user_id, &workspace_root).await;
                 }
 
                 // 如果有 DB 连接，同步哈希和 agent 索引
@@ -255,8 +255,14 @@ fn classify_event(workspace_root: &Path, event: &Event) -> Vec<ReloadAction> {
     actions
 }
 
-/// 对 WorkSpace 执行重载动作。
-async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
+/// 对 WorkSpace 执行重载动作。`db` / `user_id` / `workspace_root` 供 KB 同步后投影 `documents`。
+async fn execute_action(
+    ws: &WorkSpace,
+    action: &ReloadAction,
+    db: Option<&SqlitePool>,
+    user_id: &str,
+    workspace_root: &Path,
+) {
     match action {
         ReloadAction::Agent(name) => {
             debug!(agent = %name, "File watcher: reloading agent");
@@ -272,9 +278,24 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
         }
         ReloadAction::KnowledgeSync(kb_name) => {
             debug!(kb = %kb_name, "File watcher: syncing knowledge base");
-            if let Err(e) = ws.sync_knowledge(kb_name).await {
-                warn!(kb = %kb_name, error = %e,
-                    "File watcher: knowledge sync failed");
+            match ws.sync_knowledge(kb_name).await {
+                Ok(report) => {
+                    if let Some(db) = db {
+                        sync_documents_projection(
+                            db,
+                            ws,
+                            user_id,
+                            workspace_root,
+                            kb_name,
+                            &report,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(kb = %kb_name, error = %e,
+                        "File watcher: knowledge sync failed");
+                }
             }
         }
         ReloadAction::KnowledgeReload => {
@@ -308,6 +329,43 @@ async fn execute_action(ws: &WorkSpace, action: &ReloadAction) {
                     "File watcher: workflow reload failed");
             }
         }
+    }
+}
+
+/// 同步后把该 KB 的 manifest 投影到 `documents` 表（未注册的 KB 跳过）。
+async fn sync_documents_projection(
+    db: &SqlitePool,
+    ws: &WorkSpace,
+    user_id: &str,
+    workspace_root: &Path,
+    kb_name: &str,
+    report: &peco_core::knowledge::SyncReport,
+) {
+    let kb_row = match crate::db::knowledge_bases::find_by_name_and_user(db, kb_name, user_id).await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            debug!(kb = %kb_name, "File watcher: KB not registered, skipping projection");
+            return;
+        }
+        Err(e) => {
+            warn!(kb = %kb_name, error = %e, "File watcher: KB lookup for projection failed");
+            return;
+        }
+    };
+
+    let docs_dir = crate::knowledge::reconcile::docs_dir(workspace_root, kb_name);
+    if let Err(e) = crate::knowledge::reconcile::reconcile_documents(
+        db,
+        ws.knowledge_manager(),
+        &kb_row.id,
+        kb_name,
+        &docs_dir,
+        report,
+    )
+    .await
+    {
+        warn!(kb = %kb_name, error = %e, "File watcher: document reconciliation failed");
     }
 }
 

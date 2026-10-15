@@ -6,6 +6,7 @@
 //! - 自动增量同步（扫描 docs/ 目录 → 对比哈希 → 更新数据库）
 //! - 多维度搜索（BM25 + 向量 + 图谱）
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +43,10 @@ pub struct KnowledgeManager {
     underlying: Mutex<Option<knowledge_base::KnowledgeBaseManager>>,
     /// 确保 auto_sync_on_start 只执行一次
     auto_sync_done: AtomicBool,
+    /// 每 KB 一把同步锁，串行化同名 KB 的并发 sync。
+    sync_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 串行化 reload 的「构建 + 安装」，防旧快照覆盖新快照。锁序 reload_lock → underlying。
+    reload_lock: Mutex<()>,
 }
 
 impl KnowledgeManager {
@@ -62,6 +67,8 @@ impl KnowledgeManager {
             config,
             underlying: Mutex::new(None),
             auto_sync_done: AtomicBool::new(false),
+            sync_locks: Mutex::new(HashMap::new()),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -76,6 +83,8 @@ impl KnowledgeManager {
             config: KnowledgeConfig::default(),
             underlying: Mutex::new(None),
             auto_sync_done: AtomicBool::new(false),
+            sync_locks: Mutex::new(HashMap::new()),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -98,12 +107,16 @@ impl KnowledgeManager {
     /// 适用于工作空间下新增或删除了知识库配置后触发全量刷新。
     /// 注意：若配置了 `auto_sync_on_start`，reload 后允许再次自动同步。
     pub async fn reload(&self) -> Result<(), KnowledgeModuleError> {
+        let _reload = self.reload_lock.lock().await;
+        // 先构建成功再替换：失败必须保留旧实例，否则底层永久停在未初始化态。
+        let mgr =
+            knowledge_base::KnowledgeBaseManager::load_with_scope(&self.base_dir, &self.scope)
+                .await?;
         let mut guard = self.underlying.lock().await;
-        *guard = None;
+        *guard = Some(mgr);
         drop(guard);
         // 允许重新触发 auto_sync
         self.auto_sync_done.store(false, Ordering::SeqCst);
-        self.ensure_loaded().await?;
         info!("KnowledgeManager reloaded");
         Ok(())
     }
@@ -691,6 +704,10 @@ impl KnowledgeManager {
 
     /// 内部同步实现 — 调用方需先确保 `ensure_loaded()` 已完成。
     async fn sync_kb_impl(&self, name: &str) -> Result<SyncReport, KnowledgeModuleError> {
+        // 串行化整段同步（含 manifest 读-改-写），否则并发 sync 会重复摄入。
+        let lock = self.sync_guard(name).await;
+        let _guard = lock.lock().await;
+
         let start = std::time::Instant::now();
 
         let kb_dir = self.base_dir.join(knowledge_base::sanitize_kb_name(name));
@@ -835,6 +852,30 @@ impl KnowledgeManager {
     }
 
     // ── 内部辅助方法 ────────────────────────────────────────────────────────
+
+    /// 取（或惰性创建）指定 KB 的同步锁。持 map 锁期间不得 await。
+    async fn sync_guard(&self, kb: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.sync_locks.lock().await;
+        locks
+            .entry(kb.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// 读取 KB 的哈希清单；KB 目录不存在返回 `NotFound`，目录在但无清单视为空清单。
+    /// 调用方（`documents` 表投影）据此区分「KB 消失」与「尚无文档」。
+    pub async fn read_manifest(
+        &self,
+        kb_name: &str,
+    ) -> Result<FileHashManifest, KnowledgeModuleError> {
+        let kb_dir = self
+            .base_dir
+            .join(knowledge_base::sanitize_kb_name(kb_name));
+        if !kb_dir.is_dir() {
+            return Err(KnowledgeModuleError::NotFound(kb_name.to_string()));
+        }
+        FileHashManifest::load(&kb_dir).await
+    }
 
     /// 处理单个文件的同步逻辑。
     async fn process_one_file(
@@ -1110,6 +1151,75 @@ mod tests {
 
         let report4 = km.sync_kb("test-sync").await.unwrap();
         assert_eq!(report4.removed, 1);
+    }
+
+    /// 不变量：reload 失败后底层实例必须保留，后续调用不得报 `NotInitialized`。
+    #[tokio::test]
+    async fn reload_failure_preserves_loaded_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        let km = KnowledgeManager::new(ws.clone());
+        km.ensure_loaded().await.unwrap();
+
+        // 用普通文件占位数据根目录，使 create_dir_all 失败
+        tokio::fs::remove_dir_all(&ws).await.unwrap();
+        tokio::fs::write(&ws, b"occupied by a file").await.unwrap();
+
+        assert!(km.reload().await.is_err(), "根目录被占位时 reload 应失败");
+        assert!(
+            km.list_kbs().await.is_ok(),
+            "reload 失败后旧实例必须保留，list_kbs 不得报 NotInitialized"
+        );
+    }
+
+    /// 不变量：reload 与 list_kbs 并发时，底层不得出现未初始化窗口。
+    #[tokio::test]
+    async fn concurrent_reload_never_not_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
+        km.ensure_loaded().await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let km = km.clone();
+            handles.push(tokio::spawn(async move {
+                let reload_ok = km.reload().await.is_ok();
+                let list_ok = km.list_kbs().await.is_ok();
+                (reload_ok, list_ok)
+            }));
+        }
+
+        for handle in handles {
+            let (reload_ok, list_ok) = handle.await.unwrap();
+            assert!(reload_ok, "空 workspace 的 reload 应成功");
+            assert!(list_ok, "reload 与 list_kbs 并发不得出现 NotInitialized");
+        }
+    }
+
+    /// 不变量：同一 KB 的并发 sync 只能摄入一次。
+    #[tokio::test]
+    async fn concurrent_sync_does_not_double_ingest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config("k")).await.unwrap();
+
+        let docs_dir = tmp.path().join("k").join("docs");
+        tokio::fs::create_dir_all(&docs_dir).await.unwrap();
+        tokio::fs::write(docs_dir.join("a.md"), b"# A\n\nhello world content")
+            .await
+            .unwrap();
+
+        let (r1, r2) = tokio::join!(km.sync_kb("k"), km.sync_kb("k"));
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        assert_eq!(
+            r1.added + r2.added,
+            1,
+            "并发 sync 同一 KB 只应摄入一次（r1 added={}, r2 added={}）",
+            r1.added,
+            r2.added
+        );
     }
 
     /// BK-3 回归：`open_kb` 失败映射**只**把 `KnowledgeError::NotFound` 收敛为

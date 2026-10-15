@@ -101,12 +101,20 @@ pub async fn compute_file_hash(path: &Path) -> Result<(String, u64), KnowledgeMo
     Ok((hex::encode(hasher.finalize()), total_size))
 }
 
-/// 受支持的文件扩展名列表。
+/// 可摄入的扩展名 —— 摄入扫描与上传准入共用的唯一真相源。
+/// `docx` 解析器未实现（Phase 2），故不在其内。
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "md", "markdown", "html", "htm", "txt", "rs", "py", "js", "ts", "go", "java", "c",
     "cpp", "h", "hpp", "toml", "yaml", "yml", "json", "xml", "csv", "sql", "r", "rb", "swift",
     "kt", "scala", "sh", "bash", "zsh", "fish", "css", "scss", "vue", "svelte",
 ];
+
+/// 文件路径的扩展名是否可被摄入（大小写不敏感）。
+pub fn is_supported_extension(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        SUPPORTED_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str())
+    })
+}
 
 /// 递归扫描目录，收集所有受支持的文件。
 ///
@@ -143,13 +151,8 @@ pub async fn scan_supported_files(
         if path.is_dir() && recursive {
             let sub_files = Box::pin(scan_supported_files(&path, recursive)).await?;
             files.extend(sub_files);
-        } else if path.is_file()
-            && let Some(ext) = path.extension()
-        {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            if SUPPORTED_EXTENSIONS.contains(&ext_str.as_str()) {
-                files.push(path);
-            }
+        } else if path.is_file() && is_supported_extension(&path) {
+            files.push(path);
         }
     }
 
@@ -234,6 +237,25 @@ mod tests {
         assert!(names.contains(&"data.txt"));
         assert!(!names.contains(&"image.png"));
         assert!(!names.contains(&".hidden.md"));
+    }
+
+    #[test]
+    fn is_supported_extension_follows_scan_set() {
+        assert!(is_supported_extension(Path::new("nested/A.PDF")));
+        assert!(!is_supported_extension(Path::new("a.docx")));
+        assert!(!is_supported_extension(Path::new("logs/a.log")));
+        assert!(!is_supported_extension(Path::new("README")));
+    }
+
+    #[tokio::test]
+    async fn scan_supported_files_excludes_docx() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("spec.docx"), b"fake docx")
+            .await
+            .unwrap();
+
+        let files = scan_supported_files(tmp.path(), false).await.unwrap();
+        assert!(files.is_empty(), ".docx 解析器未实现，不应被扫描收集");
     }
 
     #[tokio::test]

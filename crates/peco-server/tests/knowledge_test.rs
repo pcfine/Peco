@@ -232,6 +232,52 @@ async fn test_get_documents_empty() {
     assert!(body.is_empty());
 }
 
+// ── backend / embedding_model 取自 KbInfo（D4 回归） ─────────────────────────
+
+/// `backend` / `embedding_model` 必须报 `kb_config.json` 的真实值，而非硬编码。
+/// 需可用的 HelixDB 端点（`PECO_KB_HELIX_URL`，回退 `http://localhost:6970`，跑测试时
+/// 指向一次性实例）。非默认嵌入模型用于区分真值与旧的硬编码 `BGEBaseZHV15`。
+#[tokio::test]
+async fn get_kb_reports_real_backend() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .post("/api/knowledge")
+        .json(&json!({
+            "name": "backend-label-kb",
+            "embedding_model": "all-minilm-l6-v2q"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(created["backend"], "HelixDB", "创建响应应报真实后端");
+    let kb_id = created["id"].as_str().unwrap();
+
+    // 详情
+    let resp = app
+        .get(&format!("/api/knowledge/{kb_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["backend"], "HelixDB");
+    assert_eq!(body["embedding_model"], "AllMiniLML6V2Q");
+
+    // 列表
+    let resp = app.get("/api/knowledge").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: Vec<serde_json::Value> = resp.json().await.unwrap();
+    let item = list
+        .iter()
+        .find(|k| k["id"] == kb_id)
+        .expect("列表应包含刚建的知识库");
+    assert_eq!(item["backend"], "HelixDB");
+    assert_eq!(item["embedding_model"], "AllMiniLML6V2Q");
+}
+
 // ── 认证要求 ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
