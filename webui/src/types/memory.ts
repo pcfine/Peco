@@ -1,18 +1,30 @@
 // 「记忆」页类型定义 —— 字段与后端 E1/E2 响应逐字对齐
 // E1 `GET /peco/memory/graph`、E2 `GET /peco/memory/documents`
 
-/** 图谱节点。`id` 为稳定 id（`entity:Entity:<hash8>`），`name` 缺失时为 `""`。 */
+/**
+ * 图谱节点。`id` 为稳定 id（`entity:Entity:<hash8>`），`name` 缺失时为 `""`。
+ *
+ * `type` 是实体类型（后端闭集 + `Other` 兜底）；后端把**缺失或闭集外**的取值
+ * 一律下发为 `"Other"` —— 正常响应里不会缺这个字段，但前端仍按「未知」兜底。
+ */
 export interface MemoryNode {
   id: string;
   name: string;
+  type: string;
 }
 
-/** 图谱边。**无稳定边 id**（后端不返回），前端用复合键生成 React key。 */
+/**
+ * 图谱边。**无稳定边 id**（后端不返回），前端用复合键生成 React key。
+ *
+ * `predicate` 是边 label 原文（未映射也不改写）；`group` 是读侧派生的关系组，
+ * **未映射谓词无此字段**（缺省不是错误，只是没有对应组）。
+ */
 export interface MemoryEdge {
   source: string;
   target: string;
   predicate: string;
   weight: number;
+  group?: string;
 }
 
 /** E1 响应：`nodes` 或 `edges` 任一被上限截断时 `truncated` 为 `true`。 */

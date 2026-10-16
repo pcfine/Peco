@@ -28,6 +28,9 @@ pub struct MemoryNode {
     pub id: String,
     /// 节点 `name` 属性；缺失时 `""`。
     pub name: String,
+    /// 节点 `entity_type` 属性（本体闭集 canonical 名）；缺失/未知 → `"Other"`。
+    #[serde(rename = "type")]
+    pub entity_type: String,
 }
 
 /// 图谱响应里的一条谓词边。**不含边 id** —— HelixDB 边只有不稳定内部 id。
@@ -35,9 +38,12 @@ pub struct MemoryNode {
 pub struct MemoryEdge {
     pub source: String,
     pub target: String,
-    /// 边 label 原文（谓词，大小写敏感，无规范化）。
+    /// 边 label 原文（谓词；仅空白/全角在写入时被折叠，无同义改写）。
     pub predicate: String,
     pub weight: f32,
+    /// 读侧从 `predicate` 派生的关系组；未映射谓词则无此字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// `GET /api/peco/memory/graph` 响应。
@@ -119,6 +125,12 @@ pub fn build_graph(
         .into_iter()
         .map(|n| MemoryNode {
             name: n.properties.get("name").cloned().unwrap_or_default(),
+            entity_type: n
+                .properties
+                .get("entity_type")
+                .and_then(|t| peco_core::ontology::EntityType::from_name(t))
+                .map(|t| t.as_str().to_string())
+                .unwrap_or_else(|| "Other".to_string()),
             id: n.id,
         })
         .collect();
@@ -126,11 +138,13 @@ pub fn build_graph(
         .into_iter()
         .map(|e| {
             let predicate = e.edge_type.as_label().to_string();
+            let group = peco_core::ontology::group_of(&predicate).map(str::to_string);
             MemoryEdge {
                 source: e.source_id,
                 target: e.target_id,
                 predicate,
                 weight: e.weight,
+                group,
             }
         })
         .collect();
@@ -467,6 +481,76 @@ mod tests {
         assert_eq!(resp.edges.len(), 1);
         assert_eq!(resp.edges[0].predicate, "朋友");
         assert!((resp.edges[0].weight - 0.95).abs() < f32::EPSILON);
+        // 缺 `entity_type` 属性 → `"Other"`；未映射谓词 → 无 group
+        assert!(resp.nodes.iter().all(|n| n.entity_type == "Other"));
+        assert_eq!(resp.edges[0].group, None);
+    }
+
+    fn typed_node(id: &str, name: &str, entity_type: &str) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            labels: vec!["Entity".into()],
+            properties: HashMap::from([
+                ("name".to_string(), name.to_string()),
+                ("entity_type".to_string(), entity_type.to_string()),
+            ]),
+            distance: 0,
+        }
+    }
+
+    /// 节点 `entity_type` 属性透出为 `type`；闭集外取值回退 `"Other"`。
+    #[test]
+    fn entity_type_passes_through_and_falls_back_to_other() {
+        let resp = build_graph(
+            vec![
+                typed_node("a", "peco", "SoftwareProject"),
+                typed_node("b", "神秘", "NotAType"),
+            ],
+            vec![],
+            10,
+            10,
+        );
+        let by_id: HashMap<&str, &MemoryNode> =
+            resp.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        assert_eq!(by_id["a"].entity_type, "SoftwareProject");
+        assert_eq!(by_id["b"].entity_type, "Other", "闭集外类型回退 Other");
+    }
+
+    /// 谓词派生 `group`：命中映射表则有值，未映射则无此字段（序列化时省略）。
+    #[test]
+    fn edge_group_is_derived_and_omitted_when_unmapped() {
+        let resp = build_graph(
+            vec![
+                typed_node("a", "用户", "Person"),
+                typed_node("b", "陈晨", "Person"),
+            ],
+            vec![edge("a", "b", "原名", 1.0), edge("a", "b", "摸鱼", 1.0)],
+            10,
+            10,
+        );
+
+        let mapped = resp
+            .edges
+            .iter()
+            .find(|e| e.predicate == "原名")
+            .expect("应有「原名」边");
+        assert_eq!(mapped.group.as_deref(), Some("名称标识"));
+        let unmapped = resp
+            .edges
+            .iter()
+            .find(|e| e.predicate == "摸鱼")
+            .expect("应有「摸鱼」边");
+        assert_eq!(unmapped.group, None);
+
+        // 序列化形状：`type` 键存在；未映射边的 `group` 键被省略
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["nodes"][0].get("type").is_some());
+        let edges = json["edges"].as_array().unwrap();
+        let unmapped_json = edges.iter().find(|e| e["predicate"] == "摸鱼").unwrap();
+        assert!(
+            unmapped_json.get("group").is_none(),
+            "未映射谓词的 group 应被省略"
+        );
     }
 
     /// 文档列表：3 行 / limit=2 ⇒ 截断到 2 且 has_more=true。

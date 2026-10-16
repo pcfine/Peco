@@ -151,6 +151,14 @@ pub struct Fact {
     /// 扩展属性
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    /// 主体实体类型（canonical 名）。**元数据，不参与 `compute_entity_id` 身份、
+    /// 不进 id** —— 类型进 id 会把逐轮类型判断差异放大成实体分裂，并让
+    /// 「只有名字」的读/删入口算不出 id。
+    #[serde(default)]
+    pub subject_type: Option<String>,
+    /// 客体实体类型（canonical 名）。同 `subject_type`，不进身份。
+    #[serde(default)]
+    pub object_type: Option<String>,
 }
 
 impl Fact {
@@ -182,6 +190,8 @@ impl Fact {
             source: String::new(),
             created_at: String::new(),
             metadata: HashMap::new(),
+            subject_type: None,
+            object_type: None,
         }
     }
 }
@@ -191,6 +201,38 @@ impl Fact {
 /// `max_depth` 是 LLM 可控入参（`query_entity_facts` 工具）。HelixDB 的分层遍历
 /// 按它 `with_capacity` 并逐层发子查询，超大值会导致巨量分配或海量子查询。
 pub const MAX_TRAVERSAL_DEPTH: u32 = 5;
+
+/// 谓词的轻归一化 —— 边 label 的**唯一**实现，写/读/删三处共用。
+///
+/// 只做 `trim` + 全角→半角 + 连续空白折叠为单空格；**不做同义改写**（`采用`
+/// 不会变成 `使用`）。读侧分组（`peco_core::ontology::group_of`）也用它归一
+/// 入参，口径一致才能让「使用 」与「使用」落到同一组/同一条边。
+pub fn normalize_predicate(predicate: &str) -> String {
+    let folded: String = predicate.chars().map(fold_fullwidth).collect();
+    let mut out = String::with_capacity(folded.len());
+    let mut prev_was_space = false;
+    for ch in folded.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_was_space = false;
+        }
+    }
+    out
+}
+
+/// 全角 ASCII（U+FF01–U+FF5E）与表意空格（U+3000）折成半角。
+fn fold_fullwidth(c: char) -> char {
+    match c {
+        '\u{3000}' => ' ',
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        _ => c,
+    }
+}
 
 /// 计算确定性实体节点 ID。
 ///
@@ -564,5 +606,25 @@ mod tests {
         assert_eq!(fact.predicate, "has_skill");
         assert_eq!(fact.object, "Rust");
         assert_eq!(fact.confidence, 0.9);
+        // 类型是选项字段，构造入口不赋值
+        assert!(fact.subject_type.is_none());
+        assert!(fact.object_type.is_none());
+    }
+
+    #[test]
+    fn normalize_predicate_trims_and_folds_whitespace() {
+        assert_eq!(normalize_predicate("  喜欢  "), "喜欢");
+        assert_eq!(normalize_predicate("喜欢\t\n"), "喜欢");
+        // 连续空白折叠为单空格
+        assert_eq!(normalize_predicate("a   b"), "a b");
+        // 全角 ASCII 折半角
+        assert_eq!(normalize_predicate("ＡＢＣ"), "ABC");
+        // 表意空格（U+3000）折为半角空格再折叠
+        assert_eq!(normalize_predicate("使\u{3000}用"), "使 用");
+        // 空/纯空白 → 空串
+        assert_eq!(normalize_predicate(""), "");
+        assert_eq!(normalize_predicate("   "), "");
+        // 不做同义改写
+        assert_eq!(normalize_predicate("采用"), "采用");
     }
 }

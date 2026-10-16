@@ -679,7 +679,8 @@ impl MemoryExtractionHook {
     /// 2. **图事实无审计/回滚** —— `memory_audit` 不覆盖图，删除只能靠
     ///    `delete_fact`；
     /// 3. **实体名漂移** —— 同一实体的不同写法会分裂成平行节点（prompt 已
-    ///    约束取最短稳定名，未做归一化）；
+    ///    约束取最短稳定名，实体名不做归一化；谓词只做空白/全角的轻归一化，
+    ///    不同义改写）；
     /// 4. **幂等有边界** —— 图写入只挡「同值重复追加」：(a) 旧值 vs 新值
     ///    仍并存（见第 1 条）；(b) 守卫是「读后写」，不覆盖并发/多实例
     ///    竞争窗口；(c) 守卫生效前已产生的重复边不会被自动回收，需人工
@@ -713,6 +714,8 @@ impl MemoryExtractionHook {
                 GRAPH_FACT_CONFIDENCE,
             );
             f.source = source_of(fact);
+            f.subject_type = t.subject_type.clone();
+            f.object_type = t.object_type.clone();
             f.metadata
                 .insert("origin".to_string(), "memory_turn_extract".to_string());
             triples.push(f);
@@ -1251,6 +1254,11 @@ mod tests {
                 result: std::sync::Mutex::new(Err(msg.to_string())),
                 calls: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// 改写下一轮返回值 —— 跨轮幂等用例需要两轮给不同的 triple。
+        fn set_facts(&self, facts: Vec<MemoryFact>) {
+            *self.result.lock().unwrap() = Ok(facts);
         }
     }
 
@@ -3160,8 +3168,10 @@ mod tests {
             supersedes: vec![],
             triple: Some(MemoryTriple {
                 subject: "用户".to_string(),
+                subject_type: Some("Person".to_string()),
                 predicate: "原名".to_string(),
                 object: "陈晨".to_string(),
+                object_type: Some("Person".to_string()),
             }),
         }
     }
@@ -3294,6 +3304,67 @@ mod tests {
             doc_count(&km).await,
             1,
             "第二轮同文被 dedup 拦下，文档面同为 1"
+        );
+    }
+
+    /// 幂等收口：同一三元组跨轮、谓词仅差空白（半角空格 vs 全角空格）→ 图边仍恰 1 条。
+    ///
+    /// 读/写两侧经同一个轻归一化（全角空格折半角再折叠空白），守卫不会因空白差异
+    /// 漏判而追加平行边。取内部全角空格而非尾随空白：`parse_facts` 已把谓词 `trim()`，
+    /// 尾随空白到不了这一层，只有内部空白才落进 `normalize_predicate` 的折叠口。
+    #[tokio::test]
+    async fn graph_write_predicate_whitespace_variant_stays_single_edge() {
+        let km = make_km().await;
+        let analyzer = Arc::new(MockAnalyzer::ok(vec![fact_with_triple()]));
+        let (hook, _pool, _dir) = make_hook(Arc::clone(&km), analyzer.clone(), make_config()).await;
+
+        // 第 1 轮：谓词 "使 用"（半角空格）
+        let mut first = fact_with_triple();
+        first.triple.as_mut().unwrap().predicate = "使 用".to_string();
+        analyzer.set_facts(vec![first]);
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+        let mut first_seen = false;
+        for _ in 0..100 {
+            let (_nodes, edges) = km.list_entity_graph("@private_memory").await.unwrap();
+            if edges.len() == 1 {
+                first_seen = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(first_seen, "第一轮图边应在超时前写入");
+
+        // 第 2 轮：同一三元组，谓词换全角空格 "使\u{3000}用"（归一化后与第 1 轮同一条
+        // 边）。正文换一句让文档面计数增加 —— 文档写入排在图写入之前，凭「文档面已
+        // 到 2」才能区分「守卫生效（恰 1 条）」与「写得更慢、其实还没写（也是 1 条）」。
+        let mut variant = fact_with_triple();
+        variant.content = "用户对外一直用的是陈晨这个名字".to_string();
+        variant.triple.as_mut().unwrap().predicate = "使\u{3000}用".to_string();
+        analyzer.set_facts(vec![variant]);
+        hook.on_turn_complete(0, None, &Usage::default(), &graph_session())
+            .await;
+
+        let mut doc_write_seen = false;
+        let mut edge_count = 1;
+        for _ in 0..100 {
+            if doc_count(&km).await >= 2 {
+                doc_write_seen = true;
+            }
+            let (_nodes, edges) = km.list_entity_graph("@private_memory").await.unwrap();
+            edge_count = edges.len();
+            if edge_count != 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            doc_write_seen,
+            "第二轮文档面应写入 —— 否则无法排除「写得更慢、其实还没写」造成的假通过"
+        );
+        assert_eq!(
+            edge_count, 1,
+            "谓词只差空白（半角/全角）不得追加平行边，实际 {edge_count} 条"
         );
     }
 

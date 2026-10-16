@@ -21,7 +21,7 @@ use super::config::{BackendType, KbConfig};
 /// 该函数只服务实体 id 的计算，不产节点 label —— label 恒为
 /// [`ENTITY_NODE_LABEL`]。并入 ns 是为了让跨命名空间的同名实体得到不同 id：
 /// 否则 `node_exists` 会静默跳过建点，事实边也会挂到别的命名空间去。
-fn entity_type_for(ns: &str) -> String {
+fn id_scope_for(ns: &str) -> String {
     format!("{ENTITY_NODE_LABEL}::{ns}")
 }
 
@@ -418,8 +418,8 @@ impl KnowledgeBase {
                 continue;
             }
 
-            let subject_id = compute_entity_id(&fact.subject, &entity_type_for(&self.ns));
-            let object_id = compute_entity_id(&fact.object, &entity_type_for(&self.ns));
+            let subject_id = compute_entity_id(&fact.subject, &id_scope_for(&self.ns));
+            let object_id = compute_entity_id(&fact.object, &id_scope_for(&self.ns));
 
             // 确保实体节点存在
             if !gs.node_exists(&subject_id).await.unwrap_or(false) {
@@ -429,6 +429,9 @@ impl KnowledgeBase {
                     properties: {
                         let mut props = HashMap::new();
                         props.insert("name".into(), fact.subject.clone());
+                        if let Some(t) = &fact.subject_type {
+                            props.insert("entity_type".into(), t.clone());
+                        }
                         props
                     },
                     distance: 0,
@@ -442,6 +445,9 @@ impl KnowledgeBase {
                     properties: {
                         let mut props = HashMap::new();
                         props.insert("name".into(), fact.object.clone());
+                        if let Some(t) = &fact.object_type {
+                            props.insert("entity_type".into(), t.clone());
+                        }
                         props
                     },
                     distance: 0,
@@ -452,7 +458,7 @@ impl KnowledgeBase {
             edges.push(KnowledgeEdge {
                 source_id: subject_id,
                 target_id: object_id,
-                edge_type: EdgeType::Custom(fact.predicate.clone()),
+                edge_type: EdgeType::Custom(normalize_predicate(&fact.predicate)),
                 weight: fact.confidence,
                 properties: {
                     let mut props = fact.metadata.clone();
@@ -536,7 +542,7 @@ impl KnowledgeBase {
     /// `compute_entity_id` 的口径收敛在 manager 内部：调用方按字面量 `"Entity"`
     /// 自行复算会与本库写入侧漂移，而漂移的表现是静默 no-op 而非报错。
     pub fn entity_id(&self, entity_name: &str) -> String {
-        compute_entity_id(entity_name, &entity_type_for(&self.ns))
+        compute_entity_id(entity_name, &id_scope_for(&self.ns))
     }
 
     /// 查询与指定实体相关的所有事实（遍历相邻边）。
@@ -547,7 +553,7 @@ impl KnowledgeBase {
         entity_name: &str,
         max_depth: u32,
     ) -> Result<Vec<TraversalStep>, KnowledgeError> {
-        self.query_entity_facts_with_type(entity_name, &entity_type_for(&self.ns), max_depth)
+        self.query_entity_facts_with_type(entity_name, &id_scope_for(&self.ns), max_depth)
             .await
     }
 
@@ -590,7 +596,7 @@ impl KnowledgeBase {
         from_entity: &str,
         to_entity: &str,
     ) -> Result<Option<Vec<TraversalStep>>, KnowledgeError> {
-        self.query_relation_path_with_type(from_entity, to_entity, &entity_type_for(&self.ns))
+        self.query_relation_path_with_type(from_entity, to_entity, &id_scope_for(&self.ns))
             .await
     }
 
@@ -626,9 +632,9 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let subject_id = compute_entity_id(subject, &entity_type_for(&self.ns));
-        let object_id = compute_entity_id(object, &entity_type_for(&self.ns));
-        let edge_type = EdgeType::Custom(predicate.to_string());
+        let subject_id = compute_entity_id(subject, &id_scope_for(&self.ns));
+        let object_id = compute_entity_id(object, &id_scope_for(&self.ns));
+        let edge_type = EdgeType::Custom(normalize_predicate(predicate));
 
         gs.edges_between(&subject_id, &object_id, Some(&edge_type))
             .await
@@ -654,9 +660,9 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let subject_id = compute_entity_id(subject, &entity_type_for(&self.ns));
-        let object_id = compute_entity_id(object, &entity_type_for(&self.ns));
-        let edge_type = EdgeType::Custom(predicate.to_string());
+        let subject_id = compute_entity_id(subject, &id_scope_for(&self.ns));
+        let object_id = compute_entity_id(object, &id_scope_for(&self.ns));
+        let edge_type = EdgeType::Custom(normalize_predicate(predicate));
 
         gs.remove_edges_between(&subject_id, &object_id, Some(&edge_type))
             .await
@@ -688,7 +694,7 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let entity_id = compute_entity_id(entity_name, &entity_type_for(&self.ns));
+        let entity_id = compute_entity_id(entity_name, &id_scope_for(&self.ns));
         let node = gs.get_node(&entity_id).await?;
 
         let steps = gs
@@ -723,7 +729,7 @@ impl KnowledgeBase {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
 
-        let entity_id = compute_entity_id(entity_name, &entity_type_for(&self.ns));
+        let entity_id = compute_entity_id(entity_name, &id_scope_for(&self.ns));
         let removed_edges = gs.remove_node(&entity_id, cascade).await?;
         Ok((removed_edges, 1))
     }

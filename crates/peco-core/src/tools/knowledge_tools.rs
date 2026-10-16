@@ -606,7 +606,7 @@ impl ToolDyn for AddFactsToKnowledgeBase {
                                 },
                                 "predicate": {
                                     "type": "string",
-                                    "description": "Predicate / relation type (e.g. 'prefers', 'works_for')"
+                                    "description": "A short, stable relation word (a verb phrase, e.g. 'prefers', 'works_for'). Do not express an attribute as a relation — values, states and config entries belong in the content."
                                 },
                                 "object": {
                                     "type": "string",
@@ -919,7 +919,7 @@ impl ToolDyn for DeleteEntityFact {
                 "properties": {
                     "kb_name": { "type": "string", "description": "Name of the target knowledge base" },
                     "subject": { "type": "string", "description": "Subject entity name (e.g. 'user', 'Alice')" },
-                    "predicate": { "type": "string", "description": "Predicate / relation type (e.g. 'prefers', 'works_for')" },
+                    "predicate": { "type": "string", "description": "A short, stable relation word (a verb phrase, e.g. 'prefers', 'works_for'). Do not express an attribute as a relation." },
                     "object": { "type": "string", "description": "Object entity name" }
                 },
                 "required": ["kb_name", "subject", "predicate", "object"]

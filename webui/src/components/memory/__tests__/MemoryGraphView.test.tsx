@@ -23,9 +23,9 @@ const GRAPH = vi.mocked(getMemoryGraph);
 
 const THREE_NODES: MemoryGraphResponse = {
   nodes: [
-    { id: "n1", name: "小C" },
-    { id: "n2", name: "chen" },
-    { id: "n3", name: "男" },
+    { id: "n1", name: "小C", type: "Person" },
+    { id: "n2", name: "chen", type: "Person" },
+    { id: "n3", name: "男", type: "Other" },
   ],
   edges: [
     { source: "n1", target: "n2", predicate: "朋友", weight: 0.95 },
@@ -170,9 +170,9 @@ describe("MemoryGraphView", () => {
     // `Not possible to find intersection inside of the rectangle` → 整页白屏
     GRAPH.mockResolvedValue({
       nodes: [
-        { id: "iso", name: "孤立点" },
-        { id: "hub", name: "peco" },
-        { id: "dep", name: "Docling" },
+        { id: "iso", name: "孤立点", type: "Other" },
+        { id: "hub", name: "peco", type: "SoftwareProject" },
+        { id: "dep", name: "Docling", type: "Technology" },
       ],
       edges: [
         { source: "hub", target: "dep", predicate: "使用", weight: 0.8 },
@@ -204,7 +204,7 @@ describe("MemoryGraphView", () => {
 
   it("单节点 / 0 边渲染不抛错（包围盒除零保护）", async () => {
     GRAPH.mockResolvedValue({
-      nodes: [{ id: "only", name: "孤立点" }],
+      nodes: [{ id: "only", name: "孤立点", type: "Other" }],
       edges: [],
       truncated: false,
     });

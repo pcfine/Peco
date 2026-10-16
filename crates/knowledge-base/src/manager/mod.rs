@@ -132,6 +132,62 @@ mod tests {
         );
     }
 
+    /// `add_facts` 把 `Fact` 的类型字段写进节点 `entity_type` 属性；谓词轻归一化
+    /// 在写/读两侧同口径（尾随空白被折叠）。
+    #[tokio::test]
+    async fn add_facts_writes_entity_type_and_normalizes_predicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr
+            .create_kb(make_kb_config("fact-type-test"))
+            .await
+            .unwrap();
+
+        let mut f = Fact::new("用户", "喜欢 ", "Rust", 0.9);
+        f.subject_type = Some("Person".into());
+        f.object_type = Some("Technology".into());
+        kb.add_facts(&[f], false).await.unwrap();
+
+        // 写侧尾随空白被折叠；读侧按归一化后的谓词命中同一条边
+        let found = kb.read_fact("用户", "喜欢", "Rust").await.unwrap();
+        assert_eq!(found.len(), 1, "尾随空白应被折叠为 '喜欢'");
+        assert_eq!(found[0].edge_type, EdgeType::Custom("喜欢".into()));
+
+        // 节点带 entity_type 属性
+        let (nodes, _edges) = kb.list_entity_graph().await.unwrap();
+        let user_node = nodes
+            .iter()
+            .find(|n| n.properties.get("name").map(String::as_str) == Some("用户"))
+            .expect("应有「用户」节点");
+        assert_eq!(
+            user_node.properties.get("entity_type").map(String::as_str),
+            Some("Person")
+        );
+    }
+
+    /// 无类型的 `Fact`（直接调用 `add_facts`，不经收口归一化）不写 `entity_type` 属性。
+    #[tokio::test]
+    async fn add_facts_without_types_writes_no_entity_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr
+            .create_kb(make_kb_config("fact-no-type-test"))
+            .await
+            .unwrap();
+
+        kb.add_facts(&[Fact::new("小C", "朋友", "chen", 0.95)], false)
+            .await
+            .unwrap();
+
+        let (nodes, _edges) = kb.list_entity_graph().await.unwrap();
+        for n in &nodes {
+            assert!(
+                !n.properties.contains_key("entity_type"),
+                "类型为 None 时不应写 entity_type 属性"
+            );
+        }
+    }
+
     /// 实体 id 口径防漂移：`delete_fact` 匹配的边必须正是 `add_facts` 写进去的那条。
     ///
     /// 这是整个删除链路最容易出错的一点 —— 口径漂移的表现是**静默 no-op**

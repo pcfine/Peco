@@ -764,7 +764,7 @@ pub fn list_documents_with_content(schema: &HelixSchema, limit: usize) -> Value 
 /// 方案都会让「节点集」与「边集」来自不同快照，无法保证子图闭合。
 ///
 /// 形状（只读实测）：
-/// 1. `nodes` —— `NWhere{$label=<label>[, ns]} → Project($id, id_property, name)`：
+/// 1. `nodes` —— `NWhere{$label=<label>[, ns]} → Project($id, id_property, name, entity_type)`：
 ///    同时投影内部 `$id`（关联键）与稳定 `id_property`（对外身份）；
 /// 2. `edges` —— `NWhere{$label=<label>[, ns]} → OutE:null → EdgeProperties:null`：
 ///    从**全部命中节点**扇出（`NWhere` 多命中的既定语义），返回每条出边的
@@ -785,7 +785,8 @@ pub fn list_subgraph(schema: &HelixSchema, label: &str) -> Value {
                     {"Project": [
                         {"source": "$id", "alias": "internal_id"},
                         {"source": schema.id_property, "alias": "node_id"},
-                        {"source": "name", "alias": "name"}
+                        {"source": "name", "alias": "name"},
+                        {"source": "entity_type", "alias": "entity_type"}
                     ]}
                 ], "condition": null}},
                 {"Query": {"name": "edges", "steps": [
@@ -1946,7 +1947,7 @@ mod tests {
 
     /// `list_subgraph` 的 AST 形状 —— 一个 read batch、两个子查询、闭包所需的两份投影。
     ///
-    /// 与只读实测逐字比对：`nodes` = `NWhere{$label} → Project($id, id, name)`；
+    /// 与只读实测逐字比对：`nodes` = `NWhere{$label} → Project($id, id, name, entity_type)`；
     /// `edges` = `NWhere{$label} → OutE:null → EdgeProperties:null`。形状漂移会先在这里炸。
     #[test]
     fn list_subgraph_shape() {
@@ -1959,7 +1960,7 @@ mod tests {
         assert_eq!(batch.len(), 2, "一个 batch 内并发 nodes + edges");
         assert_eq!(q["query"]["returns"], json!(["nodes", "edges"]));
 
-        // nodes：NWhere{$label=Entity} → Project($id, id_property, name)
+        // nodes：NWhere{$label=Entity} → Project($id, id_property, name, entity_type)
         let nodes = &batch[0]["Query"];
         assert_eq!(nodes["name"], "nodes");
         let nsteps = nodes["steps"].as_array().unwrap();
@@ -1975,7 +1976,8 @@ mod tests {
             json!({"Project": [
                 {"source": "$id", "alias": "internal_id"},
                 {"source": "id", "alias": "node_id"},
-                {"source": "name", "alias": "name"}
+                {"source": "name", "alias": "name"},
+                {"source": "entity_type", "alias": "entity_type"}
             ]}),
             "同时投影内部 $id（join 键）与稳定身份字段 id（对外身份）"
         );

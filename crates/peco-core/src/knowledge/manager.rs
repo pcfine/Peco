@@ -521,7 +521,18 @@ impl KnowledgeManager {
             .await
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
-        let result = kb.add_facts(facts, index_text).await?;
+        // 类型校验/推断在唯一收口点做 —— 三个写图调用方（自动提取双写、
+        // agent 工具、审计回放）都经这里，放在各调用方会漏掉工具路径。
+        let normalized: Vec<knowledge_base::Fact> = facts
+            .iter()
+            .cloned()
+            .map(|mut f| {
+                crate::ontology::normalize_fact(&mut f);
+                f
+            })
+            .collect();
+
+        let result = kb.add_facts(&normalized, index_text).await?;
         info!(kb = %kb_name, fact_count = facts.len(), index_text, "Facts added to knowledge base");
         Ok(result)
     }
@@ -1031,6 +1042,46 @@ mod tests {
 
         let docs = km.list_documents("test-search", 0, 10).await.unwrap();
         assert!(!docs.is_empty());
+    }
+
+    /// 收口归一化：`add_facts_to_kb` 委托前给每条 fact 落类型、折叠谓词空白。
+    /// 未映射谓词**不被替换**（无关系闭集）。
+    #[tokio::test]
+    async fn add_facts_to_kb_normalizes_types_and_keeps_predicate_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config("test-graph")).await.unwrap();
+
+        let facts = vec![
+            knowledge_base::Fact::new("用户", "喜欢", "Rust", 0.8),
+            knowledge_base::Fact::new("peco", "使用 ", "HelixDB", 0.7),
+        ];
+        km.add_facts_to_kb("test-graph", &facts, false)
+            .await
+            .unwrap();
+
+        // 谓词轻归一化：尾随空白被折叠；未映射谓词原样保留
+        let hit = km
+            .read_fact("test-graph", "peco", "使用", "HelixDB")
+            .await
+            .unwrap();
+        assert_eq!(hit.len(), 1, "尾随空白应被折叠为 '使用'");
+        assert_eq!(hit[0].edge_type.as_label(), "使用");
+
+        // 节点带 entity_type，且落在本体闭集内
+        let (nodes, _edges) = km.list_entity_graph("test-graph").await.unwrap();
+        assert!(!nodes.is_empty());
+        for n in &nodes {
+            let t = n
+                .properties
+                .get("entity_type")
+                .expect("节点应带 entity_type");
+            assert!(
+                crate::ontology::EntityType::from_name(t).is_some(),
+                "entity_type {t:?} 应在闭集内"
+            );
+        }
     }
 
     #[tokio::test]

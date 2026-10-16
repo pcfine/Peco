@@ -19,6 +19,7 @@ import type {
   MemoryGraphResponse,
   MemoryNode,
 } from "@/types/memory";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -44,6 +45,106 @@ const PAD = 16;
 /** 平行边之间的垂直间距（px）—— 同一对节点的多条边据此错开。 */
 const EDGE_SPREAD = 9;
 
+/** `Other` / 未知类型 / 未映射及闭集外关系组共用的兜底色。 */
+const FALLBACK_COLOR = "#a1a1aa";
+
+/**
+ * 节点类型闭集 + 配色。顺序即图例展示序；`Other` 用兜底灰。
+ * 闭集外的取值（含字段缺失）在图例里全部归到「未知」一行，不新增行。
+ */
+const NODE_TYPES: { name: string; color: string }[] = [
+  { name: "Person", color: "#ef4444" },
+  { name: "Organization", color: "#f97316" },
+  { name: "SoftwareProject", color: "#f59e0b" },
+  { name: "SoftwareComponent", color: "#84cc16" },
+  { name: "Technology", color: "#22c55e" },
+  { name: "CodeSymbol", color: "#10b981" },
+  { name: "Document", color: "#14b8a6" },
+  { name: "KnowledgeBase", color: "#06b6d4" },
+  { name: "Agent", color: "#3b82f6" },
+  { name: "Issue", color: "#6366f1" },
+  { name: "Task", color: "#8b5cf6" },
+  { name: "Commit", color: "#a855f7" },
+  { name: "Concept", color: "#d946ef" },
+  { name: "Other", color: FALLBACK_COLOR },
+];
+
+/**
+ * 关系组清单 + 配色（已知组）。谓词到组的映射由后端读侧派生、随边下发，前端只认
+ * 组名 —— 后端扩充映射表时这里不用改：闭集外的组名自成一行、用兜底灰。
+ */
+const RELATION_GROUPS: { name: string; color: string }[] = [
+  { name: "使用依赖", color: "#0ea5e9" },
+  { name: "组成包含", color: "#14b8a6" },
+  { name: "定义记录", color: "#6366f1" },
+  { name: "修复变更", color: "#22c55e" },
+  { name: "人员归属", color: "#f97316" },
+  { name: "偏好", color: "#ec4899" },
+  { name: "缺陷问题", color: "#ef4444" },
+  { name: "名称标识", color: "#a855f7" },
+  { name: "集成配置", color: "#eab308" },
+];
+
+/** 「未知」图例行的键：与任何真实类型名都不重合，免得出现在闭集里造成误判。 */
+const UNKNOWN_TYPE = "__unknown_type__";
+
+/** 「未映射」图例行的键：仅 `group` 缺省或为空串时归到这里；闭集外组名自成一行。 */
+const UNMAPPED_GROUP = "__unmapped__";
+
+/** 节点 `type` 原文 → 图例键；闭集外（含字段缺失）统一归到「未知」。 */
+function typeKeyOf(type: string | undefined): string {
+  return type && NODE_TYPES.some((t) => t.name === type) ? type : UNKNOWN_TYPE;
+}
+
+/**
+ * 边 `group` 原文 → 图例键。缺省 / 空串即未映射（不是错误）；其余（含闭集外的组名）
+ * 按原样自成一行 —— 后端扩充映射表后新组不会被误并进「未映射」。
+ */
+function groupKeyOf(group: string | undefined): string {
+  return group ? group : UNMAPPED_GROUP;
+}
+
+/** 图例键 → 节点色。 */
+function nodeColorOf(typeKey: string): string {
+  return NODE_TYPES.find((t) => t.name === typeKey)?.color ?? FALLBACK_COLOR;
+}
+
+/** 图例键 → 边色。 */
+function groupColorOf(groupKey: string): string {
+  return (
+    RELATION_GROUPS.find((g) => g.name === groupKey)?.color ?? FALLBACK_COLOR
+  );
+}
+
+/** 组名 → 稳定 id 后缀。组名可能是任意文本（含中文 / 空格），直接入 SVG id 不安全。 */
+function groupNameHash(name: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < name.length; i++) {
+    h = Math.imul(h ^ name.charCodeAt(i), 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * 箭头 marker id —— 组名含中文，不宜直接做 SVG id。已知组按序号，未映射用兜底，
+ * 闭集外的组名按名哈希：同组同名同 id、不同组不同 id。
+ */
+function arrowMarkerId(groupKey: string): string {
+  const i = RELATION_GROUPS.findIndex((g) => g.name === groupKey);
+  if (i >= 0) return `memory-graph-arrow-g${i}`;
+  if (groupKey === UNMAPPED_GROUP) return "memory-graph-arrow-fallback";
+  return `memory-graph-arrow-x${groupNameHash(groupKey)}`;
+}
+
+/** 箭头 marker 基线（已知组 + 未映射）；闭集外组名的 marker 随数据追加。 */
+const ARROW_MARKERS: { id: string; color: string }[] = [
+  ...RELATION_GROUPS.map((g) => ({
+    id: arrowMarkerId(g.name),
+    color: g.color,
+  })),
+  { id: arrowMarkerId(UNMAPPED_GROUP), color: FALLBACK_COLOR },
+];
+
 /**
  * 布局图上的「节点对」键。用 JSON 元组而非拼接分隔符：node id 由后端给出，
  * 拼接分隔符一旦出现在 id 里会把两条不同关系折叠成同一条（静默丢边）。
@@ -64,6 +165,8 @@ const WHEEL_STEP = 1.2;
 interface PlacedNode {
   id: string;
   name: string;
+  /** 图例键（闭集外已归为「未知」）。 */
+  type: string;
   x: number;
   y: number;
 }
@@ -73,6 +176,8 @@ interface PlacedEdge {
   source: string;
   target: string;
   predicate: string;
+  /** 图例键（`group` 缺省已归为「未映射」）。 */
+  group: string;
   /** 最终绘制走线（已含平行边垂直偏移）。 */
   points: { x: number; y: number }[];
 }
@@ -197,6 +302,8 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  /** 被隐藏的节点类型（图例键）。空集 = 全开；只影响渲染掩码，不持久化。 */
+  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
   const [view, setView] = useState({ tx: 0, ty: 0, k: 1 });
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   // SVG 容器的真实像素尺寸（决定 viewBox）；未测得时退回内容尺寸 ⇒ k=1。
@@ -223,6 +330,15 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   }, [load]);
 
   useImperativeHandle(ref, () => ({ refresh: load }), [load]);
+
+  const toggleType = useCallback((key: string) => {
+    setHiddenTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   // Esc 收起选中面板
   useEffect(() => {
@@ -315,7 +431,13 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
 
     const nodes: PlacedNode[] = data.nodes.map((n) => {
       const pos = placed.get(n.id);
-      return { id: n.id, name: n.name, x: pos?.x ?? 0, y: pos?.y ?? 0 };
+      return {
+        id: n.id,
+        name: n.name,
+        type: typeKeyOf(n.type),
+        x: pos?.x ?? 0,
+        y: pos?.y ?? 0,
+      };
     });
 
     // 平行边共用代表边走线，按序号垂直展开（代表边居中）；无走线点的边补成
@@ -342,6 +464,7 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
         source: edge.source,
         target: edge.target,
         predicate: edge.predicate,
+        group: groupKeyOf(edge.group),
         points: shiftPolyline(base, (idx - (total - 1) / 2) * EDGE_SPREAD),
       };
     });
@@ -384,6 +507,104 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
       height: Math.max(1, maxY - minY) + PAD * 2,
     };
   }, [data]);
+
+  /**
+   * 图例行：类型 14 类 + 「未知」；关系组为已知 9 组 ∪ 本轮出现的闭集外组名（+ 仅当
+   * 存在无 `group` 的边时才有的「未映射」）。类型行清单恒定；关系组行随数据里出现的
+   * 额外组名增减，计数取当前 `nodes` / `edges`。
+   */
+  const legend = useMemo(() => {
+    if (!data) return null;
+    const typeCounts = new Map<string, number>();
+    for (const n of data.nodes) {
+      const key = typeKeyOf(n.type);
+      typeCounts.set(key, (typeCounts.get(key) ?? 0) + 1);
+    }
+    const knownGroups = new Set(RELATION_GROUPS.map((g) => g.name));
+    const groupCounts = new Map<string, number>();
+    const extraGroups: string[] = [];
+    const seenExtra = new Set<string>();
+    let hasUnmapped = false;
+    for (const e of data.edges) {
+      const key = groupKeyOf(e.group);
+      groupCounts.set(key, (groupCounts.get(key) ?? 0) + 1);
+      if (key === UNMAPPED_GROUP) {
+        hasUnmapped = true;
+      } else if (!knownGroups.has(key) && !seenExtra.has(key)) {
+        seenExtra.add(key);
+        extraGroups.push(key);
+      }
+    }
+    extraGroups.sort();
+    const withCounts = (
+      rows: { key: string; label: string; color: string }[],
+      counts: Map<string, number>,
+    ) => rows.map((row) => ({ ...row, count: counts.get(row.key) ?? 0 }));
+    return {
+      types: withCounts(
+        [
+          ...NODE_TYPES.map((t) => ({
+            key: t.name,
+            label: t.name,
+            color: t.color,
+          })),
+          { key: UNKNOWN_TYPE, label: "未知", color: FALLBACK_COLOR },
+        ],
+        typeCounts,
+      ),
+      groups: withCounts(
+        [
+          ...RELATION_GROUPS.map((g) => ({
+            key: g.name,
+            label: g.name,
+            color: g.color,
+          })),
+          ...extraGroups.map((name) => ({
+            key: name,
+            label: name,
+            color: FALLBACK_COLOR,
+          })),
+          ...(hasUnmapped
+            ? [{ key: UNMAPPED_GROUP, label: "未映射", color: FALLBACK_COLOR }]
+            : []),
+        ],
+        groupCounts,
+      ),
+    };
+  }, [data]);
+
+  /**
+   * 箭头 marker 定义：已知组 + 未映射之外，再为本轮出现的闭集外组名补一个 ——
+   * `arrowMarkerId` 会按其名生成专属 id，对应的 marker 不建则箭头引用悬空、不显示。
+   */
+  const arrowMarkers = useMemo(() => {
+    const markers = [...ARROW_MARKERS];
+    const seen = new Set(markers.map((m) => m.id));
+    if (data) {
+      for (const e of data.edges) {
+        const key = groupKeyOf(e.group);
+        const id = arrowMarkerId(key);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        markers.push({ id, color: groupColorOf(key) });
+      }
+    }
+    return markers;
+  }, [data]);
+
+  /**
+   * 过滤掩码：只决定「画不画」，**不参与布局** —— `layoutData` 的依赖里没有
+   * `hiddenTypes`，所以开关类型不会重跑 dagre（重排会让大图跳变，还白付一次
+   * 布局开销）。隐藏一个类型会连带隐藏它的悬空边。
+   */
+  const hiddenNodeIds = useMemo(() => {
+    if (!layoutData || hiddenTypes.size === 0) return null;
+    const ids = new Set<string>();
+    for (const n of layoutData.nodes) {
+      if (hiddenTypes.has(n.type)) ids.add(n.id);
+    }
+    return ids;
+  }, [layoutData, hiddenTypes]);
 
   // 把 viewBox 设为「与容器像素 1:1」——这是放大得动的前提。
   // 旧实现 viewBox = 整图 bbox，浏览器先把整图压进视口（77 节点实测 fit≈0.12），
@@ -441,6 +662,8 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     const out: {
       key: string;
       predicate: string;
+      /** 关系组原文（未映射为 `undefined`）。 */
+      group?: string;
       arrow: string;
       neighborName: string;
       weight: number;
@@ -455,6 +678,7 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
       out.push({
         key: `${base}#${idx}`,
         predicate: e.predicate,
+        group: e.group,
         // source === selected 用 →，target === selected 用 ←
         arrow: outgoing ? "→" : "←",
         neighborName: nameById.get(outgoing ? e.target : e.source) ?? "",
@@ -563,6 +787,80 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
         </p>
       )}
       <div className="flex gap-4">
+        {legend && (
+          <Card
+            className="w-60 shrink-0 gap-3 py-4"
+            data-testid="memory-graph-legend"
+          >
+            <CardHeader className="px-4">
+              <CardTitle className="text-base">图例</CardTitle>
+            </CardHeader>
+            <CardContent className="px-4">
+              <ScrollArea className="h-[440px]">
+                <div className="space-y-4 pr-3">
+                  <section>
+                    <h3 className="mb-1 text-xs font-medium text-muted-foreground">
+                      节点类型
+                    </h3>
+                    <ul className="space-y-0.5">
+                      {legend.types.map((row) => {
+                        const hidden = hiddenTypes.has(row.key);
+                        return (
+                          <li key={row.key}>
+                            <button
+                              type="button"
+                              data-testid={`memory-legend-type-${row.key}`}
+                              aria-pressed={!hidden}
+                              title={`${hidden ? "显示" : "隐藏"} ${row.label}`}
+                              onClick={() => toggleType(row.key)}
+                              className={`flex w-full items-center gap-2 rounded px-1 py-0.5 text-left text-xs hover:bg-accent ${hidden ? "opacity-40" : ""}`}
+                            >
+                              <span
+                                className="size-2.5 shrink-0 rounded-sm"
+                                style={{ backgroundColor: row.color }}
+                              />
+                              <span className="min-w-0 flex-1 truncate">
+                                {row.label}
+                              </span>
+                              <span className="shrink-0 tabular-nums text-muted-foreground">
+                                {row.count}
+                              </span>
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </section>
+                  <section>
+                    <h3 className="mb-1 text-xs font-medium text-muted-foreground">
+                      关系组
+                    </h3>
+                    <ul className="space-y-0.5">
+                      {legend.groups.map((row) => (
+                        <li
+                          key={row.key}
+                          data-testid={`memory-legend-group-${row.key}`}
+                          className="flex items-center gap-2 px-1 py-0.5 text-xs"
+                        >
+                          <span
+                            className="size-2.5 shrink-0 rounded-sm"
+                            style={{ backgroundColor: row.color }}
+                          />
+                          <span className="min-w-0 flex-1 truncate">
+                            {row.label}
+                          </span>
+                          <span className="shrink-0 tabular-nums text-muted-foreground">
+                            {row.count}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                </div>
+              </ScrollArea>
+            </CardContent>
+          </Card>
+        )}
         <div
           ref={wrapRef}
           className="relative h-[520px] flex-1 overflow-hidden rounded-md border bg-muted/10"
@@ -580,20 +878,20 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
             onClick={handleBackgroundClick}
           >
             <defs>
-              <marker
-                id="memory-graph-arrow"
-                viewBox="0 0 10 7"
-                refX={10}
-                refY={3.5}
-                markerWidth={8}
-                markerHeight={6}
-                orient="auto-start-reverse"
-              >
-                <polygon
-                  points="0 0, 10 3.5, 0 7"
-                  fill="var(--color-border, #d4d4d8)"
-                />
-              </marker>
+              {arrowMarkers.map((m) => (
+                <marker
+                  key={m.id}
+                  id={m.id}
+                  viewBox="0 0 10 7"
+                  refX={10}
+                  refY={3.5}
+                  markerWidth={8}
+                  markerHeight={6}
+                  orient="auto-start-reverse"
+                >
+                  <polygon points="0 0, 10 3.5, 0 7" fill={m.color} />
+                </marker>
+              ))}
             </defs>
 
             <g transform={`translate(${view.tx},${view.ty}) scale(${view.k})`}>
@@ -607,28 +905,39 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
                   neighborIds === null ||
                   pe.source === selectedNodeId ||
                   pe.target === selectedNodeId;
+                const hidden =
+                  hiddenNodeIds !== null &&
+                  (hiddenNodeIds.has(pe.source) ||
+                    hiddenNodeIds.has(pe.target));
                 return (
-                  <g key={pe.key} opacity={active ? 1 : 0.12}>
+                  <g
+                    key={pe.key}
+                    display={hidden ? "none" : undefined}
+                    opacity={active ? 1 : 0.12}
+                  >
                     <path
                       d={d}
                       fill="none"
-                      stroke="var(--color-border, #d4d4d8)"
+                      stroke={groupColorOf(pe.group)}
                       strokeWidth={1.5}
-                      markerEnd="url(#memory-graph-arrow)"
+                      markerEnd={`url(#${arrowMarkerId(pe.group)})`}
                     />
-                    <text
-                      x={midX}
-                      y={midY}
-                      textAnchor="middle"
-                      dominantBaseline="middle"
-                      fontSize={11}
-                      fill="var(--color-muted-foreground, #71717a)"
-                      stroke="var(--color-background, #ffffff)"
-                      strokeWidth={3}
-                      paintOrder="stroke"
-                    >
-                      {pe.predicate}
-                    </text>
+                    {/* 谓词为空（后端异常数据）时不画标签，不抛错 */}
+                    {pe.predicate ? (
+                      <text
+                        x={midX}
+                        y={midY}
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        fontSize={11}
+                        fill="var(--color-muted-foreground, #71717a)"
+                        stroke="var(--color-background, #ffffff)"
+                        strokeWidth={3}
+                        paintOrder="stroke"
+                      >
+                        {pe.predicate}
+                      </text>
+                    ) : null}
                   </g>
                 );
               })}
@@ -640,10 +949,12 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
                 const isSelected = n.id === selectedNodeId;
                 const dimmed =
                   neighborIds !== null && !isSelected && !neighborIds.has(n.id);
+                const tint = nodeColorOf(n.type);
                 return (
                   <g
                     key={n.id}
                     data-testid={`memory-node-${n.id}`}
+                    display={hiddenNodeIds?.has(n.id) ? "none" : undefined}
                     className="cursor-pointer"
                     opacity={dimmed ? 0.25 : 1}
                     onClick={() => setSelectedNodeId(n.id)}
@@ -655,11 +966,10 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
                       width={NODE_W}
                       height={NODE_H}
                       rx={6}
-                      fill="var(--color-muted, #f4f4f5)"
+                      fill={tint}
+                      fillOpacity={0.18}
                       stroke={
-                        isSelected
-                          ? "var(--color-primary, #18181b)"
-                          : "var(--color-border, #d4d4d8)"
+                        isSelected ? "var(--color-primary, #18181b)" : tint
                       }
                       strokeWidth={isSelected ? 2.5 : 1.5}
                     />
@@ -732,8 +1042,16 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
                         key={r.key}
                         className="flex items-center justify-between gap-2 py-1.5 text-sm"
                       >
-                        <span className="min-w-0 truncate">
-                          <span className="font-medium">{r.predicate}</span>{" "}
+                        <span className="flex min-w-0 items-center gap-1 truncate">
+                          <span className="font-medium">{r.predicate}</span>
+                          {r.group && (
+                            <Badge
+                              variant="secondary"
+                              className="shrink-0 px-1.5 py-0 text-[10px] font-normal"
+                            >
+                              {r.group}
+                            </Badge>
+                          )}
                           {r.arrow} <span>{r.neighborName}</span>
                         </span>
                         <span className="shrink-0 text-xs tabular-nums text-muted-foreground">

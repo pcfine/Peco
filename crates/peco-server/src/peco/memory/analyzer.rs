@@ -9,7 +9,7 @@
 // 取代指针，但只落 shadow 观测表（见 hook.rs），不执行任何删除 ——
 // 记忆的更新/删除仍由 `@memory` 子 agent 的显式工具路径负责。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use model_provider::{ContentBlock, GenerateRequest, InputItem, ReasoningConfig, Role};
@@ -55,10 +55,14 @@ impl MemoryCategory {
 pub struct MemoryTriple {
     /// 主体实体名（最短稳定写法，用户为「用户」）。
     pub subject: String,
+    /// 主体实体类型（本体闭集 canonical 名）；模型留空 → 写侧推断。
+    pub subject_type: Option<String>,
     /// 中文关系词（如 原名、喜欢、任职于）。
     pub predicate: String,
     /// 客体实体名。
     pub object: String,
+    /// 客体实体类型（本体闭集 canonical 名）；模型留空 → 写侧推断。
+    pub object_type: Option<String>,
 }
 
 /// 一条提取出的记忆。
@@ -103,8 +107,8 @@ pub trait TurnAnalyzer: Send + Sync {
     ) -> Result<Vec<MemoryFact>, String>;
 }
 
-/// 提取器的系统提示词。
-const ANALYZER_SYSTEM_PROMPT: &str = r#"You are the personal assistant's memory extractor. Analyze one turn of dialogue and decide whether it contains new or updated information worth remembering long-term.
+/// 提取器的系统提示词模板 —— `{entity_type_lines}` 由本体渲染后注入。
+const ANALYZER_PROMPT_TEMPLATE: &str = r#"You are the personal assistant's memory extractor. Analyze one turn of dialogue and decide whether it contains new or updated information worth remembering long-term.
 
 Three memory categories:
 - profile: user identity and preferences (how to address the user, language, communication style, long-term preferences)
@@ -121,17 +125,34 @@ Rules:
 7. When there is nothing worth extracting, output {"facts": []}.
 8. Output JSON only, with no other text or markdown code fence markers.
 
-Relation triple (optional): when the fact states a relationship between two entities, or an
-attribute of one named entity, ALSO fill "subject", "predicate" and "object". Otherwise leave
-them empty.
-- subject / object: the shortest stable entity name (real name where known, e.g. "陈晨"; use
-  "用户" for the user). Never a sentence or a descriptive phrase.
-- predicate: a short stable relation word in Chinese (e.g. 原名, 喜欢, 使用, 任职于).
+Relation triple (optional). Emit a triple ONLY when this fact links TWO NAMED ENTITIES by a stable relation. If the object is a literal value, leave the triple empty.
+
+ENTITY TYPES — "subject_type"/"object_type" MUST be one of:
+{entity_type_lines}
+
+RELATION — "predicate": a short, stable relation word (a verb phrase), in Chinese. Use the same word for the same kind of relation. Never invent a relation when the object is a literal value.
+
+ATTRIBUTE vs RELATION (the deciding rule):
+- subject AND object must EACH be a named entity of the types above.
+- If the object is a literal value — a number, port, PID, version, path, filename, boolean, date, count, status word (未实现/待立项/待定夺/已修复), config value, or a descriptive phrase — do NOT emit a triple; leave it empty. The fact sentence itself carries the value.
+- Never create an entity for a state, a defect description, or a property name.
+- subject / object: the shortest stable entity name (real name where known, e.g. "陈晨"; use "用户" for the user). Never a sentence or a descriptive phrase.
 - At most ONE triple per fact — pick the most important relation.
 - Never invent entities that this turn does not mention.
 
 Output format:
-{"facts": [{"category": "profile|semantic|episodic", "content": "one-sentence fact", "topic": "short_key", "supersedes": ["existing_memory_id"], "subject": "entity_name", "predicate": "relation_word", "object": "entity_name"}]}"#;
+{"facts": [{"category": "profile|semantic|episodic", "content": "one-sentence fact", "topic": "short_key", "supersedes": ["existing_memory_id"], "subject": "entity_name", "subject_type": "entity_type", "predicate": "relation_word", "object": "entity_name", "object_type": "entity_type"}]}"#;
+
+/// 渲染好的系统提示词 —— 词表只定义一次，进程内渲染一次。
+fn analyzer_system_prompt() -> &'static str {
+    static RENDERED: OnceLock<String> = OnceLock::new();
+    RENDERED.get_or_init(|| {
+        ANALYZER_PROMPT_TEMPLATE.replace(
+            "{entity_type_lines}",
+            &peco_core::ontology::render_entity_type_lines(),
+        )
+    })
+}
 
 /// 基于 [`model_provider::ModelProvider`] 的提取器。
 pub struct ModelTurnAnalyzer {
@@ -174,7 +195,7 @@ impl TurnAnalyzer for ModelTurnAnalyzer {
 
         let request = GenerateRequest {
             model: self.model.clone(),
-            instructions: Some(ANALYZER_SYSTEM_PROMPT.to_string()),
+            instructions: Some(analyzer_system_prompt().to_string()),
             input: vec![Arc::new(InputItem::Message {
                 role: Role::User,
                 content: user_content.into(),
@@ -275,8 +296,10 @@ fn parse_facts(raw: &str) -> Vec<MemoryFact> {
                 ) {
                     (Some(subject), Some(predicate), Some(object)) => Some(MemoryTriple {
                         subject,
+                        subject_type: non_empty(f.subject_type),
                         predicate,
                         object,
+                        object_type: non_empty(f.object_type),
                     }),
                     _ => None,
                 };
@@ -313,9 +336,13 @@ struct RawFact {
     #[serde(default)]
     subject: Option<serde_json::Value>,
     #[serde(default)]
+    subject_type: Option<serde_json::Value>,
+    #[serde(default)]
     predicate: Option<serde_json::Value>,
     #[serde(default)]
     object: Option<serde_json::Value>,
+    #[serde(default)]
+    object_type: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -493,5 +520,62 @@ mod tests {
             assert_eq!(MemoryCategory::from_raw(s), Some(cat));
             assert_eq!(cat.as_str(), s);
         }
+    }
+
+    #[test]
+    fn test_parse_triple_types() {
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "用户的原名是陈晨",
+                 "subject": "用户", "subject_type": "Person", "predicate": "原名",
+                 "object": "陈晨", "object_type": "Person"}]}"#,
+        );
+        let triple = facts[0].triple.as_ref().expect("三字段齐全应产出 triple");
+        assert_eq!(triple.subject_type.as_deref(), Some("Person"));
+        assert_eq!(triple.object_type.as_deref(), Some("Person"));
+    }
+
+    #[test]
+    fn test_parse_triple_types_optional_for_old_format() {
+        // 旧格式无类型字段 → 类型缺省 None，triple 照产出
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "x",
+                 "subject": "用户", "predicate": "原名", "object": "陈晨"}]}"#,
+        );
+        let triple = facts[0].triple.as_ref().unwrap();
+        assert!(triple.subject_type.is_none());
+        assert!(triple.object_type.is_none());
+    }
+
+    #[test]
+    fn test_parse_non_string_type_keeps_triple() {
+        // 类型字段是数字/数组 → 该类型取不到字符串 → None，但 triple 本体保留
+        let facts = parse_facts(
+            r#"{"facts": [{"category": "profile", "content": "x",
+                 "subject": "用户", "subject_type": 42, "predicate": "原名",
+                 "object": "陈晨", "object_type": ["Person"]}]}"#,
+        );
+        assert_eq!(facts.len(), 1);
+        let triple = facts[0].triple.as_ref().expect("坏的类型字段不得丢 triple");
+        assert!(triple.subject_type.is_none());
+        assert!(triple.object_type.is_none());
+    }
+
+    #[test]
+    fn test_prompt_renders_entity_types_without_relation_enum() {
+        let prompt = analyzer_system_prompt();
+        // 实体类型闭集注入
+        for ty in peco_core::ontology::EntityType::ALL {
+            assert!(
+                prompt.contains(&format!("- {}: ", ty.as_str())),
+                "prompt 缺类型 {}",
+                ty.as_str()
+            );
+        }
+        // 占位符已被替换
+        assert!(!prompt.contains("{entity_type_lines}"));
+        // 删掉了把属性引导成三元组的措辞
+        assert!(!prompt.contains("attribute of one named entity"));
+        // 关系不闭集：prompt 不给关系枚举
+        assert!(!prompt.contains("原名, 喜欢, 使用, 任职于"));
     }
 }

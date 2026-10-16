@@ -56,8 +56,8 @@ describe("MemoryGraphView dagre 兜底", () => {
   it("layout 抛错时仍渲染全部节点与谓词（网格兜底，不白屏）", async () => {
     GRAPH.mockResolvedValue({
       nodes: [
-        { id: "a", name: "peco" },
-        { id: "b", name: "Docling" },
+        { id: "a", name: "peco", type: "SoftwareProject" },
+        { id: "b", name: "Docling", type: "Technology" },
       ],
       edges: [{ source: "a", target: "b", predicate: "使用", weight: 0.8 }],
       truncated: false,

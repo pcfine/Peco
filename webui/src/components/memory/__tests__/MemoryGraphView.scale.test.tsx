@@ -27,8 +27,12 @@ let root: Root;
 
 /** 星形图：中心 + 30 个叶子 ⇒ 单列堆叠，高度远超视口（与真实大图同形）。 */
 function tallGraph() {
-  const nodes = [{ id: "hub", name: "中心" }].concat(
-    Array.from({ length: 30 }, (_, i) => ({ id: `l${i}`, name: `实体${i}` })),
+  const nodes = [{ id: "hub", name: "中心", type: "Concept" }].concat(
+    Array.from({ length: 30 }, (_, i) => ({
+      id: `l${i}`,
+      name: `实体${i}`,
+      type: "Concept",
+    })),
   );
   const edges = Array.from({ length: 30 }, (_, i) => ({
     source: "hub",

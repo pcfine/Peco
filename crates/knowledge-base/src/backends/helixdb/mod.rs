@@ -1104,6 +1104,14 @@ impl GraphStore for HelixDbBackend {
                 if !name.is_empty() {
                     properties.insert("name".to_string(), name);
                 }
+                // 实体类型随节点属性透出；缺列/空值不插，读侧按缺省处理。
+                if let Some(entity_type) = row
+                    .get("entity_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.is_empty())
+                {
+                    properties.insert("entity_type".to_string(), entity_type.to_string());
+                }
                 nodes.push(GraphNode {
                     id: stable.clone(),
                     labels: vec![label.to_string()],
