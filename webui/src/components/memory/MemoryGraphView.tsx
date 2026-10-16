@@ -40,6 +40,16 @@ const NODE_H = 40;
 /** 节点名超过 10 字截断为 `…`（完整名放 `<title>`）。 */
 const NAME_MAX = 10;
 const PAD = 16;
+/** 平行边之间的垂直间距（px）—— 同一对节点的多条边据此错开。 */
+const EDGE_SPREAD = 9;
+
+/**
+ * 布局图上的「节点对」键。用 JSON 元组而非拼接分隔符：node id 由后端给出，
+ * 拼接分隔符一旦出现在 id 里会把两条不同关系折叠成同一条（静默丢边）。
+ */
+function pairKey(source: string, target: string): string {
+  return JSON.stringify([source, target]);
+}
 const MIN_SCALE = 0.25;
 const MAX_SCALE = 3;
 
@@ -55,6 +65,7 @@ interface PlacedEdge {
   source: string;
   target: string;
   predicate: string;
+  /** 最终绘制走线（已含平行边垂直偏移）。 */
   points: { x: number; y: number }[];
 }
 
@@ -107,19 +118,45 @@ function polylineMidpoint(pts: { x: number; y: number }[]): {
   return pts[pts.length - 1];
 }
 
-/** 把 dagre 折线转成 SVG path（无点则回退为源→靶中心直线）。 */
-function edgePath(
+/** 折线 → SVG path（调用方保证点 ≥ 2）。 */
+function polylinePath(
   points: { x: number; y: number }[],
   ox: number,
   oy: number,
-  fallback: { x1: number; y1: number; x2: number; y2: number },
 ): string {
-  if (points.length >= 2) {
-    return points
-      .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x + ox} ${p.y + oy}`)
-      .join(" ");
-  }
-  return `M ${fallback.x1 + ox} ${fallback.y1 + oy} L ${fallback.x2 + ox} ${fallback.y2 + oy}`;
+  return points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${p.x + ox} ${p.y + oy}`)
+    .join(" ");
+}
+
+/** 沿折线法向平移 `off` px —— 同一对节点的平行边据此错开，避免完全重叠。 */
+function shiftPolyline(
+  points: { x: number; y: number }[],
+  off: number,
+): { x: number; y: number }[] {
+  if (off === 0) return points;
+  const dx = points[points.length - 1].x - points[0].x;
+  const dy = points[points.length - 1].y - points[0].y;
+  const len = Math.hypot(dx, dy);
+  if (len === 0) return points;
+  const nx = -dy / len;
+  const ny = dx / len;
+  return points.map((p) => ({ x: p.x + nx * off, y: p.y + ny * off }));
+}
+
+/** dagre 抛错时的兜底排布：按序网格，保证节点可见、页面不白屏。 */
+function gridLayout(
+  nodes: MemoryNode[],
+): Map<string, { x: number; y: number }> {
+  const cols = Math.max(1, Math.ceil(Math.sqrt(nodes.length)));
+  const out = new Map<string, { x: number; y: number }>();
+  nodes.forEach((n, i) => {
+    out.set(n.id, {
+      x: (i % cols) * (NODE_W + 40) + NODE_W / 2,
+      y: Math.floor(i / cols) * (NODE_H + 40) + NODE_H / 2,
+    });
+  });
+  return out;
 }
 
 function truncateName(name: string): string {
@@ -165,7 +202,42 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   const layoutData = useMemo<GraphLayout | null>(() => {
     if (!data || data.nodes.length === 0) return null;
 
-    // multigraph: true 必须 —— 并行边 (s,t,predicate) 可能重复，非 multigraph 会丢边
+    // dagre 3.1.x 有两类已知布局抛错，都会打断整个 useMemo、使整页白屏：
+    //   ① 交集计算：跨层长边的 dummy 落在空 rank 上拿不到坐标 → 该边
+    //      `points` 出现 NaN → intersectRect 抛
+    //      `Not possible to find intersection inside of the rectangle`
+    //      （实测由「同一对节点间多条平行边 + 孤立点」触发）。
+    //   ② 模块级跨调用状态：bundle 内的 `useDynamic` 缓存保存**上一张**布局图
+    //      （`var ke=null,xe=null`），连续布局不同图时可能抛错。
+    // 规避 ①：交给 dagre 的图每条 (source,target) 只喂一条代表边（实测把 ①
+    // 的触发率降到 0）；平行边改在本层按序号垂直展开，关系不丢（选中节点侧栏
+    // 本就逐条列出图上全部关系）。
+    // 规避 ②：不依赖——下面的 try/catch 是**最终保底**，它兜住一切布局异常，
+    // 包括 ② 和未来新形态。**不要因为它看起来没被触发就删掉**：删掉即退回白屏。
+    const ids = new Set(data.nodes.map((n) => n.id));
+    // idx = 同 (source, target) 的平行边序号（与 React key、垂直偏移同源）
+    const pairSeen = new Map<string, number>();
+    const reps = new Map<string, MemoryEdge>();
+    const drawEdges: {
+      key: string;
+      edge: MemoryEdge;
+      pair: string;
+      idx: number;
+    }[] = [];
+    for (const e of data.edges) {
+      if (!ids.has(e.source) || !ids.has(e.target)) continue;
+      const pair = pairKey(e.source, e.target);
+      const idx = pairSeen.get(pair) ?? 0;
+      pairSeen.set(pair, idx + 1);
+      if (!reps.has(pair)) reps.set(pair, e);
+      drawEdges.push({
+        key: `${pair}#${e.predicate}#${idx}`,
+        edge: e,
+        pair,
+        idx,
+      });
+    }
+
     const g = new graphlib.Graph({ directed: true, multigraph: true });
     g.setDefaultEdgeLabel(() => ({}));
     g.setGraph({
@@ -178,26 +250,64 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     for (const n of data.nodes) {
       g.setNode(n.id, { width: NODE_W, height: NODE_H });
     }
+    for (const [pair, e] of reps) g.setEdge(e.source, e.target, {}, pair);
 
-    const ids = new Set(data.nodes.map((n) => n.id));
-    // idx = 同 (source, target, predicate) 的并行边序号，与 React key 同源
-    const counters = new Map<string, number>();
-    const rawEdges: { key: string; name: string; edge: MemoryEdge }[] = [];
-    for (const e of data.edges) {
-      if (!ids.has(e.source) || !ids.has(e.target)) continue;
-      const base = `${e.source}→${e.target}#${e.predicate}`;
-      const idx = counters.get(base) ?? 0;
-      counters.set(base, idx + 1);
-      const name = `${e.predicate}#${idx}`;
-      g.setEdge(e.source, e.target, {}, name);
-      rawEdges.push({ key: `${base}#${idx}`, name, edge: e });
+    let placed = new Map<string, { x: number; y: number }>();
+    let routed = new Map<string, { x: number; y: number }[]>();
+    try {
+      layout(g);
+      for (const n of data.nodes) {
+        const pos = g.node(n.id);
+        placed.set(n.id, { x: pos?.x ?? 0, y: pos?.y ?? 0 });
+      }
+      for (const [pair, e] of reps) {
+        const label = g.edge({ v: e.source, w: e.target, name: pair }) as
+          | EdgeLabel
+          | undefined;
+        routed.set(
+          pair,
+          (label?.points ?? []).map((p) => ({ x: p.x, y: p.y })),
+        );
+      }
+    } catch (err) {
+      // 兜底：布局异常绝不升级为白屏 —— 退化为按序网格，边走直线。
+      // 必须留痕：兜底一旦静默，用户只会看到「布局变丑」而无从察觉。
+      console.warn("[memory-graph] dagre layout failed; falling back to grid", err);
+      placed = gridLayout(data.nodes);
+      routed = new Map();
     }
 
-    layout(g);
-
     const nodes: PlacedNode[] = data.nodes.map((n) => {
-      const pos = g.node(n.id);
+      const pos = placed.get(n.id);
       return { id: n.id, name: n.name, x: pos?.x ?? 0, y: pos?.y ?? 0 };
+    });
+
+    // 平行边共用代表边走线，按序号垂直展开（代表边居中）；无走线点的边补成
+    // 「源→靶」直线（各让出节点半宽），保证每个 PlacedEdge.points 都 ≥ 2 点。
+    const posById = new Map(nodes.map((n) => [n.id, n]));
+    const edges: PlacedEdge[] = drawEdges.map(({ key, edge, pair, idx }) => {
+      const routedPoints = routed.get(pair);
+      const base =
+        routedPoints && routedPoints.length >= 2
+          ? routedPoints
+          : [
+              {
+                x: (posById.get(edge.source)?.x ?? 0) + NODE_W / 2,
+                y: posById.get(edge.source)?.y ?? 0,
+              },
+              {
+                x: (posById.get(edge.target)?.x ?? 0) - NODE_W / 2,
+                y: posById.get(edge.target)?.y ?? 0,
+              },
+            ];
+      const total = pairSeen.get(pair) ?? 1;
+      return {
+        key,
+        source: edge.source,
+        target: edge.target,
+        predicate: edge.predicate,
+        points: shiftPolyline(base, (idx - (total - 1) / 2) * EDGE_SPREAD),
+      };
     });
 
     let minX = Infinity;
@@ -210,27 +320,21 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
       maxX = Math.max(maxX, n.x + NODE_W / 2);
       maxY = Math.max(maxY, n.y + NODE_H / 2);
     }
+    // 边已含平行边偏移，一并纳入包围盒（避免贴边裁切）
+    for (const pe of edges) {
+      for (const p of pe.points) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
     if (!Number.isFinite(minX)) {
       minX = 0;
       minY = 0;
       maxX = NODE_W;
       maxY = NODE_H;
     }
-
-    const edges: PlacedEdge[] = rawEdges.map(({ key, name, edge }) => {
-      const label = g.edge({
-        v: edge.source,
-        w: edge.target,
-        name,
-      }) as EdgeLabel | undefined;
-      return {
-        key,
-        source: edge.source,
-        target: edge.target,
-        predicate: edge.predicate,
-        points: (label?.points ?? []).map((p) => ({ x: p.x, y: p.y })),
-      };
-    });
 
     const ox = -minX + PAD;
     const oy = -minY + PAD;
@@ -290,12 +394,6 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     }
     return out;
   }, [data, selectedNodeId]);
-
-  const nodePosById = useMemo(() => {
-    const map = new Map<string, PlacedNode>();
-    for (const n of layoutData?.nodes ?? []) map.set(n.id, n);
-    return map;
-  }, [layoutData]);
 
   const resetView = () => setView({ tx: 0, ty: 0, k: 1 });
 
@@ -408,29 +506,8 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
             <g transform={`translate(${view.tx},${view.ty}) scale(${view.k})`}>
               {/* 边：path + 箭头 + 中点谓词 */}
               {layoutData.edges.map((pe) => {
-                const from = nodePosById.get(pe.source);
-                const to = nodePosById.get(pe.target);
-                const fallback = {
-                  x1: (from?.x ?? 0) + NODE_W / 2,
-                  y1: from?.y ?? 0,
-                  x2: (to?.x ?? 0) - NODE_W / 2,
-                  y2: to?.y ?? 0,
-                };
-                const d = edgePath(pe.points, layoutData.ox, layoutData.oy, {
-                  x1: fallback.x1,
-                  y1: fallback.y1,
-                  x2: fallback.x2,
-                  y2: fallback.y2,
-                });
-                // dagre 无控制点时回退为源→靶直线，谓词标签仍摆在直线中点
-                const midPath =
-                  pe.points.length >= 2
-                    ? pe.points
-                    : [
-                        { x: fallback.x1, y: fallback.y1 },
-                        { x: fallback.x2, y: fallback.y2 },
-                      ];
-                const mid = polylineMidpoint(midPath);
+                const d = polylinePath(pe.points, layoutData.ox, layoutData.oy);
+                const mid = polylineMidpoint(pe.points);
                 const midX = mid.x + layoutData.ox;
                 const midY = mid.y + layoutData.oy;
                 const active =

@@ -165,6 +165,43 @@ describe("MemoryGraphView", () => {
     expect(panel()).toBeNull();
   });
 
+  it("同一对节点多条平行边不抛错，且每条谓词都保留（回归：dagre 平行边）", async () => {
+    // 该形态曾使 dagre 布局抛
+    // `Not possible to find intersection inside of the rectangle` → 整页白屏
+    GRAPH.mockResolvedValue({
+      nodes: [
+        { id: "iso", name: "孤立点" },
+        { id: "hub", name: "peco" },
+        { id: "dep", name: "Docling" },
+      ],
+      edges: [
+        { source: "hub", target: "dep", predicate: "使用", weight: 0.8 },
+        { source: "hub", target: "dep", predicate: "实测", weight: 0.8 },
+        { source: "hub", target: "dep", predicate: "接入", weight: 0.8 },
+      ],
+      truncated: false,
+    });
+
+    await renderView();
+
+    expect(container.querySelector("svg")).not.toBeNull();
+    const text = container.textContent ?? "";
+    expect(text).toContain("peco");
+    expect(text).toContain("Docling");
+    // 平行边不丢：三条谓词都在图上
+    expect(text).toContain("使用");
+    expect(text).toContain("实测");
+    expect(text).toContain("接入");
+
+    // 且确实被「展开」而非三条重叠成一条：用 marker-end 只取边 path
+    // （lucide 图标也是 <path>，不能直接数 svg path）
+    const ds = Array.from(
+      container.querySelectorAll("svg path[marker-end]"),
+    ).map((p) => p.getAttribute("d"));
+    expect(ds).toHaveLength(3);
+    expect(new Set(ds).size).toBe(3);
+  });
+
   it("单节点 / 0 边渲染不抛错（包围盒除零保护）", async () => {
     GRAPH.mockResolvedValue({
       nodes: [{ id: "only", name: "孤立点" }],
