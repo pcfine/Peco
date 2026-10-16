@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Stdio;
 use std::time::Duration;
 
 use futures::Future;
@@ -7,6 +8,8 @@ use peco_derive::peco_tool;
 use serde_json::json;
 use tracing::warn;
 
+use super::command_screen::screen_command;
+use super::proc_group::{GroupGuard, configure_process_group};
 use super::{Content, Tool, ToolDefinition, ToolDyn, ToolError};
 
 /// shell 命令超时默认 20 分钟；`PECO_SHELL_TIMEOUT_SECS` 可覆盖，`0` 表示不设超时。
@@ -50,32 +53,70 @@ fn timeout_from(raw: Option<&str>) -> Option<Duration> {
     required = ["command"]
 )]
 pub async fn shell_exec(command: String, cwd: Option<String>) -> Result<String, ToolError> {
-    // 必须使用 tokio::process — std::process::Command::output() 是同步阻塞调用，
-    // 会占住一个 tokio worker 线程直到子进程退出。子 Agent 扇出场景下
-    // （RunParallelSubAgents → N 个 SimpleAgentLooper → 各自并发 shell）
-    // 足以耗尽 worker 池，导致 SSE 流与其他请求全部停摆。
+    let cwd = cwd.filter(|d| !d.is_empty());
+    run_shell(&command, cwd.as_deref(), shell_timeout()).await
+}
+
+/// `shell_exec` 的实现主体；超时值作为参数注入以便单测复用同一路径。
+///
+/// 必须使用 tokio::process —— `std::process::Command::output()` 是同步阻塞调用，
+/// 会占住一个 tokio worker 线程直到子进程退出。子 Agent 扇出场景下
+///（RunParallelSubAgents → N 个 SimpleAgentLooper → 各自并发 shell）
+/// 足以耗尽 worker 池，导致 SSE 流与其他请求全部停摆。
+async fn run_shell(
+    command: &str,
+    cwd: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<String, ToolError> {
+    if let Some(reason) = screen_command(command) {
+        return Err(ToolError::ToolCallError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            reason,
+        ))));
+    }
+
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(&command);
-    if let Some(dir) = cwd.as_deref().filter(|d| !d.is_empty()) {
+    cmd.arg("-c").arg(command);
+    // 标记后代，供下次启动时清理上一代孤儿（见 peco-server 的 orphan_reaper）。
+    cmd.env("PECO_SHELL_CHILD", "1");
+    if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    // 取消/回收工具任务时一并杀掉子进程，避免孤儿进程继续跑。
-    cmd.kill_on_drop(true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // 取消/回收工具任务时杀掉直接子进程 `sh`。
+        .kill_on_drop(true);
+    configure_process_group(&mut cmd);
 
-    let output = match shell_timeout() {
-        Some(limit) => tokio::time::timeout(limit, cmd.output())
-            .await
-            .map_err(|_| {
-                ToolError::ToolCallError(Box::new(std::io::Error::new(
+    let child = cmd
+        .spawn()
+        .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+    // 超时/取消时 drop 会连同孙进程整组杀掉；正常完成前 disarm。
+    let mut guard = GroupGuard::new(child.id());
+
+    let output = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, child.wait_with_output()).await {
+            Ok(res) => {
+                let output = res.map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+                guard.disarm();
+                output
+            }
+            Err(_) => {
+                return Err(ToolError::ToolCallError(Box::new(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("shell command timed out after {}s", limit.as_secs()),
-                )))
-            })?
-            .map_err(|e| ToolError::ToolCallError(Box::new(e)))?,
-        None => cmd
-            .output()
-            .await
-            .map_err(|e| ToolError::ToolCallError(Box::new(e)))?,
+                ))));
+            }
+        },
+        None => {
+            let output = child
+                .wait_with_output()
+                .await
+                .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+            guard.disarm();
+            output
+        }
     };
 
     let mut result = String::new();
@@ -253,5 +294,115 @@ mod tests {
             "pwd output `{out}` should start with `{prefix}`"
         );
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // ── 进程组加固 ─────────────────────────────────────────────────────
+    //
+    // 用 `sleep ... & ... wait` 制造一个真实孙进程；验证超时 / 取消两条路径
+    // 都能把整组杀掉，而非只杀 `sh`。
+
+    #[cfg(unix)]
+    fn is_running(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // "pid (comm) STATE ..."：comm 可含空格/括号，取最后一个 ')' 之后。
+            Ok(stat) => {
+                let state = stat
+                    .rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start()
+                    .chars()
+                    .next();
+                !matches!(state, Some('Z') | None)
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_pidfile(path: &Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pidfile(path: &Path) -> Option<i32> {
+        for _ in 0..100 {
+            if let Some(pid) = read_pidfile(path) {
+                return Some(pid);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: i32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !is_running(pid) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn grandchild_script(pidfile: &Path) -> String {
+        format!("sleep 30 & echo $! > '{}'; wait", pidfile.display())
+    }
+
+    #[cfg(unix)]
+    fn temp_pidfile(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("peco-shell-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("gc.pid");
+        (dir, pidfile)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_timeout_kills_process_group() {
+        let (dir, pidfile) = temp_pidfile("timeout");
+        let err = run_shell(
+            &grandchild_script(&pidfile),
+            None,
+            Some(Duration::from_millis(300)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+
+        let grandchild = read_pidfile(&pidfile).expect("grandchild pid file missing");
+        assert!(
+            wait_until_dead(grandchild, Duration::from_secs(3)).await,
+            "grandchild {grandchild} survived timeout"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_shell_kills_process_group() {
+        let (dir, pidfile) = temp_pidfile("cancel");
+        let script = grandchild_script(&pidfile);
+        let handle = tokio::spawn(async move { run_shell(&script, None, None).await });
+
+        let grandchild = wait_for_pidfile(&pidfile)
+            .await
+            .expect("grandchild pid file missing");
+        assert!(is_running(grandchild), "grandchild should start running");
+
+        handle.abort();
+        assert!(
+            wait_until_dead(grandchild, Duration::from_secs(3)).await,
+            "grandchild {grandchild} survived cancellation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

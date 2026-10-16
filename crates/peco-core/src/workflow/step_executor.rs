@@ -2,12 +2,13 @@
 // step_executor — 步骤执行器（Shell + Agent 类型）
 // ============================================================================
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::agent::SimpleAgentLooper;
-use crate::tools::AgentAccess;
+use crate::tools::{AgentAccess, GroupGuard, configure_process_group, screen_command};
 
 use super::definition::{StepConfig, StepOutcome, StepResult, WorkflowStep};
 use super::template::TemplateContext;
@@ -97,21 +98,33 @@ pub(crate) async fn execute_step_static(
 
 /// 执行 Shell 类型步骤（已渲染 command，直接执行，无内层超时）。
 ///
-/// 超时由 `execute_step_static` 统一负责，此处仅调用 `Command::output()`。
+/// 超时由 `execute_step_static` 统一负责 —— 超时或取消都会 drop 本 future，
+/// 此时 [`GroupGuard`] 按进程组 SIGKILL，连同 `sh` fork 出的孙进程一起清理。
 async fn execute_shell_step(command: &str) -> StepOutcome {
-    match tokio::process::Command::new("sh")
-        .arg("-c")
+    if let Some(reason) = screen_command(command) {
+        return StepOutcome::Failed(reason);
+    }
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
-        // 超时/取消/全局超时中止步骤任务时，`output()` future 被 drop；若未设置
-        // `kill_on_drop`，`sh -c` 子进程会继续在后台运行（孤儿进程，持续消耗 CPU
-        // 并产生副作用）。`kill_on_drop(true)` 在 handle drop 时 SIGKILL 直接子进程。
-        // 注意：这仅杀死 `sh` 本身；复合命令（如 `sleep 300 && deploy.sh`）fork 出的
-        // 孙进程仍可能存活，彻底清理需按进程组 kill（后续可加固）。
-        .kill_on_drop(true)
-        .output()
-        .await
-    {
+        // 标记后代，供下次启动时清理上一代孤儿。
+        .env("PECO_SHELL_CHILD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    configure_process_group(&mut cmd);
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return StepOutcome::Failed(format!("command execution error: {e}")),
+    };
+    let mut guard = GroupGuard::new(child.id());
+
+    match child.wait_with_output().await {
         Ok(output) => {
+            guard.disarm();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let combined = format!("{stdout}\n{stderr}").trim().to_string();

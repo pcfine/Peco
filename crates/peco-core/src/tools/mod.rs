@@ -3,10 +3,12 @@
 // ============================================================================
 
 mod agent_tools;
+mod command_screen;
 mod deps;
 mod fetch;
 mod knowledge_tools;
 mod mcp_tools;
+mod proc_group;
 mod shell;
 mod skill_tools;
 mod sub_agent;
@@ -16,6 +18,7 @@ mod web_search;
 mod workspace_info;
 
 pub use agent_tools::{DeleteAgent, ReadAgent, SaveAgent};
+pub use command_screen::screen_command;
 #[cfg(test)]
 pub use deps::NoopMemoryAudit;
 pub use deps::{
@@ -29,6 +32,7 @@ pub use knowledge_tools::{
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
+pub use proc_group::{GroupGuard, configure_process_group};
 pub use shell::{ShellExec, ShellTool};
 pub use skill_tools::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};

@@ -53,6 +53,9 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 # Cache
 lru = "0.14"
 
+# 进程组 / 孤儿回收（unix）
+libc = { workspace = true }
+
 # Rate limiting
 governor = "0.8"
 

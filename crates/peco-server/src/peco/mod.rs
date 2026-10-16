@@ -15,4 +15,5 @@ pub mod handler;
 pub mod manager;
 pub mod memory;
 pub mod metrics;
+pub mod orphan_reaper;
 pub mod session;

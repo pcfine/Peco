@@ -22,6 +22,12 @@ async fn main() -> anyhow::Result<()> {
     // 见 `peco_server::logging` 模块文档。
     peco_server::logging::init_tracing();
 
+    // ── 2.5 清理上一代遗留的孤儿 shell 子进程 ─────────────────────────────
+    // 在 serve 之前同步跑一次：此刻还没有本次进程产生的 shell 调用，
+    // 清理范围只含上一代，不会误伤正在服务的子进程。
+    let reaped = peco_server::peco::orphan_reaper::reap_orphaned_shell_children();
+    tracing::info!(reaped, "Reaped orphaned shell children from previous run");
+
     // ── 3. 加载初步配置（获取 database_url 和 data_dir）─────────────────
     let config_prelim = ServerConfig::from_env()?;
     tracing::info!(
