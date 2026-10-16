@@ -4,13 +4,14 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { graphlib, layout } from "@dagrejs/dagre";
 import axios from "axios";
-import { RefreshCw } from "lucide-react";
+import { Minus, Plus, RefreshCw } from "lucide-react";
 import { getMemoryGraph } from "@/api/memory";
 import type { EdgeLabel } from "@dagrejs/dagre";
 import type {
@@ -50,8 +51,15 @@ const EDGE_SPREAD = 9;
 function pairKey(source: string, target: string): string {
   return JSON.stringify([source, target]);
 }
-const MIN_SCALE = 0.25;
-const MAX_SCALE = 3;
+/**
+ * 缩放区间。viewBox 与容器像素 1:1（见 `vw`/`vh` 与 `fitView`），故 `k` 就是
+ * 相对 1:1 的屏幕倍率：k=1 时节点 140×40 px、字号 12px（可读）。上下界给足
+ * 余量以实现「自由缩放」——大图能缩小看全貌，也能放大到看清节点。
+ */
+const MIN_SCALE = 0.02;
+const MAX_SCALE = 5;
+/** 滚轮每格缩放系数。 */
+const WHEEL_STEP = 1.2;
 
 interface PlacedNode {
   id: string;
@@ -159,6 +167,27 @@ function gridLayout(
   return out;
 }
 
+/** 视口尺寸（px）。viewBox 与之一致 ⇒ SVG 用户单位 == CSS 像素。 */
+interface Viewport {
+  w: number;
+  h: number;
+}
+
+/** 让整张图恰好铺满视口并居中（缩放 + 平移一次算好）。 */
+function fitView(
+  vp: Viewport,
+  layout: { width: number; height: number },
+): { tx: number; ty: number; k: number } {
+  const k = Math.min(vp.w / layout.width, vp.h / layout.height);
+  // 尺寸退化（0 / NaN）时退回 1:1，绝不产生 NaN transform。
+  const kk = Number.isFinite(k) && k > 0 ? k : 1;
+  return {
+    k: kk,
+    tx: (vp.w - layout.width * kk) / 2,
+    ty: (vp.h - layout.height * kk) / 2,
+  };
+}
+
 function truncateName(name: string): string {
   return name.length > NAME_MAX ? `${name.slice(0, NAME_MAX)}…` : name;
 }
@@ -170,6 +199,11 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [view, setView] = useState({ tx: 0, ty: 0, k: 1 });
   const dragRef = useRef<{ x: number; y: number } | null>(null);
+  // SVG 容器的真实像素尺寸（决定 viewBox）；未测得时退回内容尺寸 ⇒ k=1。
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [vp, setVp] = useState<Viewport>({ w: 0, h: 0 });
+  // 已「适应内容」过的布局对象；换了一份数据才重新复位，避免每次渲染都跳回。
+  const fittedRef = useRef<GraphLayout | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -262,8 +296,7 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
       }
       for (const [pair, e] of reps) {
         const label = g.edge({ v: e.source, w: e.target, name: pair }) as
-          | EdgeLabel
-          | undefined;
+          EdgeLabel | undefined;
         routed.set(
           pair,
           (label?.points ?? []).map((p) => ({ x: p.x, y: p.y })),
@@ -272,7 +305,10 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     } catch (err) {
       // 兜底：布局异常绝不升级为白屏 —— 退化为按序网格，边走直线。
       // 必须留痕：兜底一旦静默，用户只会看到「布局变丑」而无从察觉。
-      console.warn("[memory-graph] dagre layout failed; falling back to grid", err);
+      console.warn(
+        "[memory-graph] dagre layout failed; falling back to grid",
+        err,
+      );
       placed = gridLayout(data.nodes);
       routed = new Map();
     }
@@ -349,6 +385,39 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     };
   }, [data]);
 
+  // 把 viewBox 设为「与容器像素 1:1」——这是放大得动的前提。
+  // 旧实现 viewBox = 整图 bbox，浏览器先把整图压进视口（77 节点实测 fit≈0.12），
+  // 再乘 k≤3 ⇒ 有效放大上限仅 0.36×，节点永远糊。改成 1:1 后 k=1 即真实 1:1。
+  useLayoutEffect(() => {
+    const el = wrapRef.current;
+    if (!el || !layoutData) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (w > 0 && h > 0) setVp((p) => (p.w === w && p.h === h ? p : { w, h }));
+    // 新布局到达：复位为「适应内容」（首帧测量不到时用内容尺寸兜底）。
+    if (fittedRef.current !== layoutData) {
+      fittedRef.current = layoutData;
+      const size =
+        w > 0 && h > 0
+          ? { w, h }
+          : { w: layoutData.width, h: layoutData.height };
+      setView(fitView(size, layoutData));
+    }
+  }, [layoutData]);
+
+  // 容器尺寸变化只更新 viewBox（保留用户当前缩放），不强制复位。
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      const h = el.clientHeight;
+      if (w > 0 && h > 0) setVp((p) => (p.w === w && p.h === h ? p : { w, h }));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [layoutData]);
+
   /** 选中节点的直接邻居 id 集（客户端从已取回的 nodes/edges 过滤，不新增请求）。 */
   const neighborIds = useMemo(() => {
     if (!data || !selectedNodeId) return null;
@@ -395,15 +464,36 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     return out;
   }, [data, selectedNodeId]);
 
-  const resetView = () => setView({ tx: 0, ty: 0, k: 1 });
+  // 未测得视口（含 jsdom 无布局）时退回内容尺寸 ⇒ viewBox 与内容同尺寸、k=1。
+  const vw = vp.w || layoutData?.width || 1;
+  const vh = vp.h || layoutData?.height || 1;
+
+  const clampScale = (k: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, k));
+
+  /** 复位 = 适应内容（缩放到看见全图并居中）。 */
+  const resetView = () => {
+    if (layoutData) setView(fitView({ w: vw, h: vh }, layoutData));
+  };
+
+  /** 以视口中心为锚点缩放（按钮用）。 */
+  const zoomBy = (factor: number) => {
+    const cx = vw / 2;
+    const cy = vh / 2;
+    setView((v) => {
+      const k = clampScale(v.k * factor);
+      const ratio = k / v.k;
+      return { k, tx: cx - ratio * (cx - v.tx), ty: cy - ratio * (cy - v.ty) };
+    });
+  };
 
   const handleWheel = (e: React.WheelEvent<SVGSVGElement>) => {
-    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const factor = e.deltaY < 0 ? WHEEL_STEP : 1 / WHEEL_STEP;
     const rect = e.currentTarget.getBoundingClientRect();
+    // viewBox 与容器像素 1:1 ⇒ 客户端坐标即用户单位，锚点无需再折算。
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
     setView((v) => {
-      const k = Math.min(MAX_SCALE, Math.max(MIN_SCALE, v.k * factor));
+      const k = clampScale(v.k * factor);
       const ratio = k / v.k;
       return {
         k,
@@ -473,9 +563,12 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
         </p>
       )}
       <div className="flex gap-4">
-        <div className="relative h-[520px] flex-1 overflow-hidden rounded-md border bg-muted/10">
+        <div
+          ref={wrapRef}
+          className="relative h-[520px] flex-1 overflow-hidden rounded-md border bg-muted/10"
+        >
           <svg
-            viewBox={`0 0 ${layoutData.width} ${layoutData.height}`}
+            viewBox={`0 0 ${vw} ${vh}`}
             className="h-full w-full touch-none select-none"
             role="img"
             aria-label="记忆图谱"
@@ -587,15 +680,35 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
             </g>
           </svg>
 
-          <Button
-            variant="outline"
-            size="sm"
-            className="absolute right-2 top-2"
-            onClick={resetView}
-          >
-            <RefreshCw className="h-4 w-4" />
-            复位
-          </Button>
+          <div className="absolute right-2 top-2 flex flex-col gap-1">
+            <Button
+              variant="outline"
+              size="icon-sm"
+              aria-label="放大"
+              title="放大"
+              onClick={() => zoomBy(WHEEL_STEP)}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              aria-label="缩小"
+              title="缩小"
+              onClick={() => zoomBy(1 / WHEEL_STEP)}
+            >
+              <Minus className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              aria-label="适应内容"
+              title="适应内容"
+              onClick={resetView}
+            >
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
 
         {selectedNode && (
