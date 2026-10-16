@@ -11,7 +11,7 @@ use axum_extra::extract::Multipart;
 use knowledge_base::manager::config::{
     BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
 };
-use peco_core::knowledge::hash_manifest::is_supported_extension;
+use peco_core::knowledge::hash_manifest::is_supported_extension_with;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -199,9 +199,14 @@ fn build_kb_config(
 ///
 /// 隐藏文件与含路径分隔符的名字既不被扫描收录，还可能写到 `docs/` 之外。
 fn is_supported_upload(mime: &str, filename: &str) -> bool {
+    is_supported_upload_with(mime, filename, knowledge_base::parsers::docling_enabled())
+}
+
+/// 同 [`is_supported_upload`]，但显式指定 Docling 开关以便脱离环境单测。
+fn is_supported_upload_with(mime: &str, filename: &str, docling: bool) -> bool {
     // 此处 `Path` 是 axum 的提取器，故用全限定名指 std 的路径类型
     is_allowed_mime(mime)
-        && is_supported_extension(std::path::Path::new(filename))
+        && is_supported_extension_with(std::path::Path::new(filename), docling)
         && is_acceptable_upload_name(filename)
 }
 
@@ -211,7 +216,7 @@ fn is_acceptable_upload_name(filename: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\\')
 }
 
-/// 允许上传的 MIME 类型。`.docx` 不在其中（解析器未实现）。
+/// 允许上传的 MIME 类型。是否可摄入另由扩展名（含 Docling 开关）共同判定。
 fn is_allowed_mime(mime: &str) -> bool {
     matches!(
         mime,
@@ -224,6 +229,9 @@ fn is_allowed_mime(mime: &str) -> bool {
             | "text/x-go"
             | "application/javascript"
             | "text/typescript"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     ) || mime.starts_with("text/")
 }
 
@@ -729,22 +737,54 @@ mod tests {
     #[test]
     fn upload_gate_matches_ingestion_extension_set() {
         for (mime, filename) in [("text/markdown", "a.md"), ("application/pdf", "a.pdf")] {
-            assert!(is_supported_upload(mime, filename), "{filename} 应被接受");
+            assert!(
+                is_supported_upload_with(mime, filename, false),
+                "{filename} 应被接受"
+            );
         }
 
-        // docx 解析器未实现（Phase 2），准入必须同样拒绝
+        // Docling 关闭时 docx 不属于可摄入集合，准入必须同样拒绝
         assert!(
-            !is_supported_upload(
+            !is_supported_upload_with(
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "a.docx"
+                "a.docx",
+                false
             ),
-            ".docx 解析器未实现，上传必须被拒绝"
+            "Docling 关闭时 .docx 上传必须被拒绝"
         );
 
         assert!(
-            !is_supported_upload("text/plain", "server.log"),
+            !is_supported_upload_with("text/plain", "server.log", false),
             ".log 不会被摄入，必须在入口拒绝"
         );
+    }
+
+    /// Docling 开启时 docx/pptx/xlsx 的 MIME 与扩展名同时命中 → 准入。
+    #[test]
+    fn upload_gate_accepts_docling_formats_when_enabled() {
+        for (mime, name) in [
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "a.docx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "a.pptx",
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "a.xlsx",
+            ),
+        ] {
+            assert!(
+                !is_supported_upload_with(mime, name, false),
+                "{name} 关闭时应拒"
+            );
+            assert!(
+                is_supported_upload_with(mime, name, true),
+                "{name} 开启时应收"
+            );
+        }
     }
 
     /// 隐藏文件与含路径分隔符的名字必须在入口拒绝。

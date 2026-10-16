@@ -42,6 +42,7 @@ import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
 /**
  * 附件扩展名白名单 — 与服务端分类白名单对齐。驱动 input accept 与发送前的
  * 图片能力预筛；类型是否受支持始终由服务端权威判定（不匹配回 400 可读文案）。
+ * docx/pptx/xlsx 仅在服务端启用 Docling 时可摄入，关闭时服务端返回 400。
  */
 const IMAGE_FILE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
 const DOC_FILE_EXTS = [
@@ -67,6 +68,9 @@ const DOC_FILE_EXTS = [
   "tsx",
   "go",
   "java",
+  "docx",
+  "pptx",
+  "xlsx",
 ];
 
 /** 取文件名小写扩展名；无扩展名返回空串。 */

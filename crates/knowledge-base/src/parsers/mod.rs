@@ -10,6 +10,8 @@
 //! 根据文件扩展名自动选择合适的解析器。
 
 pub mod code;
+#[cfg(feature = "docling")]
+pub mod docling;
 pub mod docx;
 pub mod html;
 pub mod markdown;
@@ -90,6 +92,8 @@ pub enum DocumentFormat {
     Markdown,
     Html,
     Docx,
+    Pptx,
+    Xlsx,
     Txt,
     Code { language: Option<&'static str> },
     Unknown,
@@ -108,6 +112,8 @@ impl DocumentFormat {
             Some("md" | "mdx" | "markdown") => DocumentFormat::Markdown,
             Some("html" | "htm") => DocumentFormat::Html,
             Some("docx") => DocumentFormat::Docx,
+            Some("pptx") => DocumentFormat::Pptx,
+            Some("xlsx") => DocumentFormat::Xlsx,
             Some("txt" | "text" | "log") => DocumentFormat::Txt,
             Some("rs") => DocumentFormat::Code {
                 language: Some("rust"),
@@ -150,6 +156,8 @@ impl DocumentFormat {
             DocumentFormat::Markdown => "md",
             DocumentFormat::Html => "html",
             DocumentFormat::Docx => "docx",
+            DocumentFormat::Pptx => "pptx",
+            DocumentFormat::Xlsx => "xlsx",
             DocumentFormat::Txt => "txt",
             DocumentFormat::Code { language } => language.unwrap_or("code"),
             DocumentFormat::Unknown => "unknown",
@@ -208,6 +216,51 @@ pub fn extract_title_from_path(path: &Path, fallback: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Docling 格式覆盖
+// ---------------------------------------------------------------------------
+
+/// 仅 Docling 能解析的扩展名（原生解析器不支持）。
+///
+/// 这些格式只有在 Docling 启用时才进入「可摄入集合」，否则维持现状拒绝 ——
+/// 上传被接受 ⟺ 会被摄入。
+pub const DOCLING_ONLY_EXTENSIONS: &[&str] = &["docx", "pptx", "xlsx"];
+
+/// 扩展名（不带点，大小写不敏感）是否属于 Docling 专属格式。
+pub fn is_docling_only_ext(ext: &str) -> bool {
+    DOCLING_ONLY_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+}
+
+/// Docling 是否启用（转发 [`docling::docling_enabled`]；未编译该 feature 时恒 `false`）。
+#[cfg(feature = "docling")]
+pub fn docling_enabled() -> bool {
+    docling::docling_enabled()
+}
+
+#[cfg(not(feature = "docling"))]
+pub fn docling_enabled() -> bool {
+    false
+}
+
+/// 格式对应的上传/表单 Content-Type。
+#[cfg(feature = "docling")]
+pub(crate) fn content_type_for(format: DocumentFormat) -> &'static str {
+    match format {
+        DocumentFormat::Pdf => "application/pdf",
+        DocumentFormat::Markdown => "text/markdown",
+        DocumentFormat::Html => "text/html",
+        DocumentFormat::Txt => "text/plain",
+        DocumentFormat::Docx => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
+        DocumentFormat::Pptx => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
+        DocumentFormat::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        DocumentFormat::Code { .. } | DocumentFormat::Unknown => "application/octet-stream",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 工厂函数
 // ---------------------------------------------------------------------------
 
@@ -225,7 +278,43 @@ pub fn extract_title_from_path(path: &Path, fallback: &str) -> String {
 /// # }
 /// ```
 pub fn make_parser(path: &Path) -> Result<Box<dyn DocumentParser>, KnowledgeError> {
+    make_parser_with_env(path)
+}
+
+#[cfg(feature = "docling")]
+fn make_parser_with_env(path: &Path) -> Result<Box<dyn DocumentParser>, KnowledgeError> {
+    make_parser_with_docling(path, docling::DoclingConfig::from_env().as_ref())
+}
+
+#[cfg(not(feature = "docling"))]
+fn make_parser_with_env(path: &Path) -> Result<Box<dyn DocumentParser>, KnowledgeError> {
+    make_parser_for_format(DocumentFormat::from_path(path), path)
+}
+
+/// 按格式选择解析器，可选地叠加 Docling 后端。
+///
+/// `cfg` 为 `Some` 且该格式被 Docling 支持时返回 [`docling::DoclingParser`]
+/// （回退到同格式原生解析器）；否则走原生解析器。
+#[cfg(feature = "docling")]
+pub fn make_parser_with_docling(
+    path: &Path,
+    cfg: Option<&docling::DoclingConfig>,
+) -> Result<Box<dyn DocumentParser>, KnowledgeError> {
     let format = DocumentFormat::from_path(path);
+    if let Some(cfg) = cfg.filter(|_| docling::supports_format(format)) {
+        match docling::build_client(cfg) {
+            Ok(client) => {
+                // 原生解析器仅作兜底：pptx/xlsx 无原生实现，缺失时靠 Docling 本体
+                let fallback = make_parser_for_format(format, path).ok();
+                return Ok(Box::new(docling::DoclingParser::new(
+                    cfg.clone(),
+                    client,
+                    fallback,
+                )));
+            }
+            Err(e) => tracing::warn!(error = %e, "Docling client init failed; using native parser"),
+        }
+    }
     make_parser_for_format(format, path)
 }
 
@@ -253,6 +342,11 @@ pub fn make_parser_for_format(
             // DOCX 解析器目前返回友好的错误提示，完整实现将在后续版本提供
             Ok(Box::new(crate::parsers::docx::DocxParser::new()))
         }
+        // 无原生解析器；按文本读会产出乱码，故显式报错（Docling 开启时才会走到这里）
+        DocumentFormat::Pptx | DocumentFormat::Xlsx => Err(KnowledgeError::InvalidInput(
+            "PPTX/XLSX requires the Docling backend (PECO_KB_DOCLING_URL configured and reachable)"
+                .into(),
+        )),
         DocumentFormat::Code { .. } => {
             // 代码/结构化文本原样保留（缩进、空行有语义，不经 clean_text 清洗）。
             Ok(Box::new(crate::parsers::code::CodeFileParser::new()))
@@ -313,6 +407,40 @@ mod tests {
                 language: Some("rust")
             }
         );
+    }
+
+    #[test]
+    fn detect_docling_only_formats() {
+        assert_eq!(
+            DocumentFormat::from_path(Path::new("deck.pptx")),
+            DocumentFormat::Pptx
+        );
+        assert_eq!(
+            DocumentFormat::from_path(Path::new("book.xlsx")),
+            DocumentFormat::Xlsx
+        );
+    }
+
+    #[test]
+    fn docling_only_ext_matches_case_insensitively() {
+        for ext in ["docx", "DOCX", "Pptx", "xlsx"] {
+            assert!(is_docling_only_ext(ext), "{ext}");
+        }
+        for ext in ["pdf", "md", "txt", ""] {
+            assert!(!is_docling_only_ext(ext), "{ext}");
+        }
+        assert_eq!(DOCLING_ONLY_EXTENSIONS, &["docx", "pptx", "xlsx"]);
+    }
+
+    /// Pptx/Xlsx 不得有原生兜底解析器 —— 二进制被当文本读会产出乱码。
+    #[test]
+    fn pptx_xlsx_have_no_native_parser() {
+        for f in [DocumentFormat::Pptx, DocumentFormat::Xlsx] {
+            assert!(
+                make_parser_for_format(f, Path::new("x")).is_err(),
+                "{f:?} 不应有原生解析器"
+            );
+        }
     }
 
     #[test]
@@ -377,5 +505,61 @@ mod tests {
     fn extract_title_from_filename() {
         let title = extract_title_from_path(Path::new("/docs/rust_guide.pdf"), "untitled");
         assert_eq!(title, "rust_guide");
+    }
+
+    #[cfg(feature = "docling")]
+    #[test]
+    fn docling_routing_prefers_docling_for_supported_formats() {
+        use crate::parsers::docling::DoclingConfig;
+
+        let cfg = DoclingConfig {
+            base_url: "http://localhost:1".into(),
+            api_key: None,
+            do_ocr: true,
+            table_mode: "fast".into(),
+            timeout_secs: 5,
+        };
+
+        // PDF 命中 Docling 路由（DoclingParser 覆盖多格式）
+        let docling = make_parser_with_docling(Path::new("a.pdf"), Some(&cfg)).unwrap();
+        assert!(docling.supported_formats().len() > 1);
+
+        // 无配置 → 原生 PDF 解析器
+        let native = make_parser_with_docling(Path::new("a.pdf"), None).unwrap();
+        assert_eq!(native.supported_formats(), vec![DocumentFormat::Pdf]);
+
+        // Markdown 不在 Docling 支持集合 → 原生
+        let md = make_parser_with_docling(Path::new("a.md"), Some(&cfg)).unwrap();
+        assert_eq!(md.supported_formats(), vec![DocumentFormat::Markdown]);
+
+        // pptx/xlsx 无原生解析器：Docling 可用时仍须路由成功，不得被兜底失败短路
+        let pptx = make_parser_with_docling(Path::new("a.pptx"), Some(&cfg)).unwrap();
+        assert!(pptx.supported_formats().contains(&DocumentFormat::Pptx));
+        let xlsx = make_parser_with_docling(Path::new("a.xlsx"), Some(&cfg)).unwrap();
+        assert!(xlsx.supported_formats().contains(&DocumentFormat::Xlsx));
+    }
+
+    /// Docling 转换失败且无原生兜底时，必须报错而非 panic 或吞掉。
+    #[cfg(feature = "docling")]
+    #[tokio::test]
+    async fn docling_failure_without_fallback_is_an_error() {
+        use crate::parsers::docling::{DoclingConfig, DoclingParser, build_client};
+
+        let cfg = DoclingConfig {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: None,
+            do_ocr: false,
+            table_mode: "fast".into(),
+            timeout_secs: 2,
+        };
+        let client = build_client(&cfg).unwrap();
+        let parser = DoclingParser::new(cfg, client, None);
+        match parser.parse_bytes(b"PK\x03\x04", "a.pptx").await {
+            Ok(_) => panic!("无兜底且 Docling 不可达时必须报错"),
+            Err(e) => assert!(
+                matches!(e, KnowledgeError::InvalidInput(_)),
+                "错误类型应为 InvalidInput：{e:?}"
+            ),
+        }
     }
 }

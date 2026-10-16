@@ -53,7 +53,7 @@ pub struct UploadedFile {
 /// 允许上传的图片扩展名（与 `ALLOWED_MIME_TYPES` 对应）。
 pub const IMAGE_EXT_WHITELIST: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
-/// 允许上传的文档扩展名（docx 解析器未就绪，显式排除）。
+/// 允许上传的文档扩展名（原生解析器）。Docling 专属格式另经 [`is_document_ext`] 放行。
 pub const DOC_EXT_WHITELIST: &[&str] = &[
     "pdf", "md", "markdown", "txt", "text", "log", "html", "htm", "csv", "json", "yaml", "yml",
     "toml", "xml", "rs", "py", "js", "jsx", "ts", "tsx", "go", "java",
@@ -71,8 +71,21 @@ pub const MAX_FILES_PER_TURN: usize = 8;
 /// 文档提取正文的 token 预算。
 pub const DOC_TEXT_MAX_TOKENS: usize = 8192;
 
-/// 单个文档解析超时。
-pub const PARSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 原生解析的文档超时。
+const NATIVE_PARSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Docling 解析的文档超时 —— CPU 上 7 页中文 PDF 需 8~16s，10s 会误杀。
+/// 这是外层硬上限，独立于客户端 `PECO_KB_DOCLING_TIMEOUT_SECS`。
+const DOCLING_PARSE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 单个文档解析超时：Docling 启用时放宽，否则沿用原生上限。
+fn parse_timeout() -> Duration {
+    if knowledge_base::parsers::docling_enabled() {
+        DOCLING_PARSE_TIMEOUT
+    } else {
+        NATIVE_PARSE_TIMEOUT
+    }
+}
 
 /// 解析失败/空正文的统一用户文案（服务端细节只进日志，不进响应）。
 const PARSE_FAILED_MSG: &str = "未能从该文档提取文本（可能是扫描件），请改用文本型 PDF 或纯文本";
@@ -124,12 +137,8 @@ pub async fn store_uploaded_file(
 
     if IMAGE_EXT_WHITELIST.contains(&ext.as_str()) {
         store_image(state, user_id, &ext, content_type.as_deref(), &data).await
-    } else if DOC_EXT_WHITELIST.contains(&ext.as_str()) {
+    } else if is_document_ext(&ext) {
         store_document(state, user_id, &name, &ext, &data).await
-    } else if ext == "docx" {
-        Err(ApiError::BadRequest(
-            "暂不支持 docx，请转 PDF/Markdown/纯文本后重试".into(),
-        ))
     } else {
         Err(ApiError::BadRequest(format!(
             "不支持的文件类型：{ext}。支持：{}",
@@ -143,6 +152,17 @@ pub async fn store_uploaded_file(
         size: data.len(),
         url,
     })
+}
+
+/// 该扩展名是否可按文档落盘/解析：原生白名单命中，或 Docling 启用时的 Docling 专属格式。
+fn is_document_ext(ext: &str) -> bool {
+    is_document_ext_with(ext, knowledge_base::parsers::docling_enabled())
+}
+
+/// 同 [`is_document_ext`]，但显式指定 Docling 开关以便脱离环境单测。
+fn is_document_ext_with(ext: &str, docling: bool) -> bool {
+    DOC_EXT_WHITELIST.contains(&ext)
+        || (docling && knowledge_base::parsers::is_docling_only_ext(ext))
 }
 
 /// 支持的扩展名列表（错误文案用）。
@@ -255,7 +275,7 @@ pub async fn resolve_file_parts(
         let ext = extension_of(id).unwrap_or_default();
         if IMAGE_EXT_WHITELIST.contains(&ext.as_str()) {
             parts.push(resolve_image(state, user_id, id).await?);
-        } else if DOC_EXT_WHITELIST.contains(&ext.as_str()) {
+        } else if is_document_ext(&ext) {
             parts.push(resolve_document(state, user_id, id).await?);
         } else {
             return Err(ApiError::BadRequest(format!(
@@ -303,7 +323,7 @@ async fn resolve_document(
     }
     let name = original_name(&dir, id).await;
 
-    let parsed = timeout(PARSE_TIMEOUT, async {
+    let parsed = timeout(parse_timeout(), async {
         let parser =
             knowledge_base::parsers::make_parser(&path).map_err(|e| (0u8, e.to_string()))?;
         let doc = parser
@@ -463,18 +483,20 @@ mod tests {
         }
     }
 
-    /// docx → 400（提示转格式）；未知扩展名 → 400；无扩展名 → 400；空文件 → 400。
+    /// docx 准入随 Docling 开关；未知扩展名 / 无扩展名 / 空文件恒 → 400。
     #[tokio::test]
-    async fn upload_rejects_docx_unknown_missing_ext_and_empty() {
+    async fn upload_gate_follows_docling_switch() {
         let (state, _dir) = test_state().await;
 
-        let err = upload(&state, "report.docx", b"PK..").await.unwrap_err();
-        match err {
-            ApiError::BadRequest(m) => {
-                assert!(m.contains("docx"), "{m}");
-                assert!(m.contains("PDF"), "{m}");
-            }
-            other => panic!("docx 应 400：{other:?}"),
+        let docx = upload(&state, "report.docx", b"PK..").await;
+        if knowledge_base::parsers::docling_enabled() {
+            assert!(docx.is_ok(), "Docling 开启时 docx 应被接受：{docx:?}");
+        } else {
+            let err = docx.unwrap_err();
+            assert!(
+                matches!(err, ApiError::BadRequest(ref m) if m.contains("不支持的文件类型") && m.contains("docx")),
+                "{err:?}"
+            );
         }
 
         let err = upload(&state, "tool.exe", b"MZ").await.unwrap_err();
@@ -668,13 +690,28 @@ mod tests {
         for ext in DOC_EXT_WHITELIST {
             assert!(DOC_EXT_WHITELIST.contains(ext), "{ext}");
         }
-        // docx 解析器未就绪：必须落在两个白名单之外
-        assert!(!DOC_EXT_WHITELIST.contains(&"docx"));
-        assert!(!IMAGE_EXT_WHITELIST.contains(&"docx"));
+        // Docling 专属格式由 `is_document_ext` 分支放行，不在两个白名单常量内
+        for ext in ["docx", "pptx", "xlsx"] {
+            assert!(!DOC_EXT_WHITELIST.contains(&ext), "{ext}");
+            assert!(!IMAGE_EXT_WHITELIST.contains(&ext), "{ext}");
+        }
         // exe / csv 分类：csv 是文档，exe 两者皆非
         assert!(DOC_EXT_WHITELIST.contains(&"csv"));
         assert!(!DOC_EXT_WHITELIST.contains(&"exe"));
         assert!(!IMAGE_EXT_WHITELIST.contains(&"exe"));
+    }
+
+    /// 文档准入口径随 Docling 开关变化 —— 显式传参，不读进程环境变量。
+    #[test]
+    fn document_ext_gate_tracks_docling_switch() {
+        for ext in ["pdf", "md", "csv", "yaml"] {
+            assert!(is_document_ext_with(ext, false), "{ext}");
+        }
+        for ext in ["docx", "pptx", "xlsx"] {
+            assert!(!is_document_ext_with(ext, false), "{ext}");
+            assert!(is_document_ext_with(ext, true), "{ext}");
+        }
+        assert!(!is_document_ext_with("exe", true));
     }
 
     #[test]

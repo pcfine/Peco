@@ -129,7 +129,7 @@ export function KnowledgeDetailPage() {
           type="file"
           className="hidden"
           onChange={(e) => handleUpload(e.target.files)}
-          accept=".pdf,.html,.md,.txt,.py,.rs,.go,.js,.ts"
+          accept=".pdf,.html,.md,.txt,.py,.rs,.go,.js,.ts,.docx,.pptx,.xlsx"
         />
         <Button onClick={() => fileRef.current?.click()} disabled={uploading}>
           <Upload className="mr-2 h-4 w-4" />

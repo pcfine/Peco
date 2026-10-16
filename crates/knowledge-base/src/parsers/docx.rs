@@ -1,8 +1,6 @@
-//! DOCX 解析器 — 提取 Office Open XML 文档文本。
+//! DOCX 解析器 — 无实际解析能力，仅为 Docling 不可用时的回退。
 //!
-//! 注意：当前为简单回退实现，将 DOCX 作为 ZIP 读取并提取
-//! `word/document.xml` 中的文本。如需完整支持（表格、样式保留），
-//! 建议未来引入 `docx-rs` 等专用库。
+//! DOCX 由 Docling 后端解析（见 [`crate::parsers::docling`]）。
 
 use std::path::Path;
 
@@ -30,10 +28,10 @@ impl DocumentParser for DocxParser {
     }
 
     async fn parse_file(&self, _path: &Path) -> Result<ParsedDocument, KnowledgeError> {
-        // 当前作为纯文本回退处理（DOCX 二进制格式无法直接当 UTF-8 读取）
-        // 完整的 DOCX 解析器将在后续版本中通过 docx-rs 实现
+        // 无原生解析器：DOCX 是 ZIP 二进制，当文本读会产出乱码。
+        // 由 Docling 后端解析（见 parsers::docling），此处仅为其不可用时的回退。
         Err(KnowledgeError::InvalidInput(
-            "DOCX parsing engine is not ready yet. Convert the document to PDF or Markdown and retry."
+            "DOCX requires the Docling backend (PECO_KB_DOCLING_URL configured and reachable)"
                 .into(),
         ))
     }

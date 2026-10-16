@@ -101,8 +101,8 @@ pub async fn compute_file_hash(path: &Path) -> Result<(String, u64), KnowledgeMo
     Ok((hex::encode(hasher.finalize()), total_size))
 }
 
-/// 可摄入的扩展名 —— 摄入扫描与上传准入共用的唯一真相源。
-/// `docx` 解析器未实现（Phase 2），故不在其内。
+/// 原生解析器可摄入的扩展名 —— 摄入扫描与上传准入共用的唯一真相源。
+/// Docling 专属格式（docx/pptx/xlsx）不在此内，由 [`is_supported_extension_with`] 叠加。
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pdf", "md", "markdown", "html", "htm", "txt", "rs", "py", "js", "ts", "go", "java", "c",
     "cpp", "h", "hpp", "toml", "yaml", "yml", "json", "xml", "csv", "sql", "r", "rb", "swift",
@@ -111,8 +111,17 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
 
 /// 文件路径的扩展名是否可被摄入（大小写不敏感）。
 pub fn is_supported_extension(path: &Path) -> bool {
+    is_supported_extension_with(path, knowledge_base::parsers::docling_enabled())
+}
+
+/// 同 [`is_supported_extension`]，但显式指定 Docling 是否启用以便脱离环境单测。
+///
+/// Docling 启用时叠加其专属格式（docx/pptx/xlsx），否则仅原生集合。
+pub fn is_supported_extension_with(path: &Path, docling: bool) -> bool {
     path.extension().is_some_and(|ext| {
-        SUPPORTED_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str())
+        let ext = ext.to_string_lossy().to_lowercase();
+        SUPPORTED_EXTENSIONS.contains(&ext.as_str())
+            || (docling && knowledge_base::parsers::is_docling_only_ext(&ext))
     })
 }
 
@@ -239,23 +248,51 @@ mod tests {
         assert!(!names.contains(&".hidden.md"));
     }
 
+    /// 原生集合与 Docling 开关的组合口径 —— 显式传参，不读进程环境变量。
     #[test]
     fn is_supported_extension_follows_scan_set() {
-        assert!(is_supported_extension(Path::new("nested/A.PDF")));
-        assert!(!is_supported_extension(Path::new("a.docx")));
-        assert!(!is_supported_extension(Path::new("logs/a.log")));
-        assert!(!is_supported_extension(Path::new("README")));
+        assert!(is_supported_extension_with(
+            Path::new("nested/A.PDF"),
+            false
+        ));
+        assert!(!is_supported_extension_with(Path::new("a.docx"), false));
+        assert!(!is_supported_extension_with(Path::new("logs/a.log"), false));
+        assert!(!is_supported_extension_with(Path::new("README"), false));
     }
 
+    /// Docling 专属格式仅在开关打开时进入可摄入集合；其余格式不受开关影响。
+    #[test]
+    fn docling_only_extensions_join_scan_set_when_enabled() {
+        for name in ["spec.docx", "deck.pptx", "book.xlsx"] {
+            assert!(
+                !is_supported_extension_with(Path::new(name), false),
+                "{name}"
+            );
+            assert!(is_supported_extension_with(Path::new(name), true), "{name}");
+        }
+        assert!(is_supported_extension_with(Path::new("a.pdf"), true));
+        assert!(!is_supported_extension_with(Path::new("tool.exe"), true));
+    }
+
+    /// 扫描层遵循 Docling 开关（开关取自进程环境）：关闭不收 .docx，开启才收。
     #[tokio::test]
-    async fn scan_supported_files_excludes_docx() {
+    async fn scan_supported_files_follows_docling_switch() {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("spec.docx"), b"fake docx")
+        tokio::fs::write(tmp.path().join("spec.docx"), b"fake")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("note.md"), b"# hi")
             .await
             .unwrap();
 
         let files = scan_supported_files(tmp.path(), false).await.unwrap();
-        assert!(files.is_empty(), ".docx 解析器未实现，不应被扫描收集");
+        let expected = if knowledge_base::parsers::docling_enabled() {
+            2
+        } else {
+            1
+        };
+        assert_eq!(files.len(), expected, "{files:?}");
+        assert!(files.iter().any(|p| p.ends_with("note.md")), "{files:?}");
     }
 
     #[tokio::test]

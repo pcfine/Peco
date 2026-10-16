@@ -9,11 +9,12 @@ name = "knowledge_base"
 path = "src/lib.rs"
 
 [features]
-default = ["fastembed-embedding", "pdf", "lancedb"]
+default = ["fastembed-embedding", "pdf", "lancedb", "docling"]
 fastembed-embedding = ["dep:fastembed", "dep:hf-hub"]
 pdf = ["dep:pdf-extract"]
 lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema"]
 helixdb = ["dep:reqwest"]
+docling = ["dep:reqwest"]
 # docx = ["dep:docx-rs"]   # Phase 2
 
 [dependencies]
@@ -26,7 +27,7 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = "2"
 chrono = { workspace = true }
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["multipart"] }
 
 # 嵌入引擎（可选）
 fastembed = { workspace = true, optional = true }

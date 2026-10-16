@@ -99,6 +99,7 @@ pub enum ChunkingStrategySerde {
     OverlappingWindow { size: usize, overlap: usize },
     FixedSize { size: usize },
     SentenceBased { max_chars: usize },
+    MarkdownHeading { max_chars: usize },
 }
 
 impl Default for ChunkingStrategySerde {
@@ -119,6 +120,9 @@ impl From<ChunkingStrategySerde> for ChunkingStrategy {
             ChunkingStrategySerde::FixedSize { size } => ChunkingStrategy::FixedSize { size },
             ChunkingStrategySerde::SentenceBased { max_chars } => {
                 ChunkingStrategy::SentenceBased { max_chars }
+            }
+            ChunkingStrategySerde::MarkdownHeading { max_chars } => {
+                ChunkingStrategy::MarkdownHeading { max_chars }
             }
         }
     }
@@ -151,6 +155,41 @@ mod tests {
     fn default_chunking_strategy() {
         let s = ChunkingStrategySerde::default();
         assert!(matches!(s, ChunkingStrategySerde::OverlappingWindow { .. }));
+    }
+
+    /// 全部变体的 JSON 形式必须保持稳定（既有文件向后兼容），新增变体不得改动旧形式。
+    #[test]
+    fn chunking_serde_covers_all_variants() {
+        let cases = [
+            (
+                r#"{"type":"overlapping-window","size":500,"overlap":100}"#,
+                ChunkingStrategy::OverlappingWindow {
+                    size: 500,
+                    overlap: 100,
+                },
+            ),
+            (
+                r#"{"type":"fixed-size","size":256}"#,
+                ChunkingStrategy::FixedSize { size: 256 },
+            ),
+            (
+                r#"{"type":"sentence-based","max_chars":128}"#,
+                ChunkingStrategy::SentenceBased { max_chars: 128 },
+            ),
+            (
+                r#"{"type":"markdown-heading","max_chars":800}"#,
+                ChunkingStrategy::MarkdownHeading { max_chars: 800 },
+            ),
+        ];
+        for (json, expected) in cases {
+            let cs: ChunkingStrategySerde = serde_json::from_str(json).unwrap();
+            assert_eq!(ChunkingStrategy::from(cs), expected, "{json}");
+        }
+
+        let json =
+            serde_json::to_string(&ChunkingStrategySerde::MarkdownHeading { max_chars: 800 })
+                .unwrap();
+        assert_eq!(json, r#"{"type":"markdown-heading","max_chars":800}"#);
     }
 
     #[test]
