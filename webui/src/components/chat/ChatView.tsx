@@ -35,6 +35,7 @@ import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { TokenUsageRing } from "@/components/chat/TokenUsageRing";
+import { BrandMark } from "@/components/common/BrandMark";
 import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -146,6 +147,8 @@ export interface ChatViewProps {
   headerTitle?: React.ReactNode;
   /** 消息列表为空时显示的欢迎内容 */
   welcomeMessage?: React.ReactNode;
+  /** 空态建议问题，点击即发送。 */
+  suggestions?: string[];
   /** 提交反馈回调 */
   onFeedback?: (messageId: string, rating: "up" | "down") => Promise<void>;
   /** 当前是否为可见对话。false 时隐藏 DOM 但保持挂载和 SSE */
@@ -207,6 +210,7 @@ export function ChatView({
   headerActions,
   headerTitle = "对话",
   welcomeMessage,
+  suggestions,
   visible = true,
   initialQuery,
   onUnread,
@@ -444,6 +448,17 @@ export function ChatView({
   }, [sendMessage]);
 
   // ── initialQuery auto-send ──────────────────────────────────────────────
+
+  const submitText = useCallback(
+    (text: string) => {
+      if (onExternalSendRef.current) {
+        onExternalSendRef.current(text, []);
+      } else {
+        sendMessage(text);
+      }
+    },
+    [sendMessage],
+  );
 
   const hasSentInitialRef = useRef(false);
   useEffect(() => {
@@ -711,9 +726,11 @@ export function ChatView({
           </div>
         )}
         {displayMessages.length === 0 && welcomeMessage && (
-          <div className="text-center text-muted-foreground mt-20">
-            {welcomeMessage}
-          </div>
+          <WelcomeHero
+            message={welcomeMessage}
+            suggestions={suggestions}
+            onSuggestion={submitText}
+          />
         )}
         {displayMessages.map((msg, i) => (
           <ChatBubble key={msg.id ?? i} message={msg} />
@@ -722,8 +739,8 @@ export function ChatView({
       </div>
 
       {/* Input */}
-      <div className="pt-4 mt-4 border-t border-muted-foreground/15">
-        <div className="flex flex-col rounded-xl border bg-background focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/50">
+      <div className="pt-4 mt-4 border-t border-border">
+        <div className="flex flex-col rounded-2xl border bg-card shadow-xs focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
           <Textarea
             className="min-h-10 max-h-40 resize-none border-0 px-3 pt-2.5 pb-0 shadow-none focus-visible:ring-0"
             placeholder={isInputDisabled ? "加载中…" : "输入消息..."}
@@ -900,6 +917,37 @@ export function ChatView({
 
 // ── ChatBubble ─────────────────────────────────────────────────────────────
 
+function WelcomeHero({
+  message,
+  suggestions,
+  onSuggestion,
+}: {
+  message: React.ReactNode;
+  suggestions?: string[];
+  onSuggestion: (text: string) => void;
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-6 py-16 text-center">
+      <BrandMark size={56} className="rounded-2xl" />
+      <div className="max-w-md space-y-1.5 text-muted-foreground">{message}</div>
+      {suggestions && suggestions.length > 0 && (
+        <div className="flex max-w-lg flex-wrap justify-center gap-2">
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => onSuggestion(s)}
+              className="rounded-full border bg-card px-3.5 py-1.5 text-xs text-muted-foreground shadow-xs transition-colors hover:border-ring/40 hover:bg-accent hover:text-accent-foreground"
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.isNotice) {
     return (
@@ -926,7 +974,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
-        <div className="bg-primary text-primary-foreground rounded-lg px-4 py-2 max-w-[80%] text-sm">
+        <div className="bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2 max-w-[80%] text-sm">
           {message.images && message.images.length > 0 && (
             <div className="mb-2 flex flex-wrap justify-end gap-2">
               {message.images.map((url, i) => (
@@ -961,7 +1009,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.role === "agent-call") {
     return (
       <div className="flex gap-2 items-start">
-        <div className="bg-accent rounded-lg px-4 py-2 text-sm border border-accent-foreground/10 max-w-[80%]">
+        <div className="bg-accent rounded-2xl rounded-bl-md px-4 py-2 text-sm border border-accent-foreground/10 max-w-[80%]">
           <p className="font-medium text-xs text-muted-foreground">
             🤖 子 Agent: {message.agentName}
           </p>
@@ -977,7 +1025,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.role === "tool") {
     return (
       <div className="flex gap-2 items-start">
-        <div className="bg-muted/50 rounded-lg px-3 py-1.5 text-xs text-muted-foreground max-w-[85%] font-mono whitespace-pre-wrap break-all">
+        <div className="bg-muted/50 rounded-xl px-3 py-1.5 text-xs text-muted-foreground max-w-[85%] font-mono whitespace-pre-wrap break-all">
           {message.content}
         </div>
       </div>
@@ -990,8 +1038,8 @@ function ChatBubble({ message }: { message: ChatMessage }) {
       <div
         className={
           message.isError
-            ? "bg-destructive/10 border border-destructive/30 text-destructive rounded-lg px-4 py-2 text-sm max-w-[80%]"
-            : "bg-muted rounded-lg px-4 py-2 text-sm max-w-[80%]"
+            ? "bg-destructive/10 border border-destructive/30 text-destructive rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
+            : "bg-muted rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
         }
       >
         {message.reasoning && (

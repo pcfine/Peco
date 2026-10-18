@@ -1,10 +1,39 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Peco —— 全栈 AI Agent 平台：永续对话、长期记忆、Agent / Skill / 知识库 / 工作流。"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="theme-color"
+      content="#ffffff"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#252525"
+      media="(prefers-color-scheme: dark)"
+    />
     <title>peco</title>
+    <!-- 首帧前套用持久化主题，避免闪烁；key 与 themeStore 一致。 -->
+    <script>
+      (function () {
+        try {
+          var raw = JSON.parse(localStorage.getItem("peco-theme") || "{}");
+          var t = (raw.state && raw.state.theme) || "system";
+          var dark =
+            t === "dark" ||
+            (t === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

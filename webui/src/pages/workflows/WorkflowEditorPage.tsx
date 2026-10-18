@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
+import { PageHeader } from "@/components/common/PageHeader";
 import { YamlEditor } from "@/components/workflow/YamlEditor";
 import { DagPreview } from "@/components/workflow/DagPreview";
 import { StepConfigForm } from "@/components/workflow/StepConfigForm";
@@ -162,8 +163,9 @@ export function WorkflowEditorPage() {
   return (
     <div className="max-w-7xl mx-auto space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
+      <PageHeader
+        title={isEdit ? `编辑 ${name}` : "新建工作流"}
+        leading={
           <Button
             variant="ghost"
             size="icon"
@@ -171,43 +173,42 @@ export function WorkflowEditorPage() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <h2 className="text-xl font-bold">
-            {isEdit ? `编辑 ${name}` : "新建工作流"}
-          </h2>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center border rounded-md p-0.5 mr-2">
-            <button
-              type="button"
-              className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${
-                mode === "form"
-                  ? "bg-primary text-primary-foreground"
-                  : "hover:bg-muted"
-              }`}
-              onClick={() => setMode("form")}
-            >
-              <FormInput className="h-3.5 w-3.5 inline mr-1" />
-              表单
-            </button>
-            <button
-              type="button"
-              className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${
-                mode === "yaml"
-                  ? "bg-primary text-primary-foreground"
-                  : "hover:bg-muted"
-              }`}
-              onClick={() => setMode("yaml")}
-            >
-              <Code2 className="h-3.5 w-3.5 inline mr-1" />
-              YAML
-            </button>
-          </div>
-          <Button onClick={handleSave} disabled={saving}>
-            <Save className="mr-2 h-4 w-4" />
-            {saving ? "保存中..." : "保存"}
-          </Button>
-        </div>
-      </div>
+        }
+        actions={
+          <>
+            <div className="flex items-center border rounded-md p-0.5 mr-2">
+              <button
+                type="button"
+                className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${
+                  mode === "form"
+                    ? "bg-primary text-primary-foreground"
+                    : "hover:bg-muted"
+                }`}
+                onClick={() => setMode("form")}
+              >
+                <FormInput className="h-3.5 w-3.5 inline mr-1" />
+                表单
+              </button>
+              <button
+                type="button"
+                className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${
+                  mode === "yaml"
+                    ? "bg-primary text-primary-foreground"
+                    : "hover:bg-muted"
+                }`}
+                onClick={() => setMode("yaml")}
+              >
+                <Code2 className="h-3.5 w-3.5 inline mr-1" />
+                YAML
+              </button>
+            </div>
+            <Button onClick={handleSave} disabled={saving}>
+              <Save className="mr-2 h-4 w-4" />
+              {saving ? "保存中..." : "保存"}
+            </Button>
+          </>
+        }
+      />
 
       {/* Editor + Preview */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
 import {
   listKnowledgeBases,
   createKnowledgeBase,
@@ -91,56 +92,58 @@ export function KnowledgeListPage() {
 
   return (
     <div className="max-w-4xl mx-auto space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">知识库</h2>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="mr-2 h-4 w-4" />
-              创建知识库
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>新建知识库</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <Label>名称</Label>
-                <Input
-                  value={form.name}
-                  placeholder="例如 my-kb-01"
-                  aria-invalid={!!nameError}
-                  onChange={(e) => setForm({ ...form, name: e.target.value })}
-                />
-                <p className="text-xs text-muted-foreground">
-                  以字母或数字开头，仅可包含字母、数字、.、_、-，最多 64
-                  个字符（不能以 @ 开头）
-                </p>
-                {nameError && (
-                  <p className="text-sm text-destructive">{nameError}</p>
-                )}
-              </div>
-              <div className="space-y-2">
-                <Label>描述</Label>
-                <Textarea
-                  value={form.description}
-                  onChange={(e) =>
-                    setForm({ ...form, description: e.target.value })
-                  }
-                />
-              </div>
-              <Button
-                onClick={handleCreate}
-                disabled={!nameValid}
-                className="w-full"
-              >
-                创建
+      <PageHeader
+        title="知识库"
+        actions={
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="mr-2 h-4 w-4" />
+                创建知识库
               </Button>
-            </div>
-          </DialogContent>
-        </Dialog>
-      </div>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>新建知识库</DialogTitle>
+              </DialogHeader>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label>名称</Label>
+                  <Input
+                    value={form.name}
+                    placeholder="例如 my-kb-01"
+                    aria-invalid={!!nameError}
+                    onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    以字母或数字开头，仅可包含字母、数字、.、_、-，最多 64
+                    个字符（不能以 @ 开头）
+                  </p>
+                  {nameError && (
+                    <p className="text-sm text-destructive">{nameError}</p>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label>描述</Label>
+                  <Textarea
+                    value={form.description}
+                    onChange={(e) =>
+                      setForm({ ...form, description: e.target.value })
+                    }
+                  />
+                </div>
+                <Button
+                  onClick={handleCreate}
+                  disabled={!nameValid}
+                  className="w-full"
+                >
+                  创建
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
+        }
+      />
 
       {kbs.length === 0 ? (
         <EmptyState icon={BookOpen} title="暂无知识库" />

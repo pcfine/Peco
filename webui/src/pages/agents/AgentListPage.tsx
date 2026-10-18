@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
 import { listAgents, deleteAgent } from "@/api/agents";
 import type { AgentListItem } from "@/types/agent";
 import {
@@ -81,15 +82,17 @@ export function AgentListPage() {
 
   return (
     <div className="max-w-4xl mx-auto space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">Agent 管理</h2>
-        <Link to="/workspace/agents/new">
-          <Button>
-            <Plus className="mr-2 h-4 w-4" />
-            创建 Agent
-          </Button>
-        </Link>
-      </div>
+      <PageHeader
+        title="Agent 管理"
+        actions={
+          <Link to="/workspace/agents/new">
+            <Button>
+              <Plus className="mr-2 h-4 w-4" />
+              创建 Agent
+            </Button>
+          </Link>
+        }
+      />
 
       {agents.length === 0 ? (
         <EmptyState

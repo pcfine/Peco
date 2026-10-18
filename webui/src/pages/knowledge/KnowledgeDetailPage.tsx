@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { useParams, Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
+import { PageHeader } from "@/components/common/PageHeader";
 import {
   getKnowledgeBase,
   listDocuments,
@@ -105,23 +106,24 @@ export function KnowledgeDetailPage() {
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
-      <div className="flex items-center gap-3">
-        <Link
-          to="/workspace/knowledge"
-          className="text-muted-foreground hover:text-foreground"
-        >
-          <ArrowLeft className="h-5 w-5" />
-        </Link>
-        <h2 className="text-2xl font-bold">{kb.name}</h2>
-        <Button variant="outline" size="sm" onClick={handleSync}>
-          <RefreshCw className="mr-2 h-4 w-4" />
-          同步
-        </Button>
-      </div>
-      <p className="text-muted-foreground">{kb.description || "无描述"}</p>
-      <p className="text-sm text-muted-foreground">
-        {kb.document_count} 文档 · {kb.chunk_count} 分块 · {kb.embedding_model}
-      </p>
+      <PageHeader
+        leading={
+          <Link
+            to="/workspace/knowledge"
+            className="text-muted-foreground hover:text-foreground"
+          >
+            <ArrowLeft className="h-5 w-5" />
+          </Link>
+        }
+        title={kb.name}
+        description={`${kb.description || "无描述"} · ${kb.document_count} 文档 · ${kb.chunk_count} 分块 · ${kb.embedding_model}`}
+        actions={
+          <Button variant="outline" size="sm" onClick={handleSync}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            同步
+          </Button>
+        }
+      />
 
       <div className="flex items-center gap-2">
         <input

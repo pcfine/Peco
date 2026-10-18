@@ -5,75 +5,120 @@
 
 @custom-variant dark (&:is(.dark *));
 
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/geist-latin-wght-normal.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/geist-mono-latin-wght-normal.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
+  /* 画布略深于卡片，用微差底色建立表面层级。 */
+  --background: oklch(0.985 0.002 280);
+  --foreground: oklch(0.2 0.016 280);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.2 0.016 280);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0.042 265.755);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.965 0.001 286.375);
-  --secondary-foreground: oklch(0.205 0.042 265.755);
-  --muted: oklch(0.965 0.001 286.375);
-  --muted-foreground: oklch(0.556 0.019 286.375);
-  --accent: oklch(0.965 0.001 286.375);
-  --accent-foreground: oklch(0.205 0.042 265.755);
+  --popover-foreground: oklch(0.2 0.016 280);
+  /* 浅色下压深，保证白字对比度 ≥4.5:1。 */
+  --primary: oklch(0.51 0.204 277);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.965 0.004 280);
+  --secondary-foreground: oklch(0.29 0.02 280);
+  --muted: oklch(0.967 0.003 280);
+  --muted-foreground: oklch(0.51 0.02 280);
+  --accent: oklch(0.955 0.022 277);
+  --accent-foreground: oklch(0.42 0.16 277);
   --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0.004 286.375);
-  --input: oklch(0.922 0.004 286.375);
-  --ring: oklch(0.87 0.006 286.375);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
+  --destructive-foreground: oklch(0.985 0 0);
+  --success: oklch(0.55 0.15 152);
+  --success-foreground: oklch(0.99 0 0);
+  --warning: oklch(0.68 0.16 68);
+  --warning-foreground: oklch(0.24 0.03 68);
+  --info: oklch(0.58 0.16 240);
+  --info-foreground: oklch(0.99 0 0);
+  --border: oklch(0.9 0.005 280);
+  --input: oklch(0.75 0.008 280);
+  --ring: oklch(0.55 0.19 277);
+  /* 图表/图谱配色：按色相排序，相邻类别可区分。 */
+  --chart-1: oklch(0.55 0.2 277);
+  --chart-2: oklch(0.62 0.13 195);
+  --chart-3: oklch(0.72 0.16 68);
+  --chart-4: oklch(0.62 0.2 12);
+  --chart-5: oklch(0.6 0.15 152);
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0.042 265.755);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.965 0.001 286.375);
-  --sidebar-accent-foreground: oklch(0.205 0.042 265.755);
-  --sidebar-border: oklch(0.922 0.004 286.375);
-  --sidebar-ring: oklch(0.87 0.006 286.375);
+  /* 暗底上低透光更易察觉，过强会把画布染灰。 */
+  --glow-strength: 7%;
+  --brand-gradient: linear-gradient(
+    135deg,
+    oklch(0.6 0.21 290) 0%,
+    oklch(0.55 0.2 265) 52%,
+    oklch(0.63 0.16 232) 100%
+  );
+  --sidebar: oklch(0.975 0.003 280);
+  --sidebar-foreground: oklch(0.24 0.016 280);
+  --sidebar-primary: oklch(0.51 0.204 277);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.945 0.022 277);
+  --sidebar-accent-foreground: oklch(0.42 0.16 277);
+  --sidebar-border: oklch(0.905 0.005 280);
+  --sidebar-ring: oklch(0.55 0.19 277);
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.145 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.145 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.985 0 0);
-  --primary-foreground: oklch(0.205 0.042 265.755);
-  --secondary: oklch(0.269 0.015 286.375);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0.015 286.375);
-  --muted-foreground: oklch(0.708 0.01 286.375);
-  --accent: oklch(0.269 0.015 286.375);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.577 0.245 27.325);
-  --border: oklch(0.269 0.015 286.375);
-  --input: oklch(0.269 0.015 286.375);
-  --ring: oklch(0.439 0.01 286.375);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.205 0.042 265.755);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0.015 286.375);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(0.269 0.015 286.375);
-  --sidebar-ring: oklch(0.439 0.01 286.375);
+  --background: oklch(0.145 0.012 278);
+  --foreground: oklch(0.97 0.004 280);
+  --card: oklch(0.188 0.014 278);
+  --card-foreground: oklch(0.97 0.004 280);
+  --popover: oklch(0.205 0.014 278);
+  --popover-foreground: oklch(0.97 0.004 280);
+  --primary: oklch(0.55 0.19 277);
+  --primary-foreground: oklch(0.99 0 0);
+  --glow-strength: 4%;
+  --secondary: oklch(0.26 0.016 278);
+  --secondary-foreground: oklch(0.97 0.004 280);
+  --muted: oklch(0.26 0.016 278);
+  --muted-foreground: oklch(0.7 0.02 280);
+  --accent: oklch(0.29 0.038 277);
+  --accent-foreground: oklch(0.88 0.06 277);
+  --destructive: oklch(0.65 0.21 25);
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.7 0.16 152);
+  --success-foreground: oklch(0.16 0.02 152);
+  --warning: oklch(0.78 0.15 72);
+  --warning-foreground: oklch(0.2 0.03 72);
+  --info: oklch(0.7 0.15 240);
+  --info-foreground: oklch(0.16 0.02 240);
+  --border: oklch(0.29 0.014 278);
+  --input: oklch(0.40 0.016 278);
+  --ring: oklch(0.62 0.18 277);
+  --chart-1: oklch(0.66 0.19 277);
+  --chart-2: oklch(0.72 0.13 195);
+  --chart-3: oklch(0.78 0.15 72);
+  --chart-4: oklch(0.68 0.2 12);
+  --chart-5: oklch(0.7 0.16 152);
+  --brand-gradient: linear-gradient(
+    135deg,
+    oklch(0.68 0.2 290) 0%,
+    oklch(0.63 0.19 265) 52%,
+    oklch(0.7 0.15 232) 100%
+  );
+  --sidebar: oklch(0.168 0.013 278);
+  --sidebar-foreground: oklch(0.94 0.004 280);
+  --sidebar-primary: oklch(0.62 0.19 277);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.28 0.038 277);
+  --sidebar-accent-foreground: oklch(0.9 0.05 277);
+  --sidebar-border: oklch(0.26 0.014 278);
+  --sidebar-ring: oklch(0.62 0.18 277);
 }
 
 @theme inline {
@@ -93,6 +138,12 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -113,8 +164,14 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
-  --font-sans: "Geist", system-ui, -apple-system, sans-serif;
-  --font-mono: "Geist Mono", "JetBrains Mono", monospace;
+  /* 拉丁与数字走 Geist；中文显式落到系统 CJK 栈（Geist 无 CJK 字形）。 */
+  --font-sans:
+    "Geist", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC",
+    "Source Han Sans SC", "Microsoft YaHei", system-ui, -apple-system,
+    sans-serif;
+  --font-mono:
+    "Geist Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
 }
 
 @layer base {
@@ -132,5 +189,47 @@
     font-feature-settings:
       "rlig" 1,
       "calt" 1;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* 标题统一收紧字距（大字号下默认字距显松）。 */
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.014em;
+  }
+  /* 数字/计数用等宽数字，避免表格与统计卡数字跳动 */
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 22%, transparent);
+  }
+  /* 滚动条：细、低干扰（Firefox + WebKit） */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--foreground) 22%, transparent)
+      transparent;
+  }
+}
+
+@layer utilities {
+  /* 顶部径向光晕，强度由 --glow-strength 控制。 */
+  .canvas-glow {
+    background: radial-gradient(
+      62rem 42rem at 50% 0%,
+      color-mix(in oklab, var(--primary) var(--glow-strength), transparent) 0%,
+      transparent 68%
+    );
+  }
+
+  .text-brand-gradient {
+    background: var(--brand-gradient);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .bg-brand-gradient {
+    background: var(--brand-gradient);
   }
 }

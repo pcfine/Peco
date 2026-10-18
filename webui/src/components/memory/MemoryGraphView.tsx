@@ -301,6 +301,8 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   const [data, setData] = useState<MemoryGraphResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 无该库时后端 404，视为空图。
+  const [notFound, setNotFound] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   /** 被隐藏的节点类型（图例键）。空集 = 全开；只影响渲染掩码，不持久化。 */
   const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
@@ -315,11 +317,16 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setNotFound(false);
     try {
       const graph = await getMemoryGraph();
       setData(graph);
     } catch (err) {
-      setError(getApiErrorMessage(err) ?? "加载记忆图谱失败");
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        setNotFound(true);
+      } else {
+        setError(getApiErrorMessage(err) ?? "加载记忆图谱失败");
+      }
     } finally {
       setLoading(false);
     }
@@ -763,6 +770,15 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
           <Skeleton className="h-10 w-40" />
         </div>
       </div>
+    );
+  }
+
+  if (notFound) {
+    return (
+      <EmptyState
+        title="还没有记忆"
+        description="开始对话后，Peco 会在这里沉淀你的长期记忆"
+      />
     );
   }
 

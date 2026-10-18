@@ -7,6 +7,7 @@ import axios from "axios";
 import { toast } from "sonner";
 import { getSupersedeHealth, triggerSupersedeReconcile } from "@/api/memory";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/common/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -92,13 +93,15 @@ export function MemoryPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">记忆</h2>
-        <Button variant="outline" size="sm" onClick={handleRefresh}>
-          <RefreshCw className="h-4 w-4" />
-          刷新
-        </Button>
-      </div>
+      <PageHeader
+        title="记忆"
+        actions={
+          <Button variant="outline" size="sm" onClick={handleRefresh}>
+            <RefreshCw className="h-4 w-4" />
+            刷新
+          </Button>
+        }
+      />
 
       <Tabs
         defaultValue="documents"

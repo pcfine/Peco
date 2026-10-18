@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
 import { ScheduleConfigForm } from "@/components/workflow/ScheduleConfigForm";
 import {
   listSchedules,
@@ -126,10 +127,12 @@ export function ScheduleManagePage() {
   return (
     <div className="max-w-3xl mx-auto space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">定时调度管理</h2>
-        <Button onClick={() => setShowCreate(true)}>+ 新建调度</Button>
-      </div>
+      <PageHeader
+        title="定时调度管理"
+        actions={
+          <Button onClick={() => setShowCreate(true)}>+ 新建调度</Button>
+        }
+      />
 
       {/* Create new schedule form */}
       {showCreate && (

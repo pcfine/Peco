@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
 import { getMcpConfig, saveMcpConfig, testMcpConnection } from "@/api/mcp";
 import type {
   McpServerConfig,
@@ -387,15 +388,15 @@ export function McpConfigPage() {
   return (
     <div className="max-w-4xl mx-auto space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">MCP 配置</h2>
-        <div className="flex gap-2">
+      <PageHeader
+        title="MCP 配置"
+        actions={
           <Button onClick={openAddDialog}>
             <Plus className="mr-2 h-4 w-4" />
             添加服务器
           </Button>
-        </div>
-      </div>
+        }
+      />
 
       {/* Empty state */}
       {servers.length === 0 ? (

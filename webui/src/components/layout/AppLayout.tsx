@@ -11,9 +11,15 @@ export function AppLayout() {
   const collapsed = useSidebarStore((s) => s.collapsed);
 
   return (
-    <div className="flex h-full overflow-hidden bg-background">
+    <div className="relative flex h-full overflow-hidden bg-background">
+      {/* 画布氛围光晕，强度见 --glow-strength */}
+      <div
+        aria-hidden="true"
+        className="canvas-glow pointer-events-none absolute inset-0"
+      />
+
       {/* Desktop sidebar */}
-      <div className="hidden md:block h-full shrink-0">
+      <div className="relative z-10 hidden h-full shrink-0 md:block">
         <Sidebar />
       </div>
 
@@ -27,7 +33,7 @@ export function AppLayout() {
         </SheetContent>
       </Sheet>
 
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="relative z-10 flex flex-1 flex-col overflow-hidden">
         {/* 移动端专用菜单栏：仅保留汉堡按钮用于打开侧边栏 */}
         <div className="md:hidden flex h-10 items-center border-b shrink-0">
           <Button

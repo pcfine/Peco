@@ -1,4 +1,4 @@
-import { Suspense, lazy } from "react";
+import { Suspense, lazy, useEffect } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "sonner";
@@ -22,6 +22,7 @@ import { WorkflowDetailPage } from "@/pages/workflows/WorkflowDetailPage";
 import { WorkflowRunDetailPage } from "@/pages/workflows/WorkflowRunDetailPage";
 import { ScheduleManagePage } from "@/pages/workflows/ScheduleManagePage";
 import { SettingsPage } from "@/pages/settings/SettingsPage";
+import { applyTheme, useThemeStore } from "@/stores/themeStore";
 
 // Lazy-loaded management pages (new in v2)
 const SkillListPage = lazy(() =>
@@ -41,6 +42,17 @@ const McpConfigPage = lazy(() =>
 );
 
 export default function App() {
+  // 跟随系统主题时，OS 切换后同步 .dark（首帧由 index.html 内联脚本处理）。
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const sync = () => {
+      if (useThemeStore.getState().theme === "system") applyTheme("system");
+    };
+    mq.addEventListener("change", sync);
+    sync();
+    return () => mq.removeEventListener("change", sync);
+  }, []);
+
   return (
     <TooltipProvider>
       <ErrorBoundary>

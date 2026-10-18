@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
+import { PageHeader } from "@/components/common/PageHeader";
 import { getSkill, upsertSkill } from "@/api/skills";
 import type { SkillDetail } from "@/types/skill";
 import { ArrowLeft } from "lucide-react";
@@ -45,16 +46,18 @@ export function SkillEditPage() {
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       {/* Header */}
-      <div className="flex items-center gap-4">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => navigate("/workspace/skills")}
-        >
-          <ArrowLeft className="h-5 w-5" />
-        </Button>
-        <h2 className="text-2xl font-bold">编辑 Skill — {skill.name}</h2>
-      </div>
+      <PageHeader
+        title={`编辑 Skill — ${skill.name}`}
+        leading={
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => navigate("/workspace/skills")}
+          >
+            <ArrowLeft className="h-5 w-5" />
+          </Button>
+        }
+      />
 
       {/* Content editor */}
       <div className="space-y-2">

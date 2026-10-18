@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
 import { WorkflowCard } from "@/components/workflow/WorkflowCard";
 import { listWorkflows, executeWorkflow } from "@/api/workflows";
 import type { WorkflowListItem } from "@/types/workflow";
@@ -99,13 +100,15 @@ export function WorkflowListPage() {
   return (
     <div className="max-w-5xl mx-auto space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">工作流</h2>
-        <Button onClick={() => navigate("/workflows/new")}>
-          <Plus className="mr-2 h-4 w-4" />
-          新建工作流
-        </Button>
-      </div>
+      <PageHeader
+        title="工作流"
+        actions={
+          <Button onClick={() => navigate("/workflows/new")}>
+            <Plus className="mr-2 h-4 w-4" />
+            新建工作流
+          </Button>
+        }
+      />
 
       {/* Stat cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">

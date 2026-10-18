@@ -64,6 +64,8 @@ export function MemoryDocumentList({ ref }: MemoryDocumentListProps) {
   const [page, setPage] = useState<MemoryDocumentPage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 无该库时后端 404，视为空列表。
+  const [notFound, setNotFound] = useState(false);
 
   // 条件栏（列表态与检索态共用）
   const [source, setSource] = useState("");
@@ -84,6 +86,7 @@ export function MemoryDocumentList({ ref }: MemoryDocumentListProps) {
   const loadList = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setNotFound(false);
     try {
       setPage(
         source
@@ -91,7 +94,11 @@ export function MemoryDocumentList({ ref }: MemoryDocumentListProps) {
           : await listMemoryDocuments(offset, PAGE_LIMIT),
       );
     } catch (err) {
-      setError(getApiErrorMessage(err) ?? "加载记忆文档失败");
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        setNotFound(true);
+      } else {
+        setError(getApiErrorMessage(err) ?? "加载记忆文档失败");
+      }
     } finally {
       setLoading(false);
     }
@@ -280,6 +287,13 @@ export function MemoryDocumentList({ ref }: MemoryDocumentListProps) {
         ))}
       </div>
     );
+  } else if (notFound) {
+    body = (
+      <EmptyState
+        title="还没有记忆"
+        description="开始对话后，Peco 会在这里沉淀你的长期记忆"
+      />
+    );
   } else if (error) {
     body = <ErrorBanner message={error} onRetry={() => void loadList()} />;
   } else {
@@ -356,7 +370,7 @@ export function MemoryDocumentList({ ref }: MemoryDocumentListProps) {
   // 分页条仅列表态显示（E4 无分页）。
   const step = page?.limit || PAGE_LIMIT;
   const hasMore = page?.has_more ?? false;
-  const pagination = !searching && !loading && !error && (
+  const pagination = !searching && !loading && !notFound && !error && (
     <div className="flex items-center justify-between">
       <p className="text-xs text-muted-foreground">
         第 {Math.floor(offset / step) + 1} 页 · offset {offset}

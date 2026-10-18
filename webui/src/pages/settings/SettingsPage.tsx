@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { ProviderSection } from "@/components/settings/ProviderSection";
+import { PageHeader } from "@/components/common/PageHeader";
 import { ContextMetricsCard } from "@/components/settings/ContextMetricsCard";
 import { MemoryConsolidationCard } from "@/components/settings/MemoryConsolidationCard";
 import { useNavigate } from "react-router-dom";
@@ -18,7 +19,7 @@ export function SettingsPage() {
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
-      <h2 className="text-2xl font-bold">设置</h2>
+      <PageHeader title="设置" />
 
       <Card>
         <CardHeader>

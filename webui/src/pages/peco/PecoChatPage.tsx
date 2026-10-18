@@ -115,6 +115,11 @@ export function PecoChatPage() {
           清除对话
         </Button>
       }
+      suggestions={[
+        "介绍一下你能做什么",
+        "查看我的长期记忆",
+        "帮我搜索知识库",
+      ]}
       welcomeMessage={
         <>
           <p className="text-lg">👋 你好！我是 Peco，你的个人 AI 助理。</p>

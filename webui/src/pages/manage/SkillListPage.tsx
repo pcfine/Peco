@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
+import { PageHeader } from "@/components/common/PageHeader";
 import {
   listSkills,
   deleteSkill,
@@ -139,13 +140,15 @@ export function SkillListPage() {
   return (
     <div className="max-w-4xl mx-auto space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold">Skill 管理</h2>
-        <Button onClick={openImport}>
-          <Upload className="mr-2 h-4 w-4" />
-          导入 Skill
-        </Button>
-      </div>
+      <PageHeader
+        title="Skill 管理"
+        actions={
+          <Button onClick={openImport}>
+            <Upload className="mr-2 h-4 w-4" />
+            导入 Skill
+          </Button>
+        }
+      />
 
       {/* Empty state */}
       {skills.length === 0 ? (

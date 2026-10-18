@@ -3,6 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
+import { PageHeader } from "@/components/common/PageHeader";
 import { YamlEditor } from "@/components/workflow/YamlEditor";
 import { DagPreview } from "@/components/workflow/DagPreview";
 import { ExecutionHistoryTable } from "@/components/workflow/ExecutionHistoryTable";
@@ -262,8 +263,10 @@ export function WorkflowDetailPage() {
   return (
     <div className="max-w-5xl mx-auto space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
+      <PageHeader
+        title={detail.name}
+        description={detail.description}
+        leading={
           <Button
             variant="ghost"
             size="icon"
@@ -271,38 +274,32 @@ export function WorkflowDetailPage() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <h2 className="text-xl font-bold">{detail.name}</h2>
-            {detail.description && (
-              <p className="text-sm text-muted-foreground">
-                {detail.description}
-              </p>
-            )}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button onClick={handleExecute} disabled={executing}>
-            <Play className="mr-2 h-4 w-4" />
-            {executing ? "触发中..." : "执行"}
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() =>
-              navigate(`/workflows/${encodeURIComponent(detail.name)}/edit`)
-            }
-          >
-            <Pencil className="mr-2 h-4 w-4" />
-            编辑
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setDeleteOpen(true)}
-          >
-            <Trash2 className="h-4 w-4 text-destructive" />
-          </Button>
-        </div>
-      </div>
+        }
+        actions={
+          <>
+            <Button onClick={handleExecute} disabled={executing}>
+              <Play className="mr-2 h-4 w-4" />
+              {executing ? "触发中..." : "执行"}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() =>
+                navigate(`/workflows/${encodeURIComponent(detail.name)}/edit`)
+              }
+            >
+              <Pencil className="mr-2 h-4 w-4" />
+              编辑
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setDeleteOpen(true)}
+            >
+              <Trash2 className="h-4 w-4 text-destructive" />
+            </Button>
+          </>
+        }
+      />
 
       <Tabs defaultValue="overview">
         <TabsList>
