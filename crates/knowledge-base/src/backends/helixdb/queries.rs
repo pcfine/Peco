@@ -115,6 +115,17 @@ fn ns_where_step(schema: &HelixSchema) -> Option<Value> {
 
 // ── 属性构建器 ────────────────────────────────────────────────────────────
 
+/// `created_at`(RFC3339) → Unix 毫秒；缺失或不可解析 → 0。
+///
+/// 必须落成独立数值属性：`OrderBy` 无法下钻 `metadata` JSON；属性缺失时
+/// 排序会静默失效，故缺失也写 0 而非省略。
+fn created_ts_millis(created_at: Option<&str>) -> i64 {
+    created_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
 /// 构建文档属性数组（v2 AddN `properties` 格式）。
 ///
 /// 返回 `[["key", PropertyValue], ...]` 的元组数组。
@@ -131,6 +142,10 @@ fn document_props(
         json!(["source_path", prop_str(&doc.source_path)]),
         json!(["content", prop_str(&doc.content)]),
         json!(["metadata", prop_str(metadata_json)]),
+        json!([
+            "created_ts",
+            prop_i64(created_ts_millis(doc.metadata.created_at.as_deref()))
+        ]),
     ];
 
     if let Some(ns) = ns {
@@ -715,6 +730,7 @@ pub fn list_documents_filtered(
             "queries": [
                 {"Query": {"name": "docs", "steps": [
                     {"NWhere": node_match},
+                    {"OrderByMultiple": [["created_ts", "Desc"], [schema.id_property, "Asc"]]},
                     {"Skip": offset},
                     {"Limit": limit},
                     {"Project": [
@@ -1615,6 +1631,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn created_ts_is_projected_as_millis() {
+        assert_eq!(
+            created_ts_millis(Some("2026-10-16T21:24:33.829549649+00:00")),
+            1792185873829
+        );
+        assert_eq!(
+            created_ts_millis(Some("2026-10-16T21:24:33+00:00")),
+            1792185873000
+        );
+        assert_eq!(
+            created_ts_millis(Some("2026-10-17T05:24:33+08:00")),
+            1792185873000
+        );
+        assert_eq!(created_ts_millis(None), 0);
+        assert_eq!(created_ts_millis(Some("not-a-time")), 0);
+        assert_eq!(created_ts_millis(Some("")), 0);
+    }
+
+    /// 文档属性必须携带 created_ts（缺失属性会让 OrderBy 静默失效）。
+    #[test]
+    fn document_props_always_carry_created_ts() {
+        let s = test_schema();
+
+        let mut doc = sample_doc();
+        doc.metadata.created_at = Some("2026-10-16T21:24:33.829549649+00:00".into());
+        let q = create_document_node(&s, &doc, "{}", &[]);
+        let props = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let ts = props
+            .iter()
+            .find(|p| p[0] == "created_ts")
+            .expect("应写入 created_ts");
+        assert_eq!(ts[1]["Value"]["I64"], 1792185873829i64);
+
+        let doc = sample_doc();
+        let q = create_document_node(&s, &doc, "{}", &[]);
+        let props = q["query"]["queries"][0]["Query"]["steps"][0]["AddN"]["properties"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let ts = props
+            .iter()
+            .find(|p| p[0] == "created_ts")
+            .expect("缺失 created_at 时也必须写 0");
+        assert_eq!(ts[1]["Value"]["I64"], 0i64);
+    }
+
     /// ④ 空 embedding（graph_only / text_only 存储模式）必须整体省略该属性 ——
     /// 写入空 F32Array 会被向量索引按 0 维拒绝。
     #[test]
@@ -1699,10 +1765,16 @@ mod tests {
             json!({"Eq": ["source_path", {"String": "ppa_profile"}]})
         );
 
+        // 排序在 Skip 之前下推：created_ts 倒序，同刻按 id 升序保证稳定
+        assert_eq!(
+            steps[1]["OrderByMultiple"],
+            json!([["created_ts", "Desc"], ["id", "Asc"]]),
+            "列表必须按最近时间倒序"
+        );
         // 过滤在 Skip/Limit 之前下推
-        assert_eq!(steps[1]["Skip"], 5);
-        assert_eq!(steps[2]["Limit"], 10);
-        let project = steps[3]["Project"].as_array().unwrap();
+        assert_eq!(steps[2]["Skip"], 5);
+        assert_eq!(steps[3]["Limit"], 10);
+        let project = steps[4]["Project"].as_array().unwrap();
         assert_eq!(project[0]["source"], "id");
         assert_eq!(project[0]["alias"], "id");
     }
