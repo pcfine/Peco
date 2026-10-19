@@ -233,3 +233,98 @@
     background: var(--brand-gradient);
   }
 }
+
+/* 编辑器高亮配色：跟随主题；markdown 代码块仍沿用 github-dark。 */
+:root {
+  --code-fg: oklch(0.28 0.02 280);
+  --code-comment: oklch(0.545 0.02 280);
+  --code-keyword: oklch(0.47 0.19 320);
+  --code-string: oklch(0.45 0.13 155);
+  --code-number: oklch(0.5 0.15 250);
+  --code-title: oklch(0.44 0.17 285);
+  --code-builtin: oklch(0.44 0.12 210);
+  --code-attr: oklch(0.5 0.14 62);
+}
+
+.dark {
+  --code-fg: oklch(0.93 0.004 280);
+  --code-comment: oklch(0.62 0.02 280);
+  --code-keyword: oklch(0.75 0.15 320);
+  --code-string: oklch(0.78 0.12 155);
+  --code-number: oklch(0.78 0.1 240);
+  --code-title: oklch(0.8 0.11 285);
+  --code-builtin: oklch(0.8 0.09 200);
+  --code-attr: oklch(0.82 0.1 70);
+}
+
+[data-code-editor] .hljs {
+  display: block;
+  overflow: visible;
+  padding: 0;
+  background: transparent;
+  color: var(--code-fg);
+}
+/* 先全部回到基准色：github-dark 的浅灰一旦漏进浅色主题就几乎不可见。 */
+[data-code-editor] [class*="hljs-"] {
+  color: inherit;
+}
+[data-code-editor] .hljs-comment,
+[data-code-editor] .hljs-quote,
+[data-code-editor] .hljs-code,
+[data-code-editor] .hljs-formula,
+[data-code-editor] .hljs-meta,
+[data-code-editor] .hljs-deletion {
+  color: var(--code-comment);
+}
+[data-code-editor] .hljs-keyword,
+[data-code-editor] .hljs-doctag,
+[data-code-editor] .hljs-literal,
+[data-code-editor] .hljs-selector-tag,
+[data-code-editor] .hljs-selector,
+[data-code-editor] .hljs-selector-attr,
+[data-code-editor] .hljs-selector-class,
+[data-code-editor] .hljs-selector-id,
+[data-code-editor] .hljs-selector-pseudo,
+[data-code-editor] .hljs-tag,
+[data-code-editor] .hljs-name {
+  color: var(--code-keyword);
+}
+[data-code-editor] .hljs-string,
+[data-code-editor] .hljs-regexp,
+[data-code-editor] .hljs-addition,
+[data-code-editor] .hljs-char.escape_,
+[data-code-editor] .hljs-link {
+  color: var(--code-string);
+}
+[data-code-editor] .hljs-number,
+[data-code-editor] .hljs-symbol,
+[data-code-editor] .hljs-bullet,
+[data-code-editor] .hljs-template,
+[data-code-editor] .hljs-template-tag,
+[data-code-editor] .hljs-template-variable {
+  color: var(--code-number);
+}
+[data-code-editor] .hljs-title,
+[data-code-editor] .hljs-title.class_,
+[data-code-editor] .hljs-title.function_,
+[data-code-editor] .hljs-section {
+  color: var(--code-title);
+}
+[data-code-editor] .hljs-built_in,
+[data-code-editor] .hljs-type,
+[data-code-editor] .hljs-variable.language_ {
+  color: var(--code-builtin);
+}
+[data-code-editor] .hljs-attr,
+[data-code-editor] .hljs-attribute,
+[data-code-editor] .hljs-variable,
+[data-code-editor] .hljs-params,
+[data-code-editor] .hljs-property {
+  color: var(--code-attr);
+}
+[data-code-editor] .hljs-emphasis {
+  font-style: italic;
+}
+[data-code-editor] .hljs-strong {
+  font-weight: 700;
+}
