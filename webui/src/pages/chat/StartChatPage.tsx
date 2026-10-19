@@ -336,6 +336,7 @@ export function StartChatPage() {
           {/* Agent info */}
           <AgentIcon
             icon={agent?.icon || "🤖"}
+            name={agent?.name}
             backgroundColor={agent?.background_color}
             size="lg"
           />

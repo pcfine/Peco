@@ -574,6 +574,7 @@ export function AgentChatPage() {
           </Button>
           <AgentIcon
             icon={agent?.icon || "🤖"}
+            name={agent?.name}
             backgroundColor={agent?.background_color}
             size="sm"
           />
@@ -615,6 +616,7 @@ export function AgentChatPage() {
             <div className="flex flex-col items-center gap-4 w-full max-w-xl px-4">
               <AgentIcon
                 icon={agent?.icon || "🤖"}
+                name={agent?.name}
                 backgroundColor={agent?.background_color}
                 size="lg"
               />
@@ -691,6 +693,7 @@ export function AgentChatPage() {
                   <div className="flex items-center gap-2">
                     <AgentIcon
                       icon={agent.icon || "🤖"}
+                      name={agent.name}
                       backgroundColor={agent.background_color}
                       size="sm"
                     />

@@ -6,6 +6,7 @@ import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageHeader } from "@/components/common/PageHeader";
 import { PageContainer } from "@/components/common/PageContainer";
+import { PixelIdenticon } from "@/components/common/PixelIdenticon";
 import { CardGrid } from "@/components/common/CardGrid";
 import { listAgents, deleteAgent } from "@/api/agents";
 import type { AgentListItem } from "@/types/agent";
@@ -22,6 +23,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { resolveAgentIcon } from "@/lib/identicon";
 import { normalizeModel } from "@/lib/constants";
 
 /** 元数据 chip：名称过长时截断，保持单行。 */
@@ -158,8 +160,8 @@ export function AgentListPage() {
       ) : (
         <CardGrid>
           {agents.map((a) => {
+            const icon = resolveAgentIcon(a.icon, a.name);
             const leftBg = a.background_color || "#6366f118";
-            const isImg = a.icon.startsWith("/uploads/");
             return (
               <Link
                 key={a.id}
@@ -171,17 +173,27 @@ export function AgentListPage() {
                     {/* 左侧：正方形色块/图片 */}
                     <div
                       className="aspect-square h-full shrink-0 rounded-xl overflow-hidden flex items-center justify-center"
-                      style={{ background: isImg ? "transparent" : leftBg }}
+                      style={{
+                        background:
+                          icon.kind === "emoji" ? leftBg : "transparent",
+                      }}
                     >
-                      {isImg ? (
+                      {icon.kind === "image" && (
                         <img
-                          src={a.icon}
+                          src={icon.value}
                           alt=""
                           className="h-full w-full object-cover"
                         />
-                      ) : (
+                      )}
+                      {icon.kind === "pixel" && (
+                        <PixelIdenticon
+                          identicon={icon.identicon!}
+                          className="h-full w-full"
+                        />
+                      )}
+                      {icon.kind === "emoji" && (
                         <span className="text-4xl select-none">
-                          {a.icon || "🤖"}
+                          {icon.value || "🤖"}
                         </span>
                       )}
                     </div>
