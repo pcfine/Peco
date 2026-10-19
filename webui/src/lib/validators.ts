@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { DEFAULT_MODEL } from "./constants";
+
 export const loginSchema = z.object({
   email: z.string().min(1, "请输入邮箱").email("邮箱格式不正确"),
   password: z.string().min(1, "请输入密码"),
@@ -15,7 +17,7 @@ export const agentSchema = z.object({
   name: z.string().min(1, "请输入 Agent 名称"),
   description: z.string().optional().default(""),
   system_prompt: z.string().optional().default(""),
-  model: z.string().optional().default("deepseek-v4-flash"),
+  model: z.string().optional().default(DEFAULT_MODEL),
   provider: z.string().optional().default("deepseek"),
   icon: z.string().optional().default("🤖"),
   background_color: z.string().optional().default(""),

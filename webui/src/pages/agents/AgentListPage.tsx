@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { normalizeModel } from "@/lib/constants";
 
 /** 元数据 chip：名称过长时截断，保持单行。 */
 function Chip({
@@ -234,7 +235,7 @@ export function AgentListPage() {
                         {a.model && (
                           <div className="flex items-center gap-1 text-xs text-muted-foreground">
                             <Cpu className="h-3 w-3 shrink-0" />
-                            <span className="truncate">{a.model}</span>
+                            <span className="truncate">{normalizeModel(a.model)}</span>
                           </div>
                         )}
 

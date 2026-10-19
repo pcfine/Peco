@@ -1,20 +1,33 @@
 export const MODELS = [
-  { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash" },
-  { value: "deepseek-v4", label: "DeepSeek V4" },
+  { value: "deepseek-flash", label: "DeepSeek V4.1 Flash" },
+  { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
 ] as const;
 
-// 上下文窗口总量（token）— 每个模型的固定规格，按模型名维护。
-export const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+/** 默认模型 —— API 的 flash 档规范名。 */
+export const DEFAULT_MODEL = "deepseek-flash";
+
+/** 历史别名 → 规范名。`deepseek-v4-flash` 仍可调用，但 /models 已只列规范名。 */
+const LEGACY_MODEL_ALIASES: Record<string, string> = {
+  "deepseek-v4-flash": "deepseek-flash",
+};
+
+/** 把历史别名归一为规范模型名，未知值原样返回。 */
+export function normalizeModel(model?: string): string {
+  if (!model) return DEFAULT_MODEL;
+  return LEGACY_MODEL_ALIASES[model] ?? model;
+}
+
+/** 上下文窗口总量（token）— 取自 provider /models 的 context_window。 */
+export const DEFAULT_CONTEXT_WINDOW = 1_048_576;
 
 export const MODEL_CONTEXT_WINDOW: Record<string, number> = {
-  "deepseek-v4-flash": 1_000_000,
-  "deepseek-v4-pro": 1_000_000,
-  "deepseek-v4": 1_000_000,
+  "deepseek-flash": 1_048_576,
+  "deepseek-v4-pro": 1_048_576,
 };
 
 /** 按模型名解析上下文窗口总量，未知模型回退默认值。 */
 export function contextWindowForModel(model?: string): number {
-  return (model && MODEL_CONTEXT_WINDOW[model]) || DEFAULT_CONTEXT_WINDOW;
+  return (model && MODEL_CONTEXT_WINDOW[normalizeModel(model)]) || DEFAULT_CONTEXT_WINDOW;
 }
 
 export const PROVIDERS = [
