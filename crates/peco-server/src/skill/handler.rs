@@ -1,15 +1,16 @@
 // Skill Handler — 用户 workspace 级别 Skill 管理
 
+use std::io::Read;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::state::AppState;
-use peco_core::skills::{SkillError, SkillResourceFile};
+use peco_core::skills::{SkillError, SkillResourceFile, validate_name};
 use tracing::info;
 
 #[derive(Debug, Serialize)]
@@ -209,4 +210,277 @@ fn skill_error_to_api(e: SkillError) -> ApiError {
         SkillError::SkillMdNotFound(_) => ApiError::NotFound(msg),
         _ => ApiError::Internal(msg),
     }
+}
+
+// ── 目录文件（只读） ────────────────────────────────────────────────────────
+
+/// 预览上限：超出部分不返回，响应体标记 `truncated`。
+const PREVIEW_LIMIT: u64 = 256 * 1024;
+const MAX_LISTED_FILES: usize = 2000;
+const MAX_WALK_DEPTH: usize = 8;
+
+const BINARY_EXTS: &[&str] = &[
+    "pyc", "pyo", "so", "dylib", "dll", "exe", "bin", "o", "a", "class", "wasm", "zip", "gz",
+    "tar", "pdf", "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "woff", "woff2", "ttf", "otf",
+    "mp3", "mp4", "mov", "sqlite", "db",
+];
+const CODE_EXTS: &[&str] = &[
+    "py", "sh", "bash", "zsh", "js", "mjs", "cjs", "ts", "tsx", "jsx", "css", "html", "htm", "xml",
+    "rs", "go", "java", "c", "h", "cpp", "hpp", "rb", "php", "lua", "sql",
+];
+const DATA_EXTS: &[&str] = &["json", "jsonl", "csv", "toml", "yaml", "yml", "ini", "conf"];
+
+#[derive(Debug, Serialize)]
+pub struct SkillFileInfo {
+    /// 相对 skill 根目录的路径，`/` 分隔。
+    pub path: String,
+    pub size: u64,
+    /// RFC3339（UTC，秒精度）。
+    pub mtime: String,
+    /// markdown / code / data / env / text / binary
+    pub kind: &'static str,
+    /// 能否通过现有 API 保存（scripts/ references/ assets/ 且非 __pycache__）。
+    pub writable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillFileContent {
+    pub path: String,
+    pub size: u64,
+    pub mtime: String,
+    pub kind: &'static str,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum SkillFilesResponse {
+    List { files: Vec<SkillFileInfo> },
+    Content(SkillFileContent),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileQuery {
+    pub path: Option<String>,
+}
+
+/// `GET /api/skills/{name}/files` — 目录清单；带 `?path=` 时返回该文件内容。
+pub async fn files(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<SkillFilesResponse>, ApiError> {
+    // `{name}` 已由 axum 百分号解码，`..%2F..` 会还原成 `../..`；与写路径共用同一套名称校验。
+    if let Err(msg) = validate_name(&name) {
+        return Err(ApiError::BadRequest(msg));
+    }
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let skill_dir = ws.skills_dir().join(&name);
+    if !skill_dir.join("SKILL.md").is_file() {
+        return Err(ApiError::NotFound(format!("skill '{name}' not found")));
+    }
+
+    match query.path.as_deref() {
+        None => {
+            let mut files = Vec::new();
+            walk_dir(&skill_dir, "", 0, &mut files);
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            info!(user_id = %user_id, name = %name, count = files.len(), "Skill files listed");
+            Ok(Json(SkillFilesResponse::List { files }))
+        }
+        Some(rel) => {
+            let path = resolve_within(&skill_dir, rel)?;
+            let meta = std::fs::metadata(&path)
+                .map_err(|_| ApiError::NotFound(format!("file '{rel}' not found")))?;
+            if !meta.is_file() {
+                return Err(ApiError::BadRequest(format!("'{rel}' is not a file")));
+            }
+            let size = meta.len();
+            let kind = classify(&path);
+            if kind == "binary" {
+                return Err(ApiError::UnsupportedMedia(format!(
+                    "'{rel}' is a binary file"
+                )));
+            }
+
+            let mut handle = std::fs::File::open(&path)
+                .map_err(|e| ApiError::Internal(format!("failed to open '{rel}': {e}")))?;
+            let mut buf = Vec::new();
+            handle
+                .by_ref()
+                .take(PREVIEW_LIMIT)
+                .read_to_end(&mut buf)
+                .map_err(|e| ApiError::Internal(format!("failed to read '{rel}': {e}")))?;
+            let truncated = size > PREVIEW_LIMIT;
+            if !truncated && buf.contains(&0) {
+                return Err(ApiError::UnsupportedMedia(format!(
+                    "'{rel}' is a binary file"
+                )));
+            }
+            // 截断可能切断多字节字符，此时用有损转换；未截断则严格校验。
+            let content = if truncated {
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                String::from_utf8(buf)
+                    .map_err(|_| ApiError::UnsupportedMedia(format!("'{rel}' is not UTF-8")))?
+            };
+
+            info!(user_id = %user_id, name = %name, path = %rel, "Skill file read");
+            Ok(Json(SkillFilesResponse::Content(SkillFileContent {
+                path: rel.to_string(),
+                size,
+                mtime: mtime_rfc3339(&meta),
+                kind,
+                content,
+                truncated,
+            })))
+        }
+    }
+}
+
+/// 递归收集文件（不跟随符号链接；根级 SKILL.md 由前端固定行承担，不重复列出）。
+fn walk_dir(root: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec<SkillFileInfo>) {
+    if depth > MAX_WALK_DEPTH || out.len() >= MAX_LISTED_FILES {
+        return;
+    }
+    let dir = if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(prefix)
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        if out.len() >= MAX_LISTED_FILES {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if file_type.is_dir() {
+            walk_dir(root, &rel, depth + 1, out);
+            continue;
+        }
+        if !file_type.is_file() || rel == "SKILL.md" {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let path = entry.path();
+        out.push(SkillFileInfo {
+            kind: classify(&path),
+            writable: is_writable(&rel),
+            size: meta.len(),
+            mtime: mtime_rfc3339(&meta),
+            path: rel,
+        });
+    }
+}
+
+/// 现有写入 API 的白名单：三个 Tier-3 前缀，且不是字节码缓存。
+fn is_writable(rel: &str) -> bool {
+    let Some((top, _)) = rel.split_once('/') else {
+        return false;
+    };
+    matches!(top, "scripts" | "references" | "assets") && !rel.contains("__pycache__/")
+}
+
+fn classify(path: &std::path::Path) -> &'static str {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name == ".env" || name.starts_with(".env.") {
+        return if name.ends_with(".example") {
+            "text"
+        } else {
+            "env"
+        };
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("md" | "markdown" | "mdx") => "markdown",
+        Some(e) if BINARY_EXTS.contains(&e) => "binary",
+        Some(e) if CODE_EXTS.contains(&e) => "code",
+        Some(e) if DATA_EXTS.contains(&e) => "data",
+        _ => {
+            if sniff_binary(path) {
+                "binary"
+            } else {
+                "text"
+            }
+        }
+    }
+}
+
+/// 读前 4KB 判断：含 NUL 或非 UTF-8 即视为二进制。
+fn sniff_binary(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 4096];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    let head = &buf[..n];
+    head.contains(&0) || std::str::from_utf8(head).is_err()
+}
+
+/// 解析相对路径并确保落在 skill 目录内（阻断 `..`、绝对路径与符号链接逃逸）。
+fn resolve_within(skill_dir: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, ApiError> {
+    let trimmed = rel.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\0')
+        || trimmed.contains('\\')
+        || trimmed.starts_with('/')
+    {
+        return Err(ApiError::BadRequest("invalid file path".into()));
+    }
+    let mut joined = std::path::PathBuf::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(ApiError::BadRequest("invalid file path".into()));
+        }
+        joined.push(part);
+    }
+
+    let root = skill_dir
+        .canonicalize()
+        .map_err(|e| ApiError::Internal(format!("failed to resolve skill dir: {e}")))?;
+    let target = root
+        .join(&joined)
+        .canonicalize()
+        .map_err(|_| ApiError::NotFound(format!("file '{rel}' not found")))?;
+    if !target.starts_with(&root) {
+        return Err(ApiError::BadRequest("invalid file path".into()));
+    }
+    Ok(target)
+}
+
+fn mtime_rfc3339(meta: &std::fs::Metadata) -> String {
+    meta.modified()
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }

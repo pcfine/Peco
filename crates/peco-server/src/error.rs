@@ -25,6 +25,8 @@ pub enum ApiError {
     Conflict(String),
     /// 500 — 服务器内部错误
     Internal(String),
+    /// 415 — 内容类型不支持（如二进制文件预览）
+    UnsupportedMedia(String),
     /// 504 — 上游/本地处理超时
     GatewayTimeout(String),
 }
@@ -39,6 +41,7 @@ impl ApiError {
             | ApiError::NotFound(m)
             | ApiError::Conflict(m)
             | ApiError::Internal(m)
+            | ApiError::UnsupportedMedia(m)
             | ApiError::GatewayTimeout(m) => m.as_str(),
         }
     }
@@ -53,6 +56,7 @@ impl std::fmt::Display for ApiError {
             ApiError::NotFound(m) => write!(f, "Not found: {m}"),
             ApiError::Conflict(m) => write!(f, "Conflict: {m}"),
             ApiError::Internal(m) => write!(f, "Internal error: {m}"),
+            ApiError::UnsupportedMedia(m) => write!(f, "Unsupported media: {m}"),
             ApiError::GatewayTimeout(m) => write!(f, "Gateway timeout: {m}"),
         }
     }
@@ -69,6 +73,9 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            ApiError::UnsupportedMedia(_) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media")
+            }
             ApiError::GatewayTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout"),
         };
 

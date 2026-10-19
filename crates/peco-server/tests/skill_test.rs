@@ -157,3 +157,197 @@ async fn test_import_requires_name_and_content() {
     assert_eq!(resp.status(), 200);
     assert!(skills_dir(&app).join("demo/assets/logo.txt").is_file());
 }
+
+// ── 目录文件读取 ────────────────────────────────────────────────────────────
+
+/// 准备一个带嵌套资源与二进制的 skill 目录（直接落盘，绕开写入 API 的白名单）。
+fn seed_skill_tree(app: &TestApp) -> std::path::PathBuf {
+    let dir = skills_dir(app).join("demo");
+    std::fs::create_dir_all(dir.join("scripts/__pycache__")).unwrap();
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    std::fs::write(dir.join("SKILL.md"), DEMO_SKILL).unwrap();
+    std::fs::write(dir.join("scripts/run.py"), "print('hi')\n").unwrap();
+    std::fs::write(dir.join("scripts/__pycache__/run.pyc"), [0u8, 1, 2, 3]).unwrap();
+    std::fs::write(dir.join("references/notes.md"), "# Notes\n").unwrap();
+    std::fs::write(dir.join(".env"), "TOKEN=secret\n").unwrap();
+    std::fs::write(dir.join("state/cache.json"), "{\"a\":1}").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn test_list_files_reports_tree_and_write_boundary() {
+    let app = TestApp::new().await;
+    seed_skill_tree(&app);
+
+    let resp = app.get("/api/skills/demo/files").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let files = body["files"].as_array().unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+
+    // 根级 SKILL.md 不重复列出
+    assert!(!paths.contains(&"SKILL.md"));
+    assert!(paths.contains(&"scripts/run.py"));
+    assert!(paths.contains(&"scripts/__pycache__/run.pyc"));
+    assert!(paths.contains(&"references/notes.md"));
+    assert!(paths.contains(&"state/cache.json"));
+    assert!(paths.contains(&".env"));
+    // 升序
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+
+    let find = |p: &str| files.iter().find(|f| f["path"] == p).unwrap();
+    assert_eq!(find("scripts/run.py")["writable"], true);
+    assert_eq!(find("references/notes.md")["writable"], true);
+    assert_eq!(find("scripts/__pycache__/run.pyc")["writable"], false);
+    assert_eq!(find("state/cache.json")["writable"], false);
+    assert_eq!(find("scripts/run.py")["kind"], "code");
+    assert_eq!(find("references/notes.md")["kind"], "markdown");
+    assert_eq!(find("scripts/__pycache__/run.pyc")["kind"], "binary");
+    assert_eq!(find(".env")["kind"], "env");
+    assert_eq!(find("state/cache.json")["kind"], "data");
+    assert!(
+        find("state/cache.json")["mtime"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+}
+
+#[tokio::test]
+async fn test_read_file_returns_content_and_metadata() {
+    let app = TestApp::new().await;
+    seed_skill_tree(&app);
+
+    let resp = app
+        .get("/api/skills/demo/files?path=scripts/run.py")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["path"], "scripts/run.py");
+    assert_eq!(body["content"], "print('hi')\n");
+    assert_eq!(body["truncated"], false);
+    assert_eq!(body["size"], 12);
+    assert_eq!(body["kind"], "code");
+}
+
+#[tokio::test]
+async fn test_read_file_rejects_traversal_and_binary() {
+    let app = TestApp::new().await;
+    let dir = seed_skill_tree(&app);
+
+    for bad in [
+        "../demo/SKILL.md",
+        "/etc/passwd",
+        "scripts/../SKILL.md",
+        "./scripts/run.py",
+        "scripts\\run.py",
+    ] {
+        let resp = app
+            .get(&format!("/api/skills/demo/files?path={bad}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "path {bad} should be rejected");
+    }
+
+    // 二进制 → 415
+    let resp = app
+        .get("/api/skills/demo/files?path=scripts/__pycache__/run.pyc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 415);
+
+    // 不存在 → 404
+    let resp = app
+        .get("/api/skills/demo/files?path=scripts/nope.py")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // 目录 → 400
+    let resp = app
+        .get("/api/skills/demo/files?path=scripts")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 未知 skill → 404
+    let resp = app.get("/api/skills/none/files").send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(dir.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_read_file_rejects_symlink_escape() {
+    let app = TestApp::new().await;
+    let dir = seed_skill_tree(&app);
+    std::os::unix::fs::symlink("/etc/passwd", dir.join("scripts/escape.py")).unwrap();
+
+    // 符号链接不出现在清单里
+    let resp = app.get("/api/skills/demo/files").send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let paths: Vec<&str> = body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(!paths.contains(&"scripts/escape.py"));
+
+    // 直接请求也被拦截
+    let resp = app
+        .get("/api/skills/demo/files?path=scripts/escape.py")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn test_read_file_truncates_over_limit() {
+    let app = TestApp::new().await;
+    let dir = seed_skill_tree(&app);
+    let big = "a".repeat(300 * 1024);
+    std::fs::write(dir.join("references/big.md"), &big).unwrap();
+
+    let resp = app
+        .get("/api/skills/demo/files?path=references/big.md")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["size"], 300 * 1024);
+    assert_eq!(body["content"].as_str().unwrap().len(), 256 * 1024);
+}
+
+#[tokio::test]
+async fn test_files_rejects_traversal_in_skill_name() {
+    let app = TestApp::new().await;
+    seed_skill_tree(&app);
+
+    // axum 会把 %2F 解码进 {name}，`..%2F..%2Fetc` 即 `../../etc`。
+    let resp = app
+        .get("/api/skills/..%2F..%2Fetc/files")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = app
+        .get("/api/skills/%2e%2e%2fdemo/files?path=SKILL.md")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}

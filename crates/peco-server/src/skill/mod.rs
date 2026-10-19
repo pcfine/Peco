@@ -20,4 +20,5 @@ pub fn router() -> Router<Arc<AppState>> {
                 .delete(handler::delete_skill),
         )
         .route("/{name}/export", get(handler::export_skill))
+        .route("/{name}/files", get(handler::files))
 }
