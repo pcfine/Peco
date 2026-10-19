@@ -13,6 +13,7 @@ import {
 import type { KnowledgeBase, Document } from "@/types/knowledge";
 import { ArrowLeft, Upload, RefreshCw, Trash2, FileText } from "lucide-react";
 import { toast } from "sonner";
+import { PageContainer } from "@/components/common/PageContainer";
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "bg-yellow-100 text-yellow-700",
@@ -105,23 +106,24 @@ export function KnowledgeDetailPage() {
   if (!kb) return null;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
+    <PageContainer width="wide" className="space-y-6">
       <PageHeader
-        leading={
-          <Link
-            to="/workspace/knowledge"
-            className="text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </Link>
-        }
         title={kb.name}
         description={`${kb.description || "无描述"} · ${kb.document_count} 文档 · ${kb.chunk_count} 分块 · ${kb.embedding_model}`}
         actions={
-          <Button variant="outline" size="sm" onClick={handleSync}>
-            <RefreshCw className="mr-2 h-4 w-4" />
-            同步
-          </Button>
+          <>
+            <Link
+              to="/workspace/knowledge"
+              aria-label="返回知识库列表"
+              className="text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft className="h-5 w-5" />
+            </Link>
+            <Button variant="outline" size="sm" onClick={handleSync}>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              同步
+            </Button>
+          </>
         }
       />
 
@@ -187,6 +189,6 @@ export function KnowledgeDetailPage() {
           </div>
         )}
       </div>
-    </div>
+    </PageContainer>
   );
 }

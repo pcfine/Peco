@@ -15,6 +15,8 @@ import {
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageHeader } from "@/components/common/PageHeader";
+import { PageContainer } from "@/components/common/PageContainer";
+import { CardGrid } from "@/components/common/CardGrid";
 import {
   listKnowledgeBases,
   createKnowledgeBase,
@@ -91,7 +93,7 @@ export function KnowledgeListPage() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-4">
+    <PageContainer>
       <PageHeader
         title="知识库"
         actions={
@@ -148,10 +150,10 @@ export function KnowledgeListPage() {
       {kbs.length === 0 ? (
         <EmptyState icon={BookOpen} title="暂无知识库" />
       ) : (
-        <div className="grid gap-3 md:grid-cols-2">
+        <CardGrid>
           {kbs.map((kb) => (
-            <Link key={kb.id} to={`/workspace/knowledge/${kb.id}`}>
-              <Card className="group hover:bg-accent/50 transition-colors">
+            <Link key={kb.id} to={`/workspace/knowledge/${kb.id}`} className="block h-full">
+              <Card className="group h-full py-0 hover:bg-accent/50 transition-colors">
                 <CardHeader className="flex flex-row items-center justify-between p-4">
                   <div className="min-w-0 flex-1">
                     <CardTitle className="text-base truncate">
@@ -180,8 +182,8 @@ export function KnowledgeListPage() {
               </Card>
             </Link>
           ))}
-        </div>
+        </CardGrid>
       )}
-    </div>
+    </PageContainer>
   );
 }

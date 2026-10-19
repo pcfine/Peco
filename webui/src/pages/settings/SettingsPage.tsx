@@ -7,6 +7,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { ContextMetricsCard } from "@/components/settings/ContextMetricsCard";
 import { MemoryConsolidationCard } from "@/components/settings/MemoryConsolidationCard";
 import { useNavigate } from "react-router-dom";
+import { PageContainer } from "@/components/common/PageContainer";
 
 export function SettingsPage() {
   const { user, logout } = useAuthStore();
@@ -18,49 +19,51 @@ export function SettingsPage() {
   };
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <PageContainer width="form" className="space-y-6">
       <PageHeader title="设置" />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>用户信息</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center gap-4">
-            <Avatar className="h-16 w-16">
-              <AvatarFallback className="text-lg">
-                {user?.username.slice(0, 2).toUpperCase()}
-              </AvatarFallback>
-            </Avatar>
-            <div>
-              <p className="text-lg font-semibold">{user?.username}</p>
-              <p className="text-sm text-muted-foreground">{user?.email}</p>
-              <p className="text-xs text-muted-foreground">
-                注册时间:{" "}
-                {user?.created_at
-                  ? new Date(user.created_at).toLocaleDateString("zh-CN")
-                  : "-"}
-              </p>
+      <div className="grid items-start gap-4 @min-[1040px]:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>用户信息</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center gap-4">
+              <Avatar className="h-16 w-16">
+                <AvatarFallback className="text-lg">
+                  {user?.username.slice(0, 2).toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
+              <div>
+                <p className="text-lg font-semibold">{user?.username}</p>
+                <p className="text-sm text-muted-foreground">{user?.email}</p>
+                <p className="text-xs text-muted-foreground">
+                  注册时间:{" "}
+                  {user?.created_at
+                    ? new Date(user.created_at).toLocaleDateString("zh-CN")
+                    : "-"}
+                </p>
+              </div>
             </div>
-          </div>
-          <Button variant="destructive" onClick={handleLogout}>
-            退出登录
-          </Button>
-        </CardContent>
-      </Card>
+            <Button variant="destructive" onClick={handleLogout}>
+              退出登录
+            </Button>
+          </CardContent>
+        </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Provider 配置</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <ProviderSection />
-        </CardContent>
-      </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Provider 配置</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ProviderSection />
+          </CardContent>
+        </Card>
 
-      <MemoryConsolidationCard />
+        <MemoryConsolidationCard />
 
-      <ContextMetricsCard />
-    </div>
+        <ContextMetricsCard />
+      </div>
+    </PageContainer>
   );
 }

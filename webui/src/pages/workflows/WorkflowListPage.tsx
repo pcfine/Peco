@@ -5,6 +5,8 @@ import { Input } from "@/components/ui/input";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageHeader } from "@/components/common/PageHeader";
+import { PageContainer } from "@/components/common/PageContainer";
+import { CardGrid } from "@/components/common/CardGrid";
 import { WorkflowCard } from "@/components/workflow/WorkflowCard";
 import { listWorkflows, executeWorkflow } from "@/api/workflows";
 import type { WorkflowListItem } from "@/types/workflow";
@@ -98,7 +100,7 @@ export function WorkflowListPage() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-5xl mx-auto space-y-4">
+    <PageContainer>
       {/* Header */}
       <PageHeader
         title="工作流"
@@ -110,23 +112,31 @@ export function WorkflowListPage() {
         }
       />
 
-      {/* Stat cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div className="rounded-lg border bg-card p-3 text-center">
-          <p className="text-2xl font-bold">{filtered.length}</p>
-          <p className="text-xs text-muted-foreground">全部</p>
+      {/* 汇总条：细线分隔的四段，避免宽屏下四个空荡的居中数字卡 */}
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-border @min-[740px]:grid-cols-4">
+        <div className="bg-card px-4 py-3">
+          <p className="text-2xl font-semibold leading-none tabular-nums">
+            {filtered.length}
+          </p>
+          <p className="mt-1.5 text-xs text-muted-foreground">全部</p>
         </div>
-        <div className="rounded-lg border bg-card p-3 text-center">
-          <p className="text-2xl font-bold">{runningCount}</p>
-          <p className="text-xs text-muted-foreground">运行中</p>
+        <div className="bg-card px-4 py-3">
+          <p className="text-2xl font-semibold leading-none tabular-nums">
+            {runningCount}
+          </p>
+          <p className="mt-1.5 text-xs text-muted-foreground">运行中</p>
         </div>
-        <div className="rounded-lg border bg-card p-3 text-center">
-          <p className="text-2xl font-bold">{enabledScheduleCount}</p>
-          <p className="text-xs text-muted-foreground">已启用调度</p>
+        <div className="bg-card px-4 py-3">
+          <p className="text-2xl font-semibold leading-none tabular-nums">
+            {enabledScheduleCount}
+          </p>
+          <p className="mt-1.5 text-xs text-muted-foreground">已启用调度</p>
         </div>
-        <div className="rounded-lg border bg-card p-3 text-center">
-          <p className="text-2xl font-bold">{totalExecs}</p>
-          <p className="text-xs text-muted-foreground">有执行记录</p>
+        <div className="bg-card px-4 py-3">
+          <p className="text-2xl font-semibold leading-none tabular-nums">
+            {totalExecs}
+          </p>
+          <p className="mt-1.5 text-xs text-muted-foreground">有执行记录</p>
         </div>
       </div>
 
@@ -164,7 +174,7 @@ export function WorkflowListPage() {
 
       {/* Card grid */}
       {filtered.length > 0 && (
-        <div className="grid gap-3 md:grid-cols-2">
+        <CardGrid>
           {filtered.map((wf) => (
             <WorkflowCard
               key={wf.name}
@@ -174,8 +184,8 @@ export function WorkflowListPage() {
               onView={handleView}
             />
           ))}
-        </div>
+        </CardGrid>
       )}
-    </div>
+    </PageContainer>
   );
 }

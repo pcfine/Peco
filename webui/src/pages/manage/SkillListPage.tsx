@@ -16,6 +16,8 @@ import {
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageHeader } from "@/components/common/PageHeader";
+import { PageContainer } from "@/components/common/PageContainer";
+import { CardGrid } from "@/components/common/CardGrid";
 import {
   listSkills,
   deleteSkill,
@@ -138,7 +140,7 @@ export function SkillListPage() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-4">
+    <PageContainer>
       {/* Header */}
       <PageHeader
         title="Skill 管理"
@@ -164,18 +166,18 @@ export function SkillListPage() {
           }
         />
       ) : (
-        <div className="grid gap-3 md:grid-cols-2">
+        <CardGrid>
           {skills.map((skill) => (
             <Card
               key={skill.name}
-              className="group hover:border-primary/50 transition-colors cursor-pointer"
+              className="group h-full py-0 hover:border-primary/50 transition-colors cursor-pointer"
               onClick={() =>
                 navigate(
                   `/workspace/skills/${encodeURIComponent(skill.name)}/edit`,
                 )
               }
             >
-              <CardContent className="p-4 flex items-start gap-3">
+              <CardContent className="p-4 flex items-start gap-3 h-full">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-accent">
                   <Puzzle className="h-5 w-5" />
                 </div>
@@ -214,7 +216,7 @@ export function SkillListPage() {
               </CardContent>
             </Card>
           ))}
-        </div>
+        </CardGrid>
       )}
 
       {/* Delete Confirmation Dialog */}
@@ -294,6 +296,6 @@ export function SkillListPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageContainer>
   );
 }

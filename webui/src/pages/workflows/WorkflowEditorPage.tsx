@@ -14,6 +14,7 @@ import { getWorkflow, createWorkflow, updateWorkflow } from "@/api/workflows";
 import { ArrowLeft, Save, Eye, Code2, FormInput } from "lucide-react";
 import { toast } from "sonner";
 import axios from "axios";
+import { PageContainer } from "@/components/common/PageContainer";
 
 function getApiErrorMessage(err: unknown): string | undefined {
   if (axios.isAxiosError(err)) {
@@ -161,21 +162,20 @@ export function WorkflowEditorPage() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-7xl mx-auto space-y-4">
+    <PageContainer width="wide" className="space-y-4">
       {/* Header */}
       <PageHeader
         title={isEdit ? `编辑 ${name}` : "新建工作流"}
-        leading={
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate("/workflows")}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-        }
         actions={
           <>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="返回工作流列表"
+              onClick={() => navigate("/workflows")}
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
             <div className="flex items-center border rounded-md p-0.5 mr-2">
               <button
                 type="button"
@@ -284,6 +284,6 @@ export function WorkflowEditorPage() {
           </div>
         </div>
       </div>
-    </div>
+    </PageContainer>
   );
 }

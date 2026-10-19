@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import axios from "axios";
+import { PageContainer } from "@/components/common/PageContainer";
 
 function getApiErrorMessage(err: unknown): string | undefined {
   if (axios.isAxiosError(err)) {
@@ -261,22 +262,21 @@ export function WorkflowDetailPage() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto space-y-4">
+    <PageContainer width="wide" className="space-y-4">
       {/* Header */}
       <PageHeader
         title={detail.name}
         description={detail.description}
-        leading={
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate("/workflows")}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-        }
         actions={
           <>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="返回工作流列表"
+              onClick={() => navigate("/workflows")}
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
             <Button onClick={handleExecute} disabled={executing}>
               <Play className="mr-2 h-4 w-4" />
               {executing ? "触发中..." : "执行"}
@@ -431,6 +431,6 @@ export function WorkflowDetailPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageContainer>
   );
 }

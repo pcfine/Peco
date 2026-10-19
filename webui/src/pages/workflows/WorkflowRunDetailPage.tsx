@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { PageContainer } from "@/components/common/PageContainer";
 
 export function WorkflowRunDetailPage() {
   const navigate = useNavigate();
@@ -136,7 +137,7 @@ export function WorkflowRunDetailPage() {
   }
 
   return (
-    <div className="max-w-5xl mx-auto space-y-4">
+    <PageContainer width="wide" className="space-y-4">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -243,6 +244,6 @@ export function WorkflowRunDetailPage() {
           </div>
         </div>
       </div>
-    </div>
+    </PageContainer>
   );
 }

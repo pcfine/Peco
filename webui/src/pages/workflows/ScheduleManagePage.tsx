@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import axios from "axios";
+import { PageContainer } from "@/components/common/PageContainer";
 
 function getApiErrorMessage(err: unknown): string | undefined {
   if (axios.isAxiosError(err)) {
@@ -125,7 +126,7 @@ export function ScheduleManagePage() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-3xl mx-auto space-y-4">
+    <PageContainer width="wide" className="space-y-4">
       {/* Header */}
       <PageHeader
         title="定时调度管理"
@@ -136,7 +137,7 @@ export function ScheduleManagePage() {
 
       {/* Create new schedule form */}
       {showCreate && (
-        <div className="border rounded-md p-4 space-y-3">
+        <div className="max-w-[640px] border rounded-md p-4 space-y-3">
           <h3 className="text-sm font-medium">新建调度</h3>
           <div className="space-y-1">
             <label className="text-xs">Workflow 名称</label>
@@ -246,6 +247,6 @@ export function ScheduleManagePage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageContainer>
   );
 }

@@ -1,10 +1,12 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageHeader } from "@/components/common/PageHeader";
+import { PageContainer } from "@/components/common/PageContainer";
+import { CardGrid } from "@/components/common/CardGrid";
 import { listAgents, deleteAgent } from "@/api/agents";
 import type { AgentListItem } from "@/types/agent";
 import {
@@ -19,6 +21,58 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
+
+/** 元数据 chip：名称过长时截断，保持单行。 */
+function Chip({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <span
+      className={cn(
+        "min-w-0 max-w-[100px] truncate rounded bg-accent px-1.5 py-0.5 text-xs",
+        className,
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+/**
+ * 元数据行：窄卡显示 2 项、宽卡显示 3 项，余量以 +N 收口。
+ *
+ * 断点用卡片自身宽度（Card 上有 @container），4 列下卡片变窄时自动少显示一项，
+ * 而不是把整行裁掉半截。
+ */
+function ChipRow({ icon, items }: { icon: ReactNode; items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div className="flex items-center gap-1 overflow-hidden">
+      <span className="shrink-0 text-muted-foreground">{icon}</span>
+      {items.slice(0, 2).map((it) => (
+        <Chip key={it}>{it}</Chip>
+      ))}
+      {items.length > 2 && (
+        <Chip className="hidden @min-[430px]:inline-block">{items[2]}</Chip>
+      )}
+      {items.length > 2 && (
+        <span className="shrink-0 text-xs text-muted-foreground @min-[430px]:hidden">
+          +{items.length - 2}
+        </span>
+      )}
+      {items.length > 3 && (
+        <span className="hidden shrink-0 text-xs text-muted-foreground @min-[430px]:inline">
+          +{items.length - 3}
+        </span>
+      )}
+    </div>
+  );
+}
 
 export function AgentListPage() {
   const navigate = useNavigate();
@@ -67,7 +121,7 @@ export function AgentListPage() {
 
   if (error) {
     return (
-      <div className="max-w-4xl mx-auto">
+      <PageContainer>
         <div className="flex flex-col items-center justify-center gap-4 py-20">
           <AlertCircle className="h-10 w-10 text-destructive" />
           <p className="text-muted-foreground text-sm">{error}</p>
@@ -76,12 +130,12 @@ export function AgentListPage() {
             重试
           </Button>
         </div>
-      </div>
+      </PageContainer>
     );
   }
 
   return (
-    <div className="max-w-4xl mx-auto space-y-4">
+    <PageContainer>
       <PageHeader
         title="Agent 管理"
         actions={
@@ -101,7 +155,7 @@ export function AgentListPage() {
           description="创建一个 Agent 开始使用"
         />
       ) : (
-        <div className="grid gap-3 md:grid-cols-2">
+        <CardGrid>
           {agents.map((a) => {
             const leftBg = a.background_color || "#6366f118";
             const isImg = a.icon.startsWith("/uploads/");
@@ -111,7 +165,7 @@ export function AgentListPage() {
                 to={`/workspace/agents/${a.id}/edit`}
                 className="block"
               >
-                <Card className="group h-[170px] hover:border-primary/50 transition-colors cursor-pointer overflow-hidden">
+                <Card className="@container group h-[170px] hover:border-primary/50 transition-colors cursor-pointer overflow-hidden">
                   <CardContent className="p-3 h-full flex gap-3">
                     {/* 左侧：正方形色块/图片 */}
                     <div
@@ -185,44 +239,16 @@ export function AgentListPage() {
                         )}
 
                         {/* 工具 */}
-                        {(a.tools ?? []).length > 0 && (
-                          <div className="flex items-center gap-1 overflow-hidden">
-                            <Wrench className="h-3 w-3 shrink-0 text-muted-foreground" />
-                            {(a.tools ?? []).slice(0, 3).map((t) => (
-                              <span
-                                key={t}
-                                className="rounded bg-accent px-1.5 py-0.5 text-xs truncate max-w-[100px]"
-                              >
-                                {t}
-                              </span>
-                            ))}
-                            {(a.tools ?? []).length > 3 && (
-                              <span className="text-xs text-muted-foreground shrink-0">
-                                +{(a.tools ?? []).length - 3}
-                              </span>
-                            )}
-                          </div>
-                        )}
+                        <ChipRow
+                          icon={<Wrench className="h-3 w-3" />}
+                          items={a.tools ?? []}
+                        />
 
                         {/* 知识库 */}
-                        {(a.knowledge_bases ?? []).length > 0 && (
-                          <div className="flex items-center gap-1 overflow-hidden">
-                            <Database className="h-3 w-3 shrink-0 text-muted-foreground" />
-                            {(a.knowledge_bases ?? []).slice(0, 3).map((kb) => (
-                              <span
-                                key={kb}
-                                className="rounded bg-accent px-1.5 py-0.5 text-xs truncate max-w-[100px]"
-                              >
-                                {kb}
-                              </span>
-                            ))}
-                            {(a.knowledge_bases ?? []).length > 3 && (
-                              <span className="text-xs text-muted-foreground shrink-0">
-                                +{(a.knowledge_bases ?? []).length - 3}
-                              </span>
-                            )}
-                          </div>
-                        )}
+                        <ChipRow
+                          icon={<Database className="h-3 w-3" />}
+                          items={a.knowledge_bases ?? []}
+                        />
                       </div>
                     </div>
                   </CardContent>
@@ -230,8 +256,8 @@ export function AgentListPage() {
               </Link>
             );
           })}
-        </div>
+        </CardGrid>
       )}
-    </div>
+    </PageContainer>
   );
 }

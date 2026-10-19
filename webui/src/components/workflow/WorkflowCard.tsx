@@ -59,7 +59,7 @@ export function WorkflowCard({
 
   return (
     <Card
-      className="group hover:border-primary/40 transition-colors cursor-pointer"
+      className="group h-full py-0 hover:border-primary/40 transition-colors cursor-pointer"
       onClick={() => onView(workflow.name)}
     >
       <CardContent className="p-4 space-y-3">

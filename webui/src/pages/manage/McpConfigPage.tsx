@@ -24,6 +24,8 @@ import {
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
 import { EmptyState } from "@/components/common/EmptyState";
 import { PageHeader } from "@/components/common/PageHeader";
+import { PageContainer } from "@/components/common/PageContainer";
+import { CardGrid } from "@/components/common/CardGrid";
 import { getMcpConfig, saveMcpConfig, testMcpConnection } from "@/api/mcp";
 import type {
   McpServerConfig,
@@ -386,7 +388,7 @@ export function McpConfigPage() {
   if (loading) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-4">
+    <PageContainer>
       {/* Header */}
       <PageHeader
         title="MCP 配置"
@@ -406,14 +408,14 @@ export function McpConfigPage() {
           description="添加一个 MCP 服务器开始使用"
         />
       ) : (
-        <div className="grid gap-3 md:grid-cols-2">
+        <CardGrid>
           {servers.map(([name, server]) => {
             const isStdio = server.transport === "stdio";
             const isTesting = testing === name;
             return (
               <Card
                 key={name}
-                className="group hover:border-primary/50 transition-colors"
+                className="group h-full py-0 hover:border-primary/50 transition-colors"
               >
                 <CardContent className="p-4 space-y-3">
                   {/* Row 1: status + name + transport badge + actions */}
@@ -497,7 +499,7 @@ export function McpConfigPage() {
               </Card>
             );
           })}
-        </div>
+        </CardGrid>
       )}
 
       {/* Delete Confirmation Dialog */}
@@ -717,6 +719,6 @@ export function McpConfigPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </PageContainer>
   );
 }
