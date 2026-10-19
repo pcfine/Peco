@@ -1,6 +1,12 @@
 import axios from "axios";
 import api from "./client";
-import type { SkillListItem, SkillDetail } from "@/types/skill";
+import type {
+  SkillListItem,
+  SkillDetail,
+  SkillFile,
+  SkillFileContent,
+  SkillResourceFile,
+} from "@/types/skill";
 
 export async function listSkills(): Promise<SkillListItem[]> {
   const res = await api.get<SkillListItem[]>("/skills");
@@ -12,13 +18,40 @@ export async function getSkill(name: string): Promise<SkillDetail> {
   return res.data;
 }
 
+/**
+ * 写入 SKILL.md；`files` 为要一并落盘的资源文件（仅 scripts/ references/ assets/）。
+ * 未列入 `files` 的既有资源文件不会被删除。
+ */
 export async function upsertSkill(
   name: string,
   content: string,
+  files: SkillResourceFile[] = [],
 ): Promise<{ success: boolean; message?: string }> {
   const res = await api.put<{ success: boolean; message?: string }>(
     `/skills/${encodeURIComponent(name)}`,
-    { content },
+    { content, files },
+  );
+  return res.data;
+}
+
+/** 列出 skill 目录内全部文件（不含根级 SKILL.md）。 */
+export async function listSkillFiles(
+  name: string,
+): Promise<{ files: SkillFile[] }> {
+  const res = await api.get<{ files: SkillFile[] }>(
+    `/skills/${encodeURIComponent(name)}/files`,
+  );
+  return res.data;
+}
+
+/** 读取单个文件内容（服务端 256 KB 截断，二进制返回 415）。 */
+export async function readSkillFile(
+  name: string,
+  path: string,
+): Promise<SkillFileContent> {
+  const res = await api.get<SkillFileContent>(
+    `/skills/${encodeURIComponent(name)}/files`,
+    { params: { path } },
   );
   return res.data;
 }
