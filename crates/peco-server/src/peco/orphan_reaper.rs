@@ -14,7 +14,6 @@ struct ProcFacts<'a> {
     pid: i32,
     ppid: i32,
     sid: i32,
-    /// 可执行文件与本进程相同（即另一个 peco-server）。
     exe_is_self: bool,
     environ: &'a [u8],
 }
