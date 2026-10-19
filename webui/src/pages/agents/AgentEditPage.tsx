@@ -4,9 +4,7 @@ import { AgentForm } from "./components/AgentForm";
 import { getAgent, updateAgent } from "@/api/agents";
 import type { AgentDetail, UpdateAgentRequest } from "@/types/agent";
 import { LoadingSpinner } from "@/components/common/LoadingSpinner";
-import { Button } from "@/components/ui/button";
-import { PageHeader } from "@/components/common/PageHeader";
-import { ArrowLeft } from "lucide-react";
+import { PageContainer } from "@/components/common/PageContainer";
 import { toast } from "sonner";
 
 export function AgentEditPage() {
@@ -35,24 +33,15 @@ export function AgentEditPage() {
   if (!agent) return <LoadingSpinner />;
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <PageHeader
-        title="编辑 Agent"
-        leading={
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate("/workspace/agents")}
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </Button>
-        }
-      />
-      <AgentForm
-        defaultValues={agent}
-        onSubmit={(d) => handleSubmit(d as UpdateAgentRequest)}
-        onCancel={() => navigate("/workspace/agents")}
-      />
+    <div className="@container flex h-full min-h-0 flex-col">
+      <PageContainer className="flex min-h-0 flex-1 flex-col space-y-0 max-lg:h-auto max-lg:pb-6">
+        <AgentForm
+          title="编辑 Agent"
+          defaultValues={agent}
+          onSubmit={(d) => handleSubmit(d as UpdateAgentRequest)}
+          onCancel={() => navigate("/workspace/agents")}
+        />
+      </PageContainer>
     </div>
   );
 }

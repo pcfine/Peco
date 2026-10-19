@@ -2,10 +2,8 @@ import { useNavigate } from "react-router-dom";
 import { AgentForm } from "./components/AgentForm";
 import { createAgent } from "@/api/agents";
 import type { CreateAgentRequest } from "@/types/agent";
-import { Button } from "@/components/ui/button";
-import { PageHeader } from "@/components/common/PageHeader";
-import { ArrowLeft } from "lucide-react";
 import { toast } from "sonner";
+import { PageContainer } from "@/components/common/PageContainer";
 
 export function AgentCreatePage() {
   const navigate = useNavigate();
@@ -21,23 +19,14 @@ export function AgentCreatePage() {
   };
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <PageHeader
-        title="创建 Agent"
-        leading={
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate("/workspace/agents")}
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </Button>
-        }
-      />
-      <AgentForm
-        onSubmit={handleSubmit}
-        onCancel={() => navigate("/workspace/agents")}
-      />
+    <div className="@container flex h-full min-h-0 flex-col">
+      <PageContainer className="flex min-h-0 flex-1 flex-col space-y-0 max-lg:h-auto max-lg:pb-6">
+        <AgentForm
+          title="创建 Agent"
+          onSubmit={handleSubmit}
+          onCancel={() => navigate("/workspace/agents")}
+        />
+      </PageContainer>
     </div>
   );
 }
