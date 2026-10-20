@@ -68,6 +68,7 @@ pub async fn get(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    check_skill_name(&name)?;
     let ws = state
         .workspace_manager
         .get_synced(&user_id, &state.db)
@@ -114,6 +115,7 @@ pub async fn delete_skill(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
+    check_skill_name(&name)?;
     let ws = state
         .workspace_manager
         .get_synced(&user_id, &state.db)
@@ -141,6 +143,7 @@ pub async fn export_skill(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Vec<u8>, ApiError> {
+    check_skill_name(&name)?;
     let ws = state
         .workspace_manager
         .get_synced(&user_id, &state.db)
@@ -189,6 +192,15 @@ pub async fn import_skill(
 }
 
 // ── 内部辅助 ────────────────────────────────────────────────────────────────
+
+/// 校验 `{name}` 路径参数。
+///
+/// axum 会把 `%2F` 解码进 `{name}`，于是 `..%2F..%2Fetc` 变成 `../../etc`；
+/// 未校验时 `skills_dir().join(name)` 会逃出 skills 根目录。读写两类端点
+/// 都必须先过这道闸。
+fn check_skill_name(name: &str) -> Result<(), ApiError> {
+    validate_name(name).map_err(ApiError::BadRequest)
+}
 
 /// 重新计算 skills 模块哈希并写入 DB（模块文件变更后调用）。
 async fn refresh_skills_hash(state: &AppState, user_id: &str, skills_dir: &std::path::Path) {
@@ -272,10 +284,7 @@ pub async fn files(
     Path(name): Path<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<SkillFilesResponse>, ApiError> {
-    // `{name}` 已由 axum 百分号解码，`..%2F..` 会还原成 `../..`；与写路径共用同一套名称校验。
-    if let Err(msg) = validate_name(&name) {
-        return Err(ApiError::BadRequest(msg));
-    }
+    check_skill_name(&name)?;
     let ws = state
         .workspace_manager
         .get_synced(&user_id, &state.db)

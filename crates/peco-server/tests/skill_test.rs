@@ -351,3 +351,50 @@ async fn test_files_rejects_traversal_in_skill_name() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+// ── 兄弟端点名称闸门 ────────────────────────────────────────────────────────
+
+/// `get` / `export` / `delete` 与 `files` 一样暴露 `{name}`，必须同样校验，
+/// 否则 `..%2F..%2F<dir>` 会逃出 skills 根目录——读他人内容、删任意目录。
+#[tokio::test]
+async fn test_get_export_delete_reject_traversal_in_skill_name() {
+    let app = TestApp::new().await;
+
+    // skills_dir 的爷爷目录：`../../<name>` 正好落在这里。
+    let escape_target = skills_dir(&app)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("escape-{}", &app.user_id[..8]));
+    std::fs::create_dir_all(&escape_target).unwrap();
+    std::fs::write(escape_target.join("SKILL.md"), DEMO_SKILL).unwrap();
+    std::fs::write(escape_target.join("keep.txt"), "keep").unwrap();
+
+    let encoded = format!("..%2F..%2Fescape-{}", &app.user_id[..8]);
+
+    let resp = app
+        .get(&format!("/api/skills/{encoded}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "GET 应拒绝越界名称");
+
+    let resp = app
+        .get(&format!("/api/skills/{encoded}/export"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "export 应拒绝越界名称");
+
+    let resp = app
+        .delete(&format!("/api/skills/{encoded}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "DELETE 应拒绝越界名称");
+    assert!(
+        escape_target.join("keep.txt").is_file(),
+        "越界名称不得删除 skills 根之外的目录"
+    );
+}
