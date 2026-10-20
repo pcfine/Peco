@@ -108,7 +108,7 @@ fn wrapper_value_opts(wrapper: &str) -> &'static [&'static str] {
 
 /// 跳过前缀包装与 `VAR=val` 赋值，返回 (程序名, 其余参数)。
 /// 包装器的选项及其取值一并跳过，否则 `sudo -n rm -rf /` 会漏拦。
-fn leading_program<'a>(seg: &'a [String]) -> Option<(&'a str, &'a [String])> {
+fn leading_program(seg: &[String]) -> Option<(&str, &[String])> {
     const WRAPPERS: [&str; 7] = ["sudo", "doas", "env", "nohup", "time", "command", "exec"];
     let mut i = 0;
     while i < seg.len() {
@@ -172,12 +172,12 @@ fn recursion_signal(prog: &str, rest: &[String]) -> Option<String> {
             return Some(tok.clone());
         }
         // 只认该程序自己的递归字母。
-        if let (Some(letters), false) = (recursive_letters(prog), tok.starts_with("--")) {
-            if let Some(cluster) = tok.strip_prefix('-') {
-                if !cluster.is_empty() && cluster.chars().any(|c| letters.contains(c)) {
-                    return Some(tok.clone());
-                }
-            }
+        if let (Some(letters), false) = (recursive_letters(prog), tok.starts_with("--"))
+            && let Some(cluster) = tok.strip_prefix('-')
+            && !cluster.is_empty()
+            && cluster.chars().any(|c| letters.contains(c))
+        {
+            return Some(tok.clone());
         }
     }
     None
