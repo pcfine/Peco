@@ -4,6 +4,7 @@ node_modules/
 node_modules.bak/
 dist/
 .env
+.cargo/
 
 **/knowledge/**/__manifest/
 **/knowledge/**/*.lance/
