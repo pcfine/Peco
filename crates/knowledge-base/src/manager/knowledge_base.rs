@@ -677,6 +677,21 @@ impl KnowledgeBase {
     /// `entity_id` 由本方法一并返回，是为了把 `compute_entity_id` 的调用**收敛在
     /// manager 内部**（与 `add_facts` 同源）——工具层不得自行计算，否则口径漂移
     /// 的表现是静默 no-op 而非报错。
+    pub async fn read_entity(
+        &self,
+        entity_name: &str,
+    ) -> Result<(String, Option<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        let entity_id = compute_entity_id(entity_name, &id_scope_for(&self.ns));
+        let (node, edges) = self.read_entity_by_id(&entity_id).await?;
+        Ok((entity_id, node, edges))
+    }
+
+    /// 按节点 id 读取实体节点及其双向关联边（存在性判定 + 审计快照）。
+    ///
+    /// 与 [`Self::read_entity`] 的唯一差别是**不做 `compute_entity_id`**：图谱下发的
+    /// id 已经是真值，用 name 反算只在名称可逆时才碰巧相等，而 HelixDB 对不存在的
+    /// 节点是静默 no-op —— 反算错了不会报错，只会删不到东西却回成功。
+    /// `entity_id` 不以 [`ENTITY_ID_PREFIX`] 开头 → [`KnowledgeError::InvalidInput`]。
     ///
     /// 关联边的收集方式：先用 1 跳双向遍历拿到邻居 id，再对每个邻居调一次
     /// [`GraphStore::edges_between`]（`edge_type: None` 为该方法的双向通配形态）。
@@ -686,19 +701,19 @@ impl KnowledgeBase {
     ///
     /// 代价是 `1 + n` 次查询（`n` = 度数）。实体度数在事实图里是个位数，
     /// 可接受；此方法只用于级联删除前的单次快照。
-    pub async fn read_entity(
+    pub async fn read_entity_by_id(
         &self,
-        entity_name: &str,
-    ) -> Result<(String, Option<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
+        entity_id: &str,
+    ) -> Result<(Option<GraphNode>, Vec<KnowledgeEdge>), KnowledgeError> {
         let gs = self.graph_store.as_ref().ok_or_else(|| {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
+        ensure_entity_id(entity_id)?;
 
-        let entity_id = compute_entity_id(entity_name, &id_scope_for(&self.ns));
-        let node = gs.get_node(&entity_id).await?;
+        let node = gs.get_node(entity_id).await?;
 
         let steps = gs
-            .traverse(&entity_id, &[], TraversalDirection::Both, 1)
+            .traverse(entity_id, &[], TraversalDirection::Both, 1)
             .await?;
 
         let mut edges: Vec<KnowledgeEdge> = Vec::new();
@@ -707,10 +722,10 @@ impl KnowledgeBase {
             if step.via_edge.is_none() || step.node.id == entity_id {
                 continue;
             }
-            edges.extend(gs.edges_between(&entity_id, &step.node.id, None).await?);
+            edges.extend(gs.edges_between(entity_id, &step.node.id, None).await?);
         }
 
-        Ok((entity_id, node, edges))
+        Ok((node, edges))
     }
 
     /// 删除一个实体节点，返回 `(被删除的边数, 被删除的节点数)`。
@@ -725,14 +740,47 @@ impl KnowledgeBase {
         entity_name: &str,
         cascade: bool,
     ) -> Result<(usize, usize), KnowledgeError> {
+        let entity_id = compute_entity_id(entity_name, &id_scope_for(&self.ns));
+        self.delete_entity_by_id(&entity_id, cascade).await
+    }
+
+    /// 按节点 id 删除实体节点，返回 `(删除前观测到的关联边数, 删除的节点数)`。
+    ///
+    /// 存在性是前置条件：`get_node` 为 `None` → [`KnowledgeError::NotFound`]。
+    /// 图后端删不存在的节点不报错，不看前置读就无从区分「删掉了」与「本来就没有」，
+    /// 调用方会把静默 no-op 当成成功（`entity:` 前缀断言同理，防止拿文档 id 误删）。
+    pub async fn delete_entity_by_id(
+        &self,
+        entity_id: &str,
+        cascade: bool,
+    ) -> Result<(usize, usize), KnowledgeError> {
         let gs = self.graph_store.as_ref().ok_or_else(|| {
             KnowledgeError::InvalidInput("Current backend does not support graph storage".into())
         })?;
+        ensure_entity_id(entity_id)?;
 
-        let entity_id = compute_entity_id(entity_name, &id_scope_for(&self.ns));
-        let removed_edges = gs.remove_node(&entity_id, cascade).await?;
+        if gs.get_node(entity_id).await?.is_none() {
+            return Err(KnowledgeError::NotFound(format!(
+                "Entity node '{entity_id}' not found"
+            )));
+        }
+
+        let removed_edges = gs.remove_node(entity_id, cascade).await?;
         Ok((removed_edges, 1))
     }
+}
+
+/// 实体节点 id 的前缀 —— `compute_entity_id` 的固定开头。
+const ENTITY_ID_PREFIX: &str = "entity:";
+
+/// 拒绝非实体 id：图里还有文档 / 分块节点，按它们的 id 调删除会删掉实体之外的东西。
+fn ensure_entity_id(entity_id: &str) -> Result<(), KnowledgeError> {
+    if !entity_id.starts_with(ENTITY_ID_PREFIX) {
+        return Err(KnowledgeError::InvalidInput(format!(
+            "Not an entity node id: '{entity_id}'"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +790,70 @@ impl KnowledgeBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::KnowledgeBaseManager;
     use std::sync::Mutex;
+
+    fn memory_kb_config(name: &str) -> KbConfig {
+        KbConfig {
+            name: name.to_string(),
+            description: "测试".into(),
+            embedding_model: super::super::config::FastembedModelTypeSerde::AllMiniLML6V2Q,
+            chunking: super::super::config::ChunkingStrategySerde::FixedSize { size: 100 },
+            backend: BackendType::InMemory,
+            storage_path: None,
+            default_storage_mode: Default::default(),
+            helix_url: None,
+        }
+    }
+
+    /// 按 id 删除必须先看存在性：图后端删不存在的节点不报错，缺了这道判定，
+    /// 「删了 0 个」会伪装成成功，调用方（HTTP / agent 工具）只能报 404 之外的东西。
+    #[tokio::test]
+    async fn delete_entity_by_id_reports_missing_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr
+            .create_kb(memory_kb_config("entity-delete-test"))
+            .await
+            .unwrap();
+
+        // 不存在的节点 → NotFound
+        match kb
+            .delete_entity_by_id("entity:Entity:x:deadbeef", true)
+            .await
+        {
+            Err(KnowledgeError::NotFound(msg)) => assert!(msg.contains("deadbeef"), "{msg}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // 非实体 id → InvalidInput（拿文档 / 分块 id 走实体删除会删错东西）
+        match kb.delete_entity_by_id("not-an-entity-id", true).await {
+            Err(KnowledgeError::InvalidInput(_)) => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // 对照：已存在的节点照常删除，边数如实上报
+        kb.add_facts(
+            &[
+                Fact::new("小C", "朋友", "chen", 0.95),
+                Fact::new("小C", "年龄", "30", 0.9),
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+        let entity_id = kb.entity_id("小C");
+        assert_eq!(
+            kb.delete_entity_by_id(&entity_id, true).await.unwrap(),
+            (2, 1)
+        );
+
+        // 第二次按同一 id 删除 → NotFound（读-删之后不能再回成功）
+        match kb.delete_entity_by_id(&entity_id, true).await {
+            Err(KnowledgeError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
 
     /// `resolve_helix_url` 读写进程级环境变量，用例串行执行避免相互干扰。
     static ENV_LOCK: Mutex<()> = Mutex::new(());

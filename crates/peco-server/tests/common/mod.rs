@@ -276,6 +276,14 @@ impl TestApp {
             .post(format!("{}{}", self.base_url, path))
             .bearer_auth(token)
     }
+
+    /// 使用第二个用户的 token 发送 DELETE 请求。
+    #[allow(dead_code)]
+    pub fn delete_as(&self, path: &str, token: &str) -> reqwest::RequestBuilder {
+        self.client
+            .delete(format!("{}{}", self.base_url, path))
+            .bearer_auth(token)
+    }
 }
 
 // ── TestServerConfig ───────────────────────────────────────────────────────────

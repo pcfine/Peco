@@ -1,4 +1,4 @@
-// 记忆图谱视图 —— 取数 + dagre 布局 + 纯 SVG 渲染 + 选中 / 平移 / 缩放
+// 记忆图谱视图 —— 取数 + dagre 布局 + 纯 SVG 渲染 + 选中 / 删除 / 平移 / 缩放
 
 import {
   useCallback,
@@ -11,8 +11,9 @@ import {
 } from "react";
 import { graphlib, layout } from "@dagrejs/dagre";
 import axios from "axios";
-import { Minus, Plus, RefreshCw } from "lucide-react";
-import { getMemoryGraph } from "@/api/memory";
+import { Minus, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { deleteMemoryNode, getMemoryGraph } from "@/api/memory";
 import type { EdgeLabel } from "@dagrejs/dagre";
 import type {
   MemoryEdge,
@@ -26,6 +27,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { MemoryDeleteDialog } from "@/components/memory/MemoryDeleteDialog";
 
 /** 供父组件（`MemoryPage`）触发重新拉取的句柄。 */
 export interface MemoryGraphViewHandle {
@@ -297,6 +299,11 @@ function truncateName(name: string): string {
   return name.length > NAME_MAX ? `${name.slice(0, NAME_MAX)}…` : name;
 }
 
+/** 节点显示名：后端允许 `name` 为空串，删除确认里必须给出可分辨的替代标识。 */
+function nodeDisplayName(node: { id: string; name: string }): string {
+  return node.name || `未命名节点（${node.id.slice(-12)}）`;
+}
+
 export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   const [data, setData] = useState<MemoryGraphResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -304,6 +311,12 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
   // 无该库时后端 404，视为空图。
   const [notFound, setNotFound] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  // 删除确认（目标单独持有：成功后要先清选中，目标不能跟着选中一起消失）
+  const [nodeDeleteTarget, setNodeDeleteTarget] = useState<MemoryNode | null>(
+    null,
+  );
+  const [deletingNode, setDeletingNode] = useState(false);
+  const [nodeDeleteError, setNodeDeleteError] = useState<string | null>(null);
   /** 被隐藏的节点类型（图例键）。空集 = 全开；只影响渲染掩码，不持久化。 */
   const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
   const [view, setView] = useState({ tx: 0, ty: 0, k: 1 });
@@ -695,6 +708,59 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
     return out;
   }, [data, selectedNodeId]);
 
+  /** 待删节点的关联边数（与选中面板的 `relations` 同口径，但不依赖选中态）。 */
+  const nodeDeleteEdgeCount = useMemo(() => {
+    if (!data || !nodeDeleteTarget) return 0;
+    return data.edges.filter(
+      (e) =>
+        e.source === nodeDeleteTarget.id || e.target === nodeDeleteTarget.id,
+    ).length;
+  }, [data, nodeDeleteTarget]);
+
+  const openNodeDelete = (node: MemoryNode) => {
+    setNodeDeleteError(null);
+    setNodeDeleteTarget(node);
+  };
+
+  const closeNodeDelete = () => {
+    setNodeDeleteTarget(null);
+    setNodeDeleteError(null);
+  };
+
+  const confirmNodeDelete = async () => {
+    if (!nodeDeleteTarget) return;
+    const id = nodeDeleteTarget.id;
+    setDeletingNode(true);
+    setNodeDeleteError(null);
+    try {
+      const res = await deleteMemoryNode(id);
+      toast.success(`已删除实体节点，连带 ${res.removed_edges} 条关联关系`);
+      closeNodeDelete();
+      // 局部移除而非整页重取：少一次全图请求，也避免重排后视图跳动。
+      setData(
+        (prev) =>
+          prev && {
+            ...prev,
+            nodes: prev.nodes.filter((n) => n.id !== id),
+            edges: prev.edges.filter((e) => e.source !== id && e.target !== id),
+          },
+      );
+      setSelectedNodeId(null);
+    } catch (err) {
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+      if (status === 404) {
+        toast.warning("该实体节点已被删除");
+        closeNodeDelete();
+        setSelectedNodeId(null);
+        void load();
+      } else {
+        setNodeDeleteError(getApiErrorMessage(err) ?? "删除失败");
+      }
+    } finally {
+      setDeletingNode(false);
+    }
+  };
+
   // 未测得视口（含 jsdom 无布局）时退回内容尺寸 ⇒ viewBox 与内容同尺寸、k=1。
   const vw = vp.w || layoutData?.width || 1;
   const vh = vp.h || layoutData?.height || 1;
@@ -1043,9 +1109,21 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
             data-testid="memory-selected-panel"
           >
             <CardHeader>
-              <CardTitle className="text-base break-all">
-                {selectedNode.name}
-              </CardTitle>
+              <div className="flex items-start justify-between gap-2">
+                <CardTitle className="text-base break-all">
+                  {selectedNode.name}
+                </CardTitle>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="删除该节点"
+                  title="删除该节点"
+                  data-testid="memory-node-delete"
+                  onClick={() => openNodeDelete(selectedNode)}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>
               <ScrollArea className="max-h-[420px]">
@@ -1082,6 +1160,33 @@ export function MemoryGraphView({ ref }: MemoryGraphViewProps) {
           </Card>
         )}
       </div>
+      <MemoryDeleteDialog
+        open={nodeDeleteTarget !== null}
+        title="确认删除这个实体节点？"
+        description={
+          <>
+            <span className="block">
+              将永久删除实体「
+              <span className="font-semibold">
+                {nodeDeleteTarget && nodeDisplayName(nodeDeleteTarget)}
+              </span>
+              」，并同时删除它的{" "}
+              {data.truncated
+                ? `至少 ${nodeDeleteEdgeCount}`
+                : nodeDeleteEdgeCount}{" "}
+              条关联关系。删除后该实体及其关系不会再出现在记忆图谱中。
+            </span>
+            <span className="block">
+              图实体删除不可一键恢复：审计只保留关系快照（不含对端实体名称），无法自动重放。
+            </span>
+          </>
+        }
+        busy={deletingNode}
+        error={nodeDeleteError}
+        onCancel={closeNodeDelete}
+        onConfirm={() => void confirmNodeDelete()}
+        testId="memory-node-delete-dialog"
+      />
     </div>
   );
 }

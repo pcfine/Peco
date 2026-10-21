@@ -22,6 +22,8 @@
 //   - GET  /api/peco/memory/graph                记忆实体子图（节点 + 谓词边）
 //   - GET  /api/peco/memory/documents            记忆文档列表（分页，可按 source 过滤）
 //   - GET  /api/peco/memory/documents/{id}       记忆文档详情（全文 + 元数据）
+//   - DELETE /api/peco/memory/documents/{id}     删除单条记忆文档（写删除审计）
+//   - DELETE /api/peco/memory/graph/nodes/{id}   删除单个实体节点及其关联边
 //   - GET  /api/peco/memory/search               记忆内容检索（正文子串扫描）
 //   - GET  /api/peco/memory/supersede/health     取代对账健康计数
 //   - POST /api/peco/memory/supersede/reconcile  手动触发一次取代对账
@@ -44,7 +46,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum_extra::extract::Multipart;
 use futures::stream::Stream;
 use model_provider::{Content, ContentPart, InputItem};
@@ -54,7 +56,10 @@ use peco_core::agent::{
 use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
 use peco_core::persistence::SessionPersister;
 use peco_core::session::{Session, SessionSnapshot};
-use peco_core::tools::MemoryAuditEntry;
+use peco_core::tools::{
+    DeleteOrigin, KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry, MemoryDeleteError,
+    delete_document, delete_entity_by_id,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
@@ -68,6 +73,7 @@ use crate::peco::active::{
 use crate::session_dto::{TurnData, turns_to_dto};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
+use crate::workspace::SqliteMemoryAudit;
 
 use super::emitter::{PecoRunEvent, RunEmitter, run_event_to_sse};
 use super::filter::PecoContextFilter;
@@ -2168,6 +2174,130 @@ pub async fn get_memory_document(
     Ok(Json(view::build_document_detail(doc)))
 }
 
+/// `DELETE /memory/documents/{id}` 的成功响应。
+#[derive(Debug, Serialize)]
+pub struct DeleteMemoryDocumentResponse {
+    pub doc_id: String,
+    pub removed_chunks: usize,
+    /// 可追溯锚点：审计行 id（回滚面按它索引）。
+    pub audit_id: i64,
+}
+
+/// `DELETE /memory/graph/nodes/{id}` 的成功响应。
+#[derive(Debug, Serialize)]
+pub struct DeleteMemoryNodeResponse {
+    pub entity_id: String,
+    pub removed_edges: usize,
+    pub removed_nodes: usize,
+    pub audit_id: i64,
+}
+
+/// 删除失败 → [`ApiError`]。
+///
+/// `op` 是 500 details 的操作前缀；`not_found` 由调用方给 —— 两个端点「什么不存在」
+/// 不同，而 404 的 details 是对外契约的一部分。
+fn map_memory_delete_error(op: &str, not_found: &str, e: MemoryDeleteError) -> ApiError {
+    match e {
+        MemoryDeleteError::NotFound(_) => ApiError::NotFound(not_found.to_string()),
+        MemoryDeleteError::Forbidden(_) => {
+            ApiError::Forbidden("画像记忆（ppa_profile）不支持删除".into())
+        }
+        MemoryDeleteError::Conflict(details) => ApiError::Conflict(details),
+        MemoryDeleteError::Unavailable(details) | MemoryDeleteError::Internal(details) => {
+            ApiError::Internal(format!("{op}: {details}"))
+        }
+    }
+}
+
+/// `DELETE /api/peco/memory/documents/{id}` —— 删除单条记忆文档。
+///
+/// 库名写死 `@private_memory`：路径与请求体都不接受库名，跨库删除不是本端点的语义。
+pub async fn delete_memory_document(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path(doc_id): Path<String>,
+) -> Result<Json<DeleteMemoryDocumentResponse>, ApiError> {
+    let doc_id = doc_id.trim();
+    if doc_id.is_empty() {
+        return Err(ApiError::BadRequest("文档 id 不能为空".into()));
+    }
+
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let access: Arc<dyn KnowledgeAccess> = ws;
+    let audit: Arc<dyn MemoryAuditAccess> = Arc::new(SqliteMemoryAudit::new(state.db.clone()));
+
+    let deleted = delete_document(
+        &access,
+        &audit,
+        PRIVATE_MEMORY_KB,
+        doc_id,
+        DeleteOrigin::User,
+    )
+    .await
+    .map_err(|e| {
+        map_memory_delete_error(
+            "failed to delete memory document",
+            "文档不存在或已被删除",
+            e,
+        )
+    })?;
+
+    Ok(Json(DeleteMemoryDocumentResponse {
+        doc_id: deleted.doc_id,
+        removed_chunks: deleted.removed_chunks,
+        audit_id: deleted.audit_id,
+    }))
+}
+
+/// `DELETE /api/peco/memory/graph/nodes/{id}` —— 删除单个实体节点及其全部关联边。
+///
+/// 恒级联：本端点的产品语义就是「删节点 + 连带关联边」，把 `cascade=false` 暴露出去
+/// 只会给 UI 多一条 409 分支而没有用户价值。前缀校验放在契约层 —— 图上除实体外还有
+/// 文档/分块节点，按它们的 id 走到这里会删掉不该删的东西。
+pub async fn delete_memory_node(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Path(entity_id): Path<String>,
+) -> Result<Json<DeleteMemoryNodeResponse>, ApiError> {
+    if !entity_id.starts_with("entity:") {
+        return Err(ApiError::BadRequest("不是实体节点 id".into()));
+    }
+
+    let ws = state
+        .workspace_manager
+        .get_synced(&user_id, &state.db)
+        .await?;
+    let access: Arc<dyn KnowledgeAccess> = ws;
+    let audit: Arc<dyn MemoryAuditAccess> = Arc::new(SqliteMemoryAudit::new(state.db.clone()));
+
+    let deleted = delete_entity_by_id(
+        &access,
+        &audit,
+        PRIVATE_MEMORY_KB,
+        &entity_id,
+        true,
+        DeleteOrigin::User,
+    )
+    .await
+    .map_err(|e| {
+        map_memory_delete_error(
+            "failed to delete memory node",
+            "实体节点不存在或已被删除",
+            e,
+        )
+    })?;
+
+    Ok(Json(DeleteMemoryNodeResponse {
+        entity_id: deleted.entity_id,
+        removed_edges: deleted.removed_edges,
+        removed_nodes: deleted.removed_nodes,
+        audit_id: deleted.audit_id,
+    }))
+}
+
 /// `GET /api/peco/memory/search` —— 记忆内容检索（E4，正文子串扫描）。
 ///
 /// 一次只读查询取回至多 `SCAN_LIMIT + 1` 条文档（含正文），Rust 侧做大小写不敏感
@@ -2309,6 +2439,8 @@ pub struct SupersedeHealthResponse {
 /// - `GET /memory/graph` — 记忆实体子图（节点 + 谓词边）
 /// - `GET /memory/documents` — 记忆文档列表（分页，可按 `source` 过滤）
 /// - `GET /memory/documents/{id}` — 记忆文档详情（全文 + 元数据）
+/// - `DELETE /memory/documents/{id}` — 删除单条记忆文档（写删除审计）
+/// - `DELETE /memory/graph/nodes/{id}` — 删除单个实体节点及其关联边
 /// - `GET /memory/search` — 记忆内容检索（正文子串扫描，`?q=&limit[&source]`）
 /// - `GET /memory/supersede/health` — 取代对账健康计数
 /// - `POST /memory/supersede/reconcile` — 手动触发一次取代对账
@@ -2345,7 +2477,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/memory/consolidation/optin", put(set_memory_optin))
         .route("/memory/graph", get(get_memory_graph))
         .route("/memory/documents", get(list_memory_documents))
-        .route("/memory/documents/{id}", get(get_memory_document))
+        .route(
+            "/memory/documents/{id}",
+            get(get_memory_document).delete(delete_memory_document),
+        )
+        .route("/memory/graph/nodes/{id}", delete(delete_memory_node))
         .route("/memory/search", get(search_memory_documents))
         .route("/memory/supersede/health", get(supersede_health))
         .route("/memory/supersede/reconcile", post(supersede_reconcile))

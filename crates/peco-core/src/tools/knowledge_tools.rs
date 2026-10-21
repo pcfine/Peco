@@ -14,6 +14,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::deps::{KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry};
+use super::memory_delete::{DeleteOrigin, delete_document, delete_entity_by_name};
+// 图事实标签与审计快照的「来源」同一口径：删除侧（含 REST 端点）只认这个字面量。
+use super::memory_delete::GRAPH_FACT_SOURCE;
 
 use super::{Content, StringError, ToolDyn, ToolError};
 use crate::knowledge::hash_manifest::now_iso8601;
@@ -808,12 +811,6 @@ impl ToolDyn for QueryEntityFacts {
 // 写响应不报告删除条数（`DropEdgeLabeled` 后的 `Count` 数的是流经的源节点数），
 // 且删除不存在的边是静默 no-op（HTTP 200）—— 不看前置读就没有任何信号。
 
-/// 图事实在 `memory_audit.source` 上的显式标记。
-///
-/// 图上无真实来源可填（见本节开头），因此用固定标签把图事实与 `ppa_*` 文档
-/// 区分开 —— 回滚重放按这个字段分流（事实走 `add_facts`，文档走文档重建）。
-const GRAPH_FACT_SOURCE: &str = "graph_fact";
-
 /// 事实边的审计快照 —— 写进 `MemoryAuditEntry::content`。
 ///
 /// 回滚 = 按 `weight` 逐条重放 `add_facts`，因此必须存**真实 weight**：
@@ -834,39 +831,6 @@ fn fact_snapshot_json(
                 json!({
                     "source_id": e.source_id,
                     "target_id": e.target_id,
-                    "weight": e.weight,
-                    "properties": e.properties,
-                })
-            })
-            .collect::<Vec<_>>(),
-    })
-}
-
-/// 实体级联删除的审计快照 —— 写进 `MemoryAuditEntry::content`。
-///
-/// 级联删除要重建的远不止一条边，因此快照必须包含删除前的完整状况：
-/// 节点属性 + **两个方向**的全部关联边。`edges[]` 里每条边都带 `weight`，
-/// 回滚按 `(source_id 对应的实体名, via 标签, target_id)` 逐条重放。
-fn entity_snapshot_json(
-    entity_name: &str,
-    entity_id: &str,
-    node: &Option<knowledge_base::GraphNode>,
-    edges: &[knowledge_base::KnowledgeEdge],
-) -> serde_json::Value {
-    json!({
-        "entity_name": entity_name,
-        "entity_id": entity_id,
-        "node": node.as_ref().map(|n| json!({
-            "labels": n.labels,
-            "properties": n.properties,
-        })),
-        "edges": edges
-            .iter()
-            .map(|e| {
-                json!({
-                    "source_id": e.source_id,
-                    "target_id": e.target_id,
-                    "predicate": e.edge_type.as_label(),
                     "weight": e.weight,
                     "properties": e.properties,
                 })
@@ -1179,14 +1143,16 @@ impl ToolDyn for DeleteEntity {
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
             let audit = require_audit(&self.memory_audit)?;
 
-            let outcome = delete_entity_one(
+            let outcome = delete_entity_by_name(
                 &self.access,
                 audit,
                 &parsed.kb_name,
                 &parsed.entity_name,
                 parsed.cascade,
+                DeleteOrigin::Agent,
             )
-            .await?;
+            .await
+            .map_err(|e| string_err(e.to_string()))?;
 
             serde_json::to_string_pretty(&json!({
                 "kb_name": parsed.kb_name,
@@ -1203,14 +1169,13 @@ impl ToolDyn for DeleteEntity {
 }
 
 // ============================================================================
-// 删除编排（DeleteKbDocument / DeleteKbDocuments 共用）
+// 删除工具的共享件（批量上限 / 事实编排 / 审计门）
 // ============================================================================
 
-/// 偏好类记忆的硬守卫标签 — source_path 为该值的文档一律拒绝删除，
-/// 不接受参数绕过（用户显式删除 profile 走独立 REST 端点 + 二次确认）。
-const PROFILE_SOURCE: &str = "ppa_profile";
-
 /// agent 路径删除的执行者标识（'agent:@memory' | 'worker' | 'user'）。
+///
+/// 事实删除仍在本地填这两个值（本次不迁移事实编排）；文档与实体删除统一由
+/// `DeleteOrigin` 提供，避免两处字面量漂移。
 const AGENT_DELETED_BY: &str = "agent:@memory";
 
 /// agent 路径删除的默认原因（工具删除是人工整理动作）。
@@ -1219,113 +1184,21 @@ const AGENT_DELETE_REASON: &str = "manual_organize";
 /// 批量删除的单次上限。
 const MAX_BATCH_DELETIONS: usize = 50;
 
-/// 单条删除的收口结果（outbox 已迁移为 done）。
-struct DeletedDoc {
-    doc_id: String,
-    title: String,
-    audit_id: i64,
-    removed_chunks: usize,
-}
-
-impl DeletedDoc {
-    fn to_json(&self) -> serde_json::Value {
-        json!({
-            "doc_id": self.doc_id,
-            "title": self.title,
-            "audit_id": self.audit_id,
-            "removed_chunks": self.removed_chunks,
-        })
-    }
-}
-
-/// 单条删除编排（outbox：pending → done / cancelled）。
-///
-/// 取原文（title / content / source 是审计记录与回滚重放的依据）→ profile
-/// 硬守卫 → 写 pending 审计 → 删除 → 成功 mark_done / 失败 mark_cancelled
-/// 并返回错误。删除失败时 pending 行必须收口为 cancelled，否则会留下
-/// 永远无法回滚的假成功记录；文档不存在时不产生审计行。
-///
-/// 文档删除成功后 mark_done 失败只降级为 warn：删除已是既成事实，
-/// 向调用方报错会得到「文档已删却报告失败」的假失败（模型可能重试并撞上
-/// 文档不存在）；残留的 pending 行保留完整原文，可人工恢复，等待启动期对账。
-async fn delete_one(
-    access: &Arc<dyn KnowledgeAccess>,
-    audit: &Arc<dyn MemoryAuditAccess>,
-    kb_name: &str,
-    doc_id: &str,
-) -> Result<DeletedDoc, ToolError> {
-    let km = access.knowledge_manager();
-    km.ensure_loaded().await.map_err(string_err)?;
-
-    let doc = km
-        .get_document(kb_name, doc_id)
-        .await
-        .map_err(string_err)?
-        .ok_or_else(|| {
-            string_err(format!(
-                "Document not found: '{doc_id}' (knowledge base '{kb_name}')"
-            ))
-        })?;
-
-    if doc.source_path == PROFILE_SOURCE {
-        return Err(string_err(format!(
-            "Deletion rejected: document '{doc_id}' is a profile memory ({PROFILE_SOURCE}) and cannot be deleted via tools."
-        )));
-    }
-
-    let audit_id = audit
-        .record_pending(MemoryAuditEntry {
-            user_id: access.user_id().to_string(),
-            kb_name: kb_name.to_string(),
-            doc_id: doc.id.clone(),
-            title: doc.title.clone(),
-            content: doc.content.clone(),
-            source: doc.source_path.clone(),
-            reason: AGENT_DELETE_REASON.to_string(),
-            deleted_by: AGENT_DELETED_BY.to_string(),
-            deleted_at: now_iso8601(),
-            topic_key: None,
-            successor_doc_id: None,
-        })
-        .await
-        .map_err(string_err)?;
-
-    match km.delete_document(kb_name, &doc.id).await {
-        Ok(report) => {
-            if let Err(e) = audit.mark_done(audit_id).await {
-                warn!(
-                    audit_id,
-                    error = %e,
-                    "Failed to mark audit row done; a pending row remains (original content retained for manual restore)"
-                );
-            }
-            info!(
-                kb = %kb_name,
-                doc_id = %doc.id,
-                audit_id,
-                removed_chunks = report.removed_chunks,
-                "Document deleted via tool"
-            );
-            Ok(DeletedDoc {
-                doc_id: doc.id,
-                title: doc.title,
-                audit_id,
-                removed_chunks: report.removed_chunks,
-            })
-        }
-        Err(e) => {
-            if let Err(cancel_err) = audit.mark_cancelled(audit_id).await {
-                warn!(audit_id, error = %cancel_err, "Failed to mark audit row cancelled; a pending row may remain");
-            }
-            Err(string_err(e))
-        }
-    }
+/// 单条删除结果的 JSON 形状 —— 单条工具与批量工具共用一份，免得两处字段漂移。
+fn deleted_doc_json(d: &super::memory_delete::DeletedDoc) -> serde_json::Value {
+    json!({
+        "doc_id": d.doc_id,
+        "title": d.title,
+        "audit_id": d.audit_id,
+        "removed_chunks": d.removed_chunks,
+    })
 }
 
 /// 单条事实删除编排（outbox：pending → done / cancelled），返回
 /// `(audit_id, deleted_edges)`。
 ///
-/// 顺序严格对齐 [`delete_one`]，唯一的结构性差异是**第 2 步的「先读」不可省略**：
+/// 顺序与 `memory_delete::delete_document` 一致，唯一的结构性差异是**第 2 步的
+/// 「先读」不可省略**：
 /// 文档删除可以用「返回 `None`」判存在，图删除却必须显式读一次 —— HelixDB 删不
 /// 存在的边是静默 no-op（HTTP 200、无错误、无信号），不看前置读就没有任何办法
 /// 区分「删掉了」与「本来就没有」。
@@ -1390,99 +1263,6 @@ async fn delete_fact_one(
                 "Fact deleted via tool"
             );
             Ok((audit_id, deleted_edges))
-        }
-        Err(e) => {
-            if let Err(cancel_err) = audit.mark_cancelled(audit_id).await {
-                warn!(audit_id, error = %cancel_err, "Failed to mark audit row cancelled; a pending row may remain");
-            }
-            Err(string_err(e))
-        }
-    }
-}
-
-/// 实体级联删除的收口结果（outbox 已迁移为 done）。
-struct EntityDeleteOutcome {
-    entity_id: String,
-    audit_id: i64,
-    removed_edges: usize,
-    removed_nodes: usize,
-}
-
-/// 实体删除编排（outbox：pending → done / cancelled）。
-///
-/// 比 [`delete_fact_one`] 多一道 `cascade` 门，且这道门必须在**写审计之前**：
-/// 拒绝时什么都没删，不该留下任何审计行。「有残留边却不带 `cascade`」是最容易
-/// 发生的误操作（模型想「忘掉小C的年龄」，却升级成「忘掉小C」），因此拒绝信息
-/// 要明确给出边数并把 `cascade: true` 的路指出来。
-async fn delete_entity_one(
-    access: &Arc<dyn KnowledgeAccess>,
-    audit: &Arc<dyn MemoryAuditAccess>,
-    kb_name: &str,
-    entity_name: &str,
-    cascade: bool,
-) -> Result<EntityDeleteOutcome, ToolError> {
-    let km = access.knowledge_manager();
-    km.ensure_loaded().await.map_err(string_err)?;
-
-    let (entity_id, node, edges) = km
-        .read_entity(kb_name, entity_name)
-        .await
-        .map_err(string_err)?;
-
-    if node.is_none() && edges.is_empty() {
-        return Err(string_err(format!(
-            "Entity not found: '{entity_name}' (knowledge base '{kb_name}')"
-        )));
-    }
-
-    if !cascade && !edges.is_empty() {
-        return Err(string_err(format!(
-            "Deletion rejected: entity '{entity_name}' still has {} relation(s). \
-             Use delete_entity_fact to remove a single relation, or pass cascade: true \
-             to delete the entity together with all its relations.",
-            edges.len()
-        )));
-    }
-
-    let audit_id = audit
-        .record_pending(MemoryAuditEntry {
-            user_id: access.user_id().to_string(),
-            kb_name: kb_name.to_string(),
-            doc_id: entity_id.clone(),
-            title: format!("entity:{entity_name}"),
-            content: entity_snapshot_json(entity_name, &entity_id, &node, &edges).to_string(),
-            source: GRAPH_FACT_SOURCE.to_string(),
-            reason: AGENT_DELETE_REASON.to_string(),
-            deleted_by: AGENT_DELETED_BY.to_string(),
-            deleted_at: now_iso8601(),
-            topic_key: None,
-            successor_doc_id: None,
-        })
-        .await
-        .map_err(string_err)?;
-
-    match km.delete_entity(kb_name, entity_name, cascade).await {
-        Ok((removed_edges, removed_nodes)) => {
-            if let Err(e) = audit.mark_done(audit_id).await {
-                warn!(
-                    audit_id,
-                    error = %e,
-                    "Failed to mark audit row done; a pending row remains (snapshot retained for manual restore)"
-                );
-            }
-            info!(
-                kb = %kb_name,
-                removed_edges,
-                removed_nodes,
-                audit_id,
-                "Entity deleted via tool"
-            );
-            Ok(EntityDeleteOutcome {
-                entity_id,
-                audit_id,
-                removed_edges,
-                removed_nodes,
-            })
         }
         Err(e) => {
             if let Err(cancel_err) = audit.mark_cancelled(audit_id).await {
@@ -1570,11 +1350,19 @@ impl ToolDyn for DeleteKbDocument {
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
             let audit = require_audit(&self.memory_audit)?;
 
-            let deleted = delete_one(&self.access, audit, &parsed.kb_name, &parsed.doc_id).await?;
+            let deleted = delete_document(
+                &self.access,
+                audit,
+                &parsed.kb_name,
+                &parsed.doc_id,
+                DeleteOrigin::Agent,
+            )
+            .await
+            .map_err(|e| string_err(e.to_string()))?;
 
             serde_json::to_string_pretty(&json!({
                 "kb_name": parsed.kb_name,
-                "deleted": [deleted.to_json()],
+                "deleted": [deleted_doc_json(&deleted)],
             }))
             .map_err(string_err)
             .map(Content::Text)
@@ -1662,8 +1450,16 @@ impl ToolDyn for DeleteKbDocuments {
             let mut deleted = Vec::new();
             let mut failed = Vec::new();
             for doc_id in &parsed.doc_ids {
-                match delete_one(&self.access, audit, &parsed.kb_name, doc_id).await {
-                    Ok(d) => deleted.push(d.to_json()),
+                match delete_document(
+                    &self.access,
+                    audit,
+                    &parsed.kb_name,
+                    doc_id,
+                    DeleteOrigin::Agent,
+                )
+                .await
+                {
+                    Ok(d) => deleted.push(deleted_doc_json(&d)),
                     Err(e) => failed.push(json!({ "doc_id": doc_id, "error": e.to_string() })),
                 }
             }

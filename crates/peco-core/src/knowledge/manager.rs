@@ -694,6 +694,66 @@ impl KnowledgeManager {
         Ok(counts)
     }
 
+    /// 按节点 id 读取实体节点及其双向关联边（图谱下发的 id 即真值）。
+    ///
+    /// 与 [`Self::read_entity`] 并存的原因同 `KnowledgeBase::read_entity_by_id`：
+    /// 用 name 反算 id 在名称缺失/规范化差异时会得到另一个 id，图后端对不存在的
+    /// 节点静默 no-op —— 那种「成功」比报错更难发现。
+    pub async fn read_entity_by_id(
+        &self,
+        kb_name: &str,
+        entity_id: &str,
+    ) -> Result<
+        (
+            Option<knowledge_base::GraphNode>,
+            Vec<knowledge_base::KnowledgeEdge>,
+        ),
+        KnowledgeModuleError,
+    > {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        Ok(kb.read_entity_by_id(entity_id).await?)
+    }
+
+    /// 按节点 id 删除实体节点，返回 `(被删除的边数, 被删除的节点数)`。
+    ///
+    /// 节点不存在 → [`KnowledgeError::NotFound`](knowledge_base::KnowledgeError::NotFound)，
+    /// 不再无条件报「删了 1 个」。
+    pub async fn delete_entity_by_id(
+        &self,
+        kb_name: &str,
+        entity_id: &str,
+        cascade: bool,
+    ) -> Result<(usize, usize), KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        let counts = kb.delete_entity_by_id(entity_id, cascade).await?;
+        info!(
+            kb = %kb_name,
+            entity_id = %entity_id,
+            cascade,
+            removed_edges = counts.0,
+            "Entity deleted from knowledge graph"
+        );
+        Ok(counts)
+    }
+
     // ── 同步 ────────────────────────────────────────────────────────────────
 
     /// 同步指定知识库：扫描 docs/ 目录，对比文件哈希，执行增量更新。

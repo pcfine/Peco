@@ -50,6 +50,27 @@ export interface MemoryDocumentPage {
   has_more: boolean;
 }
 
+/**
+ * `DELETE /peco/memory/documents/{id}` 响应。`audit_id` 是可追溯锚点
+ * （删除审计行 id），删除已生效、调用方无需再查列表确认。
+ */
+export interface DeleteMemoryDocumentResponse {
+  doc_id: string;
+  removed_chunks: number;
+  audit_id: number;
+}
+
+/**
+ * `DELETE /peco/memory/graph/nodes/{id}` 响应。边数是**下界**（读-删之间有并发
+ * 窗口），仅用于告知用户，不参与一致性判断。
+ */
+export interface DeleteMemoryNodeResponse {
+  entity_id: string;
+  removed_edges: number;
+  removed_nodes: number;
+  audit_id: number;
+}
+
 /** E3 响应：单条记忆文档详情（含全文）。`content` 可能为空串。 */
 export interface MemoryDocumentDetail {
   id: string;

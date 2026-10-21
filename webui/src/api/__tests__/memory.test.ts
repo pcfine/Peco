@@ -3,6 +3,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import api from "../client";
 import {
+  deleteMemoryDocument,
+  deleteMemoryNode,
   getMemoryDocument,
   getMemoryGraph,
   getSupersedeHealth,
@@ -14,15 +16,17 @@ import {
 } from "../memory";
 
 vi.mock("../client", () => ({
-  default: { get: vi.fn(), post: vi.fn() },
+  default: { get: vi.fn(), post: vi.fn(), delete: vi.fn() },
 }));
 
 const GET = vi.mocked(api.get);
 const POST = vi.mocked(api.post);
+const DELETE = vi.mocked(api.delete);
 
 beforeEach(() => {
   GET.mockReset();
   POST.mockReset();
+  DELETE.mockReset();
 });
 
 describe("memory API", () => {
@@ -142,6 +146,44 @@ describe("memory API", () => {
     expect(GET).toHaveBeenCalledWith("/peco/memory/search", {
       params: { q: "小C", limit: 20, source: "ppa_semantic" },
     });
+  });
+
+  // ── 删除（记忆页删除功能） ───────────────────────────────────────────────
+
+  it("deleteMemoryDocument('abc') DELETE 文档路径并 resolve data", async () => {
+    const payload = {
+      doc_id: "abc",
+      removed_chunks: 3,
+      audit_id: 42,
+    };
+    DELETE.mockResolvedValue({ data: payload });
+
+    await expect(deleteMemoryDocument("abc")).resolves.toEqual(payload);
+    expect(DELETE).toHaveBeenCalledWith("/peco/memory/documents/abc");
+  });
+
+  it("deleteMemoryDocument('a/b:c') 对 id 做 URL 编码", async () => {
+    DELETE.mockResolvedValue({ data: {} });
+
+    await deleteMemoryDocument("a/b:c");
+
+    expect(DELETE).toHaveBeenCalledWith("/peco/memory/documents/a%2Fb%3Ac");
+  });
+
+  it("deleteMemoryNode 对 entity id 的冒号编码（%3A）", async () => {
+    const id = "entity:Entity:user-x::@private_memory:ab12cd34";
+    const payload = {
+      entity_id: id,
+      removed_edges: 3,
+      removed_nodes: 1,
+      audit_id: 88,
+    };
+    DELETE.mockResolvedValue({ data: payload });
+
+    await expect(deleteMemoryNode(id)).resolves.toEqual(payload);
+    expect(DELETE).toHaveBeenCalledWith(
+      "/peco/memory/graph/nodes/entity%3AEntity%3Auser-x%3A%3A%40private_memory%3Aab12cd34",
+    );
   });
 
   // ── 审计 / 取代健康（历史 tab） ─────────────────────────────────────────

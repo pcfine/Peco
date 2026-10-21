@@ -8,6 +8,7 @@ mod deps;
 mod fetch;
 mod knowledge_tools;
 mod mcp_tools;
+mod memory_delete;
 mod proc_group;
 mod shell;
 mod skill_tools;
@@ -32,6 +33,10 @@ pub use knowledge_tools::{
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
 pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
+pub use memory_delete::{
+    DeleteOrigin, DeletedDoc, DeletedEntity, MemoryDeleteError, delete_document,
+    delete_entity_by_id, delete_entity_by_name,
+};
 pub use proc_group::{GroupGuard, configure_process_group};
 pub use shell::{ShellExec, ShellTool};
 pub use skill_tools::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};

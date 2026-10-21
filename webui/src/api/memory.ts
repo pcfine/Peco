@@ -2,6 +2,8 @@
 
 import api from "./client";
 import type {
+  DeleteMemoryDocumentResponse,
+  DeleteMemoryNodeResponse,
   MemoryAuditItem,
   MemoryDocumentDetail,
   MemoryDocumentPage,
@@ -57,6 +59,26 @@ export async function listMemoryDocuments(
   const res = await api.get<MemoryDocumentPage>(`${PATH}/documents`, {
     params,
   });
+  return res.data;
+}
+
+/** 删除单条记忆文档（`DELETE /documents/{id}`）。失败原样上抛（403/404/5xx）。 */
+export async function deleteMemoryDocument(
+  id: string,
+): Promise<DeleteMemoryDocumentResponse> {
+  const res = await api.delete<DeleteMemoryDocumentResponse>(
+    `${PATH}/documents/${encodeURIComponent(id)}`,
+  );
+  return res.data;
+}
+
+/** 删除单个实体节点及其全部关联边（`DELETE /graph/nodes/{id}`）。 */
+export async function deleteMemoryNode(
+  id: string,
+): Promise<DeleteMemoryNodeResponse> {
+  const res = await api.delete<DeleteMemoryNodeResponse>(
+    `${PATH}/graph/nodes/${encodeURIComponent(id)}`,
+  );
   return res.data;
 }
 
