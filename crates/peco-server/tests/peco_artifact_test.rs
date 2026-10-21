@@ -2,8 +2,8 @@
 // peco 主对话产物落库集成测试 — 私有会话懒建、先落库后发事件、不可删、迁移收敛
 // ============================================================================
 //
-// 每条用例都直调 `looper_event_to_sse`（桥循环里的唯一落库入口），不需要真实
-// LLM。T9 例外：它要的不是全新库，故自建 pool。
+// 每条用例都经 `RunEmitter::emit`（runner 的唯一事件出口：带产物的工具结果先
+// 落库、后广播），不需要真实 LLM。T9 例外：它要的不是全新库，故自建 pool。
 
 mod common;
 
@@ -15,6 +15,7 @@ use peco_core::artifacts::ArtifactDecl;
 use peco_core::workdir::WorkDirs;
 use peco_server::artifact::ArtifactItem;
 use peco_server::chat::ChatSseEvent;
+use peco_server::peco::emitter::{RunEmitter, run_event_to_sse};
 use peco_server::peco::handler::ArtifactPage;
 use peco_server::peco::session::{SESSION_AGENT_NAME, SESSION_TITLE, private_session_id};
 
@@ -44,27 +45,46 @@ fn decl_of(abs: &std::path::Path, title: Option<&str>) -> ArtifactDecl {
     }
 }
 
-/// 走 peco 唯一的落库入口，把一条 ToolResult 映射为 SSE 事件。
+/// 把一条 ToolResult 投进 runner 的事件出口（落库 → 广播），再从广播里取回事件
+/// 映射为 SSE 事件 —— 与生产路径同一顺序，故「事件里的 id 已在库」可被直接断言。
+async fn tool_result_event_as(
+    app: &TestApp,
+    user_id: &str,
+    id: &str,
+    result: &str,
+    decls: Vec<ArtifactDecl>,
+) -> ChatSseEvent {
+    let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+    let emitter = RunEmitter::new(
+        tx,
+        app.state.db.clone(),
+        std::sync::Arc::clone(&app.state.workspace_manager),
+        user_id.to_string(),
+    );
+    emitter
+        .emit(LooperEvent::ToolResult {
+            id: id.to_string(),
+            name: "shell".to_string(),
+            result: result.to_string(),
+            images: Vec::new(),
+            artifacts: decls,
+        })
+        .await;
+    let event = rx.recv().await.expect("runner 必须广播每一条事件");
+    // 一条 ToolResult 只广播一次：先发 Looper 再发 Persisted 的双发会让前端
+    // 按 id 去重掩盖症状（重复建行 / 重复渲染都被吃掉）。
+    assert!(rx.try_recv().is_err(), "同一条 ToolResult 不得广播两次");
+    run_event_to_sse(user_id, event).expect("ToolResult 必须映射为 SSE 事件")
+}
+
+/// 主用户视角的简写。
 async fn tool_result_event(
     app: &TestApp,
     id: &str,
     result: &str,
     decls: Vec<ArtifactDecl>,
 ) -> ChatSseEvent {
-    peco_server::peco::handler::looper_event_to_sse(
-        &app.state.db,
-        &app.state.workspace_manager,
-        &app.user_id,
-        LooperEvent::ToolResult {
-            id: id.to_string(),
-            name: "shell".to_string(),
-            result: result.to_string(),
-            images: Vec::new(),
-            artifacts: decls,
-        },
-    )
-    .await
-    .expect("ToolResult 必须映射为 SSE 事件")
+    tool_result_event_as(app, &app.user_id, id, result, decls).await
 }
 
 fn artifacts_of(ev: ChatSseEvent) -> Vec<ArtifactItem> {
@@ -98,8 +118,8 @@ async fn session_artifact_count(app: &TestApp, conversation_id: &str) -> i64 {
 
 // ── T1 先落库后发事件 ───────────────────────────────────────────────────────
 
-/// 变异点：把 `looper_event_to_sse` 改成先返回事件、落库放 spawn / 放到后面，
-/// 或让事件字段取自入参而非库行 → `find_by_id_and_user` 命中失败或值不等。
+/// 变异点：把 `RunEmitter::emit` 改成先发事件、落库放 spawn / 放到后面，或让事件
+/// 字段取自入参而非库行 → `find_by_id_and_user` 命中失败或值不等。
 #[tokio::test]
 async fn persists_before_emitting() {
     let app = TestApp::new().await;
@@ -125,6 +145,61 @@ async fn persists_before_emitting() {
     // 「预生成 id 再落库」由 T4 / T5 打红（那两条不携带 id）。
     assert_eq!(items[0].created_at, stored.created_at);
     assert_eq!(items[0].size_bytes, stored.size_bytes);
+}
+
+// ── T1b 无订阅者也照常落库（跨连接存活） ───────────────────────────────────
+
+/// 关页面 / 断网期间生成的产物必须入库：此时桥接任务已随连接断开退出，broadcast
+/// 里一条 receiver 都没有，事件无人消费。
+///
+/// 变异点：把落库退回桥接循环（或任何依赖订阅者的路径）→ 本用例全程无
+/// receiver，声明无人处理，产物行数为 0。
+#[tokio::test]
+async fn persists_without_any_subscriber() {
+    let app = TestApp::new().await;
+    let abs = write_work_file(&app, "output/offscreen/result.png", b"PNG");
+    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    drop(rx);
+    assert_eq!(tx.receiver_count(), 0, "前提：起手就没有订阅者");
+
+    let emitter = RunEmitter::new(
+        tx.clone(),
+        app.state.db.clone(),
+        std::sync::Arc::clone(&app.state.workspace_manager),
+        app.user_id.clone(),
+    );
+    emitter
+        .emit(LooperEvent::ToolResult {
+            id: "call_offscreen".to_string(),
+            name: "shell".to_string(),
+            result: "生成完成".to_string(),
+            images: Vec::new(),
+            artifacts: vec![decl_of(&abs, Some("离线产物"))],
+        })
+        .await;
+
+    assert_eq!(tx.receiver_count(), 0, "投递全程确实无人订阅");
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, title FROM artifacts WHERE user_id = ?")
+            .bind(&app.user_id)
+            .fetch_all(&app.state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1, "无订阅者时声明仍必须落库");
+    let (artifact_id, title) = &rows[0];
+    assert_eq!(title, "离线产物");
+
+    let stored =
+        peco_server::db::artifacts::find_by_id_and_user(&app.state.db, artifact_id, &app.user_id)
+            .await
+            .unwrap()
+            .expect("落库行必须可按属主回查");
+    assert_eq!(stored.conversation_id, private_session_id(&app.user_id));
+    assert_eq!(
+        conversation_count(&app).await,
+        1,
+        "私有会话行同样要懒建（产物外键依赖它）"
+    );
 }
 
 // ── T2 私有会话只建一条且产物归属它 ────────────────────────────────────────
@@ -286,7 +361,7 @@ async fn duplicate_declaration_yields_empty_artifacts() {
     let first = artifacts_of(tool_result_event(&app, "call_1", "done", decls.clone()).await);
     assert_eq!(first.len(), 1);
 
-    // 模拟第二个仍在订阅的桥处理同一条事件
+    // 同一产物被再次声明（重连后重跑生成路径）
     let ev = tool_result_event(&app, "call_1", "done", decls).await;
     let ChatSseEvent::ToolResult {
         result,
@@ -641,20 +716,14 @@ async fn seed_artifacts(app: &TestApp, user_id: &str, n: usize) -> Vec<String> {
             &format!("output/seed-{user_id}/{i}.png"),
             b"PNG",
         );
-        let ev = peco_server::peco::handler::looper_event_to_sse(
-            &app.state.db,
-            &app.state.workspace_manager,
+        let ev = tool_result_event_as(
+            app,
             user_id,
-            LooperEvent::ToolResult {
-                id: format!("call_{user_id}_{i}"),
-                name: "shell".to_string(),
-                result: "done".to_string(),
-                images: Vec::new(),
-                artifacts: vec![decl_of(&abs, Some(&format!("产物{i}")))],
-            },
+            &format!("call_{user_id}_{i}"),
+            "done",
+            vec![decl_of(&abs, Some(&format!("产物{i}")))],
         )
-        .await
-        .expect("ToolResult 必须映射为 SSE 事件");
+        .await;
         let items = artifacts_of(ev);
         assert_eq!(items.len(), 1, "第 {i} 条声明必须落库");
         ids.push(items[0].id.clone());

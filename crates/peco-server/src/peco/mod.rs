@@ -8,6 +8,7 @@
 pub mod active;
 pub mod boot;
 pub mod config;
+pub mod emitter;
 pub mod environment;
 pub mod files;
 pub mod filter;

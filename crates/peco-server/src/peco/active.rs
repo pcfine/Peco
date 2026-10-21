@@ -4,7 +4,7 @@
 //
 // 事件转发架构（对齐 workflow/active.rs 的 broadcast + 控制通道范式）：
 //
-//   LooperHandle ──→ runner 任务 ──→ broadcast::Sender<LooperEvent>
+//   LooperHandle ──→ runner 任务 ──→ broadcast::Sender<PecoRunEvent>
 //                                        │
 //                   mpsc (Query/Cancel)  ├── 桥接任务 ×N（每 SSE 连接一个，随时附着）
 //                   (控制命令)
@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use model_provider::Content;
-use peco_core::agent::LooperEvent;
 use tokio::sync::{Notify, broadcast, mpsc};
+
+use super::emitter::PecoRunEvent;
 
 /// 发给 runner 的控制命令。
 #[derive(Debug)]
@@ -58,7 +59,7 @@ pub enum EnqueueOutcome {
 /// 注册表条目：runner 之外的所有交互都经由这份句柄。
 struct ActiveEntry {
     control_tx: mpsc::Sender<ControlCommand>,
-    event_tx: broadcast::Sender<LooperEvent>,
+    event_tx: broadcast::Sender<PecoRunEvent>,
     /// 桥接任务退出时 notify，runner 醒来复查是否可回收。
     reclaim_notify: Arc<Notify>,
     /// 是否有轮次在途（区别于「run 已注册」）。
@@ -95,7 +96,8 @@ impl Drop for RunGuard {
 /// drop 时从注册表移除（幂等）。所有字段随 runner 任务移入持有。
 pub struct RunRegistration {
     pub control_rx: mpsc::Receiver<ControlCommand>,
-    pub event_tx: broadcast::Sender<LooperEvent>,
+    /// runner 的事件广播出口；只有 [`super::emitter::RunEmitter`] 能往里塞事件。
+    pub(crate) event_tx: broadcast::Sender<PecoRunEvent>,
     pub reclaim_notify: Arc<Notify>,
     pub _guard: RunGuard,
 }
@@ -145,7 +147,7 @@ impl PecoActiveRuns {
             return None;
         }
         let (control_tx, control_rx) = mpsc::channel::<ControlCommand>(32);
-        let (event_tx, _rx) = broadcast::channel::<LooperEvent>(256);
+        let (event_tx, _rx) = broadcast::channel::<PecoRunEvent>(256);
         let reclaim_notify = Arc::new(Notify::new());
         map.insert(
             user_id.to_string(),
@@ -169,8 +171,8 @@ impl PecoActiveRuns {
         })
     }
 
-    /// 订阅指定用户的 LooperEvent 广播；无 run 时返回 None。
-    pub fn subscribe(&self, user_id: &str) -> Option<broadcast::Receiver<LooperEvent>> {
+    /// 订阅指定用户的 run 事件广播；无 run 时返回 None。
+    pub fn subscribe(&self, user_id: &str) -> Option<broadcast::Receiver<PecoRunEvent>> {
         let map = self.inner.lock().unwrap();
         map.get(user_id).map(|entry| entry.event_tx.subscribe())
     }

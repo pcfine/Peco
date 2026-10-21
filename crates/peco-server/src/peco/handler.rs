@@ -60,7 +60,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::auth::AuthUser;
-use crate::chat::sse::{ChatSseEvent, UsageData, map_looper_event};
+use crate::chat::sse::{ChatSseEvent, UsageData};
 use crate::error::ApiError;
 use crate::peco::active::{
     CancelWaitResult, ControlCommand, EnqueueOutcome, RunGuard, RunRegistration,
@@ -68,12 +68,12 @@ use crate::peco::active::{
 use crate::session_dto::{TurnData, turns_to_dto};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
-use crate::workspace::WorkspaceManager;
 
+use super::emitter::{PecoRunEvent, RunEmitter, run_event_to_sse};
 use super::filter::PecoContextFilter;
 use super::manager::PecoManager;
 use super::memory::{degraded_count, last_converged_at, view};
-use super::session::{SESSION_AGENT_NAME, SESSION_TITLE, private_session_id};
+use super::session::{SESSION_TITLE, private_session_id};
 
 /// 附着时等待将死 run 退出的上限（回收只发生在停靠态，退出是毫秒级）。
 const RUN_EXIT_WAIT: Duration = Duration::from_secs(2);
@@ -514,11 +514,18 @@ pub(crate) async fn spawn_peco_run(
     } = registration;
     let runs = Arc::clone(&state.peco_runs);
     let uid = user_id.to_string();
+    // 落库时机的约定收在 `RunEmitter::emit`：runner 只经它出事件。
+    let emitter = RunEmitter::new(
+        event_tx,
+        state.db.clone(),
+        Arc::clone(&state.workspace_manager),
+        uid.clone(),
+    );
 
     tokio::spawn(runner_loop(
         handle,
         control_rx,
-        event_tx,
+        emitter,
         reclaim_notify,
         _guard,
         runs,
@@ -529,6 +536,8 @@ pub(crate) async fn spawn_peco_run(
 }
 
 /// runner 任务：独占 LooperHandle，驱动 looper 并向订阅者广播事件。
+///
+/// 事件出口只有 [`RunEmitter::emit`] 一处（落库时机与理由见该函数文档）。
 ///
 /// 三路 select：
 /// - looper 事件 → 广播；`Shutdown` 结束；`StateChange → Idle` 且无订阅者
@@ -551,7 +560,7 @@ pub(crate) async fn spawn_peco_run(
 async fn runner_loop(
     handle: LooperHandle,
     mut control_rx: mpsc::Receiver<ControlCommand>,
-    event_tx: broadcast::Sender<LooperEvent>,
+    emitter: RunEmitter,
     reclaim_notify: Arc<Notify>,
     _guard: RunGuard,
     runs: Arc<crate::peco::active::PecoActiveRuns>,
@@ -589,9 +598,9 @@ async fn runner_loop(
                         }
                         _ => {}
                     }
-                    // 无订阅者时广播失败是常态（Err 忽略）
-                    let _ = event_tx.send(ev.clone());
-                    if matches!(ev, LooperEvent::Shutdown { .. }) {
+                    let shutting_down = matches!(ev, LooperEvent::Shutdown { .. });
+                    emitter.emit(ev).await;
+                    if shutting_down {
                         break;
                     }
                     if looper_idle && runs.try_reclaim_if_unsubscribed(&user_id) {
@@ -634,67 +643,6 @@ async fn runner_loop(
     }
 }
 
-/// 把一个 `LooperEvent` 转成待发送的 SSE 事件；不需要发事件的返回 `None`。
-///
-/// 带产物声明的 `ToolResult` **先落库、后构造事件**：事件里的 artifact id 是
-/// 前端取流的唯一凭据，反过来会给出一个指向不存在 id 的事件。
-/// `pub` 仅为让集成测试直调本函数；生产调用点只有 `bridge_sse_response`。
-pub async fn looper_event_to_sse(
-    db: &sqlx::SqlitePool,
-    workspace: &WorkspaceManager,
-    user_id: &str,
-    event: LooperEvent,
-) -> Option<ChatSseEvent> {
-    // 全函数只派生一次：私有会话行与产物归属必须是同一个 id。
-    let conversation_id = private_session_id(user_id);
-
-    match event {
-        // `artifacts` 为空是绝大多数工具调用的常态：不建行、不落库，直接走纯映射。
-        LooperEvent::ToolResult {
-            id,
-            name,
-            result,
-            images,
-            artifacts,
-        } if !artifacts.is_empty() => {
-            // 懒建在此处而非启动时：覆盖新建 run / 附着 / 重连三种入口，且对
-            // 存量安装天然生效。失败只降级 —— 随后每条声明会被外键逐条拒掉，
-            // 事件里 artifacts 为空，主对话照常。
-            if let Err(e) = crate::db::conversations::ensure_private_session(
-                db,
-                user_id,
-                &conversation_id,
-                SESSION_AGENT_NAME,
-                SESSION_TITLE,
-            )
-            .await
-            {
-                warn!(
-                    user_id,
-                    error = %e,
-                    "peco private session row unavailable; artifact persist will degrade"
-                );
-            }
-            let work = crate::artifact::work_dirs(workspace, user_id);
-            Some(
-                crate::artifact::build_tool_result_event(
-                    db,
-                    work.as_ref(),
-                    &conversation_id,
-                    user_id,
-                    id,
-                    name,
-                    result,
-                    images,
-                    &artifacts,
-                )
-                .await,
-            )
-        }
-        other => map_looper_event(other, &conversation_id),
-    }
-}
-
 /// 将 run 的 broadcast 事件流桥接为一个 SSE 响应（每个连接一个桥接任务）。
 ///
 /// 连接断开只结束桥接任务并唤醒 runner 复查回收，运行中的轮次不受影响；
@@ -702,16 +650,12 @@ pub async fn looper_event_to_sse(
 fn bridge_sse_response(
     state: Arc<AppState>,
     user_id: String,
-    mut rx: broadcast::Receiver<LooperEvent>,
+    mut rx: broadcast::Receiver<PecoRunEvent>,
 ) -> Sse<impl Stream<Item = Result<axum::response::sse::Event, Infallible>>> {
     let (sse_tx, sse_rx) = mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(256);
     let conv_id = private_session_id(&user_id);
     let runs = Arc::clone(&state.peco_runs);
     let app_state = Arc::clone(&state);
-    // `app_state` 随 WatcherGuard 被 move 进任务，循环体借不到；落库要用的依赖
-    // 必须在 spawn 之前单独克隆出来。
-    let db = state.db.clone();
-    let workspace_manager = Arc::clone(&state.workspace_manager);
     let uid = user_id;
 
     // FileWatcher 引用计数按连接管理（acquire 此处，release 由 guard 兜底）
@@ -726,8 +670,7 @@ fn bridge_sse_response(
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    if let Some(sse_ev) =
-                        looper_event_to_sse(&db, &workspace_manager, &uid, event).await
+                    if let Some(sse_ev) = run_event_to_sse(&uid, event)
                         && let Ok(ev) = sse_ev.to_sse_event()
                         && sse_tx.send(Ok(ev)).await.is_err()
                     {
@@ -2447,13 +2390,13 @@ mod tests {
         (Arc::new(state), dir)
     }
 
-    /// 桥是产物落库的唯一生产调用点：一条带声明的 ToolResult 进 broadcast 后，
-    /// 事件里的 id 必须已经落库且归属私有会话。
+    /// runner 落库、桥只转发：带声明的 ToolResult 经 runner 出口后，桥发帧里的
+    /// id 必须已经落库且归属私有会话。
     ///
-    /// 变异点：把桥循环体改回直接调 `map_looper_event` → 事件里没有 artifacts，
-    /// 这里必红（T1–T9 全绿也拦不住）。
+    /// 变异点：让 runner 把带声明的 ToolResult 当普通事件透传（落库退回桥接层或
+    /// 彻底不做）→ 帧里没有 artifacts，这里必红。
     #[tokio::test]
-    async fn bridge_persists_and_emits() {
+    async fn runner_persists_and_bridge_emits() {
         let (state, _dir) = test_state().await;
         let uid = "u-bridge".to_string();
         // conversations.user_id 有外键，而 test_state() 不建用户
@@ -2468,7 +2411,7 @@ mod tests {
 
         let work = crate::artifact::work_dirs(&state.workspace_manager, &uid)
             .expect("test workspace must follow <data_dir>/workspaces/<uid> layout");
-        // 先写文件、后调桥：此处 workspace 还没打开，output/ 得自己建
+        // 先写文件、后投递事件：此处 workspace 还没打开，output/ 得自己建
         std::fs::create_dir_all(work.output()).unwrap();
         let path = work.output().join("bridge/out.png");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2476,19 +2419,26 @@ mod tests {
 
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let resp = bridge_sse_response(Arc::clone(&state), uid.clone(), rx);
-        tx.send(LooperEvent::ToolResult {
-            id: "call_bridge".to_string(),
-            name: "shell".to_string(),
-            result: "完成".to_string(),
-            images: vec![],
-            artifacts: vec![peco_core::artifacts::ArtifactDecl {
-                path: path.to_string_lossy().into_owned(),
-                title: Some("桥产物".to_string()),
-                mime: None,
-            }],
-        })
-        .unwrap();
-        drop(tx);
+        let emitter = RunEmitter::new(
+            tx,
+            state.db.clone(),
+            Arc::clone(&state.workspace_manager),
+            uid.clone(),
+        );
+        emitter
+            .emit(LooperEvent::ToolResult {
+                id: "call_bridge".to_string(),
+                name: "shell".to_string(),
+                result: "完成".to_string(),
+                images: vec![],
+                artifacts: vec![peco_core::artifacts::ArtifactDecl {
+                    path: path.to_string_lossy().into_owned(),
+                    title: Some("桥产物".to_string()),
+                    mime: None,
+                }],
+            })
+            .await;
+        drop(emitter);
 
         let bytes = to_bytes(resp.into_response().into_body(), usize::MAX)
             .await

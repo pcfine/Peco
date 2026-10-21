@@ -245,9 +245,7 @@ pub fn guess_mime(path: &Path) -> &'static str {
 
 /// 落库产物并构造 `ToolResult` 事件。
 ///
-/// **顺序契约**：先落库、后发事件 —— 事件里的 artifact id 是前端取流的唯一
-/// 凭据，反过来会给出一个不存在的 id。抽成独立函数是为了让这条契约可测：
-/// SSE 主流程要真实 LLM 才能跑，但这条路径本身不需要。
+/// 落库时机与顺序契约见 [`crate::peco::emitter::RunEmitter::emit`]。
 ///
 /// 登记失败只降级（[`persist_declarations`] 内部 warn），不影响事件发出 ——
 /// 产物登记是旁路副作用，不该否决主对话。
