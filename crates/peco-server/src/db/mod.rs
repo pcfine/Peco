@@ -3,6 +3,7 @@
 // ============================================================================
 
 pub mod agents;
+pub mod artifacts;
 pub mod compaction_log;
 pub mod context_shadow;
 pub mod conversations;
@@ -378,6 +379,32 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::info!("Migration 014 completed");
     } else {
         tracing::debug!("Migration 014 skipped: documents.relative_path already exists");
+    }
+
+    // ── Migration 015: artifacts 表 ───────────────────────────────────────
+    // 表存在则跳过，与其余迁移一致 —— 否则每次启动都会喊「正在迁移」。
+    // 必须同时判**唯一索引**：`run_migration` 逐条执行且无事务，中途失败会留下
+    // 「表在、索引不在」的库。此时只看表会永久 skip，而 `db::artifacts::insert`
+    // 的 `ON CONFLICT(conversation_id, rel_path)` 依赖该索引，会每次都报错，
+    // 表现为「产物永远不出现」。
+    let has_artifacts = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+    let has_artifact_unique_idx = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_artifacts_conv_path'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_artifacts || !has_artifact_unique_idx {
+        run_migration(pool, "015", include_str!("migrations/015_artifacts.sql")).await?;
+        tracing::info!("Migration 015 completed");
+    } else {
+        tracing::debug!("Migration 015 skipped: artifacts table already exists");
     }
 
     Ok(())

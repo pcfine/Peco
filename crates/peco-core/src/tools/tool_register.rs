@@ -87,7 +87,10 @@ impl ToolRegister {
                 // ── 零依赖工具 ──────────────────────────
                 // ShellTool 包装 ShellExec，工作空间根目录作为默认 cwd
                 // （workspace_root 为 None 时行为与旧 ShellExec 逐字节一致）
-                "shell" => Some(Box::new(ShellTool::new(deps.workspace_root.clone()))),
+                "shell" => Some(Box::new(ShellTool::new(
+                    deps.workspace_root.clone(),
+                    deps.work_dirs.clone(),
+                ))),
                 "fetch" => Some(Box::new(Fetch)),
                 "list_tools" => Some(Box::new(ListTools { deps: deps.clone() })),
 
@@ -139,6 +142,7 @@ impl ToolRegister {
                             wa.clone(),
                             deps.agent_access.clone(),
                             persister,
+                            deps.work_dirs.clone(),
                         )))
                     }
                     None => skip_missing_dep("execute_workflow", "workflow_access"),
@@ -436,6 +440,7 @@ mod tests {
             mcp_access: None,
             workflow_persister: None,
             workspace_root: None,
+            work_dirs: None,
             web_search: None,
             // fail-closed 默认：审计存储未注入，删除工具运行时拒绝
             memory_audit: None,

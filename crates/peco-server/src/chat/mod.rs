@@ -9,6 +9,7 @@ pub(crate) mod images;
 pub(crate) mod sse;
 
 pub use active::ChatControl;
+pub use sse::ChatSseEvent;
 
 use std::sync::Arc;
 
@@ -45,6 +46,10 @@ pub fn router() -> Router<Arc<AppState>> {
             // 波及之前已注册的所有路由）
             post(images::upload_conversation_image)
                 .layer(DefaultBodyLimit::max(images::MAX_UPLOAD_BODY_BYTES)),
+        )
+        .route(
+            "/{agentId}/conversations/{id}/artifacts",
+            get(crate::artifact::list),
         )
         .route(
             "/{agentId}/conversations/{id}/stream",

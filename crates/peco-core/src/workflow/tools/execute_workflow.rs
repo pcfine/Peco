@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::tools::AgentAccess;
 use crate::tools::{Content, StringError, ToolDyn, ToolError};
+use crate::workdir::WorkDirs;
 
 use super::super::access::WorkflowAccess;
 use super::super::engine::{WorkflowConfig, WorkflowEngine};
@@ -27,6 +28,8 @@ pub struct ExecuteWorkflow {
     workflow_access: Arc<dyn WorkflowAccess>,
     agent_access: Arc<dyn AgentAccess>,
     persister: Arc<dyn WorkflowPersister>,
+    /// 工作层目录 —— 透传给引擎，使 workflow shell 步骤与 agent shell 同源。
+    work_dirs: Option<WorkDirs>,
 }
 
 impl ExecuteWorkflow {
@@ -34,11 +37,13 @@ impl ExecuteWorkflow {
         workflow_access: Arc<dyn WorkflowAccess>,
         agent_access: Arc<dyn AgentAccess>,
         persister: Arc<dyn WorkflowPersister>,
+        work_dirs: Option<WorkDirs>,
     ) -> Self {
         Self {
             workflow_access,
             agent_access,
             persister,
+            work_dirs,
         }
     }
 }
@@ -109,6 +114,7 @@ impl ToolDyn for ExecuteWorkflow {
                 self.persister.clone(),
                 config,
                 inputs,
+                self.work_dirs.clone(),
             );
 
             // 3. 收集事件，等待完成/失败
@@ -278,6 +284,7 @@ mod tests {
             Arc::new(StubWorkflowAccess { definitions }),
             Arc::new(StubAgentAccess),
             Arc::new(NullWorkflowPersister),
+            None,
         );
 
         let result = tool
@@ -298,6 +305,7 @@ mod tests {
             }),
             Arc::new(StubAgentAccess),
             Arc::new(NullWorkflowPersister),
+            None,
         );
 
         let result = tool

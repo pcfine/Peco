@@ -417,6 +417,7 @@ pub async fn stream_chat(
     let message_for_bg = message.clone();
     let message_content_for_bg = message_content;
     let user_id_for_bg = user_id.clone();
+    let workspace_manager_for_bg = state.workspace_manager.clone();
 
     // ── 5. 后台执行 AgentLooper ──────────────────────────────────────────
     // 控制通道先于任务注册：否则「任务已在跑、注册表尚无条目」的窗口里
@@ -553,6 +554,7 @@ pub async fn stream_chat(
                     ref id,
                     ref name,
                     ref result,
+                    ref artifacts,
                     ..
                 }) if name == "delegate_sub_agent" || name == "run_parallel_sub_agents" => {
                     if let Some(infos) = sub_agent_registry.remove(id.as_str()) {
@@ -573,15 +575,23 @@ pub async fn stream_chat(
                         }
                     }
 
-                    if let Some(sse_ev) = map_looper_event(
-                        LooperEvent::ToolResult {
-                            id: id.clone(),
-                            name: name.clone(),
-                            result: String::new(),
-                            images: Vec::new(),
-                        },
+                    // 子 agent 的最终正文若带声明行，父层构造结果时已剥离并挂在
+                    // 本事件上；`AgentCallEnd` 只带文本，不能吞掉 —— 必须同样落库。
+                    let work =
+                        crate::artifact::work_dirs(&workspace_manager_for_bg, &user_id_for_bg);
+                    let sse_ev = crate::artifact::build_tool_result_event(
+                        &db_for_bg,
+                        work.as_ref(),
                         &conv_id_for_bg,
-                    ) && let Ok(ev) = sse_ev.to_sse_event()
+                        &user_id_for_bg,
+                        id.clone(),
+                        name.clone(),
+                        String::new(),
+                        Vec::new(),
+                        artifacts,
+                    )
+                    .await;
+                    if let Ok(ev) = sse_ev.to_sse_event()
                         && sse_tx.send(Ok(ev)).await.is_err()
                     {
                         break;
@@ -656,6 +666,38 @@ pub async fn stream_chat(
                         let _ = sse_tx.send(Ok(ev)).await;
                     }
                     break;
+                }
+
+                // ── 工具声明的产物 ────────────────────────────────────────
+                // 必须先落库再发事件：事件里的 id 是前端访问内容/下载端点的
+                // 唯一凭据，不能等到前端自己上报。带产物的 ToolResult 因此
+                // 不进 `map_looper_event`（那是纯函数，拿不到 DB）。
+                Some(LooperEvent::ToolResult {
+                    ref id,
+                    ref name,
+                    ref result,
+                    ref images,
+                    ref artifacts,
+                }) if !artifacts.is_empty() => {
+                    let work =
+                        crate::artifact::work_dirs(&workspace_manager_for_bg, &user_id_for_bg);
+                    let sse_ev = crate::artifact::build_tool_result_event(
+                        &db_for_bg,
+                        work.as_ref(),
+                        &conv_id_for_bg,
+                        &user_id_for_bg,
+                        id.clone(),
+                        name.clone(),
+                        result.clone(),
+                        images.clone(),
+                        artifacts,
+                    )
+                    .await;
+                    if let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
+                    }
                 }
 
                 Some(event) => {

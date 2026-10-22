@@ -349,11 +349,27 @@ impl SimpleAgentLooper {
             }
             match handle.await {
                 Ok((idx, tc, output)) => {
-                    // 错误路径保持纯文本；成功路径的 Content 零转换直通
-                    let output = match output {
+                    // 声明剥离必须发生在这里：SimpleAgentLooper 与 AgentLooper 是
+                    // 两条并行的「工具输出 → 模型历史」写入路径（子 agent、单轮
+                    // 执行、结构化输出都走这条）。漏一次，模型就会看到
+                    // `@@PECO_ARTIFACT` 行并照着格式编造不存在的产物。
+                    //
+                    // **错误路径同样要剥离**：MCP 工具的 error 文本是服务端原文
+                    // （`mcp/tool.rs` 的 error_text 即脚本回传内容），同样可能带声明。
+                    let content = match output {
                         Ok(r) => r,
                         Err(e) => Content::Text(e),
                     };
+                    let (output, decls) = crate::artifacts::strip_content(content);
+                    if !decls.is_empty() {
+                        // 子 agent / 单轮路径不登记产物 —— 宿主层没有
+                        // conversation 归属可用。显式记一条，避免「产物
+                        // 凭空消失」无从追查。
+                        tracing::debug!(
+                            count = decls.len(),
+                            "Artifact declarations dropped: simple looper does not persist artifacts"
+                        );
+                    }
                     results.push((
                         idx,
                         Arc::new(InputItem::FunctionCallOutput {

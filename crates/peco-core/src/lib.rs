@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod artifacts;
 pub mod config;
 pub mod executor;
 pub mod knowledge;
@@ -11,6 +12,7 @@ pub mod skills;
 
 pub mod tools;
 pub mod utils;
+pub mod workdir;
 pub mod workflow;
 pub mod workspace;
 

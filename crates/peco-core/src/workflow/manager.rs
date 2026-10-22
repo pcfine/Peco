@@ -18,6 +18,8 @@ use tracing::{debug, warn};
 use crate::tools::AgentAccess;
 
 use super::definition::{WorkflowDefinition, pre_validate_workflow_yaml};
+use crate::workdir::WorkDirs;
+
 use super::engine::{WorkflowConfig, WorkflowEngine};
 use super::error::WorkflowError;
 use super::handle::WorkflowHandle;
@@ -48,6 +50,8 @@ pub struct WorkflowMeta {
 /// **不再持有 persister**：persister 由调用方在 `execute()` 时按用户传入。
 pub struct WorkflowManager {
     workflows_dir: PathBuf,
+    /// 工作层目录。None 时不向 shell 步骤注入 `PECO_OUT_DIR` 等变量。
+    work_dirs: Option<WorkDirs>,
     /// Tier-1 元数据缓存（name → WorkflowMeta）
     metas: RwLock<HashMap<String, WorkflowMeta>>,
     /// Tier-2 完整定义缓存（name → WorkflowDefinition）
@@ -62,9 +66,23 @@ impl WorkflowManager {
     pub fn new(workflows_dir: PathBuf) -> Self {
         Self {
             workflows_dir,
+            work_dirs: None,
             metas: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// 注入工作层目录（由 [`crate::workspace::WorkSpace::open`] 调用）。
+    ///
+    /// 与 agent 侧共用同一份 [`WorkDirs`]，保证 workflow 步骤里的 shell
+    /// 与 agent 直接调 shell 落到完全相同的产物目录。
+    pub fn set_work_dirs(&mut self, work_dirs: Option<WorkDirs>) {
+        self.work_dirs = work_dirs;
+    }
+
+    /// 当前注入的工作层目录（供调用方 / 测试确认注入是否真的抵达引擎）。
+    pub fn work_dirs(&self) -> Option<&WorkDirs> {
+        self.work_dirs.as_ref()
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
@@ -286,6 +304,7 @@ impl WorkflowManager {
             persister,
             config,
             inputs,
+            self.work_dirs.clone(),
         ))
     }
 

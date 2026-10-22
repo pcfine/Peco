@@ -181,6 +181,7 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
         mcp_access: None,
         workflow_persister: None,
         workspace_root: None,
+        work_dirs: None,
         web_search: None,
         memory_audit: None, // fail-closed：无审计存储时删除工具运行时拒绝
     };

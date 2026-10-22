@@ -8,6 +8,8 @@ use peco_derive::peco_tool;
 use serde_json::json;
 use tracing::warn;
 
+use crate::workdir::WorkDirs;
+
 use super::command_screen::screen_command;
 use super::proc_group::{GroupGuard, configure_process_group};
 use super::{Content, Tool, ToolDefinition, ToolDyn, ToolError};
@@ -54,7 +56,7 @@ fn timeout_from(raw: Option<&str>) -> Option<Duration> {
 )]
 pub async fn shell_exec(command: String, cwd: Option<String>) -> Result<String, ToolError> {
     let cwd = cwd.filter(|d| !d.is_empty());
-    run_shell(&command, cwd.as_deref(), shell_timeout()).await
+    run_shell(&command, cwd.as_deref(), shell_timeout(), None).await
 }
 
 /// `shell_exec` 的实现主体；超时值作为参数注入以便单测复用同一路径。
@@ -67,6 +69,7 @@ async fn run_shell(
     command: &str,
     cwd: Option<&str>,
     timeout: Option<Duration>,
+    work: Option<&WorkDirs>,
 ) -> Result<String, ToolError> {
     if let Some(reason) = screen_command(command) {
         return Err(ToolError::ToolCallError(Box::new(std::io::Error::new(
@@ -79,6 +82,13 @@ async fn run_shell(
     cmd.arg("-c").arg(command);
     // 标记后代，供下次启动时清理上一代孤儿（见 peco-server 的 orphan_reaper）。
     cmd.env("PECO_SHELL_CHILD", "1");
+    // 工作层目录：产物默认落点，避免 skill 各自拼相对路径
+    // （相对路径会随 cwd 漂移，且不会报错）。
+    if let Some(work) = work {
+        for (key, value) in work.envs() {
+            cmd.env(key, value);
+        }
+    }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -152,11 +162,13 @@ async fn run_shell(
 
 pub struct ShellTool {
     default_cwd: Option<PathBuf>,
+    /// 工作层目录。None 时不注入（历史行为逐字节一致）。
+    work: Option<WorkDirs>,
 }
 
 impl ShellTool {
-    pub fn new(default_cwd: Option<PathBuf>) -> Self {
-        Self { default_cwd }
+    pub fn new(default_cwd: Option<PathBuf>, work: Option<WorkDirs>) -> Self {
+        Self { default_cwd, work }
     }
 }
 
@@ -203,7 +215,14 @@ impl ToolDyn for ShellTool {
             let params: <ShellExec as Tool>::Args =
                 serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             let cwd = resolve_cwd(params.cwd, self.default_cwd.as_deref());
-            shell_exec(params.command, cwd).await.map(Content::Text)
+            run_shell(
+                &params.command,
+                cwd.as_deref(),
+                shell_timeout(),
+                self.work.as_ref(),
+            )
+            .await
+            .map(Content::Text)
         })
     }
 }
@@ -245,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_shell_tool_definition_patched() {
-        let tool = ShellTool::new(Some(PathBuf::from("/ws")));
+        let tool = ShellTool::new(Some(PathBuf::from("/ws")), None);
         let def = tool.definition();
         assert_eq!(def.name, "shell");
 
@@ -269,7 +288,7 @@ mod tests {
     #[test]
     fn test_shell_tool_definition_none_identical() {
         // 无默认 cwd 时，definition 必须与 ShellExec 逐字段相同
-        let tool = ShellTool::new(None);
+        let tool = ShellTool::new(None, None);
         let def = tool.definition();
         let exec_def = <ShellExec as Tool>::definition(&ShellExec);
         assert_eq!(def.name, exec_def.name);
@@ -281,7 +300,7 @@ mod tests {
     async fn test_shell_tool_default_cwd_used() {
         let dir = std::env::temp_dir().join(format!("peco-shell-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tool = ShellTool::new(Some(dir.clone()));
+        let tool = ShellTool::new(Some(dir.clone()), None);
         let out = tool
             .call(r#"{"command": "pwd"}"#.to_string())
             .await
@@ -370,6 +389,7 @@ mod tests {
             &grandchild_script(&pidfile),
             None,
             Some(Duration::from_millis(300)),
+            None,
         )
         .await
         .unwrap_err();
@@ -391,7 +411,7 @@ mod tests {
     async fn cancelled_shell_kills_process_group() {
         let (dir, pidfile) = temp_pidfile("cancel");
         let script = grandchild_script(&pidfile);
-        let handle = tokio::spawn(async move { run_shell(&script, None, None).await });
+        let handle = tokio::spawn(async move { run_shell(&script, None, None, None).await });
 
         let grandchild = wait_for_pidfile(&pidfile)
             .await

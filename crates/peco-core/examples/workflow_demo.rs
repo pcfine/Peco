@@ -145,6 +145,7 @@ async fn demo_programmatic_workflow() {
         persister,
         WorkflowConfig::default(),
         HashMap::new(),
+        None,
     );
 
     // Step 4: 实时消费事件流
@@ -482,6 +483,7 @@ async fn demo_execute_workflow_tool() {
         wf_access,
         Arc::new(NoopAgentAccess),
         Arc::new(NullWorkflowPersister),
+        None,
     );
 
     println!("  🔧 Tool: execute_workflow");
@@ -629,6 +631,7 @@ async fn run_and_print(steps: &[WorkflowStep], label: &str) {
         Arc::new(NullWorkflowPersister),
         WorkflowConfig::default(),
         HashMap::new(),
+        None,
     );
 
     while let Some(event) = handle.recv_event().await {

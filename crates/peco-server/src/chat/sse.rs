@@ -8,6 +8,7 @@ use peco_core::agent::{
     LooperEvent, RetryNoticeReason, TurnFailureReason, TurnOutcome, strip_summary_wrapper,
 };
 use serde::Serialize;
+use tracing::warn;
 
 /// SSE 事件类型（发给前端）。
 ///
@@ -49,6 +50,11 @@ pub enum ChatSseEvent {
         result: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
+        /// 工具声明的产物（已落库，id 可直接用于内容/下载端点）。
+        ///
+        /// 空数组不序列化 —— 绝大多数工具调用不产生产物。
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        artifacts: Vec<crate::artifact::ArtifactItem>,
         conversation_id: String,
     },
 
@@ -379,13 +385,28 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             name,
             result,
             images,
-        } => Some(ChatSseEvent::ToolResult {
-            id,
-            name,
-            result,
-            images,
-            conversation_id: cid,
-        }),
+            artifacts,
+        } => {
+            if !artifacts.is_empty() {
+                // 本函数是**纯映射**，拿不到 DB，无法落库。能走到这里的路径
+                // 只有两类：chat 主流程里被专门分支前置拦截后剩下的情况，
+                // 以及 peco 主对话（它对产物暂不支持）。
+                // 显式告警 —— 静默吞掉会让「产物凭空消失」无从追查。
+                warn!(
+                    tool = %name,
+                    count = artifacts.len(),
+                    "Artifact declarations dropped: this path does not persist artifacts"
+                );
+            }
+            Some(ChatSseEvent::ToolResult {
+                id,
+                name,
+                result,
+                images,
+                artifacts: Vec::new(),
+                conversation_id: cid,
+            })
+        }
 
         // 服务端工具复用前端既有工具卡片渲染（零前端改动）：
         // input 即发起时的原始 JSON 入参，content 即 provider 回填的结果。
@@ -401,6 +422,7 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             name,
             result: content,
             images: Vec::new(),
+            artifacts: Vec::new(),
             conversation_id: cid,
         }),
 
@@ -708,6 +730,7 @@ mod tests {
             result,
             images,
             conversation_id,
+            ..
         }) = event
         else {
             panic!("ServerToolResult 必须映射为 ToolResult，实际 {event:?}");

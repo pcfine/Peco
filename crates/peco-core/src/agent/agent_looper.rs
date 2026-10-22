@@ -153,6 +153,28 @@ pub(crate) struct ToolCallResult {
     call: Arc<ToolCall>,
     result: Content,
     is_error: bool,
+    /// 工具输出中声明的产物（`@@PECO_ARTIFACT`）。
+    ///
+    /// 声明行已从 `result` 剥离，因此不会进入模型上下文；归属判定在宿主层
+    /// （那里才知道 conversation_id）。
+    artifacts: Vec<crate::artifacts::ArtifactDecl>,
+}
+
+impl ToolCallResult {
+    /// 构造工具结果，并在**唯一入口**剥离产物声明。
+    ///
+    /// 剥离放在构造函数而不是各调用点：调用点有四处，散着写迟早漏一处，
+    /// 而漏一次就会把 `@@PECO_ARTIFACT` 行送进模型上下文（模型会照着
+    /// 输出格式编造不存在的产物）。
+    fn new(call: Arc<ToolCall>, result: Content, is_error: bool) -> Self {
+        let (result, artifacts) = crate::artifacts::strip_content(result);
+        Self {
+            call,
+            result,
+            is_error,
+            artifacts,
+        }
+    }
 }
 
 // ============================================================================
@@ -501,6 +523,8 @@ pub enum LooperEvent {
         name: String,
         result: String,
         images: Vec<String>,
+        /// 工具声明的产物（已从 `result` 剥离）。
+        artifacts: Vec<crate::artifacts::ArtifactDecl>,
     },
     /// 服务端工具调用（模型发起，provider 侧执行，不在客户端执行）
     ServerToolUse {
@@ -3183,29 +3207,33 @@ impl AgentLooper {
                         to_spawn.push(idx);
                     }
                     ToolHookAction::Override(result) => {
-                        self.react_ctx.pending_tool_calls[idx].result = Some(ToolCallResult {
-                            call: call.clone(),
-                            result: Content::Text(result.clone()),
-                            is_error: false,
-                        });
+                        let overridden =
+                            ToolCallResult::new(call.clone(), Content::Text(result), false);
+                        let artifacts = overridden.artifacts.clone();
+                        // 事件里的 result 必须用**剥离后**的文本，否则前端会看到
+                        // 裸 `@@PECO_ARTIFACT` 行（而模型历史里那行已不存在）。
+                        let text = overridden.result.text_view().into_owned();
+                        self.react_ctx.pending_tool_calls[idx].result = Some(overridden);
                         self.emit_event(LooperEvent::ToolResult {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
-                            result,
+                            result: text,
                             images: Vec::new(),
+                            artifacts,
                         });
                     }
                     ToolHookAction::Reject(reason) => {
-                        self.react_ctx.pending_tool_calls[idx].result = Some(ToolCallResult {
-                            call: call.clone(),
-                            result: Content::Text(reason.clone()),
-                            is_error: true,
-                        });
+                        let rejected =
+                            ToolCallResult::new(call.clone(), Content::Text(reason), true);
+                        let artifacts = rejected.artifacts.clone();
+                        let text = rejected.result.text_view().into_owned();
+                        self.react_ctx.pending_tool_calls[idx].result = Some(rejected);
                         self.emit_event(LooperEvent::ToolResult {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
-                            result: reason,
+                            result: text,
                             images: Vec::new(),
+                            artifacts,
                         });
                     }
                     ToolHookAction::Abort(reason) => {
@@ -3232,17 +3260,9 @@ impl AgentLooper {
                         .execute(&call.function.name, &call.function.arguments)
                         .await
                     {
-                        Ok(r) => ToolCallResult {
-                            call: call.clone(),
-                            result: r,
-                            is_error: false,
-                        },
+                        Ok(r) => ToolCallResult::new(call.clone(), r, false),
                         // 错误路径保持纯文本
-                        Err(e) => ToolCallResult {
-                            call: call.clone(),
-                            result: Content::Text(e),
-                            is_error: true,
-                        },
+                        Err(e) => ToolCallResult::new(call.clone(), Content::Text(e), true),
                     };
                     (idx, result)
                 });
@@ -3280,6 +3300,7 @@ impl AgentLooper {
                         .into_iter()
                         .map(str::to_string)
                         .collect(),
+                    artifacts: tool_result.artifacts.clone(),
                 });
 
                 Self::invoke_on_after_tool(
@@ -3312,6 +3333,7 @@ impl AgentLooper {
                                     .into_iter()
                                     .map(str::to_string)
                                     .collect(),
+                                artifacts: tr.artifacts.clone(),
                             });
 
                             Self::invoke_on_after_tool(
@@ -3849,15 +3871,45 @@ mod tests {
             .collect()
     }
 
+    /// 产物声明必须在**构造**时就被剥离 —— 这是「工具输出」与
+    /// 「会话历史」的分界。若退化到调用点各自剥离，漏一处就会让
+    /// `@@PECO_ARTIFACT` 行进模型上下文。
+    #[test]
+    fn tool_call_result_strips_artifact_declarations() {
+        let call = Arc::new(ToolCall::new("c1", "shell", "{}"));
+        let r = ToolCallResult::new(
+            call,
+            Content::Text(
+                "生成完成\n@@PECO_ARTIFACT {\"path\":\"/a/b.jpg\"}\n共 1 个文件\n".to_string(),
+            ),
+            false,
+        );
+        let text = r.result.text_view().into_owned();
+        assert!(!text.contains("@@PECO_ARTIFACT"), "leaked: {text}");
+        assert_eq!(text, "生成完成\n共 1 个文件\n");
+        assert_eq!(r.artifacts.len(), 1);
+        assert_eq!(r.artifacts[0].path, "/a/b.jpg");
+    }
+
+    /// 错误结果同样走剥离（错误文本也可能被工具拼上声明）。
+    #[test]
+    fn tool_call_result_strips_on_error_path() {
+        let call = Arc::new(ToolCall::new("c1", "shell", "{}"));
+        let r = ToolCallResult::new(
+            call,
+            Content::Text("boom\n@@PECO_ARTIFACT {\"path\":\"/a/c.mp4\"}\n".to_string()),
+            true,
+        );
+        assert!(r.is_error);
+        assert_eq!(r.result.text_view().into_owned(), "boom\n");
+        assert_eq!(r.artifacts.len(), 1);
+    }
+
     fn tool_result(idx: usize) -> (usize, ToolCallResult) {
         let call = Arc::new(ToolCall::new(format!("c{idx}"), "t", "{}"));
         (
             idx,
-            ToolCallResult {
-                call,
-                result: Content::Text(format!("r{idx}")),
-                is_error: false,
-            },
+            ToolCallResult::new(call, Content::Text(format!("r{idx}")), false),
         )
     }
 
@@ -3982,11 +4034,11 @@ mod tests {
         let mut ctx = ReActContext {
             pending_tool_calls: vec![PendingToolCall {
                 call: Arc::clone(&call),
-                result: Some(ToolCallResult {
+                result: Some(ToolCallResult::new(
                     call,
-                    result: Content::Text("salvaged".to_string()),
-                    is_error: false,
-                }),
+                    Content::Text("salvaged".to_string()),
+                    false,
+                )),
             }],
             ..Default::default()
         };

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::SimpleAgentLooper;
 use crate::tools::{AgentAccess, GroupGuard, configure_process_group, screen_command};
+use crate::workdir::WorkDirs;
 
 use super::definition::{StepConfig, StepOutcome, StepResult, WorkflowStep};
 use super::template::TemplateContext;
@@ -33,6 +34,7 @@ pub(crate) async fn execute_step_static(
     tpl_ctx: &TemplateContext,
     cancel_flag: &Arc<AtomicBool>,
     agent_access: &Arc<dyn AgentAccess>,
+    work_dirs: Option<&WorkDirs>,
 ) -> StepResult {
     let start = Instant::now();
     // 超时策略：显式 `timeout_seconds` 对所有步骤生效；未设置时仅 shell 步骤用
@@ -48,7 +50,7 @@ pub(crate) async fn execute_step_static(
     let step_fut = async {
         match &step.config {
             StepConfig::Shell { command } => match tpl_ctx.render(command) {
-                Ok(rendered) => execute_shell_step(&rendered).await,
+                Ok(rendered) => execute_shell_step(&rendered, work_dirs).await,
                 Err(e) => StepOutcome::Failed(format!("template error: {e}")),
             },
             StepConfig::Agent {
@@ -100,7 +102,7 @@ pub(crate) async fn execute_step_static(
 ///
 /// 超时由 `execute_step_static` 统一负责 —— 超时或取消都会 drop 本 future，
 /// 此时 [`GroupGuard`] 按进程组 SIGKILL，连同 `sh` fork 出的孙进程一起清理。
-async fn execute_shell_step(command: &str) -> StepOutcome {
+async fn execute_shell_step(command: &str, work_dirs: Option<&WorkDirs>) -> StepOutcome {
     if let Some(reason) = screen_command(command) {
         return StepOutcome::Failed(reason);
     }
@@ -114,6 +116,12 @@ async fn execute_shell_step(command: &str) -> StepOutcome {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // 与 agent 侧 shell 注入完全相同的变量（同一 WorkDirs 实例推导）。
+    if let Some(dirs) = work_dirs {
+        for (key, value) in dirs.envs() {
+            cmd.env(key, value);
+        }
+    }
     configure_process_group(&mut cmd);
 
     let child = match cmd.spawn() {
@@ -181,5 +189,75 @@ async fn execute_agent_step(
     match handle.wait().await {
         Ok(output) => StepOutcome::Success(output),
         Err(e) => StepOutcome::Failed(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{ShellTool, ToolDyn};
+
+    fn work_dirs() -> WorkDirs {
+        WorkDirs::from_workspace_root(std::path::Path::new("/data/workspaces/u1"))
+            .expect("standard layout must derive")
+    }
+
+    /// 五个变量一次性打印，用 `|` 分隔（避免行尾差异干扰比较）。
+    const PRINT_ENVS: &str = "printf '%s|%s|%s|%s|%s' \"$PECO_WORKSPACE\" \
+                              \"$PECO_WORK_DIR\" \"$PECO_OUT_DIR\" \"$PECO_PROJECTS_DIR\" \
+                              \"$PECO_TMP_DIR\"";
+
+    /// workflow shell 步骤必须注入工作层变量，否则产物会落到进程 cwd。
+    #[tokio::test]
+    async fn shell_step_injects_work_dirs() {
+        let wd = work_dirs();
+        let out = execute_shell_step(PRINT_ENVS, Some(&wd)).await;
+        match out {
+            StepOutcome::Success(s) => assert_eq!(
+                s.trim(),
+                "/data/workspaces/u1|/data/work/u1|/data/work/u1/output|\
+                 /data/work/u1/projects|/data/work/u1/tmp"
+            ),
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    /// 防漂移：agent 直接调 shell 与 workflow 步骤跑 shell 必须看到**完全相同**的路径。
+    /// 两者若各自注入，这条断言就会红 —— 这正是本次改动要消灭的分裂。
+    #[tokio::test]
+    async fn agent_and_workflow_shell_agree() {
+        let wd = work_dirs();
+
+        let agent_view = ShellTool::new(None, Some(wd.clone()))
+            .call(format!(
+                r#"{{"command":"{}"}}"#,
+                PRINT_ENVS.replace('"', "\\\"")
+            ))
+            .await
+            .expect("agent shell should succeed")
+            .text_view()
+            .into_owned();
+
+        let wf_view = match execute_shell_step(PRINT_ENVS, Some(&wd)).await {
+            StepOutcome::Success(s) => s,
+            other => panic!("expected success, got {other:?}"),
+        };
+
+        assert_eq!(agent_view.trim(), wf_view.trim());
+        assert!(agent_view.contains("/data/work/u1/output"), "{agent_view}");
+    }
+
+    /// None 分支：不注入任何工作层变量（子进程环境与历史版本一致）。
+    /// 用 `env -u` 逐个剥离，避免父进程残留干扰断言。
+    #[tokio::test]
+    async fn shell_step_without_work_dirs_leaves_env_untouched() {
+        let cmd = "env -u PECO_WORKSPACE -u PECO_WORK_DIR -u PECO_OUT_DIR \
+                   -u PECO_PROJECTS_DIR -u PECO_TMP_DIR \
+                   sh -c 'printf %s \"${PECO_OUT_DIR:-__unset__}\"'";
+        let out = execute_shell_step(cmd, None).await;
+        match out {
+            StepOutcome::Success(s) => assert_eq!(s.trim(), "__unset__"),
+            other => panic!("expected success, got {other:?}"),
+        }
     }
 }

@@ -15,6 +15,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod agent;
+pub mod artifact;
 pub mod auth;
 pub mod chat;
 pub mod config;
@@ -66,6 +67,7 @@ pub fn build_router_with_limits(state: Arc<state::AppState>, enable_rate_limit: 
         .nest("/api/workflows", workflow::workflow_router())
         .nest("/api/schedules", workflow::schedule_router())
         .nest("/api/usage", usage::router())
+        .nest("/api/artifacts", artifact::router())
         // DEPRECATED since 0.2.0: use /api/chat/:agentId/conversations instead
         .nest("/api/conversations", chat::conversation_router());
 

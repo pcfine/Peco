@@ -24,6 +24,7 @@ use crate::search::SearchBackend;
 use crate::skills::{SkillRegister, SkillResourceFile};
 use crate::tools::McpAccess;
 use crate::tools::MemoryAuditAccess;
+use crate::workdir::WorkDirs;
 use crate::workflow::WorkflowAccess;
 use crate::workspace::{
     AgentAccess, KnowledgeAccess, SkillProvider, ToolDependencies, WorkspaceError,
@@ -53,6 +54,9 @@ pub struct AgentManager {
     /// 工作空间根目录（agents_dir 的父目录）。
     /// 用于 shell 默认 cwd 与 show_workspace root（经 ToolDependencies 注入）。
     workspace_root: PathBuf,
+    /// 工作层目录（产物 / 工程 / 临时）。由 [`WorkSpace::open`] 注入；
+    /// None 时不向 shell 子进程注入 `PECO_OUT_DIR` 等变量（历史行为不变）。
+    work_dirs: Option<WorkDirs>,
     user_id: String,
     /// 用户级 provider 配置快照（可被 [`reload_providers`](Self::reload_providers) 整体替换）。
     /// 已构建的 Agent 内嵌 `Arc<dyn ModelProvider>`，因此替换后必须同时失效 Tier-2 缓存。
@@ -109,6 +113,7 @@ impl AgentManager {
         Self {
             agents_dir,
             workspace_root,
+            work_dirs: None,
             user_id,
             mcp_config: Arc::new(mcp_config),
             skill_registry,
@@ -125,6 +130,18 @@ impl AgentManager {
     }
 
     // ── 依赖注入 ────────────────────────────────────────────────────
+
+    /// 工作层目录。
+    pub fn work_dirs(&self) -> Option<&WorkDirs> {
+        self.work_dirs.as_ref()
+    }
+
+    /// 注入工作层目录（由 WorkSpace 在初始化时调用）。
+    ///
+    /// 必须在构造 `Arc<Self>` 之前调用 —— 之后无法再改。
+    pub fn set_work_dirs(&mut self, work_dirs: Option<WorkDirs>) {
+        self.work_dirs = work_dirs;
+    }
 
     /// 注入 Workflow 依赖（由 WorkSpace 在初始化时调用）。
     pub fn set_workflow_access(&self, wa: Arc<dyn WorkflowAccess>) {
@@ -290,6 +307,7 @@ impl AgentManager {
             mcp_access: self.mcp_access.read().unwrap().clone(),
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
+            work_dirs: self.work_dirs.clone(),
             web_search: self.web_search.read().unwrap().clone(),
             memory_audit: self.memory_audit.read().unwrap().clone(),
         }
@@ -319,6 +337,7 @@ impl AgentManager {
                 mcp_access: mcp_access.clone(),
                 web_search: self.web_search.read().unwrap().clone(),
                 memory_audit: memory_audit.clone(),
+                work_dirs: self.work_dirs.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -332,6 +351,7 @@ impl AgentManager {
             mcp_access,
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
+            work_dirs: self.work_dirs.clone(),
             web_search: self.web_search.read().unwrap().clone(),
             memory_audit,
         }
@@ -586,6 +606,8 @@ struct AmAgentAccess {
     web_search: Option<Arc<SearchBackend>>,
     /// 记忆删除审计（透传给子 Agent 的 ToolDependencies）。
     memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    /// 工作层目录（透传给子 Agent 的 ToolDependencies）。
+    work_dirs: Option<WorkDirs>,
 }
 
 impl AgentAccess for AmAgentAccess {
@@ -610,6 +632,7 @@ impl AgentAccess for AmAgentAccess {
                 mcp_access: self.mcp_access.clone(),
                 web_search: self.web_search.clone(),
                 memory_audit: self.memory_audit.clone(),
+                work_dirs: self.work_dirs.clone(),
             }),
             skill_provider: Arc::new(AmSkillProvider {
                 registry: self.skill_registry.clone(),
@@ -623,6 +646,7 @@ impl AgentAccess for AmAgentAccess {
             mcp_access: self.mcp_access.clone(),
             workflow_persister: None,
             workspace_root: Some(self.workspace_root.clone()),
+            work_dirs: self.work_dirs.clone(),
             web_search: self.web_search.clone(),
             memory_audit: self.memory_audit.clone(),
         };
