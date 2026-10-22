@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 
 -- 对话表
+-- scope 区分 agent 会话（'agent'）与 peco 私有会话（'peco'）：后者是真实会话行
+-- （产物靠它的外键归属），但不属于任何 agent，不进列表 / 计数 / 自动归档。
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -39,7 +41,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT NOT NULL DEFAULT '新对话',
     archived_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    scope TEXT NOT NULL DEFAULT 'agent'
 );
 
 -- 消息表（数据库层面记录概要，详细消息由 Session 持久化文件保存）

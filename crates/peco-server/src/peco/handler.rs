@@ -67,11 +67,12 @@ use crate::peco::active::{
 use crate::session_dto::{TurnData, turns_to_dto};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::state::AppState;
+use crate::workspace::WorkspaceManager;
 
 use super::filter::PecoContextFilter;
 use super::manager::PecoManager;
 use super::memory::{degraded_count, last_converged_at, view};
-use super::session::{SESSION_TITLE, private_session_id};
+use super::session::{SESSION_AGENT_NAME, SESSION_TITLE, private_session_id};
 
 /// 附着时等待将死 run 退出的上限（回收只发生在停靠态，退出是毫秒级）。
 const RUN_EXIT_WAIT: Duration = Duration::from_secs(2);
@@ -592,6 +593,67 @@ async fn runner_loop(
     }
 }
 
+/// 把一个 `LooperEvent` 转成待发送的 SSE 事件；不需要发事件的返回 `None`。
+///
+/// 带产物声明的 `ToolResult` **先落库、后构造事件**：事件里的 artifact id 是
+/// 前端取流的唯一凭据，反过来会给出一个指向不存在 id 的事件。
+/// `pub` 仅为让集成测试直调本函数；生产调用点只有 `bridge_sse_response`。
+pub async fn looper_event_to_sse(
+    db: &sqlx::SqlitePool,
+    workspace: &WorkspaceManager,
+    user_id: &str,
+    event: LooperEvent,
+) -> Option<ChatSseEvent> {
+    // 全函数只派生一次：私有会话行与产物归属必须是同一个 id。
+    let conversation_id = private_session_id(user_id);
+
+    match event {
+        // `artifacts` 为空是绝大多数工具调用的常态：不建行、不落库，直接走纯映射。
+        LooperEvent::ToolResult {
+            id,
+            name,
+            result,
+            images,
+            artifacts,
+        } if !artifacts.is_empty() => {
+            // 懒建在此处而非启动时：覆盖新建 run / 附着 / 重连三种入口，且对
+            // 存量安装天然生效。失败只降级 —— 随后每条声明会被外键逐条拒掉，
+            // 事件里 artifacts 为空，主对话照常。
+            if let Err(e) = crate::db::conversations::ensure_private_session(
+                db,
+                user_id,
+                &conversation_id,
+                SESSION_AGENT_NAME,
+                SESSION_TITLE,
+            )
+            .await
+            {
+                warn!(
+                    user_id,
+                    error = %e,
+                    "peco private session row unavailable; artifact persist will degrade"
+                );
+            }
+            let work = crate::artifact::work_dirs(workspace, user_id);
+            Some(
+                crate::artifact::build_tool_result_event(
+                    db,
+                    work.as_ref(),
+                    &conversation_id,
+                    user_id,
+                    id,
+                    name,
+                    result,
+                    images,
+                    &artifacts,
+                )
+                .await,
+            )
+        }
+        other => map_looper_event(other, &conversation_id),
+    }
+}
+
 /// 将 run 的 broadcast 事件流桥接为一个 SSE 响应（每个连接一个桥接任务）。
 ///
 /// 连接断开只结束桥接任务并唤醒 runner 复查回收，运行中的轮次不受影响；
@@ -605,6 +667,10 @@ fn bridge_sse_response(
     let conv_id = private_session_id(&user_id);
     let runs = Arc::clone(&state.peco_runs);
     let app_state = Arc::clone(&state);
+    // `app_state` 随 WatcherGuard 被 move 进任务，循环体借不到；落库要用的依赖
+    // 必须在 spawn 之前单独克隆出来。
+    let db = state.db.clone();
+    let workspace_manager = Arc::clone(&state.workspace_manager);
     let uid = user_id;
 
     // FileWatcher 引用计数按连接管理（acquire 此处，release 由 guard 兜底）
@@ -619,7 +685,8 @@ fn bridge_sse_response(
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id)
+                    if let Some(sse_ev) =
+                        looper_event_to_sse(&db, &workspace_manager, &uid, event).await
                         && let Ok(ev) = sse_ev.to_sse_event()
                         && sse_tx.send(Ok(ev)).await.is_err()
                     {
@@ -2298,6 +2365,72 @@ mod tests {
         let scheduler = Arc::new(CronScheduler::new().await.unwrap());
         let state = AppState::new(&config, pool, scheduler).await;
         (Arc::new(state), dir)
+    }
+
+    /// 桥是产物落库的唯一生产调用点：一条带声明的 ToolResult 进 broadcast 后，
+    /// 事件里的 id 必须已经落库且归属私有会话。
+    ///
+    /// 变异点：把桥循环体改回直接调 `map_looper_event` → 事件里没有 artifacts，
+    /// 这里必红（T1–T9 全绿也拦不住）。
+    #[tokio::test]
+    async fn bridge_persists_and_emits() {
+        let (state, _dir) = test_state().await;
+        let uid = "u-bridge".to_string();
+        // conversations.user_id 有外键，而 test_state() 不建用户
+        sqlx::query("INSERT INTO users (id, username, email, password_hash) VALUES (?, ?, ?, ?)")
+            .bind(&uid)
+            .bind("bridge")
+            .bind("bridge@example.com")
+            .bind("x")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let work = crate::artifact::work_dirs(&state.workspace_manager, &uid)
+            .expect("test workspace must follow <data_dir>/workspaces/<uid> layout");
+        // 先写文件、后调桥：此处 workspace 还没打开，output/ 得自己建
+        std::fs::create_dir_all(work.output()).unwrap();
+        let path = work.output().join("bridge/out.png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"PNG").unwrap();
+
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let resp = bridge_sse_response(Arc::clone(&state), uid.clone(), rx);
+        tx.send(LooperEvent::ToolResult {
+            id: "call_bridge".to_string(),
+            name: "shell".to_string(),
+            result: "完成".to_string(),
+            images: vec![],
+            artifacts: vec![peco_core::artifacts::ArtifactDecl {
+                path: path.to_string_lossy().into_owned(),
+                title: Some("桥产物".to_string()),
+                mime: None,
+            }],
+        })
+        .unwrap();
+        drop(tx);
+
+        let bytes = to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let data = body
+            .split("\n\n")
+            .find(|frame| frame.contains("event: tool_result"))
+            .and_then(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .expect("桥必须发出 tool_result 帧");
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let artifacts = json["data"]["artifacts"]
+            .as_array()
+            .expect("带声明的工具结果必须携带 artifacts 数组");
+        assert_eq!(artifacts.len(), 1);
+
+        let id = artifacts[0]["id"].as_str().unwrap();
+        let stored = crate::db::artifacts::find_by_id_and_user(&state.db, id, &uid)
+            .await
+            .unwrap()
+            .expect("事件里的 id 必须已经落库");
+        assert_eq!(stored.conversation_id, private_session_id(&uid));
     }
 
     /// 向指定用户的上传目录写一张测试图片。

@@ -44,6 +44,35 @@ pub async fn insert(
     Ok(())
 }
 
+/// 幂等创建 peco 私有会话行（每用户一条）。
+///
+/// `artifacts.conversation_id` 的外键要求该行先存在，否则产物登记会被数据库
+/// 拒绝。id / agent_name / title 由调用方给出：peco 的会话 id 格式属于上层
+/// 知识，嵌进 db 层会让两层各持一份格式约定。
+///
+/// 单条 upsert 而非 check-then-insert：两条桥并发懒建时，后者会输掉竞态并需要
+/// 外部事务；SQLite 在同一条语句内完成「不存在则插」，既无窗口也不需事务。
+pub async fn ensure_private_session(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+    agent_name: &str,
+    title: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, agent_id, agent_name, title, scope) \
+         VALUES (?, ?, NULL, ?, ?, 'peco') \
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .bind(agent_name)
+    .bind(title)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 查询用户在某 Agent 下的对话列表，支持归档状态过滤。
 pub async fn list_by_user_and_agent(
     pool: &SqlitePool,
@@ -55,7 +84,7 @@ pub async fn list_by_user_and_agent(
         sqlx::query_as::<_, ConversationRow>(
             "SELECT id, user_id, agent_id, agent_name, title, archived_at, created_at, updated_at \
              FROM conversations \
-             WHERE user_id = ? AND agent_name = ? \
+             WHERE user_id = ? AND agent_name = ? AND scope = 'agent' \
              ORDER BY updated_at DESC",
         )
         .bind(user_id)
@@ -67,6 +96,7 @@ pub async fn list_by_user_and_agent(
             "SELECT id, user_id, agent_id, agent_name, title, archived_at, created_at, updated_at \
              FROM conversations \
              WHERE user_id = ? AND agent_name = ? AND archived_at IS NULL \
+               AND scope = 'agent' \
              ORDER BY updated_at DESC",
         )
         .bind(user_id)
@@ -85,7 +115,8 @@ pub async fn list_by_user(
     if let Some(agent_name) = agent_name_filter {
         sqlx::query_as::<_, ConversationRow>(
             "SELECT id, user_id, agent_id, agent_name, title, archived_at, created_at, updated_at \
-             FROM conversations WHERE user_id = ? AND agent_name = ? ORDER BY updated_at DESC",
+             FROM conversations \
+             WHERE user_id = ? AND agent_name = ? AND scope = 'agent' ORDER BY updated_at DESC",
         )
         .bind(user_id)
         .bind(agent_name)
@@ -94,7 +125,7 @@ pub async fn list_by_user(
     } else {
         sqlx::query_as::<_, ConversationRow>(
             "SELECT id, user_id, agent_id, agent_name, title, archived_at, created_at, updated_at \
-             FROM conversations WHERE user_id = ? ORDER BY updated_at DESC",
+             FROM conversations WHERE user_id = ? AND scope = 'agent' ORDER BY updated_at DESC",
         )
         .bind(user_id)
         .fetch_all(pool)
@@ -103,6 +134,8 @@ pub async fn list_by_user(
 }
 
 /// 按 ID 查询对话（不校验 user_id，由调用方自行校验）。
+///
+/// 不过滤 `scope`：产物列表端点要靠它（及其归属版）命中 peco 私有会话。
 pub async fn find_by_id(
     pool: &SqlitePool,
     conversation_id: &str,
@@ -117,6 +150,8 @@ pub async fn find_by_id(
 }
 
 /// 按 ID + user_id 查询对话（验证归属）。
+///
+/// 同样不过滤 `scope` —— 私有会话的产物列表必须能通过这道归属校验。
 pub async fn find_by_id_and_user(
     pool: &SqlitePool,
     conversation_id: &str,
@@ -132,6 +167,26 @@ pub async fn find_by_id_and_user(
     .await
 }
 
+/// 按 ID + user_id 查 **agent 会话** —— 删除端点的 404 判定。
+///
+/// 删除私有会话会经 `ON DELETE CASCADE` 连带删掉它的产物行，所以删除入口必须
+/// 用本函数；而 [`find_by_id_and_user`] 不能改成这样，产物列表端点依赖它命中
+/// 私有会话。
+pub async fn find_agent_conversation_by_id_and_user(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    user_id: &str,
+) -> Result<Option<ConversationRow>, sqlx::Error> {
+    sqlx::query_as::<_, ConversationRow>(
+        "SELECT id, user_id, agent_id, agent_name, title, archived_at, created_at, updated_at \
+         FROM conversations WHERE id = ? AND user_id = ? AND scope = 'agent'",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// 统计某用户某 Agent 下活跃对话数量。
 pub async fn count_active(
     pool: &SqlitePool,
@@ -140,7 +195,7 @@ pub async fn count_active(
 ) -> Result<usize, sqlx::Error> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversations \
-         WHERE user_id = ? AND agent_name = ? AND archived_at IS NULL",
+         WHERE user_id = ? AND agent_name = ? AND archived_at IS NULL AND scope = 'agent'",
     )
     .bind(user_id)
     .bind(agent_name)
@@ -161,6 +216,7 @@ pub async fn archive_oldest(
          WHERE id IN ( \
            SELECT id FROM conversations \
            WHERE user_id = ? AND agent_name = ? AND archived_at IS NULL \
+             AND scope = 'agent' \
            ORDER BY updated_at ASC LIMIT ? \
          )",
     )

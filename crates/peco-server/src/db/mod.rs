@@ -407,6 +407,27 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 015 skipped: artifacts table already exists");
     }
 
+    // ── Migration 016: conversations.scope ────────────────────────────────
+    // 门控查列：ALTER ADD COLUMN 不可重复执行（重跑报 duplicate column name）。
+    let has_scope = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('conversations') WHERE name = 'scope'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_scope {
+        run_migration(
+            pool,
+            "016",
+            include_str!("migrations/016_conversation_scope.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 016 completed");
+    } else {
+        tracing::debug!("Migration 016 skipped: scope column already exists");
+    }
+
     Ok(())
 }
 
@@ -880,5 +901,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1, "重跑迁移后表 peco_context_shadow 不得重复创建");
+    }
+
+    /// `schema.sql` 必须自带 `scope` 列：016 的列守卫对「`schema.sql` 漏加」是瞎的
+    /// —— 漏加时全新库 `has_scope=false`，016 补列后两库的列形状仍然相同。
+    #[test]
+    fn schema_sql_declares_conversation_scope() {
+        assert!(
+            include_str!("schema.sql").contains("scope TEXT NOT NULL DEFAULT 'agent'"),
+            "schema.sql 的 conversations 建表语句必须带 scope 列"
+        );
     }
 }

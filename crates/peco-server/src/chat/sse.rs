@@ -388,14 +388,13 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             artifacts,
         } => {
             if !artifacts.is_empty() {
-                // 本函数是**纯映射**，拿不到 DB，无法落库。能走到这里的路径
-                // 只有两类：chat 主流程里被专门分支前置拦截后剩下的情况，
-                // 以及 peco 主对话（它对产物暂不支持）。
-                // 显式告警 —— 静默吞掉会让「产物凭空消失」无从追查。
+                // 本函数是**纯映射**，拿不到 DB：带产物的 ToolResult 必须由调用方
+                // 在映射前落库。走到这里只剩「新调用点漏做前置落库」这一种契约
+                // 违例 —— 显式告警，否则产物会无声消失、日志无痕。
                 warn!(
                     tool = %name,
                     count = artifacts.len(),
-                    "Artifact declarations dropped: this path does not persist artifacts"
+                    "Artifact declarations reached the pure mapper: caller must persist before mapping"
                 );
             }
             Some(ChatSseEvent::ToolResult {
