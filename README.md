@@ -350,7 +350,7 @@ cargo test -p knowledge-base
 cd webui && npx vitest run
 
 # TypeScript 类型检查
-cd webui && npx tsc --noEmit
+cd webui && npx tsc -b
 
 # 代码格式化
 cargo fmt --all
@@ -474,7 +474,7 @@ cargo run -p peco-core --example workflow_demo # workflow demo
 cargo test --workspace              # All tests
 cargo test -p peco-core -- --nocapture  # With output
 cd webui && npx vitest run           # Frontend tests
-cd webui && npx tsc --noEmit         # TypeScript check
+cd webui && npx tsc -b               # TypeScript check
 cargo fmt --all                      # Format Rust
 cargo clippy --workspace -- -D warnings  # Lint
 ```

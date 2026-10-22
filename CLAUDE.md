@@ -35,7 +35,7 @@ bash scripts/dev.sh
 # 前端
 cd webui && npm install
 cd webui && npx vitest run                     # 运行前端测试
-cd webui && npx tsc --noEmit                   # TypeScript 类型检查
+cd webui && npx tsc -b                         # TypeScript 类型检查（solution 式 tsconfig，--noEmit 查 0 个文件）
 cd webui && npx prettier --write src/          # 格式化前端代码
 ```
 

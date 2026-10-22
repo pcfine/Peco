@@ -169,7 +169,7 @@ npm run dev         # 启动开发服务器 (http://localhost:9233)
 npm run build       # TypeScript 编译 + Vite 生产构建
 npm run preview     # 预览生产构建
 npx vitest run      # 运行单元测试
-npx tsc --noEmit    # TypeScript 类型检查
+npx tsc -b          # TypeScript 类型检查
 ```
 
 ## 环境要求
