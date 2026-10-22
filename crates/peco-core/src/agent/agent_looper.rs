@@ -27,6 +27,7 @@ use model_provider::{
 type ModelTaskHandle = tokio::task::JoinHandle<Result<ModelResponse, AgentError>>;
 type SharedModelTask = Arc<tokio::sync::Mutex<Option<ModelTaskHandle>>>;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::error::TrySendError;
 
 use super::agent::{Agent, MessageFilter, ModelResponse, override_output_budget};
 use super::compaction::{BoundaryReduction, CompactionOutcome};
@@ -1222,10 +1223,34 @@ impl AgentLooper {
         self.cancel_request.load(Ordering::Acquire)
     }
 
-    /// 非阻塞发送普通事件；若 channel 满或接收端关闭则静默丢弃。
+    /// 非阻塞发送普通事件；若 channel 满或接收端关闭则丢弃。
     /// 适用于高频增量事件（TextDelta、ToolCallDelta 等）。
+    ///
+    /// 唯一例外是带 `artifacts` 的 `ToolResult`：声明行已从 `result` 剥离，
+    /// 事件即产物的唯一载体，丢一次就再也找不回 —— 这类失败必须留痕。
     fn emit_event(&self, event: LooperEvent) {
-        let _ = self.event_speaker.try_send(event);
+        // 失败的 `try_send` 会把事件还回来，据此判断丢的是不是产物声明。
+        let (reason, event) = match self.event_speaker.try_send(event) {
+            Ok(()) => return,
+            Err(TrySendError::Full(event)) => ("full", event),
+            Err(TrySendError::Closed(event)) => ("closed", event),
+        };
+        let LooperEvent::ToolResult {
+            name, artifacts, ..
+        } = event
+        else {
+            return;
+        };
+        if artifacts.is_empty() {
+            return;
+        }
+        warn!(
+            session_id = %self.session.id(),
+            tool = %name,
+            count = artifacts.len(),
+            reason = %reason,
+            "Artifact declarations lost: event channel unavailable"
+        );
     }
 
     /// 贪婪排空 `JoinSet` 中已完成 task 的结果，返回捞回的条数。非阻塞。
@@ -3801,7 +3826,9 @@ fn plan_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::AtomicUsize;
+    use tracing_subscriber::fmt::MakeWriter;
 
     // ── LooperConfig tests ────────────────────────────────────────────
 
@@ -8214,5 +8241,286 @@ mod tests {
         async fn summarize_inflight(&self, _transcript: &str) -> Result<String, AgentError> {
             unimplemented!("boundary tests never compose turn epilogues")
         }
+    }
+
+    // ── 产物声明丢失告警（emit_event 的失败分支）──────────────────────────
+
+    const ARTIFACTS_LOST: &str = "Artifact declarations lost";
+
+    fn decl(path: &str) -> crate::artifacts::ArtifactDecl {
+        crate::artifacts::ArtifactDecl {
+            path: path.to_string(),
+            title: None,
+            mime: None,
+        }
+    }
+
+    fn tool_result_with(name: &str, artifacts: Vec<crate::artifacts::ArtifactDecl>) -> LooperEvent {
+        LooperEvent::ToolResult {
+            id: "call-1".to_string(),
+            name: name.to_string(),
+            result: "ok".to_string(),
+            images: Vec::new(),
+            artifacts,
+        }
+    }
+
+    /// 采集日志的 writer：把字节流追加到共享缓冲，供告警断言。
+    ///
+    /// 日志断言必须用 `#[tokio::test]` 默认的 `current_thread` 运行时：默认
+    /// subscriber 是线程局部的，后台 task 的日志会落到别的线程上，断言恒红 ——
+    /// 所以本组用例直接在测试里构造 looper 并同步调 `emit_event`。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
+
+    /// 只用来发事件的 looper：`PanicProvider` 保证本组用例永不触达模型。
+    ///
+    /// `session_id` 由调用方指定：全组共用一个字面量时，日志里的会话归属
+    /// 与写死的常量不可区分，字段读错也照样全绿。
+    fn event_looper(buffer: usize, session_id: &str) -> (AgentLooper, Listener<LooperEvent>) {
+        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn crate::tools::ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let agent = Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::new(PanicProvider),
+            crate::agent::ModelConfigBuilder::new().build(),
+            Arc::clone(&executor),
+            Arc::new(crate::mcp::McpManager::empty(executor)),
+            None,
+        ));
+        let (looper_side, caller_side) = make_async_intercom_pair::<LooperEvent, UserMsg>(buffer);
+        let (event_speaker, _user_listener) = looper_side.split();
+        let (_user_speaker, event_listener) = caller_side.split();
+        let looper = AgentLooper::new(
+            agent,
+            Box::new(Session::new(session_id.to_string(), "d".to_string())),
+            event_speaker,
+            LooperConfig::default(),
+            Arc::new(crate::persistence::NullSessionPersister),
+        );
+        (looper, event_listener)
+    }
+
+    /// listener 全部 drop（用户关掉 SSE 页面、run 仍在后台跑）时，带声明的
+    /// `ToolResult` 不能无声蒸发。
+    ///
+    /// 变异敏感度：本条完全依赖告警可见 —— 实现若吞掉失败或降级到 debug，
+    /// 日志里就没有可断言的告警；会话与工具名取本用例专属值，把任一字段
+    /// 写死成常量都会让对应断言变红；把条数写死成常量 ⇒ `count=2` 断言
+    /// 变红；同一次丢失发两条告警 ⇒ 条数断言变红。
+    #[tokio::test]
+    async fn test_tool_result_artifacts_loss_warns_when_listener_closed() {
+        let (logs, _guard) = capture_logs();
+        let (looper, event_listener) = event_looper(4, "s-closed");
+        drop(event_listener);
+
+        looper.emit_event(tool_result_with(
+            "t-close",
+            vec![decl("/tmp/a.png"), decl("/tmp/b.png")],
+        ));
+
+        let text = logs.text();
+        assert!(
+            text.contains(ARTIFACTS_LOST),
+            "接收端关闭时丢声明必须告警；实际日志 {text:?}"
+        );
+        // `capture_logs` 对任何级别都放行，级别只能在这里锁住：` WARN ` 与
+        // `DEBUG` 都是 fmt 默认的级别渲染字面量，取值不依赖告警文案。
+        assert!(
+            text.contains(" WARN "),
+            "告警须以 warn 级别发出；实际日志 {text:?}"
+        );
+        assert!(
+            !text.contains("DEBUG"),
+            "告警不得降级到 debug 以下；实际日志 {text:?}"
+        );
+        // 同进程多会话下没有会话归属就无法定位是哪次 run 丢了产物。
+        assert!(
+            text.contains("session_id=s-closed"),
+            "告警须带会话归属；实际日志 {text:?}"
+        );
+        assert!(
+            text.contains("tool=t-close"),
+            "告警须带 tool 名；实际日志 {text:?}"
+        );
+        assert!(text.contains("count=2"), "告警须带条数；实际日志 {text:?}");
+        assert!(
+            text.contains("reason=closed"),
+            "告警须区分关闭与满载；实际日志 {text:?}"
+        );
+        assert_eq!(
+            text.matches(ARTIFACTS_LOST).count(),
+            1,
+            "同一次丢失只许告警一条：多条会让日志噪声翻倍；实际日志 {text:?}"
+        );
+    }
+
+    /// listener 活着但缓冲已满（消费过慢）同样丢声明，原因须与 closed 可区分。
+    ///
+    /// `buffer=1`：先塞一条填充事件占满唯一缓冲位，再发带声明的 `ToolResult`。
+    ///
+    /// 变异敏感度：吞掉 `Err` ⇒ 无日志，本条变红；把失败原因写死成
+    /// `closed` ⇒ `reason=full` 断言变红；会话与工具名取本用例专属值，
+    /// 把任一字段写死成常量都会让对应断言变红；成功投递也留痕（`Ok(())`
+    /// 分支加 `debug!`）⇒ 「成功投递不得留痕」断言变红。
+    #[tokio::test]
+    async fn test_tool_result_artifacts_loss_warns_when_buffer_full() {
+        let (logs, _guard) = capture_logs();
+        let (looper, mut event_listener) = event_looper(1, "s-full");
+
+        let baseline = logs.text().len();
+        looper.emit_event(LooperEvent::TextDelta {
+            delta: "fill".to_string(),
+        });
+        // 填充事件走的是成功路径，跑完不得比基线多留一个字节。
+        assert_eq!(logs.text().len(), baseline, "成功投递不得留痕");
+
+        looper.emit_event(tool_result_with("t-full", vec![decl("/tmp/a.png")]));
+
+        // 先确认这次确实是「满」而不是「关」：缓冲里只剩填充事件，带声明的被拒收。
+        assert!(
+            event_listener.try_recv().is_ok(),
+            "填充事件须占住唯一缓冲位"
+        );
+        assert!(
+            matches!(
+                event_listener.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "带声明的 ToolResult 应当被拒收"
+        );
+
+        let text = logs.text();
+        assert!(
+            text.contains(ARTIFACTS_LOST),
+            "缓冲满载时丢声明必须告警；实际日志 {text:?}"
+        );
+        assert!(
+            text.contains("session_id=s-full"),
+            "告警须带会话归属；实际日志 {text:?}"
+        );
+        assert!(
+            text.contains("tool=t-full"),
+            "告警须带 tool 名；实际日志 {text:?}"
+        );
+        assert!(text.contains("count=1"), "告警须带条数；实际日志 {text:?}");
+        assert!(
+            text.contains("reason=full"),
+            "满载须报 full；实际日志 {text:?}"
+        );
+        assert!(
+            !text.contains("reason=closed"),
+            "满载不得被报成 closed；实际日志 {text:?}"
+        );
+    }
+
+    /// 无产物的 `ToolResult` 是每轮正常对话的常态，丢弃不得告警刷屏。
+    ///
+    /// 变异敏感度：去掉 `artifacts.is_empty()` 守卫 ⇒ 前半段的静默断言变红。
+    /// 静默段比的是日志字节数而非告警文案，任何级别的留痕（含 `debug!`）都会
+    /// 变红。后半段拿同类带声明事件做阳性对照，证明采集管道在本用例里确实生效
+    /// （否则前半段可能因捕获为空而空过）。
+    #[tokio::test]
+    async fn test_tool_result_without_artifacts_stays_silent() {
+        let (logs, _guard) = capture_logs();
+        let (looper, event_listener) = event_looper(4, "s-silent");
+        drop(event_listener);
+
+        let baseline = logs.text().len();
+        looper.emit_event(tool_result_with("t-silent", Vec::new()));
+        assert_eq!(
+            logs.text().len(),
+            baseline,
+            "无产物丢失时不得留任何日志；实际日志 {:?}",
+            logs.text()
+        );
+
+        looper.emit_event(tool_result_with("t-silent", vec![decl("/tmp/a.png")]));
+        assert!(
+            logs.text().contains(ARTIFACTS_LOST),
+            "阳性对照未捕获到告警，说明采集管道未生效；实际日志 {:?}",
+            logs.text()
+        );
+    }
+
+    /// 丢弃非 `ToolResult` 事件不得留痕：`TextDelta` 每 token 一条，用户关掉
+    /// SSE 后 run 仍在后台跑，逐条告警会把日志淹掉。
+    ///
+    /// 变异敏感度：凡在丢弃路径留痕的实现都会让前半段变红 —— 静默段比的是
+    /// 日志字节数，既不认文案也不认级别，`warn!` 与 `debug!` 一视同仁；默认
+    /// 部署的过滤级别是 `peco=debug`，debug 留痕同样会进用户日志。
+    /// 后半段拿带声明的 `ToolResult` 做阳性对照，证明采集管道在本用例里确实
+    /// 生效（否则前半段可能因捕获为空而空过）。
+    #[tokio::test]
+    async fn test_non_tool_result_loss_stays_silent() {
+        let (logs, _guard) = capture_logs();
+        let (looper, event_listener) = event_looper(4, "s-silent");
+        drop(event_listener);
+
+        let baseline = logs.text().len();
+        looper.emit_event(LooperEvent::TextDelta {
+            delta: "tok".to_string(),
+        });
+        looper.emit_event(LooperEvent::ToolCallDelta {
+            id: "call-1".to_string(),
+            name: Some("t-silent".to_string()),
+            arguments: "{".to_string(),
+        });
+        assert_eq!(
+            logs.text().len(),
+            baseline,
+            "非 ToolResult 事件丢弃时不得留任何日志（debug 亦不可）；实际日志 {:?}",
+            logs.text()
+        );
+
+        looper.emit_event(tool_result_with("t-silent", vec![decl("/tmp/a.png")]));
+        assert!(
+            logs.text().contains(ARTIFACTS_LOST),
+            "阳性对照未捕获到告警，说明采集管道未生效；实际日志 {:?}",
+            logs.text()
+        );
     }
 }

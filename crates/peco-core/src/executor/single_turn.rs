@@ -82,7 +82,7 @@ impl AgentExecutor for SingleTurnExecutor {
             self.max_iterations,
         );
 
-        let content = if let Some(timeout) = self.timeout {
+        let out = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, handle.wait())
                 .await
                 .map_err(|_| ExecutorError::Timeout)?
@@ -91,7 +91,7 @@ impl AgentExecutor for SingleTurnExecutor {
         }?;
 
         Ok(ExecutorOutput {
-            content,
+            content: out.into_text("single_turn"),
             usage: Default::default(),
             structured_data: None,
             turns: 0,

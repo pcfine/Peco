@@ -187,7 +187,7 @@ async fn execute_agent_step(
 
     // 4. 等待完成
     match handle.wait().await {
-        Ok(output) => StepOutcome::Success(output),
+        Ok(out) => StepOutcome::Success(out.into_text("workflow_step")),
         Err(e) => StepOutcome::Failed(e.to_string()),
     }
 }

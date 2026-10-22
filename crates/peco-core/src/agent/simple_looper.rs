@@ -22,12 +22,13 @@ use model_provider::{
 
 use super::agent::{Agent, override_output_budget};
 use super::error::AgentError;
+use crate::artifacts::ArtifactDecl;
 use crate::tools::ToolExecutor;
 
 /// Concurrent tool execution result: (index, tool_call, output).
 type ToolExecResult = (usize, ToolCall, Result<Content, String>);
 type ToolExecHandle = tokio::task::JoinHandle<ToolExecResult>;
-type SimpleTaskHandle = tokio::task::JoinHandle<Result<String, AgentError>>;
+type SimpleTaskHandle = tokio::task::JoinHandle<Result<SimpleLooperOutput, AgentError>>;
 type SharedSimpleTask = Arc<tokio::sync::Mutex<Option<SimpleTaskHandle>>>;
 
 /// 子 agent 截断重试时的输出预算抬升目标（`None` → 本值）。
@@ -38,6 +39,40 @@ type SharedSimpleTask = Arc<tokio::sync::Mutex<Option<SimpleTaskHandle>>>;
 /// 的 `[ORGANIZE]` 扫描上百条文档）会把预算全耗在 reasoning 上，可见输出被挤成
 /// 空。抬到本值后模型有足够空间产出最终回答（实测同一模型可输出 > 7900 tokens）。
 const SUB_AGENT_TRUNCATION_RETRY_BUDGET: u32 = 32_768;
+
+// ============================================================================
+// SimpleLooperOutput — 正文 + 沿途收集的产物声明
+// ============================================================================
+
+/// 一次 `SimpleAgentLooper` 运行的产出。
+///
+/// 工具输出里的 `@@PECO_ARTIFACT` 声明已从文本剥离，只留在 `artifacts` 里：
+/// 丢弃它等于吞掉产物，而宿主层（peco-server 的 delegate/parallel 分支）正是
+/// 靠这些声明才拿得到落库候选。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimpleLooperOutput {
+    /// 最终助手正文（已剥离声明行）。
+    pub text: String,
+    /// 本次运行中工具输出声明的产物，按收集顺序。
+    pub artifacts: Vec<ArtifactDecl>,
+}
+
+impl SimpleLooperOutput {
+    /// 无落库能力的消费方统一走这里（core 内唯一丢弃点）。
+    ///
+    /// 归一到一个出口而不是各调用点各判一次：新增消费方时漏判就会静默吞掉
+    /// 声明，而这里至少留下一条 warn 供追查。
+    pub(crate) fn into_text(self, consumer: &'static str) -> String {
+        if !self.artifacts.is_empty() {
+            tracing::warn!(
+                consumer,
+                count = self.artifacts.len(),
+                "Artifact declarations dropped: consumer cannot persist artifacts"
+            );
+        }
+        self.text
+    }
+}
 
 // ============================================================================
 // SimpleAgentLooper — internal
@@ -70,6 +105,12 @@ pub struct SimpleAgentLooper {
     /// 设置后，工具定义获取和执行均使用此执行器。
     /// 由 [`StructuredOutputExecutor`](crate::executor::StructuredOutputExecutor) 使用。
     tool_executor_override: Option<Arc<dyn ToolExecutor>>,
+
+    /// 工具输出中收集到的产物声明（声明行已从文本剥离）。
+    ///
+    /// 只有成功出口会把它们交出去；失败出口由 [`spawn_looper`] 统一告警 ——
+    /// 收集过程中不能报「丢弃」，此时还不知道最终成功与否。
+    artifacts: Vec<ArtifactDecl>,
 }
 
 impl SimpleAgentLooper {
@@ -88,26 +129,7 @@ impl SimpleAgentLooper {
         prompt: String,
         max_iterations: Option<usize>,
     ) -> SimpleLooperHandle {
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let max_iterations = max_iterations.unwrap_or_else(|| agent.max_iterations());
-
-        let mut looper = SimpleAgentLooper {
-            agent,
-            max_iterations,
-            messages: Vec::new(),
-            react_loop_iteration: 0,
-            cancel_flag: cancel_flag.clone(),
-            tool_executor_override: None,
-        };
-
-        let join_handle = tokio::spawn(async move { looper.run(prompt).await });
-        let abort_handle = join_handle.abort_handle();
-
-        SimpleLooperHandle {
-            cancel_flag,
-            join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
-            abort_handle,
-        }
+        Self::spawn_looper(agent, prompt, max_iterations, None)
     }
 
     /// 使用自定义 [`ToolExecutor`] 启动（覆盖 agent 内置的）。
@@ -120,6 +142,16 @@ impl SimpleAgentLooper {
         tool_executor: Arc<dyn ToolExecutor>,
         max_iterations: Option<usize>,
     ) -> SimpleLooperHandle {
+        Self::spawn_looper(agent, prompt, max_iterations, Some(tool_executor))
+    }
+
+    /// 两个公开入口的公共实现。
+    fn spawn_looper(
+        agent: Arc<Agent>,
+        prompt: String,
+        max_iterations: Option<usize>,
+        tool_executor_override: Option<Arc<dyn ToolExecutor>>,
+    ) -> SimpleLooperHandle {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let max_iterations = max_iterations.unwrap_or_else(|| agent.max_iterations());
 
@@ -129,10 +161,24 @@ impl SimpleAgentLooper {
             messages: Vec::new(),
             react_loop_iteration: 0,
             cancel_flag: cancel_flag.clone(),
-            tool_executor_override: Some(tool_executor),
+            tool_executor_override,
+            artifacts: Vec::new(),
         };
 
-        let join_handle = tokio::spawn(async move { looper.run(prompt).await });
+        let join_handle = tokio::spawn(async move {
+            let res = looper.run(prompt).await;
+            // `run()` 有若干条不经 collect 的 `?` 错误出口（模型调用失败、
+            // 响应未完成、取消、迭代耗尽），声明此时只存在于 looper 内部。
+            // 丢弃告警收敛在这里而不是 `execute_tools`：那里还不知道成败，
+            // 两边都报会让同一次失败出两条 warn。
+            if res.is_err() && !looper.artifacts.is_empty() {
+                tracing::warn!(
+                    count = looper.artifacts.len(),
+                    "Artifact declarations discarded with failed sub-agent run"
+                );
+            }
+            res
+        });
         let abort_handle = join_handle.abort_handle();
 
         SimpleLooperHandle {
@@ -144,8 +190,8 @@ impl SimpleAgentLooper {
 
     // ── Core loop ──────────────────────────────────────────────────────────
 
-    /// Execute the ReAct loop and return the final assistant text.
-    async fn run(&mut self, prompt: String) -> Result<String, AgentError> {
+    /// Execute the ReAct loop and return the final assistant text plus artifacts.
+    async fn run(&mut self, prompt: String) -> Result<SimpleLooperOutput, AgentError> {
         // Ensure deferred MCP connections are established before first tool use.
         self.agent.mcp_manager().ensure_connected().await;
 
@@ -294,9 +340,12 @@ impl SimpleAgentLooper {
                 }));
             }
 
-            // No tool calls → done, return final text
+            // No tool calls → done, return final text + collected artifacts
             if tool_calls.is_empty() {
-                return Ok(text);
+                return Ok(SimpleLooperOutput {
+                    text,
+                    artifacts: std::mem::take(&mut self.artifacts),
+                });
             }
 
             // ── Execute tools ─────────────────────────────────────────────
@@ -313,7 +362,7 @@ impl SimpleAgentLooper {
     /// the model's `tool_calls` sequence) while checking cancel between each.
     /// Returns `FunctionCallOutput` [`InputItem`]s to be appended to the history.
     async fn execute_tools(
-        &self,
+        &mut self,
         tool_calls: &[ToolCall],
     ) -> Result<Vec<Arc<InputItem>>, AgentError> {
         // 有自定义执行器则用它，否则用 MCP 托管的执行器
@@ -361,15 +410,10 @@ impl SimpleAgentLooper {
                         Err(e) => Content::Text(e),
                     };
                     let (output, decls) = crate::artifacts::strip_content(content);
-                    if !decls.is_empty() {
-                        // 子 agent / 单轮路径不登记产物 —— 宿主层没有
-                        // conversation 归属可用。显式记一条，避免「产物
-                        // 凭空消失」无从追查。
-                        tracing::debug!(
-                            count = decls.len(),
-                            "Artifact declarations dropped: simple looper does not persist artifacts"
-                        );
-                    }
+                    // 收集放在原地（紧跟 await），而不是循环结束后统一取：
+                    // 取消/迭代耗尽会中途 return，批尾收集会把已执行工具的声明
+                    // 一起丢掉。归属判定交给调用方，这里只负责不吞。
+                    self.artifacts.extend(decls);
                     results.push((
                         idx,
                         Arc::new(InputItem::FunctionCallOutput {
@@ -411,8 +455,9 @@ impl SimpleAgentLooper {
 /// ```text
 /// let handle = SimpleAgentLooper::spawn(agent, "do X".into(), None);
 ///
-/// // Option A: wait for result
-/// let output = handle.wait().await?;
+/// // Option A: wait for result (正文 + 收集到的产物声明)
+/// let out = handle.wait().await?;
+/// println!("{}", out.text);
 ///
 /// // Option B: cancel early and discard
 /// handle.cancel();
@@ -445,7 +490,11 @@ impl SimpleLooperHandle {
         self.cancel_flag.store(true, Ordering::Release);
     }
 
-    /// Block until the looper completes, returning the final assistant text.
+    /// Block until the looper completes, returning the final assistant text and
+    /// the artifact declarations collected from tool outputs along the way.
+    ///
+    /// 消费方按自身能力取用：能落库的读 `out.artifacts`，其余用
+    /// [`SimpleLooperOutput::into_text`]（会为被丢弃的声明留下告警）。
     ///
     /// # Errors
     ///
@@ -455,7 +504,7 @@ impl SimpleLooperHandle {
     /// # Panics
     ///
     /// Propagates if the background task panicked.
-    pub async fn wait(&self) -> Result<String, AgentError> {
+    pub async fn wait(&self) -> Result<SimpleLooperOutput, AgentError> {
         let handle = self
             .join_handle
             .lock()
@@ -534,6 +583,7 @@ impl Drop for SimpleLooperHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::test_support::*;
 
     /// Spawn a no-op task purely to obtain an `AbortHandle` for tests that
     /// build a `SimpleLooperHandle` without a real running looper. The task is
@@ -549,7 +599,7 @@ mod tests {
     async fn test_handle_clone() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = Arc::new(tokio::sync::Mutex::new(
-            None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
+            None::<tokio::task::JoinHandle<Result<SimpleLooperOutput, AgentError>>>,
         ));
         let h1 = SimpleLooperHandle {
             cancel_flag: cancel_flag.clone(),
@@ -568,7 +618,7 @@ mod tests {
     async fn test_handle_is_running_no_task() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = Arc::new(tokio::sync::Mutex::new(
-            None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
+            None::<tokio::task::JoinHandle<Result<SimpleLooperOutput, AgentError>>>,
         ));
         let h = SimpleLooperHandle {
             cancel_flag,
@@ -582,7 +632,7 @@ mod tests {
     async fn test_handle_wait_already_consumed() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = Arc::new(tokio::sync::Mutex::new(
-            None::<tokio::task::JoinHandle<Result<String, AgentError>>>,
+            None::<tokio::task::JoinHandle<Result<SimpleLooperOutput, AgentError>>>,
         ));
         let h = SimpleLooperHandle {
             cancel_flag,
@@ -597,22 +647,27 @@ mod tests {
     #[tokio::test]
     async fn test_handle_wait_returns_result() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let join_handle = tokio::spawn(async { Ok("hello".to_string()) });
+        let join_handle = tokio::spawn(async {
+            Ok(SimpleLooperOutput {
+                text: "hello".into(),
+                artifacts: vec![],
+            })
+        });
         let abort_handle = join_handle.abort_handle();
         let handle = SimpleLooperHandle {
             cancel_flag,
             join_handle: Arc::new(tokio::sync::Mutex::new(Some(join_handle))),
             abort_handle,
         };
-        let result = handle.wait().await.unwrap();
-        assert_eq!(result, "hello");
+        let out = handle.wait().await.unwrap();
+        assert_eq!(out.text, "hello");
     }
 
     #[tokio::test]
     async fn test_handle_wait_returns_error() {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let join_handle = tokio::spawn(async {
-            Err::<String, AgentError>(AgentError::MaxIterations { max_iterations: 1 })
+            Err::<SimpleLooperOutput, AgentError>(AgentError::MaxIterations { max_iterations: 1 })
         });
         let abort_handle = join_handle.abort_handle();
         let handle = SimpleLooperHandle {
@@ -626,131 +681,6 @@ mod tests {
 
     // ── 截断重试 / 异常收敛（batch-only run 循环）────────────────────────────
 
-    use model_provider::{
-        FinishReason, GenerateRequest, GenerateResult, GenerateStream, ProviderError,
-        ResponseStatus, Usage,
-    };
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
-    /// 脚本化批量 provider：按顺序吐出预置响应，并记录每次请求收到的
-    /// `max_output_tokens`（用于断言截断重试确实抬了预算）。
-    struct ScriptedBatchProvider {
-        scripts: Mutex<VecDeque<GenerateResult>>,
-        budgets: Mutex<Vec<Option<u32>>>,
-    }
-
-    impl ScriptedBatchProvider {
-        fn new(scripts: Vec<GenerateResult>) -> Self {
-            Self {
-                scripts: Mutex::new(scripts.into()),
-                budgets: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn budgets(&self) -> Vec<Option<u32>> {
-            self.budgets.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl model_provider::ModelProvider for ScriptedBatchProvider {
-        fn name(&self) -> &str {
-            "scripted-batch"
-        }
-
-        async fn generate_full(
-            &self,
-            request: &GenerateRequest,
-        ) -> Result<GenerateResult, ProviderError> {
-            self.budgets.lock().unwrap().push(request.max_output_tokens);
-            if let Some(r) = self.scripts.lock().unwrap().pop_front() {
-                return Ok(r);
-            }
-            // 脚本耗尽（不应发生）：返回一个正常完成的空响应。
-            Ok(GenerateResult {
-                id: "exhausted".into(),
-                output: vec![ContentBlock::Text {
-                    text: String::new(),
-                }],
-                usage: Usage::default(),
-                status: ResponseStatus::Completed,
-                finish_reason: Some(FinishReason::Stop),
-                error: None,
-            })
-        }
-
-        async fn generate_stream(
-            &self,
-            _request: &GenerateRequest,
-        ) -> Result<GenerateStream, ProviderError> {
-            Err(ProviderError::Request(
-                "stream not used in batch-only tests".into(),
-            ))
-        }
-    }
-
-    fn completed(text: &str) -> GenerateResult {
-        GenerateResult {
-            id: "r-completed".into(),
-            output: vec![ContentBlock::Text { text: text.into() }],
-            usage: Usage::default(),
-            status: ResponseStatus::Completed,
-            finish_reason: Some(FinishReason::Stop),
-            error: None,
-        }
-    }
-
-    /// 截断响应：只有 reasoning、可见输出为空，output 顶到 4096。
-    fn truncated() -> GenerateResult {
-        GenerateResult {
-            id: "r-truncated".into(),
-            output: vec![ContentBlock::Reasoning {
-                text: "long reasoning that consumed the whole budget".into(),
-            }],
-            usage: Usage {
-                output_tokens: 4096,
-                ..Default::default()
-            },
-            status: ResponseStatus::Incomplete,
-            finish_reason: Some(FinishReason::MaxTokens),
-            error: None,
-        }
-    }
-
-    fn scripted_agent(scripts: Vec<GenerateResult>) -> (Arc<Agent>, Arc<ScriptedBatchProvider>) {
-        scripted_agent_with_max_tokens(scripts, None)
-    }
-
-    /// 同 [`scripted_agent`]，但给 agent 的 `llm:` 显式配置 `max_tokens`。
-    fn scripted_agent_with_max_tokens(
-        scripts: Vec<GenerateResult>,
-        max_tokens: Option<u32>,
-    ) -> (Arc<Agent>, Arc<ScriptedBatchProvider>) {
-        let profile: crate::agent::AgentProfile = serde_yaml::from_str(
-            "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
-        )
-        .unwrap();
-        let executor: Arc<dyn crate::tools::ToolExecutor> =
-            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
-        let provider = Arc::new(ScriptedBatchProvider::new(scripts));
-        let mut llm = crate::agent::ModelConfigBuilder::new().stream(false);
-        if let Some(tokens) = max_tokens {
-            llm = llm.max_tokens(tokens);
-        }
-        let agent = Arc::new(Agent::from_parts(
-            std::path::PathBuf::from("/tmp/agent.md"),
-            profile,
-            "sys".to_string(),
-            Arc::clone(&provider) as Arc<dyn model_provider::ModelProvider>,
-            llm.build(),
-            Arc::clone(&executor),
-            Arc::new(crate::mcp::McpManager::empty(executor)),
-            None,
-        ));
-        (agent, provider)
-    }
-
     /// 首次截断、重试成功：返回重试后的文本，且重试请求带抬高后的预算。
     #[tokio::test]
     async fn test_truncation_retries_with_raised_budget() {
@@ -759,7 +689,7 @@ mod tests {
             .wait()
             .await
             .expect("retry should succeed");
-        assert_eq!(out, "done", "必须返回重试后的正文，而非被截断的空串");
+        assert_eq!(out.text, "done", "必须返回重试后的正文，而非被截断的空串");
         assert_eq!(
             provider.budgets(),
             vec![None, Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET)],
@@ -840,6 +770,292 @@ mod tests {
         assert!(
             err.to_string().contains("upstream boom"),
             "错误须带上游 detail；实际 {err}"
+        );
+    }
+
+    // ── 产物声明收集（成功 / 失败两条出口）──────────────────────────────────
+
+    use std::io::Write;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    fn decl(path: &str) -> ArtifactDecl {
+        ArtifactDecl {
+            path: path.to_string(),
+            title: None,
+            mime: None,
+        }
+    }
+
+    /// 采集日志的 writer：把字节流追加到共享缓冲，供「丢弃告警恰好一次」的断言。
+    ///
+    /// 日志断言必须用 `#[tokio::test]` 默认的 `current_thread` 运行时：默认
+    /// subscriber 是线程局部的，多线程运行会把后台 task 的日志写到别的线程上，
+    /// 断言恒红。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
+
+    const DROP_WARNING: &str = "Artifact declarations discarded with failed sub-agent run";
+
+    /// 工具吐出的声明必须被收进 `out.artifacts`，且正文里不留 marker。
+    ///
+    /// 变异点：`execute_tools` 里不收集（或收集后不交给 `SimpleLooperOutput`）
+    /// ⇒ `out.artifacts` 为空；剥离失效 ⇒ `out.text` 里出现 marker。
+    #[tokio::test]
+    async fn test_success_collects_artifact_declarations() {
+        let d = decl("/tmp/success.jpg");
+        let tool_output = format!(
+            "{}生成完成",
+            crate::artifacts::render_artifact_lines(std::slice::from_ref(&d))
+        );
+        let (agent, _provider) = scripted_agent_with_tools(
+            vec![
+                tool_call_response("call-1", "gen_artifact", serde_json::json!({})),
+                completed("done"),
+            ],
+            vec![Box::new(StaticTool::new(
+                "gen_artifact",
+                Content::Text(tool_output),
+            ))],
+        );
+
+        let out = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(out.text, "done");
+        assert!(
+            !out.text.contains(crate::artifacts::ARTIFACT_MARKER),
+            "marker must never survive into the final text: {}",
+            out.text
+        );
+        assert_eq!(out.artifacts, vec![d]);
+    }
+
+    /// 截断重试不丢已收集的声明：重试前后都是同一批。
+    ///
+    /// 变异点：把收集放在「最终出口」而非每轮 await 之后，截断重试的
+    /// `continue` 会把第一轮的声明冲掉 ⇒ `artifacts` 为空。
+    #[tokio::test]
+    async fn test_truncation_retry_keeps_collected_artifacts() {
+        let d = decl("/tmp/retry.jpg");
+        let tool_output = format!(
+            "{}生成完成",
+            crate::artifacts::render_artifact_lines(std::slice::from_ref(&d))
+        );
+        let (agent, provider) = scripted_agent_with_tools(
+            vec![
+                tool_call_response("call-1", "gen_artifact", serde_json::json!({})),
+                truncated(),
+                completed("done"),
+            ],
+            vec![Box::new(StaticTool::new(
+                "gen_artifact",
+                Content::Text(tool_output),
+            ))],
+        );
+
+        let out = SimpleAgentLooper::spawn(agent, "hi".into(), None)
+            .wait()
+            .await
+            .expect("retry should succeed");
+
+        assert_eq!(out.text, "done");
+        assert_eq!(out.artifacts, vec![d]);
+        assert_eq!(
+            provider.budgets(),
+            vec![None, None, Some(SUB_AGENT_TRUNCATION_RETRY_BUDGET)],
+            "重试仍须抬高预算"
+        );
+    }
+
+    /// 迭代耗尽失败：已收集的声明必须告警一次（且只一次）。
+    ///
+    /// 变异点：告警留在 `execute_tools`（此时尚未知成败）会多报/错报；
+    /// 收敛点漏掉会在失败时静默吞掉声明。
+    #[tokio::test]
+    async fn test_max_iterations_warns_once_about_discarded_artifacts() {
+        let d = decl("/tmp/max_iter.jpg");
+        let tool_output = format!(
+            "{}生成完成",
+            crate::artifacts::render_artifact_lines(std::slice::from_ref(&d))
+        );
+        let (agent, _provider) = scripted_agent_with_tools(
+            vec![tool_call_response(
+                "call-1",
+                "gen_artifact",
+                serde_json::json!({}),
+            )],
+            vec![Box::new(StaticTool::new(
+                "gen_artifact",
+                Content::Text(tool_output),
+            ))],
+        );
+
+        let (logs, _guard) = capture_logs();
+        let err = SimpleAgentLooper::spawn(agent, "hi".into(), Some(1))
+            .wait()
+            .await
+            .expect_err("max_iterations=1 must fail after the tool round");
+        assert!(
+            matches!(err, AgentError::MaxIterations { .. }),
+            "expected MaxIterations, got {err}"
+        );
+
+        let logs = logs.text();
+        assert_eq!(
+            logs.matches(DROP_WARNING).count(),
+            1,
+            "discard warning must appear exactly once; logs: {logs}"
+        );
+        assert!(
+            logs.contains("count=1"),
+            "warning must carry the artifact count; logs: {logs}"
+        );
+    }
+
+    /// 取消发生在工具结果尚未收集之前：已执行完的工具声明仍要收集并告警一次。
+    ///
+    /// 变异点：把收集挪到批尾（循环结束后统一做）⇒ 中途 return 时声明全丢，
+    /// 告警不出现 ⇒ 断言红。
+    #[tokio::test]
+    async fn test_cancel_collects_artifacts_of_finished_tool() {
+        let d = decl("/tmp/cancel.jpg");
+        let tool = GateTool::new(
+            "gate",
+            Content::Text(format!(
+                "{}生成完成",
+                crate::artifacts::render_artifact_lines(std::slice::from_ref(&d))
+            )),
+        );
+        let entered = Arc::clone(&tool.entered);
+        let release = Arc::clone(&tool.release);
+        let (agent, _provider) = scripted_agent_with_tools(
+            vec![tool_call_response("call-1", "gate", serde_json::json!({}))],
+            vec![Box::new(tool)],
+        );
+
+        let (logs, _guard) = capture_logs();
+        let handle = SimpleAgentLooper::spawn(agent, "hi".into(), None);
+        // 顺序不可换：先等工具真正开跑，再取消（此时尚未 await 到结果），
+        // 最后放行工具 —— 这样声明一定在取消之后才被收集。
+        entered.notified().await;
+        handle.cancel();
+        release.notify_one();
+
+        let err = handle.wait().await.expect_err("cancelled run must fail");
+        assert!(matches!(err, AgentError::AgentProtocol(ref m) if m == "cancelled"));
+        assert!(
+            !err.to_string().contains(crate::artifacts::ARTIFACT_MARKER),
+            "error message must not carry artifact declarations: {err}"
+        );
+
+        let logs = logs.text();
+        assert_eq!(
+            logs.matches(DROP_WARNING).count(),
+            1,
+            "discard warning must appear exactly once; logs: {logs}"
+        );
+        assert!(
+            logs.contains("count=1"),
+            "warning must report the single collected declaration; logs: {logs}"
+        );
+    }
+
+    /// 取消时只收集「已执行完」的工具：后面的工具（B）从未 await，其声明不得计入。
+    ///
+    /// 变异点：收集改成批尾统一做（或把未执行工具的声明也塞进来）⇒ 计数变 0 或 2，
+    /// 告警丢失或翻倍 ⇒ 断言红。
+    #[tokio::test]
+    async fn test_cancel_collects_only_finished_tools() {
+        let d = decl("/tmp/cancel-a.jpg");
+        let gate = GateTool::new(
+            "gate_a",
+            Content::Text(format!(
+                "{}生成完成",
+                crate::artifacts::render_artifact_lines(std::slice::from_ref(&d))
+            )),
+        );
+        let entered = Arc::clone(&gate.entered);
+        let release = Arc::clone(&gate.release);
+
+        let mut response = tool_call_response("call-a", "gate_a", serde_json::json!({}));
+        response.output.push(ContentBlock::ToolCall {
+            call_id: "call-b".into(),
+            name: "late_b".into(),
+            arguments: "{}".into(),
+        });
+
+        let late_decl = decl("/tmp/cancel-b.jpg");
+        let (agent, _provider) = scripted_agent_with_tools(
+            vec![response],
+            vec![
+                Box::new(gate),
+                Box::new(StaticTool::new(
+                    "late_b",
+                    Content::Text(format!(
+                        "{}生成完成",
+                        crate::artifacts::render_artifact_lines(&[late_decl])
+                    )),
+                )),
+            ],
+        );
+
+        let (logs, _guard) = capture_logs();
+        let handle = SimpleAgentLooper::spawn(agent, "hi".into(), None);
+        entered.notified().await;
+        handle.cancel();
+        release.notify_one();
+
+        let err = handle.wait().await.expect_err("cancelled run must fail");
+        assert!(matches!(err, AgentError::AgentProtocol(ref m) if m == "cancelled"));
+
+        let logs = logs.text();
+        assert_eq!(
+            logs.matches(DROP_WARNING).count(),
+            1,
+            "discard warning must appear exactly once; logs: {logs}"
+        );
+        assert!(
+            logs.contains("count=1"),
+            "only tool A's declaration may be collected; logs: {logs}"
         );
     }
 }

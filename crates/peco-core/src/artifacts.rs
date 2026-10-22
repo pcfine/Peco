@@ -18,6 +18,12 @@
 //! - 每行一条，行首允许前导空白，`path` 必填，`title` / `mime` 可选。
 //! - 声明行**一律剥离**，不进入 `result`，因此不会进模型上下文。
 //! - JSON 非法时丢弃该声明并告警；不保留原文（否则模型每轮都读到噪声）。
+//!
+//! # 子 agent 路径的不对称
+//!
+//! delegate 路径上，模型自写于子 agent 正文里的声明会被父层剥离并升级为父级候选；
+//! parallel 路径上同样位置的声明被 JSON 转义，剥不掉，因此不会上浮。该不对称在
+//! 声明上浮之前即已存在，不是缺陷 —— 这里记录它，免得后来者把它当 bug「修」掉。
 
 use model_provider::{Content, ContentPart};
 use serde::{Deserialize, Serialize};
@@ -114,6 +120,34 @@ pub fn strip_content(content: Content) -> (Content, Vec<ArtifactDecl>) {
             }
         }
     }
+}
+
+/// 把声明渲染为声明行块：每条恰好一行，行尾带换行。
+///
+/// 序列化交给 `serde_json`：手写 `format!` 拼 JSON 在 `path` 含引号、换行或非 ASCII
+/// 时会产出非法或跨行的声明行，而跨行声明必然剥不干净。
+pub(crate) fn render_artifact_lines(decls: &[ArtifactDecl]) -> String {
+    let mut out = String::new();
+    for decl in decls {
+        out.push_str(ARTIFACT_MARKER);
+        out.push(' ');
+        out.push_str(&serde_json::to_string(decl).expect("ArtifactDecl is always serializable"));
+        out.push('\n');
+    }
+    out
+}
+
+/// 把声明行块注入到 `text` **顶部**，返回可直接下发给模型/宿主的文本。
+///
+/// 必须前置而非后置：后缀注入在 `text` 不以换行结尾时会把 marker 粘到正文行尾，
+/// 于是不再匹配「行首」规则，声明剥不掉、反倒漏进模型上下文。
+pub(crate) fn with_artifact_lines(text: &str, decls: &[ArtifactDecl]) -> String {
+    if decls.is_empty() {
+        return text.to_string();
+    }
+    let mut out = render_artifact_lines(decls);
+    out.push_str(text);
+    out
 }
 
 #[cfg(test)]
@@ -225,5 +259,137 @@ mod tests {
         let (clean, decls) = strip_artifact_lines(text);
         assert_eq!(clean, "");
         assert_eq!(decls.len(), 1);
+    }
+
+    // ── 声明渲染 / 注入（子 agent 路径上浮）────────────────────────────────
+
+    fn decl(path: &str) -> ArtifactDecl {
+        ArtifactDecl {
+            path: path.to_string(),
+            title: None,
+            mime: None,
+        }
+    }
+
+    /// 变异点：`with_artifact_lines` 改成后缀注入，或漏掉换行 ⇒ 正文还原失败。
+    #[test]
+    fn with_then_strip_round_trips_single_decl() {
+        let d = decl("/a/b.jpg");
+        let text = with_artifact_lines("正文", std::slice::from_ref(&d));
+        let (clean, decls) = strip_artifact_lines(&text);
+        assert_eq!(clean, "正文");
+        assert_eq!(decls, vec![d]);
+    }
+
+    /// 组合律：注入只可能把「声明」加在前面，正文自身的解析结果必须原样保留。
+    ///
+    /// 变异点：注入点改成后缀（或忘加换行）会让 `t` 自带的声明、缩进声明、
+    /// 相似前缀这几类样本还原错位 ⇒ 断言红。
+    #[test]
+    fn with_artifact_lines_composes_with_strip() {
+        let d = decl("/a/new.jpg");
+        let samples = [
+            "",
+            "x",
+            "x\n",
+            "第一行\n第二行\n",
+            "@@PECO_ARTIFACT {\"path\":\"/a/own.jpg\"}\n正文",
+            "  @@PECO_ARTIFACT {\"path\":\"/a/indented.jpg\"}\n",
+            "@@PECO_ARTIFACTX 不是声明\n",
+            "  \n\t\n",
+        ];
+        for t in samples {
+            let (own_clean, own_decls) = strip_artifact_lines(t);
+            let mut expected_decls = vec![d.clone()];
+            expected_decls.extend(own_decls);
+            let injected = with_artifact_lines(t, std::slice::from_ref(&d));
+            assert_eq!(
+                strip_artifact_lines(&injected),
+                (own_clean, expected_decls),
+                "sample {t:?} must round-trip"
+            );
+
+            // 空声明表：必须逐字节不动（不得追加空行、不得改空白）
+            assert_eq!(with_artifact_lines(t, &[]), t);
+        }
+    }
+
+    /// 一条声明恒一行：`path` / `title` 里的换行、引号、反斜杠、marker 文本
+    /// 都必须被 JSON 转义，否则声明会跨行、剥不干净。
+    ///
+    /// 变异点：改用手写 `format!` 拼 JSON ⇒ 含换行/引号的样本产出多行或非法 JSON。
+    #[test]
+    fn render_emits_exactly_one_line_per_decl() {
+        let cases = [
+            ArtifactDecl {
+                path: "/a/b.jpg".into(),
+                title: None,
+                mime: None,
+            },
+            ArtifactDecl {
+                path: "/a/with\nnewline.jpg".into(),
+                title: Some("标题带换行\n第二行".into()),
+                mime: Some("image/jpeg".into()),
+            },
+            ArtifactDecl {
+                path: format!("/a/{ARTIFACT_MARKER}.jpg"),
+                title: None,
+                mime: None,
+            },
+            ArtifactDecl {
+                path: "/a/红狐狸.jpg".into(),
+                title: Some("带\"引号\"的标题".into()),
+                mime: None,
+            },
+            ArtifactDecl {
+                path: "/a/back\\slash.jpg".into(),
+                title: Some("反斜杠 \\ 样本".into()),
+                mime: None,
+            },
+        ];
+
+        for d in &cases {
+            let rendered = render_artifact_lines(std::slice::from_ref(d));
+            assert_eq!(
+                rendered.lines().count(),
+                1,
+                "one decl must be one line: {d:?}"
+            );
+            assert!(
+                rendered.ends_with('\n'),
+                "decl line must be newline-terminated"
+            );
+            assert_eq!(strip_artifact_lines(&rendered).1, vec![d.clone()]);
+        }
+    }
+
+    /// 空声明表渲染为空串（调用方据此判断是否需要注入）。
+    #[test]
+    fn render_empty_decls_is_empty_string() {
+        assert_eq!(render_artifact_lines(&[]), "");
+    }
+
+    /// 非法 JSON 声明行照样剥离、正文保留、不 panic。
+    ///
+    /// 变异点：注入函数若对 JSON 失败 `unwrap` 或保留原文 ⇒ 要么 panic，要么 marker 漏回正文。
+    #[test]
+    fn malformed_declaration_line_is_stripped_without_panic() {
+        let text = format!("{ARTIFACT_MARKER} {{broken json\n正文\n");
+        let (clean, decls) = strip_artifact_lines(&text);
+        assert_eq!(clean, "正文\n");
+        assert!(decls.is_empty());
+    }
+
+    /// `@@PECO_ARTIFACTX` 这类相似前缀不是声明，注入后仍按普通行保留。
+    ///
+    /// 变异点：放宽前缀判定到「以 marker 开头即可」⇒ 该行被剥，正文缺行。
+    #[test]
+    fn similar_prefix_is_not_a_declaration_even_after_injection() {
+        let t = "@@PECO_ARTIFACTX 相似前缀\n";
+        let d = decl("/a/b.jpg");
+        let injected = with_artifact_lines(t, std::slice::from_ref(&d));
+        let (clean, decls) = strip_artifact_lines(&injected);
+        assert_eq!(clean, t);
+        assert_eq!(decls, vec![d]);
     }
 }

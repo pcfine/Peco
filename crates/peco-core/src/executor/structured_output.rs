@@ -190,7 +190,7 @@ impl StructuredOutputExecutor {
             self.max_iterations,
         );
 
-        let final_text = if let Some(timeout) = self.timeout {
+        let out = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, handle.wait())
                 .await
                 .map_err(|_| AgentError::AgentProtocol("timeout".into()))?
@@ -199,7 +199,7 @@ impl StructuredOutputExecutor {
         }?;
 
         let data = wrapper.take_data();
-        Ok((final_text, data))
+        Ok((out.into_text("structured_output"), data))
     }
 
     /// 按 JSON Schema 验证输出的 JSON 值。

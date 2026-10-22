@@ -10,6 +10,8 @@ pub(crate) mod error;
 pub mod hooks;
 pub(crate) mod simple_looper;
 mod stream;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use agent::{Agent, MessageFilter, build_provider_with_user, supports_image_input_for};
 pub use agent_config::{
@@ -34,5 +36,5 @@ pub use context::{
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;
 pub use hooks::{HookAction, LooperHook, TokenBudgetHook, ToolAllowlistHook, ToolHookAction};
-pub use simple_looper::{SimpleAgentLooper, SimpleLooperHandle};
+pub use simple_looper::{SimpleAgentLooper, SimpleLooperHandle, SimpleLooperOutput};
 pub use stream::{ModelStream, ModelStreamEvent};
