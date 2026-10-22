@@ -609,7 +609,7 @@ export function AgentChatPage() {
       </div>
 
       {/* Right panel */}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative min-w-0">
         {/* No conversation selected — StartChatPage style */}
         {showPool.length === 0 && (
           <div className="flex items-center justify-center h-full">

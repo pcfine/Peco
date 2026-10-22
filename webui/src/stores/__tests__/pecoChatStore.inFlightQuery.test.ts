@@ -160,6 +160,8 @@ describe("pecoChatStore 保留在途轮次的本地 query", () => {
     // query 在历史轮之后、assistant 占位之前 —— 恰是它被发出时的位置
     expect(msgs.filter((m) => m.content === QUERY)).toHaveLength(1);
     expect(msgs[msgs.length - 2]).toMatchObject({ role: "user", content: QUERY });
+    // 恢复出来的 query 没有可信时间：快照只带文本，不伪造 Date.now()
+    expect(msgs[msgs.length - 2].timestampMs).toBeUndefined();
     expect(msgs[msgs.length - 1]).toMatchObject({ role: "assistant", content: "" });
   });
 
@@ -229,6 +231,8 @@ describe("pecoChatStore 保留在途轮次的本地 query", () => {
     // 历史那条 + 在途那条，共两条；在途的落在 assistant 占位之前
     expect(msgs.filter((m) => m.content === "继续")).toHaveLength(2);
     expect(msgs[msgs.length - 2]).toMatchObject({ role: "user", content: "继续" });
+    // 同上：在途恢复路径不伪造时间戳
+    expect(msgs[msgs.length - 2].timestampMs).toBeUndefined();
     expect(msgs[msgs.length - 1]).toMatchObject({ role: "assistant", content: "" });
   });
 

@@ -37,6 +37,8 @@
   --muted-foreground: oklch(0.51 0.02 280);
   --accent: oklch(0.955 0.022 277);
   --accent-foreground: oklch(0.42 0.16 277);
+  /* 正文气泡专用面：--muted 与画布只差 0.018，浅色下读不出气泡边界。 */
+  --bubble: oklch(0.945 0.004 280);
   --destructive: oklch(0.577 0.245 27.325);
   --destructive-foreground: oklch(0.985 0 0);
   --success: oklch(0.55 0.15 152);
@@ -71,6 +73,11 @@
   --sidebar-accent-foreground: oklch(0.42 0.16 277);
   --sidebar-border: oklch(0.905 0.005 280);
   --sidebar-ring: oklch(0.55 0.19 277);
+  /* 工具卡展开体走「抬起面」约定：必须区别于正文气泡的 --bubble，
+     否则折叠行与气泡同色混同。 */
+  --tool-surface: oklch(1 0 0);
+  --tool-args-fg: oklch(0.44 0.02 280);
+  --tool-row-hover: oklch(0.945 0.006 280);
 }
 
 .dark {
@@ -89,6 +96,7 @@
   --muted-foreground: oklch(0.7 0.02 280);
   --accent: oklch(0.29 0.038 277);
   --accent-foreground: oklch(0.88 0.06 277);
+  --bubble: oklch(0.27 0.015 278);
   --destructive: oklch(0.65 0.21 25);
   --destructive-foreground: oklch(0.99 0 0);
   --success: oklch(0.7 0.16 152);
@@ -119,6 +127,9 @@
   --sidebar-accent-foreground: oklch(0.9 0.05 277);
   --sidebar-border: oklch(0.26 0.014 278);
   --sidebar-ring: oklch(0.62 0.18 277);
+  --tool-surface: oklch(0.168 0.013 278);
+  --tool-args-fg: oklch(0.78 0.02 280);
+  --tool-row-hover: oklch(0.235 0.016 278);
 }
 
 @theme inline {
@@ -136,6 +147,7 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
+  --color-bubble: var(--bubble);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-success: var(--success);
@@ -147,6 +159,9 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-tool-surface: var(--tool-surface);
+  --color-tool-args-fg: var(--tool-args-fg);
+  --color-tool-row-hover: var(--tool-row-hover);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);

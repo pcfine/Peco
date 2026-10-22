@@ -336,8 +336,8 @@ async function refreshSession(
   });
 
   // 服务端有轮次在途 → 追加 assistant 占位并重新附着。
-  // 占位是必须的：reduceStreamEvent 的 delta 只在末条是 assistant 时应用，
-  // 且避免新轮次文本误并入上一轮最后一条已完成的 assistant 消息。
+  // 占位是必须的：reduceStreamEvent 的 delta 落到最近的 assistant 宿主，
+  // 占位保证新轮次文本落进本轮而不是并入上一轮已完成的 assistant 消息。
   // 判据用 turn_in_flight 而非 is_running —— 后者在 run 停靠等输入时
   // 同样为真，会挂出一条永不填充的空占位。
   const token = useAuthStore.getState().token;
@@ -503,10 +503,13 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
         .map((a) => ({ name: a.name })) ?? [];
 
     // Append user message + empty assistant placeholder.
+    // 两条消息来自同一次发送，共用同一个构造时刻。
+    const sentAt = Date.now();
     const userMsg: ChatMessage = {
       role: "user",
       content: text,
       turnIndex: 0,
+      timestampMs: sentAt,
       images: imageUrls.length > 0 ? imageUrls : undefined,
       attachments: docNames.length > 0 ? docNames : undefined,
     };
@@ -514,6 +517,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       role: "assistant",
       content: "",
       turnIndex: 0,
+      timestampMs: sentAt,
     };
     set({
       messages: [...state.messages, userMsg, assistantMsg],

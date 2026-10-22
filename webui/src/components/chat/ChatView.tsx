@@ -30,13 +30,25 @@ import {
   Pause,
   Play,
   Loader2,
+  ChevronRight,
 } from "lucide-react";
 import { toast } from "sonner";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { TokenUsageRing } from "@/components/chat/TokenUsageRing";
+import { ToolCallCard } from "@/components/chat/ToolCallCard";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { CHEVRON, FOLD_ROW } from "@/components/chat/foldRow";
+import { MESSAGE_TIME_CLASS } from "@/components/chat/messageTime";
+import { UserBubble } from "@/components/chat/UserBubble";
 import { BrandMark } from "@/components/common/BrandMark";
 import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
+import { settlePendingToolCalls, type ToolCallView } from "@/lib/toolCall";
+import { formatMessageTime } from "@/lib/time";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -97,19 +109,16 @@ export interface ChatAttachment {
 }
 
 export interface ChatMessage {
-  role: "user" | "assistant" | "tool" | "agent-call";
+  role: "user" | "assistant" | "agent-call";
   content: string;
   turnIndex: number;
-  /** 稳定标识（快照消息恒有）；分页前置插入时据此保持 DOM 节点不重挂。 */
+  /**
+   * 稳定标识：快照消息恒有、实时消息恒无 —— store 据此区分来源（否则实时
+   * 残留会被当成已落盘的历史，刷新后与快照重复渲染）。
+   * 分页前置插入时也据此保持 DOM 节点不重挂。
+   */
   id?: string;
-  toolCalls?: {
-    id: string;
-    name: string;
-    arguments: string;
-    result?: string;
-    /** 工具输出图片（data URI），来自 SSE `tool_result` 事件 */
-    images?: string[];
-  }[];
+  toolCalls?: ToolCallView[];
   reasoning?: string;
   agentName?: string;
   agentTask?: string;
@@ -126,6 +135,11 @@ export interface ChatMessage {
   noticeIcon?: string;
   /** 归档摘要正文（notice 消息可选）— hover 分隔条时展示 */
   summary?: string;
+  /**
+   * 气泡时间（毫秒 epoch）：快照取自 `MessageData.timestamp_ms`，实时消息取
+   * 构造时刻。孤儿工具输出与中断横幅没有正文气泡，故留空；缺失即不渲染。
+   */
+  timestampMs?: number;
 }
 
 export interface ChatViewProps {
@@ -318,10 +332,12 @@ export function ChatView({
     // 上传中的附件不允许随消息发送（upload 完成前禁用发送即可达，这里兜底跳过）
     const fileIds = attachments.map((att) => att.id);
 
+    const sentAt = Date.now();
     const userMsg: ChatMessage = {
       role: "user",
       content: text,
       turnIndex: 0,
+      timestampMs: sentAt,
       images: attachments
         .filter((att) => att.kind === "image" && att.url)
         .map((att) => att.url as string),
@@ -338,6 +354,7 @@ export function ChatView({
       role: "assistant",
       content: "",
       turnIndex: 0,
+      timestampMs: sentAt,
     };
     setMessages((prev) => [...prev, assistantMsg]);
 
@@ -711,6 +728,7 @@ export function ChatView({
       <div
         ref={scrollContainerRef}
         onScroll={handleScroll}
+        data-slot="message-scroller"
         className="flex-1 overflow-y-auto space-y-4 pr-2"
       >
         {onLoadEarlier && hasMore && (
@@ -929,7 +947,9 @@ function WelcomeHero({
   return (
     <div className="flex flex-col items-center justify-center gap-6 py-16 text-center">
       <BrandMark size={56} className="rounded-2xl" />
-      <div className="max-w-md space-y-1.5 text-muted-foreground">{message}</div>
+      <div className="max-w-md space-y-1.5 text-muted-foreground">
+        {message}
+      </div>
       {suggestions && suggestions.length > 0 && (
         <div className="flex max-w-lg flex-wrap justify-center gap-2">
           {suggestions.map((s) => (
@@ -945,6 +965,47 @@ function WelcomeHero({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * 推理块：过程层，比工具行再淡一档 —— 无状态槽、无描边体、只有一个标签。
+ *
+ * 非受控折叠加模块级组件：折叠态存在 Radix 内部，组件在渲染函数里内联定义会
+ * 随每次流式事件重建而丢状态（展开的推理块会在下一个 token 时自己合上）。
+ */
+function ReasoningFold({ reasoning }: { reasoning: string }) {
+  return (
+    <Collapsible data-slot="reasoning-fold">
+      <CollapsibleTrigger
+        data-fold-row="reasoning"
+        className={FOLD_ROW}
+        aria-label="推理过程"
+      >
+        <ChevronRight
+          data-slot="tool-chevron"
+          className={CHEVRON}
+          aria-hidden="true"
+        />
+        <span
+          data-fold-content
+          className="flex min-w-0 flex-1 items-center gap-2"
+        >
+          <span
+            data-slot="reasoning-label"
+            className="shrink-0 truncate text-muted-foreground"
+          >
+            推理过程
+          </span>
+        </span>
+      </CollapsibleTrigger>
+      <CollapsibleContent
+        data-kind="reasoning"
+        className="mt-1 pl-[26px] pr-2 max-h-[240px] overflow-auto overscroll-contain whitespace-pre-wrap break-words text-xs text-tool-args-fg"
+      >
+        {reasoning}
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
@@ -972,38 +1033,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   }
 
   if (message.role === "user") {
-    return (
-      <div className="flex justify-end">
-        <div className="bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2 max-w-[80%] text-sm">
-          {message.images && message.images.length > 0 && (
-            <div className="mb-2 flex flex-wrap justify-end gap-2">
-              {message.images.map((url, i) => (
-                <img
-                  key={i}
-                  src={url}
-                  alt="用户图片"
-                  className="max-h-48 max-w-[240px] rounded-md border border-primary-foreground/20 object-contain"
-                />
-              ))}
-            </div>
-          )}
-          {message.attachments && message.attachments.length > 0 && (
-            <div className="mb-2 flex flex-wrap justify-end gap-2">
-              {message.attachments.map((att, i) => (
-                <span
-                  key={`${att.name}-${i}`}
-                  className="inline-flex max-w-[220px] items-center gap-1 rounded-md border border-primary-foreground/30 bg-primary-foreground/10 px-2 py-1 text-xs"
-                >
-                  <FileText className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate">{att.name}</span>
-                </span>
-              ))}
-            </div>
-          )}
-          {message.content}
-        </div>
-      </div>
-    );
+    return <UserBubble message={message} />;
   }
 
   if (message.role === "agent-call") {
@@ -1022,59 +1052,82 @@ function ChatBubble({ message }: { message: ChatMessage }) {
     );
   }
 
-  if (message.role === "tool") {
+  // 错误气泡早返回：它不受「整列全空则不渲染」的判据约束，否则空文案的
+  // 错误会被整条吞掉。保留 destructive 配色以区别于正文气泡。
+  if (message.isError) {
     return (
       <div className="flex gap-2 items-start">
-        <div className="bg-muted/50 rounded-xl px-3 py-1.5 text-xs text-muted-foreground max-w-[85%] font-mono whitespace-pre-wrap break-all">
-          {message.content}
+        <div
+          data-slot="assistant-bubble"
+          className="bg-destructive/10 border border-destructive/30 text-destructive rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
+        >
+          <MarkdownRenderer content={message.content} />
         </div>
       </div>
     );
   }
 
-  // Assistant message
+  // 正文走气泡，过程（推理与工具行）保持裸行。
+  const toolCalls = message.toolCalls ?? [];
+  // 空白正文不算内容：流式首个 token 常是 "\n"，真值判断会留下一个空外壳。
+  if (
+    !message.reasoning &&
+    toolCalls.length === 0 &&
+    message.content.trim() === ""
+  ) {
+    return null;
+  }
+
+  const hasProcess = Boolean(message.reasoning) || toolCalls.length > 0;
+  const hasResult = message.content.trim() !== "";
+  const resultTime = formatMessageTime(message.timestampMs);
+
   return (
-    <div className="flex gap-2 items-start">
+    <div
+      data-slot="assistant-turn"
+      data-turn-index={message.turnIndex}
+      className="flex gap-2 items-start"
+    >
       <div
-        className={
-          message.isError
-            ? "bg-destructive/10 border border-destructive/30 text-destructive rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
-            : "bg-muted rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
-        }
+        data-slot="assistant-column"
+        className="flex flex-col gap-2 w-full min-w-0"
       >
-        {message.reasoning && (
-          <details className="mb-2">
-            <summary className="text-xs text-muted-foreground cursor-pointer">
-              推理过程
-            </summary>
-            <p className="text-xs text-muted-foreground mt-1 whitespace-pre-wrap">
-              {message.reasoning}
-            </p>
-          </details>
-        )}
-        {message.toolCalls?.map((tc) => (
-          <details key={tc.id} className="mb-2">
-            <summary className="text-xs font-medium cursor-pointer">
-              🔧 {tc.name} {tc.result ? "✓" : "..."}
-            </summary>
-            {tc.images && tc.images.length > 0 && (
-              <div className="mt-1 flex flex-wrap gap-2">
-                {tc.images.map((url, i) => (
-                  <img
-                    key={i}
-                    src={url}
-                    alt={`${tc.name} 输出图片`}
-                    className="max-h-48 max-w-[240px] rounded-md border object-contain"
-                  />
-                ))}
-              </div>
+        {hasProcess && (
+          <div
+            data-slot="assistant-process"
+            className="flex flex-col gap-1.5 min-w-0"
+          >
+            {message.reasoning && (
+              <ReasoningFold reasoning={message.reasoning} />
             )}
-            <pre className="text-xs text-muted-foreground mt-1 whitespace-pre-wrap max-h-32 overflow-y-auto">
-              {tc.result || tc.arguments}
-            </pre>
-          </details>
-        ))}
-        {message.content && <MarkdownRenderer content={message.content} />}
+            {toolCalls.length > 0 && (
+              <ol data-slot="tool-call-group" className="flex flex-col gap-1.5">
+                {toolCalls.map((tc, i) => (
+                  // provider 可能复用 call id，下标参与 key 以避免重复键
+                  <ToolCallCard key={`${tc.id}-${i}`} toolCall={tc} />
+                ))}
+              </ol>
+            )}
+          </div>
+        )}
+        {hasResult && (
+          <div
+            data-slot="assistant-result"
+            data-has-process={hasProcess ? "true" : undefined}
+            className="group relative w-fit max-w-[80%] rounded-2xl rounded-bl-md bg-bubble border border-border px-4 py-2 text-sm"
+          >
+            <MarkdownRenderer content={message.content} />
+            {resultTime && (
+              <time
+                dateTime={resultTime.iso}
+                data-slot="message-time"
+                className={`${MESSAGE_TIME_CLASS} left-0`}
+              >
+                {resultTime.label}
+              </time>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1086,6 +1139,29 @@ function ChatBubble({ message }: { message: ChatMessage }) {
 // Exported so pecoChatStore can reuse them — keep the two copies in sync by
 // making this the single source of truth for message transformation logic.
 
+/** 最后一个 user 消息的下标；没有则 -1（此时扫描范围就是整表）。 */
+function lastUserIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === "user") return i;
+  }
+  return -1;
+}
+
+/**
+ * 向前找最近的、可作为正文/工具宿主的消息：role 为 assistant 且不是
+ * notice/error。没有则 -1。
+ *
+ * 不能只看末条：委派类工具先发 `agent_call_start` 再发 `tool_call_start`，
+ * 末条此时是 agent-call，卡片与后续增量会一起落空。
+ */
+function lastHostIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role === "assistant" && !m.isNotice && !m.isError) return i;
+  }
+  return -1;
+}
+
 /** Apply a single SSE event to a messages array (pure — no side effects). */
 export function reduceStreamEvent(
   event: ChatSseEvent,
@@ -1093,55 +1169,83 @@ export function reduceStreamEvent(
 ): ChatMessage[] {
   switch (event.event) {
     case "text_delta": {
-      const last = messages[messages.length - 1];
-      if (last?.role === "assistant") {
-        return [
-          ...messages.slice(0, -1),
-          { ...last, content: last.content + event.data.content },
-        ];
-      }
-      return messages;
+      const host = lastHostIndex(messages);
+      if (host < 0) return messages;
+      return messages.map((m, i) =>
+        i === host ? { ...m, content: m.content + event.data.content } : m,
+      );
     }
     case "reasoning_delta": {
-      const last = messages[messages.length - 1];
-      if (last?.role === "assistant") {
-        return [
-          ...messages.slice(0, -1),
-          { ...last, reasoning: (last.reasoning ?? "") + event.data.content },
-        ];
-      }
-      return messages;
+      const host = lastHostIndex(messages);
+      if (host < 0) return messages;
+      return messages.map((m, i) =>
+        i === host
+          ? { ...m, reasoning: (m.reasoning ?? "") + event.data.content }
+          : m,
+      );
     }
     case "tool_call_start": {
-      const last = messages[messages.length - 1];
-      if (last?.role === "assistant") {
-        const tc = {
-          id: event.data.id,
-          name: event.data.name,
-          arguments: event.data.arguments,
-        };
-        return [
-          ...messages.slice(0, -1),
-          { ...last, toolCalls: [...(last.toolCalls ?? []), tc] },
-        ];
-      }
-      return messages;
+      const host = lastHostIndex(messages);
+      if (host < 0) return messages;
+      const tc: ToolCallView = {
+        id: event.data.id,
+        name: event.data.name,
+        arguments: event.data.arguments,
+        status: "pending",
+      };
+      return messages.map((m, i) =>
+        i === host ? { ...m, toolCalls: [...(m.toolCalls ?? []), tc] } : m,
+      );
     }
     case "tool_result": {
-      const last = messages[messages.length - 1];
-      if (last?.role === "assistant" && last.toolCalls) {
-        const updated = last.toolCalls.map((tc) =>
-          tc.id === event.data.id
-            ? {
-                ...tc,
-                result: event.data.result,
-                images: event.data.images,
-              }
-            : tc,
-        );
-        return [...messages.slice(0, -1), { ...last, toolCalls: updated }];
-      }
-      return messages;
+      // 扫描范围限定在最后一个 user 之后的 assistant：provider 复用 call id 时，
+      // 扫全部消息会把历史轮的同名卡片一并改写。
+      const scopeStart = lastUserIndex(messages) + 1;
+      let hit = false;
+      const updated = messages.map((m, i) => {
+        if (hit || i < scopeStart || m.role !== "assistant" || !m.toolCalls) {
+          return m;
+        }
+        const target = m.toolCalls.findIndex((tc) => tc.id === event.data.id);
+        if (target < 0) return m;
+        hit = true;
+        return {
+          ...m,
+          toolCalls: m.toolCalls.map((tc, j) =>
+            j === target
+              ? {
+                  ...tc,
+                  result: event.data.result,
+                  images: event.data.images,
+                  status: "done" as const,
+                }
+              : tc,
+          ),
+        };
+      });
+      if (hit) return updated;
+
+      // 未命中 = 本轮的输出找不到对应调用（调用事件丢失或被截断）。孤儿输出
+      // 不伪造归属，单列成一条合成宿主，避免改写别人的卡片。
+      return [
+        ...messages,
+        {
+          role: "assistant" as const,
+          content: "",
+          turnIndex: 0,
+          toolCalls: [
+            {
+              id: event.data.id,
+              name: event.data.name,
+              arguments: "",
+              result: event.data.result,
+              status: "done" as const,
+              orphan: true,
+              images: event.data.images,
+            },
+          ],
+        },
+      ];
     }
     case "agent_call_start":
       return [
@@ -1163,6 +1267,7 @@ export function reduceStreamEvent(
       );
     case "turn_complete":
     case "done":
+      return settlePendingToolCalls(messages);
     case "usage":
     case "looper_state":
       return messages;
@@ -1182,16 +1287,16 @@ export function reduceStreamEvent(
       // 本次尝试已作废并回退，实时视图里留下的残句由这条横幅解释。
       // 不删除已收到的增量 —— 权威内容由 Session 快照保证，重载即收敛。
       //
-      // 横幅插在末条 assistant **之前**，不是追加到末尾：上面四个 delta
-      // 分支都以「末条 assistant」为目标，追加会让重试的增量全落进横幅里。
+      // 横幅落在宿主之前，是排版取舍：残句在上、重试说明在下，读起来是「先
+      // 看到作废的残句，再看到解释」；追加到末尾在阅读顺序上恰好相反。
       //
       // reason 区分两种重发：truncated（截断抬预算）与 transient
       //（限流/网络/5xx 退避重发）；缺省按截断展示（兼容旧后端）。
-      const last = messages[messages.length - 1];
-      if (last?.role !== "assistant") return messages;
+      const host = lastHostIndex(messages);
+      if (host < 0) return messages;
       const isTransient = event.data.reason === "transient";
       return [
-        ...messages.slice(0, -1),
+        ...messages.slice(0, host),
         {
           role: "assistant" as const,
           content: isTransient
@@ -1201,12 +1306,12 @@ export function reduceStreamEvent(
           isNotice: true,
           noticeIcon: "🔁",
         },
-        last,
+        ...messages.slice(host),
       ];
     }
     case "error":
       // 后端失败轮次（模型错误、超时、取消等）以警示气泡展示错误信息
-      return [
+      return settlePendingToolCalls([
         ...messages,
         {
           role: "assistant" as const,
@@ -1214,7 +1319,7 @@ export function reduceStreamEvent(
           turnIndex: 0,
           isError: true,
         },
-      ];
+      ]);
   }
 }
 
@@ -1259,42 +1364,109 @@ function handleSSEEvent(
   }
 }
 
-// ── Snapshot to Messages ───────────────────────────────────────────────────
+// ── Message Folding ────────────────────────────────────────────────────────
+//
+// 历史快照与实时流都产出同构的 ChatMessage：工具调用一律折叠进宿主的
+// `toolCalls`，`role:"tool"` 不再进入渲染层。
+
+interface ToolOutput {
+  callId: string;
+  content: string;
+  consumed: boolean;
+}
+
+/**
+ * 把一轮 `MessageData[]` 折叠成渲染就绪的消息列表。
+ *
+ * `tool` 消息本身不产出：它的内容被配对成对应调用的 `result`。配对按
+ * `tool_call_id` 全等且未消费，与位置无关，因此乱序输出也安全。
+ */
+export function messagesFromTurn(turn: TurnData): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  const outputs: ToolOutput[] = [];
+
+  turn.messages.forEach((md: MessageData, idx: number) => {
+    // id 用原始下标：折叠不重排，分页前置插入时 DOM 节点才不重挂
+    const id = `turn-${turn.turn_index}-${idx}`;
+    if (md.role === "user") {
+      messages.push({
+        id,
+        role: "user",
+        content: md.content ?? "",
+        turnIndex: turn.turn_index,
+        images: md.images,
+        attachments: md.attachments,
+        timestampMs: md.timestamp_ms,
+      });
+      return;
+    }
+    if (md.role === "tool") {
+      outputs.push({
+        callId: md.tool_call_id ?? "",
+        content: md.content ?? "",
+        consumed: false,
+      });
+      return;
+    }
+    messages.push({
+      id,
+      role: "assistant",
+      content: md.content ?? "",
+      turnIndex: turn.turn_index,
+      timestampMs: md.timestamp_ms,
+      toolCalls: md.tool_calls?.length
+        ? md.tool_calls.map((tc) => ({
+            id: tc.id,
+            name: tc.name,
+            arguments: tc.arguments,
+            status: "missing" as const,
+          }))
+        : undefined,
+      reasoning: md.reasoning_content,
+    });
+  });
+
+  const paired = messages.map((m) => {
+    if (!m.toolCalls) return m;
+    return {
+      ...m,
+      toolCalls: m.toolCalls.map((tc) => {
+        const output = outputs.find((o) => !o.consumed && o.callId === tc.id);
+        if (!output) return tc;
+        output.consumed = true;
+        return { ...tc, result: output.content, status: "done" as const };
+      }),
+    };
+  });
+
+  const orphans = outputs.filter((o) => !o.consumed);
+  if (orphans.length === 0) return paired;
+
+  // 孤儿输出原本挂在已被删除的 tool 消息上，落点就是那条消息本身 —— 折叠后
+  // 中间位置无法复原。本轮末尾是唯一无歧义、且不伪造归属的位置。工具名无从
+  // 得知（输出里没有），故统一记为「工具输出」。
+  return [
+    ...paired,
+    {
+      id: `turn-${turn.turn_index}-tool-orphans`,
+      role: "assistant",
+      content: "",
+      turnIndex: turn.turn_index,
+      toolCalls: orphans.map((o) => ({
+        id: o.callId,
+        name: "工具输出",
+        arguments: "",
+        result: o.content,
+        status: "done" as const,
+        orphan: true,
+      })),
+    },
+  ];
+}
 
 export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
   return turns.flatMap((turn) => {
-    const restored = turn.messages.map(
-      (md: MessageData, idx: number): ChatMessage => {
-        // 稳定 key：turn 位置号 + 轮内序号。分页前置插入时据此不重挂 DOM。
-        const id = `turn-${turn.turn_index}-${idx}`;
-        if (md.role === "user") {
-          return {
-            id,
-            role: "user",
-            content: md.content ?? "",
-            turnIndex: turn.turn_index,
-            images: md.images,
-            attachments: md.attachments,
-          };
-        }
-        if (md.role === "tool") {
-          return {
-            id,
-            role: "tool",
-            content: md.content ?? "",
-            turnIndex: turn.turn_index,
-          };
-        }
-        return {
-          id,
-          role: "assistant",
-          content: md.content ?? "",
-          turnIndex: turn.turn_index,
-          toolCalls: md.tool_calls?.map((tc) => ({ ...tc, result: undefined })),
-          reasoning: md.reasoning_content,
-        };
-      },
-    );
+    const restored = messagesFromTurn(turn);
 
     // 中断轮（取消/超时/失败后冻结入史）在两轮之间补一条居中横幅，
     // 在该轮消息之前 —— 与 compaction 归档分隔条同一渲染路径。
