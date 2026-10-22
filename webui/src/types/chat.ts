@@ -1,5 +1,7 @@
 // Chat types — aligned with peco-server /api/conversations/* and SSE events
 
+import type { ArtifactItem } from "./artifact";
+
 export interface Conversation {
   id: string;
   title: string;
@@ -63,6 +65,8 @@ export interface ToolResultData {
   result: string;
   /** 工具输出中的图片（data URI），无图片时缺省 */
   images?: string[];
+  /** 本次工具调用落库的产物；服务端省略空数组，故可选 */
+  artifacts?: ArtifactItem[];
   conversation_id: string;
 }
 

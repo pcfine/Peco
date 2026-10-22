@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { User } from "@/types/auth";
 import * as authApi from "@/api/auth";
+import { usePecoArtifactStore } from "@/stores/pecoArtifactStore";
 
 interface AuthState {
   user: User | null;
@@ -51,6 +52,10 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: () => {
+        // 产物 store 跨路由存活，不随组件卸载清理 —— 不在这里作废，同一标签页
+        // 换账号会直接看到上一账号的产物。只能在函数体内访问：模块初始化期
+        // 求值顺序上它可能还没创建。
+        usePecoArtifactStore.getState().reset();
         set({ user: null, token: null, error: null });
       },
 

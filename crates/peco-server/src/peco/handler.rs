@@ -11,6 +11,7 @@
 //   - POST /api/peco/images               上传图片（随 stream 的 image_ids 发送）
 //   - POST /api/peco/files                上传图片/文档（按扩展名分类，随 file_ids 发送）
 //   - GET  /api/peco/session               会话快照
+//   - GET  /api/peco/session/artifacts     会话产物列表（最新在前，分页）
 //   - DELETE /api/peco/session              清除/重置会话
 //   - GET  /api/peco/memory/audit           记忆删除审计（分页）
 //   - POST /api/peco/memory/audit/:id/restore  按审计行回滚删除
@@ -209,6 +210,46 @@ pub struct SessionSnapshotResponse {
 pub struct SessionMetricsResponse {
     /// 上下文指标。会话不存在时为 null（字段恒在，不 skip）。
     pub context_metrics: Option<ContextMetrics>,
+}
+
+/// 会话产物列表的默认页大小（一页 ≈50KB，够首屏）。
+const ARTIFACT_PAGE_DEFAULT_LIMIT: i64 = 200;
+
+/// 会话产物列表的页大小上限（单次请求的响应上限，不是默认值）。
+const ARTIFACT_PAGE_MAX_LIMIT: i64 = 500;
+
+/// 会话产物列表的分页查询参数。
+///
+/// 越界值一律 clamp 而非 400：同一 router 里其他分页参数都是这个语义。
+/// `limit` 必须带默认值函数 —— 否则省略 `limit` 会走 axum 的提取失败（400）。
+#[derive(Debug, Deserialize)]
+pub struct ArtifactListQuery {
+    /// 页大小（缺省 200，clamp 到 `1..=500`）。
+    #[serde(default = "default_artifact_limit")]
+    pub limit: i64,
+    /// 偏移量（缺省 0，负数按 0）。
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_artifact_limit() -> i64 {
+    ARTIFACT_PAGE_DEFAULT_LIMIT
+}
+
+/// 会话产物列表响应。
+///
+/// 裸数组带不了分页信息，故用信封：`limit`/`offset` 回显**生效值**，
+/// 前端据此知道真实页大小与当前位置。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtifactPage {
+    /// 当前页产物（`created_at DESC, rowid DESC`）。
+    pub artifacts: Vec<crate::artifact::ArtifactItem>,
+    /// 该会话的产物总数（不随分页变化）。
+    pub total: i64,
+    /// 生效的页大小（clamp 后）。
+    pub limit: i64,
+    /// 生效的偏移量（clamp 后）。
+    pub offset: i64,
 }
 
 // ── WatcherGuard ──────────────────────────────────────────────────────────
@@ -1037,6 +1078,43 @@ pub async fn get_session_metrics(
     };
 
     Ok(Json(SessionMetricsResponse { context_metrics }))
+}
+
+// ── Handler: GET /api/peco/session/artifacts ───────────────────────────────
+
+/// 列出当前用户私有会话的产物（最新在前，分页）。
+///
+/// 会话 id 由登录身份派生，不接受外部传入 —— 接受外部 id 就凭空造出一个越权面，
+/// 而本端点不做会话存在性校验，那层兜底并不存在。
+///
+/// 不做会话存在性查询：外键保证无会话行即无产物行，且 id 不可外部指定 ⇒
+/// 「会话存不存在」对外不可观测。空态是 200 + 空信封，不是 404 ——
+/// 新用户首屏是最常见的状态，不该走异常路径。GET 也不得懒建会话行，
+/// 否则「打开面板」成了写操作。
+pub async fn list_session_artifacts(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ArtifactListQuery>,
+) -> Result<Json<ArtifactPage>, ApiError> {
+    let conversation_id = private_session_id(&user_id);
+    let limit = params.limit.clamp(1, ARTIFACT_PAGE_MAX_LIMIT);
+    let offset = params.offset.max(0);
+
+    let total = crate::db::artifacts::count_by_conversation(&state.db, &conversation_id).await?;
+    let artifacts = crate::artifact::items_for_conversation(
+        &state,
+        &user_id,
+        &conversation_id,
+        Some((limit, offset)),
+    )
+    .await?;
+
+    Ok(Json(ArtifactPage {
+        artifacts,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 // ── Handler: DELETE /api/peco/session ───────────────────────────────────
@@ -2274,6 +2352,7 @@ pub struct SupersedeHealthResponse {
 /// - `POST /files` — 上传附件（图片/文档，multipart 字段 `file`，随 `file_ids` 发送）
 /// - `GET /session` — 获取会话快照（`?turns=&before=` 分 turn 分页）
 /// - `GET /session/metrics` — 上下文指标轻量端点
+/// - `GET /session/artifacts` — 会话产物列表（最新在前，倒序分页）
 /// - `DELETE /session` — 清除会话（默认先归档，`?archive=false` 硬删除）
 /// - `GET /session/export` — 导出会话
 /// - `GET /archives` — 归档列表
@@ -2311,6 +2390,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/session", get(get_session_snapshot).delete(clear_session))
         .route("/session/metrics", get(get_session_metrics))
+        .route("/session/artifacts", get(list_session_artifacts))
         .route("/session/export", get(export_session))
         .route("/archives", get(list_archives))
         .route("/archives/{id}", get(download_archive))

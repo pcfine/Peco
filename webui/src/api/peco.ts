@@ -5,6 +5,7 @@ import type {
   SessionMetricsResponse,
   SessionSnapshotResponse,
 } from "@/types/chat";
+import type { ArtifactPage } from "@/types/artifact";
 
 // axios baseURL is '/api', so paths here are relative to that.
 const PATH = "/peco";
@@ -35,6 +36,20 @@ export async function clearPecoSession(): Promise<{
   const resp = await api.delete<{ success: boolean; message?: string }>(
     `${PATH}/session`,
   );
+  return resp.data;
+}
+
+/**
+ * 会话产物分页列表（服务端按 `created_at DESC` 返回）。
+ *
+ * 路径相对 axios 实例的 `baseURL`（`/api`），不得再写一遍 `/api`。
+ */
+export async function listPecoArtifacts(
+  params: { limit?: number; offset?: number } = {},
+): Promise<ArtifactPage> {
+  const resp = await api.get<ArtifactPage>(`${PATH}/session/artifacts`, {
+    params,
+  });
   return resp.data;
 }
 

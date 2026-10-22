@@ -11,6 +11,7 @@ import {
 } from "@/api/peco";
 import { parseSSELines, toChatSseEvent } from "@/api/stream";
 import { useAuthStore } from "@/stores/authStore";
+import { usePecoArtifactStore } from "@/stores/pecoArtifactStore";
 import {
   snapshotToMessages,
   reduceStreamEvent,
@@ -620,6 +621,13 @@ function applyStreamEvent(
   // done = 服务端即将关闭该连接（run 收尾），标记后下次发送走引导路径
   if (event.event === "done" && conn) {
     conn.terminal = true;
+  }
+
+  // 产物是「会话资产」而不是「本窗口这一轮」：连接是跨窗口广播扇出，别处窗口
+  // 生成的产物也应即时进入本窗口面板，故必须落在下面的门控之前。旧连接的迟到
+  // 事件由 readStream 的代际校验挡住，与本门控无关。
+  if (event.event === "tool_result" && event.data.artifacts?.length) {
+    usePecoArtifactStore.getState().ingest(event.data.artifacts);
   }
 
   // 门控：只在「本窗口领有在途轮次」时应用事件。连接是共享的广播扇出，

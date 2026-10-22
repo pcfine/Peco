@@ -79,3 +79,36 @@ pub async fn find_by_id_and_user(
     .fetch_optional(pool)
     .await
 }
+
+/// 按对话倒序列出一页产物（最新在前 —— 产物面板要"最近生成的先看到"）。
+///
+/// `rowid` 参与排序：`created_at` 只到秒，同秒多条靠插入序定序，
+/// 只按 `created_at` 排会让同一秒内的顺序不确定，翻页时前后页互相穿插。
+pub async fn list_by_conversation_desc(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ArtifactRow>, sqlx::Error> {
+    sqlx::query_as::<_, ArtifactRow>(
+        "SELECT id, conversation_id, user_id, kind, mime, title, rel_path, size_bytes, created_at \
+         FROM artifacts WHERE conversation_id = ? \
+         ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+    )
+    .bind(conversation_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+/// 某对话的产物总数（分页信封的 `total`，不随分页变化）。
+pub async fn count_by_conversation(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .fetch_one(pool)
+        .await
+}

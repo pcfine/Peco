@@ -500,3 +500,48 @@ async fn list_requires_conversation_ownership() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+// ── chat 列表端点的形状与顺序回归 ────────────────────────────────────────────
+
+/// 变异点：让 `artifact::list` 开始读 `limit`/`offset` → 条数变成 1；改成倒序 →
+/// 顺序断言红；改成信封（而不是裸数组）→ 反序列化失败。
+///
+/// 带 `?limit=1&offset=1` 是刻意的：只测「默认参数下形状不变」拦不住「handler
+/// 开始读分页参数」这种改动，那条改动会让会话页的产物列表凭空少掉几条。
+#[tokio::test]
+async fn chat_list_order_and_shape_unchanged() {
+    let app = TestApp::new().await;
+    let conv = create_conversation(&app).await;
+
+    let mut inserted = Vec::new();
+    for name in ["a.png", "b.png", "c.png"] {
+        let abs = write_work_file(&app, &format!("output/t9/{name}"), b"PNG");
+        let title = format!("t9-{name}");
+        let item = register(&app, &conv, &abs, Some(title.as_str()))
+            .await
+            .unwrap()
+            .unwrap();
+        inserted.push(item.title);
+    }
+
+    let resp = app
+        .get(&format!(
+            "/api/chat/unknown/conversations/{conv}/artifacts?limit=1&offset=1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let listed: Vec<peco_server::artifact::ArtifactItem> = resp
+        .json()
+        .await
+        .expect("chat 列表必须仍是裸数组（不是分页信封）");
+
+    assert_eq!(listed.len(), 3, "chat 列表不读 limit/offset：仍是全量");
+    let titles: Vec<&str> = listed.iter().map(|i| i.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        inserted.iter().map(String::as_str).collect::<Vec<_>>(),
+        "仍是插入序正序（随对话阅读的方向）"
+    );
+}

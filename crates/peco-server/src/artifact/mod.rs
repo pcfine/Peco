@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use axum::Router;
 use axum::extract::State;
 use axum::routing::get;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::warn;
 
@@ -43,7 +43,7 @@ use crate::db::artifacts as db_artifacts;
 use crate::state::AppState;
 
 /// 产物 DTO —— 列表端点与 SSE 事件共用同一形状。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactItem {
     pub id: String,
     pub conversation_id: String,
@@ -310,6 +310,40 @@ pub async fn persist_declarations(
     items
 }
 
+/// 取某对话的产物行并映射为 DTO（含 `available` 的文件存在性判定）。
+///
+/// 归属校验与分页参数的 clamp 由调用方负责；分页差异下沉到 db 层，本函数只负责
+/// 「取行 + stat + 映射」。「文件是否算存在」只有这一处实现 —— 复制一份就会漂移成
+/// 面板说「还能下载」、点开却 404。
+///
+/// `page: None` 是全量正序（chat 列表沿用：与消息流方向一致）；
+/// `Some((limit, offset))` 是倒序分页（产物面板要最近优先）。
+pub(crate) async fn items_for_conversation(
+    state: &AppState,
+    user_id: &str,
+    conversation_id: &str,
+    page: Option<(i64, i64)>,
+) -> Result<Vec<ArtifactItem>, crate::error::ApiError> {
+    let rows = match page {
+        Some((limit, offset)) => {
+            db_artifacts::list_by_conversation_desc(&state.db, conversation_id, limit, offset)
+                .await?
+        }
+        None => db_artifacts::list_by_conversation(&state.db, conversation_id).await?,
+    };
+    let work = work_root(&state.workspace_manager, user_id);
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let available = work
+                .as_ref()
+                .map(|(root, _)| root.join(&row.rel_path).is_file())
+                .unwrap_or(false);
+            ArtifactItem::from_row(&row, available)
+        })
+        .collect())
+}
+
 /// 列出某对话的产物（文件是否仍在按需 stat）。
 pub async fn list(
     state: State<std::sync::Arc<AppState>>,
@@ -324,18 +358,7 @@ pub async fn list(
             crate::error::ApiError::NotFound(format!("conversation '{id}' not found"))
         })?;
 
-    let rows = db_artifacts::list_by_conversation(&state.db, &id).await?;
-    let work = work_root(&state.workspace_manager, &user.user_id);
-    let items = rows
-        .into_iter()
-        .map(|row| {
-            let available = work
-                .as_ref()
-                .map(|(root, _)| root.join(&row.rel_path).is_file())
-                .unwrap_or(false);
-            ArtifactItem::from_row(&row, available)
-        })
-        .collect();
+    let items = items_for_conversation(&state, &user.user_id, &id, None).await?;
     Ok(axum::Json(items))
 }
 

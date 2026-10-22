@@ -7,12 +7,15 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use common::TestApp;
 use peco_core::agent::LooperEvent;
 use peco_core::artifacts::ArtifactDecl;
 use peco_core::workdir::WorkDirs;
 use peco_server::artifact::ArtifactItem;
 use peco_server::chat::ChatSseEvent;
+use peco_server::peco::handler::ArtifactPage;
 use peco_server::peco::session::{SESSION_AGENT_NAME, SESSION_TITLE, private_session_id};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -602,4 +605,413 @@ async fn private_session_row_not_deletable_via_any_endpoint() {
         baseline_artifacts,
         "产物不得被 ON DELETE CASCADE 连带删除"
     );
+}
+
+// ============================================================================
+// 阶段 2：会话产物列表端点（GET /api/peco/session/artifacts）
+// ============================================================================
+//
+// 端点不接受外部 `conversation_id`：会话 id 由登录身份派生，客户端能控制的只有
+// 分页参数。因此本节的核心断言都是「返回的 id 集合来自测试自己造的那批产物」，
+// 而不是「回显了我传进去的参数」。
+
+/// 在指定用户的 work 目录下写文件 —— 双用户隔离用例要替另一方造产物。
+fn write_user_work_file(
+    app: &TestApp,
+    user_id: &str,
+    rel: &str,
+    bytes: &[u8],
+) -> std::path::PathBuf {
+    let dirs = WorkDirs::from_workspace_root(&app.state.workspace_manager.workspace_dir(user_id))
+        .expect("test workspace must follow <data_dir>/workspaces/<uid> layout");
+    std::fs::create_dir_all(dirs.output()).unwrap();
+    let path = dirs.root().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// 替指定用户造 `n` 项产物（走 peco 唯一的落库入口），按插入顺序返回 id。
+async fn seed_artifacts(app: &TestApp, user_id: &str, n: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let abs = write_user_work_file(
+            app,
+            user_id,
+            &format!("output/seed-{user_id}/{i}.png"),
+            b"PNG",
+        );
+        let ev = peco_server::peco::handler::looper_event_to_sse(
+            &app.state.db,
+            &app.state.workspace_manager,
+            user_id,
+            LooperEvent::ToolResult {
+                id: format!("call_{user_id}_{i}"),
+                name: "shell".to_string(),
+                result: "done".to_string(),
+                images: Vec::new(),
+                artifacts: vec![decl_of(&abs, Some(&format!("产物{i}")))],
+            },
+        )
+        .await
+        .expect("ToolResult 必须映射为 SSE 事件");
+        let items = artifacts_of(ev);
+        assert_eq!(items.len(), 1, "第 {i} 条声明必须落库");
+        ids.push(items[0].id.clone());
+    }
+    ids
+}
+
+/// 给测试主用户造一条 `scope='agent'` 的 chat 会话，并在其名下落 `n` 项产物。
+///
+/// `scope` 显式写死而非依赖列默认值：默认值一旦变动，这条用例就不再代表
+/// 「同一用户的另一个会话」，隔离断言会悄悄失去意义。
+async fn seed_chat_conversation_artifacts(app: &TestApp, n: usize) -> Vec<String> {
+    let conversation_id = format!("conv-chat-{}", app.user_id);
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, agent_name, title, scope) \
+         VALUES (?, ?, 'writer', 'chat 会话', 'agent')",
+    )
+    .bind(&conversation_id)
+    .bind(&app.user_id)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let abs = write_work_file(app, &format!("output/chat/{i}.png"), b"PNG-CHAT");
+        let ev = peco_server::artifact::build_tool_result_event(
+            &app.state.db,
+            Some(&work_dirs(app)),
+            &conversation_id,
+            &app.user_id,
+            format!("call_chat_{i}"),
+            "shell".to_string(),
+            "done".to_string(),
+            Vec::new(),
+            &[decl_of(&abs, None)],
+        )
+        .await;
+        let items = artifacts_of(ev);
+        assert_eq!(
+            items.len(),
+            1,
+            "第 {i} 条 chat 产物必须真落库，否则下面的隔离断言恒真"
+        );
+        ids.push(items[0].id.clone());
+    }
+    ids
+}
+
+async fn list_raw(app: &TestApp, query: &str) -> reqwest::Response {
+    app.get(&format!("/api/peco/session/artifacts{query}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// 非整数分页参数由 axum 的 Query 提取层拒绝：框架默认的纯文本 400，不是
+/// ApiError 信封 —— 故这里刻意不按 JSON envelope 解析。
+async fn assert_non_integer_paging_rejected(app: &TestApp, query: &str) {
+    let resp = list_raw(app, query).await;
+    assert_eq!(resp.status(), 400, "query={query}");
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = resp.text().await.unwrap();
+    assert!(
+        !content_type.contains("application/json"),
+        "非整数不该被包成 envelope（query={query}），content-type={content_type}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&body).is_err(),
+        "响应体不是 JSON（query={query}）：{body}"
+    );
+}
+
+/// 取一页并按 `ArtifactPage` 类型反序列化（形状错会在这里直接失败）。
+async fn list_page(app: &TestApp, query: &str) -> ArtifactPage {
+    let resp = list_raw(app, query).await;
+    assert_eq!(resp.status(), 200, "列表端点必须 200（query={query}）");
+    resp.json()
+        .await
+        .unwrap_or_else(|e| panic!("响应必须是 ArtifactPage 信封（query={query}）：{e}"))
+}
+
+fn ids_of(page: &ArtifactPage) -> BTreeSet<String> {
+    page.artifacts.iter().map(|a| a.id.clone()).collect()
+}
+
+fn item_by_id<'a>(page: &'a ArtifactPage, id: &str) -> &'a ArtifactItem {
+    page.artifacts
+        .iter()
+        .find(|a| a.id == id)
+        .unwrap_or_else(|| panic!("列表缺产物 {id}"))
+}
+
+// ── 只返回本人产物 ──────────────────────────────────────────────────────────
+
+/// 变异点：把派生 id 换成 query 里的 `conversation_id`（user2 带上 user1 的私有
+/// 会话 id 就能拿到 user1 的产物）→ user2 的集合断言红；或查询漏掉会话归属过滤
+/// → 两方集合相交。
+///
+/// 双方各造 2 项是刻意的：只比条数（2 == 2）在「user2 拿到 user1 的两项」时
+/// 也成立，等于恒真。
+#[tokio::test]
+async fn peco_list_scoped_to_owner() {
+    let app = TestApp::new().await;
+    let user1_ids: BTreeSet<String> = seed_artifacts(&app, &app.user_id, 2)
+        .await
+        .into_iter()
+        .collect();
+    let (user2_id, token2) = app.register_user2().await;
+    let user2_ids: BTreeSet<String> = seed_artifacts(&app, &user2_id, 2)
+        .await
+        .into_iter()
+        .collect();
+    assert_eq!(user1_ids.len(), 2);
+    assert_eq!(user2_ids.len(), 2);
+
+    let page1 = list_page(&app, "").await;
+    assert_eq!(page1.total, 2);
+    assert_eq!(ids_of(&page1), user1_ids, "user1 只能看到自己的 2 项");
+
+    // 带上对方的私有会话 id 也不该换来对方的数据：端点根本不读这个参数。
+    let bait = format!("?conversation_id={}", private_session_id(&app.user_id));
+    let resp = app
+        .get_as(&format!("/api/peco/session/artifacts{bait}"), &token2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let page2: ArtifactPage = resp.json().await.unwrap();
+    assert_eq!(page2.total, 2);
+    assert_eq!(ids_of(&page2), user2_ids, "user2 只能看到自己的 2 项");
+    assert!(ids_of(&page2).is_disjoint(&ids_of(&page1)));
+}
+
+// ── 同一用户的 chat 会话产物也不出现 ────────────────────────────────────────
+
+/// 变异点：把 peco handler 的 `WHERE conversation_id = ?` 改成 `WHERE user_id = ?`
+/// → user1 的 chat 会话产物混进列表，`total` 与 id 集合断言红。
+///
+/// 与上一条互补：那条只证明「别的用户的会话不可见」，按 `user_id` 查照样能过；
+/// 这条造的是同一用户、不同 `scope` 的会话，只有按 `conversation_id` 查才过得去。
+#[tokio::test]
+async fn peco_list_excludes_chat_conversations() {
+    let app = TestApp::new().await;
+    let peco_ids: BTreeSet<String> = seed_artifacts(&app, &app.user_id, 2)
+        .await
+        .into_iter()
+        .collect();
+    let chat_ids: BTreeSet<String> = seed_chat_conversation_artifacts(&app, 2)
+        .await
+        .into_iter()
+        .collect();
+
+    assert_eq!(peco_ids.len(), 2);
+    assert_eq!(chat_ids.len(), 2);
+    assert!(
+        peco_ids.is_disjoint(&chat_ids),
+        "两侧造数必须落在不同 id 上，否则下面的断言无意义"
+    );
+
+    let page = list_page(&app, "").await;
+    assert_eq!(page.total, 2, "chat 会话的产物不得计入 total");
+    assert_eq!(ids_of(&page), peco_ids, "列表只含私有会话的产物");
+}
+
+// ── 最新在前 ────────────────────────────────────────────────────────────────
+
+/// 变异点：换回既有的正序查询（`list_by_conversation`）→ 序列变成插入序，
+/// 断言红。`created_at` 只到秒，三项同秒，实际定序靠 `rowid`。
+#[tokio::test]
+async fn peco_list_newest_first() {
+    let app = TestApp::new().await;
+    let inserted = seed_artifacts(&app, &app.user_id, 3).await;
+
+    let page = list_page(&app, "").await;
+    assert_eq!(page.total, 3);
+    let got: Vec<&str> = page.artifacts.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(
+        got,
+        vec![
+            inserted[2].as_str(),
+            inserted[1].as_str(),
+            inserted[0].as_str()
+        ],
+        "最新的在最前（插入序的倒序）"
+    );
+}
+
+// ── 分页 ────────────────────────────────────────────────────────────────────
+
+/// 变异点：忽略 `offset` → 第 2 页与第 1 页重叠，交集断言红；忽略 `limit` →
+/// 第一页返回 5 项，条数断言红。
+#[tokio::test]
+async fn peco_list_paginates() {
+    let app = TestApp::new().await;
+    let seeded: BTreeSet<String> = seed_artifacts(&app, &app.user_id, 5)
+        .await
+        .into_iter()
+        .collect();
+
+    let first = list_page(&app, "?limit=2&offset=0").await;
+    assert_eq!(first.artifacts.len(), 2);
+    assert_eq!(first.total, 5, "total 是总数，不随分页变化");
+    // 这两条测的是 envelope 回显契约（以及 clamp 生效后的值），不是分页生效；
+    // 分页生效由下方的 is_disjoint 与三页并集断言证明。
+    assert_eq!(first.limit, 2);
+    assert_eq!(first.offset, 0);
+
+    let second = list_page(&app, "?limit=2&offset=2").await;
+    assert_eq!(second.artifacts.len(), 2);
+    assert!(
+        ids_of(&first).is_disjoint(&ids_of(&second)),
+        "两页不得重叠：{:?} vs {:?}",
+        ids_of(&first),
+        ids_of(&second)
+    );
+
+    let third = list_page(&app, "?limit=2&offset=4").await;
+    assert_eq!(third.artifacts.len(), 1, "第三页只剩 1 项");
+
+    // 三页并起来必须正好覆盖全部 5 项：防「每页都返回同一段头部」这类假分页
+    let union: BTreeSet<String> = ids_of(&first)
+        .union(&ids_of(&second))
+        .cloned()
+        .chain(ids_of(&third))
+        .collect();
+    assert_eq!(union, seeded);
+}
+
+// ── 空态 200 且不建会话行 ───────────────────────────────────────────────────
+
+/// 变异点：把空态改成 404（status 断言红），或让 GET 顺手 `ensure_private_session`
+/// （会话行数变 1，count 断言红 —— GET 一旦有副作用就不再幂等）。
+#[tokio::test]
+async fn peco_list_empty_without_creating_session() {
+    let app = TestApp::new().await;
+
+    let page = list_page(&app, "").await;
+    assert!(page.artifacts.is_empty());
+    assert_eq!(page.total, 0);
+    assert_eq!(page.limit, 200, "空态也回显生效的页大小");
+    assert_eq!(page.offset, 0);
+
+    assert_eq!(conversation_count(&app).await, 0, "GET 不得创建私有会话行");
+}
+
+// ── available 跟随文件系统 ──────────────────────────────────────────────────
+
+/// 变异点：把 `available` 恒置 true（不 stat）→ 删文件后仍 true，中间一步红；
+/// 恒置 false → 第一步红。
+#[tokio::test]
+async fn peco_list_available_follows_file_existence() {
+    let app = TestApp::new().await;
+    let abs = write_work_file(&app, "output/live/a.png", b"PNG");
+    let items = artifacts_of(
+        tool_result_event(&app, "call_live", "done", vec![decl_of(&abs, Some("还在"))]).await,
+    );
+    assert_eq!(items.len(), 1);
+    let id = items[0].id.clone();
+
+    assert!(
+        item_by_id(&list_page(&app, "").await, &id).available,
+        "文件在时 available 必须为 true"
+    );
+
+    std::fs::remove_file(&abs).unwrap();
+    assert!(
+        !item_by_id(&list_page(&app, "").await, &id).available,
+        "文件被清理后必须为 false"
+    );
+
+    std::fs::write(&abs, b"PNG-AGAIN").unwrap();
+    assert!(
+        item_by_id(&list_page(&app, "").await, &id).available,
+        "文件回来后必须重新为 true（不是一次性缓存）"
+    );
+}
+
+// ── 分页参数一律 clamp ──────────────────────────────────────────────────────
+
+/// 变异点：把 clamp 改成 400 → status 断言红；去掉 clamp（`limit=99999` 原样回显）
+/// → `limit == 500` 断言红；把非整数也包成 ApiError 信封 → 纯文本断言红。
+///
+/// 前三组的期望值（1 / 0 / 500）都不等于传入值（0 / -1 / 99999），不是自证式断言；
+/// `limit=500` 那组故意用等值断言 —— 上界本身合法，clamp 只对越界值生效。
+#[tokio::test]
+async fn peco_list_paging_clamped() {
+    let app = TestApp::new().await;
+    seed_artifacts(&app, &app.user_id, 3).await;
+
+    let resp = list_raw(&app, "?limit=0").await;
+    assert_eq!(resp.status(), 200);
+    let page: ArtifactPage = resp.json().await.unwrap();
+    assert_eq!(page.limit, 1, "limit < 1 收到 1");
+    // 造了 3 项、生效 limit 为 1：回 0 项同样算坏，故用等值而非上界
+    assert_eq!(page.artifacts.len(), 1);
+
+    let home = list_page(&app, "").await;
+    let negative = list_page(&app, "?offset=-1").await;
+    assert_eq!(negative.offset, 0, "offset < 0 收到 0");
+    assert_eq!(
+        ids_of(&negative),
+        ids_of(&home),
+        "offset 收敛到 0 后就是首页"
+    );
+
+    let resp = list_raw(&app, "?limit=99999").await;
+    assert_eq!(resp.status(), 200);
+    let page: ArtifactPage = resp.json().await.unwrap();
+    assert_eq!(page.limit, 500, "limit > 500 收到 500");
+
+    // 上界本身是可接受值：clamp 只对越界生效，回显必须原样 500
+    let page = list_page(&app, "?limit=500").await;
+    assert_eq!(page.limit, 500, "limit == 500 不该被夹");
+
+    assert_non_integer_paging_rejected(&app, "?limit=abc").await;
+    assert_non_integer_paging_rejected(&app, "?offset=abc").await;
+}
+
+// ── 需要认证 ────────────────────────────────────────────────────────────────
+
+/// 变异点：把路由挂到不带 auth 的 router（或去掉 `AuthUser` extractor）→ 200，
+/// 断言红。
+#[tokio::test]
+async fn peco_list_requires_auth() {
+    let app = TestApp::new().await;
+
+    let resp = app
+        .client
+        .get(format!("{}/api/peco/session/artifacts", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ── 清空对话不动产物 ────────────────────────────────────────────────────────
+
+/// 变异点：给 `clear_session` 加上删产物行（或删文件后行仍在但过滤掉）→
+/// 清空后的 total / id 集合断言红。
+#[tokio::test]
+async fn peco_clear_does_not_delete_artifacts() {
+    let app = TestApp::new().await;
+    let seeded: BTreeSet<String> = seed_artifacts(&app, &app.user_id, 2)
+        .await
+        .into_iter()
+        .collect();
+
+    let resp = app.delete("/api/peco/session").send().await.unwrap();
+    assert_eq!(resp.status(), 200, "清空对话必须成功");
+
+    let page = list_page(&app, "").await;
+    assert_eq!(page.total, 2, "清空对话 = 清历史，不删产物");
+    assert_eq!(ids_of(&page), seeded);
 }
