@@ -149,9 +149,11 @@ async fn delete_legacy(
         user_id = %user.user_id,
         "DEPRECATED /api/conversations DELETE; migrate to /api/chat/:agentId/conversations"
     );
-    let _ = conversations::find_by_id_and_user(&state.db, &conv_id, &user.user_id)
-        .await?
-        .ok_or_else(|| crate::error::ApiError::NotFound(format!("not found: {conv_id}")))?;
+    // 只认 agent 会话：私有会话的产物行靠外键挂在它上面，删会话会连带删产物。
+    let _ =
+        conversations::find_agent_conversation_by_id_and_user(&state.db, &conv_id, &user.user_id)
+            .await?
+            .ok_or_else(|| crate::error::ApiError::NotFound(format!("not found: {conv_id}")))?;
     messages::delete_by_conversation(&state.db, &conv_id).await?;
     let persister = crate::session_store::SqliteSessionPersister::new(state.db.clone());
     let _ = persister.delete(&conv_id).await;

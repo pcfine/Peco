@@ -258,7 +258,8 @@ pub async fn delete_conversation(
     State(state): State<Arc<AppState>>,
     Path((_agent_name, conv_id)): Path<(String, String)>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let conv = conversations::find_by_id_and_user(&state.db, &conv_id, &user_id)
+    // 只认 agent 会话：peco 私有会话的产物行靠外键挂在它上面，删会话会连带删产物。
+    let conv = conversations::find_agent_conversation_by_id_and_user(&state.db, &conv_id, &user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
 

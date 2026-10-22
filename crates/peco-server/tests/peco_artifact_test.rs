@@ -85,6 +85,14 @@ async fn conversation_count(app: &TestApp) -> i64 {
         .unwrap()
 }
 
+async fn session_artifact_count(app: &TestApp, conversation_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap()
+}
+
 // ── T1 先落库后发事件 ───────────────────────────────────────────────────────
 
 /// 变异点：把 `looper_event_to_sse` 改成先返回事件、落库放 spawn / 放到后面，
@@ -160,6 +168,19 @@ async fn creates_private_session_conversation_once() {
     for conversation_id in &rows {
         assert_eq!(conversation_id, &private_id);
     }
+
+    // 产物列表端点靠这条查询校验归属：误加 scope 谓词会让私有会话的产物列表变 404。
+    assert!(
+        peco_server::db::conversations::find_by_id_and_user(
+            &app.state.db,
+            &private_id,
+            &app.user_id
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "find_by_id_and_user 必须能命中私有会话行"
+    );
 }
 
 // ── T3 事件形状与 /api/chat 路径一致 ───────────────────────────────────────
@@ -530,5 +551,55 @@ async fn migration_016_converges_from_old_db() {
         scope_column_shape(&fresh_pool).await,
         legacy_shape,
         "全新库（schema.sql 建列）与存量库（016 补列）的 scope 列形状必须相同"
+    );
+}
+
+// ── T11 任何删除端点都删不掉私有会话 ───────────────────────────────────────
+
+/// 变异点：两个删除入口任一仍用 `find_by_id_and_user`（不过滤 scope）→ 该入口
+/// 返回 200，会话行与产物行经 ON DELETE CASCADE 一起消失。
+#[tokio::test]
+async fn private_session_row_not_deletable_via_any_endpoint() {
+    let app = TestApp::new().await;
+    let private_id = private_session_id(&app.user_id);
+    let abs = write_work_file(&app, "output/keep.png", b"PNG");
+    artifacts_of(tool_result_event(&app, "call_1", "done", vec![decl_of(&abs, None)]).await);
+
+    let baseline_artifacts = session_artifact_count(&app, &private_id).await;
+    assert!(baseline_artifacts >= 1);
+
+    let resp = app
+        .delete(&format!(
+            "/api/chat/{SESSION_AGENT_NAME}/conversations/{private_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // deprecated 入口：`conversations::delete` 的第二个调用方
+    let resp = app
+        .delete(&format!("/api/conversations/{private_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = ?")
+        .bind(&private_id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "私有会话行必须仍在");
+    let scope: String = sqlx::query_scalar("SELECT scope FROM conversations WHERE id = ?")
+        .bind(&private_id)
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(scope, "peco");
+    assert_eq!(
+        session_artifact_count(&app, &private_id).await,
+        baseline_artifacts,
+        "产物不得被 ON DELETE CASCADE 连带删除"
     );
 }
