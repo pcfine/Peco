@@ -32,6 +32,9 @@ export function selectArtifactItems(state: PecoArtifactState): ArtifactItem[] {
   return mergeArtifacts(state.ingested, state.pages);
 }
 
+/** 面板筛选分类。放 store 而非组件内：抽屉关闭即卸载，留在组件里每次重开都回「全部」。 */
+export type ArtifactFilter = "all" | "image" | "video" | "audio" | "document";
+
 export interface PecoArtifactState {
   /** 本窗口 SSE 增量引入、尚未被服务端响应认领的项，最新的在前。 */
   ingested: ArtifactItem[];
@@ -44,11 +47,13 @@ export interface PecoArtifactState {
   loaded: boolean;
   /** 已请求到的最远偏移，单调不减；"无更多"判据是 `nextOffset >= total`。 */
   nextOffset: number;
+  filter: ArtifactFilter;
 
   load: () => Promise<void>;
   refreshHead: () => Promise<void>;
   loadMore: () => Promise<void>;
   ingest: (next: ArtifactItem[]) => void;
+  setFilter: (next: ArtifactFilter) => void;
   markUnavailable: (id: string) => void;
   reset: () => void;
   __resetForTests: () => void;
@@ -64,6 +69,7 @@ function emptyState() {
     error: null as string | null,
     loaded: false,
     nextOffset: 0,
+    filter: "all" as ArtifactFilter,
   };
 }
 
@@ -203,6 +209,8 @@ export const usePecoArtifactStore = create<PecoArtifactState>()((set, get) => ({
       };
     });
   },
+
+  setFilter: (next) => set({ filter: next }),
 
   markUnavailable: (id) => {
     const patch = (list: ArtifactItem[]) =>

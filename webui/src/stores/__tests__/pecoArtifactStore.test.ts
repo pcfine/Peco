@@ -280,6 +280,18 @@ describe("身份代际", () => {
   });
 });
 
+describe("filter", () => {
+  it("setFilter 写入后读得回；reset 归零回「全部」", () => {
+    state().setFilter("image");
+    expect(state().filter).toBe("image");
+
+    state().reset();
+
+    // reset 复用 emptyState()：换账号后不能带着上一个账号的筛选
+    expect(state().filter).toBe("all");
+  });
+});
+
 describe("markUnavailable / reset", () => {
   it("两个数组里同 id 的项一起标成不可用", async () => {
     list.mockResolvedValueOnce(page([item("a"), item("b")], 0, 2));
