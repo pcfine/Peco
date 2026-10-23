@@ -156,6 +156,80 @@ describe("ChatView external 附件通路", () => {
     expect(container.textContent).toContain("笔记.txt");
   });
 
+  it("不支持的文件类型选完即提示，不发上传请求", async () => {
+    await render();
+
+    await chooseFile("安装包.exe", "application/x-msdownload");
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      expect.stringContaining("不支持的文件类型：.exe"),
+    );
+    expect(container.textContent).not.toContain("安装包.exe");
+  });
+
+  it("无扩展名的剪贴板位图按 MIME 走图片通路", async () => {
+    const uploadImage = vi.fn(async () => ({
+      id: "i1",
+      url: "/uploads/chat/u/i1",
+    }));
+    await render({ supportsImages: true, uploadImage });
+
+    await chooseFile("image", "image/png");
+
+    expect(uploadImage).toHaveBeenCalledTimes(1);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("上传中展示文件名与百分比，完成后转为附件 chip", async () => {
+    let report: ((pct: number) => void) | undefined;
+    let finish: (() => void) | undefined;
+    const slowUpload = vi.fn(
+      (file: File, onProgress?: (pct: number) => void) =>
+        new Promise<{ id: string; kind: "document"; name: string }>(
+          (resolve) => {
+            report = onProgress;
+            finish = () =>
+              resolve({ id: "f2", kind: "document", name: file.name });
+          },
+        ),
+    );
+    await render({ uploadFile: slowUpload });
+
+    const input = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    const file = new File([new Uint8Array([1])], "大附件.pdf", {
+      type: "application/pdf",
+    });
+    Object.defineProperty(input, "files", {
+      value: [file],
+      configurable: true,
+    });
+    await act(async () => {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    // 在途 chip 可见，尚无进度时显示「上传中」
+    expect(
+      container.querySelector('[data-slot="upload-progress"]'),
+    ).not.toBeNull();
+    expect(container.textContent).toContain("大附件.pdf");
+    expect(container.textContent).toContain("上传中");
+
+    await act(async () => {
+      report?.(42);
+    });
+    expect(container.textContent).toContain("42%");
+
+    // 上传完成：进度 chip 消失，转为可发送的附件 chip
+    await act(async () => {
+      finish?.();
+    });
+    expect(container.querySelector('[data-slot="upload-progress"]')).toBeNull();
+    expect(container.textContent).toContain("大附件.pdf");
+  });
+
   it("快照用户消息渲染文档附件 chip", async () => {
     await render({
       initialMessages: [

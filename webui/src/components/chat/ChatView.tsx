@@ -100,6 +100,40 @@ function uploadErrorMessage(err: unknown, name: string): string {
   return data?.details || data?.error || `附件上传失败：${name}`;
 }
 
+/** 上传进度回调：0–100（服务端未给出总长度时不回调）。 */
+export type UploadProgress = (percent: number) => void;
+
+/**
+ * 按扩展名分类附件；未知类型返回 null。
+ *
+ * 与服务端白名单对齐，用于选中文件后立即提示 —— 不必等一次必然 400 的往返。
+ * docx/pptx/xlsx 在服务端关闭 Docling 时仍会被拒，由服务端错误文案兜底。
+ */
+function classifyAttachment(file: File): "image" | "document" | null {
+  const ext = extensionOf(file.name);
+  if (IMAGE_FILE_EXTS.includes(ext)) return "image";
+  if (DOC_FILE_EXTS.includes(ext)) return "document";
+  // 剪贴板位图可能没有扩展名：图片端点按 MIME 识别，仍走图片通路
+  if (ext === "" && file.type.startsWith("image/")) return "image";
+  return null;
+}
+
+/** 不支持的类型提示：带扩展名，便于用户判断该换文件还是换格式。 */
+function unsupportedAttachmentMessage(file: File): string {
+  const ext = extensionOf(file.name);
+  return ext
+    ? `不支持的文件类型：.${ext}（支持图片与 PDF/Markdown/文本/代码等文档）`
+    : `无法识别文件类型：${file.name}（缺少扩展名）`;
+}
+
+/** 在途上传：完成后转成待发送附件，失败则移除并 toast。 */
+interface UploadingAttachment {
+  key: string;
+  name: string;
+  kind: "image" | "document";
+  percent: number;
+}
+
 /** 待发送附件（图片与文档统一入口）。图片有渲染 url，文档只带引用 id 与原名。 */
 export interface ChatAttachment {
   id: string;
@@ -160,9 +194,15 @@ export interface ChatViewProps {
   /** 是否支持图片输入。false 时图片文件被拒（附件入口本身由 uploadFile 决定） */
   supportsImages?: boolean;
   /** 上传图片回调（既有图片通路），返回引用 id 与渲染 URL。supportsImages 时必需 */
-  uploadImage?: (file: File) => Promise<{ id: string; url: string }>;
+  uploadImage?: (
+    file: File,
+    onProgress?: UploadProgress,
+  ) => Promise<{ id: string; url: string }>;
   /** 上传附件回调（图片与文档统一端点）。提供时附件入口可用，与 supportsImages 解耦 */
-  uploadFile?: (file: File) => Promise<ChatAttachment>;
+  uploadFile?: (
+    file: File,
+    onProgress?: UploadProgress,
+  ) => Promise<ChatAttachment>;
   /** 文件选择框 accept；缺省按内置图片/文档白名单拼接（仅 uploadFile 存在时为扩展名列表） */
   accept?: string;
   /** 初始消息列表（从快照恢复） */
@@ -276,7 +316,10 @@ export function ChatView({
   const [pendingAttachments, setPendingAttachments] = useState<
     ChatAttachment[]
   >([]);
-  const [uploading, setUploading] = useState(false);
+  /** 在途上传（带进度）；同时用于禁用附件入口与发送 */
+  const [uploads, setUploads] = useState<UploadingAttachment[]>([]);
+  const uploadSeqRef = useRef(0);
+  const uploading = uploads.length > 0;
   const abortRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -295,6 +338,8 @@ export function ChatView({
   visibleRef.current = visible;
   const pendingAttachmentsRef = useRef(pendingAttachments);
   pendingAttachmentsRef.current = pendingAttachments;
+  const uploadingRef = useRef(uploading);
+  uploadingRef.current = uploading;
 
   // StrictMode-safe unmount timer: setTimeout in cleanup is cleared on remount,
   // so abort only fires for genuine unmounts, not StrictMode double-invocation.
@@ -465,7 +510,12 @@ export function ChatView({
     const tok = tokenRef.current;
     const streaming = externalIsStreamingRef.current ?? streamingRef.current;
     const attachments = pendingAttachmentsRef.current;
-    if ((!currentInput.trim() && attachments.length === 0) || !tok || streaming)
+    if (
+      (!currentInput.trim() && attachments.length === 0) ||
+      !tok ||
+      streaming ||
+      uploadingRef.current
+    )
       return;
     setInput("");
     if (onExternalSendRef.current) {
@@ -614,65 +664,84 @@ export function ChatView({
     async (files: File[]) => {
       if (files.length === 0) return;
 
-      // 无附件端点（agent 会话页）：仅图片通路，行为与接入附件端点前一致
-      if (!uploadFile) {
-        if (!supportsImages || !uploadImage) return;
-        setUploading(true);
+      // 单个文件的上传生命周期：入列 → 进度回调 → 转附件 / 失败 toast → 出列
+      const uploadOne = async (
+        file: File,
+        kind: "image" | "document",
+        run: (
+          onProgress: UploadProgress,
+        ) => Promise<{ id: string; url?: string }>,
+        errorText: (err: unknown) => string,
+      ) => {
+        const key = `upload-${++uploadSeqRef.current}`;
+        setUploads((prev) => [
+          ...prev,
+          { key, name: file.name, kind, percent: 0 },
+        ]);
         try {
-          for (const file of files) {
-            try {
-              const uploaded = await uploadImage(file);
-              setPendingAttachments((prev) => [
-                ...prev,
-                { ...uploaded, kind: "image" as const, name: file.name },
-              ]);
-            } catch {
-              toast.error(`图片上传失败：${file.name}`);
-            }
-          }
+          const uploaded = await run((percent) =>
+            setUploads((prev) =>
+              prev.map((u) => (u.key === key ? { ...u, percent } : u)),
+            ),
+          );
+          setPendingAttachments((prev) => [
+            ...prev,
+            { ...uploaded, kind, name: file.name },
+          ]);
+        } catch (err) {
+          toast.error(errorText(err));
         } finally {
-          setUploading(false);
+          setUploads((prev) => prev.filter((u) => u.key !== key));
         }
-        return;
-      }
+      };
 
-      setUploading(true);
-      try {
-        for (const file of files) {
-          const ext = extensionOf(file.name);
-          const isImage =
-            IMAGE_FILE_EXTS.includes(ext) ||
-            (ext === "" && file.type.startsWith("image/"));
+      for (const file of files) {
+        const kind = classifyAttachment(file);
+        if (!kind) {
+          // 选文件时即可判定 —— 不发请求、不留空白，直接提示原因
+          toast.error(unsupportedAttachmentMessage(file));
+          continue;
+        }
 
-          if (isImage) {
-            if (!supportsImages) {
-              toast.error("当前模型不支持图片输入");
-              continue;
-            }
-            // 既有图片通路（/images + uploadImage）优先，行为不变
-            if (uploadImage) {
-              try {
-                const uploaded = await uploadImage(file);
-                setPendingAttachments((prev) => [
-                  ...prev,
-                  { ...uploaded, kind: "image", name: file.name },
-                ]);
-              } catch {
-                toast.error(`图片上传失败：${file.name}`);
-              }
-              continue;
-            }
+        // 无附件端点（agent 会话页）：仅图片通路，行为与接入附件端点前一致
+        if (!uploadFile) {
+          if (!supportsImages || !uploadImage) return;
+          if (kind !== "image") {
+            toast.error(`当前对话仅支持图片附件：${file.name}`);
+            continue;
           }
+          await uploadOne(
+            file,
+            "image",
+            (onProgress) => uploadImage(file, onProgress),
+            () => `图片上传失败：${file.name}`,
+          );
+          continue;
+        }
 
-          try {
-            const uploaded = await uploadFile(file);
-            setPendingAttachments((prev) => [...prev, uploaded]);
-          } catch (err) {
-            toast.error(uploadErrorMessage(err, file.name));
+        if (kind === "image") {
+          if (!supportsImages) {
+            toast.error("当前模型不支持图片输入");
+            continue;
+          }
+          // 既有图片通路（/images + uploadImage）优先，行为不变
+          if (uploadImage) {
+            await uploadOne(
+              file,
+              "image",
+              (onProgress) => uploadImage(file, onProgress),
+              () => `图片上传失败：${file.name}`,
+            );
+            continue;
           }
         }
-      } finally {
-        setUploading(false);
+
+        await uploadOne(
+          file,
+          "document",
+          (onProgress) => uploadFile(file, onProgress),
+          (err) => uploadErrorMessage(err, file.name),
+        );
       }
     },
     [uploadImage, uploadFile, supportsImages],
@@ -784,8 +853,9 @@ export function ChatView({
             rows={1}
           />
 
-          {/* 待发送附件预览（hover 出移除按钮）：图片缩略图 + 文档名 chip */}
-          {pendingAttachments.length > 0 && (
+          {/* 待发送附件预览（hover 出移除按钮）：图片缩略图 + 文档名 chip；
+              在途上传以带百分比与进度条的 chip 并排展示，完成后替换为其一 */}
+          {(pendingAttachments.length > 0 || uploads.length > 0) && (
             <div className="flex flex-wrap gap-2 px-3 pt-2">
               {pendingAttachments.map((att) =>
                 att.kind === "image" && att.url ? (
@@ -830,6 +900,28 @@ export function ChatView({
                   </div>
                 ),
               )}
+              {uploads.map((u) => (
+                <div
+                  key={u.key}
+                  data-slot="upload-progress"
+                  title={`正在上传：${u.name}`}
+                  className="relative flex items-center gap-1.5 overflow-hidden rounded-md border border-dashed bg-muted/40 py-1.5 pr-2 pl-2 text-xs"
+                >
+                  <Loader2
+                    className="h-3.5 w-3.5 shrink-0 animate-spin"
+                    aria-hidden="true"
+                  />
+                  <span className="max-w-[160px] truncate">{u.name}</span>
+                  <span className="tabular-nums text-muted-foreground">
+                    {u.percent > 0 ? `${u.percent}%` : "上传中"}
+                  </span>
+                  <span
+                    aria-hidden="true"
+                    className="absolute bottom-0 left-0 h-0.5 bg-primary transition-[width]"
+                    style={{ width: `${u.percent}%` }}
+                  />
+                </div>
+              ))}
             </div>
           )}
 
@@ -933,6 +1025,7 @@ export function ChatView({
                   onClick={handleSend}
                   disabled={
                     (!input.trim() && pendingAttachments.length === 0) ||
+                    uploading ||
                     !visible
                   }
                 >

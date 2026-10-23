@@ -127,13 +127,21 @@ export async function uploadConversationImage(
   agentId: string,
   convId: string,
   file: File,
+  onProgress?: (percent: number) => void,
 ): Promise<UploadedImage> {
   const form = new FormData();
   form.append("file", file);
   const res = await api.post<UploadedImage>(
     `${chatBase(agentId)}/${convId}/images`,
     form,
-    { headers: { "Content-Type": "multipart/form-data" } },
+    {
+      headers: { "Content-Type": "multipart/form-data" },
+      ...(onProgress && {
+        onUploadProgress: (e) => {
+          if (e.total) onProgress(Math.round((e.loaded * 100) / e.total));
+        },
+      }),
+    },
   );
   return res.data;
 }

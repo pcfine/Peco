@@ -63,6 +63,35 @@ describe("uploadPecoFile", () => {
     expect(doc.kind).toBe("document");
     expect(doc.url).toBeUndefined();
   });
+
+  it("传入进度回调时上报百分比（未知总长度不回调）", async () => {
+    POST.mockResolvedValue({
+      data: { id: "f1", kind: "document", name: "a.pdf", size: 3 },
+    });
+    const onProgress = vi.fn();
+
+    await uploadPecoFile(new File(["x"], "a.pdf"), onProgress);
+
+    const config = POST.mock.calls[0][2] as {
+      onUploadProgress: (e: { loaded: number; total?: number }) => void;
+    };
+    expect(config.onUploadProgress).toBeTypeOf("function");
+
+    config.onUploadProgress({ loaded: 25, total: 100 });
+    expect(onProgress).toHaveBeenLastCalledWith(25);
+
+    onProgress.mockClear();
+    config.onUploadProgress({ loaded: 25 });
+    expect(onProgress).not.toHaveBeenCalled();
+  });
+
+  it("未传进度回调时不挂 onUploadProgress", async () => {
+    POST.mockResolvedValue({
+      data: { id: "f1", kind: "document", name: "a.pdf", size: 3 },
+    });
+    await uploadPecoFile(new File(["x"], "a.pdf"));
+    expect(POST.mock.calls[0][2]).not.toHaveProperty("onUploadProgress");
+  });
 });
 
 describe("pecoStreamUrl", () => {

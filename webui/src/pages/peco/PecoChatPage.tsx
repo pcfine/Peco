@@ -209,8 +209,8 @@ export function PecoChatPage() {
         mode="external"
         streamUrl={pecoStreamUrl}
         supportsImages={supportsImages}
-        uploadImage={(file) => uploadPecoImage(file)}
-        uploadFile={uploadPecoFile}
+        uploadImage={(file, onProgress) => uploadPecoImage(file, onProgress)}
+        uploadFile={(file, onProgress) => uploadPecoFile(file, onProgress)}
         initialMessages={messages}
         onExternalSend={(text, attachments) => {
           sendMessage(text, token ?? "", attachments);

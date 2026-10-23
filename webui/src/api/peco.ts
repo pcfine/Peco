@@ -1,5 +1,6 @@
 // Peco 永续对话 API
 
+import type { AxiosProgressEvent } from "axios";
 import api from "./client";
 import type {
   SessionMetricsResponse,
@@ -53,16 +54,32 @@ export async function listPecoArtifacts(
   return resp.data;
 }
 
+/** 上传进度回调：0–100（拿不到请求体总长度时不回调）。 */
+export type UploadProgress = (percent: number) => void;
+
+/** multipart 上传配置；只有传入进度回调时才挂 onUploadProgress。 */
+function uploadConfig(onProgress?: UploadProgress) {
+  return {
+    headers: { "Content-Type": "multipart/form-data" },
+    ...(onProgress && {
+      onUploadProgress: (e: AxiosProgressEvent) => {
+        if (e.total) onProgress(Math.round((e.loaded * 100) / e.total));
+      },
+    }),
+  };
+}
+
 /** 上传一张随消息发送的图片，返回引用 id 与渲染 URL。 */
 export async function uploadPecoImage(
   file: File,
+  onProgress?: UploadProgress,
 ): Promise<{ id: string; url: string }> {
   const form = new FormData();
   form.append("file", file);
   const resp = await api.post<{ id: string; url: string }>(
     `${PATH}/images`,
     form,
-    { headers: { "Content-Type": "multipart/form-data" } },
+    uploadConfig(onProgress),
   );
   return resp.data;
 }
@@ -83,12 +100,17 @@ export interface PecoUploadedFile {
  *
  * 服务端按扩展名白名单分类；文档不返回 url，原始名只随 `name` 回传。
  */
-export async function uploadPecoFile(file: File): Promise<PecoUploadedFile> {
+export async function uploadPecoFile(
+  file: File,
+  onProgress?: UploadProgress,
+): Promise<PecoUploadedFile> {
   const form = new FormData();
   form.append("file", file);
-  const resp = await api.post<PecoUploadedFile>(`${PATH}/files`, form, {
-    headers: { "Content-Type": "multipart/form-data" },
-  });
+  const resp = await api.post<PecoUploadedFile>(
+    `${PATH}/files`,
+    form,
+    uploadConfig(onProgress),
+  );
   return resp.data;
 }
 

@@ -674,7 +674,8 @@ export function AgentChatPage() {
               supportsImages={agent?.supports_images ?? false}
               uploadImage={
                 agentId && convId
-                  ? (file) => uploadConversationImage(agentId, convId, file)
+                  ? (file, onProgress) =>
+                      uploadConversationImage(agentId, convId, file, onProgress)
                   : undefined
               }
               initialMessages={snapshots.get(convId) ?? EMPTY_MESSAGES}
