@@ -1,4 +1,4 @@
-// 用户消息图文气泡 + 图片点击放大 —— 尺寸档位、空正文、失败态、关闭路径与焦点归还
+// 用户消息图文气泡 + 图片点击放大 —— 同泡图文顺序、缩略图、空正文、失败态、关闭路径与焦点归还
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { act, useRef, useState } from "react";
@@ -87,13 +87,27 @@ async function openLightbox(index = 0) {
 }
 
 describe("图文气泡结构", () => {
-  it("I1 图片在组容器内，不在蓝底文字气泡里", async () => {
+  it("I1 图片与文字同泡，且排在正文后面", async () => {
     await renderUser(userMessage({ images: [A] }));
 
     const imgs = container.querySelectorAll('img[alt="用户图片"]');
     expect(imgs).toHaveLength(1);
-    expect(imgs[0].closest('[data-slot="user-text"]')).toBeNull();
-    expect(imgs[0].closest(".bg-primary")).toBeNull();
+    const textBlock = container.querySelector('[data-slot="user-text"]');
+    expect(textBlock).not.toBeNull();
+    expect(imgs[0].closest('[data-slot="user-text"]')).toBe(textBlock);
+
+    // 正文文本节点必须在图片槽位之前
+    const imageSlot = textBlock!.querySelector('[data-slot="user-images"]');
+    const textNode = Array.from(textBlock!.childNodes).find(
+      (node) =>
+        node.nodeType === Node.TEXT_NODE && node.textContent?.includes("看图"),
+    );
+    expect(imageSlot).not.toBeNull();
+    expect(textNode).toBeDefined();
+    expect(
+      textNode!.compareDocumentPosition(imageSlot!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("I9 空正文/空白正文不造空蓝药丸", async () => {
@@ -108,7 +122,7 @@ describe("图文气泡结构", () => {
     }
   });
 
-  it("I13 图、正文、文档附件三者并存且各归各位", async () => {
+  it("I13 图、正文、文档附件同泡且各归各位", async () => {
     await renderUser(
       userMessage({
         content: "看图",
@@ -121,9 +135,7 @@ describe("图文气泡结构", () => {
     expect(textBlocks).toHaveLength(1);
     expect(textBlocks[0].textContent).toContain("季度报告.pdf");
     expect(textBlocks[0].textContent).toContain("看图");
-    expect(
-      textBlocks[0].querySelector('img[alt="用户图片"]'),
-    ).toBeNull();
+    expect(textBlocks[0].querySelector('img[alt="用户图片"]')).not.toBeNull();
     expect(
       container.querySelector('[data-slot="user-images"]')?.textContent,
     ).toBe("");
@@ -146,25 +158,31 @@ describe("图文气泡结构", () => {
 });
 
 describe("图片块尺寸与失败态", () => {
-  it("I11 3+ 张分行切块、单元可收缩", async () => {
+  it("I11 每行最多 6 张，单元可收缩", async () => {
     await renderUser(userMessage({ images: [A, B, C, A] }));
     let rows = Array.from(
       container.querySelectorAll('[data-slot="user-image-row"]'),
     );
-    expect(rows).toHaveLength(2);
-    expect(Array.from(rows).map((r) => r.children.length)).toEqual([3, 1]);
+    expect(rows).toHaveLength(1);
+    expect(Array.from(rows).map((r) => r.children.length)).toEqual([4]);
 
     await renderUser(userMessage({ images: [A, B, C, A, B, C, A] }));
     rows = Array.from(
       container.querySelectorAll('[data-slot="user-image-row"]'),
     );
-    expect(rows).toHaveLength(3);
-    expect(Array.from(rows).map((r) => r.children.length)).toEqual([3, 3, 1]);
+    expect(rows).toHaveLength(2);
+    expect(Array.from(rows).map((r) => r.children.length)).toEqual([6, 1]);
 
-    // 定尺 + shrink-0 在窄列必溢出；flex-wrap 会让浏览器优先换行而不是收缩
+    await renderUser(userMessage({ images: Array(13).fill(A) }));
+    rows = Array.from(
+      container.querySelectorAll('[data-slot="user-image-row"]'),
+    );
+    expect(rows.map((r) => r.children.length)).toEqual([6, 6, 1]);
+
+    // 定尺 + shrink-0 会溢出；flex-wrap 会优先换行而不是收缩
     for (const trigger of triggers()) {
       const classes = trigger.className.split(" ");
-      expect(classes).toContain("w-[102px]");
+      expect(classes).toContain("w-24");
       expect(classes).toContain("min-w-0");
       expect(classes).toContain("shrink");
       expect(classes).toContain("aspect-square");
@@ -173,23 +191,18 @@ describe("图片块尺寸与失败态", () => {
     }
   });
 
-  it("I15 只有 2 张图的行带定宽 w-[320px]", async () => {
-    // jsdom 没有布局引擎，这条只是结构守卫：它证明的是「定宽只挂在 2 张图那一档」，
-    // 证明不了 400×400 的图真的渲染成 156×156 —— 几何判据要在真实浏览器里量。
-    for (const images of [[A], [A, B, C, A]]) {
+  it("I15 所有缩略图同尺（96px 上限、cover 裁切）", async () => {
+    // jsdom 无布局，仅守卫同尺与裁切类名；真实尺寸由浏览器验证
+    for (const images of [[A], [A, B], [A, B, C, A]]) {
       await renderUser(userMessage({ images }));
-      const rows = container.querySelectorAll('[data-slot="user-image-row"]');
-      expect(rows.length).toBeGreaterThan(0);
-      for (const row of rows) {
-        expect(row).not.toHaveClass("w-[320px]");
+      const all = triggers();
+      expect(all).toHaveLength(images.length);
+      for (const trigger of all) {
+        expect(trigger).toHaveClass("w-24", "aspect-square");
+        const img = trigger.querySelector("img");
+        expect(img).toHaveClass("object-cover", "h-full", "w-full");
       }
     }
-
-    await renderUser(userMessage({ images: [A, B] }));
-    const rows = container.querySelectorAll('[data-slot="user-image-row"]');
-    expect(rows).toHaveLength(1);
-    // max-w-full 一并守住：窄列靠它把定宽收缩回来，去掉就会溢出
-    expect(rows[0]).toHaveClass("w-[320px]", "max-w-full");
   });
 
   it("I9b 空串 src 直接进失败态，不给可点的触发按钮", async () => {
@@ -201,9 +214,8 @@ describe("图片块尺寸与失败态", () => {
     expect(placeholder).not.toBeNull();
     expect(triggers()).toHaveLength(0);
     expect(dialog()).toBeNull();
-    // 1 张图档的占位卡必须带确定宽度：父级行是 fit-content，百分比宽度在那上面会塌缩。
-    // jsdom 没有布局引擎，这条只防 `w-[320px]` 被删；320×120 的实测尺寸由浏览器给出。
-    expect(placeholder).toHaveClass("w-[320px]");
+    // 删掉 `w-24` 会退化成零宽，错误态看不见
+    expect(placeholder).toHaveClass("w-24", "aspect-square");
   });
 
   it("I10 加载失败占位不可聚焦、不可点", async () => {
@@ -279,9 +291,7 @@ describe("放大视图打开", () => {
     expect(triggers()[0].getAttribute("aria-label")).toBe("放大查看图片");
 
     await renderUser(userMessage({ images: [A, B, C] }));
-    expect(
-      triggers().map((t) => t.getAttribute("aria-label")),
-    ).toEqual([
+    expect(triggers().map((t) => t.getAttribute("aria-label"))).toEqual([
       "放大查看第 1 张图片，共 3 张",
       "放大查看第 2 张图片，共 3 张",
       "放大查看第 3 张图片，共 3 张",
@@ -348,7 +358,9 @@ describe("关闭路径与焦点归还", () => {
     if (!content) throw new Error("放大视图没打开");
     await act(async () => {
       for (const type of ["pointerdown", "pointerup", "click"]) {
-        content.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }));
+        content.dispatchEvent(
+          new MouseEvent(type, { bubbles: true, button: 0 }),
+        );
       }
     });
     await flush();
