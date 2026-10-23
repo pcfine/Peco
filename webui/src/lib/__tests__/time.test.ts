@@ -1,7 +1,7 @@
 // 气泡时间戳分档 — 纯函数用例，now 显式注入以免「昨天」随运行时刻漂移
 
 import { describe, expect, it } from "vitest";
-import { formatMessageTime } from "../time";
+import { formatDuration, formatMessageTime } from "../time";
 
 /** 本地构造：`Date.parse("...Z")` 在不同时区会落到不同的本地日历日。 */
 const at = (y: number, m: number, d: number, h = 10, min = 0) =>
@@ -58,6 +58,42 @@ describe("formatMessageTime 非法输入", () => {
     ["-Infinity", Number.NEGATIVE_INFINITY],
   ])("%s 返回 null", (_name, ms) => {
     expect(formatMessageTime(ms as number | null | undefined, NOW)).toBeNull();
+  });
+});
+
+describe("formatDuration 分档", () => {
+  it("不足 1 秒统一收敛为「不足 1 秒」", () => {
+    expect(formatDuration(0)).toBe("不足 1 秒");
+    expect(formatDuration(999)).toBe("不足 1 秒");
+  });
+
+  it("1 分钟内保留 1 位小数", () => {
+    expect(formatDuration(1000)).toBe("1.0 秒");
+    expect(formatDuration(12_340)).toBe("12.3 秒");
+    expect(formatDuration(59_940)).toBe("59.9 秒");
+  });
+
+  it("超过 1 分钟按分/秒分档，整分不带秒", () => {
+    expect(formatDuration(60_000)).toBe("1 分");
+    expect(formatDuration(83_000)).toBe("1 分 23 秒");
+    expect(formatDuration(3_599_000)).toBe("59 分 59 秒");
+  });
+
+  it("超过 1 小时按时/分分档", () => {
+    expect(formatDuration(3_600_000)).toBe("1 小时");
+    expect(formatDuration(3_840_000)).toBe("1 小时 4 分");
+  });
+});
+
+describe("formatDuration 非法输入", () => {
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["NaN", Number.NaN],
+    ["负数", -1],
+    ["Infinity", Number.POSITIVE_INFINITY],
+  ])("%s 返回 null", (_name, ms) => {
+    expect(formatDuration(ms as number | null | undefined)).toBeNull();
   });
 });
 

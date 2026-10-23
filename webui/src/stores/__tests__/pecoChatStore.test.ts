@@ -216,16 +216,14 @@ describe("pecoChatStore 常驻连接", () => {
   it("带图消息开新流并在 URL 携带 image_ids（不经 POST 控制通道）", async () => {
     global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
 
-    await usePecoChatStore
-      .getState()
-      .sendMessage("看这张图", "test-token", [
-        {
-          id: "a.png",
-          kind: "image",
-          name: "a.png",
-          url: "/uploads/chat/u/a.png",
-        },
-      ]);
+    await usePecoChatStore.getState().sendMessage("看这张图", "test-token", [
+      {
+        id: "a.png",
+        kind: "image",
+        name: "a.png",
+        url: "/uploads/chat/u/a.png",
+      },
+    ]);
 
     // 图片无法经控制通道投递 —— 不得走 POST 复用路径
     expect(queryPecoStream).not.toHaveBeenCalled();
@@ -252,16 +250,14 @@ describe("pecoChatStore 常驻连接", () => {
     expect(streamCalls()).toHaveLength(1);
 
     global.fetch = vi.fn(() => Promise.resolve(controllableStream().response));
-    await usePecoChatStore
-      .getState()
-      .sendMessage("看图", "test-token", [
-        {
-          id: "b.png",
-          kind: "image",
-          name: "b.png",
-          url: "/uploads/chat/u/b.png",
-        },
-      ]);
+    await usePecoChatStore.getState().sendMessage("看图", "test-token", [
+      {
+        id: "b.png",
+        kind: "image",
+        name: "b.png",
+        url: "/uploads/chat/u/b.png",
+      },
+    ]);
 
     expect(queryPecoStream).not.toHaveBeenCalled();
     expect(streamCalls()).toHaveLength(1);
@@ -433,6 +429,9 @@ describe("pecoChatStore abortStream()", () => {
     expect(cancelPecoStream).toHaveBeenCalledTimes(1);
     expect(usePecoChatStore.getState().isStreaming).toBe(false);
     expect(streamCalls()[0].init?.signal?.aborted).toBe(true);
+    // 连接断开后收不到服务端终态事件 → 本地给结论宿主补「取消」状态
+    const messages = usePecoChatStore.getState().messages;
+    expect(messages[messages.length - 1]?.turnResult?.status).toBe("cancelled");
   });
 });
 

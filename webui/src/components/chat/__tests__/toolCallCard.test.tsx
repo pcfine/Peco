@@ -825,9 +825,10 @@ describe("v7.1 结果优先", () => {
     expect(result.classList.contains("pt-3")).toBe(false);
     expect(result.getAttribute("data-has-process")).toBe("true");
 
-    expect(result.classList.contains("w-fit")).toBe(true);
-    expect(result.classList.contains("w-full")).toBe(false);
-    expect(result.classList.contains("max-w-[80%]")).toBe(true);
+    // 结论气泡与聊天区同宽：不再按内容收缩，也不留 80% 上限
+    expect(result.classList.contains("w-fit")).toBe(false);
+    expect(result.classList.contains("w-full")).toBe(true);
+    expect(result.classList.contains("max-w-[80%]")).toBe(false);
     expect(result.classList.contains("rounded-2xl")).toBe(true);
     expect(result.classList.contains("rounded-bl-md")).toBe(true);
     expect(result.classList.contains("px-4")).toBe(true);

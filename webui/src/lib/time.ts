@@ -17,6 +17,30 @@ function localDayOffset(from: Date, to: Date): number {
  * `new Date(undefined).toISOString()` 会抛 RangeError，气泡会白屏。
  * `now` 显式传入，单测才能确定性地断言「昨天」而不受运行时刻影响。
  */
+/**
+ * 轮次耗时展示：不足 1 秒记「不足 1 秒」，1 分钟内保留 1 位小数，
+ * 更长按分/秒或时/分分档。
+ *
+ * 非法值（缺失 / NaN / 负数 / Infinity）返回 `null`，由调用方整段省略。
+ */
+export function formatDuration(ms: number | undefined | null): string | null {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return null;
+  if (ms < 1000) return "不足 1 秒";
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} 秒`;
+
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) {
+    return seconds === 0 ? `${minutes} 分` : `${minutes} 分 ${seconds} 秒`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  return restMinutes === 0
+    ? `${hours} 小时`
+    : `${hours} 小时 ${restMinutes} 分`;
+}
+
 export function formatMessageTime(
   ms: number | undefined | null,
   now: number = Date.now(),

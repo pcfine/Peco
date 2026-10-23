@@ -48,7 +48,7 @@ import { UserBubble } from "@/components/chat/UserBubble";
 import { BrandMark } from "@/components/common/BrandMark";
 import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
 import { settlePendingToolCalls, type ToolCallView } from "@/lib/toolCall";
-import { formatMessageTime } from "@/lib/time";
+import { formatDuration, formatMessageTime } from "@/lib/time";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -108,6 +108,16 @@ export interface ChatAttachment {
   url?: string;
 }
 
+/** 一轮的终态：正常完成 / 失败 / 用户取消。 */
+export type TurnStatus = "success" | "failed" | "cancelled";
+
+/** 最终结论的终态与总耗时。 */
+export interface TurnResult {
+  status: TurnStatus;
+  /** 本轮墙钟耗时（毫秒）；缺起点时间戳时缺省。 */
+  durationMs?: number;
+}
+
 export interface ChatMessage {
   role: "user" | "assistant" | "agent-call";
   content: string;
@@ -127,6 +137,8 @@ export interface ChatMessage {
   images?: string[];
   /** 用户消息携带的文档附件名（附件正文不进展示层），来自快照 DTO attachments */
   attachments?: { name: string }[];
+  /** 本轮终态与耗时（仅结论消息携带）。 */
+  turnResult?: TurnResult;
   /** 错误提示消息（来自 SSE `error` 事件），以警示样式渲染 */
   isError?: boolean;
   /** 系统通知消息（如 SSE `context_compacted`），以居中分隔样式渲染 */
@@ -578,6 +590,8 @@ export function ChatView({
       onExternalStopRef.current();
     } else {
       abortRef.current?.abort();
+      // 连接已断，收不到服务端终态事件
+      setMessages((prev) => markTurnResult(prev, "cancelled"));
       setStreaming(false);
     }
   };
@@ -1009,6 +1023,37 @@ function ReasoningFold({ reasoning }: { reasoning: string }) {
   );
 }
 
+const TURN_STATUS_META: Record<
+  TurnStatus,
+  { label: string; dotClass: string }
+> = {
+  success: { label: "成功", dotClass: "bg-emerald-500" },
+  failed: { label: "失败", dotClass: "bg-destructive" },
+  cancelled: { label: "取消", dotClass: "bg-amber-500" },
+};
+
+/** 结论气泡上方的状态行：圆点 + 状态 + 耗时。 */
+function TurnStatusRow({ result }: { result: TurnResult }) {
+  const meta = TURN_STATUS_META[result.status];
+  const duration = formatDuration(result.durationMs);
+  return (
+    <div
+      data-slot="turn-status"
+      data-status={result.status}
+      className="flex items-center gap-1.5 px-1 text-xs text-muted-foreground"
+    >
+      <span
+        className={`size-1.5 shrink-0 rounded-full ${meta.dotClass}`}
+        aria-hidden="true"
+      />
+      <span>{meta.label}</span>
+      {duration && (
+        <span className="text-muted-foreground/80">· 耗时 {duration}</span>
+      )}
+    </div>
+  );
+}
+
 function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.isNotice) {
     return (
@@ -1057,11 +1102,14 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.isError) {
     return (
       <div className="flex gap-2 items-start">
-        <div
-          data-slot="assistant-bubble"
-          className="bg-destructive/10 border border-destructive/30 text-destructive rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
-        >
-          <MarkdownRenderer content={message.content} />
+        <div className="flex w-full min-w-0 flex-col gap-2">
+          {message.turnResult && <TurnStatusRow result={message.turnResult} />}
+          <div
+            data-slot="assistant-bubble"
+            className="bg-destructive/10 border border-destructive/30 text-destructive rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
+          >
+            <MarkdownRenderer content={message.content} />
+          </div>
         </div>
       </div>
     );
@@ -1110,11 +1158,15 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             )}
           </div>
         )}
+        {/* 状态行在结论气泡之上：圆点标终态，旁边是本轮总耗时 */}
+        {hasResult && message.turnResult && (
+          <TurnStatusRow result={message.turnResult} />
+        )}
         {hasResult && (
           <div
             data-slot="assistant-result"
             data-has-process={hasProcess ? "true" : undefined}
-            className="group relative w-fit max-w-[80%] rounded-2xl rounded-bl-md bg-bubble border border-border px-4 py-2 text-sm"
+            className="group relative w-full rounded-2xl rounded-bl-md bg-bubble border border-border px-4 py-2 text-sm"
           >
             <MarkdownRenderer content={message.content} />
             {resultTime && (
@@ -1147,6 +1199,47 @@ function lastUserIndex(messages: ChatMessage[]): number {
   return -1;
 }
 
+/** 本轮起点：最后一条 user 消息的时间戳。 */
+function turnStartMs(messages: ChatMessage[]): number | undefined {
+  const i = lastUserIndex(messages);
+  return i >= 0 ? messages[i].timestampMs : undefined;
+}
+
+/** 服务端以失败原因下发取消时的文案。 */
+function isCancellationText(message: string): boolean {
+  return /^(对话已被取消|cancelled by user)/i.test(message);
+}
+
+/** 冻结原因含 cancel 即为用户取消。 */
+function isCancellationReason(reason: string | undefined): boolean {
+  return reason !== undefined && /cancel/i.test(reason);
+}
+
+/** 以本轮起点计算终态对象。 */
+function turnResultAt(
+  messages: ChatMessage[],
+  status: TurnStatus,
+  now: number,
+): TurnResult {
+  const start = turnStartMs(messages);
+  return {
+    status,
+    durationMs: start !== undefined && now >= start ? now - start : undefined,
+  };
+}
+
+/** 给本轮最后一条 assistant 宿主挂上终态。 */
+export function markTurnResult(
+  messages: ChatMessage[],
+  status: TurnStatus,
+  now: number = Date.now(),
+): ChatMessage[] {
+  const host = lastHostIndex(messages);
+  if (host < 0) return messages;
+  const turnResult = turnResultAt(messages, status, now);
+  return messages.map((m, i) => (i === host ? { ...m, turnResult } : m));
+}
+
 /**
  * 向前找最近的、可作为正文/工具宿主的消息：role 为 assistant 且不是
  * notice/error。没有则 -1。
@@ -1162,10 +1255,14 @@ function lastHostIndex(messages: ChatMessage[]): number {
   return -1;
 }
 
-/** Apply a single SSE event to a messages array (pure — no side effects). */
+/**
+ * Apply a single SSE event to a messages array (pure — no side effects).
+ * `now` 仅在终态事件上用于计算本轮耗时。
+ */
 export function reduceStreamEvent(
   event: ChatSseEvent,
   messages: ChatMessage[],
+  now: number = Date.now(),
 ): ChatMessage[] {
   switch (event.event) {
     case "text_delta": {
@@ -1266,6 +1363,7 @@ export function reduceStreamEvent(
           : m,
       );
     case "turn_complete":
+      return markTurnResult(settlePendingToolCalls(messages), "success", now);
     case "done":
       return settlePendingToolCalls(messages);
     case "usage":
@@ -1310,7 +1408,7 @@ export function reduceStreamEvent(
       ];
     }
     case "error":
-      // 后端失败轮次（模型错误、超时、取消等）以警示气泡展示错误信息
+      // 失败轮以警示气泡展示；取消文案还原为「取消」态
       return settlePendingToolCalls([
         ...messages,
         {
@@ -1318,6 +1416,11 @@ export function reduceStreamEvent(
           content: event.data.message,
           turnIndex: 0,
           isError: true,
+          turnResult: turnResultAt(
+            messages,
+            isCancellationText(event.data.message) ? "cancelled" : "failed",
+            now,
+          ),
         },
       ]);
   }
@@ -1464,9 +1567,47 @@ export function messagesFromTurn(turn: TurnData): ChatMessage[] {
   ];
 }
 
+/** 快照轮终态：未冻结为成功，cancel 为取消，其余失败。 */
+function turnStatusOf(turn: TurnData): TurnStatus {
+  if (!turn.interrupted) return "success";
+  return isCancellationReason(turn.interrupted_reason) ? "cancelled" : "failed";
+}
+
+/** 快照轮耗时：本轮首末消息时间戳之差。 */
+function snapshotTurnDuration(turn: TurnData): number | undefined {
+  const times = turn.messages
+    .map((m) => m.timestamp_ms)
+    .filter((t) => Number.isFinite(t) && t > 0);
+  if (times.length < 2) return undefined;
+  const start = times[0];
+  const end = Math.max(...times);
+  return end > start ? end - start : undefined;
+}
+
+/** 给本轮最后一条带正文的 assistant 消息挂上终态。 */
+function attachTurnResult(
+  messages: ChatMessage[],
+  status: TurnStatus,
+  durationMs: number | undefined,
+): ChatMessage[] {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role !== "assistant" || m.isNotice || m.isError) continue;
+    if (m.content.trim() === "") continue;
+    return messages.map((x, j) =>
+      j === i ? { ...x, turnResult: { status, durationMs } } : x,
+    );
+  }
+  return messages;
+}
+
 export function snapshotToMessages(turns: TurnData[]): ChatMessage[] {
   return turns.flatMap((turn) => {
-    const restored = messagesFromTurn(turn);
+    const restored = attachTurnResult(
+      messagesFromTurn(turn),
+      turnStatusOf(turn),
+      snapshotTurnDuration(turn),
+    );
 
     // 中断轮（取消/超时/失败后冻结入史）在两轮之间补一条居中横幅，
     // 在该轮消息之前 —— 与 compaction 归档分隔条同一渲染路径。

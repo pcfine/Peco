@@ -16,6 +16,7 @@ import {
   snapshotToMessages,
   reduceStreamEvent,
   isStreamTerminalEvent,
+  markTurnResult,
 } from "@/components/chat/ChatView";
 import type { ChatAttachment, ChatMessage } from "@/components/chat/ChatView";
 import type {
@@ -580,7 +581,12 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     // 若在此期间用户已开始下一轮，它会把新一轮的门控关掉。事件不带
     // 轮次标识，无法区分归属，断连是唯一干净的取舍（与取消前语义一致）。
     closeStream();
-    set({ isStreaming: false, paused: false });
+    // 连接已断，补本地「取消」终态
+    set((s) => ({
+      messages: markTurnResult(s.messages, "cancelled"),
+      isStreaming: false,
+      paused: false,
+    }));
   },
 
   // ── pause / resume ───────────────────────────────────────────────────
