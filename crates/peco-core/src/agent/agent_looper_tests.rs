@@ -1306,6 +1306,93 @@ async fn test_batch_server_tool_emits_events() {
     );
 }
 
+// ── 统一响应解析（ResolvingResponse）tests ────────────────────────────
+
+/// 流式收尾必须经过 `ResolvingResponse` 再进入 `Done`。
+#[tokio::test]
+async fn test_stream_resolves_through_resolving_response() {
+    let (h, _provider) = spawn_scripted_looper(vec![completed("ok")], LooperConfig::default());
+
+    h.send_query("hi".into()).await.expect("looper alive");
+
+    let mut transitions = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match h.recv_event().await {
+                Some(LooperEvent::StateChange { from, to, .. }) => {
+                    transitions.push((from, to));
+                    if to == LooperState::Idle {
+                        break;
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("event channel closed before Idle"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for Idle");
+
+    assert!(
+        !transitions.contains(&(LooperState::Streaming, LooperState::Done)),
+        "流式收尾不得直连 Done，实际迁移 {transitions:?}"
+    );
+    let idx = transitions
+        .iter()
+        .position(|(from, to)| {
+            *from == LooperState::Streaming && *to == LooperState::ResolvingResponse
+        })
+        .expect("流式收尾必须进入 ResolvingResponse");
+    assert_eq!(
+        transitions.get(idx + 1),
+        Some(&(LooperState::ResolvingResponse, LooperState::Done)),
+        "ResolvingResponse 必须决定下一步（无 tool_calls → Done）"
+    );
+
+    h.shutdown().await.expect("clean shutdown");
+}
+
+/// `on_after_response` 对流式响应同样触发，且每条模型调用只触发一次。
+#[derive(Default)]
+struct ResponseProbe {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LooperHook for ResponseProbe {
+    async fn on_after_response(
+        &self,
+        _turn_index: usize,
+        _response: &GenerateResult,
+    ) -> HookAction {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        HookAction::Continue
+    }
+}
+
+#[tokio::test]
+async fn test_stream_invokes_after_response_hook() {
+    let probe = Arc::new(ResponseProbe::default());
+    let config = LooperConfig {
+        hooks: vec![probe.clone() as Arc<dyn LooperHook>],
+        ..LooperConfig::default()
+    };
+    let (h, _provider) = spawn_scripted_looper(vec![completed("ok")], config);
+
+    h.send_query("hi".into()).await.expect("looper alive");
+    match recv_until_turn_complete(&h).await {
+        TurnOutcome::Success { text } => assert_eq!(text, "ok"),
+        other => panic!("应成功完成，实际 {other:?}"),
+    }
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        1,
+        "流式响应必须经过 on_after_response，且每条模型调用只触发一次"
+    );
+
+    h.shutdown().await.expect("clean shutdown");
+}
+
 // ── 暂停/恢复（UserMsg 带内控制）tests ────────────────────────────────
 
 /// spawn 一个脚本化 provider 的 looper 及其句柄 —— 暂停/恢复走

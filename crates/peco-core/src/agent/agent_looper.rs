@@ -4,10 +4,10 @@
 //
 // 架构：唯一权威枚举 `LooperState` 平铺全部位置（停靠 / 运行 / 暂停）：
 //
-//   Idle ──③起轮──→ PreparingRequest ──→ [batch] ResolvingResponse
-//                                       ──→ [stream] Streaming
-//   二者收敛 ──→ ExecutingTools ──→ 回 PreparingRequest
-//              └→ Done ──→ Idle     └→ Failed ──②→ Idle
+//   Idle ──③起轮──→ PreparingRequest ──→ [batch]  ResolvingResponse
+//                                       └→ [stream] Streaming ─收尾→ ResolvingResponse
+//   ResolvingResponse ──→ ExecutingTools ──→ 回 PreparingRequest
+//                     └→ Done ──→ Idle     └→ Failed ──②→ Idle
 //
 //   暂停只在两个边界落地（挂起意图经 `pause_pending` 传递）：
 //   PreparingRequest 入口 → PausedBeforeRequest（Resume → PreparingRequest）
@@ -79,9 +79,10 @@ pub enum LooperState {
     // ── 运行位置 ──
     /// 构建 GenerateRequest，决定走 batch 还是 streaming 分支。
     PreparingRequest,
-    /// 收到完整 batch GenerateResult，分析结果。
+    /// 收到完整响应（batch 或 stream），统一解析并决定下一步。
     ResolvingResponse,
-    /// 消费 GenerateStream，逐 chunk 处理。
+    /// 消费 GenerateStream，逐 chunk 处理；结束后迁移到
+    /// [`Self::ResolvingResponse`]。
     Streaming,
     /// 执行收集到的 tool calls（spawn + poll 两阶段）。
     ExecutingTools,
@@ -118,11 +119,27 @@ impl LooperState {
 // 运行时数据容器
 // ============================================================================
 
+/// 一次模型调用的收敛结果，batch 与 stream 共用。
+#[derive(Debug, Clone)]
+struct ResolvedResponse {
+    result: GenerateResult,
+    origin: ResponseOrigin,
+}
+
+/// 响应来自 batch 还是 stream。
+///
+/// 两处行为据此区分：usage 记账时机、流被掐断时的瞬时重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseOrigin {
+    Batch,
+    Stream,
+}
+
 /// 内层循环需要的临时数据
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReActContext {
-    /// batch 模式的完整响应
-    batch_response: Option<GenerateResult>,
+    /// 模型调用的收敛结果，待 [`LooperState::ResolvingResponse`] 解析
+    resolved: Option<ResolvedResponse>,
     /// 待执行的 tool calls，每个携带自身执行状态
     pending_tool_calls: Vec<PendingToolCall>,
     /// 当前轮 assistant 文本内容
@@ -1082,10 +1099,6 @@ pub struct AgentLooper {
     active_stream: Option<GenerateStream>,
     /// streaming 模式：中立块组装器（跨 chunk 持久）
     stream_assembler: BlockAssembler,
-    /// streaming 模式：本次请求收到的 [`StreamChunk::Finish`] 原因。
-    /// `BlockAssembler` 只保留收敛后的 status，归因（是截断还是上游异常）要靠原始原因，
-    /// 故单独留存供失败日志使用；`None` = 流结束但从未收到 `Finish`。
-    last_finish_reason: Option<FinishReason>,
     /// 活跃的 tool 执行任务集（增量执行模式：Spawn → Poll → 完成）
     active_tool_tasks: Option<tokio::task::JoinSet<(usize, ToolCallResult)>>,
     /// 最近一次请求的估算上下文 token（响应到达后与实际 usage 对照）。
@@ -1164,7 +1177,6 @@ impl AgentLooper {
             persister,
             active_stream: None,
             stream_assembler: BlockAssembler::new(),
-            last_finish_reason: None,
             active_tool_tasks: None,
             last_request_estimated_tokens: None,
             retries_used: 0,
@@ -1760,6 +1772,8 @@ impl AgentLooper {
             // `active_stream` 握着活的 HTTP 连接 —— 取消不再 drop looper，不显式
             // 丢就是跨轮连接泄漏。
             LooperState::Streaming => self.active_stream = None,
+            // 丢弃已收敛但尚未解析的响应。
+            LooperState::ResolvingResponse => self.react_ctx.resolved = None,
             LooperState::ExecutingTools => self.abort_inflight_tools(),
             // 两个暂停态：落地时未 spawn / 请求未发出，无在途任务，无需回收
             // （这是落地点 B 只在 spawn 前生效的直接红利：暂停态永远不握活
@@ -2005,9 +2019,9 @@ impl AgentLooper {
     /// - **落地点 A**（`PreparingRequest`）：覆盖首开发前、瞬时重发前
     ///   （`begin_retry` 把状态放回 `PreparingRequest`）、工具批完成后下一次
     ///   请求前（`finish_tool_execution` 置 `PreparingRequest`）三条到达路径；
-    /// - **落地点 B**（`ExecutingTools` 的 spawn 阶段前）：覆盖流收敛 / batch
-    ///   resolve 带 tool_calls 的两条到达路径。poll 阶段（`active_tool_tasks`
-    ///   为 Some）不打断在途批。
+    /// - **落地点 B**（`ExecutingTools` 的 spawn 阶段前）：覆盖
+    ///   `ResolvingResponse` 解析出 tool_calls 后的到达。poll 阶段
+    ///   （`active_tool_tasks` 为 Some）不打断在途批。
     ///
     /// 落地后 `set` 返回，本轮步进结束回 ①；`has_pending_work` 对两个暂停态
     /// 均为 `false`（阻塞等 `recv()`），无热自旋。
@@ -2027,9 +2041,9 @@ impl AgentLooper {
                 }
             }
 
-            // ── batch 分支 ──
+            // ── batch / stream 共用：响应解析 ──
             LooperState::ResolvingResponse => {
-                self.consume_batch_response(turn_index).await;
+                self.resolve_response(turn_index).await;
             }
 
             // ── streaming 分支 ──
@@ -2306,13 +2320,8 @@ impl AgentLooper {
     /// `Done` 时会撞上 `Done` 分支的 `debug_assert!(failure_reason.is_none())`。
     ///
     /// # 锚点由调用方在收敛点就地取
-    /// `checkpoint` 是**本次模型请求发出前** staging 的条数，由
-    /// [`Self::finish_stream`] / [`Self::consume_batch_response`] /
-    /// 各 Err 站点在 [`Self::stage_output_blocks`] 之前就地读取。它不存成
-    /// 字段：从 `PreparingRequest` 到收敛点之间没有任何 staging 写入
-    /// （chunk 处理只发事件、写 `react_ctx`、记账 usage），因此收敛点的
-    /// 长度必然等于发请求前的长度 —— 存字段反而多一条「必须在每条路径上
-    /// 写对」的人工不变量。
+    /// `checkpoint` 是本次模型请求发出前 staging 的条数，由调用方在
+    /// [`Self::stage_output_blocks`] 之前就地读取。
     ///
     /// # 不刷新在途检查点
     /// 锚点即 `Session::staging_checkpoint()`，与 [`stage_tool_results`]
@@ -2458,7 +2467,7 @@ impl AgentLooper {
         let discarded_reasoning = std::mem::take(&mut self.react_ctx.assistant_reasoning);
         let had_output = !discarded_text.is_empty() || !discarded_reasoning.is_empty();
         self.react_ctx.pending_tool_calls.clear();
-        self.react_ctx.batch_response = None;
+        self.react_ctx.resolved = None;
 
         Some((dropped, discarded_text, had_output))
     }
@@ -2619,7 +2628,6 @@ impl AgentLooper {
                 Ok(stream) => {
                     self.active_stream = Some(stream);
                     self.stream_assembler = BlockAssembler::new();
-                    self.last_finish_reason = None;
                     self.set(LooperState::Streaming);
                 }
                 Err(e) => {
@@ -2657,7 +2665,10 @@ impl AgentLooper {
                 .await
             {
                 Ok(response) => {
-                    self.react_ctx.batch_response = Some(response);
+                    self.react_ctx.resolved = Some(ResolvedResponse {
+                        result: response,
+                        origin: ResponseOrigin::Batch,
+                    });
                     self.set(LooperState::ResolvingResponse);
                 }
                 Err(e) => {
@@ -2681,19 +2692,18 @@ impl AgentLooper {
         }
     }
 
-    // ── Batch 分支：ResolvingResponse ─────────────────────────────────────
+    // ── 共享：ResolvingResponse ───────────────────────────────────────────
 
-    /// 解析 batch 响应：提取内容、更新 usage、写入 staging、判断下一步。
-    async fn consume_batch_response(&mut self, turn_index: usize) {
-        // ★ 截断重试的回退锚点。必须在 `stage_output_blocks` **之前**取 ——
-        //   之后 staging 就带上本次调用的产出了。此刻的值恒等于发请求前的长度：
-        //   从 `PreparingRequest` 到这里没有任何 staging 写入。
+    /// 解析已收敛的模型响应，决定下一步。batch 与 stream 共用。
+    async fn resolve_response(&mut self, turn_index: usize) {
+        // ★ 回退锚点。必须在 `stage_output_blocks` 之前取 —— 此时 staging
+        //   尚未写入本次调用的产出。
         let checkpoint = self.session.staging_checkpoint();
 
-        let response = match self.react_ctx.batch_response.take() {
+        let ResolvedResponse { result, origin } = match self.react_ctx.resolved.take() {
             Some(r) => r,
             None => {
-                error!("No batch_response in ResolvingResponse state");
+                error!("No resolved response in ResolvingResponse state");
                 self.set(LooperState::Failed);
                 return;
             }
@@ -2701,70 +2711,69 @@ impl AgentLooper {
 
         // ★ Hook: on_after_response
         if let HookAction::Abort(reason) =
-            Self::invoke_on_after_response(&self.config.hooks, turn_index, &response).await
+            Self::invoke_on_after_response(&self.config.hooks, turn_index, &result).await
         {
             self.failure_reason = Some(TurnFailureReason::HookAbort(reason));
             self.set(LooperState::Failed);
             return;
         }
 
-        // 聚合 usage
-        self.session.add_usage(response.usage.clone());
-        self.log_estimate_calibration(turn_index, response.usage.input_tokens);
-
-        // 广播 usage 事件
-        self.emit_event(LooperEvent::ModelUsage {
-            call_index: self.react_loop_iteration,
-            usage: response.usage.clone(),
-        });
+        // 聚合 usage。流式 usage 已在 chunk 阶段记账，这里只处理 batch。
+        if origin == ResponseOrigin::Batch {
+            self.session.add_usage(result.usage.clone());
+            self.log_estimate_calibration(turn_index, result.usage.input_tokens);
+            self.emit_event(LooperEvent::ModelUsage {
+                call_index: self.react_loop_iteration,
+                usage: result.usage.clone(),
+            });
+        }
 
         // 写入 assistant 内容到 session staging（分块回填 InputItem，
         // 同时更新 assistant_text / assistant_reasoning）。
-        self.stage_output_blocks(&response.output);
+        self.stage_output_blocks(&result.output);
 
-        // 服务端工具块只通知前端展示（与流式路径一致），不进 pending_tool_calls
-        for block in &response.output {
-            match block {
-                ContentBlock::ServerToolUse {
-                    call_id,
-                    name,
-                    input,
-                } => {
-                    self.emit_event(LooperEvent::ServerToolUse {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    });
+        // 服务端工具块只通知前端展示，不进 pending_tool_calls。
+        // 流式在 `BlockEnd` 分支即时发出，batch 在此发出。
+        if origin == ResponseOrigin::Batch {
+            for block in &result.output {
+                match block {
+                    ContentBlock::ServerToolUse {
+                        call_id,
+                        name,
+                        input,
+                    } => {
+                        self.emit_event(LooperEvent::ServerToolUse {
+                            id: call_id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                    }
+                    ContentBlock::ServerToolResult {
+                        call_id,
+                        name,
+                        content,
+                    } => {
+                        self.emit_event(LooperEvent::ServerToolResult {
+                            id: call_id.clone(),
+                            name: name.clone(),
+                            content: content.clone(),
+                        });
+                    }
+                    _ => {}
                 }
-                ContentBlock::ServerToolResult {
-                    call_id,
-                    name,
-                    content,
-                } => {
-                    self.emit_event(LooperEvent::ServerToolResult {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        content: content.clone(),
-                    });
-                }
-                _ => {}
             }
         }
 
         // 状态收敛：Failed 与 Incomplete 都视为异常终止（partial_text 已回填）
-        if response.status != ResponseStatus::Completed {
-            // ★ 截断重试，判据与流式路径完全一致：`Incomplete` 且
-            //   `FinishReason::MaxTokens`。`GenerateResult::finish_reason` 由适配器
-            //   从上游原样映射（chat 的 `length` / responses 的
-            //   `incomplete_details.reason`），因此这里能区分「抬预算能救」与
-            //   「救了也没用」（`content_filter` 等），不会为后者白烧一次调用。
-            //   上游未提供该信息时为 `None` —— 不臆测，不重试。
-            if response.status == ResponseStatus::Incomplete
-                && matches!(response.finish_reason, Some(FinishReason::MaxTokens))
+        if result.status != ResponseStatus::Completed {
+            // ★ 截断重试：`Incomplete` 且 `finish_reason = MaxTokens`。
+            //   `finish_reason` 缺失时为 `None`，不重试。
+            if result.status == ResponseStatus::Incomplete
+                && matches!(result.finish_reason, Some(FinishReason::MaxTokens))
                 && self
                     .begin_retry(
                         RetryCause::Truncated {
-                            output_tokens: response.usage.output_tokens,
+                            output_tokens: result.usage.output_tokens,
                         },
                         turn_index,
                         checkpoint,
@@ -2774,27 +2783,62 @@ impl AgentLooper {
                 return;
             }
 
-            let msg = response
+            // ★ 流被掐断（`Incomplete` 且无 `finish_reason`）：按瞬时故障
+            //   退避重发。仅流式适用。
+            if origin == ResponseOrigin::Stream
+                && result.status == ResponseStatus::Incomplete
+                && result.finish_reason.is_none()
+                && self
+                    .begin_retry(
+                        RetryCause::Transient {
+                            trigger: "stream_cut",
+                        },
+                        turn_index,
+                        checkpoint,
+                    )
+                    .await
+            {
+                return;
+            }
+
+            let msg = result
                 .error
                 .map(|e| e.message)
-                .unwrap_or_else(|| match response.status {
+                .unwrap_or_else(|| match result.status {
                     ResponseStatus::Incomplete => {
                         "model response was truncated (incomplete)".to_string()
                     }
                     _ => "model response failed".to_string(),
                 });
+            // finish_reason 区分截断、内容过滤与上游异常；output_tokens 用来
+            // 判断截断是否顶到了输出上限；block_kinds 说明收到了哪些块。
             error!(
                 turn_index,
-                status = ?response.status,
-                finish_reason = response.finish_reason.map_or("-", |r| r.as_str()),
+                origin = ?origin,
+                status = ?result.status,
+                finish_reason = result.finish_reason.map_or("-", |r| r.as_str()),
                 message = %msg,
-                "Batch model response ended with non-completed status"
+                blocks = result.output.len(),
+                block_kinds = ?block_kinds_of(&result.output),
+                text_len = self.react_ctx.assistant_text.len(),
+                reasoning_len = self.react_ctx.assistant_reasoning.len(),
+                input_tokens = result.usage.input_tokens,
+                output_tokens = result.usage.output_tokens,
+                "Model response ended with non-completed status"
             );
-            // 内容过滤单独归类 — 与「网络故障」在用户面前必须是两句话，
-            // 且它明确不可重试（抬预算/退避都救不了）。
+            // 内容过滤单独归类，且不可重试。
             self.failure_reason = Some(
-                if matches!(response.finish_reason, Some(FinishReason::ContentFilter)) {
+                if matches!(result.finish_reason, Some(FinishReason::ContentFilter)) {
                     TurnFailureReason::ContentFiltered { message: msg }
+                } else if origin == ResponseOrigin::Stream
+                    && result.status == ResponseStatus::Incomplete
+                    && result.finish_reason.is_none()
+                {
+                    // 流被掐断的终局归因
+                    TurnFailureReason::ModelUnavailable {
+                        attempts: self.total_attempts(),
+                        message: msg,
+                    }
                 } else {
                     TurnFailureReason::Other(msg)
                 },
@@ -2804,7 +2848,7 @@ impl AgentLooper {
         }
 
         // 提取 tool calls（转 ToolCall）用于决定下一步
-        let tool_calls: Vec<ToolCall> = response
+        let tool_calls: Vec<ToolCall> = result
             .output
             .iter()
             .filter_map(|block| match block {
@@ -2955,10 +2999,8 @@ impl AgentLooper {
                         self.session.add_usage(usage);
                     }
 
-                    StreamChunk::Finish { reason } => {
-                        self.last_finish_reason = Some(reason);
-                        self.finish_stream().await;
-                    }
+                    // Finish 已由 assembler 记录，这里只做收尾组包。
+                    StreamChunk::Finish { .. } => self.complete_stream(),
                 }
             }
 
@@ -2986,145 +3028,31 @@ impl AgentLooper {
                     turn_index,
                     "Model stream ended without a Finish chunk; converging on assembler state"
                 );
-                self.finish_stream().await;
+                self.complete_stream();
             }
         }
     }
 
-    /// 流结束（收到 `Finish` 或流自然关闭）后的收尾。
-    ///
-    /// 从 [`BlockAssembler`] 收敛有序块，回填 `InputItem` 到 session staging，
-    /// 并决定 `Done` / `ExecutingTools` / `Failed`。
-    async fn finish_stream(&mut self) {
-        // ★ 截断重试的回退锚点。必须在 `stage_output_blocks` **之前**取 ——
-        //   之后 staging 就带上本次调用的产出了。流式 chunk 处理只发事件、
-        //   写 `react_ctx`、记账 usage，不碰 staging，故此处恒等于发请求前的长度。
-        let checkpoint = self.session.staging_checkpoint();
-
+    /// 流结束（收到 `Finish` 或流自然关闭）后，把收敛结果装入
+    /// [`ResolvedResponse`] 并迁移到 [`LooperState::ResolvingResponse`]。
+    fn complete_stream(&mut self) {
         self.active_stream = None;
-        let assembler = std::mem::take(&mut self.stream_assembler);
-        let (blocks, usage, status, error) = assembler.finish();
-        let finish_reason = self.last_finish_reason.take();
+        let (blocks, usage, status, finish_reason, error) =
+            std::mem::take(&mut self.stream_assembler).finish_with_reason();
 
-        // 回填 InputItem 到 session staging，并更新 assistant_text / assistant_reasoning
-        // （失败分支也先回填，使 Failed 结果携带 partial_text）。
-        self.stage_output_blocks(&blocks);
-
-        // 状态收敛：Failed（Aborted / Error / ContentFilter）与 Incomplete
-        //（截断 / 流被掐断）都视为异常终止
-        if status != ResponseStatus::Completed {
-            // ★ 截断重试。只认 `MaxTokens`：截断是「输出预算不够」，抬预算重发一次
-            //   比把整轮判死（冻结 staging + turn_index += 1）划算。
-            //   `Aborted` / `Error` / `ContentFilter` 抬预算救不回来，
-            //   重试只会白烧调用。
-            if status == ResponseStatus::Incomplete
-                && matches!(finish_reason, Some(FinishReason::MaxTokens))
-                && self
-                    .begin_retry(
-                        RetryCause::Truncated {
-                            output_tokens: usage.output_tokens,
-                        },
-                        self.session.turn_index(),
-                        checkpoint,
-                    )
-                    .await
-            {
-                return;
-            }
-
-            // ★ 流被掐断（无 Finish 收尾 + 未闭合块 → Incomplete + finish_reason
-            //   为 None）：传输层放弃后上抛的「上游中途消失」，是瞬时故障，
-            //   回退后退避重发比判死划算。`stage_output_blocks` 已写入 staging，
-            //   `checkpoint` 在它之前取好 —— 与截断重试同一锚点语义。
-            if status == ResponseStatus::Incomplete
-                && finish_reason.is_none()
-                && self
-                    .begin_retry(
-                        RetryCause::Transient {
-                            trigger: "stream_cut",
-                        },
-                        self.session.turn_index(),
-                        checkpoint,
-                    )
-                    .await
-            {
-                return;
-            }
-
-            let msg = error.map(|e| e.message).unwrap_or_else(|| match status {
-                ResponseStatus::Incomplete => {
-                    "model response was truncated (incomplete)".to_string()
-                }
-                _ => "model response failed".to_string(),
-            });
-            // 归因字段必须齐全：status 只说「非正常结束」，finish_reason 才区分
-            // 截断（max_tokens）、内容过滤与上游异常（aborted/error）；
-            // output_tokens 用来判断截断是否真的顶到了输出上限；
-            // block_kinds 说明收到的到底是哪些块。
-            error!(
-                turn_index = self.session.turn_index(),
-                ?status,
-                finish_reason = finish_reason.map_or("-", |r| r.as_str()),
-                message = %msg,
-                blocks = blocks.len(),
-                block_kinds = ?block_kinds_of(&blocks),
-                text_len = self.react_ctx.assistant_text.len(),
-                reasoning_len = self.react_ctx.assistant_reasoning.len(),
-                input_tokens = usage.input_tokens,
-                output_tokens = usage.output_tokens,
-                "Model stream ended with non-completed status"
-            );
-            self.failure_reason = Some(
-                if matches!(finish_reason, Some(FinishReason::ContentFilter)) {
-                    TurnFailureReason::ContentFiltered { message: msg }
-                } else if status == ResponseStatus::Incomplete && finish_reason.is_none() {
-                    // 瞬时重发已耗尽或不可用 — 上游中途消失的终局归因
-                    TurnFailureReason::ModelUnavailable {
-                        attempts: self.total_attempts(),
-                        message: msg,
-                    }
-                } else {
-                    TurnFailureReason::Other(msg)
-                },
-            );
-            self.set(LooperState::Failed);
-            return;
-        }
-
-        // 提取 tool calls（转 ToolCall）
-        let tool_calls: Vec<ToolCall> = blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                } => Some(ToolCall::new(
-                    call_id.clone(),
-                    name.clone(),
-                    arguments.clone(),
-                )),
-                _ => None,
-            })
-            .collect();
-
-        if tool_calls.is_empty() {
-            // 无 tool_calls：轮次完成。在途时记下的暂停意图被本轮完成吸收
-            // （继续 commit → Idle，不产生暂停）—— 由下一次轮起点的
-            // `reset_iteration_counters` 兜底清零。
-            self.set(LooperState::Done);
-        } else {
-            self.react_ctx.pending_tool_calls = tool_calls
-                .into_iter()
-                .map(|tc| PendingToolCall {
-                    call: Arc::new(tc),
-                    result: None,
-                })
-                .collect();
-            // 收敛带 tool_calls：状态先置位，暂停意图在下一次 react_step
-            // 入口的落地点 B（spawn 前）检查
-            self.set(LooperState::ExecutingTools);
-        }
+        self.react_ctx.resolved = Some(ResolvedResponse {
+            result: GenerateResult {
+                // 流式响应没有上游 id。
+                id: String::new(),
+                output: blocks,
+                usage,
+                status,
+                finish_reason,
+                error,
+            },
+            origin: ResponseOrigin::Stream,
+        });
+        self.set(LooperState::ResolvingResponse);
     }
 
     /// 将有序 output 块回填到 session staging：`Text→Message{Assistant}`、
@@ -3459,7 +3387,7 @@ impl AgentLooper {
         self.react_ctx.pending_tool_calls.clear();
         self.react_ctx.assistant_text.clear();
         self.react_ctx.assistant_reasoning.clear();
-        self.react_ctx.batch_response = None;
+        self.react_ctx.resolved = None;
         self.set(LooperState::PreparingRequest);
     }
 
@@ -3803,7 +3731,7 @@ fn plan_failure(
     ctx.pending_tool_calls.clear();
     ctx.assistant_text.clear();
     ctx.assistant_reasoning.clear();
-    ctx.batch_response = None;
+    ctx.resolved = None;
 
     Some(FinalizePlan {
         turn_index,

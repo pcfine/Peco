@@ -539,15 +539,31 @@ impl BlockAssembler {
 
     /// 流结束时收敛为 `(有序块, 用量, 状态, 错误)`，与 [`GenerateResult`] 的 status/error 同构。
     ///
-    /// - `BTreeMap` 按 index 升序迭代，乱序 `BlockEnd` 自动归位；
-    /// - open 残留：Finish 缺席 → 降级 `Incomplete`（流中断）；正常收尾 →
-    ///   保持 `Completed`、丢弃残留。
+    /// 不返回 `finish_reason` 的薄包装，需要时用 [`Self::finish_with_reason`]。
     pub fn finish(
         self,
     ) -> (
         Vec<ContentBlock>,
         Usage,
         ResponseStatus,
+        Option<ResponseError>,
+    ) {
+        let (blocks, usage, status, _finish_reason, error) = self.finish_with_reason();
+        (blocks, usage, status, error)
+    }
+
+    /// 与 [`Self::finish`] 相同，但额外返回收尾时的 `finish_reason`。
+    ///
+    /// - `BTreeMap` 按 index 升序迭代，乱序 `BlockEnd` 自动归位；
+    /// - open 残留：Finish 缺席 → 降级 `Incomplete`（流中断）；正常收尾 →
+    ///   保持 `Completed`、丢弃残留。
+    pub fn finish_with_reason(
+        self,
+    ) -> (
+        Vec<ContentBlock>,
+        Usage,
+        ResponseStatus,
+        Option<FinishReason>,
         Option<ResponseError>,
     ) {
         let mut status = self.status;
@@ -583,6 +599,7 @@ impl BlockAssembler {
             self.blocks.into_values().collect(),
             self.usage,
             status,
+            self.finish_reason,
             self.error,
         )
     }

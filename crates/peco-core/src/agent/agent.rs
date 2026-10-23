@@ -390,7 +390,7 @@ impl Agent {
 /// [`ModelConfig::max_tokens`]，其自身为 `None` 时交由 provider 服务端默认）。
 ///
 /// 用于截断重试时抬高输出预算 —— 推理 token 与可见输出共用这一个预算，
-/// 预算不足时推理会把可见输出挤没（见 `AgentLooper::finish_stream` 的失败日志字段）。
+/// 预算不足时推理会把可见输出挤没（见 `AgentLooper::resolve_response` 的失败日志字段）。
 pub(crate) fn override_output_budget(budget: Option<u32>) -> impl FnOnce(&mut GenerateRequest) {
     move |request| {
         if let Some(b) = budget {

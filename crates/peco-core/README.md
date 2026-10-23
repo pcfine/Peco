@@ -130,10 +130,10 @@ agent.md
 [`AgentLooper`](src/agent/agent_looper.rs) 由单一权威状态机 `LooperState` 驱动 ReAct 循环，是驱动多轮 Agent 的主引擎：
 
 ```
-Idle ──→ PreparingRequest ──→ [batch] ResolvingResponse
-                           ──→ [stream] Streaming
-                           ──→ ExecutingTools ──→ (循环回 PreparingRequest)
-                           ──→ Done / Failed ──→ Idle
+Idle ──→ PreparingRequest ──→ [batch]  ResolvingResponse
+                           └→ [stream] Streaming ──(Finish / 流关闭)──→ ResolvingResponse
+ResolvingResponse ──→ ExecutingTools ──→ (循环回 PreparingRequest)
+                  ──→ Done / Failed ──→ Idle
 任意非暂停态 ──(Pause 落地点 A/B)──→ PausedBeforeRequest / PausedDuringTools
 Paused* ──(Resume)──→ 恢复被打断的运行位
 ```
