@@ -577,6 +577,20 @@ pub enum LooperEvent {
         user_input: String,
     },
 
+    /// 在途轮排队的用户输入已并入当前轮（steering）。
+    ///
+    /// 在下一次模型请求发出前、pending 被合并进 staging 后发出；本轮不会因此
+    /// 新起 `TurnStart`。若本轮在下一个请求前就结束，排队输入改由
+    /// `start_turn_from_pending` 起新一轮（届时只有 `TurnStart`）。
+    UserSteer {
+        turn_index: usize,
+        /// 本次并入的排队输入条数
+        count: usize,
+        /// 该批的展示正文 —— 已按展示口径归一（`---` 合并标记只在多条目时
+        /// 由服务端剥离，单条原样透出）。消费方直接渲染，不自行拼装。
+        text: String,
+    },
+
     /// 本轮完成（Done 或 Failed 收尾阶段）。
     ///
     /// `outcome` 通过 [`TurnOutcome`] 枚举区分成功/失败，
@@ -834,8 +848,9 @@ impl LooperHandle {
 
     /// 向 agent 发送用户查询。
     ///
-    /// 若 looper 正在处理上一轮，消息会进入 Session 的 pending 队列，
-    /// 当前轮完成后自动处理。若 looper 已结束，返回错误。
+    /// 在途轮收到时进入 Session 的 pending 队列：下一次模型请求前并入当前轮
+    /// （steering，`UserSteer` 事件）；若本轮先结束，则作为新一轮的用户输入
+    /// 续接。暂停中收到时只排队，等 `Resume`。若 looper 已结束，返回错误。
     pub async fn send_query(
         &self,
         text: String,
@@ -861,8 +876,9 @@ impl LooperHandle {
     /// - 消息本身唤醒停靠或暂停中阻塞在 `recv()` 上的 looper
     ///   （裸 flag 置位叫不醒 —— 与 pause/resume 同走 user channel）
     /// - 收尾统一走循环顶取消分支：在途轮冻结进历史（`TurnComplete` +
-    ///   `Failed{Cancelled}`，落盘由 `persist_on_failure` 门控），pending
-    ///   队列保留但不续接
+    ///   `Failed{Cancelled}`，落盘由 `persist_on_failure` 门控），该轮**未消费**
+    ///   的 pending 一并丢弃（停止 = 这一轮连同排队输入都不要）；无在途轮时
+    ///   pending 保留但不续接
     /// - 消息在步进边界消费，**不丢弃**在途 `react_step` future —— 当前
     ///   步进完成后才收尾（流式=单 chunk、工具=≤200ms 轮询、batch=整段
     ///   生成）；Done 分支的 commit→save 窗口因此完整跑完，不会丢轮
@@ -1023,7 +1039,8 @@ pub struct AgentLooper {
 
     /// 当前 turn 缓存的动态上下文字符串。
     /// 在 [`Self::prepare_and_send_request`] 检测到新 query 时更新，
-    /// 同一 turn 内多次 ReAct 迭代复用该值。
+    /// 同一 turn 内多次 ReAct 迭代复用该值；跨轮由
+    /// [`Self::reset_iteration_counters`] 清空。
     dynamic_context: Option<String>,
 
     /// 本用户轮是否已为当前 query 解析过动态上下文。
@@ -1071,7 +1088,8 @@ pub struct AgentLooper {
     // ── pending 调度 ──
     /// pending 队列是否「现在该跑」—— 由用户意图驱动，与「有没有 pending」正交。
     /// `Resume` / 新 `Query` 置位，`Cancel` 收尾与启动一轮后清零，初值 `true`。
-    /// 取消不自动开新轮（pending 保留、随快照落盘），「保留」不等于「该跑」。
+    /// 取消不自动开新轮，「保留」不等于「该跑」—— 在途轮的 pending 被丢弃，
+    /// 无在途轮的 pending 保留并随快照落盘。
     pending_armed: bool,
 
     // ── 退出信号 ──
@@ -1564,7 +1582,7 @@ impl AgentLooper {
                 self.drain_user_msgs(&mut user_listener);
             } else if !self.recv_user_msgs(&mut user_listener).await {
                 // 通道已关，不会再有消息解除暂停 —— 按取消语义收尾（冻结在途轮
-                // 为 Cancelled + 强制落盘，pending 不丢）。
+                // 为 Cancelled + 强制落盘）。
                 if self.state.is_paused() {
                     self.finalize_cancel().await;
                 }
@@ -1587,10 +1605,11 @@ impl AgentLooper {
                 self.finalize_failure().await;
             }
 
-            // ── ③ 启动 pending 轮 —— 唯一的「pending → turn」入口 ─────────
+            // ── ③ 启动 pending 轮 —— 唯一的「pending → 新轮」入口 ─────────
             // 只放行 `Idle`：暂停态不放行 —— 暂停只在在途轮的边界落地，排队
-            // 输入由 pending 队列持有，`Resume` 后内层跑完本轮、commit 回
-            // Idle，③ 再启动续接轮。
+            // 输入由 pending 队列持有；`Resume` 后在途轮的下一次请求前
+            // （`prepare_and_send_request`）把 pending 并入当前轮（steering）。
+            // 若本轮先结束、pending 仍在，则 commit 回 Idle 后由这里起新一轮。
             if matches!(self.state, LooperState::Idle)
                 && matches!(self.session.state(), SessionState::Idle)
                 && self.pending_armed
@@ -1709,9 +1728,10 @@ impl AgentLooper {
 
     /// 处理一条用户消息 —— 消费点共用的唯一分发，同步、零 await 重活。
     ///
-    /// 三条不变量：① 只有 `Query` 触碰 Session 内容，其余四条只动 flag /
-    /// `state` / `pause_pending`；② `StopReading` 的判据 = 本条消息改变了后续
-    /// 消息的解释前提，只有 `Cancel` / `Shutdown` 满足（见 [`ReadDirective`]）；
+    /// 三条不变量：① 只有 `Query` 触碰 Session 内容（入 pending 队列，真正的
+    /// 写入发生在下一次请求前或下一轮起点），其余四条只动 flag / `state` /
+    /// `pause_pending`；② `StopReading` 的判据 = 本条消息改变了后续消息的解释
+    /// 前提，只有 `Cancel` / `Shutdown` 满足（见 [`ReadDirective`]）；
     /// ③ `pending_armed` 由用户意图驱动 —— `Resume` / 新 `Query` 表示「想要它跑」，
     /// `Cancel` 表示「停」。
     fn handle_user_msg(&mut self, msg: UserMsg) -> ReadDirective {
@@ -1787,6 +1807,16 @@ impl AgentLooper {
         // ② 冻结 + 强制落盘。有在途轮时**继承**已有失败原因（取消一个已失败的轮不该
         //    改写成 Cancelled）。`had_inflight` 必须在此刻取 —— finalize 会改变 session。
         let had_inflight = self.has_inflight_turn();
+        // 取消即丢弃：被取消的在途轮不会再发请求。未消费的排队输入若保留，会在
+        // 用户下一次发言时被合并执行 —— 而用户刚点过「停止」，前端也已在点击时
+        // 清空排队区。无在途轮的 Cancel 只是撤回暂停意图（pending 是用户正经
+        // 排队的输入），不在此列。
+        if had_inflight {
+            let dropped = self.session.clear_pending();
+            if dropped > 0 {
+                debug!(dropped, "Cancel discarded unconsumed pending input");
+            }
+        }
         let reason = if had_inflight {
             self.failure_reason
                 .take()
@@ -1803,7 +1833,7 @@ impl AgentLooper {
         self.failure_reason = Some(reason);
 
         // ③ 补落盘：无在途轮时 finalize 产不出 plan，也就不会落盘 —— 而 pending
-        //    可能正排在内存里。取消不丢 pending，所以补一次。
+        //    可能正排在内存里（无在途轮的 Cancel 保留 pending），所以补一次。
         if !had_inflight && self.session.has_pending() {
             self.persist_boundary_snapshot().await;
         }
@@ -1967,7 +1997,8 @@ impl AgentLooper {
 
     // ── 轮次启动 ──────────────────────────────────────────────────────────
 
-    /// **唯一**的「pending → turn」入口。
+    /// **唯一**的「pending → 新轮」入口（在途轮的 steering 走
+    /// `prepare_and_send_request` 里的 `drain_pending_into_turn`，不新起轮）。
     ///
     /// 失败即解除武装 —— 否则 `has_pending_work` 的「`pending_armed && has_pending`」
     /// 无人消解会让 `run()` 空转（见其「不空转不变量」）。启动失败时 pending 原封
@@ -2213,15 +2244,25 @@ impl AgentLooper {
     /// 新一轮对话开始时重置「本用户轮」的运行时状态。
     ///
     /// `react_loop_iteration`、`retries_used`、`budget_raised`、
-    /// `retry_deadline`、`dynamic_context_resolved` 与 `pause_pending`
-    /// 的生命周期都恰好是一个用户轮 —— 抽成方法就是为了让这条不变量无法被单独违反。
+    /// `retry_deadline`、`dynamic_context`、`dynamic_context_resolved` 与
+    /// `pause_pending` 的生命周期都恰好是一个用户轮 —— 抽成方法就是为了让这条
+    /// 不变量无法被单独违反。
     /// `budget_raised` 尤其不能跨轮：粘性一旦泄漏，下一轮的截断重试会
     /// 被第 4 条判据误拦（生效预算看似已抬过）。
+    ///
+    /// `dynamic_context` 的值同样是轮内状态：召回结果只在本轮有效，
+    /// [`Self::prepare_and_send_request`] 之所以能在空召回时保留旧值，
+    /// 前提是旧值一定属于本轮 —— 清空必须发生在轮边界上，否则上一轮的召回块
+    /// 会跟着拼进下一轮的 system prompt。
     fn reset_iteration_counters(&mut self) {
         self.react_loop_iteration = 0;
         self.retries_used = 0;
         self.budget_raised = false;
         self.retry_deadline = None;
+        // 轮边界复位：`prepare_and_send_request` 的「空召回保留旧值」只在**同一轮**
+        // 内成立（steering 是追加性输入）。跨轮不清会把上一轮的召回块带进下一轮的
+        // system prompt —— 新轮是 casual / 附件-only / 无命中时尤其明显。
+        self.dynamic_context = None;
         self.dynamic_context_resolved = false;
         // 新轮启动时丢弃未落地的暂停意图（流收敛无 tool_calls 时的「吸收」
         // 也靠这里兜底清零 —— 意图活不过一个用户轮）
@@ -2516,6 +2557,36 @@ impl AgentLooper {
         // ★ 递增模型调用计数
         self.react_loop_iteration += 1;
 
+        // 1.5 在途轮排队的用户输入：并入当前轮，让本次请求即可见（steering）。
+        //     放在 max_iterations 检查之后 —— 撞上限时把输入留给兜底新一轮，
+        //     不冻结进失败轮。此处也是 batch/stream、暂停恢复、工具批与重试
+        //     之后的唯一请求入口；retry 的 checkpoint 都在其后取，故 steering
+        //     消息不会被回退，也不会被二次排空。
+        match self.session.drain_pending_into_turn() {
+            Ok(Some(batch)) => {
+                // drain 后队列已空，`has_pending_work` 的 Idle 判据天然为
+                // false，无需在此解除武装；若将来改为按容量部分消费，则需恢复置位。
+                let count = batch.count;
+                // 新输入可能改变召回主题：让 RAG/记忆召回针对本轮重算一次。
+                self.dynamic_context_resolved = false;
+                Self::emit_event_guaranteed(
+                    &self.event_speaker,
+                    LooperEvent::UserSteer {
+                        turn_index,
+                        count,
+                        text: batch.display_text,
+                    },
+                )
+                .await;
+                // 副作用型检查点：把 steering 消息补进在途轮检查点，
+                // 缩小「请求在途崩溃 → 该输入从历史与 pending 同时消失」的窗口。
+                self.persist_inflight_checkpoint().await;
+                debug!(count, turn_index, "Queued user input merged into turn");
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "Failed to merge queued input into turn"),
+        }
+
         // 2. 构建消息列表（Agent 层上下文策略，零拷贝 Arc 共享）
         let all_refs: Vec<&AnnotatedMessage> = self.session.all_message_refs().collect();
 
@@ -2572,7 +2643,16 @@ impl AgentLooper {
                     _ => None,
                 })
                 .unwrap_or_default();
-            self.dynamic_context = dc.query(&query_text).await;
+            // steering 是追加性文本：有新输入进来只说明「主题可能变了」，不说明
+            // 「本轮已解析的召回作废」。casual 输入（「好的」）、附件-only（query_text
+            // 为空）、无命中三种情况都返回 None —— 一律保留旧值，否则一次 casual
+            // steering 就把本轮的记忆召回抹成 None，后续请求凭空丢上下文。
+            // 这里保留的只是**同一轮内**的值：跨轮清空交给
+            // `reset_iteration_counters`，否则上一轮的召回块会漏进下一轮。
+            let recalled = dc.query(&query_text).await;
+            if recalled.is_some() {
+                self.dynamic_context = recalled;
+            }
             self.dynamic_context_resolved = true;
         }
 
@@ -3408,7 +3488,7 @@ impl AgentLooper {
     ///
     /// `force_persist` 与 `persist_on_failure` 取或：后者门控普通失败轮是否落盘
     /// （CLI 走 `NullSessionPersister` 时置 false 即无副作用），前者供取消路径
-    /// **强制**落盘 —— 取消不丢 pending，而 pending 只活在 Session 内存里。
+    /// **强制**落盘 —— pending 只活在 Session 内存里，无在途轮的 Cancel 会保留它。
     ///
     /// 契约是「把状态搬到可推进的位置」，不回报布尔让调用方决定续接 —— 续接交给
     /// `run()` 的 ③ 单一入口。

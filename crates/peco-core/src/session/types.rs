@@ -227,8 +227,11 @@ impl SessionState {
 /// 排队中的用户输入。
 ///
 /// 当 session 处于 Active 状态时收到的用户消息不直接写入 staging，
-/// 而是放入 pending 队列。当前 turn 完成后整个队列被排空、合并为一条
-/// user 消息启动新 turn（见 [`merge_contents`]）。
+/// 而是放入 pending 队列。消费点有两个：
+/// - 在途轮的**下一次模型请求前**，并入当前轮（steering，见
+///   [`Session::drain_pending_into_turn`](crate::session::Session::drain_pending_into_turn)）；
+/// - 若本轮先结束，则在 turn 边界整个队列被排空、合并为一条 user 消息
+///   启动新 turn（见 [`merge_contents`]）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingInput {
     /// 用户输入内容（纯文本或文本 + 图片部件混排）。
@@ -344,6 +347,35 @@ pub fn strip_merge_markers(content: &Content) -> String {
         })
         .collect();
     trimmed.join("\n")
+}
+
+/// 一条消息的展示正文（前端气泡里的用户发言），按来源归一。
+///
+/// 同一批内容的两个口径必须由服务端一处决定，否则前端复刻一遍规则、两边
+/// 靠注释对齐：模型侧看到的是 [`merge_contents`] 插入的 `---` 标记（用于分辨
+/// 独立输入），气泡里不能出现它 —— 但**只有** [`MessageSource::MergedPending`]
+/// 该剥，其余来源（尤其单条 [`MessageSource::UserInput`]）原样透出，用户自己
+/// 写的一行 `---` 不会被误删。
+pub fn display_text(content: &Content, source: &MessageSource) -> String {
+    let plain = content.text_view_plain().into_owned();
+    if matches!(source, MessageSource::MergedPending) {
+        strip_merge_markers(&Content::Text(plain))
+    } else {
+        plain
+    }
+}
+
+/// 一次 steering 合并的结果：并入条数 + 该批的展示正文。
+///
+/// `display_text` 由 [`display_text`] 按本批来源算出 —— 展示口径的判定点
+/// 留在 [`Session`](super::Session) 一侧，事件消费方（looper / SSE）不必再
+/// 拿到 `Content` + 来源两样东西各判一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerBatch {
+    /// 本次并入的排队输入条数
+    pub count: usize,
+    /// 已按展示口径归一的文本（可为空串：纯图片输入无文本部件）
+    pub display_text: String,
 }
 
 // ============================================================================

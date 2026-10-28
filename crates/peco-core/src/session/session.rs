@@ -15,8 +15,8 @@ use super::buffer::{CommittedBuffer, StagingBuffer};
 use super::error::SessionError;
 use super::snapshot::{SessionSnapshot, TurnBoundaryToken};
 use super::types::{
-    AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, merge_contents,
-    unix_timestamp_ms, unix_timestamp_secs,
+    AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, SteerBatch,
+    display_text, merge_contents, unix_timestamp_ms, unix_timestamp_secs,
 };
 use crate::agent::{estimate_item_tokens, estimate_str_tokens};
 
@@ -920,8 +920,70 @@ impl Session {
     // ── Pending 队列（&mut self）──────────────────────────────────────
 
     /// 将用户输入加入 pending 队列。
+    ///
+    /// pending 有两个消费点：轮次结束、Session 回 `Idle` 时由
+    /// [`Self::dequeue_and_start_turn`] 起新轮；在途轮的**下一次请求前**由
+    /// [`Self::drain_pending_into_turn`] 并入当前轮（steering）。
     pub fn enqueue_pending(&mut self, content: Content) {
         self.pending.push_back(PendingInput::new(content));
+    }
+
+    /// 排空整个 pending 队列，合并为**当前在途轮**内的一条 user 消息（steering）。
+    ///
+    /// 与 [`Self::dequeue_and_start_turn`] 的区别：不新起 turn，只把排队输入
+    /// 追加到当前轮的 staging，让**下一次模型请求**即可见。仅 `Active` 状态
+    /// 可用；队列为空或状态不允许时返回 `Ok(None)` 且**不动队列**（不丢输入）。
+    ///
+    /// 合并语义与来源选择与 `dequeue_and_start_turn` 完全一致：单条走
+    /// [`MessageSource::UserInput`]，多条走 [`MessageSource::MergedPending`]
+    /// （展示层据此剥离 `---` 标记，见 [`display_text`]）。
+    ///
+    /// 返回 `Ok(Some(batch))` = 已并入 `batch.count` 条，`batch.display_text`
+    /// 是该批的展示正文（口径见 [`display_text`]）。
+    pub fn drain_pending_into_turn(&mut self) -> Result<Option<SteerBatch>, SessionError> {
+        if self.pending.is_empty() || !self.state.can_stage_message() {
+            return Ok(None);
+        }
+
+        // 前置检查后 `stage_item` 无可达失败点（状态不变），故可先排空。
+        let Some((merged, source, count)) = self.take_pending_batch() else {
+            return Ok(None);
+        };
+        let text = display_text(&merged, &source);
+        self.stage_item(
+            source,
+            InputItem::Message {
+                role: Role::User,
+                content: merged,
+            },
+        )?;
+        Ok(Some(SteerBatch {
+            count,
+            display_text: text,
+        }))
+    }
+
+    /// 排空整个 pending 队列，返回 `(合并内容, 来源, 条数)`；队列为空时 `None`。
+    ///
+    /// 两个消费点（轮内 steering 与轮边界起新轮）共用本方法：**来源按批大小定**
+    /// 的规则只能有一份，两侧各写一遍迟早会漂移出「单条也打 `MergedPending` →
+    /// 用户自己写的一行 `---` 在渲染时消失」。
+    ///
+    /// 不做状态守卫 —— 两个调用点的前置条件不同（轮内 staging / 起新轮），
+    /// 状态不允许时的返回也不同（`Ok(None)` / `Err`），守卫只能留在调用点。
+    fn take_pending_batch(&mut self) -> Option<(Content, MessageSource, usize)> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let batch: Vec<PendingInput> = self.pending.drain(..).collect();
+        let count = batch.len();
+        let source = if count == 1 {
+            MessageSource::UserInput
+        } else {
+            MessageSource::MergedPending
+        };
+        let merged = merge_contents(batch.into_iter().map(|i| i.content).collect());
+        Some((merged, source, count))
     }
 
     /// 排空整个 pending 队列，合并为一条消息，启动新 turn。
@@ -930,9 +992,9 @@ impl Session {
     /// **来源按批大小定**：单条走 [`MessageSource::UserInput`]（逐字节未改的原始
     /// 输入），多条才走 [`MessageSource::MergedPending`]。
     ///
-    /// 展示层只对 `MergedPending` 调 [`strip_merge_markers`]，而它会剥掉内容里
-    /// **任何**恰好等于 `---` 的行 —— 靠来源标记把直接输入挡在门外。若单条也打
-    /// `MergedPending`，用户自己写的一行 `---` 会在渲染时凭空消失。
+    /// 展示口径（见 [`display_text`]）只对 `MergedPending` 剥标记，而剥离会去掉
+    /// 内容里**任何**恰好等于 `---` 的行 —— 靠来源标记把直接输入挡在门外。若单条
+    /// 也打 `MergedPending`，用户自己写的一行 `---` 会在渲染时凭空消失。
     ///
     /// 返回 `Ok(true)` = 成功启动新 turn，`Ok(false)` = 队列为空。
     pub fn dequeue_and_start_turn(&mut self) -> Result<bool, SessionError> {
@@ -950,13 +1012,10 @@ impl Session {
             });
         }
 
-        let batch: Vec<PendingInput> = self.pending.drain(..).collect();
-        let source = if batch.len() == 1 {
-            MessageSource::UserInput
-        } else {
-            MessageSource::MergedPending
+        // 空队列已在前置检查挡掉，这里的 `None` 不可达。
+        let Some((merged, source, _)) = self.take_pending_batch() else {
+            return Ok(false);
         };
-        let merged = merge_contents(batch.into_iter().map(|i| i.content).collect());
 
         // 前置检查后不可达（其间无状态变更）；万一未来 start_turn 增加
         // 新失败点，这里只报错不回队 —— 合并态已无法还原为原序批次，
@@ -967,6 +1026,16 @@ impl Session {
     /// 是否有排队中的输入。
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// 清空 pending 队列，返回丢弃条数。
+    ///
+    /// 只用于取消**在途轮**：该轮不会再发请求，未消费的输入若保留，会在用户
+    /// 下一次发言时被合并执行（而用户已点过「停止」）。无在途轮的 Cancel 不走这里。
+    pub fn clear_pending(&mut self) -> usize {
+        let n = self.pending.len();
+        self.pending.clear();
+        n
     }
 
     // ── Token 用量（&mut self）────────────────────────────────────────
@@ -2133,6 +2202,176 @@ mod tests {
         assert_eq!(s.hydrate_inflight(staged).unwrap(), 1);
         assert!(s.staging_user_input().is_none());
         assert_eq!(s.staging_messages().len(), 1);
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_appends_current_turn_user_message() {
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending("steer".into());
+
+        let batch = s.drain_pending_into_turn().unwrap().expect("应并入一批");
+        assert_eq!(batch.count, 1);
+        assert!(!s.has_pending(), "并入后队列必须清空");
+        // 原 user_input 不动，按顺序追加一条归属当前轮的 user 消息
+        assert_eq!(s.staging_user_input().unwrap().message.as_ref(), &user("q"));
+        let staged = s.staging_messages();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].message.as_ref(), &user("steer"));
+        assert_eq!(staged[0].turn_index, s.turn_index());
+        assert_eq!(staged[0].source, MessageSource::UserInput);
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_merges_multiple() {
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending("a".into());
+        s.enqueue_pending("b".into());
+
+        let batch = s.drain_pending_into_turn().unwrap().expect("应并入一批");
+        assert_eq!(batch.count, 2);
+        let staged = s.staging_messages();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].source, MessageSource::MergedPending);
+        assert_eq!(
+            staged[0].message.as_ref(),
+            &user("---\na\n---\nb"),
+            "多条合并语义与 dequeue_and_start_turn 一致"
+        );
+    }
+
+    #[test]
+    fn test_display_text_keeps_user_written_marker_lines() {
+        // 单条直发：用户自己写的 `---` 是内容，不是合并标记 —— 原样保留
+        let content = Content::Text("第一段\n---\n第二段".to_string());
+        assert_eq!(
+            display_text(&content, &MessageSource::UserInput),
+            "第一段\n---\n第二段"
+        );
+        // 同样的内容若被误标为 MergedPending 就会被剥掉 —— 来源判定是唯一开关
+        assert_eq!(
+            display_text(&content, &MessageSource::MergedPending),
+            "第一段\n第二段"
+        );
+    }
+
+    #[test]
+    fn test_display_text_strips_markers_for_merged_pending() {
+        let merged = merge_contents(vec![Content::Text("a".into()), Content::Text("b".into())]);
+        assert_eq!(display_text(&merged, &MessageSource::MergedPending), "a\nb");
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_single_keeps_user_markers_and_counts() {
+        // 单条 steering：count = 1，display_text 逐字节等于用户原文（含自写 `---`）
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending("第一段\n---\n第二段".into());
+
+        let batch = s.drain_pending_into_turn().unwrap().expect("应并入一批");
+        assert_eq!(batch.count, 1);
+        assert_eq!(batch.display_text, "第一段\n---\n第二段");
+        assert_eq!(
+            s.staging_messages()[0].source,
+            MessageSource::UserInput,
+            "单条来源必须是 UserInput"
+        );
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_multi_counts_and_strips_markers() {
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending("a".into());
+        s.enqueue_pending("b".into());
+
+        let batch = s.drain_pending_into_turn().unwrap().expect("应并入一批");
+        assert_eq!(batch.count, 2);
+        assert_eq!(batch.display_text, "a\nb", "多条展示文本不带 --- 标记");
+        assert_eq!(
+            s.staging_messages()[0].source,
+            MessageSource::MergedPending,
+            "多条合并来源是 MergedPending"
+        );
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_with_image_counts_and_strips_markers() {
+        // 含图批次走 Parts 形态：wire 文本保留标记，展示文本归一为纯正文
+        let with_image = Content::Parts(vec![
+            ContentPart::Text {
+                text: "看这张图".to_string(),
+            },
+            ContentPart::Image {
+                url: "https://example.com/cat.png".to_string(),
+                detail: None,
+            },
+        ]);
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending(with_image);
+        s.enqueue_pending("q2".into());
+
+        let batch = s.drain_pending_into_turn().unwrap().expect("应并入一批");
+        assert_eq!(batch.count, 2);
+        assert_eq!(batch.display_text, "看这张图\nq2");
+        assert_eq!(
+            s.staging_messages()[0].source,
+            MessageSource::MergedPending,
+            "含图多条合并来源是 MergedPending"
+        );
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_noop_when_idle_or_empty() {
+        // Idle + 有排队：不动队列，留给 dequeue_and_start_turn 起新轮
+        let mut s = make_session();
+        s.enqueue_pending("queued".into());
+        assert_eq!(s.drain_pending_into_turn().unwrap(), None);
+        assert!(s.has_pending());
+
+        // Active + 空队列：no-op
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        assert_eq!(s.drain_pending_into_turn().unwrap(), None);
+        assert!(s.staging_messages().is_empty());
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_survives_staging_rollback() {
+        // 重发回退只截断失败尝试的产出，steering 消息必须在锚点之前存活
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending("steer".into());
+        s.drain_pending_into_turn().unwrap();
+        let checkpoint = s.staging_checkpoint();
+        s.stage_item(MessageSource::ModelGeneration, assistant("partial"))
+            .unwrap();
+
+        assert_eq!(s.truncate_staging(checkpoint).unwrap(), 1);
+        assert_eq!(
+            s.staging_messages().last().map(|am| am.message.as_ref()),
+            Some(&user("steer"))
+        );
+    }
+
+    #[test]
+    fn test_drain_pending_into_turn_commits_with_current_turn() {
+        let mut s = make_session();
+        s.start_turn("q".into()).unwrap();
+        s.enqueue_pending("steer".into());
+        s.drain_pending_into_turn().unwrap();
+        s.stage_item(MessageSource::ModelGeneration, assistant("答"))
+            .unwrap();
+        s.commit_turn().unwrap();
+
+        assert_eq!(s.committed_turns().len(), 1, "不新增轮次");
+        let items: Vec<&InputItem> = s.committed_turns()[0]
+            .iter()
+            .map(|am| am.message.as_ref())
+            .collect();
+        assert_eq!(items, vec![&user("q"), &user("steer"), &assistant("答")]);
     }
 
     #[test]

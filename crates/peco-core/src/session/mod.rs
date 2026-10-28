@@ -26,5 +26,6 @@ pub use metadata::SessionMeta;
 pub use session::{Session, StripCaps, StripEvaluation, StripOutcome};
 pub use snapshot::{SessionSnapshot, TurnBoundaryToken};
 pub use types::{
-    AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, strip_merge_markers,
+    AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, SteerBatch,
+    display_text, strip_merge_markers,
 };

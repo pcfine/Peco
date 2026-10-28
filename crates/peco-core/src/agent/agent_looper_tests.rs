@@ -1661,7 +1661,7 @@ async fn test_finalize_cancel_from_paused_resets_cleanly() {
 
 /// Resume 带排队输入时：从暂停态**单迁移**直达运行位（不途经 Idle ——
 /// 途经 Idle 会让 runner 见 to=Idle 且无 SSE 订阅者时回收 handle）。排队
-/// 输入由 pending 队列持有，本轮收尾回 Idle 之后才由 ③ 启动续接轮。
+/// 输入在本轮**下一次模型请求前**并入当前轮（steering），不另起续接轮。
 #[tokio::test]
 async fn test_resume_with_pending_skips_idle_emit() {
     let (h, mut senders) = spawn_controllable_looper();
@@ -1694,12 +1694,15 @@ async fn test_resume_with_pending_skips_idle_emit() {
         "Resume 必须从暂停态单迁移到运行位"
     );
 
-    // 工具执行完 → 本轮第二次模型调用
+    // 工具执行完 → 本轮第二次模型调用（排队输入在此前并入请求）
     feed_text_stream(&mut senders, "hello").await;
 
-    // 从 Resume 到本轮收尾：不得出现「暂停态 → Idle」的迁移
+    // 从 Resume 到本轮收尾：不得出现「暂停态 → Idle」的迁移；排队输入必须
+    // 以 `UserSteer` 事件并入，且本轮内不再出现第二个 `TurnStart`。
     let first = tokio::time::timeout(Duration::from_secs(5), async {
         let mut saw_idle_from_paused = false;
+        let mut steer_count = None;
+        let mut turn_starts = 0usize;
         loop {
             match h.recv_event().await {
                 Some(LooperEvent::StateChange { from, to, .. })
@@ -1707,8 +1710,10 @@ async fn test_resume_with_pending_skips_idle_emit() {
                 {
                     saw_idle_from_paused = true;
                 }
+                Some(LooperEvent::TurnStart { .. }) => turn_starts += 1,
+                Some(LooperEvent::UserSteer { count, .. }) => steer_count = Some(count),
                 Some(LooperEvent::TurnComplete { outcome, .. }) => {
-                    break (saw_idle_from_paused, outcome);
+                    break (saw_idle_from_paused, outcome, steer_count, turn_starts);
                 }
                 Some(_) => continue,
                 None => panic!("event channel closed before TurnComplete"),
@@ -1725,10 +1730,8 @@ async fn test_resume_with_pending_skips_idle_emit() {
         TurnOutcome::Success { text } => assert_eq!(text, "hello"),
         other => panic!("恢复后的在途轮应成功，实际 {other:?}"),
     }
-
-    // 续接轮：排队输入在本轮收尾后由 ③ 启动
-    feed_text_stream(&mut senders, "ok").await;
-    expect_queued_continuation(&h).await;
+    assert_eq!(first.2, Some(1), "Resume 后的下一次请求应并入 1 条排队输入");
+    assert_eq!(first.3, 0, "steering 不得另起 TurnStart");
 
     h.shutdown().await.expect("clean shutdown");
 }
@@ -1748,7 +1751,10 @@ async fn test_paused_queued_query_input_closed_cancels_without_turn() {
     let executor: Arc<dyn crate::tools::ToolExecutor> =
         Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
     let (tx_inbox, mut senders) = tokio::sync::mpsc::unbounded_channel::<ChunkSender>();
-    let provider = Arc::new(ControllableStreamProvider { senders: tx_inbox });
+    let provider = Arc::new(ControllableStreamProvider {
+        senders: tx_inbox,
+        requests: None,
+    });
     let agent = Arc::new(Agent::from_parts(
         std::path::PathBuf::from("/tmp/agent.md"),
         profile,
@@ -1856,7 +1862,10 @@ async fn test_paused_inflight_turn_closed_cancels_with_turn_complete() {
     let executor: Arc<dyn crate::tools::ToolExecutor> =
         Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
     let (tx_inbox, mut senders) = tokio::sync::mpsc::unbounded_channel::<ChunkSender>();
-    let provider = Arc::new(ControllableStreamProvider { senders: tx_inbox });
+    let provider = Arc::new(ControllableStreamProvider {
+        senders: tx_inbox,
+        requests: None,
+    });
     let agent = Arc::new(Agent::from_parts(
         std::path::PathBuf::from("/tmp/agent.md"),
         profile,
@@ -1999,7 +2008,7 @@ async fn drain_until_paused_raw(
 }
 
 /// 暂停中的输入只排队：真暂停态不得起轮（否则 `pause()` 的承诺失效、
-/// 恢复语义被绕过），`Resume` 之后才续接。
+/// 恢复语义被绕过）；`Resume` 后在本轮下一次请求前并入当前轮（steering）。
 #[tokio::test]
 async fn test_paused_query_queues_until_resume() {
     let (h, mut senders) = spawn_controllable_looper();
@@ -2035,26 +2044,272 @@ async fn test_paused_query_queues_until_resume() {
     .await;
     resumed.expect("恢复迁移应在超时内到达");
 
-    // 在途轮的第二次模型调用 → 本轮完成
+    // 在途轮的第二次模型调用 → 本轮完成；排队输入在该请求前以 UserSteer 并入。
     feed_text_stream(&mut senders, "hello").await;
     let first = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut steer = None;
+        let mut turn_starts = 0usize;
         loop {
             match h.recv_event().await {
-                Some(LooperEvent::TurnComplete { outcome, .. }) => break outcome,
+                Some(LooperEvent::UserSteer { count, .. }) => steer = Some(count),
+                Some(LooperEvent::TurnStart { .. }) => turn_starts += 1,
+                Some(LooperEvent::TurnComplete { outcome, .. }) => {
+                    break (outcome, steer, turn_starts);
+                }
                 Some(_) => continue,
                 None => panic!("event channel closed before TurnComplete"),
             }
         }
     })
     .await;
-    match first.expect("在途轮应在超时内完成") {
+    let (outcome, steer, turn_starts) = first.expect("在途轮应在超时内完成");
+    match outcome {
         TurnOutcome::Success { text } => assert_eq!(text, "hello"),
         other => panic!("恢复后在途轮应成功，实际 {other:?}"),
     }
+    assert_eq!(steer, Some(1), "恢复后的下一次请求应并入排队输入");
+    assert_eq!(turn_starts, 0, "steering 不得另起一轮");
 
-    // 排队输入由 ③ 启动续接轮
-    feed_text_stream(&mut senders, "ok").await;
-    expect_queued_continuation(&h).await;
+    h.shutdown().await.expect("clean shutdown");
+}
+
+/// 收集请求里所有 user 消息的文本视图。
+fn user_texts(input: &[Arc<InputItem>]) -> Vec<String> {
+    input
+        .iter()
+        .filter_map(|item| match item.as_ref() {
+            InputItem::Message {
+                role: Role::User,
+                content,
+            } => Some(content.text_view().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 普通运行中（工具批之前）发送的 Query：在下一次模型请求前并入当前轮，
+/// 模型请求里能看到它，且不另起 `TurnStart`。
+#[tokio::test]
+async fn test_running_query_is_steered_into_next_request() {
+    let (h, mut senders, mut requests) = spawn_controllable_looper_capturing_requests();
+
+    h.send_query("q".into()).await.expect("looper alive");
+    let first_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("first model request should arrive")
+        .expect("capture channel alive");
+    assert!(user_texts(&first_req.input).iter().any(|t| t == "q"));
+    assert!(
+        !user_texts(&first_req.input).iter().any(|t| t == "steer"),
+        "补充输入尚未发送，不得出现在第一次请求里"
+    );
+
+    let tx = senders
+        .recv()
+        .await
+        .expect("provider should start a stream");
+    tx.send(Ok(text_start())).unwrap();
+    tx.send(Ok(text_delta("hel"))).unwrap();
+
+    // 流式在途发送补充输入 —— 只入 pending，不打断当前步进
+    h.send_query("steer".into()).await.expect("looper alive");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // 以 tool_calls 收尾 → 工具执行 → 第二次请求前并入补充输入
+    tx.send(Ok(text_end("hello"))).unwrap();
+    tx.send(Ok(tool_call_end("call-1", "unknown_tool", "{}")))
+        .unwrap();
+    tx.send(Ok(stream_usage())).unwrap();
+    tx.send(Ok(stream_finish())).unwrap();
+
+    let second_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("second model request should arrive")
+        .expect("capture channel alive");
+    let texts = user_texts(&second_req.input);
+    assert!(
+        texts.iter().any(|t| t == "steer"),
+        "下一次请求必须包含在途轮排队的输入，实际 user 消息 {texts:?}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| *t == "steer").count(),
+        1,
+        "补充输入只能并入一次"
+    );
+
+    // 收尾本轮
+    feed_text_stream(&mut senders, "done").await;
+    let (steer, steer_turn_starts) = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut steer = None;
+        let mut steer_turn_starts = 0usize;
+        loop {
+            match h.recv_event().await {
+                Some(LooperEvent::UserSteer { count, text, .. }) => steer = Some((count, text)),
+                Some(LooperEvent::TurnStart { user_input, .. }) if user_input.contains("steer") => {
+                    steer_turn_starts += 1;
+                }
+                Some(LooperEvent::TurnComplete { .. }) => break (steer, steer_turn_starts),
+                Some(_) => continue,
+                None => panic!("event channel closed before TurnComplete"),
+            }
+        }
+    })
+    .await
+    .expect("turn should complete");
+    assert_eq!(
+        steer,
+        Some((1, "steer".to_string())),
+        "应发出一次 UserSteer，且展示文本直接取自 drain 结果"
+    );
+    assert_eq!(steer_turn_starts, 0, "steering 不得另起一轮");
+
+    h.shutdown().await.expect("clean shutdown");
+}
+
+/// 关键词召回：query 含关键词才给片段，casual 文本（「好的」）与空串给 None。
+struct KeywordRecall;
+
+#[async_trait::async_trait]
+impl DynamicContext for KeywordRecall {
+    async fn query(&self, query: &str) -> Option<String> {
+        query.contains("预算").then(|| "召回片段".to_string())
+    }
+}
+
+/// steering 是追加性文本：新输入的空召回不代表本轮已解析的上下文作废。
+///
+/// casual steering（「好的」）会让 `DynamicContext::query` 返回 None —— 若无条件
+/// 覆盖，本轮已召回的片段就被抹成 None，后续请求凭空丢上下文。变异点：把
+/// `if recalled.is_some()` 改回无条件赋值，第二次/第三次请求的 instructions 里
+/// 就没有片段，本测试必红。
+#[tokio::test]
+async fn test_steering_keeps_dynamic_context_when_recall_returns_none() {
+    let (h, mut senders, mut requests) =
+        spawn_controllable_looper_with_recall(Arc::new(KeywordRecall));
+
+    h.send_query("预算怎么定".into())
+        .await
+        .expect("looper alive");
+    let first_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("first model request should arrive")
+        .expect("capture channel alive");
+    let first_instructions = first_req.instructions.unwrap_or_default();
+    assert!(
+        first_instructions.contains("召回片段"),
+        "首轮应召回片段，实际 instructions {first_instructions:?}"
+    );
+
+    let tx = senders
+        .recv()
+        .await
+        .expect("provider should start a stream");
+    tx.send(Ok(text_start())).unwrap();
+    tx.send(Ok(text_delta("hel"))).unwrap();
+
+    // 流式在途投一条 casual 输入（召回器对它返回 None）
+    h.send_query("好的".into()).await.expect("looper alive");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // 以 tool_calls 收尾 → 工具执行 → 第二次请求（steering 已并入）
+    tx.send(Ok(text_end("hello"))).unwrap();
+    tx.send(Ok(tool_call_end("call-1", "unknown_tool", "{}")))
+        .unwrap();
+    tx.send(Ok(stream_usage())).unwrap();
+    tx.send(Ok(stream_finish())).unwrap();
+
+    let second_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("second model request should arrive")
+        .expect("capture channel alive");
+    let texts = user_texts(&second_req.input);
+    assert!(
+        texts.iter().any(|t| t == "好的"),
+        "第二次请求必须包含 casual steering，实际 user 消息 {texts:?}"
+    );
+    let second_instructions = second_req.instructions.unwrap_or_default();
+    assert!(
+        second_instructions.contains("召回片段"),
+        "steering 的空召回不得抹掉本轮上下文，实际 instructions {second_instructions:?}"
+    );
+
+    // 再一轮工具收尾 → 第三次请求（本轮不再重算，复用已解析值）
+    let tx = senders
+        .recv()
+        .await
+        .expect("provider should start a stream");
+    tx.send(Ok(text_start())).unwrap();
+    tx.send(Ok(text_end("second"))).unwrap();
+    tx.send(Ok(tool_call_end("call-2", "unknown_tool", "{}")))
+        .unwrap();
+    tx.send(Ok(stream_usage())).unwrap();
+    tx.send(Ok(stream_finish())).unwrap();
+
+    let third_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("third model request should arrive")
+        .expect("capture channel alive");
+    let third_instructions = third_req.instructions.unwrap_or_default();
+    assert!(
+        third_instructions.contains("召回片段"),
+        "第三次请求仍须带本轮上下文，实际 instructions {third_instructions:?}"
+    );
+
+    // 收尾本轮
+    feed_text_stream(&mut senders, "done").await;
+    recv_until_turn_complete(&h).await;
+
+    h.shutdown().await.expect("clean shutdown");
+}
+
+/// 轮边界的回归守卫：上一轮命中的召回片段不得漏进下一轮的 system prompt。
+///
+/// 「空召回保留旧值」只对**同一轮**成立（steering 是追加性输入）——
+/// `reset_iteration_counters` 若只复位 `dynamic_context_resolved` 而不清值，
+/// 第二轮 casual 输入（召回器返回 None）就会把第一轮的召回块继续拼进
+/// instructions。与同轮用例
+/// `test_steering_keeps_dynamic_context_when_recall_returns_none` 互补（那条
+/// 守同轮保留，这条守跨轮清空）。
+///
+/// 变异点：删掉轮边界里的 `self.dynamic_context = None;`，本测试必红。
+#[tokio::test]
+async fn test_dynamic_context_is_cleared_at_turn_boundary() {
+    let (h, mut senders, mut requests) =
+        spawn_controllable_looper_with_recall(Arc::new(KeywordRecall));
+
+    // turn1：输入命中关键词 → 召回片段进入 instructions
+    h.send_query("预算怎么定".into())
+        .await
+        .expect("looper alive");
+    let first_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("first model request should arrive")
+        .expect("capture channel alive");
+    let first_instructions = first_req.instructions.unwrap_or_default();
+    assert!(
+        first_instructions.contains("召回片段"),
+        "首轮应召回片段，实际 instructions {first_instructions:?}"
+    );
+
+    // turn1 正常收尾（无 tool_calls）→ 回到 Idle，轮边界清空召回值
+    feed_text_stream(&mut senders, "建议如下").await;
+    recv_until_turn_complete(&h).await;
+    recv_until_state(&h, LooperState::Idle).await;
+
+    // turn2：casual 输入让召回器返回 None → 不得残留上一轮的片段
+    h.send_query("谢谢".into()).await.expect("looper alive");
+    let second_req = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("second model request should arrive")
+        .expect("capture channel alive");
+    let second_instructions = second_req.instructions.unwrap_or_default();
+    assert!(
+        !second_instructions.contains("召回片段"),
+        "新轮的空召回不得继承上一轮的上下文，实际 instructions {second_instructions:?}"
+    );
+
+    feed_text_stream(&mut senders, "不客气").await;
+    recv_until_turn_complete(&h).await;
 
     h.shutdown().await.expect("clean shutdown");
 }
@@ -2125,33 +2380,36 @@ async fn test_pause_during_resume_lands_back_paused() {
     .await;
     resumed.expect("再次恢复迁移应在超时内到达");
 
-    // 在途轮第二次模型调用 → 完成
+    // 在途轮第二次模型调用 → 完成；排队输入在该请求前并入当前轮。
     feed_text_stream(&mut senders, "hello").await;
     let first = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut steer = None;
         loop {
             match h.recv_event().await {
-                Some(LooperEvent::TurnComplete { outcome, .. }) => break outcome,
+                Some(LooperEvent::UserSteer { count, .. }) => steer = Some(count),
+                Some(LooperEvent::TurnComplete { outcome, .. }) => break (outcome, steer),
                 Some(_) => continue,
                 None => panic!("event channel closed before TurnComplete"),
             }
         }
     })
     .await;
-    match first.expect("再次恢复后应在超时内完成") {
+    let (outcome, steer) = first.expect("再次恢复后应在超时内完成");
+    match outcome {
         TurnOutcome::Success { text } => assert_eq!(text, "hello"),
         other => panic!("再次恢复后应成功，实际 {other:?}"),
     }
-
-    // 排队输入续接轮
-    feed_text_stream(&mut senders, "ok").await;
-    expect_queued_continuation(&h).await;
+    assert_eq!(steer, Some(1), "再次恢复后的请求应并入排队输入");
 
     h.shutdown().await.expect("clean shutdown");
 }
 
-/// 暂停中排队的输入被取消后不丢：留到下一次武装时与新输入合并执行。
+/// 暂停中排队的输入被取消时一并丢弃：用户点「停止」= 这一轮连同排队输入都不要。
+///
+/// 留着它会在下一次发言时被合并执行，而前端 `abortStream` 已在点击时清空排队区
+/// —— 界面消失、服务端却照跑，是真实的数据/UI 不一致。
 #[tokio::test]
-async fn test_paused_queued_query_survives_cancel_until_next_arm() {
+async fn test_paused_queued_query_dropped_by_cancel() {
     let (h, mut senders) = spawn_controllable_looper();
     reach_paused_during_tools(&h, &mut senders).await;
 
@@ -2168,7 +2426,7 @@ async fn test_paused_queued_query_survives_cancel_until_next_arm() {
     recv_until_state(&h, LooperState::Idle).await;
     assert!(!h.is_paused(), "取消收尾后镜像必须复位");
 
-    // 下一次武装：stranded 与 second 合并进同一条 user 消息
+    // 下一次武装只跑新输入：被丢弃的 stranded 不得再出现
     h.send_query("second".into()).await.expect("looper alive");
     feed_text_stream(&mut senders, "ok").await;
     let res = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2184,9 +2442,9 @@ async fn test_paused_queued_query_survives_cancel_until_next_arm() {
     })
     .await;
     let (input, outcome) = res.expect("下一次武装应在超时内起轮并完成");
-    assert!(
-        input.contains("stranded") && input.contains("second"),
-        "取消搁置的输入必须与新输入合并执行，实际 {input:?}"
+    assert_eq!(
+        input, "second",
+        "取消已丢弃排队输入，不得与新输入合并，实际 {input:?}"
     );
     match outcome {
         TurnOutcome::Success { text } => assert_eq!(text, "ok"),
@@ -2196,15 +2454,84 @@ async fn test_paused_queued_query_survives_cancel_until_next_arm() {
     h.shutdown().await.expect("clean shutdown");
 }
 
+/// 取消**在途轮**时丢弃未消费的 pending：这一轮不会再发请求，留着排队输入只会
+/// 在用户下一次发言时合并执行 —— 而用户刚点过「停止」。变异点：删掉
+/// `finalize_cancel` 里的 `clear_pending`，`has_pending()` 断言必红。
+#[tokio::test]
+async fn test_cancel_inflight_turn_discards_unconsumed_pending() {
+    let mut h = failure_looper_harness(false, false, true);
+    h.looper.set_quiet(LooperState::Streaming);
+    let _ = h.looper.handle_user_msg(UserMsg::Cancel);
+
+    h.looper.finalize_cancel().await;
+
+    assert!(
+        !h.looper.session().has_pending(),
+        "取消在途轮必须丢弃未消费的排队输入"
+    );
+    assert_eq!(h.looper.state(), LooperState::Idle, "收尾归位到干净 Idle");
+    assert_eq!(
+        h.looper.session().committed_turns().len(),
+        1,
+        "在途轮本身照常冻结"
+    );
+
+    let mut turn_starts = 0;
+    let mut turn_completes = 0;
+    while let Ok(ev) = h.events.try_recv() {
+        match ev {
+            LooperEvent::TurnStart { .. } => turn_starts += 1,
+            LooperEvent::TurnComplete { .. } => turn_completes += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(turn_starts, 0, "取消不得另起一轮");
+    assert_eq!(turn_completes, 1, "只收尾在途轮");
+}
+
+/// 无在途轮的 Cancel 只是撤回暂停意图：pending 是用户正经排队的输入，保留并
+/// 随快照落盘（③ 补落盘分支照旧）。变异点：无条件 `clear_pending`，本测试必红。
+#[tokio::test]
+async fn test_cancel_without_inflight_turn_keeps_pending() {
+    let mut h = failure_looper_harness(false, false, true);
+    // 造「无在途轮」：回滚到 Idle、staging 清空（pending 不受影响）
+    h.looper.session.rollback_turn(false).unwrap();
+    let _ = h.looper.handle_user_msg(UserMsg::Cancel);
+
+    h.looper.finalize_cancel().await;
+
+    assert!(
+        h.looper.session().has_pending(),
+        "无在途轮的取消必须保留排队输入"
+    );
+    assert_eq!(h.looper.state(), LooperState::Idle);
+    assert!(
+        h.looper.session().committed_turns().is_empty(),
+        "无在途轮时不得凭空冻结出轮次"
+    );
+}
+
 // ── 暂停延迟到模型调用边界（流式在途）tests ──────────────────────────
 
 type ChunkSender =
     tokio::sync::mpsc::UnboundedSender<Result<StreamChunk, model_provider::ProviderError>>;
 
+/// 每次模型请求的入参快照。
+struct CapturedRequest {
+    /// 系统指令 —— 动态上下文拼在这一段里。
+    instructions: Option<String>,
+    /// 历史（与 session 共享 Arc，零拷贝）。
+    input: Arc<[Arc<InputItem>]>,
+}
+
+type RequestCapture = tokio::sync::mpsc::UnboundedSender<CapturedRequest>;
+
 /// 可控慢流 provider：每次 `generate_stream` 把发送端交回测试，由测试
 /// 决定 chunk 投放时机，从而把 looper 确定地停在 `Streaming`。
 struct ControllableStreamProvider {
     senders: tokio::sync::mpsc::UnboundedSender<ChunkSender>,
+    /// 可选的模型请求入参捕获（验证 steering 是否真的进入请求）。
+    requests: Option<RequestCapture>,
 }
 
 #[async_trait::async_trait]
@@ -2222,8 +2549,14 @@ impl model_provider::ModelProvider for ControllableStreamProvider {
 
     async fn generate_stream(
         &self,
-        _request: &model_provider::GenerateRequest,
+        request: &model_provider::GenerateRequest,
     ) -> Result<GenerateStream, model_provider::ProviderError> {
+        if let Some(capture) = &self.requests {
+            let _ = capture.send(CapturedRequest {
+                instructions: request.instructions.clone(),
+                input: request.input.clone(),
+            });
+        }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.senders
             .send(tx)
@@ -2235,10 +2568,13 @@ impl model_provider::ModelProvider for ControllableStreamProvider {
     }
 }
 
-/// spawn 一个可控慢流 looper，返回句柄与「流发送端收件箱」。
-fn spawn_controllable_looper() -> (
+fn spawn_controllable_looper_impl(
+    capture_requests: bool,
+    dynamic_context: Option<Arc<dyn DynamicContext>>,
+) -> (
     LooperHandle,
     tokio::sync::mpsc::UnboundedReceiver<ChunkSender>,
+    Option<tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>>,
 ) {
     let profile: crate::agent::AgentProfile = serde_yaml::from_str(
         "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
@@ -2247,7 +2583,16 @@ fn spawn_controllable_looper() -> (
     let executor: Arc<dyn crate::tools::ToolExecutor> =
         Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let provider = Arc::new(ControllableStreamProvider { senders: tx });
+    let (requests, requests_rx) = if capture_requests {
+        let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel();
+        (Some(rtx), Some(rrx))
+    } else {
+        (None, None)
+    };
+    let provider = Arc::new(ControllableStreamProvider {
+        senders: tx,
+        requests,
+    });
     let agent = Arc::new(Agent::from_parts(
         std::path::PathBuf::from("/tmp/agent.md"),
         profile,
@@ -2262,10 +2607,44 @@ fn spawn_controllable_looper() -> (
     let handle = AgentLooper::spawn(
         agent,
         Box::new(session),
-        LooperConfig::default(),
+        LooperConfig {
+            dynamic_context,
+            ..Default::default()
+        },
         Arc::new(crate::persistence::NullSessionPersister),
     );
+    (handle, rx, requests_rx)
+}
+
+/// spawn 一个可控慢流 looper，返回句柄与「流发送端收件箱」。
+fn spawn_controllable_looper() -> (
+    LooperHandle,
+    tokio::sync::mpsc::UnboundedReceiver<ChunkSender>,
+) {
+    let (handle, rx, _) = spawn_controllable_looper_impl(false, None);
     (handle, rx)
+}
+
+/// 同 [`spawn_controllable_looper`]，额外捕获每次模型请求的入参。
+fn spawn_controllable_looper_capturing_requests() -> (
+    LooperHandle,
+    tokio::sync::mpsc::UnboundedReceiver<ChunkSender>,
+    tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
+) {
+    let (handle, rx, requests) = spawn_controllable_looper_impl(true, None);
+    (handle, rx, requests.expect("capture channel requested"))
+}
+
+/// 同 [`spawn_controllable_looper_capturing_requests`]，额外装配动态上下文召回器。
+fn spawn_controllable_looper_with_recall(
+    recall: Arc<dyn DynamicContext>,
+) -> (
+    LooperHandle,
+    tokio::sync::mpsc::UnboundedReceiver<ChunkSender>,
+    tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
+) {
+    let (handle, rx, requests) = spawn_controllable_looper_impl(true, Some(recall));
+    (handle, rx, requests.expect("capture channel requested"))
 }
 
 fn text_start() -> StreamChunk {
