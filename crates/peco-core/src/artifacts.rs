@@ -92,13 +92,28 @@ pub fn strip_artifact_lines(text: &str) -> (String, Vec<ArtifactDecl>) {
 ///
 /// `Parts` 中的文本部件一并处理（MCP 工具可能同时回图和文本），全部文本被剥离
 /// 干净时退回 `Content::Text("")`，避免出现空部件数组。
+///
+/// **每次工具结果都会经过这里**，而带声明的输出是极少数。因此无 marker 时走
+/// 零拷贝快路径：按值接收的 `Content` 原样归还，不复制文本、不重建部件数组。
+/// 快路径只做一次 `contains`（无匹配即早退），漏判的代价是整段输出的复制。
 pub fn strip_content(content: Content) -> (Content, Vec<ArtifactDecl>) {
     match content {
         Content::Text(text) => {
+            if !text.contains(ARTIFACT_MARKER) {
+                return (Content::Text(text), Vec::new());
+            }
             let (clean, decls) = strip_artifact_lines(&text);
             (Content::Text(clean), decls)
         }
         Content::Parts(parts) => {
+            let has_marker = parts.iter().any(|part| match part {
+                ContentPart::Text { text } => text.contains(ARTIFACT_MARKER),
+                _ => false,
+            });
+            if !has_marker {
+                return (Content::Parts(parts), Vec::new());
+            }
+
             let mut decls = Vec::new();
             let mut kept = Vec::with_capacity(parts.len());
             for part in parts {
@@ -251,6 +266,46 @@ mod tests {
         ));
         assert_eq!(decls.len(), 1);
         assert_eq!(clean, Content::Text(String::new()));
+    }
+
+    /// 快路径必须归还原 allocation，而不是复制一份。
+    ///
+    /// 变异点：快路径写成 `strip_artifact_lines` 的返回值（内部的
+    /// `text.to_string()`）⇒ 原串被复制，指针不等。
+    #[test]
+    fn strip_content_text_fast_path_does_not_copy() {
+        let text = String::from("plain output\n");
+        let ptr = text.as_ptr();
+        let (clean, decls) = strip_content(Content::Text(text));
+        assert!(decls.is_empty());
+        match clean {
+            Content::Text(t) => assert_eq!(t.as_ptr(), ptr, "no-marker text must not be copied"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// 部件数组无 marker 时同样零拷贝：Vec 的堆缓冲原样保留。
+    ///
+    /// 变异点：快路径只加在最前面而不判断 `has_marker` 就重建 `kept`
+    /// ⇒ 返回的 `Content::Parts` 换了缓冲。
+    #[test]
+    fn strip_content_parts_fast_path_does_not_copy() {
+        let parts = vec![
+            ContentPart::Text {
+                text: "看图\n".to_string(),
+            },
+            ContentPart::Image {
+                url: "data:image/png;base64,AAA".to_string(),
+                detail: None,
+            },
+        ];
+        let ptr = parts.as_ptr();
+        let (clean, decls) = strip_content(Content::Parts(parts));
+        assert!(decls.is_empty());
+        match clean {
+            Content::Parts(p) => assert_eq!(p.as_ptr(), ptr, "no-marker parts must not be rebuilt"),
+            other => panic!("expected Parts, got {other:?}"),
+        }
     }
 
     #[test]
