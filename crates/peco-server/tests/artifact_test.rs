@@ -11,7 +11,7 @@ mod common;
 
 use common::TestApp;
 use peco_core::artifacts::ArtifactDecl;
-use peco_core::workdir::WorkDirs;
+use peco_core::workspace::WorkDir;
 use serde_json::json;
 
 async fn create_conversation(app: &TestApp) -> String {
@@ -26,16 +26,15 @@ async fn create_conversation(app: &TestApp) -> String {
     body["id"].as_str().unwrap().to_string()
 }
 
-fn work_dirs(app: &TestApp) -> WorkDirs {
-    WorkDirs::from_workspace_root(&app.state.workspace_manager.workspace_dir(&app.user_id))
-        .expect("test workspace must follow <data_dir>/workspaces/<uid> layout")
+fn work_dir(app: &TestApp) -> WorkDir {
+    app.state.workspace_manager.work_dir(&app.user_id)
 }
 
 /// 在 work 目录下写文件，返回绝对路径。
 fn write_work_file(app: &TestApp, rel: &str, bytes: &[u8]) -> std::path::PathBuf {
     // output/ 必须存在：路径校验对 output 做 canonicalize（前缀比较的前提）
-    std::fs::create_dir_all(work_dirs(app).output()).unwrap();
-    let path = work_dirs(app).root().join(rel);
+    std::fs::create_dir_all(work_dir(app).output()).unwrap();
+    let path = work_dir(app).root().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, bytes).unwrap();
     path
@@ -49,7 +48,7 @@ async fn register(
 ) -> Result<Option<peco_server::artifact::ArtifactItem>, String> {
     peco_server::artifact::persist_declaration(
         &app.state.db,
-        &work_dirs(app),
+        &work_dir(app),
         conv_id,
         &app.user_id,
         &ArtifactDecl {
@@ -149,7 +148,7 @@ async fn rejects_escape_through_parent_segments() {
     let conv = create_conversation(&app).await;
     // 目录存在但目标在 output 之外：canonicalize 后前缀不匹配
     write_work_file(&app, "tmp/secret.txt", b"secret");
-    let abs = work_dirs(&app).output().join("../tmp/secret.txt");
+    let abs = work_dir(&app).output().join("../tmp/secret.txt");
 
     let err = register(&app, &conv, &abs, None).await.unwrap_err();
     assert!(err.contains("outside output dir"), "unexpected: {err}");
@@ -181,7 +180,7 @@ async fn rejects_relative_path() {
 async fn rejects_missing_file() {
     let app = TestApp::new().await;
     let conv = create_conversation(&app).await;
-    let abs = work_dirs(&app).output().join("media-gen/nope.jpg");
+    let abs = work_dir(&app).output().join("media-gen/nope.jpg");
     std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
 
     let err = register(&app, &conv, &abs, None).await.unwrap_err();
@@ -340,7 +339,7 @@ async fn declared_html_is_downgraded_inline() {
     // 脚本可以声明任意 MIME —— 同源内联 text/html 就是存储型 XSS
     let item = peco_server::artifact::persist_declaration(
         &app.state.db,
-        &work_dirs(&app),
+        &work_dir(&app),
         &conv,
         &app.user_id,
         &ArtifactDecl {
@@ -384,7 +383,7 @@ async fn tool_result_event_persists_before_emitting() {
 
     let ev = peco_server::artifact::build_tool_result_event(
         &app.state.db,
-        Some(&work_dirs(&app)),
+        &work_dir(&app),
         &conv,
         &app.user_id,
         "call_1".to_string(),
@@ -420,7 +419,7 @@ async fn tool_result_event_degrades_when_declaration_rejected() {
     let conv = create_conversation(&app).await;
     write_work_file(&app, "tmp/secret.txt", b"secret");
     let decls = vec![ArtifactDecl {
-        path: work_dirs(&app)
+        path: work_dir(&app)
             .output()
             .join("../tmp/secret.txt")
             .to_string_lossy()
@@ -431,7 +430,7 @@ async fn tool_result_event_degrades_when_declaration_rejected() {
 
     let ev = peco_server::artifact::build_tool_result_event(
         &app.state.db,
-        Some(&work_dirs(&app)),
+        &work_dir(&app),
         &conv,
         &app.user_id,
         "call_1".to_string(),

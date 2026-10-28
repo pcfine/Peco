@@ -36,7 +36,7 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use peco_core::artifacts::ArtifactDecl;
-use peco_core::workdir::WorkDirs;
+use peco_core::workspace::WorkDir;
 
 use crate::chat::sse::ChatSseEvent;
 use crate::db::artifacts as db_artifacts;
@@ -90,20 +90,18 @@ pub fn router() -> Router<std::sync::Arc<AppState>> {
 }
 
 /// 该用户的产物根（`<data_dir>/work/<user_id>`）。
-///
-/// workspace 布局不标准时返回 `None` —— 与 `WorkDirs` 的 fail-safe 一致：
-/// 宁可不登记，也不写到猜出来的位置。
-pub fn work_dirs(manager: &crate::workspace::WorkspaceManager, user_id: &str) -> Option<WorkDirs> {
-    let workspace = manager.workspace_dir(user_id);
-    WorkDirs::from_workspace_root(&workspace)
+pub fn work_dir(manager: &crate::workspace::WorkspaceManager, user_id: &str) -> WorkDir {
+    manager.work_dir(user_id)
 }
 
-/// 同 [`work_dirs`]，额外给出工作层根路径（列表端点判「文件是否还在」用）。
+/// 同 [`work_dir`]，额外给出工作目录根路径（列表端点判「文件是否还在」用）。
 pub fn work_root(
     manager: &crate::workspace::WorkspaceManager,
     user_id: &str,
-) -> Option<(PathBuf, WorkDirs)> {
-    work_dirs(manager, user_id).map(|w| (w.root().to_path_buf(), w))
+) -> (PathBuf, WorkDir) {
+    let work = work_dir(manager, user_id);
+    let root = work.root().to_path_buf();
+    (root, work)
 }
 
 /// 校验并登记一条声明。
@@ -112,7 +110,7 @@ pub fn work_root(
 /// （路径越界 / 文件不存在 / 用户无工作层），调用方记日志即可，不影响工具结果。
 pub async fn persist_declaration(
     db: &SqlitePool,
-    work: &WorkDirs,
+    work: &WorkDir,
     conversation_id: &str,
     user_id: &str,
     decl: &ArtifactDecl,
@@ -254,7 +252,7 @@ pub fn guess_mime(path: &Path) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 pub async fn build_tool_result_event(
     db: &SqlitePool,
-    work: Option<&WorkDirs>,
+    work: &WorkDir,
     conversation_id: &str,
     user_id: &str,
     id: String,
@@ -277,20 +275,11 @@ pub async fn build_tool_result_event(
 /// 对一批声明逐条登记；失败只告警，不影响工具结果。
 pub async fn persist_declarations(
     db: &SqlitePool,
-    work: Option<&WorkDirs>,
+    work: &WorkDir,
     conversation_id: &str,
     user_id: &str,
     decls: &[ArtifactDecl],
 ) -> Vec<ArtifactItem> {
-    let Some(work) = work else {
-        warn!(
-            user_id,
-            count = decls.len(),
-            "Artifact declarations dropped: workspace layout not recognized"
-        );
-        return Vec::new();
-    };
-
     let mut items = Vec::new();
     for decl in decls {
         match persist_declaration(db, work, conversation_id, user_id, decl).await {
@@ -329,14 +318,11 @@ pub(crate) async fn items_for_conversation(
         }
         None => db_artifacts::list_by_conversation(&state.db, conversation_id).await?,
     };
-    let work = work_root(&state.workspace_manager, user_id);
+    let (root, _) = work_root(&state.workspace_manager, user_id);
     Ok(rows
         .into_iter()
         .map(|row| {
-            let available = work
-                .as_ref()
-                .map(|(root, _)| root.join(&row.rel_path).is_file())
-                .unwrap_or(false);
+            let available = root.join(&row.rel_path).is_file();
             ArtifactItem::from_row(&row, available)
         })
         .collect())

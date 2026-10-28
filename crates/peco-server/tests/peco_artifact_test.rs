@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use common::TestApp;
 use peco_core::agent::LooperEvent;
 use peco_core::artifacts::ArtifactDecl;
-use peco_core::workdir::WorkDirs;
+use peco_core::workspace::WorkDir;
 use peco_server::artifact::ArtifactItem;
 use peco_server::chat::ChatSseEvent;
 use peco_server::peco::emitter::{RunEmitter, run_event_to_sse};
@@ -21,15 +21,14 @@ use peco_server::peco::session::{SESSION_AGENT_NAME, SESSION_TITLE, private_sess
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn work_dirs(app: &TestApp) -> WorkDirs {
-    WorkDirs::from_workspace_root(&app.state.workspace_manager.workspace_dir(&app.user_id))
-        .expect("test workspace must follow <data_dir>/workspaces/<uid> layout")
+fn work_dir(app: &TestApp) -> WorkDir {
+    app.state.workspace_manager.work_dir(&app.user_id)
 }
 
 /// 在 work 目录下写文件，返回绝对路径。
 fn write_work_file(app: &TestApp, rel: &str, bytes: &[u8]) -> std::path::PathBuf {
     // output/ 必须存在：路径校验对 output 做 canonicalize（前缀比较的前提）
-    let dirs = work_dirs(app);
+    let dirs = work_dir(app);
     std::fs::create_dir_all(dirs.output()).unwrap();
     let path = dirs.root().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -292,7 +291,7 @@ async fn event_shape_matches_chat_path() {
     .unwrap();
     let chat_ev = peco_server::artifact::build_tool_result_event(
         &app.state.db,
-        Some(&work_dirs(&app)),
+        &work_dir(&app),
         &agent_conv,
         &app.user_id,
         "call_t3".to_string(),
@@ -390,7 +389,7 @@ async fn rejected_declaration_degrades() {
 
     // 文件真实存在：canonicalize 消解 `..` 后落在 output 之外 → 证明是越界而非缺文件
     write_work_file(&app, "tmp/x.txt", b"secret");
-    let escaping = work_dirs(&app).output().join("../tmp/x.txt");
+    let escaping = work_dir(&app).output().join("../tmp/x.txt");
 
     let ev = tool_result_event(&app, "call_1", "done", vec![decl_of(&escaping, None)]).await;
     let ChatSseEvent::ToolResult {
@@ -697,8 +696,7 @@ fn write_user_work_file(
     rel: &str,
     bytes: &[u8],
 ) -> std::path::PathBuf {
-    let dirs = WorkDirs::from_workspace_root(&app.state.workspace_manager.workspace_dir(user_id))
-        .expect("test workspace must follow <data_dir>/workspaces/<uid> layout");
+    let dirs = app.state.workspace_manager.work_dir(user_id);
     std::fs::create_dir_all(dirs.output()).unwrap();
     let path = dirs.root().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -752,7 +750,7 @@ async fn seed_chat_conversation_artifacts(app: &TestApp, n: usize) -> Vec<String
         let abs = write_work_file(app, &format!("output/chat/{i}.png"), b"PNG-CHAT");
         let ev = peco_server::artifact::build_tool_result_event(
             &app.state.db,
-            Some(&work_dirs(app)),
+            &work_dir(app),
             &conversation_id,
             &app.user_id,
             format!("call_chat_{i}"),

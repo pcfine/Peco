@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 use crate::tools::AgentAccess;
 
 use super::definition::{WorkflowDefinition, pre_validate_workflow_yaml};
-use crate::workdir::WorkDirs;
+use crate::workspace::WorkDir;
 
 use super::engine::{WorkflowConfig, WorkflowEngine};
 use super::error::WorkflowError;
@@ -50,8 +50,8 @@ pub struct WorkflowMeta {
 /// **不再持有 persister**：persister 由调用方在 `execute()` 时按用户传入。
 pub struct WorkflowManager {
     workflows_dir: PathBuf,
-    /// 工作层目录。None 时不向 shell 步骤注入 `PECO_OUT_DIR` 等变量。
-    work_dirs: Option<WorkDirs>,
+    /// shell 步骤的执行目录。
+    work_dir: WorkDir,
     /// Tier-1 元数据缓存（name → WorkflowMeta）
     metas: RwLock<HashMap<String, WorkflowMeta>>,
     /// Tier-2 完整定义缓存（name → WorkflowDefinition）
@@ -63,26 +63,17 @@ impl WorkflowManager {
     ///
     /// 创建后应调用 [`init`](Self::init) 扫描目录并缓存元数据。
     /// persister 不再通过构造注入，改为在 [`execute`](Self::execute) 时按用户传入。
-    pub fn new(workflows_dir: PathBuf) -> Self {
+    pub fn new(workflows_dir: PathBuf, work_dir: WorkDir) -> Self {
         Self {
             workflows_dir,
-            work_dirs: None,
+            work_dir,
             metas: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
         }
     }
 
-    /// 注入工作层目录（由 [`crate::workspace::WorkSpace::open`] 调用）。
-    ///
-    /// 与 agent 侧共用同一份 [`WorkDirs`]，保证 workflow 步骤里的 shell
-    /// 与 agent 直接调 shell 落到完全相同的产物目录。
-    pub fn set_work_dirs(&mut self, work_dirs: Option<WorkDirs>) {
-        self.work_dirs = work_dirs;
-    }
-
-    /// 当前注入的工作层目录（供调用方 / 测试确认注入是否真的抵达引擎）。
-    pub fn work_dirs(&self) -> Option<&WorkDirs> {
-        self.work_dirs.as_ref()
+    pub fn work_dir(&self) -> &WorkDir {
+        &self.work_dir
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
@@ -304,7 +295,7 @@ impl WorkflowManager {
             persister,
             config,
             inputs,
-            self.work_dirs.clone(),
+            self.work_dir.clone(),
         ))
     }
 
@@ -507,6 +498,10 @@ mod tests {
         (tmp, wf_dir)
     }
 
+    fn work_dir() -> WorkDir {
+        WorkDir::new(std::env::temp_dir().join("peco-workflow-test"))
+    }
+
     fn create_workflow_file(dir: &Path, name: &str, description: &str, version: &str) {
         let wf_dir = dir.join(name);
         std::fs::create_dir_all(&wf_dir).unwrap();
@@ -522,7 +517,7 @@ mod tests {
         create_workflow_file(&wf_dir, "test-wf", "A test workflow", "1.0");
         create_workflow_file(&wf_dir, "another-wf", "Another one", "2.0");
 
-        let manager = WorkflowManager::new(wf_dir);
+        let manager = WorkflowManager::new(wf_dir, work_dir());
         let count = manager.init().unwrap();
         assert_eq!(count, 2);
     }
@@ -530,14 +525,17 @@ mod tests {
     #[test]
     fn test_init_empty_dir() {
         let (_tmp, wf_dir) = setup_test_dir();
-        let manager = WorkflowManager::new(wf_dir);
+        let manager = WorkflowManager::new(wf_dir, work_dir());
         let count = manager.init().unwrap();
         assert_eq!(count, 0);
     }
 
     #[test]
     fn test_init_nonexistent_dir() {
-        let manager = WorkflowManager::new(PathBuf::from("/tmp/nonexistent-workflow-dir-12345"));
+        let manager = WorkflowManager::new(
+            PathBuf::from("/tmp/nonexistent-workflow-dir-12345"),
+            work_dir(),
+        );
         let count = manager.init().unwrap();
         assert_eq!(count, 0);
     }
@@ -549,7 +547,7 @@ mod tests {
         create_workflow_file(&wf_dir, "alpha", "A", "1.0");
         create_workflow_file(&wf_dir, "mike", "M", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir);
+        let manager = WorkflowManager::new(wf_dir, work_dir());
         manager.init().unwrap();
         let names = manager.list_names();
         assert_eq!(names, vec!["alpha", "mike", "zulu"]);
@@ -560,7 +558,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "test-wf", "A test workflow", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir);
+        let manager = WorkflowManager::new(wf_dir, work_dir());
         manager.init().unwrap();
 
         let def1 = manager.load("test-wf").unwrap();
@@ -573,7 +571,7 @@ mod tests {
     #[test]
     fn test_load_missing() {
         let (_tmp, wf_dir) = setup_test_dir();
-        let manager = WorkflowManager::new(wf_dir);
+        let manager = WorkflowManager::new(wf_dir, work_dir());
         manager.init().unwrap();
 
         let err = manager.load("nonexistent").unwrap_err();
@@ -589,7 +587,7 @@ mod tests {
         let content = "---\nworkflow:\n  name: \"multi-step-wf\"\n  description: \"Multi-step\"\n  version: \"1.0\"\n  steps:\n    - id: \"lint\"\n      name: \"Lint\"\n      type: shell\n      config:\n        command: \"cargo clippy\"\n    - id: \"review\"\n      name: \"Review\"\n      type: agent\n      config:\n        agent: \"@reviewer\"\n        prompt: \"review code\"\n---\n";
         std::fs::write(wf_dir_inner.join("workflow.md"), content).unwrap();
 
-        let manager = WorkflowManager::new(wf_dir);
+        let manager = WorkflowManager::new(wf_dir, work_dir());
         manager.init().unwrap();
 
         let def = manager.load("multi-step-wf").unwrap();
@@ -607,7 +605,7 @@ mod tests {
     #[test]
     fn test_refresh_one_new_file_adds_tier1_meta() {
         let (_tmp, wf_dir) = setup_test_dir();
-        let manager = WorkflowManager::new(wf_dir.clone());
+        let manager = WorkflowManager::new(wf_dir.clone(), work_dir());
         manager.init().unwrap();
         assert_eq!(manager.list_names().len(), 0);
 
@@ -631,7 +629,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "test-wf", "Original", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir.clone());
+        let manager = WorkflowManager::new(wf_dir.clone(), work_dir());
         manager.init().unwrap();
         assert_eq!(manager.list_meta()[0].description, "Original");
 
@@ -650,7 +648,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "temp-wf", "Will be deleted", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir.clone());
+        let manager = WorkflowManager::new(wf_dir.clone(), work_dir());
         manager.init().unwrap();
         assert_eq!(manager.list_names().len(), 1);
 
@@ -667,7 +665,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "corrupt-wf", "Original meta", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir.clone());
+        let manager = WorkflowManager::new(wf_dir.clone(), work_dir());
         manager.init().unwrap();
         assert_eq!(manager.list_meta()[0].description, "Original meta");
 
@@ -687,7 +685,7 @@ mod tests {
         let (_tmp, wf_dir) = setup_test_dir();
         create_workflow_file(&wf_dir, "temp-wf", "Will be deleted", "1.0");
 
-        let manager = WorkflowManager::new(wf_dir.clone());
+        let manager = WorkflowManager::new(wf_dir.clone(), work_dir());
         manager.init().unwrap();
         assert_eq!(manager.list_names().len(), 1);
 

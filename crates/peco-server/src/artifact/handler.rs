@@ -55,8 +55,7 @@ async fn lookup(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("artifact '{id}' not found")))?;
 
-    let (root, _) = super::work_root(&state.workspace_manager, &user.user_id)
-        .ok_or_else(|| ApiError::Internal("work dir layout not recognized".to_string()))?;
+    let (root, _) = super::work_root(&state.workspace_manager, &user.user_id);
     let path = root.join(&row.rel_path);
 
     if !path.is_file() {

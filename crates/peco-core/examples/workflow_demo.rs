@@ -33,6 +33,7 @@ use peco_core::workflow::{
     WorkflowPersister, WorkflowStep,
 };
 use peco_core::workflow::{ExecuteWorkflow, OnFailure, WorkflowAccess};
+use peco_core::workspace::WorkDir;
 
 // ============================================================================
 // Demo 1: 编程方式构建 Workflow 并执行
@@ -145,7 +146,7 @@ async fn demo_programmatic_workflow() {
         persister,
         WorkflowConfig::default(),
         HashMap::new(),
-        None,
+        WorkDir::new("."),
     );
 
     // Step 4: 实时消费事件流
@@ -307,7 +308,10 @@ workflow:
     std::fs::write(wf_dir.join("workflow.md"), workflow_yaml).unwrap();
 
     // Step 2: 通过 WorkflowManager 加载
-    let manager = WorkflowManager::new(tmp.path().join("workflows"));
+    let manager = WorkflowManager::new(
+        tmp.path().join("workflows"),
+        WorkDir::new(tmp.path().join("work")),
+    );
     manager.init().unwrap();
 
     let names = manager.list_names();
@@ -483,7 +487,7 @@ async fn demo_execute_workflow_tool() {
         wf_access,
         Arc::new(NoopAgentAccess),
         Arc::new(NullWorkflowPersister),
-        None,
+        WorkDir::new("."),
     );
 
     println!("  🔧 Tool: execute_workflow");
@@ -631,7 +635,7 @@ async fn run_and_print(steps: &[WorkflowStep], label: &str) {
         Arc::new(NullWorkflowPersister),
         WorkflowConfig::default(),
         HashMap::new(),
-        None,
+        WorkDir::new("."),
     );
 
     while let Some(event) = handle.recv_event().await {

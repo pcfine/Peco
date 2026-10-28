@@ -2578,8 +2578,7 @@ mod tests {
             .await
             .unwrap();
 
-        let work = crate::artifact::work_dirs(&state.workspace_manager, &uid)
-            .expect("test workspace must follow <data_dir>/workspaces/<uid> layout");
+        let work = crate::artifact::work_dir(&state.workspace_manager, &uid);
         // 先写文件、后投递事件：此处 workspace 还没打开，output/ 得自己建
         std::fs::create_dir_all(work.output()).unwrap();
         let path = work.output().join("bridge/out.png");

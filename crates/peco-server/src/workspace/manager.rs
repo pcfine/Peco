@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock};
 use lru::LruCache;
 use peco_core::agent::Agent;
 use peco_core::config::SystemConfig;
+use peco_core::workspace::WorkDir;
 use peco_core::workspace::{WorkSpace, hash};
 use sqlx::SqlitePool;
 
@@ -389,6 +390,11 @@ impl WorkspaceManager {
         self.data_dir.join("workspaces").join(user_id)
     }
 
+    /// 获取指定用户的工作目录：`<data_dir>/work/<user_id>`。
+    pub fn work_dir(&self, user_id: &str) -> WorkDir {
+        WorkDir::new(self.data_dir.join("work").join(user_id))
+    }
+
     /// 返回系统级配置引用。
     pub fn system_config(&self) -> &SystemConfig {
         &self.system_config
@@ -408,8 +414,13 @@ impl WorkspaceManager {
     /// 注入：任何路径创建的 workspace 都携带审计，不会因创建顺序不同而
     /// 漏注入后被 LRU 缓存放大为删除工具永久拒绝。
     fn open_workspace(&self, user_id: &str, root: &std::path::Path) -> Result<WorkSpace, ApiError> {
-        let ws = WorkSpace::open(root.to_path_buf(), user_id.to_string(), &self.system_config)
-            .map_err(|e| ApiError::Internal(format!("failed to open workspace: {e}")))?;
+        let ws = WorkSpace::open(
+            root.to_path_buf(),
+            user_id.to_string(),
+            &self.system_config,
+            self.work_dir(user_id),
+        )
+        .map_err(|e| ApiError::Internal(format!("failed to open workspace: {e}")))?;
         ws.set_memory_audit(Arc::new(super::memory_audit::SqliteMemoryAudit::new(
             self.db.clone(),
         )));

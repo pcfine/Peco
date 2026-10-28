@@ -92,11 +92,11 @@ impl RunEmitter {
                         "peco private session row unavailable; artifact persist will degrade"
                     );
                 }
-                let work = crate::artifact::work_dirs(&self.workspace_manager, &self.user_id);
+                let work = crate::artifact::work_dir(&self.workspace_manager, &self.user_id);
                 PecoRunEvent(PecoRunEventKind::Persisted(
                     crate::artifact::build_tool_result_event(
                         &self.db,
-                        work.as_ref(),
+                        &work,
                         &conversation_id,
                         &self.user_id,
                         id,

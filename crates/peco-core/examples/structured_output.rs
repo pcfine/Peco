@@ -103,7 +103,7 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
         mcp_access: None,
         workflow_persister: None,
         workspace_root: None,
-        work_dirs: None,
+        work_dir: peco_core::workspace::WorkDir::new("."),
         web_search: None,
         memory_audit: None, // fail-closed：无审计存储时删除工具运行时拒绝
     };

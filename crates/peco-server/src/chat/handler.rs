@@ -580,10 +580,10 @@ pub async fn stream_chat(
                     // 子 agent 的最终正文若带声明行，父层构造结果时已剥离并挂在
                     // 本事件上；`AgentCallEnd` 只带文本，不能吞掉 —— 必须同样落库。
                     let work =
-                        crate::artifact::work_dirs(&workspace_manager_for_bg, &user_id_for_bg);
+                        crate::artifact::work_dir(&workspace_manager_for_bg, &user_id_for_bg);
                     let sse_ev = crate::artifact::build_tool_result_event(
                         &db_for_bg,
-                        work.as_ref(),
+                        &work,
                         &conv_id_for_bg,
                         &user_id_for_bg,
                         id.clone(),
@@ -682,10 +682,10 @@ pub async fn stream_chat(
                     ref artifacts,
                 }) if !artifacts.is_empty() => {
                     let work =
-                        crate::artifact::work_dirs(&workspace_manager_for_bg, &user_id_for_bg);
+                        crate::artifact::work_dir(&workspace_manager_for_bg, &user_id_for_bg);
                     let sse_ev = crate::artifact::build_tool_result_event(
                         &db_for_bg,
-                        work.as_ref(),
+                        &work,
                         &conv_id_for_bg,
                         &user_id_for_bg,
                         id.clone(),

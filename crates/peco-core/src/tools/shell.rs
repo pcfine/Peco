@@ -8,7 +8,7 @@ use peco_derive::peco_tool;
 use serde_json::json;
 use tracing::warn;
 
-use crate::workdir::WorkDirs;
+use crate::workspace::WorkDir;
 
 use super::command_screen::screen_command;
 use super::proc_group::{GroupGuard, configure_process_group};
@@ -50,7 +50,7 @@ fn timeout_from(raw: Option<&str>) -> Option<Duration> {
     description = "Execute a shell command and return the combined stdout and stderr output. Use this to run system commands, list directory contents, read files, or perform any other shell operation. The command is executed via `sh -c`. Set `cwd` to run the command from a specific directory.",
     params(
         command = "The shell command to execute. Examples: 'ls -la', 'cat file.txt', 'pwd', 'echo hello'",
-        cwd = "Optional working directory to run the command from. Use an absolute path — e.g. a skill's directory (returned by read_skill) so relative script paths like 'python scripts/foo.py' resolve correctly."
+        cwd = "Optional working directory to run the command from. Skill scripts can be run by the absolute path returned by read_skill; set cwd when a command relies on relative paths."
     ),
     required = ["command"]
 )]
@@ -69,7 +69,7 @@ async fn run_shell(
     command: &str,
     cwd: Option<&str>,
     timeout: Option<Duration>,
-    work: Option<&WorkDirs>,
+    work: Option<&WorkDir>,
 ) -> Result<String, ToolError> {
     if let Some(reason) = screen_command(command) {
         return Err(ToolError::ToolCallError(Box::new(std::io::Error::new(
@@ -82,8 +82,6 @@ async fn run_shell(
     cmd.arg("-c").arg(command);
     // 标记后代，供下次启动时清理上一代孤儿（见 peco-server 的 orphan_reaper）。
     cmd.env("PECO_SHELL_CHILD", "1");
-    // 工作层目录：产物默认落点，避免 skill 各自拼相对路径
-    // （相对路径会随 cwd 漂移，且不会报错）。
     if let Some(work) = work {
         for (key, value) in work.envs() {
             cmd.env(key, value);
@@ -161,14 +159,16 @@ async fn run_shell(
 // 宏展开保留的原始 `shell_exec` 函数。
 
 pub struct ShellTool {
-    default_cwd: Option<PathBuf>,
-    /// 工作层目录。None 时不注入（历史行为逐字节一致）。
-    work: Option<WorkDirs>,
+    default_cwd: PathBuf,
+    work: WorkDir,
 }
 
 impl ShellTool {
-    pub fn new(default_cwd: Option<PathBuf>, work: Option<WorkDirs>) -> Self {
-        Self { default_cwd, work }
+    pub fn new(work: WorkDir) -> Self {
+        Self {
+            default_cwd: work.root().to_path_buf(),
+            work,
+        }
     }
 }
 
@@ -186,23 +186,17 @@ impl ToolDyn for ShellTool {
 
     fn definition(&self) -> ToolDefinition {
         let mut def = <ShellExec as Tool>::definition(&ShellExec);
-        // 仅在提供默认 cwd 时补充参数描述；None 时与 ShellExec 逐字段一致
-        // （向后兼容锚点：非 WorkSpace 路径的行为不因包装而改变）
-        if self.default_cwd.is_some() {
-            // miss = 宏生成的 schema 形状漂移
-            // 必须响亮失败而不是静默跳过
-            let desc = def
-                .parameters
-                .pointer_mut("/properties/cwd/description")
-                .expect("shell schema must contain /properties/cwd/description");
-            *desc = json!(
-                "Optional working directory to run the command from. \
-                 If omitted, the command runs in the workspace root directory. \
-                 Use an absolute path — e.g. a skill's directory (returned by \
-                 read_skill) so relative script paths like 'python \
-                 scripts/foo.py' resolve correctly."
-            );
-        }
+        // miss = 宏生成的 schema 形状漂移，必须响亮失败而不是静默跳过
+        let desc = def
+            .parameters
+            .pointer_mut("/properties/cwd/description")
+            .expect("shell schema must contain /properties/cwd/description");
+        *desc = json!(
+            "Optional working directory to run the command from. \
+             If omitted, the command runs in the workspace's working directory. \
+             Skill scripts can be run by the absolute path returned by read_skill; \
+             set cwd when a command relies on relative paths."
+        );
         def
     }
 
@@ -214,12 +208,12 @@ impl ToolDyn for ShellTool {
             // 直接复用宏生成的参数结构 — 避免手写副本与 schema 漂移
             let params: <ShellExec as Tool>::Args =
                 serde_json::from_str(&args).map_err(ToolError::JsonError)?;
-            let cwd = resolve_cwd(params.cwd, self.default_cwd.as_deref());
+            let cwd = resolve_cwd(params.cwd, Some(&self.default_cwd));
             run_shell(
                 &params.command,
                 cwd.as_deref(),
                 shell_timeout(),
-                self.work.as_ref(),
+                Some(&self.work),
             )
             .await
             .map(Content::Text)
@@ -264,17 +258,16 @@ mod tests {
 
     #[test]
     fn test_shell_tool_definition_patched() {
-        let tool = ShellTool::new(Some(PathBuf::from("/ws")), None);
+        let tool = ShellTool::new(WorkDir::new("/ws"));
         let def = tool.definition();
         assert_eq!(def.name, "shell");
 
         let exec_def = <ShellExec as Tool>::definition(&ShellExec);
-        // cwd 描述补充了默认行为
         assert!(
             def.parameters["properties"]["cwd"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("workspace root directory")
+                .contains("working directory")
         );
         // 其余部分与 ShellExec 一致
         assert_eq!(
@@ -285,22 +278,11 @@ mod tests {
         assert_eq!(def.parameters["required"], json!(["command"]));
     }
 
-    #[test]
-    fn test_shell_tool_definition_none_identical() {
-        // 无默认 cwd 时，definition 必须与 ShellExec 逐字段相同
-        let tool = ShellTool::new(None, None);
-        let def = tool.definition();
-        let exec_def = <ShellExec as Tool>::definition(&ShellExec);
-        assert_eq!(def.name, exec_def.name);
-        assert_eq!(def.description, exec_def.description);
-        assert_eq!(def.parameters, exec_def.parameters);
-    }
-
     #[tokio::test]
     async fn test_shell_tool_default_cwd_used() {
         let dir = std::env::temp_dir().join(format!("peco-shell-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tool = ShellTool::new(Some(dir.clone()), None);
+        let tool = ShellTool::new(WorkDir::new(dir.clone()));
         let out = tool
             .call(r#"{"command": "pwd"}"#.to_string())
             .await

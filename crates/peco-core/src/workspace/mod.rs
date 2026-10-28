@@ -4,6 +4,7 @@
 //
 // 提供：
 // - [`WorkSpace`] — 用户工作空间，持有所有用户级资源
+// - [`WorkDir`] — shell 命令的执行目录
 // - [`WorkspaceError`] — WorkSpace 相关错误类型
 //
 // Tool 组装相关的 trait 和工厂已迁移到 [`crate::tools`] 模块：
@@ -15,6 +16,7 @@
 
 mod error;
 pub mod hash;
+pub mod workdir;
 #[allow(clippy::module_inception)]
 mod workspace;
 
@@ -24,4 +26,5 @@ pub use crate::tools::{
 };
 pub use crate::workflow::WorkflowAccess;
 pub use error::WorkspaceError;
+pub use workdir::WorkDir;
 pub use workspace::{TemplateInitReport, WorkSpace};

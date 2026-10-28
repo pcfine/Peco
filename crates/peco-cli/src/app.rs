@@ -10,7 +10,7 @@ use peco_core::agent::{Agent, AgentLooper, LooperEvent, LooperHandle};
 use peco_core::config::SystemConfig;
 use peco_core::persistence::SessionPersister;
 use peco_core::session::Session;
-use peco_core::workspace::WorkSpace;
+use peco_core::workspace::{WorkDir, WorkSpace};
 
 use crate::commands::{self, CommandRegistry, CommandResult};
 use crate::config::CliConfig;
@@ -69,8 +69,13 @@ impl CliApp {
             .unwrap_or_else(|_| "cli-user".to_string());
 
         let workspace = Arc::new(
-            WorkSpace::open(config.workspace_root.clone(), user_id, &system_config)
-                .map_err(|e| anyhow::anyhow!("WorkSpace 创建失败: {e}"))?,
+            WorkSpace::open(
+                config.workspace_root.clone(),
+                user_id,
+                &system_config,
+                WorkDir::new(config.workspace_root.clone()),
+            )
+            .map_err(|e| anyhow::anyhow!("WorkSpace 创建失败: {e}"))?,
         );
         workspace.inject_deps();
 

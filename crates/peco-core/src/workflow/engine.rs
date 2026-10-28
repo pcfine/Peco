@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::tools::AgentAccess;
-use crate::workdir::WorkDirs;
+use crate::workspace::WorkDir;
 
 use super::condition::evaluate_condition;
 use super::dag::DagGraph;
@@ -68,9 +68,8 @@ pub struct WorkflowEngine {
     definition: WorkflowDefinition,
     agent_access: Arc<dyn AgentAccess>,
     persister: Arc<dyn WorkflowPersister>,
-    /// 工作层目录 —— shell 步骤据此注入 `PECO_OUT_DIR` 等变量，
-    /// 与 agent 侧共用以避免两处产物落到不同位置。
-    work_dirs: Option<WorkDirs>,
+    /// shell 步骤的执行目录，与 agent 侧共用。
+    work_dir: WorkDir,
     #[allow(dead_code)]
     config: WorkflowConfig,
 }
@@ -97,7 +96,7 @@ impl WorkflowEngine {
         persister: Arc<dyn WorkflowPersister>,
         config: WorkflowConfig,
         inputs: HashMap<String, serde_json::Value>,
-        work_dirs: Option<WorkDirs>,
+        work_dir: WorkDir,
     ) -> WorkflowHandle {
         let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -112,7 +111,7 @@ impl WorkflowEngine {
             definition,
             agent_access,
             persister,
-            work_dirs,
+            work_dir,
             config,
         };
 
@@ -213,7 +212,7 @@ impl WorkflowEngine {
         inputs: HashMap<String, serde_json::Value>,
     ) {
         let run_id = self.run_id.clone();
-        let work_dirs = self.work_dirs.clone();
+        let work_dir = self.work_dir.clone();
         let workflow_name = self.definition.name.clone();
         let total_steps = self.definition.steps.len();
 
@@ -464,11 +463,10 @@ impl WorkflowEngine {
                 let ctx = tpl_ctx.clone();
                 let cancel = cancel_flag.clone();
                 let agent_access = self.agent_access.clone();
-                let work = work_dirs.clone();
+                let work = work_dir.clone();
 
                 let handle = tokio::spawn(async move {
-                    execute_step_static(&step_data, &ctx, &cancel, &agent_access, work.as_ref())
-                        .await
+                    execute_step_static(&step_data, &ctx, &cancel, &agent_access, &work).await
                 });
                 handles.push((step_id, handle));
             }
@@ -874,7 +872,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut events = Vec::new();
@@ -927,7 +925,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut events = Vec::new();
@@ -977,7 +975,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut completed = false;
@@ -1031,7 +1029,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut skipped = false;
@@ -1088,7 +1086,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut failed = false;
@@ -1136,7 +1134,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut completed = false;
@@ -1175,7 +1173,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         // Wait for StepStarted, then cancel
@@ -1226,7 +1224,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut timed_out = false;
@@ -1286,7 +1284,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut step_failed_timeout = false;
@@ -1345,7 +1343,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut paused = false;
@@ -1410,7 +1408,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let mut aborted_after_pause = false;
@@ -1454,7 +1452,7 @@ mod tests {
             Arc::new(NullWorkflowPersister),
             WorkflowConfig::default(),
             HashMap::new(),
-            None,
+            WorkDir::new(std::env::temp_dir()),
         );
 
         let expected_run_id = handle.run_id().to_string();

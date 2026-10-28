@@ -11,9 +11,9 @@ use crate::config::{McpServerConfig, TransportType};
 use crate::knowledge::KnowledgeManager;
 use crate::search::SearchBackend;
 use crate::skills::{SkillRegister, SkillResourceFile};
-use crate::workdir::WorkDirs;
 use crate::workflow::WorkflowAccess;
 use crate::workflow::persistence::WorkflowPersister;
+use crate::workspace::WorkDir;
 
 // ============================================================================
 // AgentAccess — 所有 Agent 相关工具需要（加载、创建、列表）
@@ -186,12 +186,11 @@ pub struct ToolDependencies {
     pub mcp_access: Option<Arc<dyn McpAccess>>,
     /// Workflow 持久化支持。Optional — None 时使用 NullWorkflowPersister。
     pub workflow_persister: Option<Arc<dyn WorkflowPersister>>,
-    /// 工作空间根目录。用于 shell 工具的默认 cwd 与 show_workspace 的 root 输出。
-    /// Optional — None 时行为与历史版本逐字节一致（examples / 非 WorkSpace 路径）。
+    /// 工作空间根目录。用于 show_workspace 的 root 输出；
+    /// shell 的默认 cwd 优先取 `work_dir`。
     pub workspace_root: Option<PathBuf>,
-    /// 工作层目录（产物 / 工程 / 临时）。注入 shell 子进程的 `PECO_OUT_DIR` 等变量。
-    /// Optional — None 时不注入，子进程环境与历史版本一致。
-    pub work_dirs: Option<WorkDirs>,
+    /// 工作目录（shell 的默认 cwd）。
+    pub work_dir: WorkDir,
     /// web 搜索后端（来自 providers.toml 的 `[web_search]` 段）。
     /// Optional — None 时 web_search 工具 warn + skip，保持向后兼容。
     pub web_search: Option<Arc<SearchBackend>>,
@@ -211,7 +210,7 @@ impl Clone for ToolDependencies {
             mcp_access: self.mcp_access.clone(),
             workflow_persister: self.workflow_persister.clone(),
             workspace_root: self.workspace_root.clone(),
-            work_dirs: self.work_dirs.clone(),
+            work_dir: self.work_dir.clone(),
             web_search: self.web_search.clone(),
             memory_audit: self.memory_audit.clone(),
         }

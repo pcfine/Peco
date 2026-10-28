@@ -10,10 +10,10 @@ use crate::config::{McpConfig, SystemConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
 use crate::mcp::McpConfigStore;
 use crate::skills::{SkillRegister, SkillResourceFile};
-use crate::workdir::WorkDirs;
 use crate::workflow::{WorkflowAccess, WorkflowManager};
 
 use super::error::WorkspaceError;
+use super::workdir::WorkDir;
 use crate::tools::{
     AgentAccess, KnowledgeAccess, McpAccess, McpServerInfo, MemoryAuditAccess, SkillProvider,
     ToolExecutor, ToolRegister,
@@ -61,9 +61,7 @@ fn agent_template_version(content: &str) -> u32 {
 pub struct WorkSpace {
     user_id: String,
     root: PathBuf,
-    /// 工作层目录（产物 / 工程 / 临时）。
-    /// None 表示路径不符合 `<data_dir>/workspaces/<user_id>` 布局。
-    work_dirs: Option<WorkDirs>,
+    work_dir: WorkDir,
     /// 系统级配置快照 — 用户 providers.toml 与之深递归合并。
     /// 进程内不变，但需保留以支持 [`WorkSpace::reload_providers`] 重新合并。
     system_config: SystemConfig,
@@ -76,10 +74,12 @@ pub struct WorkSpace {
 }
 
 impl WorkSpace {
+    /// 打开（必要时创建）一个 workspace。
     pub fn open(
         root: PathBuf,
         user_id: String,
         system_config: &SystemConfig,
+        work_dir: WorkDir,
     ) -> Result<Self, WorkspaceError> {
         std::fs::create_dir_all(&root).map_err(|e| {
             WorkspaceError::WorkspaceDir(format!(
@@ -114,35 +114,28 @@ impl WorkSpace {
         let kb_dir = root.join("knowledge");
         let knowledge_manager = Arc::new(KnowledgeManager::with_scope(kb_dir, user_id.clone()));
 
-        // 工作层目录（`<data_dir>/work/<user_id>`）：产物与工程落在 workspace 之外，
-        // 使 workspace 保持「只含定义与记忆」，可整体打包迁移。
-        // 非标准布局（测试临时目录 / examples）推导失败 → None，行为不变。
-        let work_dirs = WorkDirs::from_workspace_root(&root);
-        if let Some(dirs) = &work_dirs
-            && let Err(e) = dirs.ensure()
-        {
-            tracing::warn!(error = %e, root = %dirs.root().display(), "Failed to create work dirs");
+        if let Err(e) = work_dir.ensure() {
+            tracing::warn!(error = %e, root = %work_dir.root().display(), "Failed to create work dir");
         }
 
         let agents_dir = root.join("agents");
         let mcp_config_store = McpConfigStore::new(config.mcp.clone());
-        let mut agent_manager = AgentManager::new(
+        let agent_manager = AgentManager::new(
             agents_dir,
             user_id.clone(),
             config.clone(),
             mcp_config_store,
             skill_registry.clone(),
             knowledge_manager.clone(),
+            work_dir.clone(),
         );
-        agent_manager.set_work_dirs(work_dirs.clone());
         let agent_manager = Arc::new(agent_manager);
         if let Err(e) = agent_manager.init() {
             tracing::warn!(error = %e, "Failed to scan agent metadata");
         }
 
         let workflows_dir = root.join("workflows");
-        let mut workflow_manager = WorkflowManager::new(workflows_dir);
-        workflow_manager.set_work_dirs(work_dirs.clone());
+        let workflow_manager = WorkflowManager::new(workflows_dir, work_dir.clone());
         let workflow_manager = Arc::new(workflow_manager);
         if let Err(e) = workflow_manager.init() {
             tracing::warn!(error = %e, "Failed to scan workflow metadata");
@@ -151,7 +144,7 @@ impl WorkSpace {
         Ok(Self {
             user_id,
             root,
-            work_dirs,
+            work_dir,
             system_config: system_config.clone(),
             config: RwLock::new(config),
             skill_registry,
@@ -166,9 +159,8 @@ impl WorkSpace {
     pub fn user_id(&self) -> &str {
         &self.user_id
     }
-    /// 工作层目录（可能为 None —— 非标准布局）。
-    pub fn work_dirs(&self) -> Option<&WorkDirs> {
-        self.work_dirs.as_ref()
+    pub fn work_dir(&self) -> &WorkDir {
+        &self.work_dir
     }
 
     pub fn root(&self) -> &Path {
@@ -714,63 +706,45 @@ mod tests {
             root.join("workspace"),
             "test-user".into(),
             &system_config(root),
+            WorkDir::new(root.join("work")),
         )
         .unwrap()
     }
 
-    /// 标准布局（`<data_dir>/workspaces/<uid>`）必须推导出工作层目录并创建。
-    ///
-    /// 这条断言钉住的是「产物落在 workspace 之外」这一约定：
-    /// 一旦 `WorkSpace::open` 不再建 `work/`，迁移包就会重新混入产物。
+    /// 传入的工作目录必须被创建。
     #[test]
-    fn open_creates_work_dirs_outside_workspace() {
+    fn open_creates_supplied_work_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspaces").join("u1");
-        let ws = WorkSpace::open(root, "u1".into(), &system_config(tmp.path())).unwrap();
+        let dir = WorkDir::new(tmp.path().join("work/u1"));
+        let ws =
+            WorkSpace::open(root, "u1".into(), &system_config(tmp.path()), dir.clone()).unwrap();
 
-        let dirs = ws
-            .work_dirs()
-            .expect("standard layout must derive work dirs");
-        assert_eq!(dirs.output(), tmp.path().join("work/u1/output"));
-        assert_eq!(dirs.projects(), tmp.path().join("work/u1/projects"));
-        for dir in [dirs.root(), dirs.output(), dirs.projects(), dirs.tmp()] {
-            assert!(dir.is_dir(), "{} should be created", dir.display());
-        }
-        // 工作层不在 workspace 内 —— 打包 workspace 不会带走产物
-        assert!(!tmp.path().join("workspaces/u1/work").exists());
+        assert_eq!(ws.work_dir(), &dir);
+        assert!(dir.root().is_dir(), "work root should be created");
+        assert!(!dir.output().exists(), "output/ is created on demand");
+        assert!(!dir.tmp().exists(), "tmp/ is created on demand");
     }
 
-    /// 非标准布局（测试临时目录）推导失败 → None，且不创建任何 work 目录。
+    /// 工作目录必须抵达两个 shell 执行点。
     #[test]
-    fn open_skips_work_dirs_for_non_standard_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = make_workspace(tmp.path());
-        assert!(ws.work_dirs().is_none());
-        assert!(!tmp.path().join("work").exists());
-        // 推导失败必须一路传到底，否则会注入空路径
-        assert!(ws.agent_manager().build_deps().work_dirs.is_none());
-    }
-
-    /// 推导出的工作层目录必须真的抵达两个 shell 执行点。
-    ///
-    /// 漏掉任一 `set_work_dirs` 都不会报错 —— 产物会安静地退回 workspace，
-    /// 正是本功能要消灭的那种回归。
-    #[test]
-    fn open_wires_work_dirs_into_managers() {
+    fn open_wires_work_dir_into_managers() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspaces").join("u1");
-        let ws = WorkSpace::open(root, "u1".into(), &system_config(tmp.path())).unwrap();
-        let dirs = ws.work_dirs().expect("standard layout must derive");
+        let dir = WorkDir::new(tmp.path().join("work/u1"));
+        let ws =
+            WorkSpace::open(root, "u1".into(), &system_config(tmp.path()), dir.clone()).unwrap();
+        let dir = ws.work_dir();
 
         assert_eq!(
-            ws.agent_manager().build_deps().work_dirs.as_ref(),
-            Some(dirs),
-            "agent shell 的 ToolDependencies 未拿到 WorkDirs"
+            &ws.agent_manager().build_deps().work_dir,
+            dir,
+            "agent shell 的 ToolDependencies 未拿到 WorkDir"
         );
         assert_eq!(
-            ws.workflow_manager().work_dirs(),
-            Some(dirs),
-            "workflow shell 步骤未拿到同一份 WorkDirs"
+            ws.workflow_manager().work_dir(),
+            dir,
+            "workflow shell 步骤未拿到同一份 WorkDir"
         );
     }
 

@@ -85,12 +85,7 @@ impl ToolRegister {
         for name in tool_names {
             let tool: Option<Box<dyn ToolDyn>> = match name.as_str() {
                 // ── 零依赖工具 ──────────────────────────
-                // ShellTool 包装 ShellExec，工作空间根目录作为默认 cwd
-                // （workspace_root 为 None 时行为与旧 ShellExec 逐字节一致）
-                "shell" => Some(Box::new(ShellTool::new(
-                    deps.workspace_root.clone(),
-                    deps.work_dirs.clone(),
-                ))),
+                "shell" => Some(Box::new(ShellTool::new(deps.work_dir.clone()))),
                 "fetch" => Some(Box::new(Fetch)),
                 "list_tools" => Some(Box::new(ListTools { deps: deps.clone() })),
 
@@ -142,7 +137,7 @@ impl ToolRegister {
                             wa.clone(),
                             deps.agent_access.clone(),
                             persister,
-                            deps.work_dirs.clone(),
+                            deps.work_dir.clone(),
                         )))
                     }
                     None => skip_missing_dep("execute_workflow", "workflow_access"),
@@ -320,6 +315,7 @@ mod tests {
     use crate::search::{SearchBackend, searxng::SearxngClient};
     use crate::skills::SkillRegister;
     use crate::workflow::WorkflowAccess;
+    use crate::workspace::WorkDir;
 
     use super::super::NoopMemoryAudit;
 
@@ -440,7 +436,7 @@ mod tests {
             mcp_access: None,
             workflow_persister: None,
             workspace_root: None,
-            work_dirs: None,
+            work_dir: WorkDir::new(dir.join("work")),
             web_search: None,
             // fail-closed 默认：审计存储未注入，删除工具运行时拒绝
             memory_audit: None,
