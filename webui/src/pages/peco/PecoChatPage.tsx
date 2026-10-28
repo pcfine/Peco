@@ -42,6 +42,7 @@ export function PecoChatPage() {
   const sessionKey = usePecoChatStore((s) => s.sessionKey);
   const isStreaming = usePecoChatStore((s) => s.isStreaming);
   const paused = usePecoChatStore((s) => s.paused);
+  const queued = usePecoChatStore((s) => s.queued);
   const usage = usePecoChatStore((s) => s.usage);
   const load = usePecoChatStore((s) => s.load);
   const refresh = usePecoChatStore((s) => s.refresh);
@@ -219,6 +220,7 @@ export function PecoChatPage() {
         externalIsStreaming={isStreaming}
         externalUsage={usage}
         externalPaused={paused}
+        externalQueued={queued}
         onPause={pause}
         onResume={resume}
         onLoadEarlier={loadEarlier}

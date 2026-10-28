@@ -17,6 +17,7 @@ import {
 import { useAuthStore } from "@/stores/authStore";
 import type {
   ChatSseEvent,
+  ErrorData,
   MessageData,
   TurnData,
   UsageData,
@@ -171,6 +172,8 @@ export interface ChatMessage {
   images?: string[];
   /** 用户消息携带的文档附件名（附件正文不进展示层），来自快照 DTO attachments */
   attachments?: { name: string }[];
+  /** steering 并入当前轮的用户消息：本轮耗时起点须越过它，向前取真正的轮起点。 */
+  steered?: boolean;
   /** 本轮终态与耗时（仅结论消息携带）。 */
   turnResult?: TurnResult;
   /** 错误提示消息（来自 SSE `error` 事件），以警示样式渲染 */
@@ -186,6 +189,12 @@ export interface ChatMessage {
    * 构造时刻。孤儿工具输出与中断横幅没有正文气泡，故留空；缺失即不渲染。
    */
   timestampMs?: number;
+}
+
+/** [mode="external"] 在途轮期间排队、等待下一次模型请求送达的用户输入。 */
+export interface QueuedChatMessage {
+  id: string;
+  text: string;
 }
 
 export interface ChatViewProps {
@@ -245,6 +254,9 @@ export interface ChatViewProps {
    *  本地循环收不到 `looper_state`，故以本 prop 为权威值。缺省按 false 处理；
    *  internal 模式忽略本 prop。 */
   externalPaused?: boolean;
+  /** [mode="external"] 在途轮期间已排队、等待下一次模型请求送达的用户输入。
+   *  在输入框上方以「已排队」区展示；送达后由 store 落成正式消息气泡。 */
+  externalQueued?: QueuedChatMessage[];
   /**
    * [可选] 暂停当前运行中的 looper。与 `onResume` **同时提供**时才出现入口，
    * 且只在流式进行中展示（`ExternalIsStreaming ?? streaming`）。
@@ -289,6 +301,7 @@ export function ChatView({
   externalIsStreaming,
   externalUsage = null,
   externalPaused = false,
+  externalQueued = [],
   onPause,
   onResume,
   onLoadEarlier,
@@ -510,10 +523,12 @@ export function ChatView({
     const tok = tokenRef.current;
     const streaming = externalIsStreamingRef.current ?? streamingRef.current;
     const attachments = pendingAttachmentsRef.current;
+    // external 模式允许在途发送：消息进入排队区，由 store 经控制通道投递，
+    // 在下一次模型请求或下一轮生效。internal 模式仍要求轮到 Idle 才能发。
     if (
       (!currentInput.trim() && attachments.length === 0) ||
       !tok ||
-      streaming ||
+      (streaming && !isExternalMode) ||
       uploadingRef.current
     )
       return;
@@ -524,7 +539,7 @@ export function ChatView({
     } else {
       await sendMessage(currentInput);
     }
-  }, [sendMessage]);
+  }, [sendMessage, isExternalMode]);
 
   // ── initialQuery auto-send ──────────────────────────────────────────────
 
@@ -776,7 +791,10 @@ export function ChatView({
   // external 模式的 SSE 由 store 管理，本地循环收不到 `looper_state`，
   // 故以父组件传入的 externalPaused 为权威；internal 模式仍认本地事件。
   const effectivePaused = isExternalMode ? externalPaused : paused;
-  const isInputDisabled = isStreaming || !visible;
+  // external 模式在途也允许输入（消息排队，下一次请求/下一轮送达）；
+  // internal 模式仍要求轮到 Idle。
+  const isInputDisabled = (isStreaming && !isExternalMode) || !visible;
+  const queuedCount = externalQueued.length;
 
   // 暂态的两个解除点：服务端确认挂起，或本轮结束（按钮随门控消失）
   useEffect(() => {
@@ -842,9 +860,37 @@ export function ChatView({
       {/* Input */}
       <div className="pt-4 mt-4 border-t border-border">
         <div className="flex flex-col rounded-2xl border bg-card shadow-xs focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
+          {/* 在途轮已排队、尚未被模型请求消费的输入。送达后由 store 落成正式
+              气泡（`user_steer` / 轮次收尾兜底），这里只承担「没有石沉大海」的
+              即时回显。 */}
+          {queuedCount > 0 && (
+            <div
+              data-slot="queued-inputs"
+              className="flex flex-col gap-1 px-3 pt-2 text-xs text-muted-foreground"
+            >
+              {externalQueued.map((item) => (
+                <div key={item.id} className="flex items-start gap-1.5">
+                  <span className="shrink-0 text-muted-foreground/70">
+                    已排队
+                  </span>
+                  <span className="line-clamp-1 break-all">{item.text}</span>
+                </div>
+              ))}
+              <div className="text-muted-foreground/60">
+                将在下一次模型请求时送达
+              </div>
+            </div>
+          )}
+
           <Textarea
             className="min-h-10 max-h-40 resize-none border-0 px-3 pt-2.5 pb-0 shadow-none focus-visible:ring-0"
-            placeholder={isInputDisabled ? "加载中…" : "输入消息..."}
+            placeholder={
+              isInputDisabled
+                ? "加载中…"
+                : isExternalMode && isStreaming
+                  ? "输入消息，将在下一次模型请求时送达…"
+                  : "输入消息..."
+            }
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -1010,7 +1056,7 @@ export function ChatView({
                   </TooltipContent>
                 </Tooltip>
               )}
-              {isStreaming ? (
+              {isStreaming && (
                 <Button
                   variant="destructive"
                   size="sm"
@@ -1019,7 +1065,10 @@ export function ChatView({
                 >
                   <Square className="h-4 w-4" />
                 </Button>
-              ) : (
+              )}
+              {/* external 模式在途也保留发送入口（消息排队）；internal 模式
+                  流式中仍只给停止，避免新 SSE 顶替在途 run。 */}
+              {(!isStreaming || isExternalMode) && (
                 <Button
                   size="sm"
                   onClick={handleSend}
@@ -1211,10 +1260,12 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   // 正文走气泡，过程（推理与工具行）保持裸行。
   const toolCalls = message.toolCalls ?? [];
   // 空白正文不算内容：流式首个 token 常是 "\n"，真值判断会留下一个空外壳。
+  // 终态行独立于正文 —— 切分出的占位气泡可能只有终态、没有任何内容。
   if (
     !message.reasoning &&
     toolCalls.length === 0 &&
-    message.content.trim() === ""
+    message.content.trim() === "" &&
+    !message.turnResult
   ) {
     return null;
   }
@@ -1251,10 +1302,9 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             )}
           </div>
         )}
-        {/* 状态行在结论气泡之上：圆点标终态，旁边是本轮总耗时 */}
-        {hasResult && message.turnResult && (
-          <TurnStatusRow result={message.turnResult} />
-        )}
+        {/* 状态行在结论气泡之上：圆点标终态，旁边是本轮总耗时。不依赖正文 ——
+            切分出的占位气泡只有终态，正文由前一个气泡承载。 */}
+        {message.turnResult && <TurnStatusRow result={message.turnResult} />}
         {hasResult && (
           <div
             data-slot="assistant-result"
@@ -1292,15 +1342,28 @@ function lastUserIndex(messages: ChatMessage[]): number {
   return -1;
 }
 
-/** 本轮起点：最后一条 user 消息的时间戳。 */
+/** 本轮起点：末尾向前第一条非 steering 的 user 消息的时间戳。 */
 function turnStartMs(messages: ChatMessage[]): number | undefined {
-  const i = lastUserIndex(messages);
-  return i >= 0 ? messages[i].timestampMs : undefined;
+  // steering 消息的时间戳是排队时刻（用户敲下那句话时本轮已在进行），
+  // 拿它当起点会把耗时算短 —— 必须越过它继续向前找。
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role === "user" && !m.steered) return m.timestampMs;
+  }
+  return undefined;
 }
 
-/** 服务端以失败原因下发取消时的文案。 */
-function isCancellationText(message: string): boolean {
+/**
+ * 按文案识别「服务端以取消收尾」—— 仅作旧服务端 / 非 SSE 路径的兜底。
+ * 新服务端在 `error` 事件里带 `cancelled` 字段，那才是主判据。
+ */
+export function isCancellationText(message: string): boolean {
   return /^(对话已被取消|cancelled by user)/i.test(message);
+}
+
+/** 本轮是否被用户取消：优先服务端字段，缺省时回退到文案识别。 */
+export function isCancelledError(data: ErrorData): boolean {
+  return data.cancelled ?? isCancellationText(data.message);
 }
 
 /** 冻结原因含 cancel 即为用户取消。 */
@@ -1461,6 +1524,9 @@ export function reduceStreamEvent(
       return settlePendingToolCalls(messages);
     case "usage":
     case "looper_state":
+    // steering 的气泡切分由 store 负责（需要同时消费「已排队」状态）；
+    // 纯 reducer 视角下消息列表不变。internal 模式收不到该事件。
+    case "user_steer":
       return messages;
     case "context_compacted":
       // 更早的对话已被归档为结构化摘要 — 以居中分隔线提示（hover 可看摘要正文）
@@ -1501,7 +1567,7 @@ export function reduceStreamEvent(
       ];
     }
     case "error":
-      // 失败轮以警示气泡展示；取消文案还原为「取消」态
+      // 失败轮以警示气泡展示；取消还原为「取消」态
       return settlePendingToolCalls([
         ...messages,
         {
@@ -1511,7 +1577,7 @@ export function reduceStreamEvent(
           isError: true,
           turnResult: turnResultAt(
             messages,
-            isCancellationText(event.data.message) ? "cancelled" : "failed",
+            isCancelledError(event.data) ? "cancelled" : "failed",
             now,
           ),
         },

@@ -132,11 +132,20 @@ export function pecoAttachUrl(): string {
 /**
  * 向已注册的 run 排队一条消息（复用已持有的 SSE 连接，不新开连接）。
  *
- * 无活跃 run 时抛 404 —— 调用方应改走 `pecoStreamUrl` 的引导路径
- * （附着到已有 run 或新建，语义自洽）；控制通道积压时抛 409。
+ * 附件 id 与 GET `/stream` 同构（逗号串）；为空时不放进请求体，纯文本调用
+ * 保持 `{ message }` 形态。无活跃 run 时抛 404 —— 调用方应改走
+ * `pecoStreamUrl` 的引导路径（附着到已有 run 或新建，语义自洽）；
+ * 控制通道积压时抛 409。
  */
-export async function queryPecoStream(message: string): Promise<void> {
-  await api.post(`${PATH}/stream/query`, { message });
+export async function queryPecoStream(
+  message: string,
+  imageIds: string[] = [],
+  fileIds: string[] = [],
+): Promise<void> {
+  const body: Record<string, string> = { message };
+  if (imageIds.length > 0) body.image_ids = imageIds.join(",");
+  if (fileIds.length > 0) body.file_ids = fileIds.join(",");
+  await api.post(`${PATH}/stream/query`, body);
 }
 
 /** 取消当前用户进行中的任务（无任务时服务端返回 404）。 */

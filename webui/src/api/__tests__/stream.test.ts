@@ -169,7 +169,7 @@ describe("toChatSseEvent", () => {
     expect(result!.event).toBe("usage");
   });
 
-  it("maps all 12 known event types", () => {
+  it("maps all 13 known event types", () => {
     const events = [
       "text_delta",
       "reasoning_delta",
@@ -182,6 +182,7 @@ describe("toChatSseEvent", () => {
       "usage",
       "context_compacted",
       "truncation_retry",
+      "user_steer",
       "error",
     ];
     for (const evt of events) {

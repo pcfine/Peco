@@ -4,7 +4,12 @@
 // 每个订阅者，多开一条就会让同一批 delta 被消费两次（界面文字成对重复）。
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { usePecoChatStore, __resetPecoStreamForTests } from "../pecoChatStore";
+import {
+  usePecoChatStore,
+  __resetPecoStreamForTests,
+  mergeQueuedText,
+  settleQueue,
+} from "../pecoChatStore";
 import { snapshotToMessages } from "../../components/chat/ChatView";
 import { useAuthStore } from "../../stores/authStore";
 
@@ -111,6 +116,7 @@ const resetStore = () => {
     sessionKey: 0,
     isStreaming: false,
     paused: false,
+    queued: [],
     error: null,
     usage: null,
     oldestLoadedTurn: null,
@@ -1058,5 +1064,438 @@ describe("pecoChatStore 暂停/恢复", () => {
 
     expect(usePecoChatStore.getState().paused).toBe(false);
     expect(usePecoChatStore.getState().isStreaming).toBe(true);
+  });
+});
+
+describe("pecoChatStore 在途轮发送（steering）", () => {
+  async function startTurn() {
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+    await usePecoChatStore.getState().sendMessage("第一条", "test-token");
+    s.push(frame("text_delta", { content: "旧", conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().messages.at(-1)?.content).toBe("旧"),
+    );
+    return s;
+  }
+
+  it("在途发送只进排队区：POST 投递、不插占位、不改 messages", async () => {
+    const s = await startTurn();
+    const before = usePecoChatStore.getState().messages.length;
+
+    // 暂停中同样可发送（排队不影响暂停态）
+    s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().paused).toBe(true),
+    );
+
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+
+    expect(queryPecoStream).toHaveBeenCalledWith("补充", [], []);
+    const st = usePecoChatStore.getState();
+    expect(st.queued).toHaveLength(1);
+    expect(st.queued[0].text).toBe("补充");
+    expect(st.messages).toHaveLength(before);
+    expect(st.isStreaming).toBe(true);
+    expect(st.paused).toBe(true);
+
+    // 在途附件经同一控制通道投递（不再断连重开 SSE）
+    await usePecoChatStore.getState().sendMessage("看图", "test-token", [
+      {
+        id: "b.png",
+        kind: "image",
+        name: "b.png",
+        url: "/uploads/chat/u/b.png",
+      },
+    ]);
+    expect(queryPecoStream).toHaveBeenLastCalledWith("看图", ["b.png"], []);
+    expect(usePecoChatStore.getState().queued).toHaveLength(2);
+  });
+
+  it("user_steer：排队项落成 user 气泡 + 新 assistant 占位，旧输出留在旧气泡", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+
+    s.push(
+      frame("user_steer", { count: 1, text: "补充", conversation_id: "c" }),
+    );
+
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+    let msgs = usePecoChatStore.getState().messages;
+    expect(msgs.at(-2)).toMatchObject({ role: "user", content: "补充" });
+    expect(msgs.at(-1)).toMatchObject({ role: "assistant", content: "" });
+
+    // 新输出落在新占位，旧气泡内容不被改写
+    s.push(frame("text_delta", { content: "新", conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().messages.at(-1)?.content).toBe("新"),
+    );
+    msgs = usePecoChatStore.getState().messages;
+    expect(msgs.find((m) => m.content === "旧")).toBeTruthy();
+    expect(usePecoChatStore.getState().paused).toBe(false);
+  });
+
+  it("多条排队项按 FIFO 合并成一条 user 消息", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("a", "test-token");
+    await usePecoChatStore.getState().sendMessage("b", "test-token");
+
+    s.push(
+      frame("user_steer", { count: 2, text: "a\nb", conversation_id: "c" }),
+    );
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const msgs = usePecoChatStore.getState().messages;
+    expect(msgs.at(-2)).toMatchObject({ role: "user", content: "a\nb" });
+    expect(msgs.at(-1)).toMatchObject({ role: "assistant", content: "" });
+  });
+
+  it("steer 气泡文本取服务端下发值，不再本地合并排队项", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("A", "test-token");
+    await usePecoChatStore.getState().sendMessage("B", "test-token");
+
+    // 故意与本地合并结果（"A\nB"）不同：本地合并回潮时这条断言会红
+    s.push(
+      frame("user_steer", {
+        count: 2,
+        text: "SERVER-A + B",
+        conversation_id: "c",
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const msgs = usePecoChatStore.getState().messages;
+    expect(msgs.at(-2)).toMatchObject({
+      role: "user",
+      content: "SERVER-A + B",
+    });
+    expect(msgs.at(-1)).toMatchObject({ role: "assistant", content: "" });
+  });
+
+  it("user_steer 不带 text（旧服务端）时回退本地合并文本，且不落错", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("A", "test-token");
+    await usePecoChatStore.getState().sendMessage("B", "test-token");
+
+    // 旧服务端只下发 count：气泡内容若取不到 text 就会是 undefined，
+    // 渲染层 `.trim()` 抛 TypeError，整条消息列表一起白屏。
+    s.push(frame("user_steer", { count: 2, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const st = usePecoChatStore.getState();
+    expect(st.error).toBeNull();
+    expect(st.messages.at(-2)).toMatchObject({
+      role: "user",
+      content: "A\nB",
+      steered: true,
+    });
+    expect(st.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "",
+    });
+  });
+
+  it("本轮收尾时仍有排队项：保持流式态并起下一轮占位（兜底）", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+
+    s.push(turnCompleteFrame("旧"));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const st = usePecoChatStore.getState();
+    expect(st.isStreaming).toBe(true);
+    const msgs = st.messages;
+    expect(msgs.at(-2)).toMatchObject({ role: "user", content: "补充" });
+    expect(msgs.at(-1)).toMatchObject({ role: "assistant", content: "" });
+
+    // 兜底轮的新输出落在占位
+    s.push(frame("text_delta", { content: "下一轮", conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().messages.at(-1)?.content).toBe(
+        "下一轮",
+      ),
+    );
+  });
+
+  it("兜底轮的合并气泡不标记 steered，耗时从落气泡时刻起算", async () => {
+    // 这一轮的起点就是兜底落下来的 user 气泡：若标了 steered，本轮起点会退到
+    // 上一轮的 user 时间戳，把上一轮时长也算进本轮。
+    const t0 = 1_700_000_000_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      const s = await startTurn();
+
+      // 排队时刻晚于本轮开始 10s：用户在本轮进行中敲下这句话
+      const sentAt = t0 + 10_000;
+      now.mockReturnValue(sentAt);
+      await usePecoChatStore.getState().sendMessage("补充", "test-token");
+      expect(usePecoChatStore.getState().queued[0]?.sentAt).toBe(sentAt);
+
+      const fallbackAt = t0 + 30_000;
+      now.mockReturnValue(fallbackAt);
+      s.push(turnCompleteFrame("旧"));
+      await vi.waitFor(() =>
+        expect(usePecoChatStore.getState().queued).toHaveLength(0),
+      );
+
+      const fallbackMsg = usePecoChatStore.getState().messages.at(-2);
+      expect(fallbackMsg).toMatchObject({ role: "user", content: "补充" });
+      expect(fallbackMsg?.steered).toBeFalsy();
+      expect(fallbackMsg?.timestampMs).toBe(fallbackAt);
+      expect(fallbackMsg?.timestampMs).not.toBe(sentAt);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("非取消 error 且仍有排队项：同样按兜底轮保持流式态", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+
+    s.push(frame("error", { message: "上游超时", conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const st = usePecoChatStore.getState();
+    expect(st.isStreaming).toBe(true);
+    expect(st.messages.at(-2)).toMatchObject({
+      role: "user",
+      content: "补充",
+    });
+    expect(st.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "",
+    });
+  });
+
+  it("error.cancelled=true 走取消分支：不兜底成下一轮、不留排队项", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+    const before = usePecoChatStore.getState().messages.length;
+
+    // 文案本身不像取消：判定必须认服务端字段，否则会误按失败兜底起下一轮
+    s.push(
+      frame("error", {
+        message: "上游超时",
+        cancelled: true,
+        conversation_id: "c",
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().isStreaming).toBe(false),
+    );
+
+    const st = usePecoChatStore.getState();
+    expect(st.queued).toHaveLength(0);
+    // 失败气泡是唯一新增，没有兜底轮的 user 气泡与占位
+    expect(st.messages).toHaveLength(before + 1);
+    expect(st.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "上游超时",
+      isError: true,
+    });
+  });
+
+  it("取消类 error 清空排队项并回到终态（旧服务端无 cancelled 字段）", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+
+    // 字段缺省 → 回退文案识别，仍须按取消处理
+    s.push(frame("error", { message: "对话已被取消", conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().isStreaming).toBe(false),
+    );
+    expect(usePecoChatStore.getState().queued).toHaveLength(0);
+  });
+
+  it("POST 非 404 失败：排队项落回 user 气泡并暴露错误", async () => {
+    await startTurn();
+    vi.mocked(queryPecoStream).mockRejectedValueOnce({
+      response: { status: 500 },
+    });
+
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+
+    // 输入框已被 handleSend 清空：撤回排队项后必须把它落回列表，否则输入彻底消失
+    const st = usePecoChatStore.getState();
+    expect(st.queued).toHaveLength(0);
+    expect(st.isStreaming).toBe(false);
+    expect(st.error).toBeTruthy();
+    expect(st.messages.at(-1)).toMatchObject({ role: "user", content: "补充" });
+  });
+
+  it("连接已失效时继续发送：旧排队项落成 user 气泡，新消息正常追加", async () => {
+    // 在途态尚存但连接已没了（极窄竞态）：排队项服务端已收下，本地必须留回显
+    const s = controllableStream();
+    global.fetch = vi.fn(() => Promise.resolve(s.response));
+    usePecoChatStore.setState({
+      isStreaming: true,
+      queued: [
+        { id: "queued-1", text: "旧排队", sentAt: 1 },
+        { id: "queued-2", text: "旧排队二", sentAt: 2 },
+      ],
+    });
+
+    await usePecoChatStore.getState().sendMessage("新消息", "test-token");
+
+    const st = usePecoChatStore.getState();
+    expect(st.queued).toHaveLength(0);
+    expect(st.messages).toHaveLength(3);
+    expect(st.messages[0]).toMatchObject({
+      role: "user",
+      content: "旧排队\n旧排队二",
+    });
+    expect(st.messages[1]).toMatchObject({ role: "user", content: "新消息" });
+    expect(st.messages[2]).toMatchObject({ role: "assistant", content: "" });
+    expect(st.isStreaming).toBe(true);
+  });
+
+  it("暂停 → 恢复 → 切分：排队项保持暂停态，恢复后 user_steer 才切分", async () => {
+    const s = await startTurn();
+
+    s.push(frame("looper_state", { paused: true, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().paused).toBe(true),
+    );
+
+    await usePecoChatStore.getState().sendMessage("补充", "test-token");
+    expect(usePecoChatStore.getState().queued).toHaveLength(1);
+    // 排队不改暂停态：暂停由服务端权威回填，客户端不乐观置位
+    expect(usePecoChatStore.getState().paused).toBe(true);
+
+    s.push(frame("looper_state", { paused: false, conversation_id: "c" }));
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().paused).toBe(false),
+    );
+
+    s.push(
+      frame("user_steer", { count: 1, text: "补充", conversation_id: "c" }),
+    );
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const st = usePecoChatStore.getState();
+    expect(st.messages.at(-2)).toMatchObject({
+      role: "user",
+      content: "补充",
+      steered: true,
+    });
+    expect(st.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "",
+    });
+    expect(st.paused).toBe(false);
+  });
+
+  it("连续两次 user_steer 各切一次：气泡按到达顺序落位", async () => {
+    const s = await startTurn();
+    await usePecoChatStore.getState().sendMessage("a", "test-token");
+    await usePecoChatStore.getState().sendMessage("b", "test-token");
+
+    s.push(
+      frame("user_steer", { count: 1, text: "a", conversation_id: "c" }),
+      frame("user_steer", { count: 1, text: "b", conversation_id: "c" }),
+    );
+    await vi.waitFor(() =>
+      expect(usePecoChatStore.getState().queued).toHaveLength(0),
+    );
+
+    const msgs = usePecoChatStore.getState().messages;
+    expect(msgs.slice(-4).map((m) => [m.role, m.content])).toEqual([
+      ["user", "a"],
+      ["assistant", ""],
+      ["user", "b"],
+      ["assistant", ""],
+    ]);
+  });
+});
+
+describe("settleQueue 队列清空唯一登记点", () => {
+  const carried = [
+    { id: "queued-1", text: "A", sentAt: 1 },
+    { id: "queued-2", text: "B", sentAt: 2 },
+  ];
+  const messages = [
+    { role: "assistant" as const, content: "旧", turnIndex: 0 },
+  ];
+
+  it("discard：只清队列，messages 原样透传（不加气泡、不加占位）", () => {
+    expect(settleQueue("discard", carried, messages)).toEqual({
+      messages,
+      queued: [],
+    });
+  });
+
+  it("next-turn：合并成一条 fallback 气泡 + 空占位，并清空队列", () => {
+    const out = settleQueue("next-turn", carried, messages);
+
+    expect(out.messages.map((m) => [m.role, m.content])).toEqual([
+      ["assistant", "旧"],
+      ["user", "A\nB"],
+      ["assistant", ""],
+    ]);
+    // 兜底气泡是下一轮自己的起点，不能标 steered（否则耗时起点会退到上一轮）
+    expect(out.messages[1].steered).toBeUndefined();
+    expect(out.queued).toEqual([]);
+  });
+
+  it("carry-only：只落 fallback 气泡，占位留给调用方自己追加", () => {
+    const out = settleQueue("carry-only", carried, messages);
+
+    // 长度精确 +1：这里若也落占位就会是 +2，成为没有内容落进去的孤儿气泡
+    expect(out.messages).toHaveLength(messages.length + 1);
+    expect(out.messages.map((m) => [m.role, m.content])).toEqual([
+      ["assistant", "旧"],
+      ["user", "A\nB"],
+    ]);
+    expect(out.queued).toEqual([]);
+  });
+
+  it("carry-only：无 carried 时 messages 原样透传，只清空队列", () => {
+    const out = settleQueue("carry-only", [], messages);
+
+    expect(out.messages).toBe(messages);
+    expect(out.queued).toEqual([]);
+  });
+});
+
+// 与服务端 crates/peco-core/src/session/types.rs 的 merge_contents /
+// strip_merge_markers 对照：期望字符串是手算的「合并 → strip」结果。
+// 逐字对齐是 refreshSession 去重判据的前提（文本不等 → 重复渲染）。
+describe("mergeQueuedText 对齐服务端合并口径", () => {
+  it("两条普通文本以单个换行连接", () => {
+    expect(mergeQueuedText(["A", "B"])).toBe("A\nB");
+  });
+
+  it("首尾空行由标记接缝吸收，行内空白保留", () => {
+    // merge: "---\n\n A \n\n---\n B " → strip 只去 trim 为空的整行
+    expect(mergeQueuedText(["\n A \n", " B "])).toBe(" A \n B ");
+  });
+
+  it("文本自带的 --- 行同样被当作分段标记剥离", () => {
+    // merge: "---\nA\n---\nC\n---\nB" → 三段，中间标记行消失
+    expect(mergeQueuedText(["A\n---\nC", "B"])).toBe("A\nC\nB");
+  });
+
+  it("单条文本逐字保留（服务端单条不 strip）", () => {
+    expect(mergeQueuedText(["A\n---\nB"])).toBe("A\n---\nB");
+  });
+
+  it("附件-only 排队项（空文本）不参与展示文本", () => {
+    // merge: "---\n\n---\nB" → 空段被丢弃
+    expect(mergeQueuedText(["", "B"])).toBe("B");
   });
 });

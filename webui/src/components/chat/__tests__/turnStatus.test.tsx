@@ -85,9 +85,9 @@ const TURN_COMPLETE: ChatSseEvent = {
   },
 };
 
-const errorEvent = (message: string): ChatSseEvent => ({
+const errorEvent = (message: string, cancelled?: boolean): ChatSseEvent => ({
   event: "error",
-  data: { message, conversation_id: "c" },
+  data: { message, cancelled, conversation_id: "c" },
 });
 
 // ── 实时路径：终态挂到结论宿主 ───────────────────────────────────────────
@@ -124,6 +124,17 @@ describe("reduceStreamEvent 终态", () => {
   it("取消被收编为失败原因时还原成「取消」态", () => {
     const updated = reduceStreamEvent(
       errorEvent("对话已被取消（响应中断前部分输出已展示）"),
+      liveTurn("部分输出"),
+      START_MS + 1000,
+    );
+
+    expect(updated.at(-1)?.turnResult?.status).toBe("cancelled");
+  });
+
+  it("error.cancelled=true 直接还原成「取消」态，不依赖文案", () => {
+    // 文案本身不像取消：判定必须认服务端字段，否则会被当成失败
+    const updated = reduceStreamEvent(
+      errorEvent("上游超时", true),
       liveTurn("部分输出"),
       START_MS + 1000,
     );

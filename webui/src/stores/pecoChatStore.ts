@@ -16,6 +16,7 @@ import {
   snapshotToMessages,
   reduceStreamEvent,
   isStreamTerminalEvent,
+  isCancelledError,
   markTurnResult,
 } from "@/components/chat/ChatView";
 import type { ChatAttachment, ChatMessage } from "@/components/chat/ChatView";
@@ -43,6 +44,24 @@ let conn: StreamConn | null = null;
 let nextGen = 0;
 /** 一次性自愈：意外断流最多触发一次重附着，用户发消息后重新武装。 */
 let selfHealUsed = false;
+/** 排队项 id 序号（仅用于列表 key 与失败回滚定位）。 */
+let queuedSeq = 0;
+
+/**
+ * 在途轮期间排队、尚未被模型请求消费的用户输入。
+ *
+ * 与消息列表分离：这些输入已投递到服务端 pending 队列，但还没被任何一次
+ * 模型请求看见。`user_steer`（并入当前轮）或轮次收尾兜底（成为下一轮输入）
+ * 时，才合并成一条 user 消息落到列表 —— 保证气泡顺序是「旧回复 → 补充 →
+ * 新回复」，且不会干扰 `tool_result` 按最后一条 user 划分的归属扫描。
+ */
+export interface QueuedSend {
+  id: string;
+  text: string;
+  sentAt: number;
+  images?: string[];
+  attachments?: { name: string }[];
+}
 
 /** 关闭并作废当前连接（在途 reader 的一切写入随之失效）。 */
 function closeStream(): void {
@@ -159,7 +178,12 @@ async function readStream(
     // 已被替换或关闭：不碰新连接的状态
     if (conn?.gen !== gen) return;
     conn = null;
-    set({ isStreaming: false, paused: false });
+    // 连接收尾即失去送达通道：排队项不再有回执，清空避免残留在「已排队」区。
+    set({
+      ...settleQueue("discard", [], get().messages),
+      isStreaming: false,
+      paused: false,
+    });
 
     // 未收到 done 的收尾属意外断流（服务端重启 / 网络抖动）→ 一次性重附着，
     // 由快照决定是接上在途轮次还是只重建历史。
@@ -376,6 +400,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   sessionKey: 0,
   isStreaming: false,
   paused: false,
+  queued: [],
   error: null,
   usage: null,
   oldestLoadedTurn: null,
@@ -430,6 +455,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       loaded: false,
       isStreaming: false,
       paused: false,
+      queued: [],
       usage: null,
       sessionKey: s.sessionKey + 1,
       oldestLoadedTurn: null,
@@ -491,8 +517,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
   ) => {
     const state = get();
     const hasAttachments = !!attachments && attachments.length > 0;
-    if (state.isStreaming || (!text.trim() && !hasAttachments) || !token)
-      return;
+    if ((!text.trim() && !hasAttachments) || !token) return;
 
     const imageUrls =
       attachments
@@ -502,6 +527,76 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       attachments
         ?.filter((a) => a.kind === "document")
         .map((a) => ({ name: a.name })) ?? [];
+    const imageIds =
+      attachments?.filter((a) => a.kind === "image").map((a) => a.id) ?? [];
+    const fileIds =
+      attachments?.filter((a) => a.kind === "document").map((a) => a.id) ?? [];
+
+    // ── 在途轮：进入排队区，等下一次模型请求（steering）或下一轮消费 ──
+    // 不插入 assistant 占位：本轮继续生成的输出仍属于上一条 assistant 气泡，
+    // 占位要等 `user_steer` / 轮次收尾兜底真正切分气泡时才出现。
+    if (state.isStreaming && conn && !conn.terminal) {
+      const queued: QueuedSend = {
+        id: `queued-${++queuedSeq}`,
+        text,
+        sentAt: Date.now(),
+        images: imageUrls.length > 0 ? imageUrls : undefined,
+        attachments: docNames.length > 0 ? docNames : undefined,
+      };
+      set((s) => ({ queued: [...s.queued, queued], error: null }));
+      // 用户主动发起 → 重新武装一次性自愈
+      selfHealUsed = false;
+      try {
+        await queryPecoStream(text, imageIds, fileIds);
+        return;
+      } catch (err) {
+        const status = (err as { response?: { status?: number } })?.response
+          ?.status;
+        // 撤回这条排队项（若它还没被 `user_steer` 消费）
+        set((s) => ({
+          queued: s.queued.filter((q) => q.id !== queued.id),
+        }));
+        if (status === 404) {
+          // 服务端已无该 run（连接已失效）→ 清掉在途态，按普通新消息重发。
+          closeStream();
+          set({
+            ...settleQueue("discard", [], get().messages),
+            isStreaming: false,
+            paused: false,
+          });
+          return get().sendMessage(text, token, attachments);
+        }
+        // 投递失败：输入框与附件已被清空，撤回排队项就得把它落回列表，
+        // 否则这段输入彻底消失（非排队路径同样保留 user 气泡供重发）。
+        set((s) => ({
+          messages: [
+            ...s.messages,
+            {
+              role: "user" as const,
+              content: queued.text,
+              turnIndex: 0,
+              timestampMs: queued.sentAt,
+              images: queued.images,
+              attachments: queued.attachments,
+            },
+          ],
+          isStreaming: false,
+          error: (err as Error)?.message ?? "消息发送失败，请重试",
+        }));
+        return;
+      }
+    }
+
+    // 流式中但连接已失效（极窄竞态）：回到普通发送路径。这些排队项服务端
+    // 已经收下（会进 pending 执行），本地若不落成气泡就永远看不到回显。
+    if (state.isStreaming) {
+      closeStream();
+      set((s) => ({
+        ...settleQueue("carry-only", state.queued, s.messages),
+        isStreaming: false,
+        paused: false,
+      }));
+    }
 
     // Append user message + empty assistant placeholder.
     // 两条消息来自同一次发送，共用同一个构造时刻。
@@ -521,7 +616,7 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
       timestampMs: sentAt,
     };
     set({
-      messages: [...state.messages, userMsg, assistantMsg],
+      messages: [...get().messages, userMsg, assistantMsg],
       isStreaming: true,
       error: null,
     });
@@ -581,9 +676,9 @@ export const usePecoChatStore = create<PecoChatState>()((set, get) => ({
     // 若在此期间用户已开始下一轮，它会把新一轮的门控关掉。事件不带
     // 轮次标识，无法区分归属，断连是唯一干净的取舍（与取消前语义一致）。
     closeStream();
-    // 连接已断，补本地「取消」终态
+    // 连接已断，补本地「取消」终态；排队项不会再送达，一并清空
     set((s) => ({
-      messages: markTurnResult(s.messages, "cancelled"),
+      ...settleQueue("discard", [], markTurnResult(s.messages, "cancelled")),
       isStreaming: false,
       paused: false,
     }));
@@ -615,6 +710,7 @@ export function __resetPecoStreamForTests(): void {
   selfHealUsed = false;
   loadInFlight = false;
   refreshInFlight = false;
+  queuedSeq = 0;
 }
 
 // ── SSE Event Handler (store version) ────────────────────────────────────
@@ -622,6 +718,130 @@ export function __resetPecoStreamForTests(): void {
 // Thin wrapper around the shared reduceStreamEvent / isStreamTerminalEvent
 // from ChatView.tsx.  Operates on Zustand's get() / set() instead of React's
 // setMessages / setStreaming.
+
+/**
+ * 排队输入的合并展示文本 —— 逐字复刻服务端 `merge_contents` 拼接 +
+ * `strip_merge_markers` 剥离的结果（见 crates/peco-core/src/session/types.rs）。
+ *
+ * 兜底路径：轮次收尾把排队项兜底成下一轮时服务端不下发 `user_steer`，旧服务端
+ * 的 `user_steer` 也不带 `text`，这两种情况都只有本地复刻可用。其余场景以事件
+ * 里的 `text` 为准。
+ *
+ * 逐字对齐是必需的而非求美观：刷新时 `refreshSession` 用文本相等判断本地乐观
+ * 尾部是否已落盘（`lastCommittedUser !== localUser.content`），差一个换行或一段
+ * 分隔标记就会被判成「未落盘」，快照与本轮副本于是同时渲染。
+ *
+ * 单条走 `MessageSource::UserInput`，展示层不 strip —— 用户自己写的 `---` 行
+ * 必须原样保留，故直接返回原文。
+ */
+export function mergeQueuedText(texts: string[]): string {
+  const first = texts[0];
+  if (first === undefined) return "";
+  if (texts.length === 1) return first;
+
+  // 每条前置一行 `---` 标记、末尾换行；服务端拼完再 pop 掉最后一个换行。
+  // 空文本条目不过滤：附件-only 排队项在服务端同样占一段，strip 后自然消失。
+  const joined = texts
+    .map((t) => `---\n${t}\n`)
+    .join("")
+    .slice(0, -1);
+  const lines = joined.split(/\r?\n/);
+  if (lines[lines.length - 1] === "") lines.pop();
+
+  const segments: string[][] = [[]];
+  for (const line of lines) {
+    if (line.trim() === "---") {
+      segments.push([]);
+      continue;
+    }
+    segments[segments.length - 1].push(line);
+  }
+
+  return segments
+    .map((seg) => {
+      let start = 0;
+      let end = seg.length;
+      while (start < end && seg[start].trim() === "") start += 1;
+      while (end > start && seg[end - 1].trim() === "") end -= 1;
+      return seg.slice(start, end).join("\n");
+    })
+    .filter((seg) => seg !== "")
+    .join("\n");
+}
+
+/**
+ * 把一批排队输入落成一条 user 消息。
+ *
+ * `text` 由调用方给出：steer 路径用服务端下发的权威展示文本，fallback 路径用
+ * `mergeQueuedText` 的本地复刻。
+ *
+ * `mode` 决定这条气泡在耗时统计里的身份：
+ * - `"steer"`：气泡代表真的被 steering 进当前轮的输入，时间戳取排队时刻（用户
+ *   敲字的时刻），并标 `steered` 让本轮起点越过它继续向前找。
+ * - `"fallback"`：气泡是下一轮自己的起点，时间戳取落气泡时刻 —— 排队时上一轮
+ *   还在跑，拿排队时刻当起点会把上一轮时长也算进来；不标 `steered`，它自己就
+ *   是下一轮起点。
+ */
+function mergeQueued(
+  queued: QueuedSend[],
+  mode: "steer" | "fallback",
+  text: string,
+): ChatMessage {
+  const images = queued.flatMap((q) => q.images ?? []);
+  const attachments = queued.flatMap((q) => q.attachments ?? []);
+  const steered = mode === "steer";
+  return {
+    role: "user",
+    content: text,
+    turnIndex: 0,
+    timestampMs: steered ? (queued[0]?.sentAt ?? Date.now()) : Date.now(),
+    steered: steered ? true : undefined,
+    images: images.length > 0 ? images : undefined,
+    attachments: attachments.length > 0 ? attachments : undefined,
+  };
+}
+
+/**
+ * 队列清空的唯一登记点 —— `queued` 与它引出的气泡在同一次返回里配对，
+ * 免得多处 `set` 各写一半（清了队列却没落气泡 / 落了气泡却没清队列）。
+ *
+ * - `discard`：排队项不再有送达机会（取消 / run 退出 / 断连），就地丢弃，
+ *   `messages` 取调用方已算好的那份。
+ * - `carry-only`：排队项落一条合并 user 气泡后交还控制权，调用方紧接着自己
+ *   追加新 user + 空占位。这里的 `messages` 只加气泡、不加占位：占位由调用方
+ *   补，多落一条就成了永远没有内容落进去的孤儿气泡。
+ * - `next-turn`：排队项成为下一轮输入，落一条合并 user 气泡 + 空 assistant
+ *   占位，让紧随其后的增量落进新气泡而不是上一轮已完成的回复里。
+ */
+export function settleQueue(
+  mode: "discard" | "carry-only" | "next-turn",
+  carried: QueuedSend[],
+  messages: ChatMessage[],
+): Pick<PecoChatState, "messages" | "queued"> {
+  if (mode === "discard") return { messages, queued: [] };
+
+  const fallbackBubble = mergeQueued(
+    carried,
+    "fallback",
+    mergeQueuedText(carried.map((q) => q.text)),
+  );
+
+  if (mode === "carry-only") {
+    return {
+      messages: carried.length > 0 ? [...messages, fallbackBubble] : messages,
+      queued: [],
+    };
+  }
+
+  return {
+    messages: [
+      ...messages,
+      fallbackBubble,
+      { role: "assistant", content: "", turnIndex: 0 },
+    ],
+    queued: [],
+  };
+}
 
 function applyStreamEvent(
   event: ChatSseEvent,
@@ -645,6 +865,33 @@ function applyStreamEvent(
   // 追加进本窗口最后一条已完成的 assistant 气泡，或污染下一轮。
   if (!get().isStreaming) return;
 
+  // ── steering：排队输入已被并入当前轮 ─────────────────────────────────
+  // 把最早的一批排队项落成正式 user 气泡，并在其后开一个新的 assistant
+  // 占位：此前已生成的输出留在旧气泡，之后的输出落在新气泡。
+  if (event.event === "user_steer") {
+    const queued = get().queued;
+    if (queued.length === 0) return;
+    const n = Math.min(event.data.count, queued.length);
+    const consumed = queued.slice(0, n);
+    set({
+      queued: queued.slice(n),
+      messages: [
+        ...get().messages,
+        // `text` 仍按必填契约使用；旧服务端不下发时回落本地合并，否则气泡
+        // content 为 undefined，渲染层 `.trim()` 会炸掉整个消息列表。
+        mergeQueued(
+          consumed,
+          "steer",
+          event.data.text ?? mergeQueuedText(consumed.map((q) => q.text)),
+        ),
+        { role: "assistant", content: "", turnIndex: 0 },
+      ],
+      isStreaming: true,
+      paused: false,
+    });
+    return;
+  }
+
   // `looper_state` 是跨 Paused 的唯一权威来源，同受上面门控：无在途轮次时
   // 暂停入口本就不显示，据它置位只会留下残留。
   const pausedUpdate =
@@ -663,16 +910,35 @@ function applyStreamEvent(
     };
   }
 
+  // 本轮收尾时仍有排队输入 → 它不会被 steering 消费（本轮已没有下一个请求），
+  // 而是由 looper 的「pending → 新轮」兜底成为下一轮输入。取消是例外：取消
+  // 收尾会解除武装，pending 留到下一次用户输入，不自动起轮。
+  const queuedFallback =
+    get().queued.length > 0 &&
+    (event.event === "turn_complete" ||
+      (event.event === "error" && !isCancelledError(event.data)));
+
   // Eagerly clear isStreaming on terminal events so the UI flips from
   // stop→send button immediately.
   if (isStreamTerminalEvent(event)) {
-    // 终态即本轮收尾 —— 暂停态随之复位，避免「恢复」按钮残留。
-    set({
-      messages: newMessages,
-      isStreaming: false,
-      paused: false,
-      ...(usage ? { usage } : {}),
-    });
+    if (queuedFallback) {
+      // 兜底轮马上启动：把排队项落成下一轮的用户气泡 + 占位，保持流式态。
+      set({
+        ...settleQueue("next-turn", get().queued, newMessages),
+        isStreaming: true,
+        paused: false,
+        ...(usage ? { usage } : {}),
+      });
+    } else {
+      // 终态即本轮收尾 —— 暂停态随之复位，避免「恢复」按钮残留；排队项
+      // 不再有送达机会（取消 / run 退出），一并清空。
+      set({
+        ...settleQueue("discard", [], newMessages),
+        isStreaming: false,
+        paused: false,
+        ...(usage ? { usage } : {}),
+      });
+    }
   } else {
     set({
       messages: newMessages,
@@ -694,6 +960,9 @@ interface PecoChatState {
 
   /** 在途轮次是否被暂停（由 SSE `looper_state` 事件驱动，权威状态）。 */
   paused: boolean;
+
+  /** 在途轮期间已投递、尚未被任何模型请求消费的用户输入。 */
+  queued: QueuedSend[];
 
   // Last error message from the streaming request (null when no error).
   error: string | null;

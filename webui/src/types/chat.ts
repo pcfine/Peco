@@ -40,6 +40,7 @@ export type ChatSseEvent =
   | { event: "context_compacted"; data: ContextCompactedData }
   | { event: "truncation_retry"; data: TruncationRetryData }
   | { event: "looper_state"; data: LooperStateData }
+  | { event: "user_steer"; data: UserSteerData }
   | { event: "error"; data: ErrorData };
 
 export interface TextDeltaData {
@@ -105,6 +106,12 @@ export interface UsageEventData {
 
 export interface ErrorData {
   message: string;
+  /**
+   * 本轮是否以「用户取消」收尾 —— 服务端权威判定。
+   *
+   * 缺省表示服务端未下发（旧版本），消费方仍须按文案兜底识别。
+   */
+  cancelled?: boolean;
   conversation_id: string;
 }
 
@@ -140,6 +147,22 @@ export interface TruncationRetryData {
  */
 export interface LooperStateData {
   paused: boolean;
+  conversation_id: string;
+}
+
+/**
+ * 在途轮排队的用户输入已并入当前轮（steering）。
+ *
+ * `count` 是本次并入的条数：前端把「已排队」区里最旧的 count 条移出队列。
+ */
+export interface UserSteerData {
+  count: number;
+  /**
+   * 这批输入的气泡文本 —— 服务端按展示口径归一后的结果（多条时已剥离 `---`
+   * 标记，单条原样保留用户自写的 `---`）。有则直接采用，不再本地复刻合并口径。
+   * 服务端未下发（旧版本）时前端回退本地合并。
+   */
+  text: string;
   conversation_id: string;
 }
 
