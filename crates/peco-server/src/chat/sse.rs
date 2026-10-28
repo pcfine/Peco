@@ -100,6 +100,13 @@ pub enum ChatSseEvent {
     #[serde(rename = "error")]
     Error {
         message: String,
+        /// 该轮是否由用户取消结束（`TurnFailureReason::Cancelled`）。
+        ///
+        /// 取消与真故障在 UI 上要分开处理（后者需要醒目报错），但两者的
+        /// `message` 都是人可读文案，靠文案匹配判定不可靠。向后兼容由前端
+        /// 在字段缺省时回退文案识别提供；本枚举只 Serialize，序列化总是输出
+        /// `cancelled`。
+        cancelled: bool,
         conversation_id: String,
     },
 
@@ -164,6 +171,20 @@ pub enum ChatSseEvent {
         paused: bool,
         conversation_id: String,
     },
+
+    /// 在途轮排队的用户输入已并入当前轮（steering）。
+    ///
+    /// 前端据此把「已排队」的气泡落到消息流里，并在其后开启新的 assistant
+    /// 占位：steering 之前已生成的输出留在旧气泡，之后的输出落在新气泡，
+    /// 阅读顺序保持「旧回复 → 用户补充 → 新回复」。
+    #[serde(rename = "user_steer")]
+    UserSteer {
+        /// 本次并入的排队输入条数
+        count: usize,
+        /// 该批的展示正文，已按展示口径归一（服务端是唯一权威）
+        text: String,
+        conversation_id: String,
+    },
 }
 
 /// Token 用量数据（精简版，供前端展示）。
@@ -200,6 +221,7 @@ impl ChatSseEvent {
             ChatSseEvent::ContextCompacted { .. } => "context_compacted",
             ChatSseEvent::TruncationRetry { .. } => "truncation_retry",
             ChatSseEvent::LooperState { .. } => "looper_state",
+            ChatSseEvent::UserSteer { .. } => "user_steer",
         };
         Ok(Event::default().event(event_name).data(data))
     }
@@ -439,6 +461,7 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
                 let message = format_failure_message(&reason, &partial_text);
                 Some(ChatSseEvent::Error {
                     message,
+                    cancelled: matches!(reason, TurnFailureReason::Cancelled),
                     conversation_id: cid,
                 })
             }
@@ -506,6 +529,15 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             }
         }
 
+        // 排队输入已并入当前轮：前端据此切分气泡（旧的留在上方，新的占位承接
+        // 后续输出）。TurnStart 仍然不下发 —— 它属于每一轮的正常起点，其中
+        // Agent 对话页每一轮都会产生，下发只会平白新增一条 wire 事件。
+        LooperEvent::UserSteer { count, text, .. } => Some(ChatSseEvent::UserSteer {
+            count,
+            text,
+            conversation_id: cid,
+        }),
+
         // 以下事件不产生面向客户端的 SSE 事件
         LooperEvent::ToolCallDelta { .. } | LooperEvent::TurnStart { .. } | _ => None,
     }
@@ -535,6 +567,23 @@ mod tests {
     }
 
     #[test]
+    fn user_steer_maps_with_count_and_text() {
+        let event = map_looper_event(
+            LooperEvent::UserSteer {
+                turn_index: 3,
+                count: 2,
+                text: "a\nb".to_string(),
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::UserSteer { count, text, .. }) = event else {
+            panic!("UserSteer 必须映射为 ChatSseEvent::UserSteer，实际 {event:?}");
+        };
+        assert_eq!(count, 2);
+        assert_eq!(text, "a\nb", "展示文本由服务端下发，前端不再自行拼装");
+    }
+
+    #[test]
     fn failed_outcome_maps_to_error_event() {
         // 失败轮次必须携带错误信息发送 error 事件（而非空文本的 turn_complete）
         let event = map_looper_event(
@@ -550,10 +599,92 @@ mod tests {
             },
             "conv-1",
         );
-        let Some(ChatSseEvent::Error { message, .. }) = event else {
+        let Some(ChatSseEvent::Error {
+            message, cancelled, ..
+        }) = event
+        else {
             panic!("failed outcome must map to ChatSseEvent::Error, got {event:?}");
         };
         assert!(message.contains("Insufficient Balance"));
+        assert!(!cancelled, "非取消的失败原因不能标记为取消");
+    }
+
+    // ── wire 形状 ─────────────────────────────────────────────────────
+    //
+    // `ChatSseEvent` 只 serialize：字段名写错不会有编译错误，前端静默丢字段而
+    // 后端全绿。断言因此必须落在 `to_sse_event()` 发出的报文字节上 —— 绕开它
+    // 另序列化一遍，就测不到「映射成哪条事件、载荷长什么样」。
+
+    /// 取 `to_sse_event()` 产出的完整 SSE 报文（`event: <名>\ndata: <json>`）。
+    async fn sse_wire(event: ChatSseEvent) -> String {
+        use axum::response::IntoResponse;
+
+        let event = event.to_sse_event().expect("SSE 事件序列化失败");
+        let body = axum::response::Sse::new(futures::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(event)
+        }))
+        .into_response()
+        .into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("读取 SSE 报文失败");
+        String::from_utf8(bytes.into()).expect("SSE 报文必须是 UTF-8")
+    }
+
+    /// 取报文里的 `data:` 载荷并解析 —— 顺带验证它是合法 JSON。
+    fn sse_data(wire: &str) -> serde_json::Value {
+        let data = wire
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::from_str(&data).unwrap_or_else(|e| panic!("data 不是合法 JSON: {e}\n{wire}"))
+    }
+
+    #[tokio::test]
+    async fn error_event_serializes_cancelled_flag() {
+        let wire = sse_wire(ChatSseEvent::Error {
+            message: "x".to_string(),
+            cancelled: true,
+            conversation_id: "c".to_string(),
+        })
+        .await;
+        assert!(wire.starts_with("event: error\n"), "实际 {wire}");
+        assert!(wire.contains("\"cancelled\":true"), "实际 {wire}");
+
+        // false 也必须出现：前端拿它区分「取消」与「真故障」，靠字段缺省
+        // 只能回退文案匹配 —— 序列化时省略 false 等于把主判据降级成兜底。
+        let wire = sse_wire(ChatSseEvent::Error {
+            message: "x".to_string(),
+            cancelled: false,
+            conversation_id: "c".to_string(),
+        })
+        .await;
+        assert!(wire.contains("\"cancelled\":false"), "实际 {wire}");
+
+        let data = sse_data(&wire);
+        assert_eq!(data["data"]["cancelled"], false, "实际 {data}");
+        assert_eq!(data["data"]["message"], "x");
+        assert_eq!(data["data"]["conversation_id"], "c");
+    }
+
+    #[tokio::test]
+    async fn user_steer_event_serializes_text() {
+        let wire = sse_wire(ChatSseEvent::UserSteer {
+            count: 2,
+            text: "a\nb".to_string(),
+            conversation_id: "c".to_string(),
+        })
+        .await;
+        assert!(wire.starts_with("event: user_steer\n"), "实际 {wire}");
+        // 换行必须走 JSON 转义：字面换行会被 SSE 切成多行 data，前端拼回来
+        // 是另一串字节。
+        assert!(wire.contains("\"text\":\"a\\nb\""), "实际 {wire}");
+        assert!(wire.contains("\"count\":2"), "实际 {wire}");
+
+        let data = sse_data(&wire);
+        assert_eq!(data["data"]["text"], "a\nb", "展示文本按服务端口径下发");
+        assert_eq!(data["data"]["count"], 2);
     }
 
     #[test]
@@ -754,11 +885,15 @@ mod tests {
             },
             "conv-1",
         );
-        let Some(ChatSseEvent::Error { message, .. }) = event else {
+        let Some(ChatSseEvent::Error {
+            message, cancelled, ..
+        }) = event
+        else {
             panic!("failed outcome must map to ChatSseEvent::Error, got {event:?}");
         };
         assert!(message.contains("取消"));
         assert!(message.contains("部分输出已展示"));
+        assert!(cancelled, "取消是用户行为，前端不应按故障告警");
     }
 
     #[test]

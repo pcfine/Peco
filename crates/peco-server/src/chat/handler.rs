@@ -442,6 +442,7 @@ pub async fn stream_chat(
         if let Err(e) = handle.send_query_content(message_content_for_bg).await {
             let err_event = ChatSseEvent::Error {
                 message: format!("Failed to send message: {e}"),
+                cancelled: false,
                 conversation_id: conv_id_for_bg.clone(),
             };
             if let Ok(ev) = err_event.to_sse_event() {

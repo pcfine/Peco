@@ -8,8 +8,8 @@
 
 use std::ops::Range;
 
-use model_provider::{Content, ContentPart, InputItem, Role, ToolCall};
-use peco_core::session::{AnnotatedMessage, MessageSource, strip_merge_markers};
+use model_provider::{ContentPart, InputItem, Role, ToolCall};
+use peco_core::session::{AnnotatedMessage, MessageSource, display_text};
 use serde::Serialize;
 
 /// 分组输入：内容 + 来源 + 时间戳，三者同源于一条 [`AnnotatedMessage`]。
@@ -157,16 +157,9 @@ pub fn group_input_items(items: &[ItemView<'_>]) -> Vec<GroupedMessage> {
                             _ => None,
                         })
                         .collect();
-                    // 展示用正文只取 Text 部件 —— 附件正文不进气泡。
-                    let plain = content.text_view_plain();
-                    // MergedPending（pending 批量合并）的 user 消息带 ---
-                    // 分隔标记，模型侧原样保留，展示前按来源剥离 —— 用户
-                    // 自己输入的 --- 行不在此列（source != MergedPending）。
-                    let text = if matches!(view.source, MessageSource::MergedPending) {
-                        strip_merge_markers(&Content::Text(plain.into_owned()))
-                    } else {
-                        plain.into_owned()
-                    };
+                    // 展示用正文只取 Text 部件 —— 附件正文不进气泡；
+                    // 合并标记的剥离口径统一在 `display_text`。
+                    let text = display_text(content, view.source);
                     messages.push(GroupedMessage {
                         role: "user",
                         content: Some(text),
@@ -364,9 +357,10 @@ mod tests {
 
     /// 快捷分组：造普通来源的消息后走真实投影路径。
     ///
-    /// 来源用 `UserInput` 占位 —— 分组只看「是否 `InterruptedTurn`」，
-    /// 其余变体一律等价。时间戳由 `AnnotatedMessage::new` 内部取当前时刻，
-    /// 分组断言不涉及它。
+    /// 来源用 `UserInput` 占位 —— 它只经两处影响分组结果：中断标记（只看
+    /// 「是否 `InterruptedTurn`」）与用户消息的展示正文（只有 `MergedPending`
+    /// 剥 `---`），需要后者的用例自行构造 `AnnotatedMessage`。时间戳由
+    /// `AnnotatedMessage::new` 内部取当前时刻，分组断言不涉及它。
     fn group(items: Vec<InputItem>) -> Vec<GroupedMessage> {
         let msgs: Vec<AnnotatedMessage> = items
             .into_iter()
@@ -493,6 +487,36 @@ mod tests {
         };
         let json = serde_json::to_value(&with).unwrap();
         assert_eq!(json["attachments"], serde_json::json!([{"name": "a.txt"}]));
+    }
+
+    // ── 展示口径：合并标记只在来源为 MergedPending 时剥 ────────────────
+
+    /// 多条排队输入合并后的 user 消息：`merge_contents` 插入的 `---` 标记
+    /// 只给模型分辨输入边界用，气泡里不能出现。
+    #[test]
+    fn merged_pending_user_message_strips_merge_markers() {
+        let msgs = vec![AnnotatedMessage::new(
+            MessageId(0),
+            0,
+            InputItem::Message {
+                role: Role::User,
+                content: Content::Text("---\na\n---\nb".to_string()),
+            },
+            MessageSource::MergedPending,
+        )];
+        let grouped = group_input_items(&ItemView::from_turn(&msgs));
+        assert_eq!(grouped[0].content.as_deref(), Some("a\nb"));
+    }
+
+    /// 同样字节、来源不同 → 结论相反：单条发送的 `---` 是用户自己写的，
+    /// 剥掉等于改用户的输入。来源判定是唯一开关。
+    #[test]
+    fn user_input_keeps_marker_lines_typed_by_user() {
+        let grouped = group(vec![InputItem::Message {
+            role: Role::User,
+            content: Content::Text("---\na\n---\nb".to_string()),
+        }]);
+        assert_eq!(grouped[0].content.as_deref(), Some("---\na\n---\nb"));
     }
 
     // ── 中断轮标记 ────────────────────────────────────────────────────

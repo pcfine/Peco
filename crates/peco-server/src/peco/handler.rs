@@ -324,7 +324,14 @@ async fn build_query_content(
     let attachments = if ids.is_empty() {
         Vec::new()
     } else {
-        super::files::resolve_file_parts(state, user_id, &ids).await?
+        super::files::resolve_file_parts(state, user_id, &ids)
+            .await
+            .map_err(|e| match e {
+                // 附件 id 失效是「请求参数不合法」，不是「资源不存在」：前端把 404
+                // 当作 run 已消失（断流 + 清空在途态 + 重发），不能复用。
+                ApiError::NotFound(msg) => ApiError::BadRequest(msg),
+                other => other,
+            })?
     };
 
     let Some(text) = message else {
@@ -691,6 +698,7 @@ fn bridge_sse_response(
                     warn!(conversation_id = %conv_id, skipped = n, "SSE subscribers lagging, dropping events");
                     let err_ev = ChatSseEvent::Error {
                         message: format!("事件消费过慢，{n} 条更新被跳过"),
+                        cancelled: false,
                         conversation_id: conv_id.clone(),
                     };
                     if let Ok(ev) = err_ev.to_sse_event() {
@@ -777,9 +785,18 @@ pub async fn resume_stream(
 }
 
 /// `POST /api/peco/stream/query` 的请求体。
+///
+/// 与 GET `/stream` 同构：`message` 与附件 id 至少有一项，附件-only 也允许。
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
-    pub message: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// 逗号分隔的图片引用 id（上传端点返回）。
+    #[serde(default)]
+    pub image_ids: Option<String>,
+    /// 逗号分隔的文档引用 id（上传端点返回）。
+    #[serde(default)]
+    pub file_ids: Option<String>,
 }
 
 /// POST /api/peco/stream/query — 向已注册的 run 排队一条用户消息。
@@ -787,6 +804,9 @@ pub struct QueryRequest {
 /// 客户端常驻一条 SSE 连接后，后续消息经本端点投递，不再新开连接
 /// （新连接会让同一批 broadcast 事件被重复消费）。无 run 时 404，
 /// 调用方应改走 `GET /stream?message=`（附着或新建，语义自洽）。
+///
+/// 附件与 GET `/stream` 走同一套解析（[`build_query_content`]），因此在途轮
+/// 带附件发送不必断连重开连接。
 pub async fn query_stream(
     AuthUser { user_id }: AuthUser,
     State(state): State<Arc<AppState>>,
@@ -794,12 +814,25 @@ pub async fn query_stream(
 ) -> Result<Json<SuccessResponse>, ApiError> {
     // 显式归一：缺字段 / 类型不符 / 非法 JSON / Content-Type 缺失一律 400
     let Json(req) = body.map_err(|e| ApiError::BadRequest(format!("请求体不合法：{e}")))?;
-    let text = req.message.trim().to_string();
-    if text.is_empty() {
-        return Err(ApiError::BadRequest("message is required".into()));
-    }
+    let message = req
+        .message
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let Some(content) = build_query_content(
+        &state,
+        &user_id,
+        message,
+        req.image_ids.as_deref(),
+        req.file_ids.as_deref(),
+    )
+    .await?
+    else {
+        return Err(ApiError::BadRequest(
+            "message or attachment is required".into(),
+        ));
+    };
 
-    match state.peco_runs.enqueue_query(&user_id, Content::Text(text)) {
+    match state.peco_runs.enqueue_query(&user_id, content) {
         EnqueueOutcome::Enqueued => {
             info!(user_id = %user_id, "Peco query enqueued into active run");
             Ok(Json(SuccessResponse {
@@ -2610,6 +2643,56 @@ mod tests {
 
     // ── 附件 id 解析（build_query_content）──────────────────────────────
 
+    /// `POST /stream/query` 与 GET `/stream` 同构：附件-only 也投递为 `Parts`，
+    /// 空消息且无附件则 400。
+    #[tokio::test]
+    async fn query_stream_builds_attachment_content() {
+        let (state, _dir) = test_state().await;
+        put_image(&state, "u1", "a.png").await;
+        let mut reg = state.peco_runs.try_register("u1").expect("register run");
+
+        let resp = query_stream(
+            AuthUser {
+                user_id: "u1".to_string(),
+            },
+            State(Arc::clone(&state)),
+            Ok(Json(QueryRequest {
+                message: None,
+                image_ids: Some("a.png".to_string()),
+                file_ids: None,
+            })),
+        )
+        .await
+        .expect("attachment-only query should enqueue");
+
+        assert!(resp.0.success);
+        match reg.control_rx.recv().await {
+            Some(ControlCommand::Query(Content::Parts(parts))) => {
+                assert!(
+                    parts.iter().any(|p| matches!(p, ContentPart::Image { .. })),
+                    "图片部件必须原样入队"
+                );
+            }
+            other => panic!("应投递带图片部件的 Query，实际 {other:?}"),
+        }
+
+        // 空消息 + 无附件 → 400
+        let err = query_stream(
+            AuthUser {
+                user_id: "u1".to_string(),
+            },
+            State(state),
+            Ok(Json(QueryRequest {
+                message: Some("   ".to_string()),
+                image_ids: None,
+                file_ids: None,
+            })),
+        )
+        .await
+        .expect_err("empty query should be rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
     /// 无附件（id 缺省或空）→ `Content::Text`，与改动前逐字节等价。
     #[tokio::test]
     async fn build_query_content_plain_text_without_attachments() {
@@ -2665,7 +2748,10 @@ mod tests {
         }
     }
 
-    /// 非法 id（路径穿越）→ 400；不存在 / 属于他人目录 → 404。
+    /// 非法 id（路径穿越）、不存在、属于他人目录 → 全部 400。
+    ///
+    /// 解析失败不能是 404：前端把 404 读作「run 已消失」→ 断流 + 清空在途态 +
+    /// 重发，一次写错 id 就让整轮重开。
     #[tokio::test]
     async fn build_query_content_rejects_illegal_and_missing_ids() {
         let (state, _dir) = test_state().await;
@@ -2683,16 +2769,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ApiError::NotFound(_)),
-            "不存在应 404：{err:?}"
+            matches!(err, ApiError::BadRequest(_)),
+            "不存在应 400 而非 404（前端把 404 当 run 已消失）：{err:?}"
         );
 
         let err = build_query_content(&state, "u2", Some("hi".into()), Some("a.png"), None)
             .await
             .unwrap_err();
         assert!(
-            matches!(err, ApiError::NotFound(_)),
-            "引用他人目录的图片应 404：{err:?}"
+            matches!(err, ApiError::BadRequest(_)),
+            "引用他人目录的图片应 400 而非 404（前端把 404 当 run 已消失）：{err:?}"
         );
     }
 
