@@ -32,7 +32,7 @@ pub struct CliArgs {
     #[arg(long, default_value = "true")]
     pub show_tools: bool,
 
-    /// 从内置模板初始化 workspace（personal / minimal / developer）
+    /// 从内置模板初始化 workspace（目前仅 peco）
     #[arg(short = 't', long, env = "PECO_INIT_TEMPLATE")]
     pub init_template: Option<String>,
 }

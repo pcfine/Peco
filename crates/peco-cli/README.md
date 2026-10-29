@@ -40,7 +40,7 @@ peco-cli 使用 **WorkSpace** 管理所有 Agent、Skill 和知识库。默认 w
 ```
 <workspace>/
 ├── agents/                          # Agent 定义目录
-│   ├── @assistant/
+│   ├── @master/
 │   │   └── agent.md                 # Agent 配置 + System Prompt
 │   └── code-reviewer/
 │       └── agent.md
@@ -65,7 +65,7 @@ cargo run -p peco-cli
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|---------|--------|------|
-| `-t`, `--init-template` | `PECO_INIT_TEMPLATE` | — | 从内置模板初始化 workspace（personal / minimal / developer） |
+| `-t`, `--init-template` | `PECO_INIT_TEMPLATE` | — | 从内置模板初始化 workspace（目前仅 peco） |
 | `-w`, `--workspace` | `PECO_WORKSPACE` | `./` | WorkSpace 根目录 |
 | `--no-color` | `NO_COLOR` | false | 禁用彩色输出 |
 | `--show-reasoning` | — | true | 显示模型推理过程 |
@@ -121,9 +121,7 @@ CLI 中 Agent 可用的工具由 workspace 中 agent.md 的 `tools` 字段声明
 
 ```bash
 # 初始化 workspace（从内置模板，首次使用推荐）
-peco -t personal       # 个人助手
-peco -t developer      # 开发辅助
-peco -t minimal        # 最轻量对话
+peco -t peco           # Peco 总管 Agent + 记忆管理
 
 # 使用默认 workspace（./）启动交互式对话
 peco

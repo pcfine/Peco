@@ -45,7 +45,7 @@ async fn main() {
         }
     }
 
-    // 首次启动自动初始化 personal 模板
+    // 首次启动自动初始化 peco 模板
     if let Err(e) = ensure_workspace_initialized(&config).await {
         eprintln!("自动初始化失败: {e:#}");
         process::exit(1);
@@ -121,7 +121,7 @@ async fn init_template_workspace(config: &CliConfig, template_name: &str) -> any
 }
 
 /// 首次启动自动初始化：若 workspace 的 agents/ 目录无有效 Agent，
-/// 自动应用 personal 内置模板，确保至少有一个 Agent 可用。
+/// 自动应用 peco 内置模板，确保至少有一个 Agent 可用。
 async fn ensure_workspace_initialized(config: &CliConfig) -> anyhow::Result<()> {
     let agents_dir = config.workspace_root.join("agents");
 
@@ -140,8 +140,8 @@ async fn ensure_workspace_initialized(config: &CliConfig) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    eprintln!("[init] 首次启动，自动应用 personal 模板...");
-    init_template_workspace(config, "personal").await
+    eprintln!("[init] 首次启动，自动应用 peco 模板...");
+    init_template_workspace(config, "peco").await
 }
 
 /// 初始化 `tracing_subscriber`，日志级别由 `RUST_LOG` 环境变量控制。

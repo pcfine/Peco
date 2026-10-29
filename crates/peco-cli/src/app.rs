@@ -164,7 +164,7 @@ impl CliApp {
         if metas.is_empty() {
             anyhow::bail!(
                 "workspace 中没有可用的 Agent。\n\
-                 请使用 peco -t personal 初始化 workspace。\n\
+                 请使用 peco -t peco 初始化 workspace。\n\
                  workspace: {}",
                 self.config.workspace_root.display()
             );
