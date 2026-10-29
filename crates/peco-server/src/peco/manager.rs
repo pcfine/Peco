@@ -3,8 +3,8 @@
 // ============================================================================
 //
 // 职责：
-//   1. 确保 personal 模板已安装到用户 WorkSpace（首次访问幂等安装）
-//   2. 加载 @assistant Agent
+//   1. 确保 peco 模板已安装到用户 WorkSpace（首次访问幂等安装）
+//   2. 加载总管 Agent（经 `WorkSpace::get_master_agent`，调用方不感知其名字）
 //   3. 组装 PecoConfig（compaction / 环境上下文 / 记忆双路径）
 //
 // 位于 peco 模块（统一入口）。
@@ -24,10 +24,10 @@ use super::environment::EnvironmentInfo;
 
 /// Peco 永续对话管理器。
 ///
-/// 每个用户一个 Manager，持有已加载的 @assistant Agent 和 PecoConfig。
-/// @memory Agent 不在此预加载——由 @assistant 通过 delegate_sub_agent 动态调用。
+/// 每个用户一个 Manager，持有已加载的总管 Agent 和 PecoConfig。
+/// 记忆子 Agent 不在此预加载——由总管 Agent 通过 delegate_sub_agent 动态调用。
 pub struct PecoManager {
-    /// 主助理 Agent（@assistant），从 WorkSpace 目录加载
+    /// 总管 Agent，从 WorkSpace 目录加载
     agent: Arc<peco_core::agent::Agent>,
     /// Peco 配置（compaction / 环境上下文 / 记忆双路径）
     config: PecoConfig,
@@ -36,8 +36,8 @@ pub struct PecoManager {
 impl PecoManager {
     /// 创建新的 PecoManager。
     ///
-    /// 首次调用会自动安装 `personal` 模板到用户 WorkSpace：
-    ///   - agents/@assistant/agent.md
+    /// 首次调用会自动安装 `peco` 模板到用户 WorkSpace：
+    ///   - agents/@master/agent.md
     ///   - agents/@memory/agent.md
     ///   - knowledge/@private_memory/kb_config.json
     ///
@@ -63,18 +63,15 @@ impl PecoManager {
         // ── 2. 幂等安装模板 ──────────────────────────────────────────────
         Self::ensure_template_installed(&ws).await?;
 
-        // ── 3. 使 Agent 缓存失效（模板文件可能刚写入）─────────────────────
-        state
-            .workspace_manager
-            .invalidate_agent(user_id, "@assistant")?;
-        state
-            .workspace_manager
-            .invalidate_agent(user_id, "@memory")?;
+        // ── 3. 加载总管 Agent（从 WorkSpace 目录，非 DB）─────────────────
+        //
+        // 模板安装若覆盖了 agent.md，`AgentManager::save` 已顺手失效缓存并
+        // 刷新元数据；名字是 workspace 内部约定，这里不感知、不指定。
+        let agent = ws
+            .get_master_agent()
+            .map_err(|e| ApiError::Internal(format!("failed to load master agent: {e}")))?;
 
-        // ── 4. 加载 @assistant Agent（从 WorkSpace 目录，非 DB）─────────
-        let agent = state.workspace_manager.get_agent(user_id, "@assistant")?;
-
-        // ── 5. 构建元任务模型（复用主 Agent 的 provider + Flash 模型）────
+        // ── 4. 构建元任务模型（复用主 Agent 的 provider + Flash 模型）────
         //
         // 一个实例担两职：轮边界压缩的摘要器，与撞上 max_iterations 时的收尾报告器
         // （`summarize_inflight`）。两者同范式，差异只在提示词。合成失败非致命，
@@ -129,7 +126,7 @@ impl PecoManager {
         );
         config.compaction = Some(Arc::new(policy));
 
-        // ── 5.5 记忆双路径（写 hook + 读 dynamic_context）────────────────
+        // ── 4.5 记忆双路径（写 hook + 读 dynamic_context）────────────────
         //
         // 存储载体是 @private_memory KB（第 2 步模板安装保证存在）。
         // 提取器复用主 Agent 的 provider + Flash 模型 — 与 compaction 同范式。
@@ -157,7 +154,7 @@ impl PecoManager {
             )));
         }
 
-        // ── 5.6 压缩日志钩子 + 边界观测钩子 ──────────────────────────────
+        // ── 4.6 压缩日志钩子 + 边界观测钩子 ──────────────────────────────
         //   折叠写 peco_compaction_log；每个边界写一行 peco_context_shadow
         //   （gate 关时钩子首行返回，等价于未装配）。
         config
@@ -180,7 +177,7 @@ impl PecoManager {
                 config.strip.tool_output_max_chars,
             )));
 
-        // ── 5.7 启动通道：每用户一次对账 + 每进程一次保留期清理 ─────────
+        // ── 4.7 启动通道：每用户一次对账 + 每进程一次保留期清理 ─────────
         //
         // PecoManager 每次流连接都新建，两个静态闸门保证对账按用户、清理按
         // 进程各只跑一次；均为 fire-and-forget spawn，失败只记日志，不阻塞建连。
@@ -192,7 +189,7 @@ impl PecoManager {
             user_id,
         );
 
-        // ── 6. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
+        // ── 5. 渲染环境上下文（恒定前缀，构造时求值一次）────────────────
         //
         // PecoManager 在每次流连接时新建（handler 每请求调用），
         // 因此这里求值即保证日期新鲜度——每次续接都以当天日期重建环境块。
@@ -218,7 +215,7 @@ impl PecoManager {
         Ok(Self { agent, config })
     }
 
-    /// 获取 @assistant agent 引用（供 handler 克隆）。
+    /// 获取总管 Agent 引用（供 handler 克隆）。
     pub fn agent(&self) -> &Arc<peco_core::agent::Agent> {
         &self.agent
     }
@@ -230,13 +227,13 @@ impl PecoManager {
 
     // ── 私有方法 ──────────────────────────────────────────────────────
 
-    /// 确保 personal 模板已安装在用户 WorkSpace 中。
+    /// 确保 peco 模板已安装在用户 WorkSpace 中。
     async fn ensure_template_installed(
         ws: &peco_core::workspace::WorkSpace,
     ) -> Result<(), ApiError> {
-        let template_dir = BuiltinTemplate::personal().materialize().map_err(|e| {
-            ApiError::Internal(format!("failed to materialize personal template: {e}"))
-        })?;
+        let template_dir = BuiltinTemplate::peco()
+            .materialize()
+            .map_err(|e| ApiError::Internal(format!("failed to materialize peco template: {e}")))?;
 
         let report = ws
             .init_from_template(template_dir.path())
@@ -246,19 +243,19 @@ impl PecoManager {
         if !report.agents_installed.is_empty() {
             tracing::info!(
                 agents = ?report.agents_installed,
-                "Personal agents installed from template"
+                "Peco agents installed from template"
             );
         }
         if !report.agents_skipped.is_empty() {
             tracing::debug!(
                 agents = ?report.agents_skipped,
-                "Personal agents already exist, skipped"
+                "Peco agents already exist, skipped"
             );
         }
         if !report.kbs_created.is_empty() {
             tracing::info!(
                 kbs = ?report.kbs_created,
-                "Personal knowledge bases created"
+                "Peco knowledge bases created"
             );
         }
         for (name, err) in &report.errors {

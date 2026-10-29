@@ -10,7 +10,7 @@
 // - 读路径（recall.rs）：每个新用户 query 前检索相关记忆，
 //   经既有 DynamicContext 机制注入 instructions。
 //
-// 存储载体是 workspace 内的 `@private_memory` 知识库（personal 模板
+// 存储载体是 workspace 内的 `@private_memory` 知识库（peco 模板
 // 幂等安装），本模块不引入新的存储抽象 — 直接使用 `KnowledgeManager`。
 //
 // V1 语义：自动路径只做 add（提取新信息）；记忆的更新/删除由
@@ -54,8 +54,10 @@ pub async fn build_worker(
         .get_synced(user_id, &state.db)
         .await?;
     let km = Arc::clone(ws.knowledge_manager());
-    // Flash 档 provider 复用主 Agent 的（与 compaction / 记忆提取同范式）
-    let agent = state.workspace_manager.get_agent(user_id, "@assistant")?;
+    // Flash 档 provider 复用总管 Agent 的（与 compaction / 记忆提取同范式）
+    let agent = ws
+        .get_master_agent()
+        .map_err(|e| ApiError::Internal(format!("failed to load master agent: {e}")))?;
 
     Ok(ConsolidationWorker::new(
         km,

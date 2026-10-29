@@ -502,7 +502,7 @@ pub(crate) async fn spawn_peco_run(
     message: Content,
     registration: RunRegistration,
 ) -> Result<(), ApiError> {
-    // ── 1. PecoManager（重活：模板幂等安装 + @assistant 加载 + 记忆/压缩装配）──
+    // ── 1. PecoManager（重活：模板幂等安装 + 总管 Agent 加载 + 记忆/压缩装配）──
     let manager = PecoManager::new(state, user_id).await?;
 
     // ── 2. 永续 Session ──────────────────────────────────────────────────

@@ -167,14 +167,14 @@ fn env_bool<F: Fn(&str) -> Option<String>>(get: &F, name: &str, default: bool) -
 
 /// 记忆双路径配置。
 ///
-/// 存储载体是 workspace 内的 `@private_memory` 知识库（personal 模板
+/// 存储载体是 workspace 内的 `@private_memory` 知识库（peco 模板
 /// 幂等安装，per-user 目录隔离，LanceDb 后端）——本配置只描述行为参数，
 /// 不描述存储后端。
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
     /// 总开关。`false` 时 PecoManager 不装配任何记忆组件（零开销）。
     pub enabled: bool,
-    /// 记忆知识库名（与 personal 模板保持一致）。
+    /// 记忆知识库名（与 peco 模板保持一致）。
     pub kb_name: String,
     /// 提取模型（Flash 档，低延迟低成本；复用主 Agent 的 provider）。
     pub model: String,

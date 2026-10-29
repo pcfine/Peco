@@ -599,7 +599,7 @@ impl MemoryExtractionHook {
             .map(|i| enforce && duplicates.get(i).copied().unwrap_or(false))
             .collect();
 
-        // KB 由 personal 模板幂等安装保证存在；缺失（NotFound）按非致命处理
+        // KB 由 peco 模板幂等安装保证存在；缺失（NotFound）按非致命处理
         let base_ts = chrono::Utc::now().timestamp_millis();
         let titles: Vec<String> = (0..facts.len())
             .map(|i| format!("memory_{base_ts}_{i}"))

@@ -264,7 +264,7 @@ curl -N "http://localhost:9227/api/conversations/{conv_id}/stream?message=你好
 | `GET` | `/api/peco/stream?message=` | SSE 流式永续对话（per-user perpetual session） |
 | `GET` | `/api/peco/session` | 获取当前 Session 快照 |
 
-使用 Peco 内置 `@assistant` + `@memory` 子 Agent 协作模式，自动管理个人记忆。
+使用 Peco 内置 `@master` + `@memory` 子 Agent 协作模式，自动管理个人记忆。
 
 ### Chat 对话管理
 
@@ -516,7 +516,7 @@ PPA 在对话中自动学习用户偏好和事实，采用三层记忆模型（P
 - **写路径**：`PpaMemoryHook`（LooperHook，`on_turn_complete`）→ 阈值过滤 → `MemoryAnalyzer`（独立 Flash 模型）→ `PersonalMemoryStore`（KB 文档存储 + 图谱双写）
 - **读路径**：`PpaDynamicContext`（DynamicContext）在每次请求时检索 UserProfile + 向量相似记忆，注入 system prompt
 - **查询分类**：`QueryClassifier` 规则引擎，4 类查询分类（CasualChat / PersonalQuery / TechnicalQuery / GeneralQuery）
-- **Agent 协作**：通过 `@assistant → @memory` 子 Agent 模式使用 KB 工具直接管理记忆
+- **Agent 协作**：通过 `@master → @memory` 子 Agent 模式使用 KB 工具直接管理记忆
 
 ### 用户隔离
 
