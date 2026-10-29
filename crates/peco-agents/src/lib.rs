@@ -16,11 +16,7 @@ mod templates;
 use std::io;
 
 /// 所有内置模板的静态数组。
-static ALL_TEMPLATES: [BuiltinTemplate; 3] = [
-    templates::personal::PERSONAL,
-    templates::minimal::MINIMAL,
-    templates::developer::DEVELOPER,
-];
+static ALL_TEMPLATES: [BuiltinTemplate; 1] = [templates::peco::PECO];
 
 /// 内置 Workspace 模板。
 ///
@@ -59,19 +55,9 @@ impl BuiltinTemplate {
         &ALL_TEMPLATES
     }
 
-    /// personal 模板：个人 AI 助手。
-    pub fn personal() -> Self {
-        templates::personal::PERSONAL
-    }
-
-    /// minimal 模板：最轻量对话。
-    pub fn minimal() -> Self {
-        templates::minimal::MINIMAL
-    }
-
-    /// developer 模板：开发辅助。
-    pub fn developer() -> Self {
-        templates::developer::DEVELOPER
+    /// peco 模板：Peco 元 Agent + 记忆管理。
+    pub fn peco() -> Self {
+        templates::peco::PECO
     }
 }
 
@@ -84,15 +70,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_returns_three_templates() {
-        assert_eq!(BuiltinTemplate::all().len(), 3);
+    fn test_all_returns_single_template() {
+        assert_eq!(BuiltinTemplate::all().len(), 1);
+        assert_eq!(BuiltinTemplate::all()[0].name, "peco");
     }
 
     #[test]
     fn test_by_name_found() {
-        let t = BuiltinTemplate::by_name("personal");
+        let t = BuiltinTemplate::by_name("peco");
         assert!(t.is_some());
-        assert_eq!(t.unwrap().name, "personal");
+        assert_eq!(t.unwrap().name, "peco");
     }
 
     #[test]
@@ -101,38 +88,14 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_personal() {
-        let t = BuiltinTemplate::personal();
+    fn test_materialize_peco() {
+        let t = BuiltinTemplate::peco();
         let tmp = t.materialize().unwrap();
-        assert!(tmp.path().join("agents/@assistant/agent.md").exists());
+        assert!(tmp.path().join("agents/@master/agent.md").exists());
         assert!(tmp.path().join("agents/@memory/agent.md").exists());
         assert!(
             tmp.path()
                 .join("knowledge/@private_memory/kb_config.json")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn test_materialize_minimal() {
-        let t = BuiltinTemplate::minimal();
-        let tmp = t.materialize().unwrap();
-        assert!(tmp.path().join("agents/basic-chat/agent.md").exists());
-    }
-
-    #[test]
-    fn test_materialize_developer() {
-        let t = BuiltinTemplate::developer();
-        let tmp = t.materialize().unwrap();
-        assert!(
-            tmp.path()
-                .join("agents/@coding-assistant/agent.md")
-                .exists()
-        );
-        assert!(tmp.path().join("agents/@memory/agent.md").exists());
-        assert!(
-            tmp.path()
-                .join("knowledge/@project_docs/kb_config.json")
                 .exists()
         );
     }

@@ -156,7 +156,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **记忆双路径**（[crates/peco-server/src/peco/memory/](crates/peco-server/src/peco/memory/)）：存储载体是 personal 模板幂等安装的 per-user `@private_memory` KB。
   - **写路径** `MemoryExtractionHook`（LooperHook）：每轮成功完成后守卫检查（失败轮跳过、`analyze_min_chars` 过滤），`tokio::spawn` 后台检索既有记忆抑制重复 → Flash 模型（`ModelTurnAnalyzer`，严格 JSON 输出）提取事实 → 逐条写入 KB（source 标签 `ppa_{profile|semantic|episodic}`）。turn 边界零阻塞，所有失败点 warn 后 return。
   - **读路径** `MemoryRecallContext`（DynamicContext）：每次新用户 query 前，闲聊门控（问候/感谢关键词，零成本跳过；不按长度门控）→ 混合检索 → 按类别格式化注入 instructions 尾部，`injection_token_cap` 逐行截断。
-  - **分工**：compaction 解决"会话内上下文放不下"，记忆解决"跨会话/超长期的知识"，二者正交。记忆的更新/删除由 `@assistant → @memory` 子 Agent 的显式 KB 工具路径负责（自动路径只做 add）：删除走 `delete_kb_document(s)`（outbox 审计：删除前写 pending、成功 done、失败 cancelled，偏好类 `ppa_profile` 硬拒绝），审计落 SQLite `memory_audit` 表（含完整原文，不在任何检索面），`POST /api/peco/memory/audit/:id/restore` 按审计行重放回滚；审计注入在 `WorkspaceManager::open_workspace` 统一完成，审计存储缺失时删除工具运行时拒绝（fail-closed）。召回统计 / 整理水位表（`memory_recall_stats` / `memory_consolidation_state`）已建，供后续巩固流水线使用。
+  - **分工**：compaction 解决"会话内上下文放不下"，记忆解决"跨会话/超长期的知识"，二者正交。记忆的更新/删除由 `@master → @memory` 子 Agent 的显式 KB 工具路径负责（自动路径只做 add）：删除走 `delete_kb_document(s)`（outbox 审计：删除前写 pending、成功 done、失败 cancelled，偏好类 `ppa_profile` 硬拒绝），审计落 SQLite `memory_audit` 表（含完整原文，不在任何检索面），`POST /api/peco/memory/audit/:id/restore` 按审计行重放回滚；审计注入在 `WorkspaceManager::open_workspace` 统一完成，审计存储缺失时删除工具运行时拒绝（fail-closed）。召回统计 / 整理水位表（`memory_recall_stats` / `memory_consolidation_state`）已建，供后续巩固流水线使用。
 
 **Skills**（[crates/peco-core/src/skills/](crates/peco-core/src/skills/)）：
 - 三级渐进式加载：Tier 1（启动时加载名称+描述）、Tier 2（激活时加载完整正文）、Tier 3（按需加载 scripts/references/assets）。
@@ -208,7 +208,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **磁盘上的 agent.md 文件**：Agent 定义的**唯一真相源**。DB 仅存储轻量索引（name、path、user_id）。Agent 始终从 `.md` 文件通过 `WorkspaceManager::get_agent()` 加载。
 
 **Peco 模块**（[crates/peco-server/src/peco/](crates/peco-server/src/peco/)）：
-- `PecoManager`（[manager.rs](crates/peco-server/src/peco/manager.rs)）：每次流连接构造。确保 personal 模板幂等安装、加载 `@assistant` Agent，并组装 `PecoConfig` — 滚动压缩策略、环境上下文前缀、记忆双路径（hook + dynamic_context，`memory.enabled` 时）。
+- `PecoManager`（[manager.rs](crates/peco-server/src/peco/manager.rs)）：每次流连接构造。确保 personal 模板幂等安装、加载 `@master` Agent，并组装 `PecoConfig` — 滚动压缩策略、环境上下文前缀、记忆双路径（hook + dynamic_context，`memory.enabled` 时）。
 - `PecoConfig`（[config.rs](crates/peco-server/src/peco/config.rs)）：预算/压缩/记忆参数 + 管理器构造期填充的可选组件（compaction / environment / dynamic_context / hooks）。handler 无需改动即可增减注入组件。
 - `PecoContextFilter`（[filter.rs](crates/peco-server/src/peco/filter.rs)）：单一截断点上下文组装器（见上文"滚动压缩"）。
 - SSE 事件含 `context_compacted`（归档提示），前端以居中分隔条展示。

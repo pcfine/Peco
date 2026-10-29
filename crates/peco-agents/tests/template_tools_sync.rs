@@ -136,39 +136,22 @@ fn template_tools_exist_in_builtin_registry() {
         checked += 1;
     }
     assert!(
-        checked >= 5,
-        "expected at least 5 template agents, got {checked}"
+        checked == 2,
+        "expected the peco template's agent.md files (master + memory), got {checked}"
     );
 }
 
-/// 两套模板的 @memory 是镜像：tools 清单逐字一致（除 KB 名外不应分叉）。
+/// G1 锁定：@memory agent 必须声明三个图删除工具。
 #[test]
-fn memory_tools_are_mirrored_across_templates() {
-    let personal = frontmatter_tools(
-        &repo_root().join("crates/peco-agents/templates/personal/agents/@memory/agent.md"),
+fn memory_template_declares_graph_delete_tools() {
+    let tools = frontmatter_tools(
+        &repo_root().join("crates/peco-agents/templates/peco/agents/@memory/agent.md"),
     );
-    let developer = frontmatter_tools(
-        &repo_root().join("crates/peco-agents/templates/developer/agents/@memory/agent.md"),
-    );
-    assert_eq!(
-        personal, developer,
-        "@memory tools lists diverged between personal and developer templates"
-    );
-}
-
-/// G1 锁定：两个 @memory 模板都必须声明三个图删除工具。
-#[test]
-fn memory_templates_declare_graph_delete_tools() {
-    for tpl in ["personal", "developer"] {
-        let tools = frontmatter_tools(&repo_root().join(format!(
-            "crates/peco-agents/templates/{tpl}/agents/@memory/agent.md"
-        )));
-        for required in GRAPH_DELETE_TOOLS {
-            assert!(
-                tools.iter().any(|t| t == required),
-                "{tpl}/@memory must declare '{required}', got {tools:?}"
-            );
-        }
+    for required in GRAPH_DELETE_TOOLS {
+        assert!(
+            tools.iter().any(|t| t == required),
+            "peco/@memory must declare '{required}', got {tools:?}"
+        );
     }
 }
 
