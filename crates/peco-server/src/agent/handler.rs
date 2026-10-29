@@ -95,6 +95,8 @@ pub struct AgentListItem {
     pub status: String,
     pub tools: Vec<String>,
     pub knowledge_bases: Vec<String>,
+    /// 是否为当前 workspace 的总管 Agent（名字由 peco-core 内部约定，不外露）
+    pub is_master: bool,
     pub created_at: String,
 }
 
@@ -297,6 +299,7 @@ pub async fn list(
             status: r.status.clone(),
             tools,
             knowledge_bases,
+            is_master: ws.is_master_agent(&r.name),
             created_at: r.created_at.clone(),
         });
     }
@@ -705,7 +708,7 @@ mod tests {
     /// 一个「由模板衍生」的 agent.md：带 template_version。
     const TEMPLATE_DERIVED_MD: &str = r#"---
 agent:
-  name: "@assistant"
+  name: "sample-agent"
   description: "Peco"
 template_version: 7
 llm:

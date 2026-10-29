@@ -10,6 +10,8 @@ export interface AgentListItem {
   status: string;
   tools?: string[];
   knowledge_bases: string[];
+  /** 是否为当前 workspace 的总管 Agent（后端据内部保留名判定） */
+  is_master?: boolean;
   created_at: string;
 }
 

@@ -7,7 +7,7 @@ import type {
 } from "@/types/agent";
 import type { SuccessResponse } from "@/types/common";
 
-// ── @assistant 图片输入能力（进程内 memo）────────────────────────────────
+// ── 总管 Agent 图片输入能力（进程内 memo）────────────────────────────────
 //
 // 该能力只取决于 agent 绑定的 provider，属静态值；每次进 /peco 都 listAgents +
 // getAgent 会随路由往返重复打两个请求（开发态 StrictMode 双跑还会翻倍）。
@@ -49,14 +49,14 @@ export async function deleteAgent(id: string): Promise<SuccessResponse> {
   return res.data;
 }
 
-/** @assistant 是否支持用户图片输入。结果 memo，重复调用至多一次网络往返。 */
+/** 总管 Agent 是否支持用户图片输入。结果 memo，重复调用至多一次网络往返。 */
 export async function getAssistantSupportsImages(): Promise<boolean> {
   if (assistantSupportsImages !== null) return assistantSupportsImages;
   if (!assistantSupportsImagesInFlight) {
     assistantSupportsImagesInFlight = (async () => {
       try {
         const all = await listAgents();
-        const match = all.find((a) => a.name === "@assistant");
+        const match = all.find((a) => a.is_master);
         if (!match) return false;
         const detail = await getAgent(match.id);
         assistantSupportsImages = detail.supports_images;

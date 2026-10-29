@@ -230,6 +230,14 @@ impl WorkSpace {
         self.agent_manager
             .refresh_one(crate::agent::MASTER_AGENT_NAME);
     }
+
+    /// 判断某个名字是否为总管 Agent 的保留名。
+    ///
+    /// 供展示层标注/识别总管 Agent 使用——调用方仍不感知具体名字。
+    pub fn is_master_agent(&self, name: &str) -> bool {
+        name == crate::agent::MASTER_AGENT_NAME
+    }
+
     pub fn workflow_manager(&self) -> &Arc<WorkflowManager> {
         &self.workflow_manager
     }
@@ -877,6 +885,8 @@ mod tests {
             ws.get_master_agent().is_err(),
             "缺失时必须报错，不能静默回退"
         );
+        assert!(ws.is_master_agent(crate::agent::MASTER_AGENT_NAME));
+        assert!(!ws.is_master_agent("other"));
 
         let content = master_md(crate::agent::MASTER_AGENT_NAME);
         ws.agent_manager()

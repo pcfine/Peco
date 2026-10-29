@@ -78,7 +78,7 @@ export function PecoChatPage() {
     void loadArtifacts();
   }, [loadArtifacts]);
 
-  // @assistant 的 provider 是否支持用户图片输入 —— 只决定图片文件能否发送
+  // 总管 Agent 的 provider 是否支持用户图片输入 —— 只决定图片文件能否发送
   // （文档不依赖视觉能力，附件入口始终可用）。能力值静态、进程内 memo
   // （见 api/agents），路由往返与 StrictMode 双跑各只探一次。
   useEffect(() => {
@@ -237,7 +237,7 @@ export function PecoChatPage() {
           <>
             <p className="text-lg">👋 你好！我是 Peco，你的个人 AI 助理。</p>
             <p className="text-sm mt-2">
-              由 @assistant 驱动 · 我可以执行命令、管理记忆、搜索知识库。
+              由总管 Agent 驱动 · 我可以执行命令、管理记忆、搜索知识库。
             </p>
           </>
         }
