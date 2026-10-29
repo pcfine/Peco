@@ -110,7 +110,7 @@ impl ToolDyn for SaveAgent {
                 followed by the system prompt in Markdown.\n\
                 \n\
                 Naming convention: names starting with '@' are reserved for built-in system \
-                agents (e.g., '@assistant'). Do NOT prefix user-created agents with '@'.\n\
+                agents (e.g., '@master'). Do NOT prefix user-created agents with '@'.\n\
                 \n\
                 Required frontmatter fields:\n\
                   agent.name: unique agent identifier\n\
@@ -225,10 +225,7 @@ impl ToolDyn for DeleteAgent {
         ToolDefinition {
             name: "delete_agent".to_string(),
             description: "Delete an agent and its agent.md file. This is irreversible. \
-                The agent directory and all its contents will be permanently removed. \
-                You CANNOT delete @assistant itself.\n\
-                \n\
-                Before deleting, explain the impact to the user and require explicit confirmation."
+                The agent directory and all its contents will be permanently removed. "
                 .to_string(),
             parameters: json!({
                 "type": "object",

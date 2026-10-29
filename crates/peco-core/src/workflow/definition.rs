@@ -420,7 +420,7 @@ pub fn pre_validate_workflow_yaml(yaml: &str) -> Result<(), WorkflowError> {
                 "agent" => {
                     let mut missing = Vec::new();
                     if !config_map.contains_key("agent") {
-                        missing.push("agent (which agent to invoke, e.g. \"@assistant\")");
+                        missing.push("agent (which agent to invoke, e.g. \"@master\")");
                     }
                     if !config_map.contains_key("prompt") {
                         missing.push("prompt (instructions for the agent)");

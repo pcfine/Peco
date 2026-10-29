@@ -30,4 +30,8 @@ pub enum WorkspaceError {
     /// 工作空间目录创建失败。
     #[error("workspace directory error: {0}")]
     WorkspaceDir(String),
+
+    /// 试图删除或重命名内置 Agent
+    #[error("reserved agent: {0}")]
+    ReservedAgent(String),
 }

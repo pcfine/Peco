@@ -17,6 +17,7 @@
 mod error;
 pub mod hash;
 pub mod workdir;
+
 #[allow(clippy::module_inception)]
 mod workspace;
 

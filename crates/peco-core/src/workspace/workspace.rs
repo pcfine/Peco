@@ -203,6 +203,33 @@ impl WorkSpace {
     pub fn agent_manager(&self) -> &Arc<AgentManager> {
         &self.agent_manager
     }
+
+    /// 本 workspace 必备的总管 Agent
+    ///
+    /// 名字是内部约定，调用方无需知道；加载走 Tier-2 缓存。
+    /// 模板安装路径负责在缺失时补装，其他入口缺失时返回错误。
+    pub fn get_master_agent(
+        self: &Arc<Self>,
+    ) -> Result<Arc<crate::agent::Agent>, crate::agent::AgentError> {
+        self.agent_manager
+            .load_cached(crate::agent::MASTER_AGENT_NAME)
+    }
+
+    /// 本 workspace 是否已安装总管 Agent。
+    ///
+    /// 供生命周期层判断 workspace 是否具备总管 Agent，
+    /// 不暴露具体 Agent 名字。
+    pub fn has_master_agent(&self) -> bool {
+        self.agent_manager
+            .md_path(crate::agent::MASTER_AGENT_NAME)
+            .exists()
+    }
+
+    /// 刷新总管 Agent 的两级缓存（模板覆盖或文件变更后调用）。
+    pub fn reload_master_agent(&self) {
+        self.agent_manager
+            .refresh_one(crate::agent::MASTER_AGENT_NAME);
+    }
     pub fn workflow_manager(&self) -> &Arc<WorkflowManager> {
         &self.workflow_manager
     }
@@ -530,12 +557,8 @@ impl AgentAccess for WorkSpace {
     }
 
     fn delete_agent(&self, name: &str) -> Result<(), String> {
-        if name == "@assistant" {
-            return Err(
-                "Cannot delete @assistant — it is the meta-agent managing this workspace."
-                    .to_string(),
-            );
-        }
+        // 保留 Agent 的保护在 AgentManager::delete 内统一执行，
+        // 避免工具路径 / API 路径各写一份判断。
         self.agent_manager.delete(name).map_err(|e| e.to_string())
     }
 }
@@ -834,6 +857,66 @@ mod tests {
         let agents_dir = installed_agent_dir(tmp.path());
         assert!(agents_dir.join("agent.md").exists());
         assert!(!agents_dir.join("agent.md.bak.0").exists());
+    }
+
+    fn master_md(name: &str) -> String {
+        format!(
+            "---\nagent:\n  name: \"{name}\"\n  description: \"master\"\nllm:\n  provider: \"deepseek\"\n---\n# master"
+        )
+    }
+
+    /// 总管 Agent 通过 WorkSpace 获取，调用方不需要知道名字。
+    #[test]
+    fn get_master_agent_requires_master_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_providers(tmp.path(), "sk-test");
+        let ws = Arc::new(make_workspace(tmp.path()));
+
+        assert!(!ws.has_master_agent());
+        assert!(
+            ws.get_master_agent().is_err(),
+            "缺失时必须报错，不能静默回退"
+        );
+
+        let content = master_md(crate::agent::MASTER_AGENT_NAME);
+        ws.agent_manager()
+            .save(crate::agent::MASTER_AGENT_NAME, &content)
+            .unwrap();
+
+        assert!(ws.has_master_agent());
+        let agent = ws.get_master_agent().unwrap();
+        assert_eq!(agent.config().agent.name, crate::agent::MASTER_AGENT_NAME);
+    }
+
+    /// 保留 Agent 的删除/改名保护必须落在 AgentManager 层，
+    /// 这样工具路径与 API 路径都能覆盖。
+    #[test]
+    fn master_agent_cannot_be_deleted_or_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = Arc::new(make_workspace(tmp.path()));
+        let content = master_md(crate::agent::MASTER_AGENT_NAME);
+        ws.agent_manager()
+            .save(crate::agent::MASTER_AGENT_NAME, &content)
+            .unwrap();
+
+        let err = ws
+            .agent_manager()
+            .delete(crate::agent::MASTER_AGENT_NAME)
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::ReservedAgent(_)));
+        assert!(ws.has_master_agent(), "删除被拒后文件必须仍在");
+
+        let err = ws
+            .agent_manager()
+            .rename(crate::agent::MASTER_AGENT_NAME, "renamed", &content)
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::ReservedAgent(_)));
+
+        let err = ws
+            .agent_manager()
+            .rename("other", crate::agent::MASTER_AGENT_NAME, &content)
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::ReservedAgent(_)));
     }
 
     /// 写出 providers.toml，其中 deepseek 的 api_key 为字面量 `key`。

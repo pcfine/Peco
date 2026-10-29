@@ -1,3 +1,9 @@
+/// 内置总管 Agent 的保留名。
+///
+/// 每个 workspace 都必须安装该 Agent；名字只在 crate 内部使用，
+/// 外部通过 [`crate::workspace::WorkSpace::get_master_agent`] 获取实例。
+pub(crate) const MASTER_AGENT_NAME: &str = "@master";
+
 #[allow(clippy::module_inception)]
 pub(crate) mod agent;
 pub mod agent_config;

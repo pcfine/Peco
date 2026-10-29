@@ -485,8 +485,45 @@ impl AgentManager {
         Ok(())
     }
 
+    /// 删除前置校验：内置总管 Agent 不可删除。
+    ///
+    /// 供服务端在删除 DB 索引前调用，避免出现「DB 行已删、文件还在」的半完成状态。
+    pub fn ensure_deletable(&self, name: &str) -> Result<(), WorkspaceError> {
+        if name == super::MASTER_AGENT_NAME {
+            return Err(WorkspaceError::ReservedAgent(format!(
+                "Cannot delete {} — it is the master agent of this workspace.",
+                super::MASTER_AGENT_NAME
+            )));
+        }
+        Ok(())
+    }
+
+    /// 重命名 Agent。
+    ///
+    /// 总管 Agent 既不能被改名，也不能被其他 Agent 顶替 —— 两条路径都会
+    /// 让 [`crate::workspace::WorkSpace::get_master_agent`] 失效。
+    pub fn rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        content: &str,
+    ) -> Result<(), WorkspaceError> {
+        if old_name == super::MASTER_AGENT_NAME || new_name == super::MASTER_AGENT_NAME {
+            return Err(WorkspaceError::ReservedAgent(format!(
+                "Cannot rename agent '{old_name}' to '{new_name}' — {} is reserved.",
+                super::MASTER_AGENT_NAME
+            )));
+        }
+        if old_name == new_name {
+            return self.save(new_name, content);
+        }
+        self.save(new_name, content)?;
+        self.delete(old_name)
+    }
+
     /// 删除 Agent 目录并清除缓存。
     pub fn delete(&self, name: &str) -> Result<(), WorkspaceError> {
+        self.ensure_deletable(name)?;
         let dir = self.agents_dir.join(name);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -682,6 +719,12 @@ impl AgentAccess for AmAgentAccess {
     }
 
     fn delete_agent(&self, name: &str) -> Result<(), String> {
+        if name == super::MASTER_AGENT_NAME {
+            return Err(format!(
+                "Cannot delete {} — it is the master agent of this workspace.",
+                super::MASTER_AGENT_NAME
+            ));
+        }
         let dir = self.agents_dir.join(name);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)

@@ -117,7 +117,7 @@ const ENTITY_ALIASES: &[(&str, EntityType)] = &[
     ("知识图谱", EntityType::Concept),
     ("本体", EntityType::Concept),
     ("@memory", EntityType::Agent),
-    ("@assistant", EntityType::Agent),
+    ("@master", EntityType::Agent),
     ("@private_memory", EntityType::KnowledgeBase),
 ];
 
