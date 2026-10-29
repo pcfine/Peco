@@ -91,8 +91,19 @@ mod tests {
     fn test_materialize_peco() {
         let t = BuiltinTemplate::peco();
         let tmp = t.materialize().unwrap();
-        assert!(tmp.path().join("agents/@master/agent.md").exists());
-        assert!(tmp.path().join("agents/@memory/agent.md").exists());
+
+        let agent_mds: Vec<_> = t
+            .files
+            .iter()
+            .filter(|(path, _)| path.starts_with("agents/") && path.ends_with("/agent.md"))
+            .collect();
+        assert_eq!(agent_mds.len(), 2);
+        assert!(
+            agent_mds
+                .iter()
+                .all(|(path, _)| tmp.path().join(path).exists()),
+            "所有模板 agent.md 都必须落盘"
+        );
         assert!(
             tmp.path()
                 .join("knowledge/@private_memory/kb_config.json")
