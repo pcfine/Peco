@@ -149,7 +149,7 @@ fn analyzer_system_prompt() -> &'static str {
     RENDERED.get_or_init(|| {
         ANALYZER_PROMPT_TEMPLATE.replace(
             "{entity_type_lines}",
-            &peco_core::ontology::render_entity_type_lines(),
+            &super::ontology::render_entity_type_lines(),
         )
     })
 }
@@ -564,7 +564,7 @@ mod tests {
     fn test_prompt_renders_entity_types_without_relation_enum() {
         let prompt = analyzer_system_prompt();
         // 实体类型闭集注入
-        for ty in peco_core::ontology::EntityType::ALL {
+        for ty in crate::peco::memory::ontology::EntityType::ALL {
             assert!(
                 prompt.contains(&format!("- {}: ", ty.as_str())),
                 "prompt 缺类型 {}",

@@ -128,7 +128,7 @@ pub fn build_graph(
             entity_type: n
                 .properties
                 .get("entity_type")
-                .and_then(|t| peco_core::ontology::EntityType::from_name(t))
+                .and_then(|t| super::ontology::EntityType::from_name(t))
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "Other".to_string()),
             id: n.id,
@@ -138,7 +138,7 @@ pub fn build_graph(
         .into_iter()
         .map(|e| {
             let predicate = e.edge_type.as_label().to_string();
-            let group = peco_core::ontology::group_of(&predicate).map(str::to_string);
+            let group = super::ontology::group_of(&predicate).map(str::to_string);
             MemoryEdge {
                 source: e.source_id,
                 target: e.target_id,

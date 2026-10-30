@@ -4,7 +4,6 @@ pub mod config;
 pub mod executor;
 pub mod knowledge;
 pub mod mcp;
-pub mod ontology;
 pub mod persistence;
 pub mod search;
 pub mod session;

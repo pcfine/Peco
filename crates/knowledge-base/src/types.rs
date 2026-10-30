@@ -205,8 +205,8 @@ pub const MAX_TRAVERSAL_DEPTH: u32 = 5;
 /// 谓词的轻归一化 —— 边 label 的**唯一**实现，写/读/删三处共用。
 ///
 /// 只做 `trim` + 全角→半角 + 连续空白折叠为单空格；**不做同义改写**（`采用`
-/// 不会变成 `使用`）。读侧分组（`peco_core::ontology::group_of`）也用它归一
-/// 入参，口径一致才能让「使用 」与「使用」落到同一组/同一条边。
+/// 不会变成 `使用`）。读侧关系分组也用它归一入参，口径一致才能让
+/// 「使用 」与「使用」落到同一组/同一条边。
 pub fn normalize_predicate(predicate: &str) -> String {
     let folded: String = predicate.chars().map(fold_fullwidth).collect();
     let mut out = String::with_capacity(folded.len());

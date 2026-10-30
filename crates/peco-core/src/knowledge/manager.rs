@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -24,6 +24,9 @@ use super::sync::SyncReport;
 // ---------------------------------------------------------------------------
 // KnowledgeManager
 // ---------------------------------------------------------------------------
+
+/// 写入前的 fact 变换钩子。
+pub type FactNormalizer = Arc<dyn Fn(&mut knowledge_base::Fact) + Send + Sync>;
 
 /// 知识库模块 — AI Agent 的统一知识管理入口。
 ///
@@ -47,6 +50,8 @@ pub struct KnowledgeManager {
     sync_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// 串行化 reload 的「构建 + 安装」，防旧快照覆盖新快照。锁序 reload_lock → underlying。
     reload_lock: Mutex<()>,
+    /// 写入前的 fact 变换钩子；未安装时原样写入。
+    fact_normalizer: RwLock<Option<FactNormalizer>>,
 }
 
 impl KnowledgeManager {
@@ -69,6 +74,7 @@ impl KnowledgeManager {
             auto_sync_done: AtomicBool::new(false),
             sync_locks: Mutex::new(HashMap::new()),
             reload_lock: Mutex::new(()),
+            fact_normalizer: RwLock::new(None),
         }
     }
 
@@ -85,7 +91,15 @@ impl KnowledgeManager {
             auto_sync_done: AtomicBool::new(false),
             sync_locks: Mutex::new(HashMap::new()),
             reload_lock: Mutex::new(()),
+            fact_normalizer: RwLock::new(None),
         }
+    }
+
+    /// 安装写入前的 fact 变换钩子。
+    ///
+    /// [`add_facts_to_kb`](Self::add_facts_to_kb) 对每条 fact 调用它；未安装时原样写入。
+    pub fn set_fact_normalizer(&self, normalizer: FactNormalizer) {
+        *self.fact_normalizer.write().unwrap() = Some(normalizer);
     }
 
     // ── 初始化 ──────────────────────────────────────────────────────────────
@@ -521,13 +535,15 @@ impl KnowledgeManager {
             .await
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
-        // 类型校验/推断在唯一收口点做 —— 三个写图调用方（自动提取双写、
-        // agent 工具、审计回放）都经这里，放在各调用方会漏掉工具路径。
+        // 类型校验/推断由注入的 normalizer 提供；未安装时原样写入。
+        let normalizer = self.fact_normalizer.read().unwrap().clone();
         let normalized: Vec<knowledge_base::Fact> = facts
             .iter()
             .cloned()
             .map(|mut f| {
-                crate::ontology::normalize_fact(&mut f);
+                if let Some(normalizer) = &normalizer {
+                    normalizer(&mut f);
+                }
                 f
             })
             .collect();
@@ -1104,12 +1120,16 @@ mod tests {
         assert!(!docs.is_empty());
     }
 
-    /// 收口归一化：`add_facts_to_kb` 委托前给每条 fact 落类型、折叠谓词空白。
-    /// 未映射谓词**不被替换**（无关系闭集）。
+    /// 收口变换：`add_facts_to_kb` 对每条 fact 调用注入的 normalizer，
+    /// 并折叠谓词空白。未映射谓词**不被替换**（无关系闭集）。
     #[tokio::test]
-    async fn add_facts_to_kb_normalizes_types_and_keeps_predicate_verbatim() {
+    async fn add_facts_to_kb_applies_injected_normalizer_and_keeps_predicate_verbatim() {
         let tmp = tempfile::tempdir().unwrap();
         let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.set_fact_normalizer(Arc::new(|f: &mut knowledge_base::Fact| {
+            f.subject_type = Some("Person".into());
+            f.object_type = Some("Technology".into());
+        }));
         km.ensure_loaded().await.unwrap();
         km.create_kb(make_test_config("test-graph")).await.unwrap();
 
@@ -1129,7 +1149,7 @@ mod tests {
         assert_eq!(hit.len(), 1, "尾随空白应被折叠为 '使用'");
         assert_eq!(hit[0].edge_type.as_label(), "使用");
 
-        // 节点带 entity_type，且落在本体闭集内
+        // normalizer 落下的类型写进节点属性
         let (nodes, _edges) = km.list_entity_graph("test-graph").await.unwrap();
         assert!(!nodes.is_empty());
         for n in &nodes {
@@ -1138,8 +1158,32 @@ mod tests {
                 .get("entity_type")
                 .expect("节点应带 entity_type");
             assert!(
-                crate::ontology::EntityType::from_name(t).is_some(),
-                "entity_type {t:?} 应在闭集内"
+                t == "Person" || t == "Technology",
+                "entity_type {t:?} 应由注入的 normalizer 决定"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_facts_to_kb_without_normalizer_writes_no_entity_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config("test-graph-plain"))
+            .await
+            .unwrap();
+
+        let facts = vec![knowledge_base::Fact::new("用户", "喜欢", "Rust", 0.8)];
+        km.add_facts_to_kb("test-graph-plain", &facts, false)
+            .await
+            .unwrap();
+
+        let (nodes, _edges) = km.list_entity_graph("test-graph-plain").await.unwrap();
+        assert!(!nodes.is_empty());
+        for n in &nodes {
+            assert!(
+                !n.properties.contains_key("entity_type"),
+                "未安装 normalizer 时不应写 entity_type"
             );
         }
     }

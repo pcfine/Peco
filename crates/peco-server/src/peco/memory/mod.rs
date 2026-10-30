@@ -22,6 +22,8 @@ pub mod consolidation;
 pub mod cron;
 pub mod dedup;
 pub mod hook;
+/// 记忆图谱本体 —— 实体类型闭集与关系组映射。
+pub mod ontology;
 pub mod recall;
 pub mod retire;
 pub mod view;

@@ -424,6 +424,8 @@ impl WorkspaceManager {
         ws.set_memory_audit(Arc::new(super::memory_audit::SqliteMemoryAudit::new(
             self.db.clone(),
         )));
+        ws.knowledge_manager()
+            .set_fact_normalizer(Arc::new(crate::peco::memory::ontology::normalize_fact));
         Ok(ws)
     }
 
