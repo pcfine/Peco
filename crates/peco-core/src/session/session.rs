@@ -18,6 +18,7 @@ use super::types::{
     AnnotatedMessage, MessageId, MessageSource, PendingInput, SessionState, SteerBatch,
     display_text, merge_contents, unix_timestamp_ms, unix_timestamp_secs,
 };
+use crate::agent::compaction::strip_tool_output;
 use crate::agent::{estimate_item_tokens, estimate_str_tokens};
 
 /// 悬空 tool_call 的合成结果文案。
@@ -42,8 +43,9 @@ pub struct StripCaps {
     pub strip_tool_args: bool,
     /// 历史工具输出截断上限（字符数）；`0` = 关闭。
     ///
-    /// 只截 `Content::Text`：`Content::Parts`（图文混排）整条跳过 ——
-    /// `text_view` 拼接出的视图无法无损写回 Parts 原结构。
+    /// 上限作用于内容（不含转录行前缀），削减与转录共用同一变换。只截
+    /// `Content::Text`：`Content::Parts`（图文混排）整条跳过 —— `text_view`
+    /// 拼接出的视图无法无损写回 Parts 原结构。
     pub tool_output_max_chars: usize,
 }
 
@@ -100,10 +102,12 @@ fn hit_tool_args(item: &InputItem, caps: StripCaps) -> bool {
         )
 }
 
-/// 改字段类命中：该工具输出文本超出截断上限，可截到上限。
+/// 改字段类命中：该工具输出文本被同一变换改写，即视为命中。
 ///
 /// 只对 `Content::Text` 命中 —— `Content::Parts` 的 `text_view` 拼接视图
-/// 无法无损写回原结构，整条跳过。
+/// 无法无损写回原结构，整条跳过。判据取「变换后是否变样」：命中、释放量与
+/// 写入值三者出自同一个 `strip_tool_output`，任何一处另立判据都会让 shadow
+/// 观测与真实改写对不上。
 fn hit_tool_output(item: &InputItem, caps: StripCaps) -> bool {
     caps.tool_output_max_chars > 0
         && matches!(
@@ -111,13 +115,8 @@ fn hit_tool_output(item: &InputItem, caps: StripCaps) -> bool {
             InputItem::FunctionCallOutput {
                 output: Content::Text(text),
                 ..
-            } if text.chars().count() > caps.tool_output_max_chars
+            } if strip_tool_output(text, caps.tool_output_max_chars) != text.as_str()
         )
-}
-
-/// 按字符截到上限 —— 与转录逐条截断（`chars().take`）同一单位。
-fn truncate_tool_output(text: &str, cap: usize) -> String {
-    text.chars().take(cap).collect()
 }
 
 /// 会话实体。
@@ -833,7 +832,7 @@ impl Session {
     /// - 若某轮将被整轮删空（仅由 reasoning 构成），整轮跳过并计入
     ///   `skipped_turns` —— committed 轮不保证以 User 开头，「每轮非空」是
     ///   持久化与展示的底线
-    /// - 工具输出只截 `Content::Text` 且只在超上限时截；`Content::Parts`
+    /// - 工具输出只削 `Content::Text`，且只在变换真的会改动文本时计入；`Content::Parts`
     ///   整条跳过 —— 文本视图无法无损写回 Parts 原结构
     /// - 改写只动 `message` 内容：条目 id / timestamp / source / turn_index
     ///   与轮次结构（除被删条目外）保持不变
@@ -872,14 +871,14 @@ impl Session {
                     released += estimate_item_tokens(&am.message);
                 } else if hit_tool_output(item, caps) {
                     changes += 1;
-                    // 只释放被截掉的尾部：input_item_text 对该条取 output 全文
+                    // 只释放被削掉的尾部：input_item_text 对该条取 output 全文
                     if let InputItem::FunctionCallOutput {
                         output: Content::Text(text),
                         ..
                     } = item
                     {
-                        let kept = truncate_tool_output(text, caps.tool_output_max_chars);
-                        released += estimate_str_tokens(text) - estimate_str_tokens(&kept);
+                        let kept = strip_tool_output(text, caps.tool_output_max_chars);
+                        released += estimate_str_tokens(text) - estimate_str_tokens(kept.as_ref());
                     }
                 }
             }
@@ -909,7 +908,8 @@ impl Session {
                             ..
                         } = Arc::make_mut(&mut am.message)
                     {
-                        *text = truncate_tool_output(text, caps.tool_output_max_chars);
+                        let kept = strip_tool_output(text, caps.tool_output_max_chars);
+                        *text = kept.into_owned();
                     }
                 }
             }
@@ -2626,7 +2626,7 @@ mod tests {
 
         // 评估不改任何内容 —— 会话逐字节不变
         let after = serde_json::to_string(s.committed_turns()).unwrap();
-        assert_eq!(before, after, "评估不得改写会话内容");
+        assert_eq!(before, after, "evaluation must not rewrite session content");
         assert_eq!(s.turn_index(), turn_index_before);
         assert!(s.is_idle());
         // 幂等：第二次评估得到同样的值（没有可削内容变化）
@@ -2716,7 +2716,7 @@ mod tests {
         assert_ne!(
             in_scope_before,
             serde_json::to_string(&s.committed_turns()[1]).unwrap(),
-            "前置：两轮内容本就不同，避免恒真断言"
+            "precondition: the two turns differ already, so this assertion is not vacuous"
         );
         let out_of_scope_before = serde_json::to_string(&s.committed_turns()[1]).unwrap();
 
@@ -2725,15 +2725,19 @@ mod tests {
         assert_eq!(eval.would_change_items, 2);
 
         let t0 = &s.committed_turns()[0];
-        assert_eq!(t0.len(), 4, "5 条里只删 reasoning，其余保留");
+        assert_eq!(
+            t0.len(),
+            4,
+            "of the 5 items only the reasoning is deleted; the other 4 are kept"
+        );
         assert!(matches!(t0[0].message.as_ref(), InputItem::Message { .. }));
         let InputItem::FunctionCall { arguments, .. } = t0[1].message.as_ref() else {
-            panic!("第 2 条应是清参后的 FunctionCall");
+            panic!("item 2 should be the FunctionCall with cleared arguments");
         };
-        assert_eq!(arguments, "", "apply=true 必须真的清空参数");
+        assert_eq!(arguments, "", "apply=true must really clear the arguments");
         assert!(
             matches!(t0[2].message.as_ref(), InputItem::FunctionCallOutput { .. }),
-            "短 tool 输出不超截断上限，条目原样保留"
+            "a short tool output stays under the cap, so the item is kept as-is"
         );
 
         // 身份不变：存活条目（reasoning 已删）逐条比对 id / timestamp / turn_index / source
@@ -2743,17 +2747,22 @@ mod tests {
             .collect();
         let expected: Vec<_> = identity
             .into_iter()
-            .filter(|(id, ..)| *id != 1) // id 1 是被删的 reasoning（构造时顺序分配）
+            // id 1 是被删的 reasoning（构造时顺序分配）
+            .filter(|(id, ..)| *id != 1)
             .collect();
-        assert_eq!(identity_after, expected, "I8：身份保真");
-        assert_eq!(s.turn_index(), turn_index_before, "I3：轮次编号不变");
-        assert_eq!(s.committed_turns().len(), 2, "I1：不驱逐轮次");
+        assert_eq!(identity_after, expected, "I8: identity preserved");
+        assert_eq!(
+            s.turn_index(),
+            turn_index_before,
+            "I3: turn numbering unchanged"
+        );
+        assert_eq!(s.committed_turns().len(), 2, "I1: no turn is evicted");
 
         // 保留窗外的轮逐字节不动
         assert_eq!(
             serde_json::to_string(&s.committed_turns()[1]).unwrap(),
             out_of_scope_before,
-            "最近 keep_recent_turns 轮恒不动"
+            "the last keep_recent_turns turns never move"
         );
 
         // 幂等：第二次 apply 零改写
@@ -2762,7 +2771,7 @@ mod tests {
         assert_eq!(eval2.would_release_tokens, 0);
         assert!(
             eval2.skipped_turns <= eval.skipped_turns,
-            "幂等后不会新增跳过轮"
+            "idempotence adds no skipped turn"
         );
 
         // caps 关闭时 apply=true 也不改写
@@ -2777,7 +2786,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(s.committed_turns()).unwrap(),
             before,
-            "caps 关闭时生效路径零改写"
+            "with every cap off the enforce path rewrites nothing"
         );
     }
 
@@ -2796,9 +2805,12 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&s.committed_turns()[0]).unwrap(),
             before,
-            "整轮跳过的轮在 apply 路径也逐字节不变"
+            "a skipped turn stays byte-identical on the apply path too"
         );
-        assert!(!s.committed_turns()[0].is_empty(), "I4：每轮非空");
+        assert!(
+            !s.committed_turns()[0].is_empty(),
+            "I4: every turn stays non-empty"
+        );
     }
 
     #[test]
@@ -2820,19 +2832,22 @@ mod tests {
                 s.committed_turns()[0][0].message.as_ref(),
                 InputItem::Reasoning { .. }
             ),
-            "前置：committed 轮仅含 reasoning"
+            "precondition: the committed turn holds reasoning only"
         );
 
         let eval = s.strip_stale_content(0, ALL_CAPS, true).unwrap();
         assert_eq!(eval.skipped_turns, 1);
         assert_eq!(eval.would_change_items, 0);
-        assert!(!s.committed_turns()[0].is_empty(), "I4：削减后仍非空");
+        assert!(
+            !s.committed_turns()[0].is_empty(),
+            "I4: still non-empty after the strip"
+        );
         assert!(
             matches!(
                 s.committed_turns()[0][0].message.as_ref(),
                 InputItem::Reasoning { .. }
             ),
-            "整轮跳过 ⇒ 条目原样保留"
+            "a skipped turn keeps its items as-is"
         );
     }
 
@@ -2864,12 +2879,15 @@ mod tests {
         // 评估路径：只算不改
         let before = serde_json::to_string(s.committed_turns()).unwrap();
         let eval = s.strip_stale_content(1, output_only, false).unwrap();
-        assert_eq!(eval.would_change_items, 1, "超上限输出恰 1 条");
-        assert!(eval.would_release_tokens > 0, "被截掉的尾部必须计入释放");
+        assert_eq!(eval.would_change_items, 1, "exactly 1 over-cap output");
+        assert!(
+            eval.would_release_tokens > 0,
+            "the cut tail must count as released"
+        );
         assert_eq!(
             serde_json::to_string(s.committed_turns()).unwrap(),
             before,
-            "评估不得改写会话内容"
+            "evaluation must not rewrite session content"
         );
 
         // 生效路径：截到上限
@@ -2880,15 +2898,26 @@ mod tests {
             id,
             turn_index,
         } = probe_scope_output(&s);
-        assert_eq!(text.chars().count(), 2000, "必须恰好截到上限");
-        assert!(text.starts_with("HEAD"), "头部内容必须保留");
-        assert_eq!((id, turn_index), identity, "I8：身份保真");
+        assert!(
+            text.chars().count() <= 2000,
+            "stripped text must not exceed the cap (head+tail truncation is always shorter than the cap)"
+        );
+        assert!(text.starts_with("HEAD"), "head content must be kept");
+        assert!(
+            text.ends_with(&"甲".repeat(50)),
+            "tail content must survive — conclusions and exit status live there"
+        );
+        assert!(
+            text.contains("chars omitted]"),
+            "must spell out how much was omitted"
+        );
+        assert_eq!((id, turn_index), identity, "I8: identity preserved");
         assert_eq!(
             serde_json::to_string(&s.committed_turns()[1]).unwrap(),
             out_of_scope_before,
-            "保留窗轮恒不动"
+            "a turn inside the retention window never moves"
         );
-        assert_eq!(s.committed_turns().len(), 2, "I1：不驱逐轮次");
+        assert_eq!(s.committed_turns().len(), 2, "I1: no turn is evicted");
 
         // 幂等：二次 apply 零改写
         let eval2 = s.strip_stale_content(1, output_only, true).unwrap();
@@ -2926,12 +2955,12 @@ mod tests {
         let eval = s.strip_stale_content(1, caps, true).unwrap();
         assert_eq!(
             eval.would_change_items, 0,
-            "Parts 即便文本部件超上限也不命中"
+            "Parts is a miss even though its text part exceeds the cap"
         );
         assert_eq!(
             serde_json::to_string(s.committed_turns()).unwrap(),
             before,
-            "Parts 必须逐字节原样"
+            "Parts must stay byte-identical"
         );
     }
 
@@ -2946,13 +2975,13 @@ mod tests {
         let am = s.committed_turns()[0]
             .iter()
             .find(|am| matches!(am.message.as_ref(), InputItem::FunctionCallOutput { .. }))
-            .expect("夹具必须含工具输出");
+            .expect("the fixture must contain a tool output");
         let InputItem::FunctionCallOutput {
             output: Content::Text(text),
             ..
         } = am.message.as_ref()
         else {
-            panic!("夹具的工具输出必须是纯文本");
+            panic!("the fixture's tool output must be plain text");
         };
         OutputProbe {
             text: text.clone(),

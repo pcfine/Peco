@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use peco_core::agent::hooks::LooperHook;
 use peco_core::agent::{
     CompactionPolicy, DynamicContext, LooperConfig, MessageFilter, SUMMARY_TOKEN_CAP,
-    TRANSCRIPT_ITEM_MAX_CHARS, TRANSCRIPT_TOOL_OUTPUT_MIN_CAP, TurnSummarizer,
+    TRANSCRIPT_ITEM_MAX_CHARS, TurnSummarizer,
 };
 use tracing::warn;
 
@@ -27,8 +27,7 @@ pub struct PecoConfig {
     /// 不含 tool 输出与 reasoning。与 [`Self::compaction_trigger_tokens`]
     /// 的「全量轮」口径不同 — 两个数值不可直接比较。
     ///
-    /// 取代早期的 `max_history_messages` 消息条数窗口 — 中文场景下
-    /// 按条数截断的 token 波动过大，预算控制必须基于校准 token 估算。
+    /// 按消息条数截断在中文文本上 token 波动过大，预算控制必须基于校准 token 估算。
     ///
     /// 默认值可用 env `PECO_HISTORY_TOKEN_BUDGET` 覆盖（[`Self::from_env`]）。
     pub history_token_budget: usize,
@@ -140,8 +139,9 @@ pub struct CompactionStripConfig {
     pub strip_tool_args: bool,
     /// 历史工具输出截断上限（字符数）：`0` = 关闭。
     ///
-    /// 非 0 时不小于转录下界（削后行才不短于单条上限），违规值在读取端
-    /// 回退默认。
+    /// 非 0 时不低于转录单条上限（低于它时削后切口短于转录切口、头尾不再对齐；
+    /// 削后落回单条上限内时两侧逐字节一致，否则头尾逐字相同、只有省略计数不同），
+    /// 违规值在读取端回退默认。
     pub tool_output_max_chars: usize,
     /// 生效开关：`true` 时边界上就地改写历史；`false`（默认）只评估观测，
     /// legacy 路径行为与不引入削减时逐字节一致。
@@ -302,14 +302,14 @@ fn env_bool<F: Fn(&str) -> Option<String>>(get: &F, name: &str, default: bool) -
     }
 }
 
-/// 校验工具输出截断上限：`0` = 关闭（合法）；非 0 必须不小于转录下界 ——
-/// 低于下界时削后转录行短于单条上限、无损等式失配，回退默认。
+/// 校验工具输出截断上限：`0` = 关闭（合法）；非 0 必须不低于转录单条上限 ——
+/// 低于它时削后切口短于转录切口，「削减不改变转录」随之失配，回退默认。
 fn clamp_tool_output_cap(value: usize) -> usize {
-    if value != 0 && value < TRANSCRIPT_TOOL_OUTPUT_MIN_CAP {
+    if value != 0 && value < TRANSCRIPT_ITEM_MAX_CHARS {
         warn!(
             variable = ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
             value,
-            min = TRANSCRIPT_TOOL_OUTPUT_MIN_CAP,
+            min = TRANSCRIPT_ITEM_MAX_CHARS,
             "Tool output strip cap below transcript bound; using default"
         );
         TRANSCRIPT_ITEM_MAX_CHARS
@@ -399,17 +399,15 @@ impl PecoConfig {
             self.strip.keep_recent_turns = 1;
         }
 
-        // V3：非 0 的输出截断上限不得低于转录下界 —— 低于则无损等式失配
+        // V3：非 0 的输出截断上限不得低于转录单条上限 —— 低于则削后切口短于转录切口
         if self.strip.tool_output_max_chars != 0
-            && self.strip.tool_output_max_chars < TRANSCRIPT_TOOL_OUTPUT_MIN_CAP
+            && self.strip.tool_output_max_chars < TRANSCRIPT_ITEM_MAX_CHARS
         {
             violations.push(ConfigViolation::error(
                 "V3",
                 format!(
-                    "tool_output_max_chars {} below transcript bound {}; clamped to default {}",
-                    self.strip.tool_output_max_chars,
-                    TRANSCRIPT_TOOL_OUTPUT_MIN_CAP,
-                    TRANSCRIPT_ITEM_MAX_CHARS
+                    "tool_output_max_chars {} below transcript bound {}; clamped",
+                    self.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS
                 ),
             ));
             self.strip.tool_output_max_chars = TRANSCRIPT_ITEM_MAX_CHARS;
@@ -548,50 +546,44 @@ mod tests {
         assert!(cfg.strip.strip_tool_args);
         assert_eq!(
             cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS,
-            "默认上限与转录单条上限同源"
+            "the default cap and the transcript item cap share one source"
         );
-        assert!(!cfg.strip.enforce, "默认必须 legacy：只评估不改写");
+        assert!(
+            !cfg.strip.enforce,
+            "the default must stay legacy: evaluate only, never rewrite"
+        );
         assert_eq!(cfg.strip.retention_days, 30);
     }
 
+    /// 输出截断上限的合法域：`0`（关闭）∪ `[转录单条上限, ∞)`。
+    ///
+    /// 下界卡在单条上限本身：低于它时削后切口短于转录切口，
+    /// 「削减不改变转录」的等式失效。
     #[test]
     fn strip_tool_output_cap_clamps_below_bound() {
-        // 显式关闭合法
-        let cfg =
-            PecoConfig::from_env_with(env_of(&[(ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS, "0")]));
-        assert_eq!(cfg.strip.tool_output_max_chars, 0);
+        let cap_of = |raw: &str| {
+            PecoConfig::from_env_with(env_of(&[(ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS, raw)]))
+                .strip
+                .tool_output_max_chars
+        };
 
-        // 合法放大：≥ 下界即通过
-        let cfg = PecoConfig::from_env_with(env_of(&[(
-            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
-            "4000",
-        )]));
-        assert_eq!(cfg.strip.tool_output_max_chars, 4000);
-
-        // 恰在下界：通过
-        let bound = TRANSCRIPT_TOOL_OUTPUT_MIN_CAP.to_string();
-        let cfg = PecoConfig::from_env_with(env_of(&[(
-            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
-            bound.as_str(),
-        )]));
+        assert_eq!(cap_of("0"), 0, "explicit off is legal");
         assert_eq!(
-            cfg.strip.tool_output_max_chars,
-            TRANSCRIPT_TOOL_OUTPUT_MIN_CAP
+            cap_of("1999"),
+            TRANSCRIPT_ITEM_MAX_CHARS,
+            "off by one is still invalid: the bound is the item cap itself"
         );
-
-        // 低于下界：回退默认（非 0 保底）
-        let cfg = PecoConfig::from_env_with(env_of(&[(
-            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
-            "100",
-        )]));
-        assert_eq!(cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS);
-
-        // 写错取默认
-        let cfg = PecoConfig::from_env_with(env_of(&[(
-            ENV_COMPACTION_STRIP_TOOL_OUTPUT_MAX_CHARS,
-            "abc",
-        )]));
-        assert_eq!(cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS);
+        assert_eq!(
+            cap_of("2000"),
+            TRANSCRIPT_ITEM_MAX_CHARS,
+            "exactly at the lower bound passes"
+        );
+        assert_eq!(cap_of("4000"), 4000, "above the lower bound is kept as-is");
+        assert_eq!(
+            cap_of("abc"),
+            TRANSCRIPT_ITEM_MAX_CHARS,
+            "garbage falls back to the default"
+        );
     }
 
     #[test]
@@ -618,7 +610,10 @@ mod tests {
         ]));
         assert!(cfg.strip.shadow);
         assert_eq!(cfg.strip.keep_recent_turns, 4);
-        assert!(!cfg.strip.enforce, "写错的布尔取默认 false");
+        assert!(
+            !cfg.strip.enforce,
+            "a malformed boolean falls back to the default false"
+        );
     }
 
     // ── Phase 3：viewable 守卫 env、配置不变量 V1′–V7、日志闸门 ──
@@ -627,8 +622,14 @@ mod tests {
     fn view_guard_defaults_off_and_reads_env() {
         // 默认关闭（legacy 触发口径不变）
         let cfg = PecoConfig::from_env_with(env_of(&[]));
-        assert_eq!(cfg.strip.view_guard_tokens, 0, "守卫默认必须关");
-        assert_eq!(cfg.strip.keep_view_tokens, 0, "view 保留默认必须关");
+        assert_eq!(
+            cfg.strip.view_guard_tokens, 0,
+            "the guard must be off by default"
+        );
+        assert_eq!(
+            cfg.strip.keep_view_tokens, 0,
+            "view retention must be off by default"
+        );
 
         let cfg = PecoConfig::from_env_with(env_of(&[
             (ENV_COMPACTION_VIEW_GUARD_TOKENS, "50000"),
@@ -648,7 +649,7 @@ mod tests {
         let violations = cfg.validate_compaction();
         assert!(
             violations.is_empty(),
-            "默认配置必须零违规，实际: {violations:?}"
+            "the default config must have zero violations, got: {violations:?}"
         );
         // V1′ 默认值自检：k_recent + Σcap ≤ T
         assert!(
@@ -666,7 +667,7 @@ mod tests {
             (ENV_COMPACTION_KEEP_RECENT_TOKENS, "90000"),
         ]));
         let violations = cfg.validate_compaction();
-        assert_eq!(violations.len(), 1, "只应有 V1′: {violations:?}");
+        assert_eq!(violations.len(), 1, "only V1' should fire: {violations:?}");
         assert_eq!(violations[0].invariant, "V1'");
         assert!(violations[0].is_error);
         assert_eq!(
@@ -682,7 +683,10 @@ mod tests {
         let violations = cfg.validate_compaction();
         assert_eq!(violations.len(), 2, "{violations:?}");
         assert!(violations[0].is_error);
-        assert!(!violations[1].is_error, "第二条是「界不可保证」warn");
+        assert!(
+            !violations[1].is_error,
+            "the second entry is the 'bound not guaranteeable' warn"
+        );
         assert_eq!(cfg.compaction_keep_recent_tokens, 0);
     }
 
@@ -697,10 +701,10 @@ mod tests {
         assert_eq!(violations.len(), 2, "{violations:?}");
         assert_eq!(violations[0].invariant, "V2");
         assert_eq!(violations[1].invariant, "V3");
-        assert_eq!(cfg.strip.keep_recent_turns, 1, "V2 钳到 1");
+        assert_eq!(cfg.strip.keep_recent_turns, 1, "V2 clamps to 1");
         assert_eq!(
             cfg.strip.tool_output_max_chars, TRANSCRIPT_ITEM_MAX_CHARS,
-            "V3 回退默认上限"
+            "V3 falls back to the default cap"
         );
     }
 
@@ -713,10 +717,13 @@ mod tests {
             (ENV_COMPACTION_KEEP_VIEW_TOKENS, "64000"),
         ]));
         let violations = cfg.validate_compaction();
-        assert_eq!(violations.len(), 1, "只应有 V4: {violations:?}");
+        assert_eq!(violations.len(), 1, "only V4 should fire: {violations:?}");
         assert_eq!(violations[0].invariant, "V4");
-        assert_eq!(cfg.strip.view_guard_tokens, 128_000, "鉗到窗口宽");
-        assert_eq!(cfg.strip.keep_view_tokens, 64_000, "keep_view 不动");
+        assert_eq!(
+            cfg.strip.view_guard_tokens, 128_000,
+            "clamped to the window width"
+        );
+        assert_eq!(cfg.strip.keep_view_tokens, 64_000, "keep_view untouched");
     }
 
     #[test]
@@ -726,12 +733,15 @@ mod tests {
             (ENV_COMPACTION_KEEP_VIEW_TOKENS, "30000"),
         ]));
         let violations = cfg.validate_compaction();
-        assert_eq!(violations.len(), 1, "只应有 V7: {violations:?}");
+        assert_eq!(violations.len(), 1, "only V7 should fire: {violations:?}");
         assert_eq!(violations[0].invariant, "V7");
         assert!(violations[0].is_error);
-        assert_eq!(cfg.strip.view_guard_tokens, 0, "V7 钳守卫为 0");
+        assert_eq!(cfg.strip.view_guard_tokens, 0, "V7 clamps the guard to 0");
         // V7 先于 V5/V5′：守卫已死，keep_view 不再按它钳制
-        assert_eq!(cfg.strip.keep_view_tokens, 30_000, "keep_view 原样保留");
+        assert_eq!(
+            cfg.strip.keep_view_tokens, 30_000,
+            "keep_view is left as-is"
+        );
     }
 
     #[test]
@@ -742,9 +752,9 @@ mod tests {
             (ENV_COMPACTION_KEEP_VIEW_TOKENS, "80000"),
         ]));
         let violations = cfg.validate_compaction();
-        assert_eq!(violations.len(), 1, "只应有 V5: {violations:?}");
+        assert_eq!(violations.len(), 1, "only V5 should fire: {violations:?}");
         assert_eq!(violations[0].invariant, "V5");
-        assert_eq!(cfg.strip.keep_view_tokens, 40_000, "鉗到 guard/2");
+        assert_eq!(cfg.strip.keep_view_tokens, 40_000, "clamped to guard/2");
     }
 
     #[test]
@@ -755,10 +765,10 @@ mod tests {
             (ENV_COMPACTION_KEEP_VIEW_TOKENS, "0"),
         ]));
         let violations = cfg.validate_compaction();
-        assert_eq!(violations.len(), 1, "只应有 V5′: {violations:?}");
+        assert_eq!(violations.len(), 1, "only V5' should fire: {violations:?}");
         assert_eq!(violations[0].invariant, "V5'");
-        assert_eq!(cfg.strip.keep_view_tokens, 50_000, "鉗到 guard/2");
-        // 鉗后仍满足 V5（严于守卫）：50_000 < 100_000
+        assert_eq!(cfg.strip.keep_view_tokens, 50_000, "clamped to guard/2");
+        // 钳后仍满足 V5（严于守卫）：50_000 < 100_000
         assert!(cfg.strip.keep_view_tokens < cfg.strip.view_guard_tokens);
     }
 
@@ -766,16 +776,25 @@ mod tests {
     fn v6_warns_enforce_without_guard() {
         let mut cfg = PecoConfig::from_env_with(env_of(&[(ENV_COMPACTION_STRIP_ENFORCE, "on")]));
         let violations = cfg.validate_compaction();
-        assert_eq!(violations.len(), 1, "只应有 V6: {violations:?}");
+        assert_eq!(violations.len(), 1, "only V6 should fire: {violations:?}");
         assert_eq!(violations[0].invariant, "V6");
-        assert!(!violations[0].is_error, "V6 只提示不鉗制");
-        assert_eq!(cfg.compaction_keep_recent_tokens, 128_000, "无鉗制发生");
+        assert!(!violations[0].is_error, "V6 only warns, never clamps");
+        assert_eq!(
+            cfg.compaction_keep_recent_tokens, 128_000,
+            "no clamp happened"
+        );
         assert_eq!(cfg.strip.view_guard_tokens, 0);
     }
 
     #[test]
     fn compaction_config_log_gate_is_once_per_process() {
-        assert!(claim_compaction_config_log(), "首次必须领到打印权");
-        assert!(!claim_compaction_config_log(), "二次必须静默");
+        assert!(
+            claim_compaction_config_log(),
+            "the first call must win the log right"
+        );
+        assert!(
+            !claim_compaction_config_log(),
+            "the second call must stay silent"
+        );
     }
 }
