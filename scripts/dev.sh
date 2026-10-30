@@ -44,6 +44,10 @@ elif [[ -f crates/peco-core/.env ]]; then
     log_info "Loaded crates/peco-core/.env"
 fi
 
+# 默认数据目录与原 peco（~/.peco）隔离，避免两个实例共用同一份 SQLite。
+export PECO_DATA_DIR="${PECO_DATA_DIR:-${HOME}/.peco2}"
+log_info "PECO_DATA_DIR=$PECO_DATA_DIR"
+
 if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
     echo "  [WARN] DEEPSEEK_API_KEY not set. Set it in .env or export it."
 fi
@@ -62,8 +66,8 @@ trap cleanup EXIT INT TERM
 if $BACKEND; then
     printf "\n${BOLD}${BLUE}=== Starting peco-server (backend) ===${NC}\n"
     log_info "Building & running peco-server..."
-    log_info "API  : http://localhost:9227"
-    log_info "Docs : http://localhost:9227/docs"
+    log_info "API  : http://localhost:9327"
+    log_info "Docs : http://localhost:9327/docs"
 
     # 启用 debug 日志：tracing_subscriber 通过 RUST_LOG 读取过滤级别。
     export RUST_LOG="${RUST_LOG:-peco=debug,model_provider=debug,knowledge_base=debug,tower_http=info}"
@@ -93,7 +97,7 @@ if $FRONTEND; then
     npm install --silent 2>/dev/null || npm install
 
     log_info "Starting Vite dev server..."
-    log_info "Web UI: http://localhost:9233"
+    log_info "Web UI: http://localhost:9333"
 
     npx vite --host 0.0.0.0 &
     FRONTEND_PID=$!
@@ -102,9 +106,9 @@ if $FRONTEND; then
     printf "${GREEN}========================================${NC}\n"
     printf "${GREEN}  peco dev environment ready!${NC}\n"
     printf "${GREEN}========================================${NC}\n"
-    $BACKEND && printf "  Backend API : ${BOLD}http://localhost:9227${NC}\n"
-    $BACKEND && printf "  API Docs    : ${BOLD}http://localhost:9227/docs${NC}\n"
-    printf "  Web UI      : ${BOLD}http://localhost:9233${NC}\n"
+    $BACKEND && printf "  Backend API : ${BOLD}http://localhost:9327${NC}\n"
+    $BACKEND && printf "  API Docs    : ${BOLD}http://localhost:9327/docs${NC}\n"
+    printf "  Web UI      : ${BOLD}http://localhost:9333${NC}\n"
     printf "\n${YELLOW}  Press Ctrl+C to stop all services${NC}\n"
     printf "\n"
 
