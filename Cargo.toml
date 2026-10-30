@@ -6,7 +6,6 @@ members = [
   "crates/knowledge-base",
   "crates/peco-derive",
   "crates/peco-core",
-  "crates/peco-cli",
   "crates/peco-server",
   "crates/peco-agents",
 ]
