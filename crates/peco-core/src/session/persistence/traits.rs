@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::persistence::inflight::InflightCheckpoint;
+use super::inflight::InflightCheckpoint;
 use crate::session::{SessionMeta, SessionSnapshot};
 
 // ============================================================================

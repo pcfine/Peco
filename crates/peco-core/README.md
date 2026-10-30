@@ -40,8 +40,7 @@ WorkSpace（用户隔离核心）
 | [`workspace`](src/workspace/mod.rs) | 用户隔离核心：WorkSpace、WorkspaceError、模板初始化 |
 | [`workflow`](src/workflow/mod.rs) | Workflow 编排引擎：DAG 定义、拓扑执行、条件门控、模板变量、失败策略 |
 | [`mcp`](src/mcp/mod.rs) | MCP 客户端：连接管理、工具自动同步、热重载（Stdio/SSE/StreamableHTTP） |
-| [`persistence`](src/persistence/mod.rs) | 会话持久化：`SessionPersister` trait + FileSessionPersister + NullSessionPersister |
-| [`session`](src/session/mod.rs) | 多轮对话状态管理：Session、消息缓冲、Snapshot |
+| [`session`](src/session/mod.rs) | 多轮对话状态管理：Session、消息缓冲、Snapshot，及会话持久化子模块 `persistence`（`SessionPersister` trait + File/Null 实现） |
 | [`skills`](src/skills/mod.rs) | Skill 系统：三层渐进式加载、YAML frontmatter 解析 |
 | [`tools`](src/tools/mod.rs) | 工具抽象层：`Tool`/`ToolDyn` trait、`ToolRegister`、26 个内置工具（shell/fetch + Agent/Skill/Workflow/MCP/KB 完整 CRUD） |
 
@@ -303,11 +302,12 @@ Session 不包含内部锁，由 `AgentLooper` 以 `Box<Session>` 独占所有�
 
 ### 持久化
 
-[`persistence`](src/persistence/mod.rs) 模块提供独立的会话持久化层。Session 本身不感知持久化 — `AgentLooper` 在 turn 边界调用 `SessionPersister::save()` 触发落盘。
+[`session::persistence`](src/session/persistence/mod.rs) 是会话模块下的持久化子模块。Session 本身不感知持久化 — `AgentLooper` 在 turn 边界调用 `SessionPersister::save()` 触发落盘。
 
-- **[`SessionPersister`](src/persistence/traits.rs)** trait — 定义 `save` / `load` / `delete` / `list` 接口
-- **[`FileSessionPersister`](src/persistence/file.rs)** — JSON 文件持久化实现（`{base_dir}/{session_id}.json`）
-- **[`NullSessionPersister`](src/persistence/traits.rs)** — 空实现，用于不需要持久化的场景
+- **[`SessionPersister`](src/session/persistence/traits.rs)** trait — 定义 `save` / `load` / `delete` / `list` 接口
+- **[`FileSessionPersister`](src/session/persistence/file.rs)** — JSON 文件持久化实现（`{base_dir}/{session_id}.json`）
+- **[`NullSessionPersister`](src/session/persistence/traits.rs)** — 空实现，用于不需要持久化的场景
+- **[`InflightCheckpoint`](src/session/persistence/inflight.rs)** — 在途轮检查点（崩溃恢复）
 
 ### 错误处理
 
@@ -509,11 +509,12 @@ src/
 │   ├── snapshot.rs          # SessionSnapshot + TurnBoundaryToken（持久化快照）
 │   ├── types.rs             # AnnotatedMessage、MessageSource、SessionState
 │   ├── metadata.rs          # SessionMeta
+│   ├── persistence/
+│   │   ├── traits.rs        # SessionPersister trait + NullSessionPersister
+│   │   ├── file.rs          # FileSessionPersister（JSON 文件持久化）
+│   │   ├── inflight.rs      # InflightCheckpoint（在途轮检查点）
+│   │   └── format.rs        # SessionFile 序列化格式
 │   └── error.rs             # SessionError
-├── persistence/
-│   ├── traits.rs            # SessionPersister trait + NullSessionPersister
-│   ├── file.rs              # FileSessionPersister（JSON 文件持久化）
-│   └── format.rs            # SessionFile 序列化格式
 ├── mcp/
 │   ├── mcp_manager.rs       # McpManager（连接编排）
 │   ├── mcp_client_handler.rs # McpClientHandler（工具同步 + 热重载）

@@ -129,7 +129,7 @@ impl MultiTurnExecutor {
                 self.agent.clone(),
                 session,
                 self.config.clone(),
-                Arc::new(crate::persistence::NullSessionPersister),
+                Arc::new(crate::session::persistence::NullSessionPersister),
             );
             *guard = Some(h);
         }

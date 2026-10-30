@@ -2,7 +2,7 @@
 // SqliteSessionPersister — SQLite 版 Session 持久化
 // ============================================================================
 //
-// 实现 peco_core::persistence::SessionPersister trait，
+// 实现 peco_core::session::SessionPersister trait，
 // 将 SessionSnapshot 以 JSON 格式存入 session_snapshots 表，
 // SessionMeta 动态字段由 SqliteSessionPersister 自行计算。
 //
@@ -12,8 +12,10 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use peco_core::persistence::{InflightCheckpoint, PersistError, PersistResult, SessionPersister};
-use peco_core::session::{Session, SessionMeta, SessionSnapshot};
+use peco_core::session::{
+    InflightCheckpoint, PersistError, PersistResult, Session, SessionMeta, SessionPersister,
+    SessionSnapshot,
+};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 

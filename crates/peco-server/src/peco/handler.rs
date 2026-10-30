@@ -54,7 +54,7 @@ use peco_core::agent::{
     AgentLooper, LooperEvent, LooperHandle, LooperState, strip_summary_wrapper,
 };
 use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
-use peco_core::persistence::SessionPersister;
+use peco_core::session::SessionPersister;
 use peco_core::session::{Session, SessionSnapshot};
 use peco_core::tools::{
     DeleteOrigin, KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry, MemoryDeleteError,

@@ -409,16 +409,17 @@ struct CountingPersister {
 }
 
 #[async_trait::async_trait]
-impl crate::persistence::SessionPersister for CountingPersister {
+impl crate::session::persistence::SessionPersister for CountingPersister {
     async fn save(
         &self,
         _snapshot: &SessionSnapshot,
         _session_id: &str,
         _description: &str,
         _created_at: u64,
-    ) -> Result<crate::persistence::PersistResult, crate::persistence::PersistError> {
+    ) -> Result<crate::session::persistence::PersistResult, crate::session::persistence::PersistError>
+    {
         self.saves.fetch_add(1, Ordering::SeqCst);
-        Ok(crate::persistence::PersistResult {
+        Ok(crate::session::persistence::PersistResult {
             bytes_written: 0,
             path: std::path::PathBuf::new(),
         })
@@ -426,14 +427,21 @@ impl crate::persistence::SessionPersister for CountingPersister {
     async fn load(
         &self,
         _session_id: &str,
-    ) -> Result<Option<(SessionSnapshot, crate::SessionMeta)>, crate::persistence::PersistError>
-    {
+    ) -> Result<
+        Option<(SessionSnapshot, crate::SessionMeta)>,
+        crate::session::persistence::PersistError,
+    > {
         Ok(None)
     }
-    async fn delete(&self, _session_id: &str) -> Result<(), crate::persistence::PersistError> {
+    async fn delete(
+        &self,
+        _session_id: &str,
+    ) -> Result<(), crate::session::persistence::PersistError> {
         Ok(())
     }
-    async fn list(&self) -> Result<Vec<crate::SessionMeta>, crate::persistence::PersistError> {
+    async fn list(
+        &self,
+    ) -> Result<Vec<crate::SessionMeta>, crate::session::persistence::PersistError> {
         Ok(Vec::new())
     }
 }
@@ -582,7 +590,7 @@ fn failure_looper_harness_with_epilogue(
             epilogue,
             ..Default::default()
         },
-        Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        Arc::clone(&persister) as Arc<dyn crate::session::persistence::SessionPersister>,
     );
     // 直写内部闩模拟「run() 启动前已请求取消」（测试同模块访问私有字段）
     looper.cancel_request.store(cancel, Ordering::Release);
@@ -1074,7 +1082,7 @@ fn retry_harness_inner(
         Box::new(session),
         event_speaker,
         config,
-        Arc::new(crate::persistence::NullSessionPersister),
+        Arc::new(crate::session::persistence::NullSessionPersister),
     );
 
     RetryHarness {
@@ -1404,7 +1412,7 @@ fn spawn_scripted_looper(
     spawn_scripted_looper_with_persister(
         scripts,
         config,
-        Arc::new(crate::persistence::NullSessionPersister),
+        Arc::new(crate::session::persistence::NullSessionPersister),
     )
 }
 
@@ -1412,7 +1420,7 @@ fn spawn_scripted_looper(
 fn spawn_scripted_looper_with_persister(
     scripts: Vec<Script>,
     config: LooperConfig,
-    persister: Arc<dyn crate::persistence::SessionPersister>,
+    persister: Arc<dyn crate::session::persistence::SessionPersister>,
 ) -> (LooperHandle, Arc<ScriptedStreamProvider>) {
     let profile: crate::agent::AgentProfile = serde_yaml::from_str(
         "agent:\n  name: t\n  description: d\nllm:\n  provider: p\n  model: m\n",
@@ -1774,7 +1782,7 @@ async fn test_paused_queued_query_input_closed_cancels_without_turn() {
         Box::new(session),
         event_speaker,
         LooperConfig::default(),
-        Arc::new(crate::persistence::NullSessionPersister),
+        Arc::new(crate::session::persistence::NullSessionPersister),
     );
     let run_task = tokio::spawn(async move { looper.run(user_listener).await });
 
@@ -1885,7 +1893,7 @@ async fn test_paused_inflight_turn_closed_cancels_with_turn_complete() {
         Box::new(session),
         event_speaker,
         LooperConfig::default(),
-        Arc::new(crate::persistence::NullSessionPersister),
+        Arc::new(crate::session::persistence::NullSessionPersister),
     );
     let run_task = tokio::spawn(async move { looper.run(user_listener).await });
 
@@ -2611,7 +2619,7 @@ fn spawn_controllable_looper_impl(
             dynamic_context,
             ..Default::default()
         },
-        Arc::new(crate::persistence::NullSessionPersister),
+        Arc::new(crate::session::persistence::NullSessionPersister),
     );
     (handle, rx, requests_rx)
 }
@@ -4606,7 +4614,7 @@ async fn test_boundary_hook_fires_without_fold_and_no_extra_persist() {
     let (h, _provider) = spawn_scripted_looper_with_persister(
         vec![completed("ok")],
         config,
-        Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        Arc::clone(&persister) as Arc<dyn crate::session::persistence::SessionPersister>,
     );
 
     h.send_query("hi".into()).await.expect("looper alive");
@@ -4654,7 +4662,7 @@ async fn test_boundary_fold_emits_event_and_repersists() {
     let (h, _provider) = spawn_scripted_looper_with_persister(
         vec![completed("ok1"), completed("ok2")],
         config,
-        Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        Arc::clone(&persister) as Arc<dyn crate::session::persistence::SessionPersister>,
     );
 
     // 第 1 轮：唯一一轮被保底留住 ⇒ 不折叠，仅 commit 落盘
@@ -4705,7 +4713,7 @@ async fn test_boundary_strip_enforce_repersists_without_fold() {
     let (h, _provider) = spawn_scripted_looper_with_persister(
         vec![reasoning_then_text("想想", "ok1"), completed("ok2")],
         config,
-        Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        Arc::clone(&persister) as Arc<dyn crate::session::persistence::SessionPersister>,
     );
 
     // 第 1 轮：scope = 1 − 1 = 0 ⇒ 无可削，无折叠 ⇒ 仅 commit 落盘
@@ -4761,7 +4769,7 @@ async fn test_boundary_compaction_error_is_nonfatal_no_persist() {
     let (h, _provider) = spawn_scripted_looper_with_persister(
         vec![completed("ok1"), completed("ok2"), completed("ok3")],
         config,
-        Arc::clone(&persister) as Arc<dyn crate::persistence::SessionPersister>,
+        Arc::clone(&persister) as Arc<dyn crate::session::persistence::SessionPersister>,
     );
 
     // 第 1 轮：evict=0（保底）⇒ Ok(None) ⇒ 钩子照发、无额外落盘
@@ -4967,7 +4975,7 @@ fn event_looper(buffer: usize, session_id: &str) -> (AgentLooper, Listener<Loope
         Box::new(Session::new(session_id.to_string(), "d".to_string())),
         event_speaker,
         LooperConfig::default(),
-        Arc::new(crate::persistence::NullSessionPersister),
+        Arc::new(crate::session::persistence::NullSessionPersister),
     );
     (looper, event_listener)
 }

@@ -163,7 +163,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - `SKILL.md` 格式：YAML frontmatter（`name`、`description`、`allowed-tools`）+ Markdown 正文。
 - 目录结构：`<skill-name>/SKILL.md`，可选 `scripts/`、`references/`、`assets/`。
 
-**Persistence**（[crates/peco-core/src/persistence/](crates/peco-core/src/persistence/)）：
+**Persistence**（[crates/peco-core/src/session/persistence/](crates/peco-core/src/session/persistence/) — `session` 的子模块）：
 - `SessionPersister` trait，含 `save(SessionSnapshot)` 和 `load(session_id) -> SessionSnapshot`。
 - `FileSessionPersister`：将 JSON 序列化的快照写入 `{data_dir}/sessions/{session_id}.json`。
 - **重要**：持久化格式使用 `serde` 反序列化和 `Session::from_snapshot()` 重建。向 `AnnotatedMessage` 或 session 类型添加字段时，JSON 格式必须保持向后兼容或显式迁移。

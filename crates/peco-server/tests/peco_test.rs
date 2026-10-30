@@ -14,7 +14,7 @@ mod common;
 
 use common::TestApp;
 use model_provider::{InputItem, Role, Usage};
-use peco_core::persistence::SessionPersister;
+use peco_core::session::SessionPersister;
 use peco_core::session::{AnnotatedMessage, MessageId, MessageSource, SessionSnapshot};
 use peco_server::session_store::SqliteSessionPersister;
 use std::time::Duration;

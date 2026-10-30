@@ -35,7 +35,9 @@ use super::context::{estimate_item_tokens, estimate_str_tokens};
 use super::dynamic_context::DynamicContext;
 use super::error::AgentError;
 use super::hooks::{HookAction, LooperHook, ToolHookAction};
-use crate::persistence::{INFLIGHT_CRASH_REASON, InflightCheckpoint, PersistError, PersistResult};
+use crate::session::persistence::{
+    INFLIGHT_CRASH_REASON, InflightCheckpoint, PersistError, PersistResult,
+};
 use crate::session::{AnnotatedMessage, MessageSource, Session, SessionSnapshot, SessionState};
 use crate::utils::intercom::{Listener, Speaker, make_async_intercom_pair};
 use tracing::{debug, error, info, warn};
@@ -1110,7 +1112,7 @@ pub struct AgentLooper {
     pause_mirror: Arc<AtomicBool>,
 
     // ── 持久化 ──
-    persister: Arc<dyn crate::persistence::SessionPersister>,
+    persister: Arc<dyn crate::session::persistence::SessionPersister>,
 
     // ── 纯运行时状态（不可持久化）──
     /// streaming 模式：活跃的 [`GenerateStream`]
@@ -1167,7 +1169,7 @@ impl AgentLooper {
         session: Box<Session>,
         event_speaker: Speaker<LooperEvent>,
         config: LooperConfig,
-        persister: Arc<dyn crate::persistence::SessionPersister>,
+        persister: Arc<dyn crate::session::persistence::SessionPersister>,
     ) -> Self {
         let max_iterations = agent.max_iterations();
         // 在 config 被 move 进结构体之前求值稳定前缀
@@ -1212,7 +1214,7 @@ impl AgentLooper {
         agent: Arc<Agent>,
         session: Box<Session>,
         config: LooperConfig,
-        persister: Arc<dyn crate::persistence::SessionPersister>,
+        persister: Arc<dyn crate::session::persistence::SessionPersister>,
     ) -> LooperHandle {
         let (looper_side, caller_side) =
             make_async_intercom_pair::<LooperEvent, UserMsg>(config.event_buffer);

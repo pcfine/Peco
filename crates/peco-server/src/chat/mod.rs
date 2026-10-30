@@ -17,7 +17,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
 
-use peco_core::persistence::SessionPersister;
+use peco_core::session::SessionPersister;
 
 use crate::state::AppState;
 
