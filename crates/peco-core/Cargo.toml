@@ -24,11 +24,11 @@ thiserror = "2"
 uuid = { workspace = true }
 
 anyhow = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
 pin-project-lite = { workspace = true }
-chrono = "0.4.45"
+chrono = { workspace = true }
 libc = { workspace = true }
 minijinja = "2"
 
