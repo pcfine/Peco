@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod echo;
 pub mod hub;
 // 模块按职责命名，契约文件就叫 machine.rs；重名只是路径重复，不表示分层。
@@ -9,6 +10,7 @@ pub mod state;
 pub mod store;
 
 pub use crate::machine::machine::{Machine, MachineDescriptor, MachineError};
+pub use agent::{AgentMachine, AgentMachineConfig};
 pub use echo::EchoMachine;
 pub use hub::{HubConfig, ObsStream, TaskHub};
 pub use model::{

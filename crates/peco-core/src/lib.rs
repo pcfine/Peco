@@ -15,8 +15,8 @@ pub mod workflow;
 pub mod workspace;
 
 pub use machine::{
-    HubConfig, InMemoryStore, Machine, ObsEvent, Task, TaskHub, TaskId, TaskOutcome, TaskSink,
-    TaskSnapshot, TaskState, TaskStore, Update, UpdateBody,
+    AgentMachine, AgentMachineConfig, HubConfig, InMemoryStore, Machine, ObsEvent, Task, TaskHub,
+    TaskId, TaskOutcome, TaskSink, TaskSnapshot, TaskState, TaskStore, Update, UpdateBody,
 };
 pub use session::{
     AnnotatedMessage, FileSessionPersister, INFLIGHT_CRASH_REASON, InflightCheckpoint, MessageId,
