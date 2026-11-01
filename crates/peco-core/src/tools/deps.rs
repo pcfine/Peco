@@ -4,11 +4,12 @@
 
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::agent::{Agent, AgentError};
 use crate::config::{McpServerConfig, TransportType};
 use crate::knowledge::KnowledgeManager;
+use crate::machine::MachineRuntime;
 use crate::search::SearchBackend;
 use crate::skills::{SkillRegister, SkillResourceFile};
 use crate::workflow::WorkflowAccess;
@@ -197,6 +198,12 @@ pub struct ToolDependencies {
     /// 记忆删除审计支持。Optional — None 时删除工具运行时拒绝（fail-closed），
     /// 与其他 Optional 依赖的 warn + skip 语义不同：工具仍注册，只是执行被拒。
     pub memory_audit: Option<Arc<dyn MemoryAuditAccess>>,
+    /// 任务 Hub 归属者。Optional — None 时机器任务工具被 warn + skip。
+    ///
+    /// 只持弱引用：强引用的唯一持有者是 `AgentManager`。换成 `Arc` 会闭合
+    /// `Hub → AgentMachine → Agent → ToolExecutor → 工具 → runtime`，
+    /// 使 Hub 的后台扫描任务随工作空间一起永不退出。
+    pub machine_runtime: Option<Weak<MachineRuntime>>,
 }
 
 impl Clone for ToolDependencies {
@@ -213,6 +220,7 @@ impl Clone for ToolDependencies {
             work_dir: self.work_dir.clone(),
             web_search: self.web_search.clone(),
             memory_audit: self.memory_audit.clone(),
+            machine_runtime: self.machine_runtime.clone(),
         }
     }
 }

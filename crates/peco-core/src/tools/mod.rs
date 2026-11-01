@@ -7,6 +7,7 @@ mod command_screen;
 mod deps;
 mod fetch;
 mod knowledge_tools;
+mod machine_tool;
 mod mcp_tools;
 mod memory_delete;
 mod proc_group;
@@ -32,6 +33,7 @@ pub use knowledge_tools::{
     DeleteKbDocument, DeleteKbDocuments, GetKnowledgeBaseDocs, ListKnowledgeBases,
     QueryEntityFacts, SearchKnowledge, SyncKnowledgeBase,
 };
+pub use machine_tool::{InspectMachineTask, RunMachineTask};
 pub use mcp_tools::{DeleteMcpServer, ListMcpServers, SaveMcpServer, TestMcpConnection};
 pub use memory_delete::{
     DeleteOrigin, DeletedDoc, DeletedEntity, MemoryDeleteError, delete_document,

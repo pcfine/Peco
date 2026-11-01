@@ -14,10 +14,10 @@ use crate::tools::{
     AddFactsToKnowledgeBase, AddToKnowledgeBase, Content, DefaultToolsExecutor, DelegateSubAgent,
     DeleteAgent, DeleteEntity, DeleteEntityFact, DeleteEntityFacts, DeleteKbDocument,
     DeleteKbDocuments, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs,
-    ListKnowledgeBases, ListMcpServers, ListSkills, QueryEntityFacts, ReadAgent, ReadSkill,
-    RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge, ShellTool,
-    ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError, ToolExecutor,
-    WebSearchTool,
+    InspectMachineTask, ListKnowledgeBases, ListMcpServers, ListSkills, QueryEntityFacts,
+    ReadAgent, ReadSkill, RunMachineTask, RunParallelSubAgents, SaveAgent, SaveMcpServer,
+    SaveSkill, SearchKnowledge, ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection,
+    ToolDyn, ToolError, ToolExecutor, WebSearchTool,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -37,6 +37,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "delete_skill",
     "delegate_sub_agent",
     "run_parallel_sub_agents",
+    "run_machine_task",
+    "inspect_machine_task",
     "save_agent",
     "read_agent",
     "delete_agent",
@@ -122,6 +124,34 @@ impl ToolRegister {
                 "run_parallel_sub_agents" => Some(Box::new(RunParallelSubAgents::new(
                     deps.agent_access.clone(),
                 ))),
+                // ── 机器任务（machine_runtime 缺失时 warn + skip）──
+                "run_machine_task" => {
+                    match deps
+                        .machine_runtime
+                        .as_ref()
+                        .and_then(|weak| weak.upgrade())
+                    {
+                        Some(runtime) => Some(Box::new(RunMachineTask::new(
+                            deps.agent_access.clone(),
+                            deps.knowledge_access.user_id().to_string(),
+                            Arc::downgrade(&runtime),
+                        ))),
+                        None => skip_missing_dep("run_machine_task", "machine_runtime"),
+                    }
+                }
+                "inspect_machine_task" => {
+                    match deps
+                        .machine_runtime
+                        .as_ref()
+                        .and_then(|weak| weak.upgrade())
+                    {
+                        Some(runtime) => {
+                            Some(Box::new(InspectMachineTask::new(Arc::downgrade(&runtime))))
+                        }
+                        None => skip_missing_dep("inspect_machine_task", "machine_runtime"),
+                    }
+                }
+
                 "save_agent" => Some(Box::new(SaveAgent::new(deps.agent_access.clone()))),
                 "read_agent" => Some(Box::new(ReadAgent::new(deps.agent_access.clone()))),
                 "delete_agent" => Some(Box::new(DeleteAgent::new(deps.agent_access.clone()))),
@@ -440,7 +470,16 @@ mod tests {
             web_search: None,
             // fail-closed 默认：审计存储未注入，删除工具运行时拒绝
             memory_audit: None,
+            machine_runtime: None,
         }
+    }
+
+    /// `full_deps` 里的 `Weak` 必须指向一个活到进程结束的 runtime：指向临时 `Arc`
+    /// 会在 `full_deps` 返回时立刻失效，依赖它的用例就再也取不到。
+    fn shared_machine_runtime() -> Arc<crate::machine::MachineRuntime> {
+        static RUNTIME: std::sync::OnceLock<Arc<crate::machine::MachineRuntime>> =
+            std::sync::OnceLock::new();
+        Arc::clone(RUNTIME.get_or_init(|| Arc::new(crate::machine::MachineRuntime::new())))
     }
 
     fn full_deps() -> ToolDependencies {
@@ -450,6 +489,7 @@ mod tests {
         deps.web_search = Some(Arc::new(SearchBackend::Searxng(
             SearxngClient::new("http://localhost:8888").expect("client"),
         )));
+        deps.machine_runtime = Some(Arc::downgrade(&shared_machine_runtime()));
         deps
     }
 
@@ -502,6 +542,8 @@ mod tests {
             "delete_mcp_server",
             "test_mcp_connection",
             "web_search",
+            "run_machine_task",
+            "inspect_machine_task",
         ] {
             assert!(
                 !names.contains(&name.to_string()),
@@ -532,6 +574,25 @@ mod tests {
         let with = definition_names(ToolRegister::build(&all_names, &with).as_ref());
 
         assert_eq!(without, with);
+    }
+
+    /// `Weak` 已失效（工作空间已 drop）时两个机器任务工具都不得注册：
+    /// 注册期就升级一次，运行期失败只剩「返回错误」这一条路。
+    #[test]
+    fn machine_tools_are_skipped_when_the_runtime_is_gone() {
+        let mut deps = full_deps();
+        {
+            let runtime = Arc::new(crate::machine::MachineRuntime::new());
+            deps.machine_runtime = Some(Arc::downgrade(&runtime));
+        }
+
+        for name in ["run_machine_task", "inspect_machine_task"] {
+            let executor = ToolRegister::build(&[name.to_string()], &deps);
+            assert!(
+                definition_names(executor.as_ref()).is_empty(),
+                "tool '{name}' must be skipped once its runtime is gone"
+            );
+        }
     }
 
     /// web_search 在后端就绪时正常注册（与 fetch 同级注册验证）。

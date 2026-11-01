@@ -155,6 +155,29 @@ impl TaskHub {
         Arc::new(TaskHub { inner })
     }
 
+    /// 覆盖已注册 kind 的 machine。`register` 的「重复即拒绝」仍是首注册的守门，
+    /// 本方法是唯一合法替换路径：配置热更新后不换 machine，任务就永远跑旧配置。
+    /// 路由键的唯一来源是 `descriptor`，故 `kind` 与它不一致按非法请求拒绝。
+    pub fn replace(&self, kind: &str, machine: Arc<dyn Machine>) -> Result<(), MachineError> {
+        if machine.descriptor().kind != kind {
+            return Err(MachineError::Illegal {
+                reason: format!("kind mismatch: registry '{kind}'"),
+            });
+        }
+        // 旧 machine 连同它持有的 agent/provider 图在锁外 drop：锁内析构会挂在注册表锁上。
+        let previous = {
+            self.inner
+                .machines
+                .lock()
+                .map_err(|_| MachineError::Unavailable {
+                    reason: "machine registry lock poisoned".to_string(),
+                })?
+                .insert(kind.to_string(), machine)
+        };
+        drop(previous);
+        Ok(())
+    }
+
     pub fn register(&self, machine: Arc<dyn Machine>) -> Result<(), MachineError> {
         let kind = machine.descriptor().kind;
         let mut machines = self
@@ -1107,6 +1130,48 @@ mod tests {
         assert!(
             store.list(&no_filter()).expect("store list").is_empty(),
             "a rejected submission must never reach the store"
+        );
+    }
+
+    /// `replace` 是唯一合法的覆盖路径：覆盖后提交打到新 machine，而 `register`
+    /// 对同 kind 仍然拒绝（首注册的守门不得被替换语义松掉）。
+    #[tokio::test]
+    async fn replace_overwrites_a_kind_and_register_still_rejects_duplicates() {
+        let hub = TaskHub::new(test_config(), Arc::new(InMemoryStore::new()));
+        hub.register(Arc::new(ChattyMachine::new("swap")))
+            .expect("the first registration is accepted");
+
+        let duplicate = hub.register(Arc::new(ChattyMachine::new("swap")));
+        assert!(
+            matches!(duplicate, Err(MachineError::Illegal { .. })),
+            "register must stay reject-on-duplicate: {duplicate:?}"
+        );
+
+        hub.replace("swap", Arc::new(OutputMachine::new("swap", 1)))
+            .expect("replace overwrites the registered kind");
+
+        let id = hub.submit("swap", task("hello")).await.expect("submit");
+        let snapshot = wait_until(&hub, &id, "the replaced machine settles", |snapshot| {
+            snapshot.state.is_terminal()
+        })
+        .await;
+        assert_eq!(snapshot.state, TaskState::Completed);
+        assert_eq!(
+            snapshot.outcome.and_then(|outcome| outcome.output),
+            Some(OutputMachine::marker()),
+            "the task must run on the machine that replaced the old one"
+        );
+
+        // 路由键的唯一来源是 descriptor：与它不一致的 kind 不得借此挂上同一台 machine。
+        let mismatch = hub.replace("other", Arc::new(OutputMachine::new("swap", 1)));
+        assert!(
+            matches!(mismatch, Err(MachineError::Illegal { .. })),
+            "replace must reject a kind that disagrees with the descriptor: {mismatch:?}"
+        );
+        let unrouted = hub.submit("other", task("hello")).await;
+        assert!(
+            matches!(unrouted, Err(MachineError::UnknownKind { .. })),
+            "a rejected replace must not register the machine under another kind: {unrouted:?}"
         );
     }
 

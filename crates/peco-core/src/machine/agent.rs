@@ -17,7 +17,8 @@ use crate::session::{NullSessionPersister, Session, SessionPersister};
 
 use super::machine::{Machine, MachineDescriptor, MachineError};
 use super::model::{
-    OutputView, Progress, TaggedJson, Task, TaskError, TaskId, TaskOutcome, TaskSnapshot,
+    Artifact, ArtifactId, OutputView, Progress, TaggedJson, Task, TaskError, TaskId, TaskOutcome,
+    TaskSnapshot,
 };
 use super::sink::{SinkError, TaskSink};
 use super::state::{OutputChunk, TaskState};
@@ -31,8 +32,18 @@ const CONTROL_BUFFER: usize = 4;
 /// 会话描述只作人读标签，超出部分截断不损失任何判定信息。
 const DESCRIPTION_CHARS: usize = 120;
 
+/// 工具声明的产物在 `Artifact.payload` 里的 tag。
+pub(crate) const ARTIFACT_DECL_TAG: &str = "artifact_decl";
+
+/// 单任务可上浮的声明数上限：声明数本身无上界，跑飞的子 agent 输出上万行会把
+/// 每个任务的快照撑大、每条各推一次 seq。
+const MAX_ARTIFACTS_PER_TASK: usize = 64;
+
 /// `AgentMachine` 的装配参数。
 pub struct AgentMachineConfig {
+    /// `TaskHub` 的路由键。默认 `"agent"`；同 Hub 里要跑多个 agent 时必须改名
+    /// （如 `agent:<name>`），因为 `register` 对重复 kind 直接拒绝。
+    pub kind: String,
     /// 会话落盘器。默认 `NullSessionPersister`，即关闭持久化。
     pub persister: Arc<dyn SessionPersister>,
     pub looper_config: LooperConfig,
@@ -46,6 +57,7 @@ pub struct AgentMachineConfig {
 impl Default for AgentMachineConfig {
     fn default() -> Self {
         Self {
+            kind: "agent".to_string(),
             persister: Arc::new(NullSessionPersister),
             looper_config: LooperConfig::default(),
             cancel_grace: Duration::from_secs(1),
@@ -127,7 +139,7 @@ impl AgentMachine {
 impl Machine for AgentMachine {
     fn descriptor(&self) -> MachineDescriptor {
         MachineDescriptor {
-            kind: "agent".to_string(),
+            kind: self.config.kind.clone(),
             state_tag: "agent".to_string(),
             input_tag: PROMPT_TAG.to_string(),
             description: "runs one agent turn for the task prompt".to_string(),
@@ -271,6 +283,7 @@ async fn drive(
     }
 
     let mut offset = 0u64;
+    let mut declared = 0usize;
     let mut deadline_sleep = deadline.map(|at| Box::pin(sleep(remaining_until(at))));
     let mut cancel_sleep: Option<Pin<Box<Sleep>>> = None;
 
@@ -308,7 +321,31 @@ async fn drive(
                     Some(LooperEvent::Shutdown { reason, .. }) => {
                         break Some(error_verdict(TaskState::Failed, "looper_shutdown", reason));
                     }
-                    // 推理增量 / 工具事件 / 用量都不进产出。
+                    Some(LooperEvent::ToolResult { artifacts, .. }) => {
+                        // 声明已从工具结果正文里剥离：不在这一帧写进 sink 就永久丢失。
+                        // 写失败按「已丢」处理，不改变本轮收敛。
+                        for decl in &artifacts {
+                            if declared >= MAX_ARTIFACTS_PER_TASK {
+                                warn!(
+                                    task_id = %id,
+                                    "artifact declarations beyond the per-task cap are dropped"
+                                );
+                                break;
+                            }
+                            let Some(artifact) = artifact_from_decl(decl) else {
+                                continue;
+                            };
+                            if let Err(err) = sink.artifact(artifact).await {
+                                warn!(
+                                    task_id = %id,
+                                    error = %err,
+                                    "artifact declaration dropped; the hub refused it"
+                                );
+                            }
+                            declared += 1;
+                        }
+                    }
+                    // 推理增量 / 工具调用 / 用量都不进产出。
                     Some(_) => {}
                 }
             }
@@ -428,6 +465,36 @@ fn parse_prompt(input: &TaggedJson) -> Result<String, MachineError> {
             "input must carry tag \"{PROMPT_TAG}\" with a string payload, got tag \"{}\"",
             input.tag
         ),
+    })
+}
+
+/// 一条声明整条覆盖同 id 的已有值（`append: false`）：`append: true` 只接受字符串
+/// payload，对象会被 Hub 按非法转移拒掉，而调用点是尽力而为，产物会静默消失。
+fn artifact_from_decl(decl: &crate::artifacts::ArtifactDecl) -> Option<Artifact> {
+    if decl.path.is_empty() {
+        // 多条空 path 会塌成同一条产物，各自覆盖对方。
+        warn!("artifact declaration without a path is dropped");
+        return None;
+    }
+    let payload = match serde_json::to_value(decl) {
+        Ok(payload) => payload,
+        // 结构上不会发生：字段全是 String/Option<String>。
+        Err(err) => {
+            warn!(error = %err, "artifact declaration is not serializable; dropped");
+            return None;
+        }
+    };
+    Some(Artifact {
+        id: ArtifactId(decl.path.clone()),
+        kind: ARTIFACT_DECL_TAG.to_string(),
+        // 单条即完整值：offset 由 Hub 按 payload 长度重算，不入参。
+        offset: 0,
+        append: false,
+        last_chunk: true,
+        payload: TaggedJson {
+            tag: ARTIFACT_DECL_TAG.to_string(),
+            payload,
+        },
     })
 }
 
@@ -557,8 +624,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::agent::test_support::{
-        GateTool, ScriptedBatchProvider, completed, scripted_agent, scripted_agent_with_tools,
-        tool_call_response,
+        GateTool, ScriptedBatchProvider, StaticTool, completed, scripted_agent,
+        scripted_agent_with_tools, tool_call_response,
     };
     use crate::agent::{AgentProfile, ModelConfigBuilder};
     use crate::machine::hub::{HubConfig, ObsStream, TaskHub};
@@ -1286,6 +1353,113 @@ mod tests {
                 provider.budgets().len(),
                 1,
                 "a retired driver must not issue further model calls"
+            );
+        })
+        .await;
+    }
+
+    /// 默认 kind 不变：既有提交路径用的就是这个字面量，改了会让所有已注册的
+    /// Hub 路由键一起漂移。
+    #[test]
+    fn default_descriptor_kind_is_agent() {
+        let (agent, _provider) = scripted_agent(vec![]);
+        assert_eq!(
+            AgentMachine::new(Arc::clone(&agent), AgentMachineConfig::default())
+                .descriptor()
+                .kind,
+            "agent"
+        );
+
+        let named = AgentMachineConfig {
+            kind: "agent:t".to_string(),
+            ..AgentMachineConfig::default()
+        };
+        assert_eq!(
+            AgentMachine::new(agent, named).descriptor().kind,
+            "agent:t",
+            "the descriptor must read the configured kind"
+        );
+    }
+
+    /// 声明已从工具结果正文里剥离：不写进 sink 就永久丢失，故这里钉住「声明进了
+    /// Hub 的快照，且能按 id 还原成原声明」。
+    #[tokio::test]
+    async fn tool_artifact_declarations_reach_the_hub_snapshot() {
+        within_budget(async {
+            let output = "ok\n@@PECO_ARTIFACT {\"path\":\"/ws/output/a.jpg\",\"title\":\"fox\"}\n\
+                          @@PECO_ARTIFACT {\"path\":\"\"}\n";
+            let tool = StaticTool::new("emit", Content::Text(output.to_string()));
+            let (agent, _provider) = scripted_agent_with_tools(
+                vec![
+                    tool_call_response("c1", "emit", serde_json::json!({})),
+                    completed("done"),
+                ],
+                vec![Box::new(tool)],
+            );
+            let machine = machine_for(agent, AgentMachineConfig::default());
+            let hub = hub_for(machine.clone(), hub_config());
+            let id = submit(&hub, &machine, prompt("hi"), None)
+                .await
+                .expect("the task is accepted");
+
+            let snapshot = terminal(&hub, &id).await;
+            assert_eq!(snapshot.state, TaskState::Completed);
+            assert_eq!(
+                snapshot.artifacts.len(),
+                1,
+                "a declaration without a path must be dropped"
+            );
+
+            let artifact = &snapshot.artifacts[0];
+            assert_eq!(artifact.id, ArtifactId("/ws/output/a.jpg".to_string()));
+            assert_eq!(artifact.kind, ARTIFACT_DECL_TAG);
+            assert_eq!(artifact.payload.tag, ARTIFACT_DECL_TAG);
+            assert!(artifact.last_chunk, "one declaration is a complete value");
+            assert!(
+                artifact.offset > 0,
+                "the hub recomputes the offset from the payload"
+            );
+
+            let restored: crate::artifacts::ArtifactDecl =
+                serde_json::from_value(artifact.payload.payload.clone())
+                    .expect("the payload round-trips to the declaration");
+            assert_eq!(restored.path, "/ws/output/a.jpg");
+            assert_eq!(restored.title.as_deref(), Some("fox"));
+        })
+        .await;
+    }
+
+    /// 声明数没有天然上界：跑飞的子 agent 可以一次吐出上万行，故按任务截断。
+    #[tokio::test]
+    async fn artifact_declarations_are_capped_per_task() {
+        within_budget(async {
+            let overflow = MAX_ARTIFACTS_PER_TASK + 1;
+            let mut output = String::from("ok\n");
+            for index in 0..overflow {
+                output.push_str(&format!(
+                    "@@PECO_ARTIFACT {{\"path\":\"/tmp/{index}.jpg\"}}\n"
+                ));
+            }
+            let tool = StaticTool::new("emit", Content::Text(output));
+            let (agent, _provider) = scripted_agent_with_tools(
+                vec![
+                    tool_call_response("c1", "emit", serde_json::Value::Null),
+                    completed("done"),
+                ],
+                vec![Box::new(tool)],
+            );
+            let machine = machine_for(agent, AgentMachineConfig::default());
+            let hub = hub_for(machine.clone(), hub_config());
+            let id = submit(&hub, &machine, prompt("hi"), None)
+                .await
+                .expect("the task is accepted");
+
+            let snapshot = terminal(&hub, &id).await;
+            assert_eq!(snapshot.state, TaskState::Completed);
+            assert_eq!(
+                snapshot.artifacts.len(),
+                MAX_ARTIFACTS_PER_TASK,
+                "declarations beyond the per-task cap must be dropped"
             );
         })
         .await;

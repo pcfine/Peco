@@ -19,6 +19,7 @@ use crate::agent::agent_config::{AgentProfile, split_frontmatter};
 use crate::agent::{Agent, AgentError};
 use crate::config::{McpConfig, UserConfig};
 use crate::knowledge::KnowledgeManager;
+use crate::machine::MachineRuntime;
 use crate::mcp::McpConfigStore;
 use crate::search::SearchBackend;
 use crate::skills::{SkillRegister, SkillResourceFile};
@@ -85,6 +86,9 @@ pub struct AgentManager {
     /// 建一次（reqwest 连接池与 `${ENV_VAR}` 解析只做一次）并随 provider
     /// 重载一并重建；None 表示未配置或配置无效，web_search 工具随之 skip。
     web_search: RwLock<Option<Arc<SearchBackend>>>,
+    /// 机器任务 Hub 归属者。强引用的唯一持有者就是这里：工具侧经 `ToolDependencies`
+    /// 只拿到 `Weak`，否则 agent ↔ 工具 ↔ Hub 会成环。
+    machine_runtime: Arc<MachineRuntime>,
 }
 
 impl AgentManager {
@@ -124,6 +128,8 @@ impl AgentManager {
             mcp_access: RwLock::new(None),
             memory_audit: RwLock::new(None),
             web_search: RwLock::new(web_search),
+            // 只存配置，不建 Hub：TaskHub 需要 tokio runtime，而这里是同步构造。
+            machine_runtime: Arc::new(MachineRuntime::new()),
             user_config: RwLock::new(user_config),
             config_generation: AtomicU64::new(0),
         }
@@ -302,6 +308,7 @@ impl AgentManager {
             work_dir: self.work_dir.clone(),
             web_search: self.web_search.read().unwrap().clone(),
             memory_audit: self.memory_audit.read().unwrap().clone(),
+            machine_runtime: Some(Arc::downgrade(&self.machine_runtime)),
         }
     }
 
@@ -346,6 +353,7 @@ impl AgentManager {
             work_dir: self.work_dir.clone(),
             web_search: self.web_search.read().unwrap().clone(),
             memory_audit,
+            machine_runtime: Some(Arc::downgrade(&self.machine_runtime)),
         }
     }
 
@@ -677,6 +685,8 @@ impl AgentAccess for AmAgentAccess {
             work_dir: self.work_dir.clone(),
             web_search: self.web_search.clone(),
             memory_audit: self.memory_audit.clone(),
+            // 子 agent 一律拿不到 runtime：否则 machine 加载出的 agent 能再开扇出通道。
+            machine_runtime: None,
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;
@@ -827,6 +837,33 @@ mod tests {
         assert!(
             am.build_deps().memory_audit.is_some(),
             "注入后 build_deps 必须携带审计访问"
+        );
+    }
+
+    /// 机器任务工具只拿弱引用：升级必须落到 AgentManager 自己持有的那个 runtime，
+    /// 两条构建路径都不能漏（漏了工具就永远拿不到 Hub）。
+    #[test]
+    fn both_dep_paths_carry_a_live_machine_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = test_agent_manager(tmp.path());
+
+        let cached = am
+            .build_deps()
+            .machine_runtime
+            .expect("build_deps must inject the runtime");
+        assert!(
+            cached.upgrade().is_some(),
+            "the weak reference must point at the AgentManager-owned runtime"
+        );
+
+        let direct = am
+            .build_deps_direct()
+            .machine_runtime
+            .expect("build_deps_direct must inject the runtime");
+        assert!(direct.upgrade().is_some());
+        assert!(
+            std::sync::Weak::ptr_eq(&cached, &direct),
+            "both paths must point at the same runtime"
         );
     }
 

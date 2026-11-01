@@ -184,6 +184,8 @@ You are a helpful AI assistant. Answer questions concisely and accurately.
         work_dir: peco_core::workspace::WorkDir::new("."),
         web_search: None,
         memory_audit: None, // fail-closed：无审计存储时删除工具运行时拒绝
+        // 示例不提供机器任务：工具缺依赖时 warn + skip。
+        machine_runtime: None,
     };
 
     let agent = Arc::new(Agent::from_file(&agent_md, &user_config, &tool_deps)?);

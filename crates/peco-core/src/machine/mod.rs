@@ -5,6 +5,7 @@ pub mod hub;
 #[allow(clippy::module_inception)]
 pub mod machine;
 pub mod model;
+pub mod runtime;
 pub mod sink;
 pub mod state;
 pub mod store;
@@ -17,6 +18,7 @@ pub use model::{
     Artifact, ArtifactId, OutputView, Progress, TaggedJson, Task, TaskContext, TaskError,
     TaskFilter, TaskId, TaskOutcome, TaskSnapshot, TaskSource,
 };
+pub use runtime::MachineRuntime;
 pub use sink::{SinkError, TaskSink};
 pub use state::{ObsEvent, OutputChunk, TaskState, Update, UpdateBody, UpdateOrigin};
 pub use store::{InMemoryStore, StoreError, TaskStore};
