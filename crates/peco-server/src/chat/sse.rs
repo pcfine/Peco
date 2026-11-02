@@ -3,9 +3,10 @@
 // ============================================================================
 
 use axum::response::sse::Event;
-use model_provider::Usage;
+use model_provider::{Usage, text_of_blocks};
 use peco_core::agent::{
-    LooperEvent, RetryNoticeReason, TurnFailureReason, TurnOutcome, strip_summary_wrapper,
+    LooperEvent, ResponseOrigin, RetryNoticeReason, TurnFailureReason, TurnOutcome,
+    strip_summary_wrapper,
 };
 use serde::Serialize;
 use tracing::warn;
@@ -386,6 +387,21 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
             conversation_id: cid,
         }),
 
+        // batch 没有 TextDelta：每次模型调用的完整文本以**一次** text_delta 下发，
+        // 让只认增量事件的前端仍能实时追加。流式来源的文本已由 TextDelta 覆盖，
+        // 这里不再重发。
+        LooperEvent::ModelOutput {
+            origin: ResponseOrigin::Batch,
+            output,
+            ..
+        } => {
+            let content = text_of_blocks(&output);
+            (!content.is_empty()).then_some(ChatSseEvent::TextDelta {
+                content,
+                conversation_id: cid,
+            })
+        }
+
         LooperEvent::ReasoningDelta { delta } => Some(ChatSseEvent::ReasoningDelta {
             content: delta,
             conversation_id: cid,
@@ -546,6 +562,7 @@ pub fn map_looper_event(event: LooperEvent, conversation_id: &str) -> Option<Cha
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model_provider::ContentBlock;
     use peco_core::agent::LooperState;
 
     #[test]
@@ -564,6 +581,49 @@ mod tests {
             event,
             Some(ChatSseEvent::TurnComplete { ref text, .. }) if text == "你好"
         ));
+    }
+
+    /// batch 输出以一次 text_delta 下发：前端只认增量事件，若不翻译就永远看不到。
+    #[test]
+    fn batch_model_output_maps_to_one_text_delta() {
+        let event = map_looper_event(
+            LooperEvent::ModelOutput {
+                call_index: 1,
+                origin: ResponseOrigin::Batch,
+                output: vec![
+                    ContentBlock::Reasoning {
+                        text: "思考".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "答案".to_string(),
+                    },
+                ],
+            },
+            "conv-1",
+        );
+        let Some(ChatSseEvent::TextDelta { content, .. }) = event else {
+            panic!("ModelOutput(Batch) 必须映射为 TextDelta，实际 {event:?}");
+        };
+        assert_eq!(content, "答案", "只取可见文本，推理不进正文");
+    }
+
+    /// 流式来源的汇总不得重复下发 —— 文本已经由 TextDelta 逐块送过了。
+    #[test]
+    fn stream_model_output_maps_to_nothing() {
+        let event = map_looper_event(
+            LooperEvent::ModelOutput {
+                call_index: 1,
+                origin: ResponseOrigin::Stream,
+                output: vec![ContentBlock::Text {
+                    text: "答案".to_string(),
+                }],
+            },
+            "conv-1",
+        );
+        assert!(
+            event.is_none(),
+            "ModelOutput(Stream) 只是汇总，不应再发一次"
+        );
     }
 
     #[test]

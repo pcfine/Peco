@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use model_provider::text_of_blocks;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::{Sleep, sleep};
 use tracing::warn;
 
 use crate::agent::{
-    Agent, AgentLooper, LooperConfig, LooperEvent, LooperHandle, TurnFailureReason, TurnOutcome,
+    Agent, AgentLooper, LooperConfig, LooperEvent, LooperHandle, ResponseOrigin, TurnFailureReason,
+    TurnOutcome,
 };
 use crate::session::{NullSessionPersister, Session, SessionPersister};
 
@@ -299,22 +301,6 @@ async fn drive(
                             "looper event channel closed".to_string(),
                         ));
                     }
-                    Some(LooperEvent::TextDelta { delta }) => {
-                        if delta.is_empty() {
-                            continue;
-                        }
-                        match write_delta(&sink, &mut offset, delta.as_bytes()).await {
-                            DeltaWrite::Written => {}
-                            DeltaWrite::Gap => {
-                                break Some(error_verdict(
-                                    TaskState::Failed,
-                                    "output_gap",
-                                    "output offset never matched the hub window".to_string(),
-                                ));
-                            }
-                            DeltaWrite::Blocked => break None,
-                        }
-                    }
                     Some(LooperEvent::TurnComplete { outcome, .. }) => {
                         break Some(from_turn(outcome));
                     }
@@ -345,8 +331,35 @@ async fn drive(
                             declared += 1;
                         }
                     }
-                    // 推理增量 / 工具调用 / 用量都不进产出。
-                    Some(_) => {}
+                    // 文本来源：流式增量与 batch 整段输出共用同一条偏移通道。
+                    // 其余事件（推理增量 / 工具调用 / 用量）不进产出；流式来源的
+                    // `ModelOutput` 也在这里被吸收（文本已由 TextDelta 落写）。
+                    Some(event) => {
+                        let text = match event {
+                            LooperEvent::TextDelta { delta } => Some(delta),
+                            LooperEvent::ModelOutput {
+                                origin: ResponseOrigin::Batch,
+                                output,
+                                ..
+                            } => Some(text_of_blocks(&output)),
+                            _ => None,
+                        };
+                        let Some(text) = text else { continue };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        match write_delta(&sink, &mut offset, text.as_bytes()).await {
+                            DeltaWrite::Written => {}
+                            DeltaWrite::Gap => {
+                                break Some(error_verdict(
+                                    TaskState::Failed,
+                                    "output_gap",
+                                    "output offset never matched the hub window".to_string(),
+                                ));
+                            }
+                            DeltaWrite::Blocked => break None,
+                        }
+                    }
                 }
             }
             Some(Signal::Cancel) = control.recv() => {
@@ -619,7 +632,7 @@ mod tests {
 
     use model_provider::{
         BlockType, Content, ContentBlock, FinishReason, GenerateRequest, GenerateResult,
-        GenerateStream, ModelProvider, ProviderError, StreamChunk, Usage,
+        GenerateStream, ModelProvider, ProviderError, ResponseStatus, StreamChunk, Usage,
     };
     use uuid::Uuid;
 
@@ -871,7 +884,7 @@ mod tests {
             .as_str()
     }
 
-    /// T1：成功轮的文本只来自 `TurnComplete`，不是拼出来的增量流。
+    /// T1：成功轮的最终文本来自 `TurnComplete`，中途文本由 `ModelOutput` 落写。
     #[tokio::test]
     async fn turn_complete_settles_completed() {
         within_budget(async {
@@ -889,15 +902,55 @@ mod tests {
             assert_eq!(outcome.output, Some(text("hello")));
             assert!(outcome.error.is_none());
             assert!(snapshot.updated_at >= snapshot.created_at);
-            // batch 路径整段文本只在 `TurnComplete` 交付，looper 一个 delta 都不发，
-            // 故本机从未写过 output chunk：窗口必须停在原点、不留半句增量。写成非零
-            // 就说明实现自己从终态文本伪造了增量。
-            assert!(
-                snapshot.output.tail.is_empty(),
-                "the batch path must not fabricate output chunks"
+            // batch 路径没有 TextDelta，整段文本由 looper 的 `ModelOutput` 交付；
+            // 本机按同一偏移通道落写，故窗口形状与流式路径一致 —— 若实现自己从
+            // 终态文本伪造增量，就不是「那次调用真实产出的位置」。
+            assert_eq!(
+                snapshot.output.tail.as_slice(),
+                b"hello",
+                "the batch text must land in the hub window via ModelOutput"
             );
             assert_eq!(snapshot.output.start_offset, 0);
-            assert_eq!(snapshot.output.end_offset, 0);
+            assert_eq!(snapshot.output.end_offset, 5);
+        })
+        .await;
+    }
+
+    /// 截断重试作废的 batch 文本不得进入产出窗口：作废尝试在重试决策后不再外发。
+    #[tokio::test]
+    async fn batch_truncation_retry_does_not_leak_discarded_text() {
+        within_budget(async {
+            let discarded = GenerateResult {
+                id: "r-truncated".into(),
+                output: vec![ContentBlock::Text {
+                    text: "discarded".into(),
+                }],
+                usage: Usage {
+                    output_tokens: 4096,
+                    ..Default::default()
+                },
+                status: ResponseStatus::Incomplete,
+                finish_reason: Some(FinishReason::MaxTokens),
+                error: None,
+            };
+            let (machine, provider) = scripted_machine(vec![discarded, completed("final")]);
+            let hub = hub_for(machine.clone(), hub_config());
+            let id = submit(&hub, &machine, prompt("hi"), None)
+                .await
+                .expect("the task is accepted");
+
+            let snapshot = terminal(&hub, &id).await;
+            assert_eq!(snapshot.state, TaskState::Completed);
+            assert_eq!(
+                provider.budgets().len(),
+                2,
+                "the truncated attempt must be retried"
+            );
+            assert_eq!(
+                snapshot.output.tail.as_slice(),
+                b"final",
+                "discarded attempt text must never reach the hub window"
+            );
         })
         .await;
     }

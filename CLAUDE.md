@@ -93,7 +93,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 - **流式路径**：使用 `StreamAssembler` 将 `StreamEvent` 块中的增量文本/推理/工具调用增量累积为完整的 assistant 消息。
 - 动态上下文组装：系统提示词每轮重新注入，工具结果追加其后。`DynamicContext` trait 支持在每次新用户查询时注入 RAG 增强内容；同一轮的 ReAct 迭代复用缓存上下文。
 - **上下文策略**：`FullHistory`（默认）、`SlidingWindow { max_turns }`、`TokenBudget { max_tokens, summarize_overflow }` 或 `Custom(Arc<dyn ContextFilter>)`。通过 `LooperConfig` 为每个 looper 选择。
-- `LooperEvent` 枚举（19 个变体）通过异步 intercom 通道（`Speaker`/`Listener` 对）流动，覆盖文本增量、推理增量、工具调用生命周期、状态转换、轮次边界和关闭。
+- `LooperEvent` 枚举（20 个变体）通过异步 intercom 通道（`Speaker`/`Listener` 对）流动，覆盖文本增量、推理增量、工具调用生命周期、状态转换、轮次边界和关闭。新增的 `ModelOutput` 在每次**未被重试作废**的模型调用后发一次（batch/stream 都发）：stream 下是已下发增量的权威汇总，batch 下是该次输出唯一的中途视图（`AgentMachine` 据此把 batch 文本写进任务产出窗口）。被 `begin_retry` 作废的尝试不发 —— 只在重试决策之后外发，避免只增不减的产出窗口残留残句。
 - **模型错误分类与统一重发**：模型故障统一经 `model_failure_reason`（按 `ProviderError::classify()` 映射）转成类型化 `TurnFailureReason`（`RateLimited`/`ModelUnavailable`/`AuthError`/`QuotaExhausted`/`ContextOverflow`/`ContentFiltered`，均携带 provider 原始 msg）。故障出口 `fail_or_retry` 收敛三处 Err 站点：**只 classify 一次**，瞬时类进重发，否则写入 `failure_reason`。
   - **单一重发入口 `begin_retry(RetryCause)`**：截断（`Truncated { output_tokens }`，触发条件 `Incomplete + MaxTokens`）与瞬时（`Transient { trigger }`，限流/网络/5xx，或流被掐断 `Incomplete + finish_reason=None`）共用一条路径 —— 守卫 `can_retry` → 回退 staging 到请求前锚点 → 计数 → 设定退避 deadline → 通知。两者**语义差异只是入参**：截断额外抬输出预算，其余（退避、通知、回退）完全一致。
   - **单计数单上限**：`retry_limit` 默认 3（旧「截断 1 + 瞬时 2」的合计天花板），`PECO_RETRY_LIMIT` 可调，`0` = 关闭。**截断不需要独立限额** —— `budget_raised` 粘性到轮末，抬到 `retry_output_budget` 后 headroom 判据恒假，第二次截断重试被 `can_retry` 拦死。
@@ -197,7 +197,7 @@ peco-server (Axum Web 服务, REST/SSE, JWT 认证, Cron 调度器, Peco 记忆�
 
 **Chat/SSE**（[crates/peco-server/src/chat/](crates/peco-server/src/chat/)）：
 - `GET /api/conversations/:id/stream` — SSE 端点。创建 `AgentLooper`，在 tokio 任务中启动它，并将 `LooperEvent` 桥接到 SSE 事件流。
-- SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`error`、`done`、`looper_state`、`user_steer`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`TurnStart` 被过滤掉，不发送给客户端 —— `StateChange` 只在跨暂停转换时转化为 `looper_state` 布尔事件；`TurnStart` 每轮都会产生，不单独下发，气泡切分由 `user_steer` 或终态事件承担；`TruncationRetry` 的 `discarded_text` 字段同样不下发 —— 它只服务 `chat` 模块落库累加器的后缀剥离。）
+- SSE 事件类型：`text_delta`、`reasoning_delta`、`tool_call_start`、`tool_result`、`turn_complete`、`agent_call_start`、`agent_call_end`、`context_compacted`、`truncation_retry`、`usage`、`error`、`done`、`looper_state`、`user_steer`。（部分内部 `LooperEvent` 变体如 `ToolCallDelta`、`ModelUsage`、`TurnStart` 被过滤掉，不发送给客户端 —— `ModelOutput` 仅在 `origin: Batch` 时翻译成一次 `text_delta`（batch 无增量，否则前端永远看不到中途输出），`origin: Stream` 时过滤（文本已经过 `TextDelta`）；`StateChange` 只在跨暂停转换时转化为 `looper_state` 布尔事件；`TurnStart` 每轮都会产生，不单独下发，气泡切分由 `user_steer` 或终态事件承担；`TruncationRetry` 的 `discarded_text` 字段同样不下发 —— 它只服务 `chat` 模块落库累加器的后缀剥离。）
 - `truncation_retry` 是**纯通知**，不含撤销语义：重发回退的是 `Session`（staging）而非传输层，前端不删除已收到的增量，只在当前轮气泡**之前**插一条居中横幅解释残句；重载从快照恢复后残句与横幅一并消失。CLI 同路线（打一行提示，保留残句）。`reason` 字段区分两种重发：`truncated`（截断抬预算）与 `transient`（限流/网络/5xx 退避重发），缺省按截断展示以兼容旧后端。
 - 失败轮的 `error` 事件文案由 `format_failure_message` 生成：类型化失败原因（限流/网络/鉴权/额度/上下文/过滤）输出「中文分类前缀 + provider 原始 msg」，分类给结论、原文保留诊断。
 - 子 Agent 调用（`delegate_sub_agent` / `run_parallel_sub_agents`）通过按 tool_call_id 映射的 `SubAgentInfo` 注册表追踪，生成 `agent_call_start`/`agent_call_end` SSE 事件供前端可视化。

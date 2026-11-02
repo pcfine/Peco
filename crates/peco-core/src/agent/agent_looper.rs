@@ -130,9 +130,10 @@ struct ResolvedResponse {
 
 /// 响应来自 batch 还是 stream。
 ///
-/// 两处行为据此区分：usage 记账时机、流被掐断时的瞬时重试。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponseOrigin {
+/// 三处行为据此区分：usage 记账时机、流被掐断时的瞬时重试、
+/// [`LooperEvent::ModelOutput`] 的消费者判断文本是否已经由增量下发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseOrigin {
     Batch,
     Stream,
 }
@@ -560,9 +561,33 @@ pub enum LooperEvent {
     },
     /// 模型调用 token 用量
     ModelUsage {
-        /// Zero-based index of this call within the run
+        /// 本次运行内第几次模型调用（1-based，请求发出前递增）
         call_index: usize,
         usage: Usage,
+    },
+
+    /// 单次模型调用的完整输出（batch 与 stream 都会发出）。
+    ///
+    /// 流式路径的文本已由 [`TextDelta`](LooperEvent::TextDelta) 实时下发，本事件
+    /// 是该次调用的**权威汇总**（含推理与工具调用）；batch 路径没有增量，本事件
+    /// 是这次输出唯一的对外视图。与 [`TurnComplete`](LooperEvent::TurnComplete)
+    /// 的分工：本事件按「每次模型调用」发，后者按「每个用户轮次」发且只带最终文本。
+    ///
+    /// **被重试作废的尝试不发**：`begin_retry` 语义上等价于「这次调用从未发生」。
+    /// 事件一旦发出，`AgentMachine` 只增不减的产出窗口就无法撤回，batch 下更
+    /// 没有 `TextDelta` 残句可解释。非重试的截断/失败仍照发 —— 那是该轮真正
+    /// 留下来的局部产出。
+    ///
+    /// 走非阻塞发送（同 `TextDelta`）：通道满时丢弃属实时视图降级，权威结果仍由
+    /// `TurnComplete` 保证送达。收尾报告（max_iterations 的 epilogue）也经本事件
+    /// 下发，`call_index` 复用触发失败的迭代编号 —— 它是旁路 summarizer 的 batch 产物。
+    ModelOutput {
+        /// 本次运行内第几次模型调用（1-based，与 `ModelUsage` 同口径）
+        call_index: usize,
+        /// 输出来自 batch 还是 stream
+        origin: ResponseOrigin,
+        /// 有序内容块：文本 / 推理 / 工具调用 / 服务端工具
+        output: Vec<ContentBlock>,
     },
 
     // ── 生命周期事件 ──────────────────────────────────────────────────────
@@ -2776,6 +2801,23 @@ impl AgentLooper {
 
     // ── 共享：ResolvingResponse ───────────────────────────────────────────
 
+    /// 发出单次模型调用的完整输出。
+    ///
+    /// **只能在重试决策之后调用**：被 `begin_retry` 作废的尝试不再对外呈现 ——
+    /// batch 下它的文本从未上过屏，`AgentMachine` 的产出窗口又只增不减，发出去
+    /// 就再也收不回来；stream 下残句由 [`TextDelta`](LooperEvent::TextDelta) 承担，
+    /// 汇总事件本就没有额外信息。
+    ///
+    /// 调用方直接移交 `Vec`（不再 clone）：事件是这次调用产出的唯一剩余所有者，
+    /// 为大输出（长思维链/大段正文）省掉一次无谓的深拷贝。
+    fn emit_model_output(&self, origin: ResponseOrigin, output: Vec<ContentBlock>) {
+        self.emit_event(LooperEvent::ModelOutput {
+            call_index: self.react_loop_iteration,
+            origin,
+            output,
+        });
+    }
+
     /// 解析已收敛的模型响应，决定下一步。batch 与 stream 共用。
     async fn resolve_response(&mut self, turn_index: usize) {
         // ★ 回退锚点。必须在 `stage_output_blocks` 之前取 —— 此时 staging
@@ -2883,6 +2925,12 @@ impl AgentLooper {
                 return;
             }
 
+            // 不重试 ⇒ 这次尝试就是终局：局部产出照发（失败轮的部分文本仍是
+            // 该轮真正留下来的可见内容）。
+            let blocks = result.output.len();
+            let block_kinds = block_kinds_of(&result.output);
+            self.emit_model_output(origin, result.output);
+
             let msg = result
                 .error
                 .map(|e| e.message)
@@ -2900,8 +2948,8 @@ impl AgentLooper {
                 status = ?result.status,
                 finish_reason = result.finish_reason.map_or("-", |r| r.as_str()),
                 message = %msg,
-                blocks = result.output.len(),
-                block_kinds = ?block_kinds_of(&result.output),
+                blocks,
+                block_kinds = ?block_kinds,
                 text_len = self.react_ctx.assistant_text.len(),
                 reasoning_len = self.react_ctx.assistant_reasoning.len(),
                 input_tokens = result.usage.input_tokens,
@@ -2929,7 +2977,8 @@ impl AgentLooper {
             return;
         }
 
-        // 提取 tool calls（转 ToolCall）用于决定下一步
+        // 提取 tool calls（转 ToolCall）用于决定下一步；先借用 `output`，
+        // 随后整个输出移交事件（move，不做深拷贝）。
         let tool_calls: Vec<ToolCall> = result
             .output
             .iter()
@@ -2947,6 +2996,10 @@ impl AgentLooper {
             })
             .collect();
 
+        // 走到这里说明本次调用没有被重试作废：batch 的中途视图 / stream 的
+        // 权威汇总照发。
+        self.emit_model_output(origin, result.output);
+
         // 判断下一步
         if !tool_calls.is_empty() {
             self.react_ctx.pending_tool_calls = tool_calls
@@ -2958,8 +3011,9 @@ impl AgentLooper {
                 .collect();
             self.set(LooperState::ExecutingTools);
         } else {
-            // batch 路径不发送 TextDelta（整段文本不是增量），
-            // 统一由 Done 状态中的 TurnComplete 事件提供本轮最终文本。
+            // batch 路径不发送 TextDelta（整段文本不是增量）：本次调用的输出由
+            // `ModelOutput`（重试决策后已发）承载，本轮最终文本仍由 Done 状态的
+            // `TurnComplete` 提供。
             self.set(LooperState::Done);
         }
     }
@@ -3542,15 +3596,21 @@ impl AgentLooper {
             "Turn interrupted; staging frozen into committed history"
         );
 
-        // ★ 收尾报告先于 TurnComplete 下发。它不是流式产物（`generate_full` 一次
-        //   成形），若不在这里补发，用户不刷新页面就看不到 —— 实时视图只认
-        //   `text_delta`，而它会追加到最后一条 assistant 气泡。必达发送：
-        //   丢一条就等于这轮白白多花了一次模型调用。
+        // ★ 收尾报告先于 TurnComplete 下发。它是 `generate_full` 一次成形的 batch
+        //   产物，故以 `ModelOutput { origin: Batch }` 承载 —— 用 `TextDelta` 是伪造
+        //   流式语义（batch 从不产生增量）。实时视图的展示由传输层自行把
+        //   `ModelOutput(Batch)` 翻译成一次增量，looper 不替它撒谎。
+        //
+        //   `call_index` 复用触发失败的迭代编号：收尾是旁路的 summarizer 调用，
+        //   不占 ReAct 循环的调用计数。必达发送 —— 丢一条就等于这轮白白多花了
+        //   一次模型调用。
         if let Some(text) = &plan.epilogue {
             Self::emit_event_guaranteed(
                 &self.event_speaker,
-                LooperEvent::TextDelta {
-                    delta: text.clone(),
+                LooperEvent::ModelOutput {
+                    call_index: self.react_loop_iteration,
+                    origin: ResponseOrigin::Batch,
+                    output: vec![ContentBlock::Text { text: text.clone() }],
                 },
             )
             .await;

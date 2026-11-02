@@ -617,7 +617,7 @@ impl FailureHarness {
 }
 
 /// 撞上 `max_iterations` 时合成收尾报告：成为本轮最后一条 assistant 消息，
-/// 且补发 `TextDelta` 让实时视图（不刷新页面）也能看到。
+/// 且以 `ModelOutput(Batch)` 下发让实时视图（不刷新页面）也能看到。
 #[tokio::test]
 async fn test_max_iterations_composes_epilogue_as_last_message() {
     let mut h = failure_looper_harness_with_epilogue(
@@ -653,14 +653,24 @@ async fn test_max_iterations_composes_epilogue_as_last_message() {
     ));
 
     let mut deltas = Vec::new();
+    let mut outputs = Vec::new();
     while let Ok(ev) = h.events.try_recv() {
-        if let LooperEvent::TextDelta { delta } = ev {
-            deltas.push(delta);
+        match ev {
+            LooperEvent::TextDelta { delta } => deltas.push(delta),
+            LooperEvent::ModelOutput { origin, output, .. } => outputs.push((origin, output)),
+            _ => {}
         }
     }
     assert!(
-        deltas.iter().any(|d| d.contains("本轮已完成")),
-        "收尾是 generate_full 产物，不补发 TextDelta 用户就看不到；现状={deltas:?}"
+        deltas.is_empty(),
+        "batch 收尾不得伪造 TextDelta；现状={deltas:?}"
+    );
+    let epilogue = outputs.iter().find_map(|(origin, output)| {
+        (*origin == ResponseOrigin::Batch).then(|| model_provider::text_of_blocks(output))
+    });
+    assert!(
+        epilogue.is_some_and(|text| text.contains("本轮已完成")),
+        "收尾是 generate_full 产物，必须经 ModelOutput(Batch) 下发；现状={outputs:?}"
     );
 }
 
@@ -1311,6 +1321,80 @@ async fn test_batch_server_tool_emits_events() {
             InputItem::FunctionCall { call_id, .. } if call_id == "srv_1"
         )),
         "服务端工具块不得写入 session 历史"
+    );
+}
+
+/// batch 路径没有 TextDelta，但每次未被重试作废的模型调用都必须以
+/// `ModelOutput` 暴露整段输出。
+#[tokio::test]
+async fn test_batch_emits_model_output() {
+    let mut h = batch_retry_harness(
+        vec![batch_response(
+            "hello",
+            20,
+            ResponseStatus::Completed,
+            Some(FinishReason::Stop),
+        )],
+        LooperConfig::default(),
+    );
+
+    drive_query(&mut h).await;
+
+    let events = h.drain_events();
+    let outputs: Vec<_> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            LooperEvent::ModelOutput {
+                call_index,
+                origin,
+                output,
+            } => Some((*call_index, *origin, output.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 1, "one ModelOutput per model call");
+    let (call_index, origin, output) = &outputs[0];
+    assert_eq!(*call_index, 1, "call_index matches ModelUsage");
+    assert_eq!(*origin, ResponseOrigin::Batch);
+    assert!(
+        matches!(output.as_slice(), [ContentBlock::Text { text }] if text == "hello"),
+        "ModelOutput must carry this call's full text: {output:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, LooperEvent::TextDelta { .. })),
+        "the batch path must not emit TextDelta"
+    );
+}
+
+/// 流式路径同样发 `ModelOutput`，作为已下发增量的权威汇总。
+#[tokio::test]
+async fn test_stream_emits_model_output_summary() {
+    let mut h = retry_harness(vec![completed("hello")], LooperConfig::default());
+
+    drive_query(&mut h).await;
+
+    let events = h.drain_events();
+    let output = events
+        .iter()
+        .find_map(|ev| match ev {
+            LooperEvent::ModelOutput {
+                origin: ResponseOrigin::Stream,
+                output,
+                ..
+            } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the stream path emits ModelOutput");
+    assert!(
+        matches!(output.as_slice(), [ContentBlock::Text { text }] if text == "hello"),
+        "ModelOutput must summarize the streamed blocks: {output:?}"
+    );
+    assert_eq!(
+        streamed_text(&events),
+        "hello",
+        "deltas stay the real-time view; ModelOutput is only the summary"
     );
 }
 
@@ -3801,6 +3885,53 @@ async fn test_batch_truncation_retry_emits_notice() {
     assert!(
         streamed_text(&events).is_empty(),
         "批量路径本就不发 delta，客户端无残句"
+    );
+}
+
+/// 被重试作废的尝试不产生 `ModelOutput`：batch 下它从未上过屏，发出去只会
+/// 让 `AgentMachine` 把残句写进无法回退的产出窗口。
+#[tokio::test]
+async fn test_batch_truncation_retry_skips_discarded_model_output() {
+    let mut h = batch_retry_harness(
+        vec![
+            batch_response(
+                "part",
+                4096,
+                model_provider::ResponseStatus::Incomplete,
+                Some(FinishReason::MaxTokens),
+            ),
+            batch_response(
+                "done",
+                20,
+                model_provider::ResponseStatus::Completed,
+                Some(FinishReason::Stop),
+            ),
+        ],
+        LooperConfig {
+            retry_limit: 1,
+            retry_output_budget: 32_768,
+            ..Default::default()
+        },
+    );
+
+    drive_query(&mut h).await;
+    let events = h.drain_events();
+
+    let outputs: Vec<Vec<ContentBlock>> = events
+        .iter()
+        .filter_map(|ev| match ev {
+            LooperEvent::ModelOutput {
+                origin: ResponseOrigin::Batch,
+                output,
+                ..
+            } => Some(output.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 1, "作废尝试不得发 ModelOutput");
+    assert!(
+        matches!(outputs[0].as_slice(), [ContentBlock::Text { text }] if text == "done"),
+        "只发重试后成功那次的输出"
     );
 }
 

@@ -25,8 +25,8 @@ pub use agent_config::{
     assemble_agent_md, parse_agent_md, resolve_api_key, split_frontmatter,
 };
 pub use agent_looper::{
-    AgentLooper, LooperConfig, LooperEvent, LooperHandle, LooperState, RetryNoticeReason,
-    TurnFailureReason, TurnOutcome, UserMsg,
+    AgentLooper, LooperConfig, LooperEvent, LooperHandle, LooperState, ResponseOrigin,
+    RetryNoticeReason, TurnFailureReason, TurnOutcome, UserMsg,
 };
 pub use agent_manager::AgentManager;
 pub use agent_manager::AgentMeta;

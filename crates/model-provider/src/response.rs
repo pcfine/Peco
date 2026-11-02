@@ -50,6 +50,24 @@ pub enum ContentBlock {
     },
 }
 
+impl ContentBlock {
+    /// 可见正文：仅 `Text` 块有文本，其余内容块返回 `None`。
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// 按块顺序拼接全部可见正文（[`ContentBlock::Text`]），不插入分隔符。
+///
+/// 推理 / 工具调用 / 服务端工具块跳过。展示、落库与任务产出窗口必须共用
+/// 这一口径，否则同一份输出在不同消费者里会出现不一致。
+pub fn text_of_blocks(blocks: &[ContentBlock]) -> String {
+    blocks.iter().filter_map(ContentBlock::as_text).collect()
+}
+
 /// 引擎在请求工具列表中追加以此命名的 `ToolDefinition`，表示启用服务端 web 搜索。
 pub const SERVER_TOOL_WEB_SEARCH: &str = "__server_tool_web_search__";
 
@@ -617,6 +635,25 @@ mod tests {
         ContentBlock::Text {
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn text_of_blocks_concatenates_only_visible_text() {
+        let blocks = vec![
+            ContentBlock::Reasoning {
+                text: "think".to_string(),
+            },
+            text_block("answer"),
+            ContentBlock::ToolCall {
+                call_id: "c1".to_string(),
+                name: "t".to_string(),
+                arguments: "{}".to_string(),
+            },
+            text_block("!"),
+        ];
+        assert_eq!(text_of_blocks(&blocks), "answer!");
+        assert_eq!(blocks[0].as_text(), None);
+        assert_eq!(blocks[1].as_text(), Some("answer"));
     }
 
     #[test]

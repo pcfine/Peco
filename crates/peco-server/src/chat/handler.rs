@@ -14,8 +14,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use futures::stream::Stream;
-use model_provider::{Content, ContentPart, InputItem};
-use peco_core::agent::{AgentLooper, LooperConfig, LooperEvent, strip_summary_wrapper};
+use model_provider::{Content, ContentPart, InputItem, text_of_blocks};
+use peco_core::agent::{
+    AgentLooper, LooperConfig, LooperEvent, ResponseOrigin, strip_summary_wrapper,
+};
 use peco_core::session::Session;
 use peco_core::session::SessionPersister;
 use serde::{Deserialize, Serialize};
@@ -314,6 +316,24 @@ pub async fn get_messages(
     Ok(Json(responses))
 }
 
+/// 用必达的 `TurnComplete` 文本补齐落库累加器。
+///
+/// batch 轮的 `assistant_text` 全部来自可丢弃的 `ModelOutput(Batch)`：事件被
+/// `try_send` 丢掉时，成功轮会写不出 assistant 行。`TurnComplete` 是必达的，
+/// 用它补上最后的整段文本。`saw_text_delta` 为真说明是流式轮、文本已逐块累加
+/// （掉一块后再补整段会让已到达的片段重复），故不补。
+fn backfill_assistant_text(
+    assistant_text: &mut String,
+    saw_text_delta: bool,
+    final_text: Option<&str>,
+) {
+    let Some(text) = final_text else { return };
+    if saw_text_delta || text.is_empty() || assistant_text.ends_with(text) {
+        return;
+    }
+    assistant_text.push_str(text);
+}
+
 // ── SSE Stream Handler ───────────────────────────────────────────────────────
 
 /// `GET /api/chat/:agentId/conversations/:id/stream?message=`
@@ -465,6 +485,8 @@ pub async fn stream_chat(
         .await;
 
         let mut assistant_text = String::new();
+        // 流式轮是否真的收到过增量：决定 TurnComplete 的兜底能否追加整段文本。
+        let mut saw_text_delta = false;
         let mut sub_agent_registry: HashMap<String, Vec<SubAgentInfo>> = HashMap::new();
         // is_first_turn is captured from the outer scope — based on session
         // snapshot committed_turns, NOT reset per SSE connection.
@@ -494,9 +516,34 @@ pub async fn stream_chat(
 
                 event = handle.recv_event() => match event {
                 Some(LooperEvent::TextDelta { delta }) => {
+                    saw_text_delta = true;
                     assistant_text.push_str(&delta);
                     if let Some(sse_ev) =
                         map_looper_event(LooperEvent::TextDelta { delta }, &conv_id_for_bg)
+                        && let Ok(ev) = sse_ev.to_sse_event()
+                        && sse_tx.send(Ok(ev)).await.is_err()
+                    {
+                        break;
+                    }
+                }
+
+                // ── batch 模型输出 ───────────────────────────────────────
+                // 与 TextDelta 共用同一条落库累加器：SSE 展示了、messages 表却是
+                // 空的，是比「不展示」更糟的不一致。
+                Some(LooperEvent::ModelOutput {
+                    call_index,
+                    origin,
+                    output,
+                }) if origin == ResponseOrigin::Batch => {
+                    assistant_text.push_str(&text_of_blocks(&output));
+                    // 文本提取只借用，随后把同一份 `output` 原样交给映射层
+                    // （不 clone、也不需要再解构一次事件）。
+                    let event = LooperEvent::ModelOutput {
+                        call_index,
+                        origin,
+                        output,
+                    };
+                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
                         && let Ok(ev) = sse_ev.to_sse_event()
                         && sse_tx.send(Ok(ev)).await.is_err()
                     {
@@ -601,6 +648,16 @@ pub async fn stream_chat(
                 }
 
                 Some(event @ LooperEvent::TurnComplete { .. }) => {
+                    // batch 轮文本只来自可丢弃的 `ModelOutput(Batch)`：慢客户端
+                    // 把通道塞满时事件会被丢掉。TurnComplete 必达，用它兜底，
+                    // 否则成功轮会写不出 assistant 行。
+                    if let LooperEvent::TurnComplete { outcome, .. } = &event {
+                        backfill_assistant_text(
+                            &mut assistant_text,
+                            saw_text_delta,
+                            outcome.text(),
+                        );
+                    }
                     if !assistant_text.is_empty() {
                         let _ = messages::insert(
                             &db_for_bg,
@@ -633,6 +690,7 @@ pub async fn stream_chat(
                         }
                     }
                     assistant_text.clear();
+                    saw_text_delta = false;
 
                     if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
                         && let Ok(ev) = sse_ev.to_sse_event()
@@ -1008,4 +1066,45 @@ fn conversation_turns_markdown(
         }
     }
     md
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backfill_assistant_text;
+
+    #[test]
+    fn backfills_when_no_delta_was_seen() {
+        let mut acc = String::new();
+        backfill_assistant_text(&mut acc, false, Some("answer"));
+        assert_eq!(acc, "answer");
+    }
+
+    #[test]
+    fn appends_final_text_when_earlier_batch_calls_landed() {
+        let mut acc = "first".to_string();
+        backfill_assistant_text(&mut acc, false, Some("answer"));
+        assert_eq!(acc, "firstanswer");
+    }
+
+    #[test]
+    fn does_not_duplicate_when_final_text_is_already_the_suffix() {
+        let mut acc = "firstanswer".to_string();
+        backfill_assistant_text(&mut acc, false, Some("answer"));
+        assert_eq!(acc, "firstanswer");
+    }
+
+    #[test]
+    fn leaves_streamed_text_untouched() {
+        // 流式轮已逐块累加；掉一块时补整段会让已到达的片段重复。
+        let mut acc = " world".to_string();
+        backfill_assistant_text(&mut acc, true, Some("hello world"));
+        assert_eq!(acc, " world");
+    }
+
+    #[test]
+    fn failed_turns_have_no_final_text() {
+        let mut acc = String::new();
+        backfill_assistant_text(&mut acc, false, None);
+        assert!(acc.is_empty());
+    }
 }
