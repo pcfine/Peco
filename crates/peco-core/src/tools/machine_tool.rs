@@ -60,6 +60,8 @@ const MAX_DECL_TITLE_BYTES: usize = 128;
 const TEXT_OUTPUT_TAG: &str = "text";
 const PROMPT_TAG: &str = "prompt";
 const ORIGIN_LABEL: &str = "run_machine_task";
+/// 标明这次提交没有等待期；同步提交不带该键。
+const ASYNC_LABEL: &str = "async";
 const CANCEL_NOTE: &str = "cancellation requested; poll action=status to confirm";
 /// 终态任务上 `cancel` 什么都没做：`accepted` 恒 `true`，只能靠 `note` 说清。
 const CANCEL_INERT_NOTE: &str = "task is already terminal; cancel has no effect";
@@ -114,7 +116,14 @@ impl RunMachineTask {
                     continue;
                 }
             };
-            let built = build_task(&kind, &task.prompt, task.deadline_secs, &self.user_id);
+            let built = build_task(
+                &kind,
+                &task.prompt,
+                task.deadline_secs,
+                &self.user_id,
+                !wait,
+                ORIGIN_LABEL,
+            );
             match hub.submit(&kind, built).await {
                 Ok(id) => {
                     submitted.push((index, id));
@@ -350,7 +359,17 @@ fn invalid_name_error(raw: &str, err: RuntimeError) -> ToolError {
 }
 
 /// 任务构造的唯一实现点：字段取值即 Hub 与 `AgentMachine` 的入参契约。
-fn build_task(kind: &str, prompt: &str, deadline_secs: Option<u64>, principal: &str) -> Task {
+///
+/// `is_async` 只影响 `labels`：异步提交（`wait=false`）没有等待期，结果只能靠
+/// 台账扫描发现并唤醒提交人，扫描侧需要这个键才能把同步调用排除掉。
+pub(crate) fn build_task(
+    kind: &str,
+    prompt: &str,
+    deadline_secs: Option<u64>,
+    principal: &str,
+    is_async: bool,
+    origin: &str,
+) -> Task {
     Task {
         // Hub 会用自己分配的 id 与 kind 覆盖这两个字段。
         id: TaskId(Uuid::nil()),
@@ -367,7 +386,13 @@ fn build_task(kind: &str, prompt: &str, deadline_secs: Option<u64>, principal: &
             principal: principal.to_string(),
         },
         deadline: deadline_secs.map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64)),
-        labels: BTreeMap::from([("origin".to_string(), ORIGIN_LABEL.to_string())]),
+        labels: {
+            let mut labels = BTreeMap::from([("origin".to_string(), origin.to_string())]);
+            if is_async {
+                labels.insert(ASYNC_LABEL.to_string(), "true".to_string());
+            }
+            labels
+        },
         created_at: Utc::now(),
     }
 }
@@ -486,6 +511,20 @@ fn inspect_hub_error(id: TaskId, err: MachineError) -> ToolError {
 /// `status` 与 `run` 共用同一份额度：声明块先占，正文只拿剩下的；正文超预算时
 /// 先剥 `task.artifacts`（与声明块重复）。`status` 没有 `prompt` 回显可剥。
 fn render_status(snapshot: &TaskSnapshot) -> String {
+    render_status_with(snapshot, "status", None)
+}
+
+/// 供跨空间 `inspect_workspace_task` 复用同一份额度与裁剪逻辑。
+pub(crate) fn render_task_status(snapshot: &TaskSnapshot) -> String {
+    render_status(snapshot)
+}
+
+/// `await` 与 `status` 同形状，只多一个 `timed_out`。
+pub(crate) fn render_task_await(snapshot: &TaskSnapshot, timed_out: bool) -> String {
+    render_status_with(snapshot, "await", Some(timed_out))
+}
+
+fn render_status_with(snapshot: &TaskSnapshot, action: &str, timed_out: Option<bool>) -> String {
     let report = TaskReport::new(snapshot);
     let (decls, artifacts_truncated) = collect_declarations([report.artifacts.as_slice()]);
     let body_budget = remaining_body_budget(&decls);
@@ -500,25 +539,33 @@ fn render_status(snapshot: &TaskSnapshot) -> String {
         &decls,
         body_budget,
         &mut rows,
-        |rows| status_body(rows, artifacts_truncated),
+        |rows| status_body(rows, action, timed_out, artifacts_truncated),
         &[reclaim_artifacts],
     )
 }
 
-fn status_body(rows: &[Value], artifacts_truncated: bool) -> Value {
+fn status_body(
+    rows: &[Value],
+    action: &str,
+    timed_out: Option<bool>,
+    artifacts_truncated: bool,
+) -> Value {
     let mut fields = Map::new();
-    fields.insert("action".to_string(), json!("status"));
+    fields.insert("action".to_string(), json!(action));
     fields.insert("found".to_string(), json!(true));
     fields.insert(
         "task".to_string(),
         rows.first().cloned().unwrap_or(Value::Null),
     );
+    if let Some(timed_out) = timed_out {
+        fields.insert("timed_out".to_string(), json!(timed_out));
+    }
     insert_artifacts_truncated(&mut fields, artifacts_truncated);
     Value::Object(fields)
 }
 
 /// `accepted` 恒 `true`（请求本身就是成功的），所以「什么都没做」只能由 `note` 表达。
-fn render_cancel(task_id: TaskId, state: TaskState) -> String {
+pub(crate) fn render_cancel(task_id: TaskId, state: TaskState) -> String {
     let note = if state.is_terminal() {
         CANCEL_INERT_NOTE
     } else {
@@ -2382,7 +2429,14 @@ mod tests {
 
     #[test]
     fn build_task_maps_the_submission_contract() {
-        let task = build_task("agent:worker", "do it", Some(30), "user-7");
+        let task = build_task(
+            "agent:worker",
+            "do it",
+            Some(30),
+            "user-7",
+            false,
+            ORIGIN_LABEL,
+        );
 
         assert_eq!(task.input.tag, "prompt");
         assert_eq!(task.input.payload, json!("do it"));
@@ -2406,10 +2460,85 @@ mod tests {
 
         // 省略 deadline 时不写墙钟上界：父回合的退出边界只由 timeout_secs 决定。
         assert!(
-            build_task("agent:worker", "p", None, "u")
+            build_task("agent:worker", "p", None, "u", false, ORIGIN_LABEL)
                 .deadline
                 .is_none()
         );
+    }
+
+    /// 同步提交（默认 `wait=true`）不得带 `async` 键：台账扫描会把带键的任务
+    /// 当成待唤醒项，同步调用当轮已拿到结果，补记只会造成冗余轮次。
+    #[test]
+    fn only_async_submissions_are_labelled() {
+        let sync_task = build_task("agent:worker", "p", None, "u", false, ORIGIN_LABEL);
+        assert_eq!(
+            sync_task.labels.get("origin").map(String::as_str),
+            Some("run_machine_task"),
+            "the origin label must not change"
+        );
+        assert!(
+            !sync_task.labels.contains_key("async"),
+            "a waited submission carries no async key: {:?}",
+            sync_task.labels
+        );
+
+        let async_task = build_task("agent:worker", "p", None, "u", true, ORIGIN_LABEL);
+        assert_eq!(
+            async_task.labels.get("async").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(async_task.labels.len(), 2, "async 是唯一新增的 label");
+    }
+
+    /// 端到端：`wait=false` 落进 Hub 的任务带 `async` 键，`wait=true` 的不带 ——
+    /// label 是扫描侧的判据，只在 build_task 上加对还不够，必须真的出现在快照里。
+    #[tokio::test]
+    async fn the_async_label_reaches_the_hub() {
+        within_budget(async {
+            let runtime = test_runtime();
+            let hub = runtime
+                .hub()
+                .expect("the hub is available inside a runtime");
+
+            let async_tool = runner(&[("worker", scripted_agent_named("bg"))], &runtime);
+            let (value, _) = run_json(
+                &async_tool,
+                json!({
+                    "tasks": [{ "agent_name": "worker", "prompt": "p" }],
+                    "wait": false
+                }),
+            )
+            .await;
+            let async_id = task_id_of(&value["results"][0]["task_id"]);
+            let async_labels = hub
+                .snapshot(&async_id)
+                .await
+                .expect("the submitted task is observable")
+                .labels;
+            assert_eq!(
+                async_labels.get("async").map(String::as_str),
+                Some("true"),
+                "wait=false must label the task as async: {async_labels:?}"
+            );
+
+            let sync_tool = runner(&[("worker", scripted_agent_named("done"))], &runtime);
+            let (value, _) = run_json(
+                &sync_tool,
+                json!({ "tasks": [{ "agent_name": "worker", "prompt": "p" }] }),
+            )
+            .await;
+            let sync_id = task_id_of(&value["results"][0]["task_id"]);
+            let sync_labels = hub
+                .snapshot(&sync_id)
+                .await
+                .expect("the waited task is observable")
+                .labels;
+            assert!(
+                !sync_labels.contains_key("async"),
+                "wait=true must not label the task as async: {sync_labels:?}"
+            );
+        })
+        .await;
     }
 
     #[test]

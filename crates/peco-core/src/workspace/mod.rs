@@ -16,6 +16,7 @@
 
 mod error;
 pub mod hash;
+pub mod manifest;
 pub mod workdir;
 
 #[allow(clippy::module_inception)]
@@ -27,5 +28,8 @@ pub use crate::tools::{
 };
 pub use crate::workflow::WorkflowAccess;
 pub use error::WorkspaceError;
+pub use manifest::{
+    MANIFEST_FILE, MANIFEST_FORMAT, MANIFEST_SCHEMA, ManifestError, WorkspaceManifest,
+};
 pub use workdir::WorkDir;
 pub use workspace::{TemplateInitReport, WorkSpace};

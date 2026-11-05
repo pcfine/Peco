@@ -18,6 +18,7 @@ mod tool_factory;
 mod tool_register;
 mod web_search;
 mod workspace_info;
+mod workspace_tools;
 
 pub use agent_tools::{DeleteAgent, ReadAgent, SaveAgent};
 pub use command_screen::screen_command;
@@ -47,6 +48,11 @@ pub use tool_factory::{DefaultToolsExecutor, StringError};
 pub use tool_register::ToolRegister;
 pub use web_search::WebSearchTool;
 pub use workspace_info::ShowWorkspace;
+pub use workspace_tools::{
+    CreateWorkspace, DispatchReceipt, DispatchToWorkspace, InspectWorkspaceTask, OpenRequest,
+    OpenWorkspace, WorkspaceHandle, WorkspaceHub, WorkspaceInfo, WorkspaceOpenError,
+    WorkspaceOpener, WorkspaceToolError, install_workspace_hub, workspace_hub,
+};
 
 use async_trait::async_trait;
 use std::future::Future;

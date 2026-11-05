@@ -398,7 +398,6 @@ search_kb() 混合检索（语义 + 关键词 + 图谱 + RRF 融合）
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥 | — |
-| `PECO_SKILLS_ROOT` | Skill 根目录 | `./skills/` |
 | `PECO_KB_ROOT` | 知识库根目录 | `~/.peco/knowledge_bases/` |
 | `PECO_CONVERSATIONS_DIR` | 会话持久化目录 | `~/.peco/conversations/` |
 | `RUST_LOG` | 日志过滤级别 | `warn` |

@@ -89,6 +89,23 @@ impl MachineRuntime {
         F: FnOnce() -> Result<Arc<Agent>, AgentError>,
     {
         let name = validate_agent_name(agent_name)?;
+        self.ensure_machine_named(name, load)
+    }
+
+    /// 与 [`ensure_machine`](Self::ensure_machine) 相同，但 `name` 视为内部可信值，
+    /// 不做工具入参的字符集校验。
+    ///
+    /// 只供 crate 内部按保留名（如 `@master`）注册使用：`@` 不在
+    /// [`validate_agent_name`] 的允许字符集里，而放宽字符集会让
+    /// `run_machine_task` 的外部入参也接受它们。
+    pub(crate) fn ensure_machine_named<F>(
+        &self,
+        name: &str,
+        load: F,
+    ) -> Result<String, RuntimeError>
+    where
+        F: FnOnce() -> Result<Arc<Agent>, AgentError>,
+    {
         let kind = Self::kind_for(name);
         // Hub 先于加载：没有 runtime 时不该白读一次 agent.md 与工具装配。
         let hub = self.hub()?;
@@ -146,7 +163,7 @@ fn register_error(kind: &str, err: MachineError) -> RuntimeError {
 ///
 /// 字符集收紧到 `[A-Za-z0-9_-]` 后，结构上排除了 `/`、`\`、`.`、`..`、空格与 `:` ——
 /// 唯一消费点是 `agents_dir.join(name).join("agent.md")`。
-pub(crate) fn validate_agent_name(raw: &str) -> Result<&str, RuntimeError> {
+pub fn validate_agent_name(raw: &str) -> Result<&str, RuntimeError> {
     let name = raw.trim();
     let reason = if name.is_empty() {
         Some("must not be empty")

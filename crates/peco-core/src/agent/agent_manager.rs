@@ -141,6 +141,11 @@ impl AgentManager {
         &self.work_dir
     }
 
+    /// 任务 Hub 归属者。只给弱引用：强引用的唯一持有者是本管理器。
+    pub(crate) fn machine_runtime(&self) -> std::sync::Weak<MachineRuntime> {
+        Arc::downgrade(&self.machine_runtime)
+    }
+
     /// 注入 Workflow 依赖（由 WorkSpace 在初始化时调用）。
     pub fn set_workflow_access(&self, wa: Arc<dyn WorkflowAccess>) {
         *self.workflow_access.write().unwrap() = Some(wa);
@@ -309,6 +314,7 @@ impl AgentManager {
             web_search: self.web_search.read().unwrap().clone(),
             memory_audit: self.memory_audit.read().unwrap().clone(),
             machine_runtime: Some(Arc::downgrade(&self.machine_runtime)),
+            workspace_hub: Some(Arc::downgrade(&crate::tools::workspace_hub())),
         }
     }
 
@@ -354,6 +360,7 @@ impl AgentManager {
             web_search: self.web_search.read().unwrap().clone(),
             memory_audit,
             machine_runtime: Some(Arc::downgrade(&self.machine_runtime)),
+            workspace_hub: Some(Arc::downgrade(&crate::tools::workspace_hub())),
         }
     }
 
@@ -687,6 +694,8 @@ impl AgentAccess for AmAgentAccess {
             memory_audit: self.memory_audit.clone(),
             // 子 agent 一律拿不到 runtime：否则 machine 加载出的 agent 能再开扇出通道。
             machine_runtime: None,
+            // 跨空间编排只属于顶层总管：子 agent 拿不到注入面，模板里写了也只是 skip。
+            workspace_hub: None,
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;
@@ -801,6 +810,36 @@ mod tests {
     use crate::tools::{MemoryAuditEntry, NoopMemoryAudit};
     use std::collections::HashMap;
 
+    /// 带一个可用 provider 的管理器：加载 agent.md 需要能构造 provider。
+    fn manager_with_provider(root: &Path) -> Arc<AgentManager> {
+        let user_config = UserConfig {
+            providers: ProvidersConfig {
+                default_provider: "deepseek".into(),
+                providers: HashMap::from([(
+                    "deepseek".to_string(),
+                    crate::config::ProviderEntry {
+                        provider_type: "deepseek".into(),
+                        api_key: Some("sk-test".into()),
+                        base_url: None,
+                        api: None,
+                        default: None,
+                    },
+                )]),
+                web_search: None,
+            },
+            mcp: McpConfig::empty(),
+        };
+        Arc::new(AgentManager::new(
+            root.join("agents"),
+            "test-user".into(),
+            user_config,
+            McpConfigStore::new(McpConfig::empty()),
+            Arc::new(SkillRegister::new(root.join("skills")).expect("skill register")),
+            Arc::new(KnowledgeManager::new(root.join("knowledge"))),
+            WorkDir::new(root.join("work")),
+        ))
+    }
+
     fn test_agent_manager(root: &Path) -> Arc<AgentManager> {
         let user_config = UserConfig {
             providers: ProvidersConfig {
@@ -864,6 +903,56 @@ mod tests {
         assert!(
             std::sync::Weak::ptr_eq(&cached, &direct),
             "both paths must point at the same runtime"
+        );
+    }
+
+    /// 跨空间能力只到顶层：两条顶层构建路径都持活的 `Weak<WorkspaceHub>`，
+    /// 而 `AmAgentAccess::load_agent` 再往下一层时置 None —— 子 agent 即便在
+    /// agent.md 里写了跨空间工具也只会被 warn + skip。
+    #[test]
+    fn top_level_deps_carry_workspace_hub_but_sub_agents_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = manager_with_provider(tmp.path());
+
+        let sub_dir = tmp.path().join("agents/sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(
+            sub_dir.join("agent.md"),
+            "---\nagent:\n  name: \"sub\"\n  description: \"d\"\nllm:\n  provider: \"deepseek\"\n  model: \"m\"\ntools:\n  - create_workspace\n  - open_workspace\n  - dispatch_to_workspace\n---\n# sub\n",
+        )
+        .unwrap();
+
+        // 两条顶层构建路径都拿到进程级 Hub。
+        let cached = am
+            .build_deps()
+            .workspace_hub
+            .expect("build_deps must inject the hub");
+        assert!(cached.upgrade().is_some());
+        let direct = am
+            .build_deps_direct()
+            .workspace_hub
+            .expect("build_deps_direct must inject the hub");
+        assert!(direct.upgrade().is_some());
+        assert!(
+            std::sync::Weak::ptr_eq(&cached, &direct),
+            "both paths must point at the same process hub"
+        );
+
+        // 第二层（子 agent）：两个工具都被跳过。
+        let sub = am
+            .build_deps_direct()
+            .agent_access
+            .load_agent("sub")
+            .expect("the sub agent must load");
+        let names: Vec<String> = sub
+            .tool_executor()
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(
+            names.is_empty(),
+            "a sub agent must not see the cross-workspace tools, got {names:?}"
         );
     }
 

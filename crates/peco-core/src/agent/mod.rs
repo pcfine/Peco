@@ -41,6 +41,9 @@ pub use context::{
 };
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;
-pub use hooks::{HookAction, LooperHook, TokenBudgetHook, ToolAllowlistHook, ToolHookAction};
+pub use hooks::{
+    DispatchObservation, DispatchOrigin, DispatchWatchHook, HookAction, LooperHook,
+    TaskObservationSink, TokenBudgetHook, ToolAllowlistHook, ToolHookAction,
+};
 pub use simple_looper::{SimpleAgentLooper, SimpleLooperHandle, SimpleLooperOutput};
 pub use stream::{ModelStream, ModelStreamEvent};

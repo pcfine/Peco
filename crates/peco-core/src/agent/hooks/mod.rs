@@ -5,7 +5,12 @@
 // Hook 在 looper 的 async context 中按注册顺序依次调用。
 // 第一个返回非 Continue 的 hook 会短路后续 hook 的执行。
 
+pub mod dispatch_watch;
 pub mod metrics;
+
+pub use dispatch_watch::{
+    DispatchObservation, DispatchOrigin, DispatchWatchHook, TaskObservationSink,
+};
 
 use std::collections::HashSet;
 use std::sync::Arc;

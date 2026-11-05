@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
+use super::workspace_tools::WorkspaceHub;
 use crate::agent::{Agent, AgentError};
 use crate::config::{McpServerConfig, TransportType};
 use crate::knowledge::KnowledgeManager;
@@ -204,6 +205,12 @@ pub struct ToolDependencies {
     /// `Hub → AgentMachine → Agent → ToolExecutor → 工具 → runtime`，
     /// 使 Hub 的后台扫描任务随工作空间一起永不退出。
     pub machine_runtime: Option<Weak<MachineRuntime>>,
+    /// 跨空间工作空间能力。Optional — None 时 `create_workspace` / `open_workspace` /
+    /// `dispatch_to_workspace` 都被 warn + skip。
+    ///
+    /// 只持弱引用：Hub 强持有已打开的 `WorkSpace`，后者经 AgentManager 指回
+    /// Agent 与工具；强引用会闭合 `Hub → WorkSpace → Agent → 工具 → Hub`。
+    pub workspace_hub: Option<Weak<WorkspaceHub>>,
 }
 
 impl Clone for ToolDependencies {
@@ -221,6 +228,7 @@ impl Clone for ToolDependencies {
             web_search: self.web_search.clone(),
             memory_audit: self.memory_audit.clone(),
             machine_runtime: self.machine_runtime.clone(),
+            workspace_hub: self.workspace_hub.clone(),
         }
     }
 }

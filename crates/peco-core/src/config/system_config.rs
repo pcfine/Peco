@@ -6,15 +6,16 @@
 // 不包含任何用户数据（api_key 为空）。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use super::mcp_config::McpConfig;
 use super::types::{LlmApiParams, ProviderEntry, ProvidersConfig};
 
 /// 系统级配置 — 进程生命周期内不变，所有 WorkSpace 共享。
 ///
-/// 包含 providers.toml 的基础配置（api_key 为空）、MCP 服务器注册表、
-/// skills 根目录和知识库根目录。
+/// 只承载「用户 workspace 未覆盖时的兜底」：providers.toml 的基础配置
+/// （api_key 为空）与 MCP 服务器注册表。workspace 内的目录布局
+/// （skills/knowledge/agents/workflows）由 `WorkSpace::open` 从 root 推导，
+/// 不属于系统配置。
 #[derive(Debug, Clone)]
 pub struct SystemConfig {
     /// 系统 providers.toml 的基础配置（base_url, provider_type）。
@@ -22,10 +23,6 @@ pub struct SystemConfig {
     pub providers: ProvidersConfig,
     /// 系统级 MCP 服务器注册表（用户未配置时的兜底）。
     pub mcp: McpConfig,
-    /// 系统 skills 根目录。
-    pub skills_root: PathBuf,
-    /// 知识库根目录。
-    pub knowledge_dir: PathBuf,
 }
 
 impl SystemConfig {
@@ -34,8 +31,6 @@ impl SystemConfig {
     /// 加载：
     /// - `~/.config/peco/providers.toml`（或 `PECO_PROVIDERS_CONFIG` 环境变量）
     /// - `~/.config/peco/mcpconfig.json`（或 `PECO_MCP_CONFIG` 环境变量）
-    /// - skills 根目录（`PECO_SKILLS_ROOT` 或 `./skills`）
-    /// - knowledge 目录（默认 `~/.peco/knowledge`）
     pub fn load() -> Self {
         let providers = super::loader::load_config(None).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "Failed to load providers.toml, using built-in fallback");
@@ -68,36 +63,6 @@ impl SystemConfig {
             McpConfig::empty()
         });
 
-        let skills_root = resolve_skills_root();
-        let knowledge_dir = resolve_knowledge_dir();
-
-        Self {
-            providers,
-            mcp,
-            skills_root,
-            knowledge_dir,
-        }
+        Self { providers, mcp }
     }
-}
-
-/// 解析 skills 根目录路径。
-fn resolve_skills_root() -> PathBuf {
-    std::env::var("PECO_SKILLS_ROOT")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./skills"))
-}
-
-/// 解析 knowledge 根目录路径。
-fn resolve_knowledge_dir() -> PathBuf {
-    std::env::var("PECO_KNOWLEDGE_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".peco")
-                .join("knowledge")
-        })
 }

@@ -18,7 +18,7 @@ pub use model::{
     Artifact, ArtifactId, OutputView, Progress, TaggedJson, Task, TaskContext, TaskError,
     TaskFilter, TaskId, TaskOutcome, TaskSnapshot, TaskSource,
 };
-pub use runtime::MachineRuntime;
+pub use runtime::{MachineRuntime, validate_agent_name};
 pub use sink::{SinkError, TaskSink};
 pub use state::{ObsEvent, OutputChunk, TaskState, Update, UpdateBody, UpdateOrigin};
 pub use store::{InMemoryStore, StoreError, TaskStore};

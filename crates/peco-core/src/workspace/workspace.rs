@@ -197,11 +197,20 @@ impl WorkSpace {
     pub fn set_memory_audit(&self, ma: Arc<dyn MemoryAuditAccess>) {
         self.agent_manager.set_memory_audit(ma);
     }
+
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
     }
     pub fn agent_manager(&self) -> &Arc<AgentManager> {
         &self.agent_manager
+    }
+
+    /// 本 workspace 的任务 Hub 归属者。只持弱引用，强引用在 `AgentManager` 上。
+    ///
+    /// 公开面：宿主的 [`WorkspaceHandle`](crate::tools::WorkspaceHandle) 实现
+    /// （daemon 的 `DaemonHandle`）需要它转发 `machine_runtime()`。
+    pub fn machine_runtime(&self) -> std::sync::Weak<crate::machine::MachineRuntime> {
+        self.agent_manager.machine_runtime()
     }
 
     /// 本 workspace 必备的总管 Agent
@@ -716,7 +725,7 @@ mod tests {
     }
 
     /// 构造最小系统配置（所有测试共用）。
-    fn system_config(root: &std::path::Path) -> SystemConfig {
+    fn system_config() -> SystemConfig {
         SystemConfig {
             providers: ProvidersConfig {
                 default_provider: "deepseek".into(),
@@ -727,8 +736,6 @@ mod tests {
                 mcp_servers: HashMap::new(),
                 extra: HashMap::new(),
             },
-            skills_root: root.join("skills"),
-            knowledge_dir: root.join("knowledge"),
         }
     }
 
@@ -736,7 +743,7 @@ mod tests {
         WorkSpace::open(
             root.join("workspace"),
             "test-user".into(),
-            &system_config(root),
+            &system_config(),
             WorkDir::new(root.join("work")),
         )
         .unwrap()
@@ -748,8 +755,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspaces").join("u1");
         let dir = WorkDir::new(tmp.path().join("work/u1"));
-        let ws =
-            WorkSpace::open(root, "u1".into(), &system_config(tmp.path()), dir.clone()).unwrap();
+        let ws = WorkSpace::open(root, "u1".into(), &system_config(), dir.clone()).unwrap();
 
         assert_eq!(ws.work_dir(), &dir);
         assert!(dir.root().is_dir(), "work root should be created");
@@ -763,8 +769,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspaces").join("u1");
         let dir = WorkDir::new(tmp.path().join("work/u1"));
-        let ws =
-            WorkSpace::open(root, "u1".into(), &system_config(tmp.path()), dir.clone()).unwrap();
+        let ws = WorkSpace::open(root, "u1".into(), &system_config(), dir.clone()).unwrap();
         let dir = ws.work_dir();
 
         assert_eq!(

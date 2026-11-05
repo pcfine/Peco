@@ -11,13 +11,14 @@ use model_provider::ToolDefinition;
 use serde_json::json;
 
 use crate::tools::{
-    AddFactsToKnowledgeBase, AddToKnowledgeBase, Content, DefaultToolsExecutor, DelegateSubAgent,
-    DeleteAgent, DeleteEntity, DeleteEntityFact, DeleteEntityFacts, DeleteKbDocument,
-    DeleteKbDocuments, DeleteMcpServer, DeleteSkill, Fetch, GetKnowledgeBaseDocs,
-    InspectMachineTask, ListKnowledgeBases, ListMcpServers, ListSkills, QueryEntityFacts,
-    ReadAgent, ReadSkill, RunMachineTask, RunParallelSubAgents, SaveAgent, SaveMcpServer,
-    SaveSkill, SearchKnowledge, ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection,
-    ToolDyn, ToolError, ToolExecutor, WebSearchTool,
+    AddFactsToKnowledgeBase, AddToKnowledgeBase, Content, CreateWorkspace, DefaultToolsExecutor,
+    DelegateSubAgent, DeleteAgent, DeleteEntity, DeleteEntityFact, DeleteEntityFacts,
+    DeleteKbDocument, DeleteKbDocuments, DeleteMcpServer, DeleteSkill, DispatchToWorkspace, Fetch,
+    GetKnowledgeBaseDocs, InspectMachineTask, InspectWorkspaceTask, ListKnowledgeBases,
+    ListMcpServers, ListSkills, OpenWorkspace, QueryEntityFacts, ReadAgent, ReadSkill,
+    RunMachineTask, RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge,
+    ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError,
+    ToolExecutor, WebSearchTool, WorkspaceHub,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -63,10 +64,13 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "delete_entity_facts",
     "delete_entity",
     "web_search",
+    "create_workspace",
+    "open_workspace",
+    "dispatch_to_workspace",
+    "inspect_workspace_task",
 ];
 
-/// 可选依赖（workflow_access / mcp_access）缺失时跳过该工具 —
-/// 与未知工具名一致采用 warn + skip，而非 panic。
+/// 可选依赖缺失时跳过该工具 — 与未知工具名一致采用 warn + skip，而非 panic。
 fn skip_missing_dep(tool: &str, dep: &str) -> Option<Box<dyn ToolDyn>> {
     tracing::warn!(
         tool,
@@ -74,6 +78,11 @@ fn skip_missing_dep(tool: &str, dep: &str) -> Option<Box<dyn ToolDyn>> {
         "Dependency not available in ToolDependencies, skipping tool"
     );
     None
+}
+
+/// 升级 workspace hub 的弱引用；没有注入或已释放时返回 `None`。
+fn workspace_hub(deps: &ToolDependencies) -> Option<Arc<WorkspaceHub>> {
+    deps.workspace_hub.as_ref().and_then(|weak| weak.upgrade())
 }
 
 /// 工具组装器 — 根据 tool_names 和依赖集合构建 ToolExecutor。
@@ -151,6 +160,24 @@ impl ToolRegister {
                         None => skip_missing_dep("inspect_machine_task", "machine_runtime"),
                     }
                 }
+
+                // ── 跨空间编排（workspace_hub 缺失时 warn + skip）──
+                "create_workspace" => match workspace_hub(deps) {
+                    Some(hub) => Some(Box::new(CreateWorkspace::new(Arc::downgrade(&hub)))),
+                    None => skip_missing_dep("create_workspace", "workspace hub"),
+                },
+                "open_workspace" => match workspace_hub(deps) {
+                    Some(hub) => Some(Box::new(OpenWorkspace::new(Arc::downgrade(&hub)))),
+                    None => skip_missing_dep("open_workspace", "workspace hub"),
+                },
+                "dispatch_to_workspace" => match workspace_hub(deps) {
+                    Some(hub) => Some(Box::new(DispatchToWorkspace::new(Arc::downgrade(&hub)))),
+                    None => skip_missing_dep("dispatch_to_workspace", "workspace hub"),
+                },
+                "inspect_workspace_task" => match workspace_hub(deps) {
+                    Some(hub) => Some(Box::new(InspectWorkspaceTask::new(Arc::downgrade(&hub)))),
+                    None => skip_missing_dep("inspect_workspace_task", "workspace hub"),
+                },
 
                 "save_agent" => Some(Box::new(SaveAgent::new(deps.agent_access.clone()))),
                 "read_agent" => Some(Box::new(ReadAgent::new(deps.agent_access.clone()))),
@@ -471,6 +498,7 @@ mod tests {
             // fail-closed 默认：审计存储未注入，删除工具运行时拒绝
             memory_audit: None,
             machine_runtime: None,
+            workspace_hub: None,
         }
     }
 
@@ -482,6 +510,12 @@ mod tests {
         Arc::clone(RUNTIME.get_or_init(|| Arc::new(crate::machine::MachineRuntime::new())))
     }
 
+    /// 与 runtime 同理：工具只持 `Weak<WorkspaceHub>`，强引用必须活到进程结束。
+    fn shared_workspace_hub() -> Arc<WorkspaceHub> {
+        static HUB: std::sync::OnceLock<Arc<WorkspaceHub>> = std::sync::OnceLock::new();
+        Arc::clone(HUB.get_or_init(|| Arc::new(WorkspaceHub::new())))
+    }
+
     fn full_deps() -> ToolDependencies {
         let mut deps = base_deps();
         deps.workflow_access = Some(Arc::new(StubWorkflowAccess));
@@ -490,6 +524,7 @@ mod tests {
             SearxngClient::new("http://localhost:8888").expect("client"),
         )));
         deps.machine_runtime = Some(Arc::downgrade(&shared_machine_runtime()));
+        deps.workspace_hub = Some(Arc::downgrade(&shared_workspace_hub()));
         deps
     }
 
@@ -544,6 +579,10 @@ mod tests {
             "web_search",
             "run_machine_task",
             "inspect_machine_task",
+            "create_workspace",
+            "open_workspace",
+            "dispatch_to_workspace",
+            "inspect_workspace_task",
         ] {
             assert!(
                 !names.contains(&name.to_string()),
@@ -558,6 +597,37 @@ mod tests {
         assert!(names.contains(&"delete_entity_fact".to_string()));
         assert!(names.contains(&"delete_entity_facts".to_string()));
         assert!(names.contains(&"delete_entity".to_string()));
+    }
+
+    /// 跨空间工具与 web_search / machine 工具同档：依赖缺失时 warn + skip
+    /// （不 panic），依赖就绪时各注册恰好一个。
+    #[test]
+    fn workspace_tools_follow_optional_dep_semantics() {
+        let names = [
+            "create_workspace",
+            "open_workspace",
+            "dispatch_to_workspace",
+            "inspect_workspace_task",
+        ];
+
+        let without = base_deps();
+        for name in names {
+            let executor = ToolRegister::build(&[name.to_string()], &without);
+            assert!(
+                definition_names(executor.as_ref()).is_empty(),
+                "tool '{name}' must be skipped without its optional dependency"
+            );
+        }
+
+        let with = full_deps();
+        for name in names {
+            let executor = ToolRegister::build(&[name.to_string()], &with);
+            assert_eq!(
+                definition_names(executor.as_ref()),
+                vec![name.to_string()],
+                "tool '{name}' must register exactly once when its dependency is injected"
+            );
+        }
     }
 
     /// 注入 NoopMemoryAudit（测试中显式放行删除的方式）不改变任何工具的
