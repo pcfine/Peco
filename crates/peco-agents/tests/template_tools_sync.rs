@@ -107,6 +107,14 @@ fn all_template_agents() -> Vec<PathBuf> {
 const GRAPH_DELETE_TOOLS: [&str; 3] =
     ["delete_entity_fact", "delete_entity_facts", "delete_entity"];
 
+/// 模板 agent 的完整清单（相对 `templates/`）：增删模板必须同时改这里，
+/// 否则下面的清单比对变红 —— 清单本身就是规格。
+const EXPECTED_TEMPLATE_AGENTS: &[&str] = &[
+    "peco/agents/@master/agent.md",
+    "peco/agents/@memory/agent.md",
+    "team_default/agents/@master/agent.md",
+];
+
 /// 模板 tools 中的每个名字必须逐字存在于 BUILTIN_TOOL_NAMES（无拼写漂移）。
 #[test]
 fn template_tools_exist_in_builtin_registry() {
@@ -117,7 +125,6 @@ fn template_tools_exist_in_builtin_registry() {
         builtin.len()
     );
 
-    let mut checked = 0;
     for md in all_template_agents() {
         let tools = frontmatter_tools(&md);
         assert!(
@@ -133,11 +140,36 @@ fn template_tools_exist_in_builtin_registry() {
                 tool
             );
         }
-        checked += 1;
     }
-    assert!(
-        checked == 2,
-        "expected the peco template's agent.md files (master + memory), got {checked}"
+}
+
+/// 模板集合必须与声明清单逐项相等：比「数量恰好 N」多一层身份校验，
+/// 少了模板、多了模板、目录改名都能定位到具体路径。
+#[test]
+fn template_agents_match_declared_inventory() {
+    let templates = repo_root().join("crates/peco-agents/templates");
+    let mut actual: Vec<String> = all_template_agents()
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&templates)
+                .unwrap_or_else(|_| panic!("{} is not under {}", p.display(), templates.display()))
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    actual.sort();
+
+    let mut expected: Vec<String> = EXPECTED_TEMPLATE_AGENTS
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    expected.sort();
+
+    let missing: Vec<&String> = expected.iter().filter(|p| !actual.contains(p)).collect();
+    let extra: Vec<&String> = actual.iter().filter(|p| !expected.contains(p)).collect();
+    assert_eq!(
+        actual, expected,
+        "模板 agent 清单漂移：缺失 {missing:?}，多余 {extra:?}"
     );
 }
 
@@ -208,5 +240,95 @@ fn template_agents_declare_explicit_max_tokens() {
                 md.display()
             ),
         }
+    }
+}
+
+/// 读取 frontmatter 顶层的 `template_version`。
+fn frontmatter_template_version(path: &Path) -> u32 {
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let mut lines = content.lines();
+    assert_eq!(
+        lines.next().map(str::trim_end),
+        Some("---"),
+        "{} must open with frontmatter ---",
+        path.display()
+    );
+
+    for line in lines {
+        if line.trim_end() == "---" {
+            break; // frontmatter 结束
+        }
+        if let Some(value) = line.strip_prefix("template_version:") {
+            return value.trim().parse().unwrap_or_else(|e| {
+                panic!("{} 的 template_version 不是整数: {e}", path.display())
+            });
+        }
+    }
+    panic!(
+        "{} 缺少 template_version —— 无版本号的文件在模板更新时永远不会被覆盖",
+        path.display()
+    );
+}
+
+/// Peco 独占的机器与跨空间工具 —— 也是「Peco 模板」与「团队模板」的能力分界线。
+const PECO_ONLY_TOOLS: [&str; 6] = [
+    "run_machine_task",
+    "inspect_machine_task",
+    "create_workspace",
+    "open_workspace",
+    "dispatch_to_workspace",
+    "inspect_workspace_task",
+];
+
+/// Peco 模板给 @master 的机器与跨空间工具必须同时满足「版本已 bump + 工具已声明」。
+///
+/// 版本闸门是老目录的唯一升级入口：`template_version` 不涨，`init_from_template`
+/// 会 skip 整个文件，工具只装进全新工作空间。工具按 `tools:` 块校验而非全文包含：
+/// prompt 正文也提到这些工具名，全文匹配在被摘出工具清单时仍然通过。
+#[test]
+fn peco_master_ships_machine_and_cross_space_tools() {
+    const MIN_VERSION: u32 = 12;
+    let md = repo_root().join("crates/peco-agents/templates/peco/agents/@master/agent.md");
+
+    let version = frontmatter_template_version(&md);
+    assert!(
+        version >= MIN_VERSION,
+        "{} 的 template_version = {version} < {MIN_VERSION}：模板版本未提交或工具集漂移，老工作空间装不上新工具",
+        md.display()
+    );
+
+    let tools = frontmatter_tools(&md);
+    for required in PECO_ONLY_TOOLS {
+        assert!(
+            tools.iter().any(|t| t == required),
+            "{} 的 tools 缺少 '{required}'：模板版本未提交或工具集漂移，实际清单 {tools:?}",
+            md.display()
+        );
+    }
+}
+
+/// 团队模板必须留在团队边界内：不含机器与跨空间工具，连正文提及也不行 ——
+/// 提示词里出现工具名会诱导模型调用它没有的能力。全文匹配故意从严。
+#[test]
+fn team_default_master_stays_inside_team_boundary() {
+    const MIN_VERSION: u32 = 1;
+    let md = repo_root().join("crates/peco-agents/templates/team_default/agents/@master/agent.md");
+
+    let version = frontmatter_template_version(&md);
+    assert!(
+        version >= MIN_VERSION,
+        "{} 的 template_version = {version} < {MIN_VERSION}：模板版本未提交或工具集漂移，老工作空间装不上新内容",
+        md.display()
+    );
+
+    let text = std::fs::read_to_string(&md)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", md.display()));
+    for tool in PECO_ONLY_TOOLS {
+        assert!(
+            !text.contains(tool),
+            "{} 出现了 '{tool}'：模板版本未提交或工具集漂移，团队模板越界到机器/跨空间能力",
+            md.display()
+        );
     }
 }

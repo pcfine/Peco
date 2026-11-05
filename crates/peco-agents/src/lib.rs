@@ -16,7 +16,8 @@ mod templates;
 use std::io;
 
 /// 所有内置模板的静态数组。
-static ALL_TEMPLATES: [BuiltinTemplate; 1] = [templates::peco::PECO];
+static ALL_TEMPLATES: [BuiltinTemplate; 2] =
+    [templates::peco::PECO, templates::team_default::TEAM_DEFAULT];
 
 /// 内置 Workspace 模板。
 ///
@@ -59,6 +60,11 @@ impl BuiltinTemplate {
     pub fn peco() -> Self {
         templates::peco::PECO
     }
+
+    /// team_default 模板：通用专家团队（@master + 私有记忆库）。
+    pub fn team_default() -> Self {
+        templates::team_default::TEAM_DEFAULT
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -67,12 +73,18 @@ impl BuiltinTemplate {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
-    fn test_all_returns_single_template() {
-        assert_eq!(BuiltinTemplate::all().len(), 1);
-        assert_eq!(BuiltinTemplate::all()[0].name, "peco");
+    fn test_all_templates_are_listed() {
+        let listed: BTreeSet<&str> = BuiltinTemplate::all().iter().map(|t| t.name).collect();
+        let expected: BTreeSet<&str> = ["peco", "team_default"].into_iter().collect();
+        assert_eq!(
+            listed, expected,
+            "内置模板清单漂移：`all()` 与 `by_name()` 是同一份数据，漏列即按名取不到"
+        );
     }
 
     #[test]

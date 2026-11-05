@@ -1,0 +1,13 @@
+{
+  "name": "@private_memory",
+  "description": "团队私有记忆库 — 存储本团队的偏好、事实、事件、关系",
+  "embedding_model": "b-g-e-base-z-h-v15",
+  "chunking": {
+    "type": "overlapping-window",
+    "size": 800,
+    "overlap": 200
+  },
+  "backend": "HelixDb",
+  "storage_path": null,
+  "default_storage_mode": "full"
+}
