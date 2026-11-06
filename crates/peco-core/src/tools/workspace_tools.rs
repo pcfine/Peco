@@ -396,7 +396,7 @@ impl WorkspaceHub {
             dispatch_id: Uuid::new_v4().simple().to_string(),
             task_id: task_id.to_string(),
             workspace: dir.display().to_string(),
-            state: format!("{:?}", snapshot.state),
+            state: snapshot.state.as_str().to_string(),
             output: output_of(&snapshot),
             timed_out: wait && !snapshot.state.is_terminal(),
         })
@@ -1664,7 +1664,10 @@ mod tests {
             .await
             .expect("dispatch");
 
-        assert_eq!(receipt.state, "Completed");
+        assert_eq!(
+            receipt.state, "completed",
+            "the receipt state is the model-facing name, not Debug"
+        );
         assert_eq!(receipt.output.as_deref(), Some("done"));
         assert!(!receipt.timed_out);
         assert!(!receipt.task_id.is_empty());
@@ -1743,7 +1746,10 @@ mod tests {
             receipt.timed_out,
             "the task was still gated when the wait expired"
         );
-        assert!(!receipt.state.is_empty());
+        assert_eq!(
+            receipt.state, "working",
+            "a task gated on a tool call is still working, and the receipt must say so in lowercase"
+        );
 
         entered.notified().await;
         release.notify_one();
@@ -2006,7 +2012,7 @@ mod tests {
         );
         assert_eq!(status["action"], json!("status"));
         assert_eq!(status["found"], json!(true));
-        assert_eq!(status["task"]["state"], json!("Completed"));
+        assert_eq!(status["task"]["state"], json!("completed"));
         assert_eq!(status["task"]["output"], json!("done"));
 
         let awaited = report_json(
@@ -2023,7 +2029,7 @@ mod tests {
         );
         assert_eq!(awaited["action"], json!("await"));
         assert_eq!(awaited["timed_out"], json!(false));
-        assert_eq!(awaited["task"]["state"], json!("Completed"));
+        assert_eq!(awaited["task"]["state"], json!("completed"));
 
         let cancel = report_json(
             &inspect_text(
@@ -2038,7 +2044,7 @@ mod tests {
         );
         assert_eq!(cancel["accepted"], json!(true));
         assert_eq!(cancel["already_terminal"], json!(true));
-        assert_eq!(cancel["state"], json!("Completed"));
+        assert_eq!(cancel["state"], json!("completed"));
     }
 
     #[tokio::test]

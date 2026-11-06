@@ -1260,7 +1260,7 @@ mod tests {
             assert_eq!(item["agent_name"], json!("worker"));
             assert_eq!(item["prompt"], json!("say hi"));
             assert_eq!(item["kind"], json!("agent:worker"));
-            assert_eq!(item["state"], json!("Completed"));
+            assert_eq!(item["state"], json!("completed"));
             assert_eq!(item["terminal"], json!(true));
             assert_eq!(item["output"], json!("hello"));
             assert_eq!(item["output_truncated"], json!(false));
@@ -1332,7 +1332,7 @@ mod tests {
 
             let results = value["results"].as_array().expect("results array");
             assert_eq!(results.len(), 2, "a failed submission keeps its slot");
-            assert_eq!(results[0]["state"], json!("Completed"));
+            assert_eq!(results[0]["state"], json!("completed"));
             assert_eq!(results[0]["output"], json!("worker done"));
             assert_eq!(results[1]["task_id"], Value::Null);
             assert_eq!(results[1]["kind"], Value::Null);
@@ -1384,13 +1384,13 @@ mod tests {
                 3,
                 "a failed submission must not end the batch"
             );
-            assert_eq!(results[0]["state"], json!("Completed"));
+            assert_eq!(results[0]["state"], json!("completed"));
             assert_eq!(results[0]["output"], json!("worker done"));
             assert_eq!(results[1]["error"]["kind"], json!("agent_load_failed"));
             assert_eq!(results[1]["task_id"], Value::Null);
             assert_eq!(
                 results[2]["state"],
-                json!("Completed"),
+                json!("completed"),
                 "the task after a failed one still runs: {}",
                 results[2]
             );
@@ -1424,7 +1424,7 @@ mod tests {
                 .as_str()
                 .expect("a submitted task reports a state");
             assert!(
-                matches!(state, "Submitted" | "Working"),
+                matches!(state, "submitted" | "working"),
                 "a task returned by wait=false is not terminal yet, got {state}"
             );
             assert_eq!(item["output"], Value::Null);
@@ -1474,7 +1474,7 @@ mod tests {
             let item = &value["results"][0];
             assert_eq!(
                 item["state"],
-                json!("Working"),
+                json!("working"),
                 "a wait timeout is not a cancellation"
             );
             assert_eq!(item["terminal"], json!(false));
@@ -1516,7 +1516,7 @@ mod tests {
             assert_eq!(status["found"], json!(true));
             assert_eq!(status["task"]["task_id"], json!(id.to_string()));
             assert_eq!(status["task"]["kind"], json!("agent:worker"));
-            assert_eq!(status["task"]["state"], json!("Completed"));
+            assert_eq!(status["task"]["state"], json!("completed"));
             assert_eq!(status["task"]["terminal"], json!(true));
             assert_eq!(status["task"]["output"], json!("hello"));
             assert_eq!(status["task"]["error"], Value::Null);
@@ -1573,7 +1573,7 @@ mod tests {
                 .expect("cancelling a terminal task must not fail");
             assert_eq!(third["accepted"], json!(true));
             assert_eq!(third["already_terminal"], json!(true));
-            assert_eq!(third["state"], json!("Canceled"));
+            assert_eq!(third["state"], json!("canceled"));
         })
         .await;
     }
@@ -1585,7 +1585,7 @@ mod tests {
             let runtime = test_runtime();
             let tool = runner(&[("worker", scripted_agent_named("done"))], &runtime);
             let (value, _) = run_json(&tool, one_task("worker")).await;
-            assert_eq!(value["results"][0]["state"], json!("Completed"));
+            assert_eq!(value["results"][0]["state"], json!("completed"));
             let id = task_id_of(&value["results"][0]["task_id"]);
 
             let inspect = InspectMachineTask::new(Arc::downgrade(&runtime));
@@ -1598,7 +1598,7 @@ mod tests {
 
             assert_eq!(cancel["accepted"], json!(true));
             assert_eq!(cancel["already_terminal"], json!(true));
-            assert_eq!(cancel["state"], json!("Completed"));
+            assert_eq!(cancel["state"], json!("completed"));
             let note = cancel["note"].as_str().expect("note is a string");
             assert!(
                 !note.contains("cancellation requested"),
@@ -1723,7 +1723,7 @@ mod tests {
             let (second, _) = run_json(&tool, one_task("worker")).await;
 
             for value in [&first, &second] {
-                assert_eq!(value["results"][0]["state"], json!("Completed"));
+                assert_eq!(value["results"][0]["state"], json!("completed"));
                 assert_eq!(value["results"][0]["kind"], json!("agent:worker"));
                 let id = task_id_of(&value["results"][0]["task_id"]);
                 runtime
@@ -1762,8 +1762,8 @@ mod tests {
 
             assert_eq!(value["results"][0]["kind"], json!("agent:a"));
             assert_eq!(value["results"][1]["kind"], json!("agent:b"));
-            assert_eq!(value["results"][0]["state"], json!("Completed"));
-            assert_eq!(value["results"][1]["state"], json!("Completed"));
+            assert_eq!(value["results"][0]["state"], json!("completed"));
+            assert_eq!(value["results"][1]["state"], json!("completed"));
         })
         .await;
     }
@@ -2084,7 +2084,7 @@ mod tests {
                 item["task_id"].is_string(),
                 "task_id must survive the budget: {item}"
             );
-            assert_eq!(item["state"], json!("Completed"));
+            assert_eq!(item["state"], json!("completed"));
             assert!(
                 item.get("error").is_some(),
                 "error must survive the budget: {item}"

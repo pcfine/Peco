@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::model::{Artifact, Progress, TaggedJson, TaskId, TaskSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskState {
     Submitted,
     Working,
@@ -17,6 +18,24 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// 对外的状态串：`Debug` 是内部表示，改它的措辞不该顺带改契约 ——
+    /// `DispatchReceipt.state` 与台账都按这个名字读写。
+    ///
+    /// 与 serde 的 wire name 一致，改一处必须改另一处。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Working => "working",
+            Self::InputRequired => "input_required",
+            Self::AuthRequired => "auth_required",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::TimedOut => "timed_out",
+            Self::Rejected => "rejected",
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -163,6 +182,37 @@ mod tests {
                     "unexpected transition verdict: from={from:?} to={to:?}"
                 );
             }
+        }
+    }
+
+    /// 这九个串是对外契约（模型与台账都读它），逐条钉死以便改错时立刻红。
+    #[test]
+    fn as_str_is_the_wire_name_of_each_state() {
+        let expected = [
+            (Submitted, "submitted"),
+            (Working, "working"),
+            (InputRequired, "input_required"),
+            (AuthRequired, "auth_required"),
+            (Completed, "completed"),
+            (Failed, "failed"),
+            (Canceled, "canceled"),
+            (TimedOut, "timed_out"),
+            (Rejected, "rejected"),
+        ];
+        for (state, name) in expected {
+            assert_eq!(state.as_str(), name, "wrong wire name: state={state:?}");
+        }
+    }
+
+    /// serde 与 `as_str` 是同一份契约的两处实现：任一处漂移都会让下游看到两种拼法。
+    #[test]
+    fn serde_wire_name_matches_as_str_for_each_state() {
+        for state in ALL_STATES {
+            assert_eq!(
+                serde_json::to_value(state).expect("state serializes"),
+                serde_json::json!(state.as_str()),
+                "serde name drifted from as_str: state={state:?}"
+            );
         }
     }
 
