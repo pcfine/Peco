@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Peco</title>
+    <!-- 首帧前套用主题：暗色是默认，避免亮色闪一帧。key 与 themeStore 一致。 -->
+    <script>
+      (function () {
+        try {
+          // key 与 store 名一致，且存档是 zustand persist 的 {state:{theme}} 形状。
+          var stored = JSON.parse(localStorage.getItem("peco-webui:theme") || "{}");
+          var theme = (stored.state && stored.state.theme) || "dark";
+          var dark =
+            theme === "dark" ||
+            (theme === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

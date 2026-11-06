@@ -1,0 +1,198 @@
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/geist-latin-wght-normal.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/geist-mono-latin-wght-normal.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --canvas: #fafafb;
+  --panel: #ffffff;
+  --raised: #ffffff;
+  --line: #dddee1;
+  --line-strong: #c3c4c9;
+  --ink: #14151d;
+  --ink-muted: #636572;
+  --ink-faint: #72747f;
+  --primary: #6366f1;
+  --primary-fill: #504ed7;
+  --primary-ink: #504ed7;
+  --ok: #008942;
+  --warn: #954f00;
+  --warn-mark: #d78100;
+  --danger: #e7000f;
+  --info: #0a6fa8;
+}
+
+.dark {
+  --canvas: #090a0f;
+  --panel: #12131a;
+  --raised: #1a1b23;
+  --line: #292b32;
+  --line-strong: #3b3c46;
+  --ink: #f4f5f8;
+  --ink-muted: #9c9dab;
+  --ink-faint: #848591;
+  --primary: #6366f1;
+  --primary-fill: #5a5edd;
+  --primary-ink: #8d98ff;
+  --ok: #3aba6a;
+  --warn: #f2a635;
+  --warn-mark: #f2a635;
+  --danger: #f54748;
+  --info: #26a9f1;
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-primary: var(--primary);
+  --color-primary-fill: var(--primary-fill);
+  --color-primary-ink: var(--primary-ink);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-warn-mark: var(--warn-mark);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+
+  --font-sans:
+    "Geist", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, Menlo, monospace;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1.35;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1.4;
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.5;
+  --text-base: 0.875rem;
+  --text-base--line-height: 1.6;
+  --text-lg: 1rem;
+  --text-lg--line-height: 1.4;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.3;
+  --text-mono-sm: 0.75rem;
+  --text-mono-sm--line-height: 1.45;
+
+  --radius-chip: 4px;
+  --radius-control: 6px;
+  --radius-cluster: 8px;
+
+  --spacing-row-sm: 28px;
+  --spacing-row: 32px;
+  --spacing-row-lg: 36px;
+  --spacing-row-xl: 40px;
+  --spacing-topbar: 44px;
+
+  --container-narrow: 40rem;
+  --container-mid: 64rem;
+  --container-wide: 87.5rem;
+
+  /* 拷来的 shadcn 原子用的是 background / foreground / primary 这套名字。
+     这里把它们指到上面那套语义 token，配色只有一份定义。
+     `primary` 指向 primary-fill：#6366F1 上的白字只有 4.47，只可用于描边，
+     而原子里的 bg-primary 全是填充（主按钮）。品牌色的描边用途走 brand。 */
+  --color-brand: var(--primary);
+  --color-background: var(--canvas);
+  --color-foreground: var(--ink);
+  --color-card: var(--panel);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--raised);
+  --color-popover-foreground: var(--ink);
+  --color-primary-foreground: #ffffff;
+  --color-secondary: var(--line);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--line);
+  --color-muted-foreground: var(--ink-muted);
+  --color-accent: var(--line);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: #ffffff;
+  --color-border: var(--line);
+  --color-input: var(--line-strong);
+  --color-ring: var(--primary);
+  --color-success: var(--ok);
+  --color-success-foreground: #ffffff;
+  --color-warning: var(--warn);
+  --color-warning-foreground: #ffffff;
+  --color-info-foreground: #ffffff;
+  --color-bubble: var(--line);
+  --color-tool-surface: var(--panel);
+  --color-tool-args-fg: var(--ink-muted);
+  --color-tool-row-hover: var(--line);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+  body {
+    @apply bg-canvas text-ink font-sans text-sm;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.014em;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 22%, transparent);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklab, var(--ink) 22%, transparent)
+      transparent;
+  }
+  /* 焦点环全站统一：不用 box-shadow，否则与「无阴影」的表面层级打架。 */
+  :focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+  /* 面板拼合：外层 1px 线 + gap 1px，相邻面板共享同一条线。 */
+  .board-grid {
+    gap: 1px;
+    background: var(--line);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

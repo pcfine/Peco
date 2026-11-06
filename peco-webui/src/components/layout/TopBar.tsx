@@ -1,0 +1,81 @@
+// 顶栏 h-44：标题 + 页面动作槽 + dock 开关。窄屏时 rail 离屏，
+// 空间切换器搬到这里（同一枚组件，不另造状态）。
+
+import { useLocation } from "react-router-dom";
+import { Menu, MessagesSquare } from "lucide-react";
+import { BoardEditorPopover } from "@/components/board/BoardEditorPopover";
+import { SpaceSwitcher } from "@/components/layout/SpaceSwitcher";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { usePecoTodayTasks } from "@/queries/tasks";
+import { usePeco } from "@/queries/peco";
+import { useDockStore } from "@/stores/dockStore";
+
+const PAGE_TITLES: Record<string, string> = {
+  "/": "Peco 面板",
+  "/spaces": "工作室",
+  "/spaces/new": "新建空间",
+  "/teams": "团队",
+  "/results": "成果",
+  "/schedules": "定时任务",
+};
+
+/** 动态段（`/spaces/:wsId`、`/teams/:teamId`）只按前缀取标题。 */
+function titleOf(pathname: string): string {
+  if (PAGE_TITLES[pathname]) return PAGE_TITLES[pathname];
+  if (pathname.startsWith("/spaces/")) return "空间详情";
+  if (pathname.startsWith("/teams/")) return "团队配置";
+  return "";
+}
+
+export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
+  const { pathname } = useLocation();
+  const wide = useMediaQuery("(min-width: 900px)");
+  const { data: peco } = usePeco();
+  const { data: tasks } = usePecoTodayTasks(peco?.ws_id ?? null);
+  const dockOpen = useDockStore((state) => state.open);
+  const toggleDock = useDockStore((state) => state.toggle);
+
+  // 角标 = 在飞数（Peco 发起的 submitted/working）；0 时不渲染，不显示「0」。
+  const inflight = (tasks ?? []).filter(
+    (task) => task.state === "submitted" || task.state === "working",
+  ).length;
+  const isBoard = pathname === "/";
+
+  return (
+    <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-canvas px-3">
+      {!wide && (
+        <button
+          type="button"
+          onClick={onOpenNav}
+          aria-label="打开导航"
+          className="grid h-7 w-7 place-items-center rounded-[4px] text-ink-muted hover:bg-line hover:text-ink"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      )}
+      {!wide && <SpaceSwitcher />}
+      <h1 className="truncate text-sm font-semibold text-ink">
+        {titleOf(pathname)}
+      </h1>
+
+      <div className="ml-auto flex items-center gap-1">
+        {isBoard && <BoardEditorPopover />}
+        <button
+          type="button"
+          onClick={toggleDock}
+          aria-expanded={dockOpen}
+          aria-controls="peco-dock"
+          aria-label="Peco 对话"
+          className="relative grid h-7 w-7 place-items-center rounded-[4px] text-ink-muted hover:bg-line hover:text-ink"
+        >
+          <MessagesSquare className="h-4 w-4" />
+          {inflight > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 grid h-3.5 min-w-3.5 place-items-center rounded-full bg-primary-fill px-0.5 tabular-nums text-[9px] leading-none text-white">
+              {inflight}
+            </span>
+          )}
+        </button>
+      </div>
+    </header>
+  );
+}
