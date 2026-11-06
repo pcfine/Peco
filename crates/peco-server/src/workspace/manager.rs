@@ -395,11 +395,6 @@ impl WorkspaceManager {
         WorkDir::new(self.data_dir.join("work").join(user_id))
     }
 
-    /// 返回系统级配置引用。
-    pub fn system_config(&self) -> &SystemConfig {
-        &self.system_config
-    }
-
     /// 返回当前缓存的 WorkSpace 数量。
     #[allow(dead_code)]
     pub fn cache_size(&self) -> usize {
@@ -492,8 +487,6 @@ mod tests {
                 web_search: None,
             },
             mcp: McpConfig::empty(),
-            skills_root: dir.join("skills"),
-            knowledge_dir: dir.join("knowledge"),
         });
         WorkspaceManager::new(dir.to_path_buf(), system_config, 8, pool)
     }
