@@ -16,10 +16,10 @@ use sqlx::SqlitePool;
 
 use crate::chat::active::ChatActiveRuns;
 use crate::config::DaemonConfig;
-use crate::dynamic::SpaceCatalogContext;
 use crate::space::SpaceEnv;
 use crate::space::registry::SpaceRegistry;
 use crate::space::tasks::TaskObserver;
+use crate::wake::pump::WakePump;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +34,8 @@ pub struct AppState {
     /// 会话级 chat 控制注册表：暂停/恢复必须从**另一条请求**触达在途 looper，
     /// 而 looper 由 SSE 请求任务独占持有，故只能在这里留一个会话 → 控制通道的表。
     pub chat_runs: Arc<ChatActiveRuns>,
+    /// 任务终态 → Peco 会话的投递泵。观察者叫醒它，它按台账决定投什么。
+    pub wake: Arc<WakePump>,
 }
 
 impl AppState {
@@ -50,30 +52,11 @@ impl AppState {
         self.env.dispatch_hook(origin_ws_id, principal, origin_dir)
     }
 
-    /// 为一次 `AgentLooper` 会话组装配置：观察 hook 与动态上下文的唯一装配点。
+    /// 为一次 `AgentLooper` 会话组装配置。
     ///
-    /// 清单只给 Peco 自己的空间：它列的是「可派发目标 + 当前空间」，团队总管拿到
-    /// 这份清单就会把任务派给不属于自己的空间。Peco 与其它空间共用同一条会话
-    /// 路径，因此差异只能落在这里。
+    /// 只是转调 [`SpaceEnv::looper_config`]：无 HTTP 客户端的会话运行只拿得到
+    /// [`SpaceEnv`]，两条入口各写一份会让 hook 链与动态清单在两个方向上漂移。
     pub fn looper_config(&self, ws_id: &str, team_id: &str, work_dir: PathBuf) -> LooperConfig {
-        // push 而不是整体覆盖 `hooks`：`from_env()` 给出的 hook 链仍要生效；
-        // 少了这一条，本轮派发出去的异步任务没有任何人观察。
-        let mut config = LooperConfig {
-            event_buffer: 256,
-            persist_on_failure: true,
-            ..LooperConfig::from_env()
-        };
-        config
-            .hooks
-            .push(self.dispatch_hook(ws_id.to_string(), team_id.to_string(), work_dir));
-        if self.env.peco.is_peco_space(ws_id) {
-            config.dynamic_context = Some(Arc::new(SpaceCatalogContext::new(
-                self.pool.clone(),
-                self.hub.clone(),
-                self.env.peco.clone(),
-                self.env.home.clone(),
-            )));
-        }
-        config
+        self.env.looper_config(ws_id, team_id, work_dir)
     }
 }

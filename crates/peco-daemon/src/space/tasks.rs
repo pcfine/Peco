@@ -4,8 +4,10 @@
 //! 终态 / 失联翻译成本模块的四个回调。本模块只做两件事：写 `d_dispatches`
 //! 台账，并发一条进程内广播事件（供后续 SSE 使用）。
 //!
-//! A+B 阶段不做唤醒：所有新行 `wake_state = 'skipped'`，避免未来的扫描器
-//! 把「观察」误当成「待投递」。
+//! 注册那一刻按 [`wake::qualifies`] 决定这行要不要进唤醒队列：来源判据只有
+//! 那一份，这里不再写一遍名单。
+
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use peco_core::agent::hooks::{DispatchObservation, TaskObservationSink};
@@ -17,6 +19,9 @@ use tracing::warn;
 
 use crate::db::dispatches::{self, NewDispatch};
 use crate::db::workspaces;
+use crate::space::peco::PecoIdentity;
+use crate::wake;
+use crate::wake::pump::WakePump;
 
 /// 终态摘要上限：只做 UI 的一行预览，不存整段输出。
 const MAX_DIGEST_CHARS: usize = 512;
@@ -39,12 +44,63 @@ pub struct TaskEvent {
 pub struct TaskObserver {
     pool: SqlitePool,
     events: broadcast::Sender<TaskEvent>,
+    /// 判据要区分「Peco 的待办」与「别的空间的自有任务」，故这里必须知道
+    /// Peco 是谁；晚绑定的理由见 [`TaskObserver::attach_peco`]。
+    peco: OnceLock<Arc<PecoIdentity>>,
+    /// 终态落地后要有人去投递：唤醒泵是唯一入口，观察者只负责叫醒它。
+    wake: Arc<WakePump>,
 }
 
 impl TaskObserver {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool, wake: Arc<WakePump>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
-        Self { pool, events }
+        Self {
+            pool,
+            events,
+            peco: OnceLock::new(),
+            wake,
+        }
+    }
+
+    /// 注入 Peco 身份。晚绑定是构造顺序决定的：观察者先于
+    /// [`SpaceEnv`](crate::space::SpaceEnv) 建出（它是那边的依赖），两份值只在
+    /// 那个装配点同时在场。
+    ///
+    /// 同一个身份被注入多次是装配常态（测试夹具与 `SpaceEnv` 各来一次），静默；
+    /// 只有换了一个 `ws_id` 才说明装配点拿错了身份，那才 warn —— 先到的那份才是
+    /// 本进程真正在用的。
+    pub fn attach_peco(&self, peco: Arc<PecoIdentity>) {
+        let Err(repeated) = self.peco.set(peco) else {
+            return;
+        };
+        let kept = self
+            .peco
+            .get()
+            .map(|kept| kept.ws_id.clone())
+            .unwrap_or_default();
+        if kept != repeated.ws_id {
+            warn!(
+                kept = %kept,
+                rejected = %repeated.ws_id,
+                "task observer already has another peco identity; keeping the first one"
+            );
+        }
+    }
+
+    /// 这一行进不进唤醒队列；身份未注入时一律不进 —— 宁可少一条通知，也不能
+    /// 把别的空间的自有任务当成 Peco 的待办叫醒它。
+    fn wake_state_for(&self, obs: &DispatchObservation) -> &'static str {
+        match self.peco.get() {
+            Some(peco) if wake::qualifies(&obs.origin.ws_id, &obs.origin_kind, peco) => "pending",
+            Some(_) => "skipped",
+            None => {
+                warn!(
+                    task_id = %obs.task_id,
+                    "task observer has no peco identity; dispatch ledger row will not wake"
+                );
+                "skipped"
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
@@ -91,8 +147,7 @@ impl TaskObservationSink for TaskObserver {
                 agent_name: &obs.agent_name,
                 origin_kind: &obs.origin_kind,
                 state,
-                // A+B 阶段不唤醒；写 skipped 而不是 pending。
-                wake_state: "skipped",
+                wake_state: self.wake_state_for(obs),
             },
         )
         .await;
@@ -142,13 +197,18 @@ impl TaskObservationSink for TaskObserver {
         )
         .await
         {
-            Ok(_) => self.emit(TaskEvent {
-                kind: "terminal",
-                task_id: obs.task_id.to_string(),
-                target_ws_id: None,
-                state: state.to_string(),
-                dispatch_id: obs.dispatch_id.clone(),
-            }),
+            Ok(_) => {
+                self.emit(TaskEvent {
+                    kind: "terminal",
+                    task_id: obs.task_id.to_string(),
+                    target_ws_id: None,
+                    state: state.to_string(),
+                    dispatch_id: obs.dispatch_id.clone(),
+                });
+                // 无条件叫醒：这一行该不该投、能不能投，由判据与 `claim` 的条件
+                // 更新决定；在这里先猜一遍等于多出第二份判据。重放是幂等的。
+                self.wake.notify_one();
+            }
             Err(e) => warn!(task_id = %obs.task_id, error = %e, "dispatch ledger finish failed"),
         }
     }

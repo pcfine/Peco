@@ -20,6 +20,8 @@ use peco_daemon::space::peco;
 use peco_daemon::space::registry::SpaceRegistry;
 use peco_daemon::space::tasks::TaskObserver;
 use peco_daemon::state::AppState;
+use peco_daemon::wake::deliver::PecoDelivery;
+use peco_daemon::wake::pump::WakePump;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -68,7 +70,10 @@ async fn run() -> Result<(), DaemonError> {
             "peco workspace marker missing; using the seed id until bootstrap writes it"
         );
     }
-    let tasks = Arc::new(TaskObserver::new(pool.clone()));
+    // 唤醒泵先于观察者建出：终态回调要在同一份泵上叫醒它，观察者因此持一个
+    // 泵的引用；反过来泵若持 `AppState` 就成环了（见 `attach_delivery`）。
+    let wake = Arc::new(WakePump::new(pool.clone(), peco.clone()));
+    let tasks = Arc::new(TaskObserver::new(pool.clone(), wake.clone()));
     let env = Arc::new(SpaceEnv::new(
         &config,
         pool.clone(),
@@ -119,7 +124,18 @@ async fn run() -> Result<(), DaemonError> {
         tasks,
         spaces,
         chat_runs: Arc::new(ChatActiveRuns::new()),
+        wake,
     };
+    // 投递端在这里才拿到 `SpaceRegistry` 与 `AppState`：泵必须早于观察者存在，
+    // 故只能晚绑定（`OnceLock`），否则 `pump ↔ AppState` 会成 Arc 环。
+    state.wake.attach_delivery(Arc::new(PecoDelivery::new(
+        state.pool.clone(),
+        state.spaces.clone(),
+        state.chat_runs.clone(),
+        state.env.peco.clone(),
+        Arc::downgrade(&state.env),
+    )));
+
     // 观察者已随上一个进程消失，只有台账知道哪些任务在飞：在接客之前对一遍账。
     // 失败只 warn（`reconcile_ledger` 自己吞错），一个坏行不该拦住 daemon 启动。
     let report = peco_daemon::space::reconcile::reconcile_ledger(&state).await;
@@ -130,6 +146,12 @@ async fn run() -> Result<(), DaemonError> {
         resubscribed = report.resubscribed,
         "dispatch ledger reconciled"
     );
+
+    // 回收必须在 reconcile 之后：对账会把重启前的在飞行标成 orphan 并保留唤醒态，
+    // 更早被认领、随上个进程一起停下的行则只有这一步能把它们退回队列。顺序反了，
+    // 首个 tick 就看不到这些行。
+    state.wake.startup_reclaim().await;
+    state.wake.spawn();
 
     http::serve(state).await?;
     info!("http server stopped; daemon exit");

@@ -9,6 +9,7 @@ pub(crate) mod active;
 pub(crate) mod conversation;
 pub(crate) mod handler;
 pub(crate) mod images;
+pub(crate) mod run;
 pub(crate) mod sse;
 
 pub use active::ChatActiveRuns;

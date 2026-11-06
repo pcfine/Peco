@@ -23,6 +23,7 @@ use peco_daemon::space::reconcile::{ReconcileReport, reconcile_ledger};
 use serde_json::{Value, json};
 use support::TestEnv;
 use support::upstream::{self, FakeUpstream, Reply};
+use support::{fixture, install_team};
 use tokio::sync::OnceCell;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -41,63 +42,6 @@ async fn shared() -> &'static TestEnv {
             env
         })
         .await
-}
-
-// ============================================================================
-// 夹具：团队目录（providers.toml + agents/*/agent.md）
-// ============================================================================
-
-/// 写一个团队目录：`providers.toml` 指向假上游，每个 agent 一个 `agent.md`。
-///
-/// `agent.md` 不设 `llm.stream`，于是 looper 走批量路径 —— 假上游只需实现
-/// 非流式的 chat completions。
-async fn install_team(env: &TestEnv, team: &str, upstream: &FakeUpstream, agents: &[Fixture<'_>]) {
-    let root = env.home.join("teams").join(team);
-    std::fs::create_dir_all(root.join("agents")).expect("create the team root");
-    let providers = format!(
-        "default_provider = \"fake\"\n\n\
-         [providers.fake]\n\
-         type = \"openai\"\n\
-         api = \"chat\"\n\
-         base_url = \"{}\"\n\
-         api_key = \"test\"\n\n\
-         [providers.fake.default]\n\
-         model = \"unused\"\n",
-        upstream.base_url
-    );
-    std::fs::write(root.join("providers.toml"), providers).expect("write providers.toml");
-
-    for agent in agents {
-        let dir = root.join("agents").join(agent.name);
-        std::fs::create_dir_all(&dir).expect("create the agent dir");
-        let tools = if agent.tools.is_empty() {
-            String::new()
-        } else {
-            let lines: String = agent
-                .tools
-                .iter()
-                .map(|tool| format!("  - {tool}\n"))
-                .collect();
-            format!("tools:\n{lines}")
-        };
-        let md = format!(
-            "---\nagent:\n  name: \"{}\"\n  description: \"closure fixture\"\n\
-             llm:\n  provider: \"fake\"\n  model: \"{}\"\n  temperature: 0.0\n{tools}---\n",
-            agent.name, agent.model
-        );
-        std::fs::write(dir.join("agent.md"), md).expect("write agent.md");
-    }
-}
-
-struct Fixture<'a> {
-    name: &'a str,
-    /// 同时是假上游的分派键：脚本按模型名决定「这一轮该派发还是该收尾」。
-    model: &'a str,
-    tools: &'a [&'a str],
-}
-
-fn fixture<'a>(name: &'a str, model: &'a str, tools: &'a [&'a str]) -> Fixture<'a> {
-    Fixture { name, model, tools }
 }
 
 /// 只建团队目录（不需要 provider 的场景，如「空间没恢复」）。
@@ -216,7 +160,7 @@ fn print_exchanges(label: &str, upstream: &FakeUpstream) {
 // T-A：跨空间派发（V6-7）
 // ============================================================================
 
-/// 变异方法：删掉 `state.rs::looper_config` 里的 `config.hooks.push(...)`
+/// 变异方法：删掉 `space/mod.rs::SpaceEnv::looper_config` 里的 `config.hooks.push(...)`
 /// ⇒ 派发成功但无人观察 ⇒ 1s 内台账没有行，本用例超时断言变红。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dispatch_from_a_chat_turn_lands_in_the_target_ledger() {
@@ -249,15 +193,13 @@ async fn a_dispatch_from_a_chat_turn_lands_in_the_target_ledger() {
         "t_a_origin",
         &origin_upstream,
         &[fixture("@master", "master", &["dispatch_to_workspace"])],
-    )
-    .await;
+    );
     install_team(
         env,
         "t_a_target",
         &target_upstream,
         &[fixture("@master", "target", &[])],
-    )
-    .await;
+    );
 
     let ws_a = env.open_space("t_a_origin", "t_a_origin").await;
     let ws_b = env.open_space("t_a_target", "t_a_target").await;
@@ -332,16 +274,14 @@ async fn a_dispatched_master_that_dispatches_again_is_also_observed() {
             team,
             upstream,
             &[fixture("@master", model, &["dispatch_to_workspace"])],
-        )
-        .await;
+        );
     }
     install_team(
         env,
         "t_e2_leaf",
         &leaf_upstream,
         &[fixture("@master", "leaf", &[])],
-    )
-    .await;
+    );
 
     let ws_origin = env.open_space("t_e2_origin", "t_e2_origin").await;
     let ws_middle = env.open_space("t_e2_middle", "t_e2_middle").await;
@@ -396,8 +336,7 @@ async fn a_same_space_async_machine_task_lands_in_the_ledger() {
             fixture("@master", "master", &["run_machine_task"]),
             fixture("worker", "worker", &[]),
         ],
-    )
-    .await;
+    );
     let ws = env.open_space("t_b_space", "t_b_team").await;
 
     let _turn = start_turn(env, &ws, "@master", "hi").await;
@@ -457,15 +396,13 @@ async fn closing_the_target_space_orphans_the_ledger_row() {
         "t_c_origin",
         &origin_upstream,
         &[fixture("@master", "master", &["dispatch_to_workspace"])],
-    )
-    .await;
+    );
     install_team(
         env,
         "t_c_target",
         &target_upstream,
         &[fixture("@master", "target", &[])],
-    )
-    .await;
+    );
 
     let ws_a = env.open_space("t_c_origin", "t_c_origin").await;
     let ws_b = env.open_space("t_c_target", "t_c_target").await;
@@ -581,8 +518,7 @@ async fn reconcile_resubscribes_rows_that_are_still_running() {
             fixture("@master", "master", &[]),
             fixture("worker", "worker", &[]),
         ],
-    )
-    .await;
+    );
     let ws_id = env.open_space("t_d3_space", "t_d3_team").await;
     let dir = env.work_dir_of(&ws_id).await;
 

@@ -111,6 +111,7 @@ fn template_version_of(files: &[(&str, &[u8])]) -> i64 {
         .find(|(rel_path, _)| *rel_path == MASTER_AGENT_REL)
         .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
         .and_then(template_version_from_agent_md)
+        .map(i64::from)
         .unwrap_or(0)
 }
 
@@ -119,13 +120,22 @@ pub(crate) fn template_version_on_disk(team_root: &Path) -> Option<i64> {
     std::fs::read_to_string(team_root.join(MASTER_AGENT_REL))
         .ok()
         .and_then(|raw| template_version_from_agent_md(&raw))
+        .map(i64::from)
 }
 
-fn template_version_from_agent_md(raw: &str) -> Option<i64> {
+fn template_version_from_agent_md(raw: &str) -> Option<u32> {
     peco_core::agent::agent_config::parse_agent_md(raw)
         .ok()
         .and_then(|(profile, _)| profile.template_version)
-        .map(i64::from)
+}
+
+/// 一份 agent.md 的模板版本；无字段、解析失败或文件读不到一律当 0 ——
+/// 存量文件与手写文件都没有版本号，视为 0 才能让模板的升级内容落到它们上面。
+pub(crate) fn agent_md_template_version(agent_md: &Path) -> u32 {
+    std::fs::read_to_string(agent_md)
+        .ok()
+        .and_then(|raw| template_version_from_agent_md(&raw))
+        .unwrap_or(0)
 }
 
 /// `team.json` 是 `rescan`/`meta_from_dir` 的读入面：不写它，展示名会在下一次

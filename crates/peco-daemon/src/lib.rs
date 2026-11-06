@@ -24,6 +24,7 @@ pub mod skill;
 pub mod space;
 pub mod state;
 pub mod team;
+pub mod wake;
 
 /// 单用户身份：DB 各表的 `user_id` 列恒写这个值。
 ///

@@ -15,6 +15,7 @@ pub mod tasks;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
+use peco_core::agent::LooperConfig;
 use peco_core::agent::hooks::{DispatchOrigin, DispatchWatchHook, TaskObservationSink};
 use peco_core::config::SystemConfig;
 use peco_core::tools::WorkspaceHub;
@@ -22,6 +23,7 @@ use sqlx::SqlitePool;
 
 use crate::config::DaemonConfig;
 use crate::db::workspaces::{self, WorkspaceRow};
+use crate::dynamic::SpaceCatalogContext;
 use crate::error::DaemonError;
 use crate::space::peco::PecoIdentity;
 use crate::space::tasks::TaskObserver;
@@ -57,6 +59,9 @@ impl SpaceEnv {
         peco: Arc<PecoIdentity>,
         tasks: Arc<TaskObserver>,
     ) -> Self {
+        // 唤醒判据要认「谁是 Peco」，而观察者先于本结构体构造：两份值只在
+        // 这个装配点同时在场，身份因此在这里交接。
+        tasks.attach_peco(peco.clone());
         Self {
             home: config.peco_home.clone(),
             pool,
@@ -91,6 +96,43 @@ impl SpaceEnv {
             },
             Arc::clone(&self.tasks) as Arc<dyn TaskObservationSink>,
         ))
+    }
+
+    /// 为一次 `AgentLooper` 会话组装配置：观察 hook 与动态上下文的唯一装配点。
+    ///
+    /// 清单只给 Peco 自己的空间：它列的是「可派发目标 + 当前空间」，团队总管拿到
+    /// 这份清单就会把任务派给不属于自己的空间。Peco 与其它空间共用同一条会话
+    /// 路径，因此差异只能落在这里。
+    pub fn looper_config(&self, ws_id: &str, team_id: &str, work_dir: PathBuf) -> LooperConfig {
+        // push 而不是整体覆盖 `hooks`：`from_env()` 给出的 hook 链仍要生效；
+        // 少了这一条，本轮派发出去的异步任务没有任何人观察。
+        let mut config = LooperConfig {
+            event_buffer: 256,
+            persist_on_failure: true,
+            ..LooperConfig::from_env()
+        };
+        config
+            .hooks
+            .push(self.dispatch_hook(ws_id.to_string(), team_id.to_string(), work_dir));
+        if self.peco.is_peco_space(ws_id) {
+            // 动态清单靠 Hub 判「已关闭」：没有实例表时列出来的目标可能早已销毁，
+            // 与其给一份不可信的清单，不如让这一轮没有清单。
+            match self.hub() {
+                Some(hub) => {
+                    config.dynamic_context = Some(Arc::new(SpaceCatalogContext::new(
+                        self.pool.clone(),
+                        hub,
+                        self.peco.clone(),
+                        self.home.clone(),
+                    )));
+                }
+                None => tracing::warn!(
+                    ws_id = %ws_id,
+                    "space hub not attached; peco space gets no dynamic catalog"
+                ),
+            }
+        }
+        config
     }
 
     /// 注入进程内唯一的实例表。装配顺序被破坏（重复注入）只 warn：

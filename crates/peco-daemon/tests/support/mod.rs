@@ -29,9 +29,11 @@ use peco_daemon::space::open::{self, DaemonOpener, ensure_open_indexed};
 use peco_daemon::space::registry::SpaceRegistry;
 use peco_daemon::space::tasks::TaskObserver;
 use peco_daemon::state::AppState;
+use peco_daemon::wake::pump::WakePump;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
+use upstream::FakeUpstream;
 
 /// 包装真实 `DaemonOpener`：只在打开成功时计数。
 ///
@@ -74,6 +76,8 @@ pub struct TestEnv {
     pub config: Arc<DaemonConfig>,
     pub opener: Arc<CountingOpener>,
     pub tasks: Arc<TaskObserver>,
+    /// 与观察者同一份的投递泵；投递用例要给它接上 `PecoDelivery` 才能跑。
+    pub wake: Arc<WakePump>,
     _home_guard: TempDir,
 }
 
@@ -91,7 +95,8 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
 
     let system_config = SystemConfig::load();
     let peco = Arc::new(peco_daemon::space::peco::resolve(&config.peco_home));
-    let tasks = Arc::new(TaskObserver::new(pool.clone()));
+    let wake = Arc::new(WakePump::new(pool.clone(), peco.clone()));
+    let tasks = Arc::new(TaskObserver::new(pool.clone(), wake.clone()));
     let env = Arc::new(SpaceEnv::new(
         &config,
         pool.clone(),
@@ -119,7 +124,65 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
         config,
         opener,
         tasks,
+        wake,
         _home_guard: home_guard,
+    }
+}
+
+/// 团队目录里的一个 agent：`agent.md` 的 `name` 与文件名一致。
+pub struct Fixture<'a> {
+    pub name: &'a str,
+    /// 同时是假上游的分派键：脚本按模型名决定这一轮该做什么。
+    pub model: &'a str,
+    pub tools: &'a [&'a str],
+}
+
+pub fn fixture<'a>(name: &'a str, model: &'a str, tools: &'a [&'a str]) -> Fixture<'a> {
+    Fixture { name, model, tools }
+}
+
+/// 写一个团队目录：`providers.toml` 指向假上游，每个 agent 一个 `agent.md`。
+///
+/// `agent.md` 不设 `llm.stream`，于是 looper 走批量路径 —— 假上游只需实现
+/// 非流式的 chat completions。
+///
+/// 纯文件写入，故是同步的：包成 `async` 会让每个调用点多一个永不 pending 的
+/// `.await`，读起来像「这里要做 IO 等待」。
+pub fn install_team(env: &TestEnv, team: &str, upstream: &FakeUpstream, agents: &[Fixture<'_>]) {
+    let root = env.home.join("teams").join(team);
+    std::fs::create_dir_all(root.join("agents")).expect("create the team root");
+    let providers = format!(
+        "default_provider = \"fake\"\n\n\
+         [providers.fake]\n\
+         type = \"openai\"\n\
+         api = \"chat\"\n\
+         base_url = \"{}\"\n\
+         api_key = \"test\"\n\n\
+         [providers.fake.default]\n\
+         model = \"unused\"\n",
+        upstream.base_url
+    );
+    std::fs::write(root.join("providers.toml"), providers).expect("write providers.toml");
+
+    for agent in agents {
+        let dir = root.join("agents").join(agent.name);
+        std::fs::create_dir_all(&dir).expect("create the agent dir");
+        let tools = if agent.tools.is_empty() {
+            String::new()
+        } else {
+            let lines: String = agent
+                .tools
+                .iter()
+                .map(|tool| format!("  - {tool}\n"))
+                .collect();
+            format!("tools:\n{lines}")
+        };
+        let md = format!(
+            "---\nagent:\n  name: \"{}\"\n  description: \"closure fixture\"\n\
+             llm:\n  provider: \"fake\"\n  model: \"{}\"\n  temperature: 0.0\n{tools}---\n",
+            agent.name, agent.model
+        );
+        std::fs::write(dir.join("agent.md"), md).expect("write agent.md");
     }
 }
 
@@ -133,6 +196,7 @@ impl TestEnv {
             tasks: self.tasks.clone(),
             spaces: Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone())),
             chat_runs: Arc::new(peco_daemon::chat::ChatActiveRuns::new()),
+            wake: self.wake.clone(),
         }
     }
 
@@ -164,6 +228,7 @@ impl TestEnv {
             tasks: self.tasks.clone(),
             spaces: Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone())),
             chat_runs: Arc::new(peco_daemon::chat::ChatActiveRuns::new()),
+            wake: self.wake.clone(),
         }
     }
 
@@ -287,6 +352,56 @@ impl TestEnv {
         )
         .await
         .unwrap()
+    }
+
+    /// 播种一条待唤醒的台账行。
+    ///
+    /// `seq` 写进 `created_at`：同一秒的时间戳分不出先后，`list_pending` 的排序
+    /// 会退化到随机 id，跨行断言的「前几项」就不再稳定。
+    pub async fn pending_row(&self, seq: i64, task_id: &str, state: &str, digest: Option<&str>) {
+        let id = format!("d_{task_id}");
+        sqlx::query(
+            "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+             target_team_id, origin_ws_id, agent_name, origin_kind, state, wake_state, \
+             result_digest, created_at) \
+             VALUES (?, ?, 'ws_target', '/tmp/work', 'research', 'ws_origin', '@master', \
+             'run_machine_task', ?, 'pending', ?, ?)",
+        )
+        .bind(&id)
+        .bind(task_id)
+        .bind(state)
+        .bind(digest)
+        .bind(format!("2026-01-01 00:00:{seq:02}"))
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// 播种一条「Peco 自己被唤醒」的行：发起方与目标都是 Peco 空间，摘要非空。
+    ///
+    /// 与 [`Self::pending_row`] 的差别就是这两个 `ws_id`：唤醒投递要按发起方判
+    /// 归属，用夹具里的占位空间名会让这条行看起来来自别的空间。
+    pub async fn peco_pending_row(&self, seq: i64, task_id: &str, peco_ws_id: &str) {
+        sqlx::query(
+            "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+             target_team_id, origin_ws_id, agent_name, origin_kind, state, wake_state, \
+             result_digest, created_at) \
+             VALUES (?, ?, ?, '/tmp/work', 'peco', ?, '@master', 'run_machine_task', \
+             'completed', 'pending', '重构完成，12 个测试通过', ?)",
+        )
+        .bind(format!("d_{task_id}"))
+        .bind(task_id)
+        .bind(peco_ws_id)
+        .bind(peco_ws_id)
+        .bind(format!("2026-01-01 00:00:{seq:02}"))
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// 资源模块用的 `ws_id → 实例` 适配层；与 `AppState` 里那份同源同库。
+    pub fn spaces(&self) -> Arc<SpaceRegistry> {
+        Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone()))
     }
 
     /// `d_dispatches` 一行的 `(state, wake_state)`。

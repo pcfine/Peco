@@ -8,9 +8,7 @@
 // `conversations.workspace_id`。`{agentId}` 不参与归属判定：同团队两个空间
 // 聊同一个 Agent 是两份互不可见的历史。
 
-use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
@@ -18,30 +16,24 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{KeepAlive, Sse};
 use futures::stream::Stream;
-use model_provider::{Content, ContentPart, text_of_blocks};
-use peco_core::agent::{AgentLooper, LooperEvent, ResponseOrigin};
-use peco_core::session::Session;
+use model_provider::{Content, ContentPart};
 use peco_core::session::SessionPersister;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::LOCAL_USER_ID;
 use crate::api_error::ApiError;
 use crate::auth::LocalUser;
-use crate::db::{agents, conversations, messages};
+use crate::db::{conversations, messages};
 use crate::session_dto::{
     ItemView, TurnData, group_input_items, turn_interrupted_reason, turns_to_dto,
 };
-use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
+use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
-use super::active::ChatControl;
 use super::conversation::auto_archive_oldest_if_needed;
-use super::sse::{
-    ChatSseEvent, SubAgentInfo, UsageData, extract_sub_agent_result, map_looper_event,
-    parse_sub_agent_infos, strip_suffix,
-};
+use super::run::{Registration, RunDeps, RunError, RunSink, spawn_run};
+use super::sse::UsageData;
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
 
@@ -327,25 +319,20 @@ pub async fn get_messages(
     Ok(Json(responses))
 }
 
-/// 用必达的 `TurnComplete` 文本补齐落库累加器。
-///
-/// batch 轮的 `assistant_text` 全部来自可丢弃的 `ModelOutput(Batch)`：事件被
-/// `try_send` 丢掉时，成功轮会写不出 assistant 行。`TurnComplete` 是必达的，
-/// 用它补上最后的整段文本。`saw_text_delta` 为真说明是流式轮、文本已逐块累加
-/// （掉一块后再补整段会让已到达的片段重复），故不补。
-fn backfill_assistant_text(
-    assistant_text: &mut String,
-    saw_text_delta: bool,
-    final_text: Option<&str>,
-) {
-    let Some(text) = final_text else { return };
-    if saw_text_delta || text.is_empty() || assistant_text.ends_with(text) {
-        return;
-    }
-    assistant_text.push_str(text);
-}
-
 // ── SSE Stream Handler ───────────────────────────────────────────────────────
+
+/// 装配失败原样落到 HTTP：空间未打开仍是 409，agent 装载失败仍是 500。
+impl From<RunError> for ApiError {
+    fn from(err: RunError) -> Self {
+        match err {
+            RunError::Space(e) => ApiError::from(e),
+            RunError::Agent(message) => ApiError::Internal(message),
+            // HTTP 入口是顶替语义，走不到这一支；留着是为了「有在途运行」这条
+            // 语义在两条入口上有一致的状态码。
+            RunError::Busy => ApiError::Conflict("the conversation is already running".into()),
+        }
+    }
+}
 
 /// `GET /api/chat/{agentId}/conversations/{id}/stream?message=`
 ///
@@ -388,429 +375,27 @@ pub async fn stream_chat(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
 
-    // ── 2. 加载空间实例与 Agent（从 agent_name 字段，非 agent_id）───────
-    // 经 `SpaceRegistry` 取实例：空间未打开时是 409，路径与四个资源模块一致。
-    let ws = state.spaces.workspace(&ws_id).await?;
-    let agent = ws
-        .agent_manager()
-        .load_cached(&conv.agent_name)
-        .map_err(|e| {
-            ApiError::Internal(format!("failed to load agent '{}': {e}", conv.agent_name))
-        })?;
-    let team_id = state.spaces.team_id(&ws_id).await?;
-
-    // ── 3. 加载或创建 Session ────────────────────────────────────────────
-    let persister = SqliteSessionPersister::new(state.pool.clone());
-    let mut session: Box<Session> = match persister.load(&conv_id).await {
-        Ok(Some((snapshot, _meta))) => {
-            tracing::info!(
-                conversation_id = %conv_id,
-                turns = snapshot.committed_turns.len(),
-                "Session restored from snapshot"
-            );
-            let created_at = snapshot
-                .committed_turns
-                .first()
-                .and_then(|t| t.first())
-                .map(|m| m.timestamp_ms / 1000)
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                });
-            Box::new(Session::from_snapshot(
-                conv_id.clone(),
-                conv.title.clone(),
-                created_at,
-                snapshot,
-            ))
-        }
-        Err(e) => {
-            tracing::warn!(
-                conversation_id = %conv_id,
-                error = %e,
-                "failed to load session snapshot; starting a new session (history lost)"
-            );
-            Box::new(Session::new(conv_id.clone(), conv.title.clone()))
-        }
-        Ok(None) => {
-            tracing::info!(conversation_id = %conv_id, "Creating new session");
-            Box::new(Session::new(conv_id.clone(), conv.title.clone()))
-        }
-    };
-
-    // ── 3b. 崩溃恢复：冻结上次进程留下的在途轮 ────────────────────────────
-    hydrate_inflight_turn(&persister, &mut session).await;
-
-    // 「首轮」据水化**之后**的历史判定 —— 水化刚冻结的轮次同样是历史，
-    // 否则新一轮消息会去覆盖一个已有内容的会话标题。
-    let is_first_turn = session.committed_turns().is_empty();
-
-    // ── 4. 创建 SSE channel ──────────────────────────────────────────────
+    // ── 2. 建立事件出口并跑起来 ────────────────────────────────────────
     let (sse_tx, sse_rx) = mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(256);
 
-    // 观察 hook 与动态上下文在 spawn 之前装配：两者都要读 `ws` 的 work_dir 与
-    // `team_id`，而这两者随后会被 move 进后台任务。
-    let config = state.looper_config(&ws_id, &team_id, ws.work_dir().root().to_path_buf());
-
-    let db_for_bg = state.pool.clone();
-    let conv_id_for_bg = conv_id.clone();
-    let message_for_bg = message.clone();
-    let message_content_for_bg = message_content;
-    let team_id_for_bg = team_id;
-    let ws_for_bg = ws.clone();
-
-    // ── 5. 后台执行 AgentLooper ──────────────────────────────────────────
-    // 控制通道先于任务注册：否则「任务已在跑、注册表尚无条目」的窗口里
-    // 暂停请求会被误判为无在途运行。
-    let (mut control_rx, run_guard) = state.chat_runs.register(&conv_id);
-    tokio::spawn(async move {
-        // 持有至任务结束：守卫 drop 才移除注册表条目（见 `chat::active`）。
-        let _run_guard = run_guard;
-
-        let persister: Arc<dyn SessionPersister> =
-            Arc::new(SqliteSessionPersister::new(db_for_bg.clone()));
-
-        let handle = AgentLooper::spawn(agent, session, config, persister.clone());
-
-        if let Err(e) = handle.send_query_content(message_content_for_bg).await {
-            let err_event = ChatSseEvent::Error {
-                message: format!("Failed to send message: {e}"),
-                cancelled: false,
-                conversation_id: conv_id_for_bg.clone(),
-            };
-            if let Ok(ev) = err_event.to_sse_event() {
-                let _ = sse_tx.send(Ok(ev)).await;
-            }
-            return;
-        }
-
-        let _ = conversations::touch(&db_for_bg, &conv_id_for_bg).await;
-
-        let _ = messages::insert(
-            &db_for_bg,
-            &Uuid::new_v4().to_string(),
-            &conv_id_for_bg,
-            "user",
-            &message_for_bg,
-            None,
-            None,
-        )
-        .await;
-
-        let mut assistant_text = String::new();
-        // 流式轮是否真的收到过增量：决定 TurnComplete 的兜底能否追加整段文本。
-        let mut saw_text_delta = false;
-        let mut sub_agent_registry: HashMap<String, Vec<SubAgentInfo>> = HashMap::new();
-        // is_first_turn is captured from the outer scope — based on session
-        // snapshot committed_turns, NOT reset per SSE connection.
-        let mut is_first_turn = is_first_turn;
-
-        let resolve_agent_id = |agent_name: &str| -> String {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(agents::find_id_by_name_and_team(
-                    &db_for_bg,
-                    agent_name,
-                    &team_id_for_bg,
-                ))
-            })
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "unknown".to_string())
-        };
-
-        loop {
-            // 三路复用：looper 事件 / 暂停恢复控制 / 客户端断连。
-            //
-            // 断连一路不可省 —— chat 链路没有 peco runner 那样的桥接任务，
-            // 少了它，停靠（尤其暂停）中的 looper 会随无人观看的连接一直挂着。
-            // axum 的 SSE keep-alive 写入失败后响应体被 drop，`closed()` 随即就绪。
-            tokio::select! {
-                _ = sse_tx.closed() => break,
-
-                event = handle.recv_event() => match event {
-                Some(LooperEvent::TextDelta { delta }) => {
-                    saw_text_delta = true;
-                    assistant_text.push_str(&delta);
-                    if let Some(sse_ev) =
-                        map_looper_event(LooperEvent::TextDelta { delta }, &conv_id_for_bg)
-                        && let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                // ── batch 模型输出 ───────────────────────────────────────
-                // 与 TextDelta 共用同一条落库累加器：SSE 展示了、messages 表却是
-                // 空的，是比「不展示」更糟的不一致。
-                Some(LooperEvent::ModelOutput {
-                    call_index,
-                    origin,
-                    output,
-                }) if origin == ResponseOrigin::Batch => {
-                    assistant_text.push_str(&text_of_blocks(&output));
-                    // 文本提取只借用，随后把同一份 `output` 原样交给映射层
-                    // （不 clone、也不需要再解构一次事件）。
-                    let event = LooperEvent::ModelOutput {
-                        call_index,
-                        origin,
-                        output,
-                    };
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
-                        && let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                // ── 子 Agent 调用 ────────────────────────────────────────
-                Some(LooperEvent::ToolCallStart {
-                    ref id,
-                    ref name,
-                    ref arguments,
-                }) if name == "delegate_sub_agent" || name == "run_parallel_sub_agents" => {
-                    let infos = parse_sub_agent_infos(id, name, arguments, resolve_agent_id);
-
-                    for info in &infos {
-                        let task = if name == "delegate_sub_agent" {
-                            serde_json::from_str::<serde_json::Value>(arguments)
-                                .ok()
-                                .and_then(|v| v["prompt"].as_str().map(|s| s.to_string()))
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-
-                        let sse_ev = ChatSseEvent::AgentCallStart {
-                            call_id: info.call_id.clone(),
-                            agent_id: info.agent_id.clone(),
-                            agent_name: info.agent_name.clone(),
-                            task,
-                            conversation_id: conv_id_for_bg.clone(),
-                        };
-                        if let Ok(ev) = sse_ev.to_sse_event()
-                            && sse_tx.send(Ok(ev)).await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    sub_agent_registry.insert(id.clone(), infos);
-
-                    if let Some(sse_ev) = map_looper_event(
-                        LooperEvent::ToolCallStart {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                        },
-                        &conv_id_for_bg,
-                    ) && let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                // ── 子 Agent 调用结束 ────────────────────────────────────
-                Some(LooperEvent::ToolResult {
-                    ref id,
-                    ref name,
-                    ref result,
-                    ref artifacts,
-                    ..
-                }) if name == "delegate_sub_agent" || name == "run_parallel_sub_agents" => {
-                    if let Some(infos) = sub_agent_registry.remove(id.as_str()) {
-                        for info in infos {
-                            let sub_result = extract_sub_agent_result(result, &info, name);
-                            let sse_ev = ChatSseEvent::AgentCallEnd {
-                                call_id: info.call_id,
-                                agent_id: info.agent_id,
-                                agent_name: info.agent_name,
-                                result: sub_result,
-                                conversation_id: conv_id_for_bg.clone(),
-                            };
-                            if let Ok(ev) = sse_ev.to_sse_event()
-                                && sse_tx.send(Ok(ev)).await.is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-
-                    // 子 agent 的最终正文若带声明行，父层构造结果时已剥离并挂在
-                    // 本事件上；`AgentCallEnd` 只带文本，不能吞掉 —— 必须同样落库。
-                    let sse_ev = crate::artifact::build_tool_result_event(
-                        &db_for_bg,
-                        crate::artifact::work_dir(&ws_for_bg),
-                        &conv_id_for_bg,
-                        LOCAL_USER_ID,
-                        id.clone(),
-                        name.clone(),
-                        String::new(),
-                        Vec::new(),
-                        artifacts,
-                    )
-                    .await;
-                    if let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                Some(event @ LooperEvent::TurnComplete { .. }) => {
-                    // batch 轮文本只来自可丢弃的 `ModelOutput(Batch)`：慢客户端
-                    // 把通道塞满时事件会被丢掉。TurnComplete 必达，用它兜底，
-                    // 否则成功轮会写不出 assistant 行。
-                    if let LooperEvent::TurnComplete { outcome, .. } = &event {
-                        backfill_assistant_text(
-                            &mut assistant_text,
-                            saw_text_delta,
-                            outcome.text(),
-                        );
-                    }
-                    if !assistant_text.is_empty() {
-                        let _ = messages::insert(
-                            &db_for_bg,
-                            &Uuid::new_v4().to_string(),
-                            &conv_id_for_bg,
-                            "assistant",
-                            &assistant_text,
-                            None,
-                            None,
-                        )
-                        .await;
-
-                        // 仅首轮对话时根据用户第一条消息自动生成标题
-                        if is_first_turn {
-                            let short: String = message_for_bg.chars().take(50).collect();
-                            let new_title = if short.len() >= message_for_bg.len() {
-                                short
-                            } else {
-                                format!("{short}...")
-                            };
-                            if new_title.len() > 3 {
-                                let _ = conversations::update_title(
-                                    &db_for_bg,
-                                    &conv_id_for_bg,
-                                    &new_title,
-                                )
-                                .await;
-                            }
-                            is_first_turn = false;
-                        }
-                    }
-                    assistant_text.clear();
-                    saw_text_delta = false;
-
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
-                        && let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                // ── 截断重试 ─────────────────────────────────────────────
-                // 就地剥离被作废那次的正文 —— 它不属于最终答案，不该进
-                // `messages` 表。前端侧不删自己已收到的增量，只把这条事件当
-                // 通知看：落库内容对齐最终答案、SSE 内容对齐用户一路看到的
-                // 东西，两者在这里分道。
-                Some(event @ LooperEvent::TruncationRetry { .. }) => {
-                    if let LooperEvent::TruncationRetry { discarded_text, .. } = &event {
-                        strip_suffix(&mut assistant_text, discarded_text);
-                    }
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
-                        && let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                Some(LooperEvent::Shutdown { total_usage, .. }) => {
-                    let done_ev = ChatSseEvent::Done {
-                        usage: UsageData::from(total_usage),
-                        conversation_id: conv_id_for_bg.clone(),
-                    };
-                    if let Ok(ev) = done_ev.to_sse_event() {
-                        let _ = sse_tx.send(Ok(ev)).await;
-                    }
-                    break;
-                }
-
-                // ── 工具声明的产物 ────────────────────────────────────────
-                // 必须先落库再发事件：事件里的 id 是前端访问内容/下载端点的
-                // 唯一凭据，不能等到前端自己上报。带产物的 ToolResult 因此
-                // 不进 `map_looper_event`（那是纯函数，拿不到 DB）。
-                Some(LooperEvent::ToolResult {
-                    ref id,
-                    ref name,
-                    ref result,
-                    ref images,
-                    ref artifacts,
-                }) if !artifacts.is_empty() => {
-                    let sse_ev = crate::artifact::build_tool_result_event(
-                        &db_for_bg,
-                        crate::artifact::work_dir(&ws_for_bg),
-                        &conv_id_for_bg,
-                        LOCAL_USER_ID,
-                        id.clone(),
-                        name.clone(),
-                        result.clone(),
-                        images.clone(),
-                        artifacts,
-                    )
-                    .await;
-                    if let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                Some(event) => {
-                    if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
-                        && let Ok(ev) = sse_ev.to_sse_event()
-                        && sse_tx.send(Ok(ev)).await.is_err()
-                    {
-                        break;
-                    }
-                }
-
-                None => break,
-                },
-
-                // 暂停/恢复：来自 `POST .../pause` / `.../resume`。控制通道关闭
-                // 说明本流已被同会话的新 stream 顶替，退出让位。
-                cmd = control_rx.recv() => match cmd {
-                    Some(ChatControl::Pause) => {
-                        if let Err(e) = handle.pause().await {
-                            tracing::warn!(
-                                conversation_id = %conv_id_for_bg,
-                                error = %e,
-                                "Failed to deliver pause"
-                            );
-                        }
-                    }
-                    Some(ChatControl::Resume) => {
-                        if let Err(e) = handle.resume().await {
-                            tracing::warn!(
-                                conversation_id = %conv_id_for_bg,
-                                error = %e,
-                                "Failed to deliver resume"
-                            );
-                        }
-                    }
-                    None => break,
-                },
-            }
-        }
-
-        drop(handle);
-    });
+    // 注册交给 `spawn_run`，位置在空间/agent/会话校验之后：同会话重复访问是顶替
+    // 语义（页面重载要靠它挤掉旧连接），但一个注定 409 的请求不该把在途的 run
+    // 挤掉。
+    spawn_run(
+        RunDeps {
+            pool: &state.pool,
+            env: &state.env,
+            spaces: &state.spaces,
+            chat_runs: &state.chat_runs,
+        },
+        &ws_id,
+        &conv,
+        message,
+        message_content,
+        RunSink::Sse(sse_tx),
+        Registration::Replace,
+    )
+    .await?;
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(sse_rx);
     Ok(Sse::new(stream).keep_alive(
@@ -1043,45 +628,4 @@ fn conversation_turns_markdown(
         }
     }
     md
-}
-
-#[cfg(test)]
-mod tests {
-    use super::backfill_assistant_text;
-
-    #[test]
-    fn backfills_when_no_delta_was_seen() {
-        let mut acc = String::new();
-        backfill_assistant_text(&mut acc, false, Some("answer"));
-        assert_eq!(acc, "answer");
-    }
-
-    #[test]
-    fn appends_final_text_when_earlier_batch_calls_landed() {
-        let mut acc = "first".to_string();
-        backfill_assistant_text(&mut acc, false, Some("answer"));
-        assert_eq!(acc, "firstanswer");
-    }
-
-    #[test]
-    fn does_not_duplicate_when_final_text_is_already_the_suffix() {
-        let mut acc = "firstanswer".to_string();
-        backfill_assistant_text(&mut acc, false, Some("answer"));
-        assert_eq!(acc, "firstanswer");
-    }
-
-    #[test]
-    fn leaves_streamed_text_untouched() {
-        // 流式轮已逐块累加；掉一块时补整段会让已到达的片段重复。
-        let mut acc = " world".to_string();
-        backfill_assistant_text(&mut acc, true, Some("hello world"));
-        assert_eq!(acc, " world");
-    }
-
-    #[test]
-    fn failed_turns_have_no_final_text() {
-        let mut acc = String::new();
-        backfill_assistant_text(&mut acc, false, None);
-        assert!(acc.is_empty());
-    }
 }

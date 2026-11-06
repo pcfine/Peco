@@ -7,9 +7,12 @@
 mod support;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use peco_core::artifacts::ArtifactDecl;
+use peco_daemon::chat::ChatActiveRuns;
+use peco_daemon::state::AppState;
 use serde_json::json;
 use support::{call_in_space, new_env};
 
@@ -195,6 +198,49 @@ async fn chat_and_artifact_routes_require_a_space_selector() {
         assert_eq!(reply.status, 400, "{method} {uri} body={}", reply.body);
         assert_eq!(reply.code(), "space_required", "{method} {uri}");
     }
+}
+
+/// 注册是顶替语义，但一个注定失败的请求不该把该会话在途的 run 挤掉。
+///
+/// 变异方法：把注册挪回 `spawn_run` 之前（即 handler 里先 `register` 再校验）⇒
+/// 占位 run 的条目被顶替后随失败的那次请求一起 drop，`pause` 变 false、通道收不到
+/// 任何命令，两条断言同时变红。
+#[tokio::test]
+async fn a_failed_stream_request_does_not_supersede_the_running_turn() {
+    let env = new_env(&["peco"]).await;
+    // 只索引、不打开：`spaces.workspace()` 在装配期就失败，这次请求注定 409。
+    let dir = env.work_dir("closed_peco");
+    let ws_id = env.resolve(&dir, "peco").await.unwrap();
+    let created = env
+        .post_in(&ws_id, &conversations_uri("@master"), json!({}))
+        .await;
+    assert_eq!(created.status, 201, "body={}", created.body);
+    let conv_id = created.body["id"].as_str().unwrap().to_string();
+
+    // 用户正开着这个会话：这条注册就是那个「在途的 run」。
+    let chat_runs = Arc::new(ChatActiveRuns::new());
+    let (mut control_rx, _placeholder_guard) = chat_runs.register(&conv_id);
+    let router = peco_daemon::http::router(AppState {
+        chat_runs: chat_runs.clone(),
+        ..env.app_state()
+    });
+
+    let reply = call_in_space(
+        &router,
+        Method::GET,
+        &format!("/api/chat/@master/conversations/{conv_id}/stream?message=hi"),
+        None,
+        Some(&ws_id),
+    )
+    .await;
+
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+    assert_eq!(reply.code(), "space_not_open", "body={}", reply.body);
+    assert!(chat_runs.pause(&conv_id), "占位 run 的条目被顶替掉了");
+    assert!(
+        control_rx.try_recv().is_ok(),
+        "控制命令必须仍落到占位 run 的通道"
+    );
 }
 
 /// 空间已索引但未打开 ⇒ 409 `space_not_open`：需要实例的端点必须先让空间打开。

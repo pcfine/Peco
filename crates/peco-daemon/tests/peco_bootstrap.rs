@@ -19,9 +19,37 @@ fn master_agent_path(home: &Path) -> PathBuf {
         .join("agents/@master/agent.md")
 }
 
+fn private_memory_config_path(home: &Path) -> PathBuf {
+    home.join("teams")
+        .join("peco")
+        .join("knowledge/@private_memory/kb_config.json")
+}
+
+/// `teams/peco/agents/*/` 下的 `agent.md.bak.*`；升版闸门动过文件才会出现。
+fn agent_backups(home: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(agents) = std::fs::read_dir(home.join("teams/peco/agents")) else {
+        return found;
+    };
+    for agent in agents.flatten() {
+        let Ok(files) = std::fs::read_dir(agent.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            if file.file_name().to_string_lossy().contains(".bak.") {
+                found.push(file.path());
+            }
+        }
+    }
+    found
+}
+
 /// 连跑两次引导：模板文件与索引都必须收敛，用户改过的字节必须留着。
 ///
-/// 变异方法：铺模板时去掉「已存在则跳过」，第二次启动会把 `# edited by user`
+/// 「留着」的承诺只覆盖记录/知识文件：`agents/*/agent.md` 按 `template_version`
+/// 升版覆盖（见 `space::bootstrap` 的模块说明），故这里改的是知识库配置。
+///
+/// 变异方法：铺模板时去掉「已存在则跳过」，第二次启动会把用户改过的 kb 配置
 /// 覆盖回模板内容 → 本测试的字节相等断言变红。
 #[tokio::test]
 async fn bootstrapping_twice_keeps_user_edits_and_a_single_row() {
@@ -33,14 +61,26 @@ async fn bootstrapping_twice_keeps_user_edits_and_a_single_row() {
     let template_bytes = std::fs::read(&agent).unwrap();
     assert!(!template_bytes.is_empty(), "模板文件不该是空的");
 
-    std::fs::write(&agent, b"# edited by user\n").unwrap();
+    let config = private_memory_config_path(&env.home);
+    let edited = b"{\"edited_by_user\": true}\n";
+    std::fs::write(&config, edited).unwrap();
 
     bootstrap_peco(&env.env).await;
 
     assert_eq!(
+        std::fs::read(&config).unwrap(),
+        edited,
+        "第二次引导覆盖了用户改过的知识文件"
+    );
+    assert_eq!(
         std::fs::read(&agent).unwrap(),
-        b"# edited by user\n",
-        "第二次引导覆盖了用户改过的模板文件"
+        template_bytes,
+        "版本没变的提示词必须与模板逐字节一致"
+    );
+    assert!(
+        agent_backups(&env.home).is_empty(),
+        "没有升版就不该留下备份: {:?}",
+        agent_backups(&env.home)
     );
     assert!(
         env.home.join("teams/peco/team.json").is_file(),
@@ -54,6 +94,52 @@ async fn bootstrapping_twice_keeps_user_edits_and_a_single_row() {
     assert_eq!(
         rows[0].work_dir,
         env.home.join("spaces/peco/work").to_string_lossy()
+    );
+}
+
+/// 已装过的空间必须能拿到提示词修正：把 `@master/agent.md` 换回旧版本 + 旧正文，
+/// 再引导一次 —— 内容升版成当前模板，旧文本进 `agent.md.bak.<旧版本>`。
+///
+/// 变异方法：`@master` 已存在就整步 return，文件会停在旧版本 → 内容比对变红。
+#[tokio::test]
+async fn an_installed_space_gets_the_newer_prompt_and_a_backup() {
+    let env = new_env(&[]).await;
+    bootstrap_peco(&env.env).await;
+
+    let agent = master_agent_path(&env.home);
+    let old = "---\nagent:\n  name: \"@master\"\n  description: \"旧版\"\n\
+               template_version: 12\n---\n\n# 旧的唤醒字段名\n";
+    std::fs::write(&agent, old).unwrap();
+
+    bootstrap_peco(&env.env).await;
+
+    let template = peco_agents::BuiltinTemplate::peco()
+        .files
+        .iter()
+        .find(|(rel, _)| *rel == "agents/@master/agent.md")
+        .map(|(_, bytes)| *bytes)
+        .expect("peco 模板必须带 @master");
+    assert_eq!(
+        std::fs::read(&agent).unwrap(),
+        template,
+        "陈旧提示词必须被升版覆盖成当前模板"
+    );
+
+    let backups = agent_backups(&env.home);
+    assert_eq!(backups.len(), 1, "升版只该留一份备份: {backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(&backups[0]).unwrap(),
+        old,
+        "备份里必须是旧文本"
+    );
+    assert!(
+        backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".bak.12"),
+        "备份名要带旧版本号: {:?}",
+        backups[0]
     );
 }
 
