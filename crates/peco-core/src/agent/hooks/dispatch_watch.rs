@@ -2,9 +2,10 @@
 // dispatch_watch — B 类观察：派发之后持续观察目标空间里的任务
 // ============================================================================
 //
-// `dispatch_to_workspace` 只是提交：任务会在目标 workspace 的 Hub 里继续运行，
-// 发起方 turn 结束后仍然活着。本 hook 在工具返回时解析回执，另起一个后台任务
-// 订阅目标任务，把注册 / 增量 / 终态 / 失联翻译成 [`TaskObservationSink`] 调用。
+// 两个工具都只是提交：`dispatch_to_workspace` 交给目标空间，`run_machine_task`
+// 交给本空间的其他 agent。任务在双方 turn 结束后都仍然活着，所以本 hook 在工具
+// 返回时解析结果，每一条未终态的任务各起一个后台任务订阅它，把注册 / 增量 /
+// 终态 / 失联翻译成 [`TaskObservationSink`] 调用。
 //
 // 生命周期与 turn 解耦：watcher 是独立 `tokio::spawn` 的任务，不随 turn 取消而
 // 停止 —— 这正是「B 类观察」的语义。它只持 `Weak<WorkspaceHub>`，且在任何
@@ -16,6 +17,7 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use model_provider::ToolCall;
+use serde::Deserialize;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -26,6 +28,8 @@ use crate::tools::{DispatchReceipt, WorkspaceHub, WorkspaceToolError};
 
 /// 被观察的工具名，同时作为观察记录的 `origin_kind`。
 pub(crate) const DISPATCH_TOOL_NAME: &str = "dispatch_to_workspace";
+/// 同一条观察通道上的第二个工具：`origin_kind` 与工具名同源，台账据此区分。
+pub(crate) const RUN_MACHINE_TASK_TOOL_NAME: &str = "run_machine_task";
 /// `Lagged` / 非终态 `End` 触发的重订阅上限；超过即认为任务已不可观察。
 const MAX_RESUBSCRIBES: usize = 3;
 
@@ -38,20 +42,150 @@ const MAX_RESUBSCRIBES: usize = 3;
 pub struct DispatchOrigin {
     pub ws_id: String,
     pub principal: String,
+    /// 发起方 workspace 的 work_dir。`run_machine_task` 的任务落在发起方自己的
+    /// Hub 里，结果中没有目录，只能从这里取。
+    pub origin_dir: PathBuf,
 }
 
-/// 一次派发观察的身份：目标目录 + 任务 id 是重订阅与事后查询的唯一句柄。
+/// 一次观察的身份：目标目录 + 任务 id 是重订阅与事后查询的唯一句柄。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DispatchObservation {
     pub origin: DispatchOrigin,
-    /// 目标 workspace 目录（派发回执里的 workspace，已规范化）。
+    /// 目标任务所在的 workspace 目录，已规范化：派发取自回执的 workspace，
+    /// `run_machine_task` 取自 [`DispatchOrigin::origin_dir`]。
     pub target_dir: PathBuf,
     pub task_id: TaskId,
+    /// 派发有回执 id；`run_machine_task` 没有。
     pub dispatch_id: Option<String>,
-    /// 固定 "dispatch_to_workspace"；为将来 run_machine_task 观察留位。
+    /// 产生这条观察的工具名：`dispatch_to_workspace` 或 `run_machine_task`。
     pub origin_kind: String,
-    /// 目标 agent，dispatch 恒为 @master。
+    /// 执行该任务的 agent：派发恒为 @master，`run_machine_task` 取自结果条目。
     pub agent_name: String,
+}
+
+// ============================================================================
+// 观察计划：工具结果 → 要观察的任务
+// ============================================================================
+
+/// 工具结果原文 → 观察计划。
+///
+/// 只做翻译：不碰 Hub、不 spawn，因此可以直接按字符串单测。解析失败在这里记一条
+/// warn —— 静默丢弃会让「任务在跑、却没人观察」变成无从诊断的缺口。
+fn plan_watches(
+    tool_name: &str,
+    result: &str,
+    origin: &DispatchOrigin,
+) -> Vec<DispatchObservation> {
+    let planned = match tool_name {
+        DISPATCH_TOOL_NAME => dispatch_observations(result, origin),
+        RUN_MACHINE_TASK_TOOL_NAME => machine_task_observations(result, origin),
+        _ => return Vec::new(),
+    };
+    match planned {
+        Ok(observations) => observations,
+        Err(err) => {
+            warn!(
+                tool = tool_name,
+                error = %err,
+                "tool result does not match the observation contract; nothing to observe"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// 解析失败的原因：只进日志，不参与控制流 —— 观察出错绝不能反向影响 looper。
+#[derive(Debug, thiserror::Error)]
+enum PlanError {
+    #[error("result is not valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("task_id is not a uuid: {0}")]
+    TaskId(#[from] uuid::Error),
+    #[error("dispatch receipt has no workspace directory")]
+    EmptyWorkspace,
+}
+
+fn dispatch_observations(
+    result: &str,
+    origin: &DispatchOrigin,
+) -> Result<Vec<DispatchObservation>, PlanError> {
+    let receipt: DispatchReceipt = serde_json::from_str(result)?;
+    let task_id = TaskId(Uuid::parse_str(&receipt.task_id)?);
+    let target = receipt.workspace.trim();
+    if target.is_empty() {
+        return Err(PlanError::EmptyWorkspace);
+    }
+    Ok(vec![DispatchObservation {
+        origin: origin.clone(),
+        // 回执里的 workspace 由目标空间自己给出：规范化后才是 Hub 的索引键。
+        target_dir: std::fs::canonicalize(target).unwrap_or_else(|_| PathBuf::from(target)),
+        task_id,
+        dispatch_id: (!receipt.dispatch_id.is_empty()).then_some(receipt.dispatch_id),
+        origin_kind: DISPATCH_TOOL_NAME.to_string(),
+        agent_name: MASTER_AGENT_NAME.to_string(),
+    }])
+}
+
+fn machine_task_observations(
+    result: &str,
+    origin: &DispatchOrigin,
+) -> Result<Vec<DispatchObservation>, PlanError> {
+    let parsed: MachineTaskResults = serde_json::from_str(result)?;
+    Ok(parsed
+        .results
+        .into_iter()
+        .filter_map(|item| machine_task_observation(item, origin))
+        .collect())
+}
+
+fn machine_task_observation(
+    item: MachineTaskResult,
+    origin: &DispatchOrigin,
+) -> Option<DispatchObservation> {
+    // 判据是条目自己的 `terminal`，与调用方的 `wait` 无关：wait=true 超时后任务
+    // 仍在跑，按 wait 判定会漏掉它，让它变成永远没人观察的孤儿。
+    if item.terminal == Some(true) {
+        return None;
+    }
+    // 提交即被拒的条目没有 task_id，没有任务可观察。
+    let raw_task_id = item.task_id?;
+    // 条目之间互不牵连：一个坏 id 不该让同一批里其它仍在跑的任务失去观察。
+    let task_id = match Uuid::parse_str(&raw_task_id) {
+        Ok(id) => TaskId(id),
+        Err(err) => {
+            warn!(
+                task_id = %raw_task_id,
+                agent = %item.agent_name,
+                error = %err,
+                "task id is not a uuid; this task stays unobserved"
+            );
+            return None;
+        }
+    };
+    Some(DispatchObservation {
+        origin: origin.clone(),
+        target_dir: origin.origin_dir.clone(),
+        task_id,
+        dispatch_id: None,
+        origin_kind: RUN_MACHINE_TASK_TOOL_NAME.to_string(),
+        agent_name: item.agent_name,
+    })
+}
+
+/// `run_machine_task` 的结果正文：只取观察需要的字段，渲染细节与预算无关。
+#[derive(Deserialize)]
+struct MachineTaskResults {
+    /// 缺 `results` 就是「这次没有任务结果」；形状不对才算解析失败。
+    #[serde(default)]
+    results: Vec<MachineTaskResult>,
+}
+
+#[derive(Deserialize)]
+struct MachineTaskResult {
+    agent_name: String,
+    task_id: Option<String>,
+    /// 缺字段按未终态处理：宁可多观察一条，也不能漏掉还在跑的任务。
+    terminal: Option<bool>,
 }
 
 // ============================================================================
@@ -80,10 +214,11 @@ pub trait TaskObservationSink: Send + Sync {
 // Hook
 // ============================================================================
 
-/// `on_after_tool` 观察者：只认 `dispatch_to_workspace` 的成功回执。
+/// `on_after_tool` 观察者：认 `dispatch_to_workspace` 与 `run_machine_task` 的
+/// 成功结果，每条未终态任务起一个 watcher。
 ///
-/// hook 本身立即返回；实际观察在独立任务里进行，任何解析失败都静默忽略，
-/// 绝不对 looper 造成影响。
+/// hook 本身立即返回；实际观察在独立任务里进行，解析失败只记日志，绝不对 looper
+/// 造成影响。
 pub struct DispatchWatchHook {
     hub: Weak<WorkspaceHub>,
     origin: DispatchOrigin,
@@ -109,40 +244,28 @@ impl LooperHook for DispatchWatchHook {
         result: &str,
         is_error: bool,
     ) {
-        if is_error || tool_call.function.name != DISPATCH_TOOL_NAME {
+        // 工具失败是调用结果，不是解析失败：错误正文不代表回执形状。
+        if is_error {
             return;
         }
-        let Ok(receipt) = serde_json::from_str::<DispatchReceipt>(result) else {
-            return;
-        };
-        let Ok(task_id) = Uuid::parse_str(&receipt.task_id) else {
-            return;
-        };
-        let target = receipt.workspace.trim();
-        if target.is_empty() {
+        let observations = plan_watches(&tool_call.function.name, result, &self.origin);
+        if observations.is_empty() {
             return;
         }
-        let target_dir = std::fs::canonicalize(target).unwrap_or_else(|_| PathBuf::from(target));
-
-        let observation = DispatchObservation {
-            origin: self.origin.clone(),
-            target_dir,
-            task_id: TaskId(task_id),
-            dispatch_id: (!receipt.dispatch_id.is_empty()).then_some(receipt.dispatch_id),
-            origin_kind: DISPATCH_TOOL_NAME.to_string(),
-            agent_name: MASTER_AGENT_NAME.to_string(),
-        };
 
         // hook 在 looper 的 async context 内被调用；没有运行时（极端测试上下文）
         // 时宁可放弃观察，也不能 panic 掉整个 looper。
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             warn!(
-                task_id = %observation.task_id,
-                "no tokio runtime; dispatch observation skipped"
+                tool = %tool_call.function.name,
+                observations = observations.len(),
+                "no tokio runtime; task observations skipped"
             );
             return;
         };
-        runtime.spawn(watch(self.hub.clone(), observation, Arc::clone(&self.sink)));
+        for observation in observations {
+            runtime.spawn(watch(self.hub.clone(), observation, Arc::clone(&self.sink)));
+        }
     }
 }
 
@@ -362,21 +485,30 @@ mod tests {
             dispatch_id: "dispatch-1".to_string(),
             task_id: task_id.to_string(),
             workspace: workspace.display().to_string(),
-            state: "Submitted".to_string(),
+            state: "submitted".to_string(),
             output: None,
             timed_out: false,
+        }
+    }
+
+    fn origin(dir: &std::path::Path) -> DispatchOrigin {
+        DispatchOrigin {
+            ws_id: "ws_origin".to_string(),
+            principal: "alice".to_string(),
+            origin_dir: dir.to_path_buf(),
         }
     }
 
     fn hook(hub: &Arc<WorkspaceHub>, sink: Arc<dyn TaskObservationSink>) -> DispatchWatchHook {
         DispatchWatchHook::new(
             Arc::downgrade(hub),
-            DispatchOrigin {
-                ws_id: "ws_origin".to_string(),
-                principal: "alice".to_string(),
-            },
+            origin(std::path::Path::new("/origin/ws")),
             sink,
         )
+    }
+
+    fn machine_call() -> ToolCall {
+        ToolCall::new("call-2", RUN_MACHINE_TASK_TOOL_NAME, "{}")
     }
 
     fn dispatch_call() -> ToolCall {
@@ -577,9 +709,12 @@ mod tests {
         let hook = hook(&hub, sink.clone());
         let payload = serde_json::to_string(&receipt(dir.path(), id)).unwrap();
 
-        // 非 dispatch 工具名。
-        let other = ToolCall::new("c", "run_machine_task", "{}");
+        // 不在观察面上的工具名。
+        let other = ToolCall::new("c", "shell", "{}");
         hook.on_after_tool(0, &other, &payload, false).await;
+        // 认的工具喂错形状的结果：回执喂给 run_machine_task。
+        hook.on_after_tool(0, &machine_call(), &payload, false)
+            .await;
         // 工具报错。
         hook.on_after_tool(0, &dispatch_call(), &payload, true)
             .await;
@@ -593,7 +728,7 @@ mod tests {
             dispatch_id: "d".to_string(),
             task_id: "not-a-uuid".to_string(),
             workspace: dir.path().display().to_string(),
-            state: "Submitted".to_string(),
+            state: "submitted".to_string(),
             output: None,
             timed_out: false,
         };
@@ -609,7 +744,7 @@ mod tests {
             dispatch_id: "d".to_string(),
             task_id: id.to_string(),
             workspace: "  ".to_string(),
-            state: "Submitted".to_string(),
+            state: "submitted".to_string(),
             output: None,
             timed_out: false,
         };
@@ -719,6 +854,170 @@ mod tests {
             reason.contains(&id.to_string()) && reason.contains("not open"),
             "the reason must name the task and the space: {reason}"
         );
+    }
+
+    // ── plan_watches：结果原文 → 观察条数 ──────────────────────────────
+
+    /// 变异点：target_dir 改回 `origin.origin_dir` ⇒ 派发会去错空间订阅。
+    #[test]
+    fn a_dispatch_receipt_plans_one_watch_on_the_receipt_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(std::path::Path::new("/origin/ws"));
+        let id = TaskId(Uuid::new_v4());
+        let payload = serde_json::to_string(&receipt(dir.path(), id)).unwrap();
+
+        let planned = plan_watches(DISPATCH_TOOL_NAME, &payload, &origin);
+
+        assert_eq!(planned.len(), 1);
+        let obs = &planned[0];
+        assert_eq!(
+            obs.target_dir,
+            std::fs::canonicalize(dir.path()).unwrap(),
+            "the receipt workspace is the target, not the origin directory"
+        );
+        assert_eq!(obs.task_id, id);
+        assert_eq!(obs.dispatch_id.as_deref(), Some("dispatch-1"));
+        assert_eq!(obs.origin_kind, DISPATCH_TOOL_NAME);
+        assert_eq!(obs.agent_name, MASTER_AGENT_NAME);
+        assert_eq!(obs.origin, origin);
+    }
+
+    /// 变异点：把 `terminal == Some(true)` 的跳过改成按 `wait`/整体终态判定 ⇒
+    /// 超时后那条仍在跑的任务不再产生观察（B3 的静默缺口）。
+    #[test]
+    fn only_unfinished_machine_tasks_are_planned_for_the_origin_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(dir.path());
+        let running_a = Uuid::new_v4();
+        let running_b = Uuid::new_v4();
+        let finished = Uuid::new_v4();
+        let payload = json!({
+            "waited": true,
+            "timed_out": true,
+            "results": [
+                { "index": 0, "agent_name": "worker", "task_id": running_a.to_string(), "terminal": false },
+                { "index": 1, "agent_name": "helper", "task_id": running_b.to_string(), "terminal": false },
+                { "index": 2, "agent_name": "done", "task_id": finished.to_string(), "terminal": true },
+                { "index": 3, "agent_name": "ghost", "task_id": null, "terminal": false },
+            ]
+        })
+        .to_string();
+
+        let planned = plan_watches(RUN_MACHINE_TASK_TOOL_NAME, &payload, &origin);
+
+        assert_eq!(
+            planned.len(),
+            2,
+            "two running tasks, one rejected, one terminal"
+        );
+        assert_eq!(
+            planned.iter().map(|obs| obs.task_id).collect::<Vec<_>>(),
+            vec![TaskId(running_a), TaskId(running_b)]
+        );
+        assert_eq!(
+            planned
+                .iter()
+                .map(|obs| obs.agent_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worker", "helper"],
+            "agent_name comes from the result entry"
+        );
+        for obs in &planned {
+            assert_eq!(obs.target_dir, dir.path());
+            assert_eq!(obs.origin_kind, RUN_MACHINE_TASK_TOOL_NAME);
+            assert_eq!(obs.dispatch_id, None);
+            assert_eq!(obs.origin, origin);
+        }
+    }
+
+    /// 变异点：`MachineTaskResults` 去掉 `#[serde(default)]` ⇒ 缺 `results` 变成
+    /// 解析失败；把 `serde_json` 错误 unwrap ⇒ 直接 panic 掉 looper。
+    #[test]
+    fn unreadable_results_plan_nothing_instead_of_panicking() {
+        let origin = origin(std::path::Path::new("/origin/ws"));
+        for payload in [
+            "not json",
+            "{}",
+            r#"{"results":{}}"#,
+            r#"{"results":[]}"#,
+            r#"{"results":[{"task_id":1}]}"#,
+        ] {
+            assert!(
+                plan_watches(RUN_MACHINE_TASK_TOOL_NAME, payload, &origin).is_empty(),
+                "payload must plan nothing: {payload}"
+            );
+        }
+
+        // 派发侧的坏回执同样只是「没有观察」，不是 panic。
+        for payload in ["not json", "{}", r#"{"task_id":"not-a-uuid"}"#] {
+            assert!(
+                plan_watches(DISPATCH_TOOL_NAME, payload, &origin).is_empty(),
+                "payload must plan nothing: {payload}"
+            );
+        }
+        let empty_workspace = DispatchReceipt {
+            dispatch_id: "d".to_string(),
+            task_id: Uuid::new_v4().to_string(),
+            workspace: "   ".to_string(),
+            state: "submitted".to_string(),
+            output: None,
+            timed_out: false,
+        };
+        assert!(
+            plan_watches(
+                DISPATCH_TOOL_NAME,
+                &serde_json::to_string(&empty_workspace).unwrap(),
+                &origin
+            )
+            .is_empty()
+        );
+    }
+
+    /// 端到端：`run_machine_task` 的两条未终态条目各得到一个 watcher，
+    /// 终态条目不被观察（变异点：把 `terminal` 判据去掉 ⇒ 观察数变成 3）。
+    #[tokio::test]
+    async fn a_machine_task_result_registers_every_unfinished_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime();
+        runtime
+            .hub()
+            .expect("hub")
+            .register(Arc::new(EchoMachine::new()))
+            .expect("register echo");
+        let finished = submit(&runtime, "echo", "done").await;
+        runtime
+            .hub()
+            .expect("hub")
+            .await_terminal(&finished, Some(BUDGET))
+            .await
+            .expect("the echo task converges");
+        let hub = open_hub(dir.path(), runtime);
+
+        let (sink, mut rx) = sink();
+        let payload = json!({
+            "waited": true,
+            "timed_out": true,
+            "results": [
+                { "index": 0, "agent_name": "worker", "task_id": finished.to_string(), "terminal": true },
+                { "index": 1, "agent_name": "helper", "task_id": Uuid::new_v4().to_string(), "terminal": false },
+            ]
+        })
+        .to_string();
+        DispatchWatchHook::new(Arc::downgrade(&hub), origin(dir.path()), sink)
+            .on_after_tool(0, &machine_call(), &payload, false)
+            .await;
+
+        let Recorded::Orphaned(obs, reason) = next(&mut rx).await else {
+            panic!("the unknown task id must be the one that gets watched");
+        };
+        assert_eq!(obs.origin_kind, RUN_MACHINE_TASK_TOOL_NAME);
+        assert_eq!(obs.agent_name, "helper");
+        assert_eq!(obs.target_dir, std::fs::canonicalize(dir.path()).unwrap());
+        assert!(
+            reason.contains("not found"),
+            "the terminal entry must not be watched: {reason}"
+        );
+        assert_watcher_ended(&mut rx).await;
     }
 
     async fn wait_for_working(runtime: &Arc<MachineRuntime>, id: &TaskId) {

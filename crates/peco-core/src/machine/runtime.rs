@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use thiserror::Error;
 use tracing::warn;
 
-use crate::agent::{Agent, AgentError};
+use crate::agent::{Agent, AgentError, LooperConfig, LooperHook};
 
 use super::agent::{AgentMachine, AgentMachineConfig};
 use super::hub::{HubConfig, TaskHub};
@@ -44,6 +44,13 @@ pub struct MachineRuntime {
     /// agent 名（trim 后）→ 注册时那一份 `Arc<Agent>`：只服务 `Arc::ptr_eq` 判断，
     /// 决定要不要 `replace`。
     registered: Mutex<HashMap<String, Arc<Agent>>>,
+    /// 注入给 machine 执行体的 looper hook：被派发的 `@master` 自己再派发出去的
+    /// 异步任务同样要有人观察，否则它静默。
+    ///
+    /// 宿主在空间打开时注入一次。注入只影响**此后**注册的 machine ——
+    /// `AgentMachineConfig` 在注册那一刻取快照，已注册的 machine 不回溯。
+    /// 生产路径因此安全：打开时还没有任何 machine 注册。
+    looper_hooks: RwLock<Vec<Arc<dyn LooperHook>>>,
 }
 
 impl Default for MachineRuntime {
@@ -62,6 +69,39 @@ impl MachineRuntime {
             hub_config: config,
             hub: Mutex::new(None),
             registered: Mutex::new(HashMap::new()),
+            looper_hooks: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// 设置 machine 执行体的 looper hook；传空 vec 即清除。
+    ///
+    /// 幂等。晚于某次注册调用不会影响那台 machine —— 注册时已取快照，
+    /// 若要让新 hook 生效需重新注册（换一份 `Arc<Agent>`）。
+    pub fn set_looper_hooks(&self, hooks: Vec<Arc<dyn LooperHook>>) {
+        let mut slot = self.looper_hooks.write().unwrap_or_else(|poisoned| {
+            warn!(
+                table = "looper_hooks",
+                "machine runtime lock poisoned; continuing with recovered state"
+            );
+            poisoned.into_inner()
+        });
+        *slot = hooks;
+    }
+
+    /// 注册 machine 时的装配参数：hook 在这一刻快照进 `looper_config`。
+    fn machine_config(&self, kind: String) -> AgentMachineConfig {
+        let hooks = self
+            .looper_hooks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        AgentMachineConfig {
+            kind,
+            looper_config: LooperConfig {
+                hooks,
+                ..LooperConfig::default()
+            },
+            ..AgentMachineConfig::default()
         }
     }
 
@@ -118,10 +158,7 @@ impl MachineRuntime {
 
         let machine: Arc<dyn Machine> = Arc::new(AgentMachine::new(
             Arc::clone(&agent),
-            AgentMachineConfig {
-                kind: kind.clone(),
-                ..Default::default()
-            },
+            self.machine_config(kind.clone()),
         ));
 
         let previous = {
@@ -202,11 +239,15 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
+    use model_provider::ToolCall;
     use uuid::Uuid;
 
     use super::*;
-    use crate::agent::test_support::{completed, scripted_agent};
+    use crate::agent::test_support::{
+        StaticTool, completed, scripted_agent, scripted_agent_with_tools, tool_call_response,
+    };
     use crate::machine::model::{TaggedJson, Task, TaskContext, TaskId, TaskSource};
+    use crate::tools::Content;
 
     fn test_config() -> HubConfig {
         HubConfig {
@@ -345,6 +386,94 @@ mod tests {
                 "name {raw:?} must be rejected before the agent is loaded: {result:?}"
             );
         }
+    }
+
+    /// 记录经过 `on_after_tool` 的工具名 —— 只证明「hook 真的挂到了执行体上」。
+    #[derive(Default)]
+    struct ToolRecordingHook {
+        tools: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LooperHook for ToolRecordingHook {
+        async fn on_after_tool(
+            &self,
+            _turn_index: usize,
+            tool_call: &ToolCall,
+            _result: &str,
+            _is_error: bool,
+        ) {
+            self.tools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(tool_call.function.name.clone());
+        }
+    }
+
+    /// 注入的 hook 必须进到注册参数里；未注入时不得凭空带 hook
+    /// （没有 hook 就没有观察，被派发的 agent 再派发出去的任务会静默）。
+    ///
+    /// 变异方法：`machine_config` 里写 `..AgentMachineConfig::default()`
+    /// 而不填 `looper_config` ⇒ 已注入时长度断言变红。
+    #[test]
+    fn machine_config_carries_the_installed_looper_hooks() {
+        let runtime = MachineRuntime::new();
+        assert!(
+            runtime
+                .machine_config("agent:a".to_string())
+                .looper_config
+                .hooks
+                .is_empty(),
+            "no hook was installed, so none may be injected"
+        );
+
+        runtime.set_looper_hooks(vec![Arc::new(ToolRecordingHook::default())]);
+        assert_eq!(
+            runtime
+                .machine_config("agent:a".to_string())
+                .looper_config
+                .hooks
+                .len(),
+            1,
+            "the injected hook must reach the machine config"
+        );
+    }
+
+    /// 端到端：注册的 machine 跑一轮带工具调用的 turn，注入的 hook 收到
+    /// `on_after_tool`。这是「machine 执行体也带 hook」的可判红形态 ——
+    /// 只比长度挡不住「配置被快照但没交给 looper」。
+    ///
+    /// 变异方法：`ensure_machine_named` 改回 `AgentMachineConfig { kind, ..Default }`
+    /// ⇒ 工具调用一次都不会被记录。
+    #[tokio::test]
+    async fn an_installed_hook_observes_the_tool_calls_of_registered_machines() {
+        let runtime = Arc::new(MachineRuntime::with_hub_config(test_config()));
+        let hook = Arc::new(ToolRecordingHook::default());
+        runtime.set_looper_hooks(vec![hook.clone()]);
+
+        let (agent, _provider) = scripted_agent_with_tools(
+            vec![
+                tool_call_response("c1", "noop", serde_json::json!({})),
+                completed("done"),
+            ],
+            vec![Box::new(StaticTool::new(
+                "noop",
+                Content::Text("ok".into()),
+            ))],
+        );
+        let kind = runtime
+            .ensure_machine("worker", || Ok(Arc::clone(&agent)))
+            .expect("register the machine");
+
+        assert_eq!(run_once(&runtime, &kind).await, "done");
+        assert_eq!(
+            *hook
+                .tools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["noop".to_string()],
+            "the injected hook must be invoked by the machine's looper"
+        );
     }
 
     /// 返回值必须是 trim 后的名字：调用方要拿它拼 kind，也要拿它回显。
