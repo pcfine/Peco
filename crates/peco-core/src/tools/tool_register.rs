@@ -167,7 +167,10 @@ impl ToolRegister {
                     None => skip_missing_dep("create_workspace", "workspace hub"),
                 },
                 "open_workspace" => match workspace_hub(deps) {
-                    Some(hub) => Some(Box::new(OpenWorkspace::new(Arc::downgrade(&hub)))),
+                    Some(hub) => Some(Box::new(OpenWorkspace::new(
+                        Arc::downgrade(&hub),
+                        deps.knowledge_access.user_id().to_string(),
+                    ))),
                     None => skip_missing_dep("open_workspace", "workspace hub"),
                 },
                 "dispatch_to_workspace" => match workspace_hub(deps) {

@@ -915,11 +915,13 @@ impl ToolDyn for CreateWorkspace {
 
 pub struct OpenWorkspace {
     hub: Weak<WorkspaceHub>,
+    /// 宿主的身份（daemon 里就是 kb_scope）：模型不传 label 时的兜底。
+    user_id: String,
 }
 
 impl OpenWorkspace {
-    pub fn new(hub: Weak<WorkspaceHub>) -> Self {
-        Self { hub }
+    pub fn new(hub: Weak<WorkspaceHub>, user_id: String) -> Self {
+        Self { hub, user_id }
     }
 }
 
@@ -932,13 +934,15 @@ impl ToolDyn for OpenWorkspace {
         ToolDefinition {
             name: "open_workspace".to_string(),
             description: "Read dir/.workspace.json and instantiate that workspace, returning its \
-                record. label is the acting user id and is required on the first open; opening an \
-                already-open workspace with no label reuses the existing instance, and a different \
-                label is rejected. The instance stays open in this process until forgotten."
+                record. label is optional: when omitted the host falls back to its own identity, \
+                so a daemon host ignores this parameter (it already knows the kb_scope) while a \
+                standalone host uses it as the workspace user id / knowledge scope on the first \
+                open. A different label for an already-open workspace is rejected. The instance \
+                stays open in this process until forgotten."
                 .to_string(),
             parameters: json!({
                 "type": "object",
-                "required": ["dir", "label"],
+                "required": ["dir"],
                 "properties": {
                     "dir": {
                         "type": "string",
@@ -946,7 +950,7 @@ impl ToolDyn for OpenWorkspace {
                     },
                     "label": {
                         "type": "string",
-                        "description": "Acting user id (external label). Used as the workspace user id / knowledge scope on the first open."
+                        "description": "Optional acting user id (external label). A daemon host ignores this parameter; a standalone host uses it as the workspace user id / knowledge scope on the first open. When omitted the host identity is used."
                     }
                 }
             }),
@@ -962,14 +966,14 @@ impl ToolDyn for OpenWorkspace {
             #[serde(deny_unknown_fields)]
             struct Args {
                 dir: String,
-                label: String,
+                label: Option<String>,
             }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            // 缺省用宿主身份：daemon 的 kb_scope 就是它认的那个作用域，模型不必复述。
+            let label = parsed.label.as_deref().unwrap_or(&self.user_id);
             let hub = self.hub.upgrade().ok_or(WorkspaceToolError::HubGone)?;
-            let info = hub
-                .open(Path::new(&parsed.dir), Some(&parsed.label))
-                .await?;
+            let info = hub.open(Path::new(&parsed.dir), Some(label)).await?;
             Ok(Content::Text(serde_json::to_string(&info)?))
         })
     }
@@ -2192,10 +2196,60 @@ mod tests {
             json!(["dir", "team", "name", "description"])
         );
 
-        let open = OpenWorkspace::new(Weak::new());
-        assert_eq!(
-            open.definition().parameters["required"],
-            json!(["dir", "label"])
+        let open = OpenWorkspace::new(Weak::new(), "alice".to_string());
+        let definition = open.definition();
+        assert_eq!(definition.parameters["required"], json!(["dir"]));
+        assert!(
+            definition.parameters["properties"].get("label").is_some(),
+            "label stays offered as an optional parameter"
         );
+        assert!(
+            definition.description.contains("daemon"),
+            "the description must say which host ignores label: {}",
+            definition.description
+        );
+    }
+
+    /// 不传 label 也要能走到执行路径：参数校验只要求 dir。
+    #[tokio::test]
+    async fn open_workspace_accepts_arguments_without_a_label() {
+        let tool = OpenWorkspace::new(Weak::new(), "alice".to_string());
+        let err = tool
+            .call(json!({ "dir": "/tmp/anywhere" }).to_string())
+            .await
+            .expect_err("a dropped hub is an error, not a JSON error");
+        assert!(
+            matches!(&err, ToolError::ToolCallError(inner) if inner.to_string().contains("hub is gone")),
+            "{err}"
+        );
+    }
+
+    /// label 缺省时用宿主身份（daemon 的 kb_scope）打开，而不是空值或直接拒绝。
+    #[tokio::test]
+    async fn open_workspace_falls_back_to_the_host_identity() {
+        let (agent, _provider) = scripted_agent(vec![]);
+        let (hub, opener) = fake_hub(agent, test_runtime());
+        let (_team, _dir, info) = create_workspace(&hub);
+        let tool = OpenWorkspace::new(Arc::downgrade(&hub), "alice".to_string());
+
+        let content = tool
+            .call(json!({ "dir": info.dir.clone() }).to_string())
+            .await
+            .expect("a workspace opens without a label");
+        assert!(matches!(content, Content::Text(_)));
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hub.get(Path::new(&info.dir)).expect("opened").label(),
+            "alice",
+            "the host identity becomes the label"
+        );
+
+        // 显式 label 仍然生效：与已打开实例不同即拒绝，不静默改绑作用域。
+        let other = OpenWorkspace::new(Arc::downgrade(&hub), "alice".to_string());
+        let err = other
+            .call(json!({ "dir": info.dir, "label": "bob" }).to_string())
+            .await
+            .expect_err("a different label must not silently rebind the scope");
+        assert!(err.to_string().contains("already open"), "{err}");
     }
 }
