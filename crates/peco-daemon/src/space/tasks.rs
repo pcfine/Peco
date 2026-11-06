@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::warn;
 
+use crate::db::dispatch_state::{WakeSkipReason, WakeState};
 use crate::db::dispatches::{self, NewDispatch};
 use crate::db::workspaces;
 use crate::space::peco::PecoIdentity;
@@ -87,19 +88,26 @@ impl TaskObserver {
         }
     }
 
-    /// 这一行进不进唤醒队列；身份未注入时一律不进 —— 宁可少一条通知，也不能
-    /// 把别的空间的自有任务当成 Peco 的待办叫醒它。
-    fn wake_state_for(&self, obs: &DispatchObservation) -> &'static str {
-        match self.peco.get() {
-            Some(peco) if wake::qualifies(&obs.origin.ws_id, &obs.origin_kind, peco) => "pending",
-            Some(_) => "skipped",
-            None => {
-                warn!(
-                    task_id = %obs.task_id,
-                    "task observer has no peco identity; dispatch ledger row will not wake"
-                );
-                "skipped"
-            }
+    /// 这一行的唤醒态与（跳过时的）成因；身份未注入时一律不唤醒 —— 宁可少一条
+    /// 通知，也不能把别的空间的自有任务当成 Peco 的待办叫醒它。
+    ///
+    /// 两种跳过来自完全不同的故障：来源不合规是正常语义，身份缺失是装配异常，
+    /// 台账上必须分得开。
+    fn wake_disposition(&self, obs: &DispatchObservation) -> (WakeState, Option<WakeSkipReason>) {
+        let Some(peco) = self.peco.get() else {
+            warn!(
+                task_id = %obs.task_id,
+                "task observer has no peco identity; dispatch ledger row will not wake"
+            );
+            return (
+                WakeState::Skipped,
+                Some(WakeSkipReason::PecoIdentityMissing),
+            );
+        };
+        if wake::qualifies(&obs.origin.ws_id, &obs.origin_kind, peco) {
+            (WakeState::Pending, None)
+        } else {
+            (WakeState::Skipped, Some(WakeSkipReason::NotPecoOrigin))
         }
     }
 
@@ -135,6 +143,7 @@ impl TaskObservationSink for TaskObserver {
 
         let state = snapshot.state.as_str();
         let id = format!("d_{}", obs.task_id);
+        let (wake_state, wake_skip_reason) = self.wake_disposition(obs);
         let inserted = dispatches::insert(
             &self.pool,
             &NewDispatch {
@@ -146,8 +155,9 @@ impl TaskObservationSink for TaskObserver {
                 origin_ws_id: &obs.origin.ws_id,
                 agent_name: &obs.agent_name,
                 origin_kind: &obs.origin_kind,
-                state,
-                wake_state: self.wake_state_for(obs),
+                task_state: state,
+                wake_state,
+                wake_skip_reason,
             },
         )
         .await;
@@ -172,7 +182,7 @@ impl TaskObservationSink for TaskObserver {
             return;
         };
         let state_text = state.as_str();
-        match dispatches::set_state(&self.pool, &obs.task_id.to_string(), state_text).await {
+        match dispatches::set_task_state(&self.pool, &obs.task_id.to_string(), state_text).await {
             Ok(_) => self.emit(TaskEvent {
                 kind: "state",
                 task_id: obs.task_id.to_string(),

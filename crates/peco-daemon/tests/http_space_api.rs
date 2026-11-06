@@ -252,7 +252,7 @@ async fn close_is_rejected_with_two_dispatch_tasks_inflight() {
 }
 
 /// P1-9 ○2：只有一条外来在飞 ⇒ 同样 `409`（`inflight_foreign>=1`、`dispatch==0`）；
-/// `force` 后该行 `state='orphan'` 且 `wake_state` 仍是 `skipped`。
+/// `force` 后该行 `task_state='orphan'` 且 `wake_state` 仍是 `skipped`。
 #[tokio::test]
 async fn force_close_orphans_foreign_inflight_without_waking() {
     let env = new_env(&["research"]).await;
@@ -286,9 +286,14 @@ async fn force_close_orphans_foreign_inflight_without_waking() {
     assert_eq!(forced.status, 200, "body={}", forced.body);
     assert_eq!(forced.body["stopped"], json!(true));
     assert_eq!(
-        env.dispatch_state(&ws_id, "f1").await,
+        env.task_and_wake_state(&ws_id, "f1").await,
         ("orphan".to_string(), "skipped".to_string()),
         "force 关闭必须置 orphan，且不产生唤醒"
+    );
+    assert_eq!(
+        env.wake_skip_reason(&ws_id, "f1").await.as_deref(),
+        Some("not_peco_origin"),
+        "这行注册时就已跳过，关闭不顶掉更早的原因"
     );
     assert_eq!(
         env.get(&format!("/api/spaces/{ws_id}")).await.body["status"],
@@ -487,8 +492,16 @@ async fn close_is_rejected_while_a_task_waits_for_input() {
         )
         .await;
     assert_eq!(forced.status, 200, "body={}", forced.body);
-    assert_eq!(env.dispatch_state(&ws_id, "w1").await.0, "orphan");
-    assert_eq!(env.dispatch_state(&ws_id, "w2").await.0, "orphan");
+    assert_eq!(env.task_and_wake_state(&ws_id, "w1").await.0, "orphan");
+    assert_eq!(env.task_and_wake_state(&ws_id, "w2").await.0, "orphan");
+    // 两行本来还在等唤醒；强制关闭把它们停掉，并留下「空间关了」这个原因。
+    for task_id in ["w1", "w2"] {
+        assert_eq!(
+            env.wake_skip_reason(&ws_id, task_id).await.as_deref(),
+            Some("space_closed"),
+            "{task_id} 的跳过原因必须是空间关闭"
+        );
+    }
 }
 
 /// `effective_exit_policy` 只作展示 —— 单空间 `inherit` 时跟随全局，全局缺省

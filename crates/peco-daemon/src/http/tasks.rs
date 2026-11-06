@@ -12,7 +12,11 @@ use crate::db::workspaces;
 use crate::error::DaemonError;
 use crate::state::AppState;
 
-/// UI 需要的台账视图；`wake_state` 属于 B 类唤醒内部字段，不对外暴露。
+/// UI 需要的台账视图。
+///
+/// 任务态与唤醒态是两套独立状态：一条任务可以已经 `completed`，而唤醒仍是
+/// `pending`（还没叫醒 Peco）。`wake_skip_reason` 只在 `wake_state='skipped'`
+/// 时给值，让「为什么没叫醒」不再需要翻库或看日志。
 #[derive(Debug, Serialize)]
 pub struct TaskView {
     pub id: String,
@@ -23,7 +27,9 @@ pub struct TaskView {
     pub origin_ws_id: String,
     pub origin_kind: String,
     pub agent_name: String,
-    pub state: String,
+    pub task_state: String,
+    pub wake_state: String,
+    pub wake_skip_reason: Option<String>,
     pub created_at: String,
     pub terminal_at: Option<String>,
     pub result_digest: Option<String>,
@@ -40,7 +46,9 @@ impl From<DispatchRow> for TaskView {
             origin_ws_id: row.origin_ws_id,
             origin_kind: row.origin_kind,
             agent_name: row.agent_name,
-            state: row.state,
+            task_state: row.task_state,
+            wake_state: row.wake_state,
+            wake_skip_reason: row.wake_skip_reason,
             created_at: row.created_at,
             terminal_at: row.terminal_at,
             result_digest: row.result_digest,
@@ -52,11 +60,22 @@ impl From<DispatchRow> for TaskView {
 pub struct ListQuery {
     pub target_ws_id: Option<String>,
     pub origin_ws_id: Option<String>,
-    pub state: Option<String>,
+    pub task_state: Option<String>,
+    /// 改名前的查询参数；外部脚本还带着 `?state=`，认它一版，避免静默放宽成
+    /// 「不过滤」——那会让筛选看起来失效而不是报错。
+    #[serde(rename = "state")]
+    pub legacy_state: Option<String>,
     pub limit: Option<i64>,
 }
 
-/// `GET /api/tasks?target_ws_id=&origin_ws_id=&state=&limit=`
+impl ListQuery {
+    /// 两个参数同时出现时以 `task_state` 为准。
+    fn task_state_filter(&self) -> Option<&str> {
+        self.task_state.as_deref().or(self.legacy_state.as_deref())
+    }
+}
+
+/// `GET /api/tasks?target_ws_id=&origin_ws_id=&task_state=&limit=`
 pub async fn list(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -66,7 +85,7 @@ pub async fn list(
         DispatchFilter {
             target_ws_id: query.target_ws_id.as_deref(),
             origin_ws_id: query.origin_ws_id.as_deref(),
-            state: query.state.as_deref(),
+            task_state: query.task_state_filter(),
             limit: query.limit,
         },
     )

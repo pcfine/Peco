@@ -60,7 +60,10 @@ pub struct TodayView {
 pub struct RecentTaskView {
     pub id: String,
     pub task_id: String,
-    pub state: String,
+    pub task_state: String,
+    /// 唤醒态与原因让卡片直接显示「跑完了但没叫醒」的一类行。
+    pub wake_state: String,
+    pub wake_skip_reason: Option<String>,
     pub agent_name: String,
     pub origin_kind: String,
     pub created_at: String,
@@ -73,7 +76,9 @@ impl From<DispatchRow> for RecentTaskView {
         Self {
             id: row.id,
             task_id: row.task_id,
-            state: row.state,
+            task_state: row.task_state,
+            wake_state: row.wake_state,
+            wake_skip_reason: row.wake_skip_reason,
             agent_name: row.agent_name,
             origin_kind: row.origin_kind,
             created_at: row.created_at,

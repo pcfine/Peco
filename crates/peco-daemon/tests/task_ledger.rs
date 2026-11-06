@@ -11,6 +11,7 @@ use peco_core::machine::{
     ObsEvent, OutputView, Progress, TaggedJson, TaskId, TaskOutcome, TaskSnapshot, TaskSource,
     TaskState, Update, UpdateBody, UpdateOrigin,
 };
+use peco_daemon::space::tasks::TaskObserver;
 use serde_json::json;
 use support::new_env;
 use uuid::Uuid;
@@ -82,9 +83,16 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
     sink.on_registered(&obs, &snapshot(task, TaskState::Working, None))
         .await;
     assert_eq!(
-        env.dispatch_state(&ws_id, &task.to_string()).await,
+        env.task_and_wake_state(&ws_id, &task.to_string()).await,
         ("working".to_string(), "skipped".to_string()),
         "注册即落库，且 A+B 阶段不产生唤醒"
+    );
+    assert_eq!(
+        env.wake_skip_reason(&ws_id, &task.to_string())
+            .await
+            .as_deref(),
+        Some("not_peco_origin"),
+        "夹具的发起方不是 Peco 空间，跳过要说明是来源不合规"
     );
 
     let update = ObsEvent::Update(Update {
@@ -99,7 +107,7 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
     });
     sink.on_event(&obs, &update).await;
     assert_eq!(
-        env.dispatch_state(&ws_id, &task.to_string()).await.0,
+        env.task_and_wake_state(&ws_id, &task.to_string()).await.0,
         "input_required"
     );
 
@@ -110,7 +118,7 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
     .await;
 
     let row: (String, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT state, terminal_at, result_digest FROM d_dispatches WHERE task_id = ?",
+        "SELECT task_state, terminal_at, result_digest FROM d_dispatches WHERE task_id = ?",
     )
     .bind(task.to_string())
     .fetch_one(&env.pool)
@@ -130,8 +138,15 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
     assert_eq!(items[0]["origin_ws_id"], json!("peco"));
     assert_eq!(items[0]["origin_kind"], json!("dispatch_to_workspace"));
     assert_eq!(items[0]["agent_name"], json!("@master"));
-    assert_eq!(items[0]["state"], json!("completed"));
+    assert_eq!(items[0]["task_state"], json!("completed"));
+    assert_eq!(items[0]["wake_state"], json!("skipped"));
+    assert_eq!(items[0]["wake_skip_reason"], json!("not_peco_origin"));
     assert_eq!(items[0]["result_digest"], json!("final answer"));
+    assert!(
+        items[0].get("state").is_none(),
+        "响应不得再出现旧字段 state：{:#}",
+        items[0]
+    );
 
     let detail = env.get(&format!("/api/tasks/{task}")).await;
     assert_eq!(detail.status, 200, "body={}", detail.body);
@@ -141,10 +156,41 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
     assert_eq!(for_space.status, 200, "body={}", for_space.body);
     assert_eq!(for_space.body.as_array().unwrap().len(), 1);
 
-    // 过滤：state 不匹配时为空。
-    let filtered = env.get("/api/tasks?state=working").await;
-    assert_eq!(filtered.status, 200);
-    assert_eq!(filtered.body.as_array().unwrap().len(), 0);
+    // 过滤：新旧两个参数名都要能用，取值都不匹配时为空。
+    for query in ["?state=working", "?task_state=working"] {
+        let filtered = env.get(&format!("/api/tasks{query}")).await;
+        assert_eq!(filtered.status, 200, "{query} body={}", filtered.body);
+        assert_eq!(
+            filtered.body.as_array().unwrap().len(),
+            0,
+            "{query} 必须真的过滤，而不是被当成未知参数忽略"
+        );
+    }
+    // 命中：两个参数名都能筛出这唯一一行。
+    for query in ["?state=completed", "?task_state=completed"] {
+        let filtered = env.get(&format!("/api/tasks{query}")).await;
+        assert_eq!(filtered.body.as_array().unwrap().len(), 1, "{query}");
+    }
+    // 同时给出且互相矛盾时 `task_state` 优先 —— 两个方向都断一次，只断一边的话
+    // 「取旧参数」的实现也能蒙对一半。
+    let both = env
+        .get("/api/tasks?state=working&task_state=completed")
+        .await;
+    assert_eq!(
+        both.body.as_array().unwrap().len(),
+        1,
+        "task_state=completed 必须压过 state=working，body={}",
+        both.body
+    );
+    let reversed = env
+        .get("/api/tasks?task_state=working&state=completed")
+        .await;
+    assert_eq!(
+        reversed.body.as_array().unwrap().len(),
+        0,
+        "task_state=working 必须压过 state=completed，body={}",
+        reversed.body
+    );
 }
 
 /// 失联落 `orphan`，且未知 task / 未知空间都返回 404。
@@ -155,24 +201,37 @@ async fn orphan_is_recorded_and_unknown_ids_are_404() {
     let ws_id = env.resolve(&work_dir, "research").await.unwrap();
     let target_dir = env.work_dir_of(&ws_id).await;
 
+    // 发起方取 Peco 自己的空间：这一行注册时要真的进队列，失联才有东西可停。
     let task = TaskId(Uuid::new_v4());
-    let obs = observation(target_dir, task);
+    let mut obs = observation(target_dir, task);
+    obs.origin.ws_id = env.env.peco.ws_id.clone();
     let sink: &dyn TaskObservationSink = env.tasks.as_ref();
 
     sink.on_registered(&obs, &snapshot(task, TaskState::Submitted, None))
         .await;
+    assert_eq!(
+        env.task_and_wake_state(&ws_id, &task.to_string()).await.1,
+        "pending"
+    );
     sink.on_orphaned(&obs, "target space closed").await;
 
-    let (state, wake_state, terminal_at) = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT state, wake_state, terminal_at FROM d_dispatches WHERE task_id = ?",
-    )
-    .bind(task.to_string())
-    .fetch_one(&env.pool)
-    .await
-    .unwrap();
-    assert_eq!(state, "orphan");
+    let (task_state, wake_state, terminal_at, reason) =
+        sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+            "SELECT task_state, wake_state, terminal_at, wake_skip_reason \
+         FROM d_dispatches WHERE task_id = ?",
+        )
+        .bind(task.to_string())
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(task_state, "orphan");
     assert_eq!(wake_state, "skipped", "orphan 不得留下待唤醒");
     assert!(terminal_at.is_some(), "orphan 是终态");
+    assert_eq!(
+        reason.as_deref(),
+        Some("orphaned"),
+        "运行期失联的跳过要给 orphaned"
+    );
 
     let missing_task = env.get("/api/tasks/not-a-task").await;
     assert_eq!(missing_task.status, 404, "body={}", missing_task.body);
@@ -233,4 +292,59 @@ async fn terminal_digest_is_truncated_and_non_text_is_null() {
             .await
             .unwrap();
     assert!(digest.is_none(), "非文本输出不应落摘要");
+}
+
+/// 观察者拿不到 Peco 身份（装配异常）时跳过要自成一因：它与「来源不是 Peco」
+/// 都落在 `wake_state='skipped'`，只有 `wake_skip_reason` 能区分「该修装配」
+/// 和「本该如此」。
+#[tokio::test]
+async fn a_task_observer_without_peco_identity_records_that_reason() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("no-identity-space");
+    let ws_id = env.resolve(&work_dir, "research").await.unwrap();
+    let target_dir = env.work_dir_of(&ws_id).await;
+
+    // 故意不调 attach_peco：等价于装配点漏注入身份。
+    let observer = TaskObserver::new(env.pool.clone(), env.wake.clone());
+    let sink: &dyn TaskObservationSink = &observer;
+
+    // 来源取 Peco 自己的空间：只要身份在场，这一行本该进队列。
+    let peco_ws_id = env.env.peco.ws_id.clone();
+    let blind = TaskId(Uuid::new_v4());
+    let mut blind_obs = observation(target_dir.clone(), blind);
+    blind_obs.origin.ws_id = peco_ws_id.clone();
+    sink.on_registered(&blind_obs, &snapshot(blind, TaskState::Working, None))
+        .await;
+
+    assert_eq!(
+        env.task_and_wake_state(&ws_id, &blind.to_string()).await.1,
+        "skipped"
+    );
+    assert_eq!(
+        env.wake_skip_reason(&ws_id, &blind.to_string())
+            .await
+            .as_deref(),
+        Some("peco_identity_missing"),
+        "身份缺失是装配异常，不能与来源不合规混成同一个原因"
+    );
+
+    // 同一来源、同一形状，身份注入后就该进队列 —— 证明上一条的成因确实是身份。
+    observer.attach_peco(env.env.peco.clone());
+    let sighted = TaskId(Uuid::new_v4());
+    let mut sighted_obs = observation(target_dir, sighted);
+    sighted_obs.origin.ws_id = peco_ws_id;
+    sink.on_registered(&sighted_obs, &snapshot(sighted, TaskState::Working, None))
+        .await;
+
+    assert_eq!(
+        env.task_and_wake_state(&ws_id, &sighted.to_string())
+            .await
+            .1,
+        "pending"
+    );
+    assert_eq!(
+        env.wake_skip_reason(&ws_id, &sighted.to_string()).await,
+        None,
+        "进队列的行不写跳过原因"
+    );
 }

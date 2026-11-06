@@ -2,15 +2,12 @@
 //!
 //! 无 IO、无 DB，格式只在这里出现一次 —— 投递侧只管把这段文本送进会话。
 
-use crate::db::dispatches::DispatchRow;
+use crate::db::dispatches::{DispatchRow, TASK_ORPHAN_STATE};
 
 use super::MAX_ITEM_CHARS;
 
 /// 消息首行前缀：用户与模型都靠它认出「这一条是唤醒通知」。
 const HEADER: &str = "[peco-wake] 后台任务结果";
-
-/// 结果随持有它的进程一起消失的台账状态。
-const ORPHAN_STATE: &str = "orphan";
 
 /// orphan 行的摘要固定为这句：结果已经查不到了，台账里的旧摘要不再是事实。
 const ORPHAN_DIGEST: &str = "任务在进程重启时中断，输出已丢失";
@@ -34,7 +31,7 @@ pub fn item_line(row: &DispatchRow) -> String {
     format!(
         "- task={} state={} target={} dir={} digest={}",
         row.task_id,
-        row.state,
+        row.task_state,
         row.target_ws_id,
         row.target_work_dir,
         digest(row)
@@ -42,7 +39,7 @@ pub fn item_line(row: &DispatchRow) -> String {
 }
 
 fn digest(row: &DispatchRow) -> String {
-    if row.state == ORPHAN_STATE {
+    if row.task_state == TASK_ORPHAN_STATE {
         return ORPHAN_DIGEST.to_string();
     }
     let text = row.result_digest.as_deref().unwrap_or_default();
@@ -59,7 +56,7 @@ fn one_line(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn row(task_id: &str, state: &str, digest: Option<&str>) -> DispatchRow {
+    fn row(task_id: &str, task_state: &str, digest: Option<&str>) -> DispatchRow {
         DispatchRow {
             id: format!("d_{task_id}"),
             task_id: task_id.to_string(),
@@ -69,8 +66,9 @@ mod tests {
             origin_ws_id: "ws_peco".to_string(),
             agent_name: "@master".to_string(),
             origin_kind: "run_machine_task".to_string(),
-            state: state.to_string(),
+            task_state: task_state.to_string(),
             wake_state: "pending".to_string(),
+            wake_skip_reason: None,
             result_digest: digest.map(str::to_string),
             created_at: "2026-01-01 00:00:00".to_string(),
             terminal_at: Some("2026-01-01 00:00:01".to_string()),
@@ -102,7 +100,7 @@ mod tests {
     /// W3 的纯函数侧：孤儿行不看台账里的旧摘要。
     #[test]
     fn orphan_items_ignore_the_stored_digest() {
-        let line = item_line(&row("t-1", ORPHAN_STATE, Some("别的内容")));
+        let line = item_line(&row("t-1", TASK_ORPHAN_STATE, Some("别的内容")));
 
         assert!(line.contains(ORPHAN_DIGEST), "孤儿行必须给固定文案：{line}");
         assert!(!line.contains("别的内容"), "旧摘要不再成立：{line}");

@@ -18,7 +18,10 @@ use axum::http::{Method, Request};
 use chrono::Utc;
 use futures::StreamExt;
 use peco_core::machine::{TaggedJson, Task, TaskContext, TaskId, TaskSource, TaskState};
-use peco_daemon::db::dispatches::{self, ACTIVE_STATES, DispatchFilter, DispatchRow, NewDispatch};
+use peco_daemon::db::dispatches::{
+    self, DispatchFilter, DispatchRow, NewDispatch, TASK_ACTIVE_STATES, TASK_TERMINAL_STATES,
+    WakeState,
+};
 use peco_daemon::space::reconcile::{ReconcileReport, reconcile_ledger};
 use serde_json::{Value, json};
 use support::TestEnv;
@@ -27,9 +30,6 @@ use support::{fixture, install_team};
 use tokio::sync::OnceCell;
 use tower::ServiceExt;
 use uuid::Uuid;
-
-/// 台账里的终态：与 `d_dispatches` 的状态机同源。
-const TERMINAL_STATES: &[&str] = &["completed", "failed", "canceled", "timed_out", "rejected"];
 
 static SHARED: OnceCell<TestEnv> = OnceCell::const_new();
 
@@ -136,15 +136,11 @@ async fn wait_for_row(env: &TestEnv, target_ws_id: &str, origin_kind: &str) -> D
 
 fn assert_active_or_terminal(row: &DispatchRow) {
     assert!(
-        ACTIVE_STATES.contains(&row.state.as_str())
-            || TERMINAL_STATES.contains(&row.state.as_str()),
+        TASK_ACTIVE_STATES.contains(&row.task_state.as_str())
+            || TASK_TERMINAL_STATES.contains(&row.task_state.as_str()),
         "台账行的状态必须落在状态机里，实际 {}",
-        row.state
+        row.task_state
     );
-}
-
-async fn row_state(env: &TestEnv, target_ws_id: &str, task_id: &str) -> (String, String) {
-    env.dispatch_state(target_ws_id, task_id).await
 }
 
 fn print_exchanges(label: &str, upstream: &FakeUpstream) {
@@ -410,9 +406,9 @@ async fn closing_the_target_space_orphans_the_ledger_row() {
     let _turn = start_turn(env, &ws_a, "@master", "hi").await;
     let row = wait_for_row(env, &ws_b, "dispatch_to_workspace").await;
     assert!(
-        ACTIVE_STATES.contains(&row.state.as_str()),
+        TASK_ACTIVE_STATES.contains(&row.task_state.as_str()),
         "关闭前这条台账必须还在飞，实际 {}",
-        row.state
+        row.task_state
     );
 
     let closed = env
@@ -420,11 +416,17 @@ async fn closing_the_target_space_orphans_the_ledger_row() {
         .await;
     assert_eq!(closed.status, 200, "关闭失败: {}", closed.body);
 
-    let (state, wake_state) = row_state(env, &ws_b, &row.task_id).await;
-    assert_eq!(state, "orphan", "空间被关闭后这条台账必须是 orphan");
+    let (task_state, wake_state) = env.task_and_wake_state(&ws_b, &row.task_id).await;
+    assert_eq!(task_state, "orphan", "空间被关闭后这条台账必须是 orphan");
     assert_eq!(
         wake_state, "skipped",
         "孤儿行不得再唤醒（结果已随 Hub 消失）"
+    );
+    // 这行注册时就因来源不是 Peco 而 skipped；关闭只补任务态，不覆盖更早的成因。
+    assert_eq!(
+        env.wake_skip_reason(&ws_b, &row.task_id).await.as_deref(),
+        Some("not_peco_origin"),
+        "已跳过的行保留更早的原因，不被 space_closed 顶掉"
     );
 
     // 放行那个卡住的回复，避免后台任务泄漏到下一个用例。
@@ -463,7 +465,16 @@ async fn reconcile_orphans_rows_whose_target_space_did_not_come_back() {
             resubscribed: 0,
         }
     );
-    assert_eq!(row_state(&env, &ws_id, &task_id).await.0, "orphan");
+    let (task_state, wake_state) = env.task_and_wake_state(&ws_id, &task_id).await;
+    assert_eq!(task_state, "orphan");
+    // 重启对账与运行期失联的差别就在这里：这条行还没被通知过，仍要投一次唤醒
+    // 去让 Peco 复核，所以唤醒态保持 pending，跳过原因也就没有。
+    assert_eq!(wake_state, "pending", "重启对账的孤儿仍留在待投递队列");
+    assert_eq!(
+        env.wake_skip_reason(&ws_id, &task_id).await,
+        None,
+        "没跳过的行不写原因"
+    );
 }
 
 /// 目标空间恢复了、但 Hub 里没有这个任务（上个进程的 `InMemoryStore` 已空）。
@@ -488,7 +499,7 @@ async fn reconcile_orphans_rows_the_restored_hub_does_not_know() {
             resubscribed: 0,
         }
     );
-    assert_eq!(row_state(&env, &ws_id, &task_id).await.0, "orphan");
+    assert_eq!(env.task_and_wake_state(&ws_id, &task_id).await.0, "orphan");
 }
 
 /// 目标空间恢复了、任务仍在跑：**重新订阅**，状态不变。
@@ -553,7 +564,9 @@ async fn reconcile_resubscribes_rows_that_are_still_running() {
         "仍在跑的任务必须重新订阅，不能 orphan"
     );
     assert_eq!(
-        row_state(&env, &ws_id, &task_id.to_string()).await.0,
+        env.task_and_wake_state(&ws_id, &task_id.to_string())
+            .await
+            .0,
         "working",
         "重新订阅不得改写状态"
     );
@@ -566,7 +579,13 @@ async fn reconcile_resubscribes_rows_that_are_still_running() {
 // ============================================================================
 
 /// 写一条在飞台账行。`target_work_dir` 必须是真实目录：对账靠它找 Hub 实例。
-async fn insert_row(env: &TestEnv, ws_id: &str, dir: &std::path::Path, task_id: &str, state: &str) {
+async fn insert_row(
+    env: &TestEnv,
+    ws_id: &str,
+    dir: &std::path::Path,
+    task_id: &str,
+    task_state: &str,
+) {
     let id = format!("d_{task_id}");
     dispatches::insert(
         &env.pool,
@@ -579,8 +598,9 @@ async fn insert_row(env: &TestEnv, ws_id: &str, dir: &std::path::Path, task_id: 
             origin_ws_id: "ws_origin",
             agent_name: "@master",
             origin_kind: "dispatch_to_workspace",
-            state,
-            wake_state: "skipped",
+            task_state,
+            wake_state: WakeState::Pending,
+            wake_skip_reason: None,
         },
     )
     .await

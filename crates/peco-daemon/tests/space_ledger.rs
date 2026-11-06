@@ -137,13 +137,26 @@ async fn close_is_blocked_by_dispatched_inflight_until_forced() {
         .await
         .unwrap();
     assert_eq!(rows.total(), 0, "force 后不得再有未终态行");
-    let states: Vec<String> =
-        sqlx::query_scalar("SELECT state FROM d_dispatches WHERE target_ws_id = ?")
+    let task_states: Vec<String> =
+        sqlx::query_scalar("SELECT task_state FROM d_dispatches WHERE target_ws_id = ?")
             .bind(&ws_id)
             .fetch_all(&env.pool)
             .await
             .unwrap();
-    assert_eq!(states, vec!["orphan", "orphan"]);
+    assert_eq!(task_states, vec!["orphan", "orphan"]);
+
+    // 两行都还在等唤醒：关闭必须把它们停掉，并说明是「空间关了」而不是别的。
+    let reasons: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT wake_skip_reason FROM d_dispatches WHERE target_ws_id = ?")
+            .bind(&ws_id)
+            .fetch_all(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        reasons,
+        vec![Some("space_closed".to_string()); 2],
+        "强制关闭停掉待投递的行，原因必须是 space_closed"
+    );
 
     let closed_at: Option<String> =
         sqlx::query_scalar("SELECT closed_at FROM workspaces WHERE id = ?")
@@ -164,11 +177,14 @@ async fn close_is_blocked_by_foreign_inflight_and_keeps_wake_state() {
 
     env.insert_dispatch(&ws_id, "f1", "run_machine_task", &ws_id, "working")
         .await;
-    sqlx::query("UPDATE d_dispatches SET wake_state = 'skipped' WHERE target_ws_id = ?")
-        .bind(&ws_id)
-        .execute(&env.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE d_dispatches SET wake_state = 'skipped', wake_skip_reason = 'not_peco_origin' \
+         WHERE target_ws_id = ?",
+    )
+    .bind(&ws_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
 
     let err = close_workspace(&env.env, &env.hub, &ws_id, false)
         .await
@@ -190,17 +206,22 @@ async fn close_is_blocked_by_foreign_inflight_and_keeps_wake_state() {
         .unwrap();
     assert_eq!(outcome.orphaned, 1);
 
-    let (state, wake_state) = sqlx::query_as::<_, (String, String)>(
-        "SELECT state, wake_state FROM d_dispatches WHERE target_ws_id = ?",
+    let (task_state, wake_state, reason) = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT task_state, wake_state, wake_skip_reason FROM d_dispatches WHERE target_ws_id = ?",
     )
     .bind(&ws_id)
     .fetch_one(&env.pool)
     .await
     .unwrap();
-    assert_eq!(state, "orphan");
+    assert_eq!(task_state, "orphan");
     assert_eq!(
         wake_state, "skipped",
         "外来在飞行的 wake_state 必须保持 skipped（不产生唤醒）"
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("not_peco_origin"),
+        "已跳过的行不被关闭改写原因"
     );
 }
 

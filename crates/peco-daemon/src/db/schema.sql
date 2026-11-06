@@ -235,9 +235,15 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
     agent_name      TEXT NOT NULL,
     origin_kind     TEXT NOT NULL
                     CHECK (origin_kind IN ('run_machine_task','dispatch_to_workspace')),
-    state           TEXT NOT NULL,
+    task_state      TEXT NOT NULL,
     wake_state      TEXT NOT NULL DEFAULT 'pending'
                     CHECK (wake_state IN ('pending','delivering','delivered','skipped','failed')),
+    -- 仅 wake_state='skipped' 时非空；历史行留 NULL（成因不可考）
+    wake_skip_reason TEXT
+                    CHECK (wake_skip_reason IS NULL OR wake_skip_reason IN (
+                      'not_peco_origin', 'peco_identity_missing', 'orphaned',
+                      'space_closed', 'attempts_exhausted'
+                    )),
     wake_attempts   INTEGER NOT NULL DEFAULT 0,
     wake_claimed_at TEXT,
     delivered_at    TEXT,
@@ -247,7 +253,6 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
     UNIQUE (target_ws_id, task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_dispatches_wake ON d_dispatches(wake_state, wake_claimed_at);
-CREATE INDEX IF NOT EXISTS idx_dispatches_state ON d_dispatches(target_ws_id, state);
 
 -- @after-migrations
 -- 上一行是执行器的分界：以下的语句等版本化迁移跑完再执行。
@@ -256,3 +261,8 @@ CREATE INDEX IF NOT EXISTS idx_dispatches_state ON d_dispatches(target_ws_id, st
 CREATE INDEX IF NOT EXISTS idx_agents_team ON agents(team_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_bases_team ON knowledge_bases(team_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_workspace_agent ON conversations(workspace_id, agent_name, scope);
+-- 任务状态索引依赖迁移 019 把旧库的 state 改名为 task_state。旧索引名要显式
+-- 丢弃：RENAME COLUMN 会改写索引定义却不改索引名，留着会让「同一列两个名字」
+-- 永久留在库里。DROP 也覆盖「019 已成功、进程随后崩溃」的窗口。
+DROP INDEX IF EXISTS idx_dispatches_state;
+CREATE INDEX IF NOT EXISTS idx_dispatches_task_state ON d_dispatches(target_ws_id, task_state);

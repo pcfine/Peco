@@ -31,7 +31,9 @@ pub struct TaskEventPayload {
     /// 任务所在的（目标）空间。
     pub ws_id: String,
     pub task_id: String,
-    pub state: String,
+    pub task_state: String,
+    pub wake_state: String,
+    pub wake_skip_reason: Option<String>,
     pub origin_kind: String,
     pub created_at: String,
     pub terminal_at: Option<String>,
@@ -42,7 +44,9 @@ impl From<DispatchRow> for TaskEventPayload {
         Self {
             ws_id: row.target_ws_id,
             task_id: row.task_id,
-            state: row.state,
+            task_state: row.task_state,
+            wake_state: row.wake_state,
+            wake_skip_reason: row.wake_skip_reason,
             origin_kind: row.origin_kind,
             created_at: row.created_at,
             terminal_at: row.terminal_at,

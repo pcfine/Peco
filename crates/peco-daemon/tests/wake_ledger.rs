@@ -107,6 +107,14 @@ async fn claim_seconds_ago(pool: &SqlitePool, task_id: &str, seconds_ago: i64) {
     .unwrap();
 }
 
+async fn skip_reason(pool: &SqlitePool, task_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT wake_skip_reason FROM d_dispatches WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn wake_state(pool: &SqlitePool, task_id: &str) -> String {
     sqlx::query_scalar("SELECT wake_state FROM d_dispatches WHERE task_id = ?")
         .bind(task_id)
@@ -225,16 +233,30 @@ async fn non_peco_origins_never_enter_the_wake_queue() {
     .await;
 
     assert_eq!(
-        env.dispatch_state(&target_ws_id, &own.to_string()).await.1,
+        env.task_and_wake_state(&target_ws_id, &own.to_string())
+            .await
+            .1,
         "pending",
         "Peco 自己派出去的任务要进队列"
     );
     assert_eq!(
-        env.dispatch_state(&target_ws_id, &foreign.to_string())
+        env.wake_skip_reason(&target_ws_id, &own.to_string()).await,
+        None,
+        "进队列的行不写跳过原因"
+    );
+    assert_eq!(
+        env.task_and_wake_state(&target_ws_id, &foreign.to_string())
             .await
             .1,
         "skipped",
         "别的空间的自有任务不是 Peco 的待办"
+    );
+    assert_eq!(
+        env.wake_skip_reason(&target_ws_id, &foreign.to_string())
+            .await
+            .as_deref(),
+        Some("not_peco_origin"),
+        "另一个空间的来源要标成 not_peco_origin"
     );
     let pending = dispatches::list_pending(&env.pool, wake::MAX_BATCH, wake::RETRY_BACKOFF)
         .await
@@ -360,6 +382,11 @@ async fn attempts_below_the_limit_are_rescheduled_and_the_limit_is_skipped() {
         "skipped",
         "第 10 次尝试失败后不再重排"
     );
+    assert_eq!(
+        skip_reason(&env.pool, "t-10").await.as_deref(),
+        Some("attempts_exhausted"),
+        "次数用尽要自成一种跳过原因"
+    );
 }
 
 // ============================================================================
@@ -447,20 +474,26 @@ async fn claiming_the_same_row_twice_yields_one_delivery() {
 #[tokio::test]
 async fn closing_a_space_keeps_the_wake_state_of_rows_already_in_flight() {
     let env = new_env(&[]).await;
-    for (seq, task_id) in [(1, "t-delivering"), (2, "t-delivered"), (3, "t-pending")] {
+    for (seq, task_id) in [
+        (1, "t-delivering"),
+        (2, "t-delivered"),
+        (3, "t-pending"),
+        (4, "t-failed"),
+    ] {
         env.pending_row(seq, task_id, "working", None).await;
     }
     arrange(&env.pool, "t-delivering", "delivering", 1).await;
     arrange(&env.pool, "t-delivered", "delivered", 1).await;
+    arrange(&env.pool, "t-failed", "failed", 1).await;
 
     let orphaned = dispatches::mark_orphan(&env.pool, "ws_target")
         .await
         .unwrap();
 
-    assert_eq!(orphaned, 3, "孤儿化照旧按状态维度计数");
-    for task_id in ["t-delivering", "t-delivered", "t-pending"] {
-        let (state, _) = env.dispatch_state("ws_target", task_id).await;
-        assert_eq!(state, "orphan", "{task_id} 必须被孤儿化");
+    assert_eq!(orphaned, 4, "孤儿化照旧按状态维度计数");
+    for task_id in ["t-delivering", "t-delivered", "t-pending", "t-failed"] {
+        let (task_state, _) = env.task_and_wake_state("ws_target", task_id).await;
+        assert_eq!(task_state, "orphan", "{task_id} 必须被孤儿化");
     }
     assert_eq!(
         wake_state(&env.pool, "t-delivering").await,
@@ -477,6 +510,21 @@ async fn closing_a_space_keeps_the_wake_state_of_rows_already_in_flight() {
         "skipped",
         "还没投出去的行不再唤醒"
     );
+    // 只有「还没投出去」的两种态被关闭顶掉；在途与已送达保留原唤醒态。
+    for task_id in ["t-pending", "t-failed"] {
+        assert_eq!(
+            skip_reason(&env.pool, task_id).await.as_deref(),
+            Some("space_closed"),
+            "{task_id} 的跳过原因由关闭给出"
+        );
+    }
+    for task_id in ["t-delivering", "t-delivered"] {
+        assert_eq!(
+            skip_reason(&env.pool, task_id).await,
+            None,
+            "{task_id} 没被跳过，就不该有原因"
+        );
+    }
     let pending = dispatches::list_pending(&env.pool, wake::MAX_BATCH, wake::RETRY_BACKOFF)
         .await
         .unwrap();

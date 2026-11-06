@@ -139,10 +139,20 @@ async fn a_ledger_event_reaches_an_open_connection() {
         json!(ws_id),
         "载荷里的空间是任务的目标空间"
     );
-    assert_eq!(payload["state"], json!("working"));
+    assert_eq!(payload["task_state"], json!("working"));
+    assert_eq!(
+        payload["wake_state"],
+        json!("pending"),
+        "发起方是 Peco 空间，这一行要进唤醒队列"
+    );
+    assert_eq!(payload["wake_skip_reason"], json!(null));
     assert_eq!(payload["origin_kind"], json!("dispatch_to_workspace"));
     assert!(payload["created_at"].is_string());
     assert_eq!(payload["terminal_at"], json!(null));
+    assert!(
+        payload.get("state").is_none(),
+        "载荷不得再出现旧字段 state：{payload}"
+    );
 
     // 断开后再发一条：没有订阅者时广播 `send` 失败，属正常路径，不得 panic。
     sink.on_registered(&obs, &snapshot(task, TaskState::Working))

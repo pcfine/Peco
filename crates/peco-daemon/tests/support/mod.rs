@@ -21,7 +21,7 @@ use peco_core::tools::{
 };
 use peco_daemon::config::DaemonConfig;
 use peco_daemon::db;
-use peco_daemon::db::dispatches::{self, NewDispatch};
+use peco_daemon::db::dispatches::{self, NewDispatch, WakeSkipReason, WakeState};
 use peco_daemon::db::workspaces;
 use peco_daemon::error::DaemonError;
 use peco_daemon::space::SpaceEnv;
@@ -304,7 +304,7 @@ impl TestEnv {
         task_id: &str,
         origin_kind: &str,
         origin_ws_id: &str,
-        state: &str,
+        task_state: &str,
     ) -> u64 {
         let id = format!(
             "d_{task_id}_{}",
@@ -321,8 +321,9 @@ impl TestEnv {
                 origin_ws_id,
                 agent_name: "@coder",
                 origin_kind,
-                state,
-                wake_state: "pending",
+                task_state,
+                wake_state: WakeState::Pending,
+                wake_skip_reason: None,
             },
         )
         .await
@@ -346,8 +347,9 @@ impl TestEnv {
                 origin_ws_id: target_ws_id,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
-                state: "working",
-                wake_state: "skipped",
+                task_state: "working",
+                wake_state: WakeState::Skipped,
+                wake_skip_reason: Some(WakeSkipReason::NotPecoOrigin),
             },
         )
         .await
@@ -358,18 +360,24 @@ impl TestEnv {
     ///
     /// `seq` 写进 `created_at`：同一秒的时间戳分不出先后，`list_pending` 的排序
     /// 会退化到随机 id，跨行断言的「前几项」就不再稳定。
-    pub async fn pending_row(&self, seq: i64, task_id: &str, state: &str, digest: Option<&str>) {
+    pub async fn pending_row(
+        &self,
+        seq: i64,
+        task_id: &str,
+        task_state: &str,
+        digest: Option<&str>,
+    ) {
         let id = format!("d_{task_id}");
         sqlx::query(
             "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
-             target_team_id, origin_ws_id, agent_name, origin_kind, state, wake_state, \
+             target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state, \
              result_digest, created_at) \
              VALUES (?, ?, 'ws_target', '/tmp/work', 'research', 'ws_origin', '@master', \
              'run_machine_task', ?, 'pending', ?, ?)",
         )
         .bind(&id)
         .bind(task_id)
-        .bind(state)
+        .bind(task_state)
         .bind(digest)
         .bind(format!("2026-01-01 00:00:{seq:02}"))
         .execute(&self.pool)
@@ -384,7 +392,7 @@ impl TestEnv {
     pub async fn peco_pending_row(&self, seq: i64, task_id: &str, peco_ws_id: &str) {
         sqlx::query(
             "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
-             target_team_id, origin_ws_id, agent_name, origin_kind, state, wake_state, \
+             target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state, \
              result_digest, created_at) \
              VALUES (?, ?, ?, '/tmp/work', 'peco', ?, '@master', 'run_machine_task', \
              'completed', 'pending', '重构完成，12 个测试通过', ?)",
@@ -404,10 +412,24 @@ impl TestEnv {
         Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone()))
     }
 
-    /// `d_dispatches` 一行的 `(state, wake_state)`。
-    pub async fn dispatch_state(&self, target_ws_id: &str, task_id: &str) -> (String, String) {
+    /// `d_dispatches` 一行的 `(task_state, wake_state)`：两套状态域各自断言。
+    pub async fn task_and_wake_state(&self, target_ws_id: &str, task_id: &str) -> (String, String) {
         sqlx::query_as::<_, (String, String)>(
-            "SELECT state, wake_state FROM d_dispatches WHERE target_ws_id = ? AND task_id = ?",
+            "SELECT task_state, wake_state FROM d_dispatches \
+             WHERE target_ws_id = ? AND task_id = ?",
+        )
+        .bind(target_ws_id)
+        .bind(task_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// 该行的跳过成因；`None` 表示没跳过，或历史行的成因不可考。
+    pub async fn wake_skip_reason(&self, target_ws_id: &str, task_id: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT wake_skip_reason FROM d_dispatches \
+             WHERE target_ws_id = ? AND task_id = ?",
         )
         .bind(target_ws_id)
         .bind(task_id)

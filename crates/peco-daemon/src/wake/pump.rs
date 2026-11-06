@@ -210,6 +210,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::db::dispatch_state::WakeState;
     use crate::db::dispatches::NewDispatch;
 
     /// 只回答「忙不忙」与「投出去会怎样」的假投递端：把泵的分支决策从真实运行里
@@ -296,8 +297,9 @@ mod tests {
                 origin_ws_id: "ws_peco",
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
-                state: "completed",
-                wake_state: "pending",
+                task_state: "completed",
+                wake_state: WakeState::Pending,
+                wake_skip_reason: None,
             },
         )
         .await

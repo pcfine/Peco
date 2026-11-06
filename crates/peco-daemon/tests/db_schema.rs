@@ -237,3 +237,173 @@ fn schema_sql_declares_team_and_workspace_scope() {
         assert!(schema.contains(needle), "schema.sql 必须含 {needle}");
     }
 }
+
+/// `schema.sql` 必须自带两套状态列与新索引名。
+///
+/// 019/020 的列守卫对「`schema.sql` 漏改」是瞎的：全新库照样能收敛，只是白跑
+/// 一次 DDL，而迁移前段落若仍建旧索引，旧库会在迁移前就报 `no such column`。
+#[test]
+fn schema_sql_declares_task_state_and_wake_skip_reason() {
+    let schema = include_str!("../src/db/schema.sql");
+    let (before_migrations, after_migrations) = schema
+        .split_once("-- @after-migrations")
+        .expect("schema.sql 必须有迁移分界");
+
+    assert!(
+        schema.contains("    task_state      TEXT NOT NULL,"),
+        "d_dispatches 建表语句必须带 task_state 列"
+    );
+    assert!(
+        schema.contains("    wake_skip_reason TEXT"),
+        "d_dispatches 建表语句必须带 wake_skip_reason 列"
+    );
+    assert!(
+        !before_migrations.contains("idx_dispatches_state"),
+        "迁移前段落不得建旧索引：旧库此时还没有 task_state 列"
+    );
+    assert!(
+        after_migrations.contains("DROP INDEX IF EXISTS idx_dispatches_state"),
+        "旧索引名要在迁移后显式丢弃"
+    );
+    assert!(
+        after_migrations.contains("idx_dispatches_task_state"),
+        "新索引建在迁移后段落"
+    );
+}
+
+/// 造一张 019 之前的 `d_dispatches`：`state` 列、旧索引，两行数据（一行历史
+/// `skipped`）。
+async fn legacy_dispatch_ledger(pool: &sqlx::SqlitePool) {
+    for statement in [
+        "CREATE TABLE d_dispatches (\
+           id TEXT PRIMARY KEY, task_id TEXT NOT NULL, target_ws_id TEXT NOT NULL, \
+           target_work_dir TEXT NOT NULL, target_team_id TEXT NOT NULL, \
+           origin_ws_id TEXT NOT NULL, agent_name TEXT NOT NULL, origin_kind TEXT NOT NULL, \
+           state TEXT NOT NULL, wake_state TEXT NOT NULL DEFAULT 'pending', \
+           wake_attempts INTEGER NOT NULL DEFAULT 0, wake_claimed_at TEXT, delivered_at TEXT, \
+           result_digest TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+           terminal_at TEXT, UNIQUE (target_ws_id, task_id))",
+        "CREATE INDEX idx_dispatches_wake ON d_dispatches(wake_state, wake_claimed_at)",
+        "CREATE INDEX idx_dispatches_state ON d_dispatches(target_ws_id, state)",
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+           target_team_id, origin_ws_id, agent_name, origin_kind, state, wake_state) \
+         VALUES ('d1', 't1', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+           'run_machine_task', 'completed', 'pending')",
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+           target_team_id, origin_ws_id, agent_name, origin_kind, state, wake_state) \
+         VALUES ('d2', 't2', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+           'run_machine_task', 'working', 'skipped')",
+    ] {
+        sqlx::raw_sql(statement).execute(pool).await.unwrap();
+    }
+}
+
+async fn column_names(pool: &sqlx::SqlitePool) -> Vec<String> {
+    sqlx::query_scalar("SELECT name FROM pragma_table_info('d_dispatches') ORDER BY cid")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+async fn index_exists(pool: &sqlx::SqlitePool, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+        > 0
+}
+
+/// daemon 启动对旧库跑一遍 019/020：列改名不丢行，历史 `skipped` 行留空原因，
+/// 旧名索引换成新名索引（`RENAME COLUMN` 只改定义不改名字）。
+#[tokio::test]
+async fn migration_019_and_020_upgrade_a_legacy_dispatch_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/legacy.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    legacy_dispatch_ledger(&pool).await;
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    let columns = column_names(&pool).await;
+    assert!(
+        columns.contains(&"task_state".to_string()),
+        "019 后应有 task_state：{columns:?}"
+    );
+    assert!(
+        !columns.contains(&"state".to_string()),
+        "019 后不得残留旧列 state：{columns:?}"
+    );
+    assert!(
+        columns.contains(&"wake_skip_reason".to_string()),
+        "020 后应有 wake_skip_reason：{columns:?}"
+    );
+
+    let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT id, task_state, wake_skip_reason FROM d_dispatches ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("d1".to_string(), "completed".to_string(), None),
+            ("d2".to_string(), "working".to_string(), None),
+        ],
+        "改名不得丢行或改值；历史跳过行的成因不可考，留空"
+    );
+
+    assert!(
+        !index_exists(&pool, "idx_dispatches_state").await,
+        "旧索引名必须被丢弃，否则同一列会带着两个索引名"
+    );
+    assert!(
+        index_exists(&pool, "idx_dispatches_task_state").await,
+        "迁移后段落必须建出新索引"
+    );
+
+    // 再跑一次：两个守卫都命中，形状不变。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_eq!(column_names(&pool).await, columns);
+}
+
+/// 「019 已成功、020 没跑」的半迁移库：列守卫只补 reason 列，不重建表、不编造原因。
+#[tokio::test]
+async fn migration_020_completes_a_half_migrated_dispatch_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/half.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+         target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state) \
+         VALUES ('d1', 't1', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+         'run_machine_task', 'working', 'skipped')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("ALTER TABLE d_dispatches DROP COLUMN wake_skip_reason")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    assert!(
+        column_names(&pool)
+            .await
+            .contains(&"wake_skip_reason".to_string()),
+        "020 必须把缺的列补上"
+    );
+    let reason = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT wake_skip_reason FROM d_dispatches WHERE id = 'd1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reason, None, "补列不得给历史行编造原因");
+}

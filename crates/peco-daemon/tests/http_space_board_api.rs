@@ -195,6 +195,18 @@ async fn overview_counts_today_and_only_today() {
         json!(yesterday),
         "created_at 倒序：昨天那行排最后"
     );
+    // 卡片上的状态列要能直接读到两套状态域，字段名与 `/api/tasks` 一致。
+    let done_row = recent
+        .iter()
+        .find(|row| row["task_id"] == json!(done))
+        .expect("已完成那行必须在 recent 里");
+    assert_eq!(done_row["task_state"], json!("completed"));
+    assert_eq!(done_row["wake_state"], json!("pending"));
+    assert_eq!(done_row["wake_skip_reason"], json!(null));
+    assert!(
+        done_row.get("state").is_none(),
+        "recent 行不得再出现旧字段 state：{done_row}"
+    );
 }
 
 /// 失败不进「已完成」：今日三列里失败单占一格，不计入成功数。
