@@ -1,0 +1,59 @@
+[package]
+name = "peco-daemon"
+version.workspace = true
+edition.workspace = true
+description = "Multi-workspace daemon: single-user DB, WorkspaceHub opener, marker, space lifecycle, task ledger"
+
+[dependencies]
+# Internal
+peco-core = { path = "../peco-core" }
+peco-agents = { path = "../peco-agents" }
+# chat 链路直接消费模型层类型（Content / ContentPart / text_of_blocks）
+model-provider = { path = "../model-provider" }
+# knowledge handler 直接构造 KbConfig / 调 KnowledgeManager；helixdb 是 REST
+# 建库的默认后端（`BackendType::HelixDb` 在无该 feature 时不存在）
+knowledge-base = { path = "../knowledge-base", features = ["helixdb"] }
+
+# Async / DB / HTTP
+tokio = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+# 知识库上传与对话图片上传走 multipart
+axum-extra = { workspace = true }
+tower-http = { workspace = true }
+# 产物取流用 ServeFile + Range
+tower = { workspace = true, features = ["util"] }
+# SSE 通道 → axum 流
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+# 对话图片以 data URI 进消息 Content
+base64 = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+
+# documents 投影按扩展名回填 mime_type
+mime_guess = { workspace = true }
+
+# 团队目录文件监听（外部编辑器改 agent.md 后把新内容送进已打开的空间）
+notify = { workspace = true }
+
+# Errors / logging / time / ids
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "peco_daemon"
+
+[[bin]]
+name = "peco-daemon"
+path = "src/main.rs"
