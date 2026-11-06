@@ -90,6 +90,18 @@ export interface CreateTeamRequest {
   from_template?: string;
 }
 
+/** 唤醒投递的五态；与任务生命周期是两套独立状态，一条任务可以已终态而唤醒仍待投递。 */
+export type WakeState =
+  "pending" | "delivering" | "delivered" | "skipped" | "failed";
+
+/** `wake_state='skipped'` 的成因；历史行没有记录，显示为「原因未记录」。 */
+export type WakeSkipReason =
+  | "not_peco_origin"
+  | "peco_identity_missing"
+  | "orphaned"
+  | "space_closed"
+  | "attempts_exhausted";
+
 /** 台账一行的通用形状：`/api/tasks` 与 `/api/events` 共用同名载荷。 */
 export interface Task {
   id: string;
@@ -100,7 +112,10 @@ export interface Task {
   origin_ws_id: string;
   origin_kind: string;
   agent_name: string;
-  state: string;
+  task_state: string;
+  /** `delivered` 只表示已交给运行器，不代表任务处理完成。 */
+  wake_state: WakeState;
+  wake_skip_reason: WakeSkipReason | null;
   created_at: string;
   terminal_at: string | null;
   result_digest: string | null;
@@ -110,7 +125,9 @@ export interface Task {
 export interface TaskEvent {
   ws_id: string;
   task_id: string;
-  state: string;
+  task_state: string;
+  wake_state: WakeState;
+  wake_skip_reason: WakeSkipReason | null;
   origin_kind: string;
   created_at: string;
   terminal_at: string | null;
@@ -126,7 +143,9 @@ export interface TodayCounts {
 export interface RecentTask {
   id: string;
   task_id: string;
-  state: string;
+  task_state: string;
+  wake_state: WakeState;
+  wake_skip_reason: WakeSkipReason | null;
   agent_name: string;
   origin_kind: string;
   created_at: string;

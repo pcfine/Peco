@@ -4,7 +4,7 @@ import type { Task } from "@/types/daemon";
 export interface TaskFilter {
   target_ws_id?: string;
   origin_ws_id?: string;
-  state?: string;
+  task_state?: string;
   limit?: number;
 }
 

@@ -7,6 +7,7 @@ import { BoardEditorPopover } from "@/components/board/BoardEditorPopover";
 import { SpaceSwitcher } from "@/components/layout/SpaceSwitcher";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { usePecoTodayTasks } from "@/queries/tasks";
+import { TASK_RUNNING_STATES } from "@/lib/taskStates";
 import { usePeco } from "@/queries/peco";
 import { useDockStore } from "@/stores/dockStore";
 
@@ -36,8 +37,8 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
   const toggleDock = useDockStore((state) => state.toggle);
 
   // 角标 = 在飞数（Peco 发起的 submitted/working）；0 时不渲染，不显示「0」。
-  const inflight = (tasks ?? []).filter(
-    (task) => task.state === "submitted" || task.state === "working",
+  const inflight = (tasks ?? []).filter((task) =>
+    TASK_RUNNING_STATES.includes(task.task_state),
   ).length;
   const isBoard = pathname === "/";
 

@@ -32,5 +32,8 @@ export function usePecoTodayTasks(pecoWsId: string | null) {
 
 /** 最近完成的成果：成果流面板与 rail 的「今日」计数共用。 */
 export function useRecentResults(limit = 50) {
-  return useTasks({ state: "completed", limit }, { refetchInterval: 15_000 });
+  return useTasks(
+    { task_state: "completed", limit },
+    { refetchInterval: 15_000 },
+  );
 }

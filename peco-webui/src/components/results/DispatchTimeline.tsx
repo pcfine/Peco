@@ -3,9 +3,11 @@
 
 import { useState } from "react";
 import { TaskStateMark } from "@/components/common/TaskStateMark";
+import { isNotableWakeState, WakeMark } from "@/components/common/WakeMark";
 import { spaceLabel } from "@/components/layout/spaceLabel";
 import { relativeTime } from "@/lib/relative";
 import { parseServerTimestamp } from "@/lib/format";
+import { wakeDescription } from "@/lib/wakeLabels";
 import { cn } from "@/lib/utils";
 import type { Space, Task } from "@/types/daemon";
 
@@ -64,7 +66,17 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                     <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-24">
                       {relativeTime(task.terminal_at ?? task.created_at)}
                     </span>
-                    <TaskStateMark state={task.state} className="shrink-0" />
+                    <TaskStateMark
+                      taskState={task.task_state}
+                      className="shrink-0"
+                    />
+                    {isNotableWakeState(task.wake_state) && (
+                      <WakeMark
+                        wakeState={task.wake_state}
+                        wakeSkipReason={task.wake_skip_reason}
+                        className="shrink-0"
+                      />
+                    )}
                     <span className="min-w-0 shrink-0 truncate font-mono text-2xs text-ink-faint @min-[900px]/main:w-56">
                       {nameOf(task.origin_ws_id)} → {nameOf(task.target_ws_id)}
                     </span>
@@ -89,6 +101,15 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                       >
                         {task.result_digest ?? "这条任务没有摘要。"}
                       </p>
+                      {isNotableWakeState(task.wake_state) && (
+                        <p className="text-2xs text-ink-muted">
+                          唤醒：
+                          {wakeDescription(
+                            task.wake_state,
+                            task.wake_skip_reason,
+                          )}
+                        </p>
+                      )}
                       <p className="font-mono text-2xs text-ink-faint">
                         {task.created_at} → {task.terminal_at ?? "未终态"}
                       </p>

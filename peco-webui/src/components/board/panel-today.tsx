@@ -3,15 +3,12 @@
 
 import { usePecoTodayTasks } from "@/queries/tasks";
 import { isToday, relativeTime } from "@/lib/relative";
+import { taskStateGroup } from "@/lib/taskStates";
 import { cn } from "@/lib/utils";
 import type { Task } from "@/types/daemon";
 import { PanelShell } from "@/components/board/PanelShell";
 import { EmptyState } from "@/components/common/EmptyState";
 import { useDockStore } from "@/stores/dockStore";
-
-const FAILED_STATES = ["failed", "canceled", "timed_out", "rejected"];
-const WAITING_STATES = ["input_required", "auth_required"];
-const ACTIVE_STATES = ["submitted", "working"];
 
 /** 每列最多几行：看板一格不滚动到看不见底部。 */
 const ROWS_PER_COLUMN = 5;
@@ -34,17 +31,18 @@ export function bucketToday(
     waiting: [],
   };
   for (const task of tasks) {
-    if (ACTIVE_STATES.includes(task.state)) {
+    const group = taskStateGroup(task.task_state);
+    if (group === "active") {
       // 在飞看当下状态，不看「今天」：昨天提交、现在还在跑的任务必须显形。
       buckets.active.push(task);
-    } else if (WAITING_STATES.includes(task.state)) {
+    } else if (group === "waiting") {
       buckets.waiting.push(task);
-    } else if (task.state === "completed") {
+    } else if (group === "done") {
       if (isToday(task.terminal_at ?? task.created_at, now)) {
         buckets.completed.push(task);
       }
     } else if (
-      FAILED_STATES.includes(task.state) &&
+      group === "failed" &&
       isToday(task.terminal_at ?? task.created_at, now)
     ) {
       buckets.failed += 1;

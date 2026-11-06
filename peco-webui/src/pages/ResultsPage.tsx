@@ -1,4 +1,4 @@
-// `/results` —— 跨空间台账。状态分组在前端做：`/api/tasks` 只接受单个 `state`，
+// `/results` —— 跨空间台账。状态分组在前端做：`/api/tasks` 只接受单个 `task_state`，
 // 而「进行中」是四个状态的合集 —— 为了一个 chip 连发四次请求不如在已取的窗口里筛。
 
 import { useMemo, useState } from "react";
@@ -7,10 +7,7 @@ import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConnectionStatus } from "@/components/common/ConnectionStatus";
 import { DispatchTimeline } from "@/components/results/DispatchTimeline";
-import {
-  taskStateGroup,
-  type TaskStateGroup,
-} from "@/components/common/TaskStateMark";
+import { taskStateGroup, type TaskStateGroup } from "@/lib/taskStates";
 import { spaceLabel } from "@/components/layout/spaceLabel";
 import { useSpaces } from "@/queries/spaces";
 import { useTasks } from "@/queries/tasks";
@@ -47,8 +44,8 @@ export function ResultsPage() {
     if (state === "all") return all;
     return all.filter((task) =>
       state === "active"
-        ? ["active", "waiting"].includes(taskStateGroup(task.state))
-        : taskStateGroup(task.state) === state,
+        ? ["active", "waiting"].includes(taskStateGroup(task.task_state))
+        : taskStateGroup(task.task_state) === state,
     );
   }, [tasks.data, state]);
 

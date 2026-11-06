@@ -7,9 +7,11 @@ import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConnectionStatus } from "@/components/common/ConnectionStatus";
 import { TaskStateMark } from "@/components/common/TaskStateMark";
+import { isNotableWakeState, WakeMark } from "@/components/common/WakeMark";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { errorText } from "@/lib/api";
 import { formatCreatedAt, parseServerTimestamp } from "@/lib/format";
+import { wakeDescription } from "@/lib/wakeLabels";
 import { formatDuration } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import type { Task } from "@/types/daemon";
@@ -70,7 +72,7 @@ export function SpaceTasksTab({
     <div className="h-full overflow-y-auto">
       <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-line bg-panel px-3 text-2xs text-ink-faint">
         <ConnectionStatus state={eventsState} className="mr-2 shrink-0" />
-        <span className="w-[88px] shrink-0">状态</span>
+        <span className="w-36 shrink-0">状态</span>
         <span className="w-24 shrink-0">agent</span>
         <span className="w-32 shrink-0">来源</span>
         <span className="w-20 shrink-0 text-right">耗时</span>
@@ -88,10 +90,15 @@ export function SpaceTasksTab({
                 aria-expanded={open}
                 className="flex h-9 w-full items-center gap-2 px-3 text-left hover:bg-line/30"
               >
-                <TaskStateMark
-                  state={task.state}
-                  className="w-[88px] shrink-0"
-                />
+                <span className="flex w-36 shrink-0 flex-col gap-0.5">
+                  <TaskStateMark taskState={task.task_state} />
+                  {isNotableWakeState(task.wake_state) && (
+                    <WakeMark
+                      wakeState={task.wake_state}
+                      wakeSkipReason={task.wake_skip_reason}
+                    />
+                  )}
+                </span>
                 <span className="w-24 shrink-0 truncate text-sm text-ink">
                   {task.agent_name}
                 </span>
@@ -122,6 +129,12 @@ export function SpaceTasksTab({
                   <p className="max-w-[640px] whitespace-pre-wrap break-words text-sm text-ink">
                     {task.result_digest ?? "这条任务没有摘要。"}
                   </p>
+                  {isNotableWakeState(task.wake_state) && (
+                    <p className="text-2xs text-ink-muted">
+                      唤醒：
+                      {wakeDescription(task.wake_state, task.wake_skip_reason)}
+                    </p>
+                  )}
                 </div>
               )}
             </li>
