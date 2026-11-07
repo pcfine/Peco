@@ -3,7 +3,6 @@
 
 import { useLocation } from "react-router-dom";
 import { Menu, MessagesSquare } from "lucide-react";
-import { BoardEditorPopover } from "@/components/board/BoardEditorPopover";
 import { SpaceSwitcher } from "@/components/layout/SpaceSwitcher";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { usePecoTodayTasks } from "@/queries/tasks";
@@ -12,7 +11,6 @@ import { usePeco } from "@/queries/peco";
 import { useDockStore } from "@/stores/dockStore";
 
 const PAGE_TITLES: Record<string, string> = {
-  "/peco": "Peco 面板",
   "/spaces": "工作室",
   "/spaces/new": "新建空间",
   "/teams": "团队",
@@ -22,7 +20,13 @@ const PAGE_TITLES: Record<string, string> = {
 };
 
 /** 动态段（`/spaces/:wsId`、`/teams/:teamId`）只按前缀取标题。 */
-function titleOf(pathname: string): string {
+function titleOf(pathname: string, search: string): string {
+  // Peco 的两个面共用一个路径：标题跟着 `face` 走，否则翻转后顶栏还在说聊天。
+  if (pathname === "/peco") {
+    return new URLSearchParams(search).get("face") === "config"
+      ? "Peco 能力配置"
+      : "Peco 聊天";
+  }
   if (PAGE_TITLES[pathname]) return PAGE_TITLES[pathname];
   if (/^\/spaces\/[^/]+\/status$/.test(pathname)) return "空间状态";
   if (pathname.startsWith("/spaces/")) return "空间聊天";
@@ -31,7 +35,7 @@ function titleOf(pathname: string): string {
 }
 
 export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
-  const { pathname } = useLocation();
+  const { pathname, search } = useLocation();
   const wide = useMediaQuery("(min-width: 900px)");
   const { data: peco } = usePeco();
   const { data: tasks } = usePecoTodayTasks(peco?.ws_id ?? null);
@@ -42,7 +46,6 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
   const inflight = (tasks ?? []).filter((task) =>
     TASK_RUNNING_STATES.includes(task.task_state),
   ).length;
-  const isBoard = pathname === "/peco";
 
   return (
     <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-canvas px-3">
@@ -58,11 +61,10 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
       )}
       {!wide && <SpaceSwitcher />}
       <h1 className="truncate text-sm font-semibold text-ink">
-        {titleOf(pathname)}
+        {titleOf(pathname, search)}
       </h1>
 
       <div className="ml-auto flex items-center gap-1">
-        {isBoard && <BoardEditorPopover />}
         <button
           type="button"
           onClick={toggleDock}

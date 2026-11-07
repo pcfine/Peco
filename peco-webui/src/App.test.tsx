@@ -51,7 +51,24 @@ vi.mock("@/api/spaces", () => ({
 
 vi.mock("@/api/teams", () => ({
   listTeams: async () => [],
-  getTeam: async () => {
+  // Peco 翻转面常驻挂着，`/peco` 一开始就会读它的团队详情。
+  getTeam: async (teamId: string) => ({
+    id: teamId,
+    display_name: "Peco",
+    template_version: 1,
+    root: "/tmp/peco/team",
+    has_master: true,
+    agents: [],
+    skills: [],
+    mcp_servers: [],
+    knowledge_bases: [],
+    spaces: [],
+  }),
+}));
+
+vi.mock("@/api/agents", () => ({
+  listAgents: async () => [],
+  getAgent: async () => {
     throw new Error("unused in smoke test");
   },
 }));
@@ -119,7 +136,7 @@ beforeEach(() => {
 });
 
 describe("壳与路由", () => {
-  it("/ 重定向到 /peco，看板照常渲染", async () => {
+  it("/ 重定向到 /peco，Peco 页照常渲染", async () => {
     renderAt("/");
 
     await waitFor(() =>
@@ -127,15 +144,31 @@ describe("壳与路由", () => {
     );
   });
 
-  it("/peco 渲染四块面板", async () => {
+  it("/peco 是聊天页：右栏默认总览，四块面板都在", async () => {
     renderAt("/peco");
+    expect(await screen.findByTestId("space-chat-shell")).toBeInTheDocument();
+    expect(screen.getByTestId("peco-panel")).toHaveAttribute(
+      "data-mode",
+      "overview",
+    );
     expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
     expect(screen.getByTestId("panel-spaces")).toBeInTheDocument();
     expect(screen.getByTestId("panel-teams")).toBeInTheDocument();
     expect(screen.getByTestId("panel-results")).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "Peco 面板" }),
+      screen.getByRole("heading", { name: "Peco 聊天" }),
     ).toBeInTheDocument();
+  });
+
+  it("/peco?face=config 是能力配置面：顶栏跟着换标题", async () => {
+    renderAt("/peco?face=config");
+    expect(
+      await screen.findByRole("heading", { name: "Peco 能力配置" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByTestId("peco-flip")).toHaveAttribute(
+      "data-face",
+      "config",
+    );
   });
 
   it("/spaces 是列表页，空态给一句事实", async () => {

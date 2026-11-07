@@ -7,7 +7,6 @@ import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   SPACE_PANEL_LABELS,
-  SPACE_PANEL_MODES,
   type SpacePanelMode,
 } from "@/components/spaces/useSpacePanelState";
 import { cn } from "@/lib/utils";
@@ -19,6 +18,8 @@ interface SpacePanelModeBarProps {
   inflight: number;
   onSelect: (mode: SpacePanelMode) => void;
   onToggleCollapsed: () => void;
+  /** 可选的模式集合：Peco 页多一个「总览」，两处都不该猜默认值。 */
+  modes: readonly SpacePanelMode[];
 }
 
 export function SpacePanelModeBar({
@@ -27,10 +28,11 @@ export function SpacePanelModeBar({
   inflight,
   onSelect,
   onToggleCollapsed,
+  modes,
 }: SpacePanelModeBarProps) {
   return (
     <div role="group" aria-label="右栏" className="flex items-center gap-1">
-      {SPACE_PANEL_MODES.map((item) => (
+      {modes.map((item) => (
         <button
           key={item}
           type="button"

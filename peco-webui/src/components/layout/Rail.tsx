@@ -29,7 +29,10 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
   const setActive = useOpenSpacesStore((state) => state.setActive);
   const activateSpace = useActivateSpace();
   const navigate = useNavigate();
-  const { pathname } = useLocation();
+  const { pathname, search } = useLocation();
+  const onPecoConfigFace =
+    pathname === "/peco" &&
+    new URLSearchParams(search).get("face") === "config";
 
   const { data: peco } = usePeco();
   const { data: spaces } = useSpaces();
@@ -51,10 +54,16 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
     isToday(task.terminal_at ?? task.created_at),
   ).length;
 
+  // 第一下进聊天，已经在聊天面时第二下翻到能力配置，再点回来 —— Peco 是唯一
+  // 一行「再点一次」有额外含义的入口；空间行仍然只切激活态。
   const openPeco = () => {
     if (!peco) return;
     setActive(peco.ws_id);
-    if (pathname !== "/peco") navigate("/peco");
+    if (pathname !== "/peco") {
+      navigate("/peco");
+      return;
+    }
+    navigate(onPecoConfigFace ? "/peco" : "/peco?face=config");
   };
 
   // 行之间 ↑/↓ 移动焦点：行本身是按钮，Enter/Space 天然生效。

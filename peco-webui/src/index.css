@@ -195,4 +195,9 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+  /* Peco 翻转的降级不是「不动」，而是 120ms 淡入淡出：上面的全站规则会把它
+     一起压成 0.01ms，这里把那一处时长还给设计要求的数值。 */
+  .peco-flip-fade {
+    transition-duration: 120ms !important;
+  }
 }

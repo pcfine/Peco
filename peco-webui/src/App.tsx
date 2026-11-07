@@ -2,7 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppShell } from "@/components/layout/AppShell";
 import { NotFoundPage } from "@/pages/NotFoundPage";
-import { PecoBoardPage } from "@/pages/PecoBoardPage";
+import { PecoChatPage } from "@/pages/PecoChatPage";
 import { ResultsPage } from "@/pages/ResultsPage";
 import { SchedulesPage } from "@/pages/SchedulesPage";
 import { SettingsPage } from "@/pages/SettingsPage";
@@ -14,7 +14,10 @@ import { TeamDetailPage } from "@/pages/TeamDetailPage";
 import { TeamListPage } from "@/pages/TeamListPage";
 
 /**
- * `/` 不再是看板：Peco 有了自己的路由，`/` 只剩一条重定向。
+ * `/` 只剩一条重定向：Peco 有自己的路由，不再借用首页。
+ *
+ * `/peco?face=config` 走同一个路由元素：翻转面的状态在 query 里，`/peco` 只有
+ * 一个页面，切面不重挂载、不重建聊天。
  *
  * `/spaces/new` 与 `/spaces/:wsId/status` 是静态段收尾/追加，必须能与 `/spaces/:wsId`
  * 区分开：`new` 不能被当成 ws_id，`status` 不能被当成 ws_id 的一部分。
@@ -29,7 +32,7 @@ export function App() {
       <Routes>
         <Route element={<AppShell />}>
           <Route index element={<Navigate to="/peco" replace />} />
-          <Route path="peco" element={<PecoBoardPage />} />
+          <Route path="peco" element={<PecoChatPage />} />
           <Route path="spaces" element={<SpaceListPage />} />
           <Route path="spaces/new" element={<NewSpacePage />} />
           <Route path="spaces/:wsId" element={<SpaceDetailPage />} />

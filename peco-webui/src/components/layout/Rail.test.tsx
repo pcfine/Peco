@@ -59,17 +59,22 @@ vi.mock("@/api/teams", () => ({ listTeams: async () => [] }));
 vi.mock("@/api/tasks", () => ({ listTasks: async () => [] }));
 
 function PathProbe() {
-  const { pathname } = useLocation();
-  return <span data-testid="path">{pathname}</span>;
+  const { pathname, search } = useLocation();
+  return (
+    <span data-testid="path">
+      {pathname}
+      {search}
+    </span>
+  );
 }
 
-function renderRail(collapsed = false) {
+function renderRail(collapsed = false, path = "/peco") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={["/peco"]}>
+      <MemoryRouter initialEntries={[path]}>
         <Rail collapsed={collapsed} />
         <PathProbe />
       </MemoryRouter>
@@ -151,19 +156,36 @@ describe("左栏打开集", () => {
   it("「打开空间」进工作室页", async () => {
     renderRail();
 
-    expect(await screen.findByRole("link", { name: "打开空间" })).toHaveAttribute(
-      "href",
-      "/spaces",
-    );
+    expect(
+      await screen.findByRole("link", { name: "打开空间" }),
+    ).toHaveAttribute("href", "/spaces");
   });
 
-  it("Peco 行进 /peco 并把请求归属切回 Peco", async () => {
+  it("不在 Peco 页时点 Peco 行：进 /peco 聊天并把请求归属切回 Peco", async () => {
     useSpaceStore.setState({ currentWsId: "ws_a" });
-    renderRail();
+    renderRail(false, "/spaces/ws_a");
 
     fireEvent.click(await screen.findByRole("button", { name: "Peco" }));
 
     expect(screen.getByTestId("path")).toHaveTextContent("/peco");
+    expect(screen.getByTestId("path")).not.toHaveTextContent("face=config");
     expect(useSpaceStore.getState().currentWsId).toBe("ws_peco");
+  });
+
+  it("已在 Peco 聊天面时再点 Peco 行：翻到能力配置", async () => {
+    renderRail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Peco" }));
+
+    expect(screen.getByTestId("path")).toHaveTextContent("/peco?face=config");
+  });
+
+  it("在 Peco 能力配置面时点 Peco 行：回到聊天面", async () => {
+    renderRail(false, "/peco?face=config");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Peco" }));
+
+    expect(screen.getByTestId("path")).toHaveTextContent("/peco");
+    expect(screen.getByTestId("path")).not.toHaveTextContent("face=config");
   });
 });

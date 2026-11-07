@@ -16,7 +16,10 @@ import { SpaceChatShell } from "@/components/spaces/SpaceChatShell";
 import { SpaceDetailHeader } from "@/components/spaces/SpaceDetailHeader";
 import { SpacePanelModeBar } from "@/components/spaces/SpacePanelModeBar";
 import { SpaceSidePanel } from "@/components/spaces/SpaceSidePanel";
-import { useSpacePanelState } from "@/components/spaces/useSpacePanelState";
+import {
+  SPACE_PANEL_MODES,
+  useSpacePanelState,
+} from "@/components/spaces/useSpacePanelState";
 import { useCloseSpace } from "@/components/spaces/useSpaceLifecycle";
 import { useSpace, useSpaceTasks } from "@/queries/spaceDetail";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
@@ -79,6 +82,7 @@ export function SpaceDetailPage() {
             mode={panel.mode}
             collapsed={panel.collapsed}
             inflight={inflight}
+            modes={SPACE_PANEL_MODES.space}
             onSelect={panel.selectMode}
             onToggleCollapsed={panel.toggleCollapsed}
           />

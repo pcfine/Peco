@@ -3,7 +3,7 @@
 // 它按 wsId 常驻在页面里，非当前空间只加 `hidden` 而不卸载：ChatView 卸载会
 // abort 在途 fetch（服务端随之结束该轮），切空间绝不能走那条路。
 //
-// 已知限制：离开 `/spaces/:wsId` 路由（状态页、Peco 页）就会卸载本壳，
+// 已知限制：离开承载它的路由（`/spaces/:wsId`、`/peco` 或状态页）就会卸载本壳，
 // 在途的流随之中断 —— 应用内跨空间切换不受影响。
 
 import { useMemo } from "react";
