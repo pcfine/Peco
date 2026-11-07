@@ -60,8 +60,21 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
   };
 
   return (
-    <aside className="flex h-full shrink-0 flex-col border-r border-line bg-canvas">
-      <div className="flex h-11 shrink-0 items-center gap-2 pl-3 pr-2">
+    // 宽度只能由 `collapsed` 决定：让它跟着内容走，空间一多主区就被挤窄。
+    <aside
+      className={cn(
+        "flex h-full shrink-0 flex-col border-r border-line bg-canvas",
+        collapsed ? "w-16" : "w-64",
+      )}
+    >
+      {/* 收起态 64 放不下「品牌 + 间距 + 按钮」的展开式内边距：收紧留白并居中，
+          否则标题行会横向溢出压到主区。 */}
+      <div
+        className={cn(
+          "flex h-11 shrink-0 items-center",
+          collapsed ? "justify-center gap-1 px-1" : "gap-2 pl-3 pr-2",
+        )}
+      >
         <BrandMark size={20} />
         {!collapsed && (
           <span className="text-sm font-semibold text-ink">Peco</span>
@@ -70,7 +83,10 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
           type="button"
           onClick={() => setRailOpen(!railOpen)}
           aria-label={railOpen ? "折叠左栏" : "展开左栏"}
-          className="ml-auto grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
+          className={cn(
+            "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
+            !collapsed && "ml-auto",
+          )}
         >
           {railOpen ? (
             <PanelLeftClose className="h-4 w-4" />

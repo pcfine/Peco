@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "@/App";
+import { useDockStore } from "@/stores/dockStore";
+import { useUiStore } from "@/stores/uiStore";
 
 // 壳的挂载冒烟：只验证路由与面板都渲染出来。数据来源全换成固定值 ——
 // 这一层测的不是取数，真接口由 daemon 的集成测试覆盖。
@@ -46,9 +48,39 @@ vi.mock("@/api/tasks", () => ({
   listTasks: async () => [],
 }));
 
+vi.mock("@/api/conversations", () => ({
+  listConversations: async () => [{ id: "conv-dock", title: "Peco" }],
+  getMessages: async () => [],
+  createConversation: async () => ({ id: "conv-dock" }),
+  conversationStreamUrl: () =>
+    "/api/chat/@master/conversations/conv-dock/stream",
+  uploadConversationImage: async () => ({ id: "img", url: "/img" }),
+}));
+
 vi.mock("@/lib/events", () => ({
   openTaskStream: () => () => {},
 }));
+
+/**
+ * jsdom 的 `matchMedia` 一律返回 false（见 test/setup.ts），壳的宽屏分支要显式打开，
+ * 否则 rail 只会出现在 Sheet 里、dock 也不按右列渲染。返回的函数用于复原。
+ */
+function useWideViewport(): () => void {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    matches: /min-width: (900|1100|1200)px/.test(query),
+    media: query,
+    onchange: null,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+  return () => {
+    window.matchMedia = original;
+  };
+}
 
 function renderAt(path: string) {
   const client = new QueryClient({
@@ -111,5 +143,46 @@ describe("壳与路由", () => {
   it("未注册的路径给 404 文案，不是营销页", async () => {
     renderAt("/workflows/demo");
     expect(await screen.findByText("页面不存在")).toBeInTheDocument();
+  });
+});
+
+describe("白屏与 rail 宽度", () => {
+  it("rail 宽度只由折叠态决定：展开 256、收起 64", async () => {
+    const restore = useWideViewport();
+    try {
+      useUiStore.setState({ railOpen: true });
+      const expanded = renderAt("/");
+      expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
+      expect(expanded.container.querySelector("aside")).toHaveClass("w-64");
+      expanded.unmount();
+
+      useUiStore.setState({ railOpen: false });
+      const collapsed = renderAt("/");
+      expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
+      expect(collapsed.container.querySelector("aside")).toHaveClass("w-16");
+      collapsed.unmount();
+    } finally {
+      useUiStore.setState({ railOpen: true });
+      restore();
+    }
+  });
+
+  it("dock 打开时对话首屏不白屏：ChatView 的 Tooltip 在根部 provider 里", async () => {
+    const restore = useWideViewport();
+    useDockStore.setState({ open: true, conversationByWs: {} });
+    const view = renderAt("/");
+    try {
+      // 缺 TooltipProvider 时 Radix 渲染期抛错、整棵树被卸载，消息区不会出现。
+      await waitFor(() =>
+        expect(
+          document.querySelector("[data-slot='message-scroller']"),
+        ).not.toBeNull(),
+      );
+    } finally {
+      // Tooltip 内部有延迟计时器：挂着等它到点会以 act() 警告收尾。
+      view.unmount();
+      useDockStore.setState({ open: false });
+      restore();
+    }
   });
 });
