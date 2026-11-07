@@ -167,11 +167,13 @@ describe("壳与路由", () => {
     expect(await screen.findByText(/本期尚未实现/)).toBeInTheDocument();
   });
 
-  it("/spaces/:wsId 是聊天页占位，/status 才是状态页", async () => {
+  it("/spaces/:wsId 是聊天页：单对话壳 + 右栏，/status 才是状态页", async () => {
     const chat = renderAt("/spaces/ws_peco");
-    expect(
-      await screen.findByText(/下一阶段接到这里/),
-    ).toBeInTheDocument();
+    expect(await screen.findByTestId("space-chat-shell")).toBeInTheDocument();
+    expect(screen.getByTestId("space-panel")).toHaveAttribute(
+      "data-mode",
+      "files",
+    );
     expect(screen.getByTestId("path")).toHaveTextContent("/spaces/ws_peco");
     chat.unmount();
 
@@ -179,7 +181,8 @@ describe("壳与路由", () => {
     expect(
       await screen.findByRole("tab", { name: /任务台账/ }),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/下一阶段接到这里/)).toBeNull();
+    // 状态页不承载聊天：它没有单对话壳。
+    expect(screen.queryByTestId("space-chat-shell")).toBeNull();
   });
 
   it("未注册的路径给 404 文案，不是营销页", async () => {

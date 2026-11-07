@@ -220,6 +220,10 @@ export interface ChatViewProps {
   headerActions?: React.ReactNode;
   /** 头部标题 */
   headerTitle?: React.ReactNode;
+  /** 隐藏内置头部：页面已经有自己的页头时，聊天列不再重复一条标题栏。 */
+  hideHeader?: boolean;
+  /** composer 上方的插槽（如冲突提示）：只占位不进入消息流，也不影响输入。 */
+  composerNotice?: React.ReactNode;
   /** 消息列表为空时显示的欢迎内容 */
   welcomeMessage?: React.ReactNode;
   /** 空态建议问题，点击即发送。 */
@@ -289,6 +293,8 @@ export function ChatView({
   initialMessages = [],
   headerActions,
   headerTitle = "对话",
+  hideHeader = false,
+  composerNotice,
   welcomeMessage,
   suggestions,
   visible = true,
@@ -814,10 +820,12 @@ export function ChatView({
       className={`mx-auto flex min-h-0 w-full max-w-[640px] flex-col ${className || "h-full"}`}
     >
       {/* Header */}
-      <div className="flex items-center gap-3 py-3 border-b mb-4">
-        <h2 className="font-semibold flex-1">{headerTitle}</h2>
-        {headerActions}
-      </div>
+      {!hideHeader && (
+        <div className="flex items-center gap-3 py-3 border-b mb-4">
+          <h2 className="font-semibold flex-1">{headerTitle}</h2>
+          {headerActions}
+        </div>
+      )}
 
       {/* Messages */}
       <div
@@ -853,6 +861,7 @@ export function ChatView({
 
       {/* Input */}
       <div className="pt-4 mt-4 border-t border-border">
+        {composerNotice}
         <div className="flex flex-col rounded-2xl border bg-card shadow-xs focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
           {/* 在途轮已排队、尚未被模型请求消费的输入。送达后由 store 落成正式
               气泡（`user_steer` / 轮次收尾兜底），这里只承担「没有石沉大海」的

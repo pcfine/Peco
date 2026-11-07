@@ -1,19 +1,48 @@
-// `/spaces/:wsId` —— 本阶段是页头 + 聊天占位：单对话壳与右栏在下一阶段接入。
-// 空间的开关、台账、产物、文件都已搬到 `/spaces/:wsId/status`，这里不重复承载。
+// `/spaces/:wsId` —— 空间聊天页：唯一 @master 对话 + 可收起的右栏（文件 / 任务 / 记忆）。
+//
+// 打开集里的每个空间都挂一个聊天壳，只有当前空间可见。React Router 在
+// `/spaces/A` → `/spaces/B` 之间复用同一个路由元素，页面因此不重挂载，
+// 切走的空间继续跑它的流；左栏切换只改激活态与路由。
+//
+// 已知限制：进 `/spaces/:wsId/status` 或 `/peco` 会离开这个路由元素，
+// 隐藏空间的流随组件卸载中断。
 
+import { useMemo } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CloseSpaceDialog } from "@/components/spaces/CloseSpaceDialog";
+import { SpaceChatShell } from "@/components/spaces/SpaceChatShell";
 import { SpaceDetailHeader } from "@/components/spaces/SpaceDetailHeader";
+import { SpacePanelModeBar } from "@/components/spaces/SpacePanelModeBar";
+import { SpaceSidePanel } from "@/components/spaces/SpaceSidePanel";
+import { useSpacePanelState } from "@/components/spaces/useSpacePanelState";
 import { useCloseSpace } from "@/components/spaces/useSpaceLifecycle";
-import { useSpace } from "@/queries/spaceDetail";
+import { useSpace, useSpaceTasks } from "@/queries/spaceDetail";
+import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { errorText } from "@/lib/api";
+import { TASK_RUNNING_STATES } from "@/lib/taskStates";
 
 export function SpaceDetailPage() {
   const { wsId = "" } = useParams();
   const space = useSpace(wsId);
   const close = useCloseSpace(wsId);
+  const openIds = useOpenSpacesStore((state) => state.openIds);
+  const panel = useSpacePanelState(wsId);
+
+  // 页头的「任务 N」角标与聊天壳里的冲突提示读同一份台账查询。
+  const tasks = useSpaceTasks(wsId);
+  const inflight = (tasks.data ?? []).filter((task) =>
+    TASK_RUNNING_STATES.includes(task.task_state),
+  ).length;
+
+  // 直接进 URL 的空间不一定在打开集里：当前路由永远有一个壳，
+  // 否则页面自己就成了白屏。
+  const shellIds = useMemo(() => {
+    const ids = [...openIds];
+    if (wsId && !ids.includes(wsId)) ids.push(wsId);
+    return ids;
+  }, [openIds, wsId]);
 
   if (space.isPending) {
     return (
@@ -45,20 +74,46 @@ export function SpaceDetailPage() {
         space={space.data}
         onClose={close.close}
         closing={close.closing}
+        actions={
+          <SpacePanelModeBar
+            mode={panel.mode}
+            collapsed={panel.collapsed}
+            inflight={inflight}
+            onSelect={panel.selectMode}
+            onToggleCollapsed={panel.toggleCollapsed}
+          />
+        }
       />
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        <div className="max-w-[480px] space-y-2">
-          <p className="text-sm text-ink-muted">
-            这个空间只有一条 @master 对话，聊天区下一阶段接到这里。
-          </p>
-          <Link
-            to={`/spaces/${encodeURIComponent(wsId)}/status`}
-            className="text-xs text-primary-ink hover:underline"
-          >
-            查看空间状态
-          </Link>
+      <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col p-3">
+          {/* 未打开的空间没有实例：历史还能看，但每一轮都会 409。
+              先说明白，别让用户在 composer 里撞一次错误才发现。 */}
+          {space.data.status === "closed" && (
+            <div className="shrink-0 pb-2">
+              <ErrorBanner
+                message="空间还没打开，消息发不出去。用页头的「打开」启动它。"
+                onRetry={() => void space.refetch()}
+              />
+            </div>
+          )}
+          {shellIds.map((id) => (
+            <SpaceChatShell key={id} wsId={id} visible={id === wsId} />
+          ))}
         </div>
+
+        {!panel.collapsed && (
+          <aside
+            data-testid="space-panel"
+            data-mode={panel.mode}
+            aria-label="空间右栏"
+            className="flex w-80 shrink-0 flex-col border-l border-line"
+          >
+            <div className="min-h-0 flex-1">
+              <SpaceSidePanel wsId={wsId} mode={panel.mode} />
+            </div>
+          </aside>
+        )}
       </div>
 
       <CloseSpaceDialog

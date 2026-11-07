@@ -18,12 +18,15 @@ interface SpaceDetailHeaderProps {
   space: Space;
   onClose: () => void;
   closing: boolean;
+  /** 右侧附加动作（聊天页的右栏模式按钮组）。开关按钮始终在最右。 */
+  actions?: React.ReactNode;
 }
 
 export function SpaceDetailHeader({
   space,
   onClose,
   closing,
+  actions,
 }: SpaceDetailHeaderProps) {
   const { open, opening } = useOpenSpace(
     space.ws_id,
@@ -62,7 +65,8 @@ export function SpaceDetailHeader({
             非当前空间
           </button>
         )}
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {actions}
           {space.status === "closed" && (
             <Button
               variant="outline"
