@@ -1,0 +1,802 @@
+// Provider 配置区：团队能力根下 providers.toml 的增删改与试连。
+//
+// 表单以「类型」为起点：类型一定，默认地址与默认模型就按目录自动填好，通常只需
+// 粘一个 API Key。地址与模型仍可手改（自建兼容端点），但不会让人对着空输入框
+// 手打默认值。
+
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Pencil, Plus, Trash2, Wifi } from "lucide-react";
+import { toast } from "sonner";
+import { EmptyState } from "@/components/common/EmptyState";
+import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import {
+  deleteProvider,
+  listProviderTypes,
+  listProviders,
+  testProviderConnection,
+  testProviderDraft,
+  upsertProvider,
+} from "@/api/providers";
+import type {
+  ProviderInfo,
+  ProviderTypeInfo,
+  TestDraftRequest,
+  TestResponse,
+  UpsertProviderRequest,
+} from "@/api/providers";
+import { errorText } from "@/lib/api";
+import { cn } from "@/lib/utils";
+
+/**
+ * `api` 选择器里代表「跟随类型默认风格」的哨兵值。
+ *
+ * radix Select 不接受空字符串 value，而载荷里的空串含义正是「适配器用类型默认
+ * 风格」，所以在选择器边界上做一次映射。
+ */
+const API_DEFAULT = "__type_default__";
+
+// ── 表单模型（纯函数，测试直接调用） ──────────────────────────────────────
+
+/** 表单状态 —— 与 provider 的可写字段一一对应。 */
+export interface FormState {
+  name: string;
+  providerType: string;
+  /** 留空 = 保存时不改动已存密钥（密钥不回读，无法回显旧值）。 */
+  apiKey: string;
+  baseUrl: string;
+  /** `""` = 跟随类型默认风格。 */
+  api: string;
+  model: string;
+  setDefault: boolean;
+}
+
+/** 按类型取目录条目。 */
+export function typeMeta(
+  types: ProviderTypeInfo[],
+  providerType: string,
+): ProviderTypeInfo | undefined {
+  return types.find((t) => t.provider_type === providerType);
+}
+
+/** 在 `taken` 中找一个未占用的名字（`base`、`base-2`、`base-3`…）。 */
+export function uniqueName(base: string, taken: string[]): string {
+  if (!taken.includes(base)) return base;
+  for (let i = 2; i <= taken.length + 2; i += 1) {
+    const candidate = `${base}-${i}`;
+    if (!taken.includes(candidate)) return candidate;
+  }
+  return base;
+}
+
+/** 新建时的初始表单：首个类型 + 它的默认地址与默认模型。 */
+export function blankForm(
+  types: ProviderTypeInfo[],
+  taken: string[] = [],
+): FormState {
+  const first = types[0];
+  return {
+    name: first ? uniqueName(first.provider_type, taken) : "",
+    providerType: first?.provider_type ?? "",
+    apiKey: "",
+    baseUrl: first?.default_base_url ?? "",
+    api: "",
+    model: first?.default_model ?? "",
+    setDefault: false,
+  };
+}
+
+/**
+ * 已存条目 → 表单；密钥不回读，`apiKey` 一律留空。
+ *
+ * 只回显**已存值**，不拿目录默认值补空：补空会让「只改密钥」这种编辑在保存时
+ * 把目录默认地址/模型显式写进配置（原本为空表示跟随类型默认），用户没改的字段
+ * 就被静默改掉了。
+ */
+export function formFromProvider(provider: ProviderInfo): FormState {
+  return {
+    name: provider.name,
+    providerType: provider.provider_type,
+    apiKey: "",
+    baseUrl: provider.base_url ?? "",
+    api: provider.api ?? "",
+    model: provider.default_model ?? "",
+    setDefault: provider.is_default,
+  };
+}
+
+/** 字段为空、或还停留在上一个类型的默认值时，才跟随新类型的默认值。 */
+function adoptDefault(
+  current: string,
+  prevDefault: string | undefined,
+  nextDefault: string,
+): string {
+  const trimmed = current.trim();
+  return trimmed === "" || trimmed === prevDefault ? nextDefault : current;
+}
+
+/**
+ * 切换类型时的字段重填。
+ *
+ * 只覆盖「为空或仍是上一个类型默认值」的字段 —— 用户手改过的地址/模型
+ * （自建兼容端点）不会被切类型冲掉。
+ */
+export function formForTypeChange(
+  form: FormState,
+  prev: ProviderTypeInfo | undefined,
+  next: ProviderTypeInfo | undefined,
+  opts: { isNew: boolean; taken: string[] },
+): FormState {
+  if (!next) return form;
+  const nameFollowsType =
+    form.name.trim() === "" || form.name === prev?.provider_type;
+  return {
+    ...form,
+    providerType: next.provider_type,
+    // 名字是 providers.toml 的 key（编辑时即主键），只在新建且仍是默认值时跟随类型
+    name:
+      opts.isNew && nameFollowsType
+        ? uniqueName(next.provider_type, opts.taken)
+        : form.name,
+    baseUrl: adoptDefault(
+      form.baseUrl,
+      prev?.default_base_url,
+      next.default_base_url,
+    ),
+    model: adoptDefault(form.model, prev?.default_model, next.default_model),
+    // api 档位是类型特有的，新类型没有该档位就退回「跟随默认」
+    api: next.api_modes.includes(form.api) ? form.api : "",
+  };
+}
+
+/** 表单 → `PUT .../providers` 请求体。 */
+export function toUpsertRequest(form: FormState): UpsertProviderRequest {
+  const req: UpsertProviderRequest = {
+    name: form.name.trim() || form.providerType,
+    type: form.providerType,
+    // 空串 = 用该类型的默认地址（后端把空串当「清空该字段」）
+    base_url: form.baseUrl.trim(),
+    api: form.api,
+    default_model: form.model.trim(),
+  };
+  // 省略 api_key = 保留已存密钥；新建时省略等价于「没有密钥」，语义一致。
+  // 不能传空串：后端把空串解释为「清空该字段」，编辑时留空会静默删掉已存密钥。
+  if (form.apiKey.trim()) req.api_key = form.apiKey.trim();
+  if (form.setDefault) req.set_default = true;
+  return req;
+}
+
+/** 表单 → `POST .../providers/test` 请求体。草稿没有已存值可回退，字段直传。 */
+export function toTestRequest(form: FormState): TestDraftRequest {
+  return {
+    name: form.name.trim() || form.providerType,
+    type: form.providerType,
+    api_key: form.apiKey.trim(),
+    base_url: form.baseUrl.trim(),
+    api: form.api,
+    default_model: form.model.trim(),
+  };
+}
+
+/**
+ * 保存前的本地校验，返回第一条不满足的说明；全部通过返回 null。
+ *
+ * 密钥与模型只在新建时必填：编辑时两者留空都表示「保持已存值」，而历史配置本就
+ * 可以没有默认模型 —— 强制填会让「只想换个密钥」的编辑保存不出去。
+ */
+export function validateForm(form: FormState, isNew: boolean): string | null {
+  if (!form.providerType.trim()) return "请选择 Provider 类型";
+  if (!form.name.trim()) return "请填写名称";
+  if (!isNew) return null;
+  if (!form.apiKey.trim()) {
+    return "请填写 API Key（也可填 ${ENV_VAR} 由服务端从环境变量读取）";
+  }
+  if (!form.model.trim()) return "请填写默认模型";
+  return null;
+}
+
+// ── 组件 ─────────────────────────────────────────────────────────────────
+
+export function ProviderSection({ teamId }: { teamId: string }) {
+  const queryClient = useQueryClient();
+  const providersQuery = useQuery({
+    queryKey: ["providers", teamId],
+    queryFn: () => listProviders(teamId),
+  });
+  // 目录是一份编译期常量，按团队维度缓存，别为它反复打网络。
+  const typesQuery = useQuery({
+    queryKey: ["provider-types", teamId],
+    queryFn: () => listProviderTypes(teamId),
+    staleTime: 5 * 60_000,
+  });
+
+  const providers = providersQuery.data ?? [];
+  const types = typesQuery.data ?? [];
+  const loadError = providersQuery.error ?? typesQuery.error;
+  const loading = providersQuery.isPending || typesQuery.isPending;
+
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editing, setEditing] = useState<ProviderInfo | null>(null);
+  const [form, setForm] = useState<FormState>(() => blankForm([]));
+  const [formError, setFormError] = useState<string | null>(null);
+  /** 草稿试连结论；带上载荷指纹，表单改过之后旧结论就不再展示。 */
+  const [draftTest, setDraftTest] = useState<{
+    signature: string;
+    result: TestResponse;
+  } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ProviderInfo | null>(null);
+  /** 已保存条目最近一次试连的结论，挂在对应行下方。 */
+  const [tested, setTested] = useState<{
+    name: string;
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  const refreshProviders = () =>
+    queryClient.invalidateQueries({ queryKey: ["providers", teamId] });
+
+  const save = useMutation({
+    mutationFn: (body: UpsertProviderRequest) => upsertProvider(teamId, body),
+    onSuccess: (res) => {
+      void refreshProviders();
+      setDialogOpen(false);
+      toast.success(res.message ?? "Provider 已保存");
+    },
+  });
+
+  const remove = useMutation({
+    mutationFn: (name: string) => deleteProvider(teamId, name),
+    onSuccess: (res) => {
+      void refreshProviders();
+      setDeleteTarget(null);
+      toast.success(res.message ?? "Provider 已删除");
+    },
+  });
+
+  const testSaved = useMutation({
+    mutationFn: (name: string) => testProviderConnection(teamId, name),
+    onSuccess: (res, name) =>
+      setTested({ name, ok: res.success, message: res.message }),
+    onError: (error, name) =>
+      setTested({ name, ok: false, message: errorText(error) }),
+  });
+
+  const testDraftMutation = useMutation({
+    mutationFn: (input: { signature: string; body: TestDraftRequest }) =>
+      testProviderDraft(teamId, input.body),
+    onSuccess: (result, input) =>
+      setDraftTest({ signature: input.signature, result }),
+    onError: (error, input) =>
+      setDraftTest({
+        signature: input.signature,
+        result: {
+          success: false,
+          message: errorText(error),
+          provider_type: input.body.type,
+          model: input.body.default_model,
+        },
+      }),
+  });
+
+  const update = (patch: Partial<FormState>) =>
+    setForm((prev) => ({ ...prev, ...patch }));
+
+  const openCreate = () => {
+    setEditing(null);
+    setForm(
+      blankForm(
+        types,
+        providers.map((p) => p.name),
+      ),
+    );
+    setFormError(null);
+    setDraftTest(null);
+    save.reset();
+    setDialogOpen(true);
+  };
+
+  const openEdit = (provider: ProviderInfo) => {
+    setEditing(provider);
+    setForm(formFromProvider(provider));
+    setFormError(null);
+    setDraftTest(null);
+    save.reset();
+    setDialogOpen(true);
+  };
+
+  const closeDialog = () => {
+    setDialogOpen(false);
+    setFormError(null);
+    save.reset();
+  };
+
+  const closeDelete = () => {
+    setDeleteTarget(null);
+    remove.reset();
+  };
+
+  const changeType = (nextType: string) => {
+    setForm((prev) =>
+      formForTypeChange(
+        prev,
+        typeMeta(types, prev.providerType),
+        typeMeta(types, nextType),
+        { isNew: !editing, taken: providers.map((p) => p.name) },
+      ),
+    );
+  };
+
+  const submit = () => {
+    const invalid = validateForm(form, !editing);
+    if (invalid) {
+      setFormError(invalid);
+      return;
+    }
+    setFormError(null);
+    save.mutate(toUpsertRequest(form));
+  };
+
+  const testRequest = toTestRequest(form);
+  const draftSignature = JSON.stringify(testRequest);
+  const draftResult =
+    draftTest && draftTest.signature === draftSignature
+      ? draftTest.result
+      : null;
+
+  const meta = typeMeta(types, form.providerType);
+  // 探针要真的发一次请求：缺密钥或模型时后端只会回「不能为空」类结论。
+  const draftTestBlocked = !form.apiKey.trim()
+    ? editing
+      ? editing.has_api_key
+        ? "已存密钥不回显：填入密钥可先测草稿，或保存后用列表里的「试连」验证"
+        : "这个 provider 还没有密钥，填入 API Key 后可试连"
+      : "填入 API Key 后可试连"
+    : !form.model.trim()
+      ? "填入默认模型后可试连"
+      : null;
+  const nameTaken =
+    !editing && providers.some((p) => p.name === form.name.trim());
+
+  return (
+    <section className="space-y-3">
+      <header className="flex h-8 items-center gap-2 border-b border-line">
+        <h2 className="text-sm font-semibold text-ink">Provider</h2>
+        <span className="tabular-nums text-2xs text-ink-faint">
+          {providers.length}
+        </span>
+        <span className="min-w-0 truncate text-2xs text-ink-faint">
+          providers.toml · 名称即 agent.md 里 llm.provider 引用的 key
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          className="ml-auto h-7 shrink-0"
+          disabled={types.length === 0}
+          onClick={openCreate}
+        >
+          <Plus />
+          新建 Provider
+        </Button>
+      </header>
+
+      {loadError !== null && (
+        <ErrorBanner
+          message={errorText(loadError)}
+          onRetry={() => {
+            void providersQuery.refetch();
+            void typesQuery.refetch();
+          }}
+        />
+      )}
+
+      {loading && (
+        <div className="space-y-px">
+          {[0, 1, 2].map((row) => (
+            <Skeleton key={row} className="h-10 w-full" />
+          ))}
+        </div>
+      )}
+
+      {!loading && !loadError && providers.length === 0 && (
+        <EmptyState title="这个团队还没有配置 provider，对话会走系统层默认值。" />
+      )}
+
+      <ul>
+        {providers.map((provider) => {
+          const providerMeta = typeMeta(types, provider.provider_type);
+          const outcome = tested?.name === provider.name ? tested : null;
+          const testing =
+            testSaved.isPending && testSaved.variables === provider.name;
+          return (
+            <li key={provider.name} className="border-b border-line">
+              <div className="flex flex-col justify-center gap-0.5 px-3 py-1 @min-[760px]/main:h-10 @min-[760px]/main:flex-row @min-[760px]/main:items-center @min-[760px]/main:gap-2 @min-[760px]/main:py-0">
+                <div className="flex min-w-0 items-center gap-2 @min-[760px]/main:w-56 @min-[760px]/main:shrink-0">
+                  <span className="min-w-0 truncate font-mono text-sm text-ink">
+                    {provider.name}
+                  </span>
+                  {provider.is_default && (
+                    <span className="shrink-0 rounded-[4px] border border-line px-1 text-2xs text-ink-faint">
+                      默认
+                    </span>
+                  )}
+                  <span
+                    className={cn(
+                      "shrink-0 text-2xs",
+                      provider.has_api_key ? "text-ink-faint" : "text-danger",
+                    )}
+                  >
+                    {provider.has_api_key ? "已配置密钥" : "未配置密钥"}
+                  </span>
+                </div>
+                <span className="truncate text-2xs text-ink-muted @min-[760px]/main:w-24 @min-[760px]/main:shrink-0">
+                  {providerMeta?.display_name ?? provider.provider_type}
+                </span>
+                <span className="truncate font-mono text-2xs text-ink-faint @min-[760px]/main:flex-1">
+                  {provider.base_url ??
+                    (providerMeta
+                      ? `${providerMeta.default_base_url}（类型默认）`
+                      : "类型默认地址")}
+                </span>
+                <span className="truncate text-2xs text-ink-faint @min-[760px]/main:w-40 @min-[760px]/main:shrink-0">
+                  {provider.default_model ?? "未设默认模型"}
+                  {provider.api ? ` · ${provider.api}` : ""}
+                </span>
+                <div className="flex shrink-0 items-center gap-1">
+                  {/* 试连是一次真实计费请求：并发的第二个没有意义。 */}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2"
+                    disabled={testSaved.isPending}
+                    onClick={() => testSaved.mutate(provider.name)}
+                  >
+                    <Wifi />
+                    {testing ? "试连中…" : "试连"}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-ink-faint"
+                    aria-label={`编辑 ${provider.name}`}
+                    onClick={() => openEdit(provider)}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-ink-faint hover:text-danger"
+                    aria-label={`删除 ${provider.name}`}
+                    onClick={() => {
+                      setDeleteTarget(provider);
+                      remove.reset();
+                    }}
+                  >
+                    <Trash2 />
+                  </Button>
+                </div>
+              </div>
+              {outcome && (
+                <p
+                  className={cn(
+                    "border-t border-line px-3 py-1 text-2xs",
+                    outcome.ok ? "text-ink-muted" : "text-danger",
+                  )}
+                >
+                  {outcome.ok ? "试连成功 · " : "试连失败 · "}
+                  {outcome.message}
+                </p>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+
+      <Dialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          if (!open) closeDialog();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {editing ? `编辑「${editing.name}」` : "新建 Provider"}
+            </DialogTitle>
+            <DialogDescription>
+              {editing
+                ? "留空的字段保持已存值；密钥不回读，只能覆盖不能查看。"
+                : "类型选好后地址与模型已按默认值填好，填入 API Key 即可。"}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <span className="text-2xs text-ink-faint">类型</span>
+                <Select
+                  value={form.providerType}
+                  onValueChange={changeType}
+                  disabled={save.isPending}
+                >
+                  <SelectTrigger
+                    className="h-8 w-full"
+                    aria-label="Provider 类型"
+                  >
+                    <SelectValue placeholder="选择类型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {types.map((type) => (
+                      <SelectItem
+                        key={type.provider_type}
+                        value={type.provider_type}
+                      >
+                        {type.display_name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block space-y-1">
+                  <span className="text-2xs text-ink-faint">名称</span>
+                  <Input
+                    value={form.name}
+                    onChange={(event) => update({ name: event.target.value })}
+                    placeholder={form.providerType || "deepseek"}
+                    disabled={editing !== null || save.isPending}
+                    autoComplete="off"
+                    className="h-8 font-mono text-xs"
+                  />
+                </label>
+                <p className="text-2xs text-ink-faint">
+                  {editing
+                    ? "名称是 agent.md 里 llm.provider 引用的 key，创建后不可修改"
+                    : nameTaken
+                      ? "已存在同名 Provider，保存将更新它的配置（不是新建）"
+                      : "同名端点请另起别名"}
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block space-y-1">
+                  <span className="text-2xs text-ink-faint">API Key</span>
+                  <Input
+                    type="password"
+                    value={form.apiKey}
+                    onChange={(event) => update({ apiKey: event.target.value })}
+                    placeholder={
+                      editing
+                        ? "留空则保留已存密钥"
+                        : form.providerType === "deepseek"
+                          ? "${DEEPSEEK_API_KEY}"
+                          : "${ENV_VAR} 或直接填入密钥"
+                    }
+                    autoComplete="off"
+                    className="h-8 font-mono text-xs"
+                  />
+                </label>
+                <p className="text-2xs text-ink-faint">
+                  {editing
+                    ? editing.has_api_key
+                      ? "已配置密钥；留空表示不修改"
+                      : "这个 provider 还没有密钥；留空保存不会凭空生成"
+                    : "可填 ${ENV_VAR}，由服务端从环境变量读取"}
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block space-y-1">
+                  <span className="text-2xs text-ink-faint">Base URL</span>
+                  <Input
+                    value={form.baseUrl}
+                    onChange={(event) =>
+                      update({ baseUrl: event.target.value })
+                    }
+                    placeholder={meta?.default_base_url ?? "https://…"}
+                    autoComplete="off"
+                    className="h-8 font-mono text-xs"
+                  />
+                </label>
+                <p className="text-2xs text-ink-faint">
+                  {meta
+                    ? `留空则用 ${meta.default_base_url}；自建兼容端点可改成自己的地址`
+                    : "留空则用该类型的默认地址"}
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block space-y-1">
+                  <span className="text-2xs text-ink-faint">默认模型</span>
+                  <Input
+                    list="provider-model-options"
+                    value={form.model}
+                    onChange={(event) => update({ model: event.target.value })}
+                    placeholder={meta?.default_model ?? "deepseek-v4-flash"}
+                    autoComplete="off"
+                    className="h-8 font-mono text-xs"
+                  />
+                </label>
+                <datalist id="provider-model-options">
+                  {meta?.suggested_models.map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
+                <p className="text-2xs text-ink-faint">
+                  agent.md 未指定 llm.model 时用它
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <span className="text-2xs text-ink-faint">API 风格</span>
+                <Select
+                  value={form.api || API_DEFAULT}
+                  onValueChange={(value) =>
+                    update({ api: value === API_DEFAULT ? "" : value })
+                  }
+                  disabled={save.isPending}
+                >
+                  <SelectTrigger className="h-8 w-full" aria-label="API 风格">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={API_DEFAULT}>
+                      {meta
+                        ? `跟随类型默认（${meta.api_modes[0]}）`
+                        : "跟随类型默认"}
+                    </SelectItem>
+                    {meta?.api_modes.map((mode) => (
+                      <SelectItem key={mode} value={mode}>
+                        {mode}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-2xs text-ink-faint">
+                  两种风格的请求体不同；不确定就跟随默认
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 border-t border-line pt-2">
+              <Switch
+                id="provider-default"
+                checked={form.setDefault}
+                onCheckedChange={(checked) => update({ setDefault: checked })}
+                disabled={editing?.is_default === true || save.isPending}
+              />
+              <label htmlFor="provider-default" className="text-xs text-ink">
+                设为默认 provider
+              </label>
+              <span className="text-2xs text-ink-faint">
+                {editing?.is_default
+                  ? "它已经是默认 provider"
+                  : "agent.md 未指定 provider 的 agent 走它"}
+              </span>
+            </div>
+
+            {draftResult && (
+              <p
+                className={cn(
+                  "whitespace-pre-wrap break-words border-l-2 pl-2 text-2xs",
+                  draftResult.success
+                    ? "border-line-strong text-ink-muted"
+                    : "border-danger text-danger",
+                )}
+              >
+                {draftResult.success ? "试连成功 · " : "试连失败 · "}
+                {draftResult.message}
+              </p>
+            )}
+
+            {formError && <p className="text-2xs text-danger">{formError}</p>}
+
+            {save.error !== null && (
+              <ErrorBanner message={errorText(save.error)} />
+            )}
+          </div>
+
+          <DialogFooter className="sm:justify-between">
+            <div className="flex flex-col gap-1">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={
+                  testDraftMutation.isPending || draftTestBlocked !== null
+                }
+                onClick={() =>
+                  testDraftMutation.mutate({
+                    signature: draftSignature,
+                    body: testRequest,
+                  })
+                }
+              >
+                <Wifi />
+                {testDraftMutation.isPending ? "试连中…" : "试连"}
+              </Button>
+              {draftTestBlocked && (
+                <span className="text-2xs text-ink-faint">
+                  {draftTestBlocked}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={save.isPending}
+                onClick={closeDialog}
+              >
+                取消
+              </Button>
+              <Button size="sm" disabled={save.isPending} onClick={submit}>
+                {save.isPending ? "保存中…" : "保存"}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) closeDelete();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>删除 Provider「{deleteTarget?.name}」？</DialogTitle>
+            <DialogDescription>
+              providers.toml 里的这条配置会被删掉，不可恢复；引用它的 agent.md
+              会退回默认 provider。
+            </DialogDescription>
+          </DialogHeader>
+          {remove.error !== null && (
+            <ErrorBanner message={errorText(remove.error)} />
+          )}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={remove.isPending}
+              onClick={closeDelete}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={remove.isPending}
+              onClick={() => {
+                if (deleteTarget) remove.mutate(deleteTarget.name);
+              }}
+            >
+              {remove.isPending ? "删除中…" : "确认删除"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </section>
+  );
+}

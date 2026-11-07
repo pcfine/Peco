@@ -18,6 +18,7 @@ const PAGE_TITLES: Record<string, string> = {
   "/teams": "团队",
   "/results": "成果",
   "/schedules": "定时任务",
+  "/settings": "设置",
 };
 
 /** 动态段（`/spaces/:wsId`、`/teams/:teamId`）只按前缀取标题。 */

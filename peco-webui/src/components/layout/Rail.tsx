@@ -187,10 +187,11 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
         )}
       </div>
 
+      {/* 收起态 64 宽：两块 24 的按钮加上间距正好放得下，内边距要收窄。 */}
       <div
         className={cn(
-          "flex h-11 shrink-0 items-center border-t border-line px-2",
-          collapsed && "justify-center",
+          "flex h-11 shrink-0 items-center border-t border-line",
+          collapsed ? "justify-center gap-1 px-1" : "px-2",
         )}
       >
         <button
@@ -201,17 +202,17 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
         >
           <span className="text-xs">{theme === "dark" ? "◐" : "◑"}</span>
         </button>
-        {!collapsed && (
-          <button
-            type="button"
-            disabled
-            title="下一版"
-            aria-label="设置（下一版）"
-            className="ml-1 grid h-6 w-6 cursor-not-allowed place-items-center rounded-[4px] text-ink-faint opacity-60"
-          >
-            <Settings className="h-4 w-4" />
-          </button>
-        )}
+        <Link
+          to="/settings"
+          title="设置"
+          aria-label="设置"
+          className={cn(
+            "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
+            !collapsed && "ml-1",
+          )}
+        >
+          <Settings className="h-4 w-4" />
+        </Link>
         {!collapsed && peco && (
           <span
             title={peco.work_dir}

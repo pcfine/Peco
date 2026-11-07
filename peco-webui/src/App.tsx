@@ -5,6 +5,7 @@ import { NotFoundPage } from "@/pages/NotFoundPage";
 import { PecoBoardPage } from "@/pages/PecoBoardPage";
 import { ResultsPage } from "@/pages/ResultsPage";
 import { SchedulesPage } from "@/pages/SchedulesPage";
+import { SettingsPage } from "@/pages/SettingsPage";
 import { SpaceDetailPage } from "@/pages/SpaceDetailPage";
 import { NewSpacePage } from "@/pages/NewSpacePage";
 import { SpaceListPage } from "@/pages/SpaceListPage";
@@ -31,6 +32,7 @@ export function App() {
           <Route path="teams/:teamId" element={<TeamDetailPage />} />
           <Route path="results" element={<ResultsPage />} />
           <Route path="schedules" element={<SchedulesPage />} />
+          <Route path="settings" element={<SettingsPage />} />
           <Route path="home" element={<Navigate to="/" replace />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>

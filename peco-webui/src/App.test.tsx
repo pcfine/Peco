@@ -167,6 +167,24 @@ describe("白屏与 rail 宽度", () => {
     }
   });
 
+  it("rail 收起态也能进设置页", async () => {
+    const restore = useWideViewport();
+    try {
+      useUiStore.setState({ railOpen: false });
+      const view = renderAt("/");
+      // 先等壳的数据落地，收尾时就不会留下测试之外的异步 setState。
+      expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "设置" })).toHaveAttribute(
+        "href",
+        "/settings",
+      );
+      view.unmount();
+    } finally {
+      useUiStore.setState({ railOpen: true });
+      restore();
+    }
+  });
+
   it("dock 打开时对话首屏不白屏：ChatView 的 Tooltip 在根部 provider 里", async () => {
     const restore = useWideViewport();
     useDockStore.setState({ open: true, conversationByWs: {} });
