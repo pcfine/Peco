@@ -248,9 +248,49 @@ export interface AgentDetail {
   updated_at: string;
 }
 
-/** `PATCH /api/agents/{id}` 的请求体；本期只用 `system_prompt`。 */
-export interface UpdateAgentRequest {
+/** `POST /api/agents` 的请求体：只有 `name` 必填，省略的字段由服务端补默认值。 */
+export interface CreateAgentRequest {
+  name: string;
+  description?: string;
   system_prompt?: string;
+  model?: string;
+  provider?: string;
+  icon?: string;
+  background_color?: string;
+  tools?: string[];
+  mcp_servers?: string[];
+  skills?: string[];
+  temperature?: number;
+  max_tokens?: number;
+  stream?: boolean;
+  reasoning_effort?: string;
+  max_iterations?: number;
+  knowledge_bases?: string[];
+}
+
+/**
+ * `PATCH /api/agents/{id}` 的请求体：**省略 = 不改**。
+ *
+ * `model` / `provider` / `temperature` / `max_tokens` / `stream` / `reasoning_effort`
+ * 服务端按 `Option<Option<T>>` 解析，显式 `null` 才是「清空」，与省略不是一回事。
+ */
+export interface UpdateAgentRequest {
+  name?: string;
+  description?: string;
+  system_prompt?: string;
+  model?: string | null;
+  provider?: string | null;
+  icon?: string;
+  background_color?: string;
+  tools?: string[];
+  mcp_servers?: string[];
+  skills?: string[];
+  temperature?: number | null;
+  max_tokens?: number | null;
+  stream?: boolean | null;
+  reasoning_effort?: string | null;
+  max_iterations?: number;
+  knowledge_bases?: string[];
 }
 
 export interface SkillInfo {

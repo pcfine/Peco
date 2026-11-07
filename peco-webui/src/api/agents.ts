@@ -1,7 +1,9 @@
 import { api, spaceScope } from "@/lib/api";
+import type { SuccessResponse } from "@/types/common";
 import type {
   AgentDetail,
   AgentListItem,
+  CreateAgentRequest,
   UpdateAgentRequest,
 } from "@/types/daemon";
 
@@ -25,16 +27,35 @@ export async function getAgent(
   return res.data;
 }
 
-/** 只改正文：本期团队页是「看 + 改 system_prompt」，其余字段没有编辑入口。 */
-export async function updateAgentPrompt(
+export async function createAgent(
+  wsId: string,
+  body: CreateAgentRequest,
+): Promise<AgentDetail> {
+  const res = await api.post<AgentDetail>("/agents", body, spaceScope(wsId));
+  return res.data;
+}
+
+/** 请求体里没出现的字段服务端原样保留，所以调用方只放真正要改的字段。 */
+export async function updateAgent(
   wsId: string,
   agentId: string,
-  systemPrompt: string,
+  body: UpdateAgentRequest,
 ): Promise<AgentDetail> {
-  const body: UpdateAgentRequest = { system_prompt: systemPrompt };
   const res = await api.patch<AgentDetail>(
     `/agents/${encodeURIComponent(agentId)}`,
     body,
+    spaceScope(wsId),
+  );
+  return res.data;
+}
+
+/** 删除被后端拒绝（`@master`）时抛 `ApiError`，调用方照原样展示。 */
+export async function deleteAgent(
+  wsId: string,
+  agentId: string,
+): Promise<SuccessResponse> {
+  const res = await api.delete<SuccessResponse>(
+    `/agents/${encodeURIComponent(agentId)}`,
     spaceScope(wsId),
   );
   return res.data;
