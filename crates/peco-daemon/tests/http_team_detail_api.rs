@@ -8,6 +8,7 @@ mod support;
 
 use peco_daemon::db::documents::{self, CreateDocumentParams};
 use peco_daemon::db::knowledge_bases::{self, CreateKbParams};
+use peco_daemon::db::teams::{self, NewTeam};
 use serde_json::{Value, json};
 use support::new_env;
 
@@ -19,6 +20,34 @@ fn write_agent(env: &support::TestEnv, team: &str, name: &str, description: &str
         format!(
             "---\nagent:\n  name: \"{name}\"\n  description: \"{description}\"\n---\n\n# prompt\n"
         ),
+    )
+    .unwrap();
+}
+
+/// 一份带模板版本的 `@master/agent.md`。
+fn write_versioned_master(env: &support::TestEnv, team: &str, version: u32) {
+    let dir = env.home.join("teams").join(team).join("agents/@master");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agent.md"),
+        format!(
+            "---\nagent:\n  name: \"@master\"\n  description: \"总管\"\n\
+             template_version: {version}\n---\n\n# prompt\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_team_json(env: &support::TestEnv, team: &str, display_name: &str, version: i64) {
+    let body = json!({
+        "team_id": team,
+        "display_name": display_name,
+        "template_version": version,
+        "created_at": "2024-01-01T00:00:00Z",
+    });
+    std::fs::write(
+        env.home.join("teams").join(team).join("team.json"),
+        body.to_string(),
     )
     .unwrap();
 }
@@ -192,4 +221,52 @@ async fn an_empty_team_has_no_master_and_still_answers() {
     );
     assert_eq!(reply.body["knowledge_bases"], json!([]));
     assert_eq!(reply.body["spaces"], json!([]));
+}
+
+/// 模板升过级但 `team.json` 与索引行都停在旧版本：详情必须报磁盘上的 13。
+///
+/// 变异：详情只信索引行的 `template_version` → 下面拿到 12 变红。
+#[tokio::test]
+async fn detail_reports_the_version_installed_on_disk() {
+    let env = new_env(&["research"]).await;
+    write_versioned_master(&env, "research", 13);
+    write_team_json(&env, "research", "研究组", 12);
+    teams::upsert(
+        &env.pool,
+        &NewTeam {
+            id: "research",
+            display_name: "研究组",
+            template_version: 12,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reply = env.get("/api/teams/research").await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(
+        reply.body["template_version"],
+        json!(13),
+        "详情必须报磁盘上的模板版本"
+    );
+    assert_eq!(
+        reply.body["display_name"],
+        json!("研究组"),
+        "展示名仍信索引行"
+    );
+    assert_eq!(reply.body["has_master"], json!(true));
+}
+
+/// 缺 `team.json`（外部工具手搭的团队）也要按磁盘上报版本，展示名退回目录名。
+#[tokio::test]
+async fn detail_falls_back_to_the_disk_version_without_team_json() {
+    let env = new_env(&["research"]).await;
+    write_versioned_master(&env, "research", 13);
+
+    let reply = env.get("/api/teams/research").await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["display_name"], json!("research"));
+    assert_eq!(reply.body["template_version"], json!(13));
 }

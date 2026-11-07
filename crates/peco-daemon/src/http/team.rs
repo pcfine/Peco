@@ -78,12 +78,8 @@ async fn team_view(
 ) -> Result<TeamView, DaemonError> {
     let env = state.env.as_ref();
     let root = env.team_root(team_id);
-    let (dir_name, dir_version) = teams::meta_from_dir(&root, team_id);
-    // 行是目录的索引：缺行时按目录兜底，过期行交给下一次 rescan 修正。
-    let (display_name, template_version) = match teams::get(&state.pool, team_id).await? {
-        Some(row) => (row.display_name, row.template_version),
-        None => (dir_name, dir_version),
-    };
+    let row = teams::get(&state.pool, team_id).await?;
+    let (display_name, template_version) = teams::resolve_meta(row, &root, team_id);
     Ok(TeamView {
         team_id: team_id.to_string(),
         display_name,
@@ -156,11 +152,7 @@ pub async fn detail(
     if !root.is_dir() && row.is_none() {
         return Err(DaemonError::TeamNotFound { team_id });
     }
-    // 索引行只是目录的投影：缺行时按目录兜底，与清单接口同一顺序。
-    let (display_name, template_version) = match row {
-        Some(row) => (row.display_name, row.template_version),
-        None => teams::meta_from_dir(&root, &team_id),
-    };
+    let (display_name, template_version) = teams::resolve_meta(row, &root, &team_id);
 
     let agents: Vec<TeamAgentView> = index::scan_agents(&root.join("agents"))
         .into_iter()

@@ -2,8 +2,38 @@
 
 mod support;
 
+use peco_daemon::db::teams::{self, NewTeam};
 use serde_json::json;
 use support::new_env;
+
+/// 一份带模板版本的 `@master/agent.md` —— 磁盘上的版本才是装着的模板。
+fn write_master_agent(env: &support::TestEnv, team: &str, version: u32) {
+    let dir = env.home.join("teams").join(team).join("agents/@master");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agent.md"),
+        format!(
+            "---\nagent:\n  name: \"@master\"\n  description: \"总管\"\n\
+             template_version: {version}\n---\n\n# prompt\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// `team.json` 是首装时的快照：模板升级不会改写它。
+fn write_team_json(env: &support::TestEnv, team: &str, display_name: &str, version: i64) {
+    let body = json!({
+        "team_id": team,
+        "display_name": display_name,
+        "template_version": version,
+        "created_at": "2024-01-01T00:00:00Z",
+    });
+    std::fs::write(
+        env.home.join("teams").join(team).join("team.json"),
+        body.to_string(),
+    )
+    .unwrap();
+}
 
 fn team_ids(reply: &support::HttpReply) -> Vec<String> {
     reply
@@ -159,5 +189,42 @@ async fn invalid_team_id_and_unknown_template_are_400() {
     assert!(
         !env.home.join("teams/peco2/agents").exists(),
         "不支持的模板不得留下半装目录"
+    );
+}
+
+/// 已装好的空间升过模板：`agent.md` 是 13，`team.json` 与索引行都还是 12 ——
+/// 清单必须报磁盘上的版本，否则 UI 永远看不到模板已经升级。
+///
+/// 变异：`meta_from_dir` 只读 `team.json`，或清单只信索引行的版本 → 下面的
+/// 断言拿到 12 变红。
+#[tokio::test]
+async fn list_reports_the_version_installed_on_disk() {
+    let env = new_env(&["research"]).await;
+    write_master_agent(&env, "research", 13);
+    write_team_json(&env, "research", "研究组", 12);
+    teams::upsert(
+        &env.pool,
+        &NewTeam {
+            id: "research",
+            display_name: "研究组",
+            template_version: 12,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reply = env.get("/api/teams").await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body[0]["team_id"], json!("research"));
+    assert_eq!(
+        reply.body[0]["template_version"],
+        json!(13),
+        "清单必须报磁盘上的模板版本"
+    );
+    assert_eq!(
+        reply.body[0]["display_name"],
+        json!("研究组"),
+        "展示名仍信索引行"
     );
 }

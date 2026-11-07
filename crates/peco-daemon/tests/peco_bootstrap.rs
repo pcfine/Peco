@@ -7,6 +7,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use peco_daemon::db::teams;
 use peco_daemon::db::workspaces;
 use peco_daemon::space::bootstrap::bootstrap_peco;
 use peco_daemon::space::manifest;
@@ -17,6 +18,23 @@ fn master_agent_path(home: &Path) -> PathBuf {
     home.join("teams")
         .join("peco")
         .join("agents/@master/agent.md")
+}
+
+/// `peco` 模板里 `@master/agent.md` 的模板版本 —— 与模板一起演进，不写死数字。
+fn template_master_version() -> i64 {
+    let (_, bytes) = peco_agents::BuiltinTemplate::peco()
+        .files
+        .iter()
+        .find(|(rel, _)| *rel == "agents/@master/agent.md")
+        .expect("peco 模板必须带 @master");
+    let raw = std::str::from_utf8(bytes).expect("模板 agent.md 必须是 UTF-8");
+    i64::from(
+        peco_core::agent::agent_config::parse_agent_md(raw)
+            .expect("模板 agent.md 必须可解析")
+            .0
+            .template_version
+            .expect("模板 agent.md 必须带 template_version"),
+    )
 }
 
 fn private_memory_config_path(home: &Path) -> PathBuf {
@@ -230,4 +248,65 @@ async fn the_peco_space_cannot_be_deleted_but_can_be_closed() {
     // 守卫不能写成「一律拒绝」：普通空间仍可删除。
     let purged = env.delete(&format!("/api/spaces/{normal}")).await;
     assert_eq!(purged.status, 200, "body={}", purged.body);
+}
+
+/// 旧版二进制装的空间：`agent.md` 已被升到当前模板，`team.json` 还停在上一版。
+/// 索引行与两个接口都必须报磁盘上的版本，而 `team.json` 原字节不动 ——
+/// 版本对齐是读出来的，不是重写用户文件换来的。
+///
+/// 变异：`meta_from_dir` 只读 `team.json` → 索引行与两个接口都报旧版本变红。
+#[tokio::test]
+async fn an_upgraded_space_reports_the_version_on_disk() {
+    let env = new_env(&[]).await;
+    bootstrap_peco(&env.env).await;
+
+    let installed = template_master_version();
+    assert!(installed > 1, "夹具需要模板版本高于 1");
+    let stale_version = installed - 1;
+
+    let team_json = env.home.join("teams/peco/team.json");
+    let stale = json!({
+        "team_id": "peco",
+        "display_name": "Peco",
+        "template_version": stale_version,
+        "created_at": "2024-01-01T00:00:00Z",
+    });
+    std::fs::write(&team_json, stale.to_string()).unwrap();
+    let stale_bytes = std::fs::read(&team_json).unwrap();
+
+    bootstrap_peco(&env.env).await;
+
+    let row = teams::get(&env.pool, "peco")
+        .await
+        .unwrap()
+        .expect("引导必须补索引行");
+    assert_eq!(
+        row.template_version, installed,
+        "索引行必须记磁盘上的模板版本"
+    );
+
+    let listed = env.get("/api/teams").await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    let peco = listed
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["team_id"] == json!("peco"))
+        .expect("Peco 团队必须在清单里");
+    assert_eq!(
+        peco["template_version"],
+        json!(installed),
+        "清单必须报磁盘上的模板版本"
+    );
+
+    let detail = env.get("/api/teams/peco").await;
+    assert_eq!(detail.status, 200, "body={}", detail.body);
+    assert_eq!(detail.body["template_version"], json!(installed));
+
+    assert_eq!(
+        std::fs::read(&team_json).unwrap(),
+        stale_bytes,
+        "版本对齐不该改写 team.json"
+    );
 }
