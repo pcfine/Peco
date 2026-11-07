@@ -2,6 +2,7 @@
 
 pub mod bootstrap;
 pub mod close;
+pub mod compaction;
 pub mod fanout;
 pub mod index;
 pub mod manifest;
@@ -15,8 +16,9 @@ pub mod tasks;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
-use peco_core::agent::LooperConfig;
+use model_provider::ModelProvider;
 use peco_core::agent::hooks::{DispatchOrigin, DispatchWatchHook, TaskObservationSink};
+use peco_core::agent::{CompactionPolicy, LooperConfig, ModelSummarizer, TurnSummarizer};
 use peco_core::config::SystemConfig;
 use peco_core::tools::WorkspaceHub;
 use sqlx::SqlitePool;
@@ -132,6 +134,35 @@ impl SpaceEnv {
                 ),
             }
         }
+        config
+    }
+
+    /// 为一次聊天 run 组装配置：在 [`Self::looper_config`] 之上挂压缩与轮末收尾。
+    ///
+    /// 这两件只给聊天 run：聊天会话跨轮累积，不折叠就会一路顶到上下文窗口；
+    /// machine 任务每条都是新建的临时会话、跑完即弃，历史不跨轮增长，没有可压
+    /// 的对象，挂上只是白付一次扫描成本。
+    pub fn chat_looper_config(
+        &self,
+        ws_id: &str,
+        team_id: &str,
+        work_dir: PathBuf,
+        provider: Arc<dyn ModelProvider>,
+    ) -> LooperConfig {
+        let mut config = self.looper_config(ws_id, team_id, work_dir);
+        let limits = compaction::limits();
+        // 摘要器与收尾报告器共用同一个实例：两者都是「读一遍既有内容、产出短文本」
+        // 的元任务，复用同一个 provider 与模型即可，另建一份只会多一份配置漂移。
+        let summarizer: Arc<dyn TurnSummarizer> = Arc::new(ModelSummarizer::new(
+            provider,
+            limits.summarizer_model.clone(),
+        ));
+        config.epilogue = Some(Arc::clone(&summarizer));
+        config.compaction = Some(Arc::new(CompactionPolicy::new(
+            limits.trigger_tokens,
+            limits.keep_recent_tokens,
+            summarizer,
+        )));
         config
     }
 

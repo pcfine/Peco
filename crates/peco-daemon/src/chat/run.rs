@@ -224,10 +224,14 @@ pub(crate) async fn spawn_run(
 
     // ── 4. 装配 looper 配置 ──────────────────────────────────────────────
     // 观察 hook 与动态上下文在 spawn 之前装配：两者都要读 `ws` 的 work_dir 与
-    // `team_id`，而这两者随后会被 move 进后台任务。
-    let config = deps
-        .env
-        .looper_config(ws_id, &team_id, ws.work_dir().root().to_path_buf());
+    // `team_id`，而这两者随后会被 move 进后台任务。压缩与收尾报告挂在这条聊天
+    // 路径上，摘要模型取自本轮 agent 的 provider（跨空间不必配第二份模型）。
+    let config = deps.env.chat_looper_config(
+        ws_id,
+        &team_id,
+        ws.work_dir().root().to_path_buf(),
+        Arc::clone(agent.provider()),
+    );
 
     let db_for_bg = deps.pool.clone();
     let conv_id_for_bg = conv_id.clone();
