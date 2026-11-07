@@ -45,6 +45,7 @@ import {
 import { CHEVRON, FOLD_ROW } from "@/components/chat/foldRow";
 import { MESSAGE_TIME_CLASS } from "@/components/chat/messageTime";
 import { UserBubble } from "@/components/chat/UserBubble";
+import { WakeNotice, isWakeNotice } from "@/components/chat/WakeNotice";
 import { BrandMark } from "@/components/common/BrandMark";
 import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
 import { settlePendingToolCalls, type ToolCallView } from "@/lib/toolCall";
@@ -1209,6 +1210,13 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           </div>
         )}
       </div>
+    );
+  }
+
+  // 唤醒投递也走 user 角色，但它不是用户说的话：折叠成一行通知，不占气泡。
+  if (message.role === "user" && isWakeNotice(message.content)) {
+    return (
+      <WakeNotice content={message.content} timestampMs={message.timestampMs} />
     );
   }
 
