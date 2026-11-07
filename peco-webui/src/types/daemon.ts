@@ -26,6 +26,16 @@ export interface Space {
   marker: MarkerInfo | null;
 }
 
+/**
+ * `POST /api/spaces/{ws_id}/conversation/ensure` 的回执。
+ *
+ * 每个空间的 `@master` 只有一条会话：`created=false` 表示已有、原样取回。
+ */
+export interface SpaceConversation {
+  conversation_id: string;
+  created: boolean;
+}
+
 export interface SpaceOpened {
   ws_id: string;
   work_dir: string;
@@ -53,6 +63,14 @@ export interface Team {
   template_version: number;
   agents: string[];
   bound_spaces: string[];
+  /**
+   * 计数由服务端聚合。四个字段与后端并行上线，缺失时卡片显示「–」而不是 0 ——
+   * 「0」是断言事实，「–」只是「还没告诉我」。
+   */
+  agent_count?: number;
+  skill_count?: number;
+  mcp_count?: number;
+  space_count?: number;
 }
 
 export interface TeamAgent {

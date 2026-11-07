@@ -12,7 +12,7 @@ import { usePeco } from "@/queries/peco";
 import { useDockStore } from "@/stores/dockStore";
 
 const PAGE_TITLES: Record<string, string> = {
-  "/": "Peco 面板",
+  "/peco": "Peco 面板",
   "/spaces": "工作室",
   "/spaces/new": "新建空间",
   "/teams": "团队",
@@ -24,7 +24,8 @@ const PAGE_TITLES: Record<string, string> = {
 /** 动态段（`/spaces/:wsId`、`/teams/:teamId`）只按前缀取标题。 */
 function titleOf(pathname: string): string {
   if (PAGE_TITLES[pathname]) return PAGE_TITLES[pathname];
-  if (pathname.startsWith("/spaces/")) return "空间详情";
+  if (/^\/spaces\/[^/]+\/status$/.test(pathname)) return "空间状态";
+  if (pathname.startsWith("/spaces/")) return "空间聊天";
   if (pathname.startsWith("/teams/")) return "团队配置";
   return "";
 }
@@ -41,7 +42,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
   const inflight = (tasks ?? []).filter((task) =>
     TASK_RUNNING_STATES.includes(task.task_state),
   ).length;
-  const isBoard = pathname === "/";
+  const isBoard = pathname === "/peco";
 
   return (
     <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-canvas px-3">

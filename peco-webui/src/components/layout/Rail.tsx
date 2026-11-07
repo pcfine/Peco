@@ -1,62 +1,73 @@
-// 左栏：品牌 / 总管 / 空间总线 / 跨空间索引 / 底栏。
-// 它既是导航又是「当前空间」切换器 —— 所以空间列表就是导航本体，不做二级下拉。
+// 左栏：品牌 / Peco / 已打开空间 / 工作室·团队·成果 / 固定底栏。
+// 「已打开」是唯一的空间列表 —— 未打开的空间只在工作室页里，左栏不是索引。
 
-import { useState, type KeyboardEvent } from "react";
-import { Link } from "react-router-dom";
+import { type KeyboardEvent } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { PanelLeftClose, PanelLeftOpen, Plus, Settings } from "lucide-react";
 import { BrandMark } from "@/components/common/BrandMark";
-import { SpaceBusRow, spaceBusModel } from "@/components/layout/SpaceBusRow";
+import { OpenSpaceRow } from "@/components/layout/OpenSpaceRow";
+import { useActivateSpace } from "@/hooks/useOpenSpaces";
 import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
 import { useRecentResults } from "@/queries/tasks";
 import { useTeams } from "@/queries/teams";
-import { useSpaceStore } from "@/stores/spaceStore";
-import { useSwitchSpace } from "@/hooks/useSwitchSpace";
+import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useThemeStore } from "@/stores/themeStore";
 import { useUiStore } from "@/stores/uiStore";
 import { isToday } from "@/lib/relative";
 import { cn } from "@/lib/utils";
-
-/** 总线上常显的空间行数；其余折成「+N 个」。 */
-const VISIBLE_SPACES = 8;
+import type { Space } from "@/types/daemon";
 
 export function Rail({ collapsed = false }: { collapsed?: boolean }) {
-  const [showAll, setShowAll] = useState(false);
   const railOpen = useUiStore((state) => state.railOpen);
   const setRailOpen = useUiStore((state) => state.setRailOpen);
   const theme = useThemeStore((state) => state.theme);
   const setTheme = useThemeStore((state) => state.setTheme);
-  const currentWsId = useSpaceStore((state) => state.currentWsId);
-  const switchSpace = useSwitchSpace();
+  const openIds = useOpenSpacesStore((state) => state.openIds);
+  const activeWsId = useOpenSpacesStore((state) => state.activeWsId);
+  const removeOpen = useOpenSpacesStore((state) => state.close);
+  const setActive = useOpenSpacesStore((state) => state.setActive);
+  const activateSpace = useActivateSpace();
+  const navigate = useNavigate();
+  const { pathname } = useLocation();
 
   const { data: peco } = usePeco();
   const { data: spaces } = useSpaces();
   const { data: teams } = useTeams();
   const { data: results } = useRecentResults();
 
-  const openSpaces = (spaces ?? []).filter((space) => space.status === "open");
-  // 总管固定在首行，不进空间总线列表：它不属于「执行空间」那一段。
-  const busSpaces = (spaces ?? []).filter(
-    (space) => space.ws_id !== peco?.ws_id,
+  // 打开集只存 id：名称、团队、在飞数都从空间列表这一份事实里取。
+  const spaceById = new Map(
+    (spaces ?? []).map((space) => [space.ws_id, space]),
   );
-  const shown = showAll ? busSpaces : busSpaces.slice(0, VISIBLE_SPACES);
-  const hiddenCount = busSpaces.length - shown.length;
+  const rows = openIds.reduce<Space[]>((acc, id) => {
+    // Peco 有自己的行，重复出现两次只会让人怀疑哪个才是总管。
+    if (id === peco?.ws_id) return acc;
+    const space = spaceById.get(id);
+    if (space) acc.push(space);
+    return acc;
+  }, []);
   const todayResults = (results ?? []).filter((task) =>
     isToday(task.terminal_at ?? task.created_at),
   ).length;
-  const pecoSpace = (spaces ?? []).find((space) => space.ws_id === peco?.ws_id);
 
-  // 总线行之间 ↑/↓ 移动焦点：行本身是按钮，Enter/Space 天然生效。
+  const openPeco = () => {
+    if (!peco) return;
+    setActive(peco.ws_id);
+    if (pathname !== "/peco") navigate("/peco");
+  };
+
+  // 行之间 ↑/↓ 移动焦点：行本身是按钮，Enter/Space 天然生效。
   const moveFocus = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-    const rows = Array.from(
+    const rowNodes = Array.from(
       event.currentTarget.querySelectorAll<HTMLElement>("[data-space-row]"),
     );
-    const index = rows.indexOf(document.activeElement as HTMLElement);
+    const index = rowNodes.indexOf(document.activeElement as HTMLElement);
     if (index === -1) return;
     event.preventDefault();
     const next = event.key === "ArrowDown" ? index + 1 : index - 1;
-    rows[Math.min(Math.max(next, 0), rows.length - 1)]?.focus();
+    rowNodes[Math.min(Math.max(next, 0), rowNodes.length - 1)]?.focus();
   };
 
   return (
@@ -98,62 +109,84 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
 
       <div className="min-h-0 flex-1 overflow-y-auto" onKeyDown={moveFocus}>
         {peco && (
-          <SpaceBusRow
-            model={{
-              wsId: peco.ws_id,
-              name: "Peco",
-              teamId: peco.team_id,
-              inflight: pecoSpace?.inflight_dispatch ?? 0,
-            }}
-            collapsed={collapsed}
-            active={currentWsId === peco.ws_id}
-            onSelect={() => switchSpace(peco.ws_id)}
-          />
+          <button
+            type="button"
+            onClick={openPeco}
+            aria-current={activeWsId === peco.ws_id ? "true" : undefined}
+            aria-label="Peco"
+            title="Peco"
+            data-space-row=""
+            className={cn(
+              "relative flex w-full items-center transition-colors duration-[120ms]",
+              collapsed ? "h-8 justify-center" : "h-8 gap-2 pl-3 pr-2",
+              activeWsId === peco.ws_id
+                ? "bg-line/60 text-ink"
+                : "text-ink-muted hover:bg-line/40",
+            )}
+          >
+            {activeWsId === peco.ws_id && (
+              <span
+                data-testid="rail-active-bar"
+                className="absolute inset-y-1 left-0 w-[3px] rounded-full bg-brand transition-transform duration-[120ms]"
+              />
+            )}
+            <BrandMark size={14} />
+            {!collapsed && (
+              <>
+                <span className="min-w-0 truncate text-sm">Peco</span>
+                <span className="ml-auto shrink-0 font-mono text-2xs text-ink-faint">
+                  {peco.team_id}
+                </span>
+              </>
+            )}
+          </button>
         )}
+
+        <div className="mx-2 my-1 h-px bg-line" />
+
+        {!collapsed && (
+          <p className="flex h-7 items-center pl-3 pr-2 text-2xs font-semibold text-ink-faint">
+            已打开
+          </p>
+        )}
+        {rows.map((space) => (
+          <OpenSpaceRow
+            key={space.ws_id}
+            space={space}
+            collapsed={collapsed}
+            active={activeWsId === space.ws_id}
+            onSelect={() => activateSpace(space.ws_id)}
+            onRemove={() => removeOpen(space.ws_id)}
+          />
+        ))}
+        {!collapsed && rows.length === 0 && (
+          <p className="pl-3 pr-2 py-1 text-2xs text-ink-faint">
+            还没有打开空间。
+          </p>
+        )}
+        <Link
+          to="/spaces"
+          title={collapsed ? "打开空间" : undefined}
+          aria-label={collapsed ? "打开空间" : undefined}
+          className={cn(
+            "flex h-8 items-center gap-1.5 text-2xs text-ink-faint hover:text-ink",
+            collapsed ? "justify-center" : "pl-3 pr-2",
+          )}
+        >
+          <Plus className="h-3 w-3 shrink-0" />
+          {!collapsed && "打开空间"}
+        </Link>
 
         <div className="mx-2 my-1 h-px bg-line" />
 
         {!collapsed && (
           <Link
             to="/spaces"
-            className="flex h-8 items-center gap-2 pl-3 pr-2 text-xs font-semibold text-ink-muted hover:text-ink"
+            className="flex h-8 items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
           >
-            空间
-            <span className="ml-auto tabular-nums text-2xs text-ink-faint">
-              进行中 {openSpaces.length}
-            </span>
+            工作室
           </Link>
         )}
-        {shown.map((space) => (
-          <SpaceBusRow
-            key={space.ws_id}
-            model={spaceBusModel(space)}
-            collapsed={collapsed}
-            active={currentWsId === space.ws_id}
-            onSelect={() => switchSpace(space.ws_id)}
-          />
-        ))}
-        {!collapsed && hiddenCount > 0 && (
-          <button
-            type="button"
-            onClick={() => setShowAll(true)}
-            className="flex h-8 w-full items-center pl-3 pr-2 text-left text-2xs text-ink-faint hover:text-ink"
-          >
-            +{hiddenCount} 个空间 →
-          </button>
-        )}
-        {!collapsed && (
-          <Link
-            to="/spaces/new"
-            className="flex h-8 w-full items-center gap-1.5 pl-3 pr-2 text-2xs text-ink-faint hover:text-ink"
-          >
-            <Plus className="h-3 w-3" />
-            新建空间
-          </Link>
-        )}
-
-        <div className="mx-2 my-1 h-px bg-line" />
-
         {!collapsed && (
           <Link
             to="/teams"

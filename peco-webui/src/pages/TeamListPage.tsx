@@ -1,51 +1,52 @@
-// `/teams` 团队列表：行 h-40。skills 数只有详情接口给，逐团队并行取一次 ——
-// 团队数是十几个量级，N 次请求换掉「skills 一格永远是 —」是值的。
+// `/teams` 团队卡片：卡片只要数字，明细在 `/teams/:teamId`。
+// 计数由 `GET /api/teams` 一次带回来，不再逐团队查一遍详情。
 
 import { Link } from "react-router-dom";
-import { useQueries } from "@tanstack/react-query";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
-import { getTeam } from "@/api/teams";
 import { errorText } from "@/lib/api";
 import { useTeams } from "@/queries/teams";
 import type { Team } from "@/types/daemon";
 
-function TeamRow({
-  team,
-  skillCount,
-}: {
-  team: Team;
-  skillCount: number | null;
-}) {
+/** 后端未给出计数时的占位：`0` 是事实，「–」只是「还没告诉我」。 */
+const MISSING = "–";
+
+const STATS = [
+  { key: "agent", label: "agents", of: (team: Team) => team.agent_count },
+  { key: "skill", label: "skills", of: (team: Team) => team.skill_count },
+  { key: "mcp", label: "MCP", of: (team: Team) => team.mcp_count },
+  { key: "space", label: "空间", of: (team: Team) => team.space_count },
+] as const;
+
+function TeamCard({ team }: { team: Team }) {
   return (
-    <li className="flex h-16 flex-col justify-center gap-0.5 border-b border-line px-3 py-1 @min-[900px]/main:h-10 @min-[900px]/main:flex-row @min-[900px]/main:items-center @min-[900px]/main:gap-2 @min-[900px]/main:py-0">
+    <li data-team-id={team.team_id} className="min-w-0">
       <Link
         to={`/teams/${encodeURIComponent(team.team_id)}`}
-        className="min-w-0 flex-1 truncate text-sm text-ink hover:underline"
+        className="flex h-full min-w-0 flex-col gap-1.5 rounded-[8px] border border-line bg-panel p-3 hover:border-line-strong hover:bg-raised"
       >
-        {team.display_name}
-      </Link>
-      <span className="truncate font-mono text-mono-sm text-ink-faint @min-[900px]/main:w-40 @min-[900px]/main:shrink-0">
-        {team.team_id}
-      </span>
-      <span className="tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-16 @min-[900px]/main:shrink-0 @min-[900px]/main:text-right">
-        agents {team.agents.length}
-      </span>
-      <span className="tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-20 @min-[900px]/main:shrink-0 @min-[900px]/main:text-right">
-        skills {skillCount ?? "—"}
-      </span>
-      <span className="tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-24 @min-[900px]/main:shrink-0 @min-[900px]/main:text-right">
-        空间 {team.bound_spaces.length}
-      </span>
-      <span className="tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-16 @min-[900px]/main:shrink-0 @min-[900px]/main:text-right">
-        v{team.template_version}
-      </span>
-      <Link
-        to={`/teams/${encodeURIComponent(team.team_id)}?tab=spaces`}
-        className="shrink-0 text-2xs text-ink-muted hover:text-ink"
-      >
-        装配
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="min-w-0 truncate text-sm font-semibold text-ink">
+            {team.display_name}
+          </span>
+          <span className="ml-auto shrink-0 tabular-nums text-2xs text-ink-faint">
+            v{team.template_version}
+          </span>
+        </span>
+        <span className="truncate font-mono text-2xs text-ink-faint">
+          {team.team_id}
+        </span>
+        <span className="mt-auto flex flex-wrap items-baseline gap-x-3 gap-y-1 pt-1 text-2xs">
+          {STATS.map((stat) => (
+            <span key={stat.key} className="flex items-baseline gap-1">
+              <span className="text-ink-faint">{stat.label}</span>
+              <span data-stat={stat.key} className="tabular-nums text-ink">
+                {stat.of(team) ?? MISSING}
+              </span>
+            </span>
+          ))}
+        </span>
       </Link>
     </li>
   );
@@ -53,13 +54,6 @@ function TeamRow({
 
 export function TeamListPage() {
   const { data: teams, error, isPending, refetch } = useTeams();
-  const details = useQueries({
-    queries: (teams ?? []).map((team) => ({
-      queryKey: ["team", team.team_id],
-      queryFn: () => getTeam(team.team_id),
-      staleTime: 60_000,
-    })),
-  });
 
   return (
     <div className="space-y-4">
@@ -71,9 +65,9 @@ export function TeamListPage() {
       )}
 
       {isPending && (
-        <div className="space-y-px">
-          {[0, 1, 2].map((row) => (
-            <Skeleton key={row} className="h-10 w-full" />
+        <div className="grid grid-cols-1 gap-3 @min-[640px]/main:grid-cols-2 @min-[1024px]/main:grid-cols-3">
+          {[0, 1, 2].map((card) => (
+            <Skeleton key={card} className="h-24 w-full" />
           ))}
         </div>
       )}
@@ -82,13 +76,9 @@ export function TeamListPage() {
         <EmptyState title="只有一个 Peco 内置团队。" />
       )}
 
-      <ul>
-        {(teams ?? []).map((team, index) => (
-          <TeamRow
-            key={team.team_id}
-            team={team}
-            skillCount={details[index]?.data?.skills.length ?? null}
-          />
+      <ul className="grid grid-cols-1 gap-3 @min-[640px]/main:grid-cols-2 @min-[1024px]/main:grid-cols-3">
+        {(teams ?? []).map((team) => (
+          <TeamCard key={team.team_id} team={team} />
         ))}
       </ul>
     </div>

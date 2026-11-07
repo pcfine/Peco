@@ -1,8 +1,9 @@
-import { api } from "@/lib/api";
+import { api, spaceScope } from "@/lib/api";
 import type {
   CreateSpaceRequest,
   Space,
   SpaceArtifactList,
+  SpaceConversation,
   SpaceFilesResponse,
   SpaceOpened,
   SpaceOverview,
@@ -19,6 +20,23 @@ export async function listSpaces(): Promise<Space[]> {
 
 export async function getSpace(wsId: string): Promise<Space> {
   const res = await api.get<Space>(`/spaces/${encodeURIComponent(wsId)}`);
+  return res.data;
+}
+
+/**
+ * 取回该空间 `@master` 的唯一会话，没有才建。
+ *
+ * 幂等：打开集里重复点同一个空间不能建出第二条会话。`agent_name` 缺省即 `@master`，
+ * 名字由后端/core 约定，前端不写死。
+ */
+export async function ensureSpaceConversation(
+  wsId: string,
+): Promise<SpaceConversation> {
+  const res = await api.post<SpaceConversation>(
+    `/spaces/${encodeURIComponent(wsId)}/conversation/ensure`,
+    {},
+    spaceScope(wsId),
+  );
   return res.data;
 }
 

@@ -1,10 +1,7 @@
 // `/spaces` 工作室列表：三组行式表（进行中 / 已存在 / 已关闭）。
 // 组头 sticky 但不做表头 —— 列义明显，4 行表头会吃掉密度。
 
-import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { Link } from "react-router-dom";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import {
@@ -14,11 +11,10 @@ import {
   type SpaceGroup,
 } from "@/components/layout/SpaceStatusMark";
 import { spaceLabel } from "@/components/layout/spaceLabel";
-import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { closeSpace } from "@/api/spaces";
-import { errorText } from "@/lib/api";
 import { latestActivityByWs } from "@/components/board/panel-spaces";
+import { useEnterSpace } from "@/hooks/useOpenSpaces";
+import { errorText } from "@/lib/api";
 import { relativeTime } from "@/lib/relative";
 import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
@@ -33,87 +29,63 @@ function SpaceRow({
   active,
   activityAt,
   onEnter,
-  onClose,
-  closing,
 }: {
   space: Space;
   active: boolean;
   activityAt: string | null;
   onEnter: () => void;
-  onClose: () => void;
-  closing: boolean;
 }) {
+  const name = spaceLabel(space);
   return (
     <li
       data-ws-id={space.ws_id}
-      className="flex flex-col justify-center gap-0.5 border-b border-line px-3 py-1 h-16 @min-[640px]/main:h-14 @min-[900px]/main:h-10 @min-[900px]/main:flex-row @min-[900px]/main:items-center @min-[900px]/main:gap-2 @min-[900px]/main:py-0"
+      className="flex h-16 items-center gap-2 border-b border-line px-3 py-1 @min-[640px]/main:h-14 @min-[900px]/main:h-10"
     >
-      <div className="flex min-w-0 items-center gap-2">
-        <SpaceStatusMark group={spaceGroupOf(space)} />
-        <span className="min-w-0 truncate text-sm text-ink">
-          {spaceLabel(space)}
+      <button
+        type="button"
+        onClick={onEnter}
+        aria-label={`进入空间 ${name}`}
+        className="flex min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/main:flex-row @min-[900px]/main:items-center @min-[900px]/main:gap-2"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <SpaceStatusMark group={spaceGroupOf(space)} />
+          <span className="min-w-0 truncate text-sm text-ink">{name}</span>
+          {active && (
+            <span className="shrink-0 rounded-[4px] border border-line px-1 text-2xs text-ink-faint">
+              当前
+            </span>
+          )}
         </span>
-        {active && (
-          <span className="shrink-0 rounded-[4px] border border-line px-1 text-2xs text-ink-faint">
-            当前
-          </span>
-        )}
-      </div>
-      <span className="truncate pl-6 font-mono text-mono-sm text-ink-faint @min-[900px]/main:flex-1 @min-[900px]/main:pl-0">
-        {space.work_dir}
-      </span>
-      <span className="truncate pl-6 font-mono text-2xs text-ink-faint @min-[640px]/main:hidden @min-[900px]/main:block @min-[900px]/main:w-[120px] @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0">
-        {space.team_id}
-      </span>
-      <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[640px]/main:hidden @min-[900px]/main:block @min-[900px]/main:w-14 @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0 @min-[900px]/main:text-right">
-        在飞 {space.inflight_dispatch}
-      </span>
-      <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-24 @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0 @min-[900px]/main:text-right">
-        {relativeTime(activityAt)}
-      </span>
-      <span className="flex shrink-0 items-center gap-1 pl-6 @min-[900px]/main:pl-0">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 px-2"
-          onClick={onEnter}
-        >
-          打开
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 px-2"
-          disabled={space.status === "closed" || closing}
-          onClick={onClose}
-        >
-          关闭
-        </Button>
-      </span>
+        <span className="truncate pl-6 font-mono text-mono-sm text-ink-faint @min-[900px]/main:min-w-0 @min-[900px]/main:flex-1 @min-[900px]/main:pl-0">
+          {space.work_dir}
+        </span>
+        <span className="truncate pl-6 font-mono text-2xs text-ink-faint @min-[640px]/main:hidden @min-[900px]/main:block @min-[900px]/main:w-[120px] @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0">
+          {space.team_id}
+        </span>
+        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[640px]/main:hidden @min-[900px]/main:block @min-[900px]/main:w-14 @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0 @min-[900px]/main:text-right">
+          在飞 {space.inflight_dispatch}
+        </span>
+        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-24 @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0 @min-[900px]/main:text-right">
+          {relativeTime(activityAt)}
+        </span>
+      </button>
+      <Link
+        to={`/spaces/${encodeURIComponent(space.ws_id)}/status`}
+        aria-label={`${name} 状态`}
+        className="grid h-6 shrink-0 place-items-center rounded-[4px] border border-line px-2 text-2xs text-ink-muted hover:bg-line hover:text-ink"
+      >
+        状态
+      </Link>
     </li>
   );
 }
 
 export function SpaceListPage() {
-  const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const { data: peco } = usePeco();
   const { data: spaces, error, isPending, refetch } = useSpaces();
   const { data: tasks } = usePecoTodayTasks(peco?.ws_id ?? null);
   const currentWsId = useSpaceStore((state) => state.currentWsId);
-  const setCurrent = useSpaceStore((state) => state.setCurrent);
-  const [closingWs, setClosingWs] = useState<string | null>(null);
-
-  const close = useMutation({
-    mutationFn: (wsId: string) => closeSpace(wsId),
-    onMutate: (wsId) => setClosingWs(wsId),
-    onSuccess: () => {
-      toast.success("空间已关闭");
-      void queryClient.invalidateQueries({ queryKey: ["spaces"] });
-    },
-    onError: (err) => toast.error(errorText(err)),
-    onSettled: () => setClosingWs(null),
-  });
+  const enterSpace = useEnterSpace();
 
   const activity = latestActivityByWs(tasks ?? []);
   const groups = GROUP_ORDER.map((group) => ({
@@ -130,6 +102,15 @@ export function SpaceListPage() {
         />
       )}
 
+      <div className="flex h-6 items-center justify-end">
+        <Link
+          to="/spaces/new"
+          className="text-xs text-primary-ink hover:underline"
+        >
+          新建空间
+        </Link>
+      </div>
+
       {isPending && (
         <div className="space-y-px">
           {[0, 1, 2].map((row) => (
@@ -140,7 +121,7 @@ export function SpaceListPage() {
 
       {spaces && spaces.length === 0 && (
         <EmptyState
-          title="还没有工作空间。"
+          title="还没有工作空间。空间 = 一个目录 + 一个团队。"
           action={
             <Link
               to="/spaces/new"
@@ -170,12 +151,7 @@ export function SpaceListPage() {
                   space={space}
                   active={space.ws_id === currentWsId}
                   activityAt={activity.get(space.ws_id) ?? null}
-                  closing={closingWs === space.ws_id}
-                  onEnter={() => {
-                    setCurrent(space.ws_id);
-                    navigate(`/spaces/${encodeURIComponent(space.ws_id)}`);
-                  }}
-                  onClose={() => close.mutate(space.ws_id)}
+                  onEnter={() => enterSpace(space.ws_id)}
                 />
               ))}
             </ul>

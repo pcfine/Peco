@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "@/App";
 import { useDockStore } from "@/stores/dockStore";
@@ -18,23 +18,35 @@ vi.mock("@/api/peco", () => ({
   }),
 }));
 
+const pecoSpace = {
+  ws_id: "ws_peco",
+  work_dir: "/tmp/peco",
+  team_id: "peco",
+  label: "Peco",
+  exit_policy: "inherit",
+  effective_exit_policy: "inherit",
+  status: "open" as const,
+  closed_at: null,
+  last_opened_at: null,
+  reserved: true,
+  inflight_dispatch: 0,
+  inflight_foreign: 0,
+  marker: null,
+};
+
 vi.mock("@/api/spaces", () => ({
-  listSpaces: async () => [
-    {
-      ws_id: "ws_peco",
-      work_dir: "/tmp/peco",
-      team_id: "peco",
-      label: "Peco",
-      exit_policy: "inherit",
-      effective_exit_policy: "inherit",
-      status: "open",
-      reserved: true,
-      inflight_dispatch: 0,
-      inflight_foreign: 0,
-      marker: null,
-    },
-  ],
+  listSpaces: async () => [pecoSpace],
+  getSpace: async () => pecoSpace,
+  spaceTasks: async () => [],
+  spaceArtifacts: async () => ({ items: [], total: 0 }),
+  spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
+  ensureSpaceConversation: async () => ({
+    conversation_id: "conv-space",
+    created: false,
+  }),
   closeSpace: async () => ({ stopped: true }),
+  createSpace: async () => ({ ws_id: "ws_new" }),
+  deleteSpace: async () => ({ purged: true }),
 }));
 
 vi.mock("@/api/teams", () => ({
@@ -82,6 +94,12 @@ function useWideViewport(): () => void {
   };
 }
 
+/** MemoryRouter 不暴露地址栏：重定向要靠一个读 location 的探针来断言。 */
+function PathProbe() {
+  const { pathname } = useLocation();
+  return <span data-testid="path">{pathname}</span>;
+}
+
 function renderAt(path: string) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -90,6 +108,7 @@ function renderAt(path: string) {
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <App />
+        <PathProbe />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -100,8 +119,16 @@ beforeEach(() => {
 });
 
 describe("壳与路由", () => {
-  it("/ 渲染四块面板", async () => {
+  it("/ 重定向到 /peco，看板照常渲染", async () => {
     renderAt("/");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("path")).toHaveTextContent("/peco"),
+    );
+  });
+
+  it("/peco 渲染四块面板", async () => {
+    renderAt("/peco");
     expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
     expect(screen.getByTestId("panel-spaces")).toBeInTheDocument();
     expect(screen.getByTestId("panel-teams")).toBeInTheDocument();
@@ -138,6 +165,21 @@ describe("壳与路由", () => {
   it("/schedules 是占位页，文案说清未实现", async () => {
     renderAt("/schedules");
     expect(await screen.findByText(/本期尚未实现/)).toBeInTheDocument();
+  });
+
+  it("/spaces/:wsId 是聊天页占位，/status 才是状态页", async () => {
+    const chat = renderAt("/spaces/ws_peco");
+    expect(
+      await screen.findByText(/下一阶段接到这里/),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("path")).toHaveTextContent("/spaces/ws_peco");
+    chat.unmount();
+
+    renderAt("/spaces/ws_peco/status");
+    expect(
+      await screen.findByRole("tab", { name: /任务台账/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/下一阶段接到这里/)).toBeNull();
   });
 
   it("未注册的路径给 404 文案，不是营销页", async () => {

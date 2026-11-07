@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/sheet";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useResolveCurrentSpace } from "@/hooks/useResolveCurrentSpace";
+import { useSeedOpenSpaces } from "@/hooks/useOpenSpaces";
 import { useTaskEvents } from "@/hooks/useTaskEvents";
 import { useUiStore } from "@/stores/uiStore";
 
@@ -23,6 +24,7 @@ export function AppShell() {
   const [navOpen, setNavOpen] = useState(false);
   useTaskEvents();
   useResolveCurrentSpace();
+  useSeedOpenSpaces();
 
   return (
     <div className="flex h-full overflow-hidden bg-canvas text-ink">
