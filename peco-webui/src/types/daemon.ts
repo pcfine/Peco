@@ -298,6 +298,22 @@ export interface SkillInfo {
   description: string;
 }
 
+/**
+ * `POST /api/mcp/{name}/test` 的结果。连不上也是 200：`success=false` 走 `message`，
+ * 只有「server 名不在配置里」之类的前置错误才是 HTTP 错误。
+ */
+export interface McpTestResult {
+  success: boolean;
+  server: string;
+  /** `stdio` / `sse` / `streamable_http`；配置缺失时不下发。 */
+  transport?: string;
+  tool_count: number;
+  tools: string[];
+  message: string;
+  duration_ms: number;
+  error_type?: string;
+}
+
 /** `/api/knowledge` 的一行；`document_count` 由服务端聚合，前端不再数一遍。 */
 export interface KnowledgeBase {
   id: string;
