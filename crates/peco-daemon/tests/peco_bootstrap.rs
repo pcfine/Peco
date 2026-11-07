@@ -251,10 +251,12 @@ async fn the_peco_space_cannot_be_deleted_but_can_be_closed() {
 }
 
 /// 旧版二进制装的空间：`agent.md` 已被升到当前模板，`team.json` 还停在上一版。
-/// 索引行与两个接口都必须报磁盘上的版本，而 `team.json` 原字节不动 ——
+/// 索引行与详情接口都必须报磁盘上的版本，而 `team.json` 原字节不动 ——
 /// 版本对齐是读出来的，不是重写用户文件换来的。
 ///
-/// 变异：`meta_from_dir` 只读 `team.json` → 索引行与两个接口都报旧版本变红。
+/// 清单里查不到 Peco 是刻意为之（保留团队不进团队列表），版本因此由详情接口回答。
+///
+/// 变异：`meta_from_dir` 只读 `team.json` → 索引行与详情接口都报旧版本变红。
 #[tokio::test]
 async fn an_upgraded_space_reports_the_version_on_disk() {
     let env = new_env(&[]).await;
@@ -287,17 +289,15 @@ async fn an_upgraded_space_reports_the_version_on_disk() {
 
     let listed = env.get("/api/teams").await;
     assert_eq!(listed.status, 200, "body={}", listed.body);
-    let peco = listed
-        .body
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["team_id"] == json!("peco"))
-        .expect("Peco 团队必须在清单里");
-    assert_eq!(
-        peco["template_version"],
-        json!(installed),
-        "清单必须报磁盘上的模板版本"
+    assert!(
+        listed
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["team_id"] != json!("peco")),
+        "Peco 是保留团队，不得出现在团队清单里: {}",
+        listed.body
     );
 
     let detail = env.get("/api/teams/peco").await;

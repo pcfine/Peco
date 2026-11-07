@@ -7,6 +7,7 @@ pub mod events;
 pub mod peco;
 pub mod space;
 pub mod space_artifacts;
+pub mod space_conversation;
 pub mod space_files;
 pub mod space_overview;
 pub mod tasks;
@@ -41,6 +42,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/spaces/{ws_id}/tasks", get(tasks::list_for_space))
         // 空间维度的只读视图：路径里已带 `ws_id`，不要求 `X-Peco-Space` 头。
         .route("/api/spaces/{ws_id}/artifacts", get(space_artifacts::list))
+        // 空间单会话的惰性创建：前端点开空间时才调用，幂等。
+        .route(
+            "/api/spaces/{ws_id}/conversation/ensure",
+            post(space_conversation::ensure),
+        )
         .route("/api/spaces/{ws_id}/files", get(space_files::browse))
         .route(
             "/api/spaces/{ws_id}/overview",

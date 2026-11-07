@@ -18,6 +18,7 @@ use crate::db::teams;
 use crate::db::workspaces::{self, WorkspaceRow};
 use crate::error::DaemonError;
 use crate::space::index;
+use crate::space::peco::PECO_TEAM_ID;
 use crate::state::AppState;
 use crate::team::{self, create_team};
 
@@ -26,6 +27,12 @@ pub struct TeamView {
     pub team_id: String,
     pub display_name: String,
     pub template_version: i64,
+    /// 卡片只显示数量、详情页显示明细，两者因此都得给：`*_count` 供卡片，
+    /// `agents` / `bound_spaces` 供已有的详情与列表页继续使用。
+    pub agent_count: i64,
+    pub skill_count: i64,
+    pub mcp_count: i64,
+    pub space_count: i64,
     pub agents: Vec<String>,
     pub bound_spaces: Vec<String>,
 }
@@ -42,6 +49,11 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<TeamView>>, 
     let spaces = workspaces::list(&state.pool).await?;
     let mut views = Vec::new();
     for team_id in team_ids(&state).await? {
+        // Peco 是保留团队而不是可管理团队：它不进清单，由 Peco 页自己的配置面承载；
+        // 详情接口不过滤，否则配置面读不到自己的能力根。
+        if team_id == PECO_TEAM_ID {
+            continue;
+        }
         views.push(team_view(&state, &team_id, &spaces).await?);
     }
     Ok(Json(views))
@@ -51,6 +63,13 @@ pub async fn create(
     State(state): State<AppState>,
     Json(request): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<TeamView>), DaemonError> {
+    // Peco 团队由启动引导安装，不由用户创建。这条拒绝放在 HTTP 面而非
+    // `create_team`：同名的保留身份判定属于接口契约，引导路径另有自己的入口。
+    if request.id == PECO_TEAM_ID {
+        return Err(DaemonError::InvalidArgument {
+            message: format!("team id '{PECO_TEAM_ID}' is reserved"),
+        });
+    }
     create_team(
         &state.env,
         &request.id,
@@ -80,16 +99,26 @@ async fn team_view(
     let root = env.team_root(team_id);
     let row = teams::get(&state.pool, team_id).await?;
     let (display_name, template_version) = teams::resolve_meta(row, &root, team_id);
+    // 计数一律取自下面这几份清单的长度：另写一遍读盘逻辑会让卡片与详情页
+    // 对「装了几个」给出两个答案。
+    let agents = installed_agents(&root);
+    let skills = installed_skills(&root);
+    let mcp_servers = mcp_server_names(&root);
+    let bound_spaces: Vec<String> = spaces
+        .iter()
+        .filter(|space| space.team_id == team_id)
+        .map(|space| space.id.clone())
+        .collect();
     Ok(TeamView {
         team_id: team_id.to_string(),
         display_name,
         template_version,
-        agents: installed_agents(&root),
-        bound_spaces: spaces
-            .iter()
-            .filter(|space| space.team_id == team_id)
-            .map(|space| space.id.clone())
-            .collect(),
+        agent_count: agents.len() as i64,
+        skill_count: skills.len() as i64,
+        mcp_count: mcp_servers.len() as i64,
+        space_count: bound_spaces.len() as i64,
+        agents,
+        bound_spaces,
     })
 }
 

@@ -40,6 +40,9 @@ async fn open_peco_space(env: &TestEnv, upstream: &FakeUpstream) -> String {
 }
 
 /// 同上，但让 `@master` 挂上指定工具。
+///
+/// 走引导路径（索引行 + 打开）而不是 `POST /api/spaces`：保留团队不接受经接口
+/// 新建空间，真实的 Peco 空间也是启动引导建出来的。
 async fn open_peco_space_with(env: &TestEnv, upstream: &FakeUpstream, tools: &[&str]) -> String {
     install_team(
         env,
@@ -47,7 +50,12 @@ async fn open_peco_space_with(env: &TestEnv, upstream: &FakeUpstream, tools: &[&
         upstream,
         &[fixture("@master", "master", tools)],
     );
-    env.open_space("peco", "peco").await
+    let ws_id = env
+        .resolve(&env.work_dir("peco"), "peco")
+        .await
+        .expect("引导路径应能为 Peco 团队建出空间行");
+    env.open(&ws_id).await.expect("Peco 空间应能打开");
+    ws_id
 }
 
 /// 与台账里的空间对上的 Peco 身份：投递端只按它决定「投给谁、去哪儿开实例」。

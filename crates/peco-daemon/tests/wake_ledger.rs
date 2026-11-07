@@ -149,9 +149,17 @@ async fn composed_from_ledger(env: &TestEnv) -> String {
 }
 
 /// 建出 Peco 空间（含 `@master` 的 agent.md）并打开它，返回 `ws_id`。
+///
+/// 走引导路径（索引行 + 打开）而不是 `POST /api/spaces`：保留团队不接受经接口
+/// 新建空间，真实的 Peco 空间也是启动引导建出来的。
 async fn open_peco_space(env: &TestEnv, upstream: &FakeUpstream) -> String {
     install_team(env, "peco", upstream, &[fixture("@master", "master", &[])]);
-    env.open_space("peco", "peco").await
+    let ws_id = env
+        .resolve(&env.work_dir("peco"), "peco")
+        .await
+        .expect("引导路径应能为 Peco 团队建出空间行");
+    env.open(&ws_id).await.expect("Peco 空间应能打开");
+    ws_id
 }
 
 /// 与台账里的空间对上的 Peco 身份：投递端只按它决定「投给谁、去哪儿开实例」。

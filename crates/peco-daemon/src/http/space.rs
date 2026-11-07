@@ -18,6 +18,7 @@ use crate::error::DaemonError;
 use crate::space::close as space_close;
 use crate::space::manifest;
 use crate::space::open;
+use crate::space::peco::PECO_TEAM_ID;
 use crate::state::AppState;
 
 const STATUS_OPEN: &str = "open";
@@ -139,6 +140,14 @@ pub async fn create(
     State(state): State<AppState>,
     Json(request): Json<CreateRequest>,
 ) -> Result<Response, DaemonError> {
+    // Peco 只有 `$PECO_HOME/spaces/peco/work` 一个保留空间，不再由用户建第二个。
+    // 这道门槛必须早于任何 I/O：`resolve_ws_id` 会补索引行、`create_dir_all` 会
+    // 留下目录，拒绝时两者都不该发生。
+    if request.team_id == PECO_TEAM_ID {
+        return Err(DaemonError::InvalidArgument {
+            message: format!("team '{PECO_TEAM_ID}' cannot own new spaces"),
+        });
+    }
     let work_dir = open::normalize_work_dir(Path::new(&request.work_dir))?;
     let key = work_dir.to_string_lossy().into_owned();
     let existed = workspaces::by_work_dir(&state.pool, &key).await?.is_some();
@@ -196,6 +205,13 @@ pub async fn update(
         });
     }
     if let Some(team_id) = request.team_id.as_deref() {
+        // 改绑到 Peco 同样被拒：保留空间的身份由引导独占，接管的目录会跟它抢
+        // 同一个团队能力根。
+        if team_id == PECO_TEAM_ID {
+            return Err(DaemonError::InvalidArgument {
+                message: format!("team '{PECO_TEAM_ID}' is reserved"),
+            });
+        }
         // 目录不存在 ⇒ `team_missing`（此时什么都没写）；目录存在但缺索引行 ⇒ 先补行。
         open::ensure_team_indexed(&state.env, team_id).await?;
     }

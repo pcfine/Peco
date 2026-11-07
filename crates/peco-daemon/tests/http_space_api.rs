@@ -8,6 +8,7 @@ use std::path::Path;
 use peco_daemon::db;
 use peco_daemon::db::dispatches;
 use peco_daemon::space::manifest::MANIFEST_FILE;
+use peco_daemon::space::peco::PECO_TEAM_ID;
 use serde_json::json;
 use support::new_env;
 
@@ -596,4 +597,74 @@ async fn closed_at_and_last_opened_at_separate_the_three_groups() {
         "显式关闭必须写 closed_at: {row}"
     );
     assert!(row["last_opened_at"].as_str().is_some(), "打开时刻保留");
+}
+
+/// Peco 只有引导建出的那一个保留空间：拿它的团队新建空间一律 `400`，且拒绝发生
+/// 在任何 I/O 之前 —— 目录不会被建出来，索引行也不会被补。
+#[tokio::test]
+async fn creating_a_space_in_the_reserved_peco_team_is_400_and_leaves_nothing() {
+    let env = new_env(&[PECO_TEAM_ID]).await;
+    let work_dir = env.home.join("spaces").join("second").join("work");
+
+    let reply = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": PECO_TEAM_ID}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 400, "body={}", reply.body);
+    assert_eq!(reply.code(), "invalid_argument");
+    assert!(
+        !work_dir.exists(),
+        "拒绝必须早于 create_dir_all: {}",
+        work_dir.display()
+    );
+    assert_eq!(env.count_workspaces(&work_dir).await, 0, "不得留下空间行");
+    assert!(
+        env.home.join("teams").join(PECO_TEAM_ID).is_dir(),
+        "拒绝不得动 Peco 团队目录"
+    );
+    assert_eq!(
+        env.team_ids().await,
+        Vec::<String>::new(),
+        "拒绝必须早于 ensure_team_indexed，不得补出索引行"
+    );
+}
+
+/// 改绑到 Peco 同样被拒：marker 与 DB 行都保持原样。
+#[tokio::test]
+async fn rebinding_a_space_to_the_reserved_peco_team_is_400() {
+    let env = new_env(&["research", PECO_TEAM_ID]).await;
+    let work_dir = env.work_dir("zeta");
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+        )
+        .await;
+    assert_eq!(created.status, 201, "body={}", created.body);
+    let ws_id = ws_id_of(&created);
+    let marker_before = std::fs::read(work_dir.join(MANIFEST_FILE)).unwrap();
+
+    let reply = env
+        .patch(
+            &format!("/api/spaces/{ws_id}"),
+            json!({"team_id": PECO_TEAM_ID}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 400, "body={}", reply.body);
+    assert_eq!(reply.code(), "invalid_argument");
+    let row_team: String = sqlx::query_scalar("SELECT team_id FROM workspaces WHERE id = ?")
+        .bind(&ws_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(row_team, "research", "被拒的改绑不得改 DB 行");
+    assert_eq!(
+        std::fs::read(work_dir.join(MANIFEST_FILE)).unwrap(),
+        marker_before,
+        "被拒的改绑不得改 marker"
+    );
 }

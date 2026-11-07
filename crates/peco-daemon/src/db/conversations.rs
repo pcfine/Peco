@@ -84,6 +84,67 @@ pub async fn ensure_private_session(
     Ok(())
 }
 
+/// 空间页单会话的标题：一个空间只有这一条 `scope='space'` 行，标题不承担
+/// 区分职责，由界面统一显示。
+const SPACE_SESSION_TITLE: &str = "空间对话";
+
+/// 取该空间该 agent 的唯一 `scope='space'` 会话；不存在则建一条。
+///
+/// 返回 `(conversation_id, 是否本次新建)`。
+///
+/// 用「查 → 插 → 撞键回查」而不是 `ON CONFLICT(workspace_id, agent_name)`：
+/// SQLite 对带 `WHERE` 的部分唯一索引做冲突目标推断并不可靠，写错目标只会在
+/// 运行时报语法错。回查把并发留给索引：两个请求同时查空之后只有一个插得进去，
+/// 输的那个读回赢家的 id —— 幂等由唯一索引保证，不靠应用层加锁。
+pub async fn ensure_space_session(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    agent_name: &str,
+) -> Result<(String, bool), sqlx::Error> {
+    if let Some(existing) = find_space_session(pool, workspace_id, agent_name).await? {
+        return Ok((existing, false));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let inserted = sqlx::query(
+        "INSERT INTO conversations (id, user_id, workspace_id, agent_id, agent_name, title, scope) \
+         VALUES (?, ?, ?, NULL, ?, ?, 'space')",
+    )
+    .bind(&id)
+    .bind(LOCAL_USER_ID)
+    .bind(workspace_id)
+    .bind(agent_name)
+    .bind(SPACE_SESSION_TITLE)
+    .execute(pool)
+    .await;
+
+    match inserted {
+        Ok(_) => Ok((id, true)),
+        // 唯一索引挡下的是「另一个请求刚刚插成功」这一种失败；只有回查到行才算
+        // 竞态，查不到说明是别的错误（外键、磁盘），原样上报。
+        Err(e) => match find_space_session(pool, workspace_id, agent_name).await? {
+            Some(winner) => Ok((winner, false)),
+            None => Err(e),
+        },
+    }
+}
+
+async fn find_space_session(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    agent_name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM conversations \
+         WHERE scope = 'space' AND workspace_id = ? AND agent_name = ? \
+         LIMIT 1",
+    )
+    .bind(workspace_id)
+    .bind(agent_name)
+    .fetch_optional(pool)
+    .await
+}
+
 /// 查询某空间在某 Agent 下的对话列表，支持归档状态过滤。
 pub async fn list_by_workspace_and_agent(
     pool: &SqlitePool,

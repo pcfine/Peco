@@ -544,6 +544,30 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 020 skipped: d_dispatches.wake_skip_reason already exists");
     }
 
+    // ── Migration 021: 空间唯一会话的部分唯一索引 ─────────────────────────
+    // 门控查索引而不管 SQL 里的 `IF NOT EXISTS`：逐条执行无事务，进程崩在
+    // 建索引前后都会留下「表在、索引不在」的库，看索引才自愈；命中也避免每次
+    // 启动都记一条「正在迁移」。
+    let has_space_session_idx = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'index' AND name = 'idx_conversations_space_unique'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_space_session_idx {
+        run_migration(
+            pool,
+            "021",
+            include_str!("migrations/021_space_conversation.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 021 completed");
+    } else {
+        tracing::debug!("Migration 021 skipped: space session index already exists");
+    }
+
     Ok(())
 }
 

@@ -407,3 +407,66 @@ async fn migration_020_completes_a_half_migrated_dispatch_ledger() {
     .unwrap();
     assert_eq!(reason, None, "补列不得给历史行编造原因");
 }
+
+/// 旧库（本改动之前的版本）没有空间唯一会话索引：启动迁移必须补上，且必须是
+/// **部分**唯一索引 —— 只管 `scope='space'`，普通 agent 会话照样能并列多条。
+///
+/// 变异：删掉 021 的注册 → 索引不在，第一条断言变红；把 `WHERE scope='space'`
+/// 写掉 → 两条 `scope='agent'` 插不进去，第二条断言变红。
+#[tokio::test]
+async fn migration_021_adds_the_partial_unique_space_session_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/pre021.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    // 旧库的样子：表在，索引不在。
+    sqlx::raw_sql("DROP INDEX idx_conversations_space_unique")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !index_exists(&pool, "idx_conversations_space_unique").await,
+        "夹具需要一份缺索引的库"
+    );
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    assert!(
+        index_exists(&pool, "idx_conversations_space_unique").await,
+        "021 必须给旧库补出空间会话唯一索引"
+    );
+
+    for id in ["c_agent_1", "c_agent_2"] {
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, workspace_id, agent_name, scope) \
+             VALUES (?, 'local', 'ws_a', '@master', 'agent')",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("普通 agent 会话不受这条索引约束");
+    }
+
+    sqlx::raw_sql(
+        "INSERT INTO conversations (id, user_id, workspace_id, agent_name, scope) \
+         VALUES ('c_space_1', 'local', 'ws_a', '@master', 'space')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let duplicate = sqlx::raw_sql(
+        "INSERT INTO conversations (id, user_id, workspace_id, agent_name, scope) \
+         VALUES ('c_space_2', 'local', 'ws_a', '@master', 'space')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("同空间同 agent 的第二条 scope='space' 必须被唯一索引拦下");
+    assert!(
+        duplicate.to_string().contains("UNIQUE"),
+        "错误应是唯一约束: {duplicate}"
+    );
+
+    // 重跑迁移：守卫命中，索引与数据都还在。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert!(index_exists(&pool, "idx_conversations_space_unique").await);
+}
