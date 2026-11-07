@@ -68,7 +68,10 @@ crates/peco-server/src/middleware - 不copy 只留 CORS + trace
 
 crates/peco-server/src/peco - 未copy 后续阶段（记忆双路径、Peco 会话）
 crates/peco-server/src/workflow - 未copy 后续阶段
-crates/peco-server/src/provider - 未copy 后续阶段
+crates/peco-server/src/provider/handler.rs crates/peco-daemon/src/provider/handler.rs copy+mod AuthUser→`{team_id}` 路径参数、workspace_manager→SpaceEnv+WorkspaceHub；DTO 与字段级部分更新语义移到 provider/mod.rs，这里只留 HTTP 翻译；探针改走 peco_core::provider::probe
+crates/peco-server/src/provider/mod.rs crates/peco-daemon/src/provider/mod.rs copy+mod 并入 handler.rs 的 DTO 与纯函数；路由改由 http/mod.rs 按 `/api/teams/{team_id}/providers` 注册；写盘改原子写，写后按团队扇出 reload_providers
+- crates/peco-core/src/provider/mod.rs new 挂 `provider::probe`：探针上移供 peco-server 与 peco-daemon 共用
+- crates/peco-core/src/provider/probe.rs new 由 `peco-server/src/provider/probe.rs` 原样搬入（`peco_core::…` 改 `crate::…`）；server 侧 `pub use` 保旧路径可用
 crates/peco-server/src/usage - 未copy 后续阶段
 
 crates/peco-server/src/chat/mod.rs crates/peco-daemon/src/chat/mod.rs copy+mod 删 /api/conversations legacy 路由与 5 个 legacy wrapper；Router<Arc<AppState>>→Router<AppState>

@@ -5,6 +5,7 @@ pub mod executor;
 pub mod knowledge;
 pub mod machine;
 pub mod mcp;
+pub mod provider;
 pub mod search;
 pub mod session;
 pub mod skills;

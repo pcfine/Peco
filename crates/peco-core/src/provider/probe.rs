@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::agent::{ModelConfig, build_provider_with_user};
+use crate::config::{McpConfig, ProviderEntry, ProvidersConfig, UserConfig};
 use model_provider::{GenerateRequest, InputItem, ReasoningConfig, Role};
-use peco_core::agent::{ModelConfig, build_provider_with_user};
-use peco_core::config::{McpConfig, ProviderEntry, ProvidersConfig, UserConfig};
 
 /// 探针请求的输出上限。
 ///
@@ -161,8 +161,8 @@ fn build_user_config(target: &ProbeTarget) -> Result<UserConfig, String> {
         return Err("provider 类型不能为空".to_string());
     }
     // 取目录里的规范值：适配器分派是精确匹配，大小写变体会在构建期才失败
-    let Some(meta) = peco_core::config::provider_type_meta(&target.provider_type) else {
-        let supported: Vec<&str> = peco_core::config::PROVIDER_TYPES
+    let Some(meta) = crate::config::provider_type_meta(&target.provider_type) else {
+        let supported: Vec<&str> = crate::config::PROVIDER_TYPES
             .iter()
             .map(|m| m.provider_type)
             .collect();

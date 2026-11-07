@@ -26,6 +26,7 @@ use crate::chat;
 use crate::error::DaemonError;
 use crate::knowledge;
 use crate::mcp_config;
+use crate::provider;
 use crate::skill;
 use crate::state::AppState;
 
@@ -49,6 +50,27 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{task_id}", get(tasks::detail))
         .route("/api/teams", get(team::list).post(team::create))
         .route("/api/teams/{team_id}", get(team::detail))
+        // 团队级 provider 配置：providers.toml 属于团队能力根，不在某个空间里。
+        .route(
+            "/api/teams/{team_id}/providers",
+            get(provider::list).put(provider::upsert),
+        )
+        .route(
+            "/api/teams/{team_id}/providers/types",
+            get(provider::list_types),
+        )
+        .route(
+            "/api/teams/{team_id}/providers/test",
+            post(provider::test_draft),
+        )
+        .route(
+            "/api/teams/{team_id}/providers/{name}",
+            get(provider::get).delete(provider::delete),
+        )
+        .route(
+            "/api/teams/{team_id}/providers/{name}/test",
+            post(provider::test_connection),
+        )
         .route("/api/peco", get(peco::detail))
         // 台账事件流：看板靠它把「任务变状态」推进 UI，不轮询。
         .route("/api/events", get(events::stream))

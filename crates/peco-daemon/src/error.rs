@@ -95,6 +95,9 @@ pub enum DaemonError {
     #[error("team '{team_id}' has neither a directory nor an index row")]
     TeamNotFound { team_id: String },
 
+    #[error("provider '{name}' is not configured for this team")]
+    ProviderNotFound { name: String },
+
     #[error("invalid path '{path}': {reason}")]
     InvalidPath { path: String, reason: String },
 
@@ -142,6 +145,7 @@ impl DaemonError {
             Self::TaskNotFound { .. } => "task_not_found",
             Self::TeamExists { .. } => "team_exists",
             Self::TeamNotFound { .. } => "team_not_found",
+            Self::ProviderNotFound { .. } => "provider_not_found",
             Self::InvalidPath { .. } => "invalid_path",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::Internal { .. } => "internal",
@@ -159,6 +163,7 @@ impl DaemonError {
             Self::SpaceNotFound { .. } => StatusCode::NOT_FOUND,
             Self::TaskNotFound { .. } => StatusCode::NOT_FOUND,
             Self::TeamNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::ProviderNotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidArgument { .. }
             | Self::InvalidPath { .. }
             | Self::ReservedSpace { .. }
@@ -215,6 +220,13 @@ mod tests {
                     team_id: "ghost".into(),
                 },
                 "team_not_found",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                DaemonError::ProviderNotFound {
+                    name: "gateway".into(),
+                },
+                "provider_not_found",
                 StatusCode::NOT_FOUND,
             ),
             (

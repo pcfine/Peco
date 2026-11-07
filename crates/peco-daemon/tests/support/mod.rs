@@ -188,16 +188,7 @@ pub fn install_team(env: &TestEnv, team: &str, upstream: &FakeUpstream, agents: 
 
 impl TestEnv {
     pub fn app_state(&self) -> AppState {
-        AppState {
-            pool: self.pool.clone(),
-            hub: self.hub.clone(),
-            env: self.env.clone(),
-            config: self.config.clone(),
-            tasks: self.tasks.clone(),
-            spaces: Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone())),
-            chat_runs: Arc::new(peco_daemon::chat::ChatActiveRuns::new()),
-            wake: self.wake.clone(),
-        }
+        self.with_env(self.env.clone())
     }
 
     pub fn router(&self) -> Router {
@@ -212,14 +203,33 @@ impl TestEnv {
         &self,
         peco: Arc<peco_daemon::space::peco::PecoIdentity>,
     ) -> AppState {
+        self.with_env(self.env_with_system_config(SystemConfig::load(), peco))
+    }
+
+    /// 换一份系统配置重建 `AppState`：系统层的 provider 兜底只在这一层可见，
+    /// 想断言「系统层补的 key 也算已配置」就必须先把它注入进来。
+    pub fn app_state_with_system_config(&self, system_config: SystemConfig) -> AppState {
+        let peco = Arc::new(peco_daemon::space::peco::resolve(&self.config.peco_home));
+        self.with_env(self.env_with_system_config(system_config, peco))
+    }
+
+    fn env_with_system_config(
+        &self,
+        system_config: SystemConfig,
+        peco: Arc<peco_daemon::space::peco::PecoIdentity>,
+    ) -> Arc<SpaceEnv> {
         let env = Arc::new(SpaceEnv::new(
             &self.config,
             self.pool.clone(),
-            SystemConfig::load(),
+            system_config,
             peco,
             self.tasks.clone(),
         ));
         env.attach_hub(&self.hub);
+        env
+    }
+
+    fn with_env(&self, env: Arc<SpaceEnv>) -> AppState {
         AppState {
             pool: self.pool.clone(),
             hub: self.hub.clone(),

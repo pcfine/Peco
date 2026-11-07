@@ -1,7 +1,9 @@
 // Provider 管理 API — 用户 workspace 级别 providers.toml CRUD
 
 mod handler;
-mod probe;
+
+// 探针在 peco-core：daemon 的团队级端点用的是同一份实现，这里只做路径转发。
+pub use peco_core::provider::probe;
 
 use std::sync::Arc;
 
