@@ -231,6 +231,8 @@ pub(crate) async fn spawn_run(
         &team_id,
         ws.work_dir().root().to_path_buf(),
         Arc::clone(agent.provider()),
+        // 记忆写进本轮空间自己的库：同一个团队的空间共用一套 KB，标签才分得开。
+        Arc::clone(ws.knowledge_manager()),
     );
 
     let db_for_bg = deps.pool.clone();

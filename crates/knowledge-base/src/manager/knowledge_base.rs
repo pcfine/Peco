@@ -106,6 +106,27 @@ fn build_text_document(kb_name: &str, title: &str, content: &str, source: &str) 
     }
 }
 
+/// 在 [`build_text_document`] 的基准上落调用方给的元数据。
+///
+/// `file_type` / `created_at` 缺省时沿用基准值：带元数据写入是 `add_text` 的
+/// 加强版，不是另一套文档形态 —— 少了这两个盖章，同一条记忆经不同入口写入
+/// 会在下游看起来来自不同种类的文档。
+fn build_text_document_with_metadata(
+    kb_name: &str,
+    title: &str,
+    content: &str,
+    source: &str,
+    mut metadata: DocumentMetadata,
+) -> Document {
+    let mut doc = build_text_document(kb_name, title, content, source);
+    metadata.file_type = metadata.file_type.or_else(|| doc.metadata.file_type.take());
+    metadata.created_at = metadata
+        .created_at
+        .or_else(|| doc.metadata.created_at.take());
+    doc.metadata = metadata;
+    doc
+}
+
 // ---------------------------------------------------------------------------
 // KnowledgeBase
 // ---------------------------------------------------------------------------
@@ -311,6 +332,27 @@ impl KnowledgeBase {
         let doc = build_text_document(&self.config.name, title, content, source);
 
         self.pipeline.ingest_with_mode(doc.clone(), mode).await?;
+        Ok(doc)
+    }
+
+    /// 直接添加文本，并把调用方给的文档元数据一并落库（默认存储模式）。
+    ///
+    /// 与 [`Self::add_text`] 的差别只有元数据；`metadata.extra` 里的标签随文档
+    /// 持久化、`get_document` 可原样读回 —— 给文档打业务标签（如空间归属）的
+    /// 路径依赖这一点。
+    pub async fn add_text_with_metadata(
+        &self,
+        title: &str,
+        content: &str,
+        source: &str,
+        metadata: DocumentMetadata,
+    ) -> Result<Document, KnowledgeError> {
+        let doc =
+            build_text_document_with_metadata(&self.config.name, title, content, source, metadata);
+
+        self.pipeline
+            .ingest_with_mode(doc.clone(), self.config.default_storage_mode)
+            .await?;
         Ok(doc)
     }
 
@@ -853,6 +895,42 @@ mod tests {
             Err(KnowledgeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// 带元数据的写入必须让标签活到读回那一刻：`extra` 是业务标签（如空间归属）
+    /// 的唯一载体，写丢了就等于「写过但查不到」。
+    ///
+    /// 同时钉住与 `add_text` 的等价性 —— 未给的 `file_type` / `created_at`
+    /// 仍按基准文档补上，两条路径产出的文档形状一致。
+    #[tokio::test]
+    async fn add_text_with_metadata_roundtrips_extra() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr.create_kb(memory_kb_config("meta-kb")).await.unwrap();
+
+        let mut metadata = DocumentMetadata::default();
+        metadata.extra.insert("ws_id".into(), "ws_a".into());
+        let written = kb
+            .add_text_with_metadata("memory_1", "用户偏好简洁的回答", "ppa_profile", metadata)
+            .await
+            .unwrap();
+        assert_eq!(
+            written.metadata.extra.get("ws_id").map(String::as_str),
+            Some("ws_a")
+        );
+        assert_eq!(written.metadata.file_type.as_deref(), Some("txt"));
+        assert!(written.metadata.created_at.is_some());
+
+        let read = kb
+            .get_document(&written.id)
+            .await
+            .unwrap()
+            .expect("刚写入的文档必须能读回");
+        assert_eq!(
+            read.metadata.extra.get("ws_id").map(String::as_str),
+            Some("ws_a"),
+            "标签必须随文档持久化"
+        );
     }
 
     /// `resolve_helix_url` 读写进程级环境变量，用例串行执行避免相互干扰。

@@ -291,8 +291,9 @@ async fn w1_a_finished_task_wakes_peco_and_runs_a_real_turn() {
     assert!(!assistant.trim().is_empty(), "agent 必须真的回了一句话");
 
     // 模型确实收到了这条文本 —— 落库只能证明「写了消息」，这件事证明真的跑了一轮。
-    let exchanges = upstream.exchanges();
-    assert_eq!(exchanges.len(), 1, "唤醒轮只该问模型一次");
+    // 只数对话那档模型：记忆提取跑在后台、用的是另一档模型，与本判据无关。
+    let exchanges = upstream.exchanges_with_model("master");
+    assert_eq!(exchanges.len(), 1, "唤醒轮只该问对话模型一次");
     let saw_wake_text = exchanges[0].request["messages"]
         .as_array()
         .into_iter()

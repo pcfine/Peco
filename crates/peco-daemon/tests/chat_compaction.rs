@@ -10,6 +10,7 @@ use std::sync::Arc;
 use model_provider::{
     GenerateRequest, GenerateResult, GenerateStream, ModelProvider, ProviderError,
 };
+use peco_core::knowledge::KnowledgeManager;
 use peco_daemon::space::bootstrap::bootstrap_peco;
 use support::new_env;
 
@@ -37,10 +38,11 @@ impl ModelProvider for UnreachableProvider {
     }
 }
 
-/// 聊天配置必须同时挂压缩与轮末收尾报告，且不能顶掉观察 hook。
+/// 聊天配置必须同时挂压缩、轮末收尾报告与记忆读写，且不能顶掉观察 hook。
 ///
 /// 变异方法：去掉 `chat_looper_config` 里的 `config.compaction = ...` →
-/// 压缩断言变红；把 `chat/run.rs` 改回 `looper_config` → 同上。
+/// 压缩断言变红；把 `chat/run.rs` 改回 `looper_config` → 同上；
+/// 去掉 `config.hooks.push(MemoryExtractionHook ...)` → hook 计数断言变红。
 #[tokio::test]
 async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
     let env = new_env(&[]).await;
@@ -48,10 +50,17 @@ async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
     let ws_id = env.env.peco.ws_id.clone();
     let work_dir = env.work_dir("peco");
     let provider: Arc<dyn ModelProvider> = Arc::new(UnreachableProvider);
+    // 装配期不碰记忆库（提取在轮末才发生），路径给一个临时目录即可。
+    let kb_dir = tempfile::tempdir().unwrap();
+    let km = Arc::new(KnowledgeManager::new(kb_dir.path().to_path_buf()));
 
-    let chat = env
-        .env
-        .chat_looper_config(&ws_id, "peco", work_dir.clone(), provider);
+    let chat = env.env.chat_looper_config(
+        &ws_id,
+        "peco",
+        work_dir.clone(),
+        provider.clone(),
+        Arc::clone(&km),
+    );
     assert!(chat.compaction.is_some(), "聊天 run 必须挂压缩");
     assert!(
         chat.epilogue.is_some(),
@@ -63,11 +72,25 @@ async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
         "Peco 空间的动态清单在聊天配置里同样要生效"
     );
 
-    let machine = env.env.looper_config(&ws_id, "peco", work_dir);
+    let machine = env.env.looper_config(&ws_id, "peco", work_dir.clone());
     assert!(
         machine.compaction.is_none(),
         "machine 任务没有跨轮累积的历史，不该挂压缩"
     );
     assert!(machine.epilogue.is_none());
     assert!(!machine.hooks.is_empty(), "machine 路径仍要观察派发");
+    assert_eq!(
+        chat.hooks.len(),
+        machine.hooks.len() + 1,
+        "聊天路径比 machine 多且只多一个记忆提取 hook"
+    );
+
+    // 非 Peco 空间：没有空间清单，但记忆召回照挂（§7.7「其它空间只有召回」）。
+    let plain = env
+        .env
+        .chat_looper_config("ws_plain", "peco", work_dir, provider, km);
+    assert!(
+        plain.dynamic_context.is_some(),
+        "记忆召回对每个空间的 @master 都生效"
+    );
 }

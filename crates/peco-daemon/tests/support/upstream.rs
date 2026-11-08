@@ -99,6 +99,17 @@ impl FakeUpstream {
         self.shared.exchanges().clone()
     }
 
+    /// 只取走 `model` 这一档的往返。
+    ///
+    /// 同一端点除了对话轮还会收到元任务请求（记忆提取跑在后台，用的是另一档
+    /// 模型），数「这一轮问了几次模型」时不能把元任务算进来。
+    pub fn exchanges_with_model(&self, model: &str) -> Vec<Exchange> {
+        self.exchanges()
+            .into_iter()
+            .filter(|exchange| exchange.request["model"] == json!(model))
+            .collect()
+    }
+
     /// 本端点收到的工具名（请求体里 `tools[].function.name`），用于断言
     /// 「模型真的看到了这个工具」。
     pub fn offered_tools(&self) -> Vec<String> {

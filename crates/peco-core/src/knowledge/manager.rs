@@ -411,6 +411,36 @@ impl KnowledgeManager {
         Ok(doc)
     }
 
+    /// 直接添加文本内容到知识库，并把调用方给的文档元数据一并落库。
+    ///
+    /// 与 [`Self::add_text_to_kb`] 只差元数据；`metadata.extra` 里的标签随文档
+    /// 持久化、[`Self::get_document`] 可原样读回 —— 给记忆文档打空间归属标签的
+    /// 路径依赖这一点。
+    pub async fn add_text_to_kb_with_metadata(
+        &self,
+        kb_name: &str,
+        title: &str,
+        content: &str,
+        source: &str,
+        metadata: knowledge_base::DocumentMetadata,
+    ) -> Result<knowledge_base::Document, KnowledgeModuleError> {
+        self.ensure_loaded().await?;
+
+        let guard = self.underlying.lock().await;
+        let mgr = guard.as_ref().ok_or(KnowledgeModuleError::NotInitialized)?;
+
+        let kb = mgr
+            .open_kb(kb_name)
+            .await
+            .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
+
+        let doc = kb
+            .add_text_with_metadata(title, content, source, metadata)
+            .await?;
+        info!(kb = %kb_name, title = %title, doc_id = %doc.id, "Text added to knowledge base (with metadata)");
+        Ok(doc)
+    }
+
     /// 按指定存储模式添加文本到知识库。
     pub async fn add_text_to_kb_with_mode(
         &self,
@@ -1072,6 +1102,42 @@ mod tests {
             default_storage_mode: Default::default(),
             helix_url: None,
         }
+    }
+
+    /// `add_text_to_kb_with_metadata` 必须让 `extra` 活到 `get_document`：
+    /// 上层（记忆写路径）靠这个标签判定文档属于哪个空间，读不回就等于没写。
+    #[tokio::test]
+    async fn add_text_to_kb_with_metadata_roundtrips_ws_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config("@private_memory"))
+            .await
+            .unwrap();
+
+        let mut metadata = knowledge_base::DocumentMetadata::default();
+        metadata.extra.insert("ws_id".into(), "ws_a".into());
+        let written = km
+            .add_text_to_kb_with_metadata(
+                "@private_memory",
+                "memory_1",
+                "用户偏好简洁的回答",
+                "ppa_profile",
+                metadata,
+            )
+            .await
+            .unwrap();
+
+        let read = km
+            .get_document("@private_memory", &written.id)
+            .await
+            .unwrap()
+            .expect("刚写入的文档必须能读回");
+        assert_eq!(
+            read.metadata.extra.get("ws_id").map(String::as_str),
+            Some("ws_a")
+        );
+        assert_eq!(read.source_path, "ppa_profile");
     }
 
     #[tokio::test]

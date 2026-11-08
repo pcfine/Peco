@@ -8,11 +8,13 @@
 //! 运行属性以 DB 为准；唯一不可自动修的是「同 work_dir 的 ws_id 不同」——
 //! `d_dispatches.target_ws_id` 已经引用了 DB 的值，就地改名会切断审计与唤醒。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use peco_core::agent::{Agent, AgentError};
+use peco_core::knowledge::KnowledgeManager;
 use peco_core::machine::MachineRuntime;
 use peco_core::tools::{
     OpenRequest, WorkspaceHandle, WorkspaceHub, WorkspaceOpenError, WorkspaceOpener,
@@ -24,6 +26,8 @@ use crate::db::teams::{self, NewTeam};
 use crate::db::workspaces::{self, EXIT_POLICY_INHERIT, NewWorkspace, WorkspaceRow};
 use crate::error::DaemonError;
 use crate::file_watcher::FileWatcher;
+use crate::memory::cleanup;
+use crate::memory::config::MemoryConfig;
 use crate::space::SpaceEnv;
 use crate::space::index;
 use crate::space::manifest;
@@ -135,6 +139,11 @@ impl DaemonOpener {
         };
         ws.inject_deps();
         ws.set_memory_audit(Arc::new(SqliteMemoryAudit::new(env.pool.clone())));
+
+        // 旧记忆清理挂在打开链路上：空间一打开记忆库就可用，且这是每次启动都会
+        // 经过的地方。它是迁移动作，不该进请求路径 —— 全量扫描一次的开销放在
+        // 打开空间时付一次，而不是每轮对话都付。
+        spawn_legacy_memory_purge(Arc::clone(ws.knowledge_manager()), &team);
 
         // machine 执行体的观察 hook 必须在任何 machine 注册之前注入：注册时取快照，
         // 晚一步就等于「被派发的 @master 自己再派发出去的任务永远没人观察」。
@@ -269,6 +278,52 @@ impl WorkspaceHandle for DaemonHandle {
     fn machine_runtime(&self) -> Weak<MachineRuntime> {
         self.ws.machine_runtime()
     }
+}
+
+/// 进程内「该团队的旧记忆已清过」的标记。
+///
+/// 只清进程里第一个打开的团队会漏掉其余团队 —— 每个团队有自己的
+/// `@private_memory`，标签缺失的旧记忆分散在各团队的库里。按团队各记一笔，
+/// 「每个库最多全量扫描一次」与「每个库都清到」同时成立。
+static PURGED_TEAMS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// 该团队是否是本次进程里第一次被清理；`true` 表示调用方该真跑一次。
+fn first_purge_for(team: &str) -> bool {
+    let purged = PURGED_TEAMS.get_or_init(Default::default);
+    let mut set = match purged.lock() {
+        Ok(set) => set,
+        // 锁只保护一个集合：别的线程 panic 过不该让清理永远不跑。
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(team.to_string())
+}
+
+/// 删掉该团队记忆库里没有空间标签的旧记忆，只记日志。
+///
+/// 失败不冒泡：清理是升级动作，一个坏掉的知识库不该拦住空间打开。
+fn spawn_legacy_memory_purge(km: Arc<KnowledgeManager>, team: &str) {
+    if !first_purge_for(team) {
+        return;
+    }
+    let config = MemoryConfig::from_env();
+    let kb_name = config.kb_name.clone();
+    let team = team.to_string();
+    tokio::spawn(async move {
+        match cleanup::purge_legacy(&km, &config).await {
+            Ok(deleted) => tracing::info!(
+                team = %team,
+                kb = %kb_name,
+                deleted,
+                "legacy memories purged"
+            ),
+            Err(e) => tracing::warn!(
+                team = %team,
+                kb = %kb_name,
+                error = %e,
+                "legacy memory purge failed"
+            ),
+        }
+    });
 }
 
 /// 启动团队根的文件监听。
@@ -468,4 +523,19 @@ pub fn normalize_work_dir(path: &Path) -> Result<PathBuf, DaemonError> {
         });
     }
     Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+#[cfg(test)]
+mod purge_guard_tests {
+    use super::first_purge_for;
+
+    /// 每个团队在进程内最多清理一次：重开空间不该再全量扫描一遍记忆库，
+    /// 但不同团队必须各自清到（各有一份 `@private_memory`）。
+    #[test]
+    fn each_team_purges_at_most_once_per_process() {
+        assert!(first_purge_for("purge-guard-team-a"));
+        assert!(!first_purge_for("purge-guard-team-a"));
+        assert!(first_purge_for("purge-guard-team-b"));
+        assert!(!first_purge_for("purge-guard-team-b"));
+    }
 }

@@ -18,8 +18,11 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use model_provider::ModelProvider;
 use peco_core::agent::hooks::{DispatchOrigin, DispatchWatchHook, TaskObservationSink};
-use peco_core::agent::{CompactionPolicy, LooperConfig, ModelSummarizer, TurnSummarizer};
+use peco_core::agent::{
+    CompactionPolicy, DynamicContext, LooperConfig, ModelSummarizer, TurnSummarizer,
+};
 use peco_core::config::SystemConfig;
+use peco_core::knowledge::KnowledgeManager;
 use peco_core::tools::WorkspaceHub;
 use sqlx::SqlitePool;
 
@@ -27,6 +30,11 @@ use crate::config::DaemonConfig;
 use crate::db::workspaces::{self, WorkspaceRow};
 use crate::dynamic::SpaceCatalogContext;
 use crate::error::DaemonError;
+use crate::memory::analyzer::ModelTurnAnalyzer;
+use crate::memory::compose::ComposedDynamicContext;
+use crate::memory::config::MemoryConfig;
+use crate::memory::hook::MemoryExtractionHook;
+use crate::memory::recall::MemoryRecallContext;
 use crate::space::peco::PecoIdentity;
 use crate::space::tasks::TaskObserver;
 
@@ -137,24 +145,29 @@ impl SpaceEnv {
         config
     }
 
-    /// 为一次聊天 run 组装配置：在 [`Self::looper_config`] 之上挂压缩与轮末收尾。
+    /// 为一次聊天 run 组装配置：在 [`Self::looper_config`] 之上挂压缩、轮末
+    /// 收尾报告与记忆读写。
     ///
-    /// 这两件只给聊天 run：聊天会话跨轮累积，不折叠就会一路顶到上下文窗口；
-    /// machine 任务每条都是新建的临时会话、跑完即弃，历史不跨轮增长，没有可压
-    /// 的对象，挂上只是白付一次扫描成本。
+    /// 这些只给聊天 run：聊天会话跨轮累积，不折叠就会一路顶到上下文窗口；记忆
+    /// 抽取与召回也只对「同一个空间里持续对话的 @master」有意义。machine 任务
+    /// 每条都是新建的临时会话、跑完即弃，历史不跨轮增长，挂上只是白付成本。
+    ///
+    /// `km` 必须是本轮空间自己的知识管理器：记忆库按团队隔离（`kb_scope`），
+    /// 用别的团队的实例会把记忆写进别人的库。
     pub fn chat_looper_config(
         &self,
         ws_id: &str,
         team_id: &str,
         work_dir: PathBuf,
         provider: Arc<dyn ModelProvider>,
+        km: Arc<KnowledgeManager>,
     ) -> LooperConfig {
         let mut config = self.looper_config(ws_id, team_id, work_dir);
         let limits = compaction::limits();
         // 摘要器与收尾报告器共用同一个实例：两者都是「读一遍既有内容、产出短文本」
         // 的元任务，复用同一个 provider 与模型即可，另建一份只会多一份配置漂移。
         let summarizer: Arc<dyn TurnSummarizer> = Arc::new(ModelSummarizer::new(
-            provider,
+            Arc::clone(&provider),
             limits.summarizer_model.clone(),
         ));
         config.epilogue = Some(Arc::clone(&summarizer));
@@ -163,7 +176,38 @@ impl SpaceEnv {
             limits.keep_recent_tokens,
             summarizer,
         )));
+
+        let memory = MemoryConfig::from_env();
+        // push 而不是替换：`from_env()` 的 hook 链与本轮的派发观察 hook 都要保留，
+        // 记忆提取只是又一位观察者。
+        config.hooks.push(Arc::new(MemoryExtractionHook::new(
+            Arc::clone(&km),
+            Arc::new(ModelTurnAnalyzer::new(provider, memory.model.clone())),
+            memory.clone(),
+            ws_id,
+        )));
+        config.dynamic_context =
+            Some(self.memory_context(ws_id, km, memory, config.dynamic_context.take()));
         config
+    }
+
+    /// 记忆召回与「既有动态上下文」的组合。
+    ///
+    /// Peco 空间已有空间清单，两段都得进同一次注入（core 只认一个
+    /// `dynamic_context`）；其它空间只有记忆召回，多包一层组合结构没有意义。
+    fn memory_context(
+        &self,
+        ws_id: &str,
+        km: Arc<KnowledgeManager>,
+        memory: MemoryConfig,
+        existing: Option<Arc<dyn DynamicContext>>,
+    ) -> Arc<dyn DynamicContext> {
+        let recall: Arc<dyn DynamicContext> =
+            Arc::new(MemoryRecallContext::new(km, memory, ws_id.to_string()));
+        match existing {
+            Some(existing) => Arc::new(ComposedDynamicContext::new(vec![existing, recall])),
+            None => recall,
+        }
     }
 
     /// 注入进程内唯一的实例表。装配顺序被破坏（重复注入）只 warn：

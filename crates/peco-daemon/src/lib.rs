@@ -17,6 +17,7 @@ pub mod file_watcher;
 pub mod http;
 pub mod knowledge;
 pub mod mcp_config;
+pub mod memory;
 pub mod provider;
 pub mod session_dto;
 pub mod session_store;
