@@ -68,7 +68,7 @@ function AgentMark({ agent }: { agent: AgentListItem }) {
     <span
       aria-hidden
       className={cn(
-        "flex size-14 shrink-0 items-center justify-center rounded-[8px] text-xl",
+        "flex size-14 shrink-0 items-center justify-center rounded-[6px] text-xl",
         !agent.background_color && "bg-line/40",
       )}
       style={

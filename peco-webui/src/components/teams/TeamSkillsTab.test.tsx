@@ -86,8 +86,11 @@ function listItem(detail: AgentDetail, isMaster: boolean): AgentListItem {
   };
 }
 
-/** 预览还在路上时「编辑」是禁用的，点它等于没点。 */
-async function openEditor() {
+/** 卡是入口：点卡进编辑器，再点「编辑」才拿到 SKILL.md 的草稿框。 */
+async function openEditor(name = "review") {
+  fireEvent.click(
+    await screen.findByRole("button", { name: new RegExp(`^${name}`) }),
+  );
   const button = await screen.findByRole("button", { name: "编辑" });
   await waitFor(() => expect(button).toBeEnabled());
   fireEvent.click(button);
@@ -263,13 +266,12 @@ describe("团队 skills tab 装配", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
-  it("删除当前选中的技能后，选中态回落到剩下的第一项", async () => {
+  it("删掉的技能从卡片里消失，剩下的那个点进去读的是它自己的正文", async () => {
     renderTab();
 
-    fireEvent.click(await screen.findByRole("button", { name: /^translate/ }));
-    expect(await screen.findByText("translate 的正文")).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "删除 translate" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "删除 translate" }),
+    );
     const confirm = await screen.findByRole("button", { name: "确认删除" });
     await waitFor(() => expect(confirm).toBeEnabled());
     fireEvent.click(confirm);
@@ -277,6 +279,11 @@ describe("团队 skills tab 装配", () => {
     await waitFor(() =>
       expect(del).toHaveBeenCalledWith("/skills/translate", SCOPE),
     );
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /^translate/ })).toBeNull(),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /^review/ }));
     expect(await screen.findByText("review 的正文")).toBeInTheDocument();
     expect(screen.queryByText("translate 的正文")).toBeNull();
   });
@@ -304,5 +311,70 @@ describe("团队 skills tab 装配", () => {
 
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(del).not.toHaveBeenCalled();
+  });
+
+  it("列表默认是卡片栅格，没点卡之前没有源码框", async () => {
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^review/ });
+    expect(screen.getByText("Skill")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(within(card).getByText("代码审查")).toBeInTheDocument();
+    expect(screen.queryByLabelText("SKILL.md")).toBeNull();
+    expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
+  });
+
+  it("没有描述的技能在卡上写「无描述」", async () => {
+    rows = [{ name: "review", description: "" }];
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^review/ });
+    expect(within(card).getByText("无描述")).toBeInTheDocument();
+  });
+
+  it("点卡片进编辑器，点「返回列表」回到卡片栅格", async () => {
+    renderTab();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^translate/ }));
+    expect(
+      screen.getByRole("button", { name: "返回列表" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("translate 的正文")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
+
+    expect(
+      await screen.findByRole("button", { name: /^translate/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("translate 的正文")).toBeNull();
+    expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
+  });
+
+  it("编辑时预览跟着草稿走：首屏给磁盘内容，改动后按防抖更新", async () => {
+    renderTab();
+    await openEditor();
+
+    // 首屏不闪空：进编辑态的第一帧就是磁盘上的正文。
+    expect(screen.getByText("review 的正文")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("SKILL.md"), {
+      target: { value: "---\nname: review\n---\n\n改过的正文\n" },
+    });
+
+    expect(await screen.findByText("改过的正文")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("review 的正文")).toBeNull());
+    // 预览是草稿的投影，没发请求。
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("卡内删除不会顺带打开编辑器", async () => {
+    renderTab();
+    await screen.findByRole("button", { name: /^review/ });
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 review" }));
+
+    expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
+    expect(screen.queryByLabelText("SKILL.md")).toBeNull();
   });
 });

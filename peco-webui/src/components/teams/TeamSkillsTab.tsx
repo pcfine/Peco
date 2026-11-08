@@ -1,10 +1,11 @@
-// skills tab：清单 + SKILL.md 预览，新建 / 编辑 / 删除都在这里 ——
-// 技能目录归团队的能力根，装配页就是它的入口。
+// skills tab：卡片列表 → 同一个位置的「源码 + 预览」编辑器，与 agents 面板同一个形状。
+// 新建 / 编辑 / 删除都在这里 —— 技能目录归团队的能力根，装配页就是它的入口。
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Trash2 } from "lucide-react";
+import { ArrowLeft, Puzzle, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { CardGrid, EntityCard } from "@/components/common/CardGrid";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
@@ -23,9 +24,60 @@ import { Textarea } from "@/components/ui/textarea";
 import { getAgent } from "@/api/agents";
 import { deleteSkill, saveSkill } from "@/api/skills";
 import { errorText } from "@/lib/api";
-import { cn } from "@/lib/utils";
 import { useSkillMd, useTeamAgents, useTeamSkills } from "@/queries/teamDetail";
-import type { AgentDetail } from "@/types/daemon";
+import type { AgentDetail, SkillInfo } from "@/types/daemon";
+
+/** 每敲一个字就重渲染整篇 markdown，长 SKILL.md 会拖住输入：预览跟着手停下来再更新。 */
+const PREVIEW_DEBOUNCE_MS = 200;
+
+interface SkillCardProps {
+  skill: SkillInfo;
+  onOpen: () => void;
+  onDelete: () => void;
+}
+
+function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
+  return (
+    <EntityCard
+      onClick={onOpen}
+      actions={
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="text-ink-faint hover:text-danger"
+          aria-label={`删除 ${skill.name}`}
+          onClick={(event) => {
+            // 卡本体是「打开」，删除是压在它上面的一层：删完不该顺带进编辑器。
+            event.stopPropagation();
+            onDelete();
+          }}
+        >
+          <Trash2 />
+        </Button>
+      }
+    >
+      <div className="flex min-w-0 items-start gap-2">
+        <span
+          aria-hidden
+          className="flex size-10 shrink-0 items-center justify-center rounded-[6px] bg-line/40"
+        >
+          <Puzzle className="size-4 text-ink-muted" />
+        </span>
+        <div className="min-w-0 flex-1 space-y-1">
+          {/* 右上角留给删除按钮，名字行不铺到那里。 */}
+          <div className="flex min-w-0 items-center pr-6">
+            <span className="truncate font-mono text-sm text-ink">
+              {skill.name}
+            </span>
+          </div>
+          <p className="line-clamp-2 text-caption text-ink-muted">
+            {skill.description || "无描述"}
+          </p>
+        </div>
+      </div>
+    </EntityCard>
+  );
+}
 
 export function TeamSkillsTab({ wsId }: { wsId: string }) {
   const queryClient = useQueryClient();
@@ -35,12 +87,13 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  /** 预览用的正文：编辑时落后草稿一个防抖周期，不进编辑态时干脆不用它。 */
+  const [preview, setPreview] = useState("");
   /** 正在二次确认删除的技能名。 */
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
   const rows = skills.data ?? [];
-  const active = selected ?? rows[0]?.name ?? null;
-  const body = useSkillMd(wsId, active);
+  const body = useSkillMd(wsId, selected);
 
   const save = useMutation({
     mutationFn: (next: { name: string; content: string }) =>
@@ -89,14 +142,16 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
       void queryClient.invalidateQueries({ queryKey: ["skills", wsId] });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       setPendingDelete(null);
-      if (active === name) {
-        // 删掉的正是当前预览的那个：回落到剩下第一项，没有就回空态。
-        setEditing(false);
-        setSelected(null);
-      }
+      setSelected((current) => (current === name ? null : current));
       toast.success(`已删除 skill「${name}」`);
     },
   });
+
+  useEffect(() => {
+    if (!editing) return;
+    const timer = setTimeout(() => setPreview(draft), PREVIEW_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [draft, editing]);
 
   const askDelete = (name: string) => {
     setPendingDelete(name);
@@ -117,8 +172,17 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
     save.reset();
   };
 
+  const backToList = () => {
+    save.reset();
+    setEditing(false);
+    setSelected(null);
+  };
+
   const startEditing = () => {
-    setDraft(body.data?.content ?? "");
+    const content = body.data?.content ?? "";
+    setDraft(content);
+    // 首屏直接给磁盘内容：等一次防抖再出字会闪一下空白。
+    setPreview(content);
     save.reset();
     setEditing(true);
   };
@@ -214,6 +278,90 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
     </>
   );
 
+  if (selected !== null) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line px-2">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="返回列表"
+            onClick={backToList}
+          >
+            <ArrowLeft />
+          </Button>
+          <span className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
+            {selected}
+          </span>
+          {editing ? (
+            <>
+              <Button
+                size="xs"
+                disabled={
+                  save.isPending || draft === (body.data?.content ?? null)
+                }
+                onClick={() => save.mutate({ name: selected, content: draft })}
+              >
+                保存
+              </Button>
+              <Button
+                variant="ghost"
+                size="xs"
+                disabled={save.isPending}
+                onClick={() => {
+                  save.reset();
+                  setEditing(false);
+                }}
+              >
+                撤销
+              </Button>
+            </>
+          ) : (
+            <Button
+              variant="ghost"
+              size="xs"
+              disabled={!body.data}
+              onClick={startEditing}
+            >
+              编辑
+            </Button>
+          )}
+        </div>
+        {save.error !== null && (
+          <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
+            {errorText(save.error)}
+          </p>
+        )}
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {body.error !== null && (
+            <ErrorBanner message={errorText(body.error)} />
+          )}
+          {body.isPending && <Skeleton className="h-16 w-full" />}
+          {body.data &&
+            (editing ? (
+              // 宽面板左右分栏，窄面板上下堆叠：两种宽度下源码与预览都同时在场。
+              <div className="grid min-w-0 grid-cols-1 gap-3 @min-[860px]/team:grid-cols-2">
+                <Textarea
+                  aria-label="SKILL.md"
+                  value={draft}
+                  onChange={(event) => setDraft(event.target.value)}
+                  disabled={save.isPending}
+                  spellCheck={false}
+                  className="min-h-[420px] font-mono text-mono-sm"
+                />
+                <div className="min-w-0">
+                  <MarkdownRenderer content={preview} />
+                </div>
+              </div>
+            ) : (
+              <MarkdownRenderer content={body.data.content} />
+            ))}
+        </div>
+        {dialog}
+      </div>
+    );
+  }
+
   if (rows.length === 0) {
     return (
       <>
@@ -233,125 +381,25 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
   }
 
   return (
-    <>
-      <div className="flex h-full min-h-0 flex-col @min-[900px]/work:flex-row">
-        <div className="shrink-0 border-line @min-[900px]/work:w-64 @min-[900px]/work:border-r">
-          <div className="flex h-9 items-center border-b border-line px-2">
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-7 px-2 text-xs"
-              onClick={() => setCreating(true)}
-            >
-              ＋ 新建技能
-            </Button>
-          </div>
-          <ul>
-            {rows.map((skill) => (
-              <li key={skill.name} className="border-b border-line">
-                <div
-                  className={cn(
-                    "flex items-center gap-1 pr-1",
-                    skill.name === active ? "bg-line/40" : "hover:bg-line/20",
-                  )}
-                >
-                  <button
-                    type="button"
-                    onClick={() => select(skill.name)}
-                    className="flex h-9 min-w-0 flex-1 flex-col justify-center px-3 text-left"
-                  >
-                    <span className="truncate font-mono text-sm text-ink">
-                      {skill.name}
-                    </span>
-                    <span className="truncate text-caption font-medium text-ink-faint">
-                      {skill.description || "没有描述"}
-                    </span>
-                  </button>
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    className="shrink-0 text-ink-faint hover:text-danger"
-                    aria-label={`删除 ${skill.name}`}
-                    onClick={() => askDelete(skill.name)}
-                  >
-                    <Trash2 />
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-
-        <div className="flex min-h-0 flex-1 flex-col">
-          <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line px-3">
-            <span className="min-w-0 flex-1 truncate font-mono text-2xs text-ink-faint">
-              SKILL.md
-            </span>
-            {editing ? (
-              <>
-                <Button
-                  size="xs"
-                  disabled={
-                    save.isPending || draft === (body.data?.content ?? null)
-                  }
-                  onClick={() => {
-                    if (active !== null) {
-                      save.mutate({ name: active, content: draft });
-                    }
-                  }}
-                >
-                  保存
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="xs"
-                  disabled={save.isPending}
-                  onClick={() => {
-                    save.reset();
-                    setEditing(false);
-                  }}
-                >
-                  撤销
-                </Button>
-              </>
-            ) : (
-              <Button
-                variant="ghost"
-                size="xs"
-                disabled={!body.data}
-                onClick={startEditing}
-              >
-                编辑
-              </Button>
-            )}
-          </div>
-          {save.error !== null && (
-            <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
-              {errorText(save.error)}
-            </p>
-          )}
-          <div className="min-h-0 flex-1 overflow-y-auto p-3">
-            {body.error !== null && (
-              <ErrorBanner message={errorText(body.error)} />
-            )}
-            {body.isPending && <Skeleton className="h-16 w-full" />}
-            {body.data &&
-              (editing ? (
-                <Textarea
-                  aria-label="SKILL.md"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  disabled={save.isPending}
-                  spellCheck={false}
-                  className="min-h-[320px] font-mono text-mono-sm"
-                />
-              ) : (
-                <MarkdownRenderer content={body.data.content} />
-              ))}
-          </div>
-        </div>
+    <div className="p-3">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="text-sm font-medium text-ink">Skill</span>
+        <span className="text-caption text-ink-faint">{rows.length}</span>
+        <Button size="sm" className="ml-auto" onClick={() => setCreating(true)}>
+          ＋ 新建技能
+        </Button>
       </div>
+      <CardGrid>
+        {rows.map((skill) => (
+          <SkillCard
+            key={skill.name}
+            skill={skill}
+            onOpen={() => select(skill.name)}
+            onDelete={() => askDelete(skill.name)}
+          />
+        ))}
+      </CardGrid>
       {dialog}
-    </>
+    </div>
   );
 }

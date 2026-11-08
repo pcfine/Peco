@@ -1,10 +1,12 @@
-// MCP tab：server 名单 + 试连 + 整份配置的 JSON 编辑。
+// MCP tab：卡片列表（状态 / transport / 地址）+ 整份配置的 JSON 编辑。
 // 不做表单化新增：stdio / sse / streamable_http 三种形态的字段差异太大，
 // 与 mcpconfig.json 同构的 JSON 才是最小充分入口。
 
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft } from "lucide-react";
 import { toast } from "sonner";
+import { CardGrid, EntityCard } from "@/components/common/CardGrid";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -32,10 +34,123 @@ function testLine(
   return null;
 }
 
+/** 卡片要从配置里取的那几项，取不到就是 `null` —— 缺字段的配置也得能摆出来。 */
+interface ServerSummary {
+  enabled: boolean;
+  transport: string | null;
+  endpoint: string | null;
+  timeoutSecs: number | null;
+  maxRetries: number | null;
+}
+
+/**
+ * 配置值是磁盘上的原始 JSON，字段可能缺、类型可能不对（文件是手写的）。
+ * 逐项判类型，缺的当没有：一张卡渲染不出来不值得把整个面板打崩。
+ */
+function summarize(value: unknown): ServerSummary {
+  const record =
+    typeof value === "object" && value !== null
+      ? (value as Record<string, unknown>)
+      : {};
+  const transport =
+    typeof record.transport === "string" ? record.transport : null;
+  const command = typeof record.command === "string" ? record.command : null;
+  const url = typeof record.url === "string" ? record.url : null;
+  const remote = transport === "sse" || transport === "streamable_http";
+
+  return {
+    enabled: record.enabled !== false,
+    transport,
+    // 远端 transport 认 url，其余认 command；没有 transport 的配置先看 command。
+    endpoint: remote ? url : (command ?? url),
+    timeoutSecs:
+      typeof record.timeoutSecs === "number" ? record.timeoutSecs : null,
+    maxRetries:
+      typeof record.maxRetries === "number" ? record.maxRetries : null,
+  };
+}
+
+interface ServerCardProps {
+  name: string;
+  config: unknown;
+  /** 试连中的那一张卡换成「试连中…」，其余同批禁用。 */
+  testing: boolean;
+  disabled: boolean;
+  line: { ok: boolean; text: string } | null;
+  onTest: () => void;
+}
+
+function ServerCard({
+  name,
+  config,
+  testing,
+  disabled,
+  line,
+  onTest,
+}: ServerCardProps) {
+  const summary = summarize(config);
+
+  return (
+    <EntityCard
+      actions={
+        // 试连一次要真起进程 / 打网络：并发的第二个没有意义。
+        <Button variant="ghost" size="xs" disabled={disabled} onClick={onTest}>
+          {testing ? "试连中…" : "试连"}
+        </Button>
+      }
+    >
+      {/* 右上角留给试连按钮（「试连中…」是最宽的一档），名字行不铺到那里。 */}
+      <div className="flex min-w-0 items-center gap-1.5 pr-14">
+        <span
+          aria-hidden
+          className={cn(
+            "size-2 shrink-0 rounded-full",
+            summary.enabled ? "bg-success" : "bg-ink-faint",
+          )}
+        />
+        {/* 状态不能只靠颜色：读屏靠这句。 */}
+        <span className="sr-only">{summary.enabled ? "已启用" : "已停用"}</span>
+        <span className="min-w-0 truncate font-mono text-sm text-ink">
+          {name}
+        </span>
+        {summary.transport && (
+          <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-2xs font-mono text-ink-muted">
+            {summary.transport}
+          </span>
+        )}
+      </div>
+      <div className="mt-auto flex min-w-0 items-baseline gap-1 font-mono text-caption text-ink-faint">
+        {summary.endpoint && (
+          <span className="min-w-0 truncate">{summary.endpoint}</span>
+        )}
+        {summary.timeoutSecs !== null && (
+          <span className="shrink-0 tabular-nums">
+            · {summary.timeoutSecs}s
+          </span>
+        )}
+        {summary.maxRetries !== null && (
+          <span className="shrink-0 tabular-nums">
+            · 重试 {summary.maxRetries} 次
+          </span>
+        )}
+      </div>
+      {line && (
+        <p
+          className={cn(
+            "text-caption font-medium",
+            line.ok ? "text-ink-muted" : "text-danger",
+          )}
+        >
+          {line.text}
+        </p>
+      )}
+    </EntityCard>
+  );
+}
+
 export function TeamMcpTab({ wsId }: { wsId: string }) {
   const queryClient = useQueryClient();
   const config = useMcpConfig(wsId);
-  const [expanded, setExpanded] = useState<string | null>(null);
   /** 非 null 即「正在编辑」：内容是整份 mcpconfig.json 的文本。 */
   const [draft, setDraft] = useState<string | null>(null);
   const [syntaxError, setSyntaxError] = useState<string | null>(null);
@@ -85,6 +200,12 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
     save.reset();
   };
 
+  const cancelEditing = () => {
+    setDraft(null);
+    setSyntaxError(null);
+    save.reset();
+  };
+
   // 本地只挡语法：字段对不对由服务端说了算，400 的原文要给用户看到。
   const submit = () => {
     if (draft === null) return;
@@ -99,117 +220,87 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
     save.mutate(parsed);
   };
 
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-9 shrink-0 items-center border-b border-line px-2">
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 px-2 text-xs"
-          disabled={draft !== null}
-          onClick={startEditing}
-        >
-          编辑配置
-        </Button>
-      </div>
-
-      {draft !== null && (
-        <div className="shrink-0 space-y-2 border-b border-line p-3">
+  if (draft !== null) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line px-2">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="返回列表"
+            onClick={cancelEditing}
+          >
+            <ArrowLeft />
+          </Button>
+          <span className="min-w-0 flex-1 truncate font-mono text-2xs text-ink-faint">
+            mcpconfig.json
+          </span>
+          <Button size="xs" disabled={save.isPending} onClick={submit}>
+            保存
+          </Button>
+          <Button
+            variant="ghost"
+            size="xs"
+            disabled={save.isPending}
+            onClick={cancelEditing}
+          >
+            撤销
+          </Button>
+        </div>
+        {syntaxError && (
+          <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
+            {syntaxError}
+          </p>
+        )}
+        {save.error !== null && (
+          <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
+            {errorText(save.error)}
+          </p>
+        )}
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
           <Textarea
             aria-label="mcpconfig.json"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             disabled={save.isPending}
             spellCheck={false}
-            className="min-h-[200px] font-mono text-mono-sm"
+            className="min-h-[420px] font-mono text-mono-sm"
           />
-          <div className="flex items-center gap-2">
-            <Button size="sm" disabled={save.isPending} onClick={submit}>
-              保存
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={save.isPending}
-              onClick={() => {
-                setDraft(null);
-                setSyntaxError(null);
-                save.reset();
-              }}
-            >
-              撤销
-            </Button>
-            {syntaxError && (
-              <span className="text-caption font-medium text-danger">
-                {syntaxError}
-              </span>
-            )}
-            {save.error !== null && (
-              <span className="text-caption font-medium text-danger">
-                {errorText(save.error)}
-              </span>
-            )}
-          </div>
         </div>
-      )}
+      </div>
+    );
+  }
 
+  return (
+    <div className="p-3">
+      <div className="mb-3 flex items-center gap-2">
+        <span className="text-sm font-medium text-ink">MCP</span>
+        <span className="text-caption text-ink-faint">{servers.length}</span>
+        <Button size="sm" className="ml-auto" onClick={startEditing}>
+          编辑配置
+        </Button>
+      </div>
       {servers.length === 0 ? (
-        <p className="max-w-narrow p-3 text-sm text-ink-muted">
+        <p className="max-w-narrow text-sm text-ink-muted">
           这个团队的 mcpconfig.json 里没有配
           server。点「编辑配置」可以直接粘一份 JSON 进来。
         </p>
       ) : (
-        <ul className="min-h-0 flex-1 overflow-y-auto">
-          {servers.map(([name, value]) => {
-            const line =
-              test.variables === name ? testLine(test.data, test.error) : null;
-            const testing = test.isPending && test.variables === name;
-            return (
-              <li key={name} className="border-b border-line">
-                <div className="flex h-9 items-center gap-2 px-3 hover:bg-line/30">
-                  <button
-                    type="button"
-                    aria-expanded={expanded === name}
-                    onClick={() => setExpanded(expanded === name ? null : name)}
-                    className="flex h-full min-w-0 flex-1 items-center gap-2 text-left"
-                  >
-                    <span className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
-                      {name}
-                    </span>
-                    <span className="shrink-0 text-caption font-medium text-ink-faint">
-                      {expanded === name ? "收起" : "看配置"}
-                    </span>
-                  </button>
-                  {/* 试连一次要真起进程 / 打网络：并发的第二个没有意义。 */}
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    className="shrink-0"
-                    disabled={test.isPending}
-                    onClick={() => test.mutate(name)}
-                  >
-                    {testing ? "试连中…" : "试连"}
-                  </Button>
-                </div>
-                {expanded === name && (
-                  <pre className="max-h-64 overflow-auto border-t border-line bg-canvas/40 px-3 py-2 font-mono text-2xs text-ink-muted">
-                    {JSON.stringify(value, null, 2)}
-                  </pre>
-                )}
-                {line && (
-                  <p
-                    className={cn(
-                      "border-t border-line px-3 py-1 text-caption font-medium",
-                      line.ok ? "text-ink-muted" : "text-danger",
-                    )}
-                  >
-                    {line.text}
-                  </p>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+        <CardGrid>
+          {servers.map(([name, value]) => (
+            <ServerCard
+              key={name}
+              name={name}
+              config={value}
+              testing={test.isPending && test.variables === name}
+              disabled={test.isPending}
+              line={
+                test.variables === name ? testLine(test.data, test.error) : null
+              }
+              onTest={() => test.mutate(name)}
+            />
+          ))}
+        </CardGrid>
       )}
     </div>
   );

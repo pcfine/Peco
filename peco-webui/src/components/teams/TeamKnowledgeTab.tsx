@@ -1,11 +1,31 @@
-// 知识库 tab：名字 + 文档数。清单来自 `/api/knowledge`（团队命名空间），
+// 知识库 tab：卡片列表（名字 + 描述 + 规模）。清单来自 `/api/knowledge`（团队命名空间），
 // `document_count` 也用接口给的那份，不在前端数文档列表。
 
+import { CardGrid, EntityCard } from "@/components/common/CardGrid";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useKnowledgeBases } from "@/queries/teamDetail";
 import { errorText } from "@/lib/api";
-import type { TeamDetail } from "@/types/daemon";
+import type { KnowledgeBase, TeamDetail } from "@/types/daemon";
+
+function KnowledgeCard({ kb }: { kb: KnowledgeBase }) {
+  return (
+    <EntityCard>
+      <div className="flex min-w-0 flex-col gap-1">
+        <span className="truncate text-sm font-semibold text-ink">
+          {kb.name}
+        </span>
+        <p className="line-clamp-2 text-caption text-ink-muted">
+          {kb.description || "无描述"}
+        </p>
+        <p className="mt-auto truncate font-mono text-caption tabular-nums text-ink-faint">
+          {kb.document_count} 文档 · {kb.chunk_count} 分块 ·{" "}
+          {kb.embedding_model}
+        </p>
+      </div>
+    </EntityCard>
+  );
+}
 
 export function TeamKnowledgeTab({
   wsId,
@@ -51,23 +71,12 @@ export function TeamKnowledgeTab({
   }
 
   return (
-    <ul>
-      {rows.map((kb) => (
-        <li
-          key={kb.id}
-          className="flex h-9 items-center gap-2 border-b border-line px-3"
-        >
-          <span className="min-w-0 flex-1 truncate text-sm text-ink">
-            {kb.name}
-          </span>
-          <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint">
-            文档 {kb.document_count}
-          </span>
-          <span className="w-28 shrink-0 truncate text-right font-mono text-2xs text-ink-faint">
-            {kb.embedding_model}
-          </span>
-        </li>
-      ))}
-    </ul>
+    <div className="p-3">
+      <CardGrid>
+        {rows.map((kb) => (
+          <KnowledgeCard key={kb.id} kb={kb} />
+        ))}
+      </CardGrid>
+    </div>
   );
 }

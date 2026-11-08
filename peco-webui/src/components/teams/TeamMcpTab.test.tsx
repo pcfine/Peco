@@ -211,10 +211,9 @@ describe("团队 MCP tab 装配", () => {
     await waitFor(() =>
       expect(screen.queryByLabelText("mcpconfig.json")).toBeNull(),
     );
-    expect(
-      await screen.findByRole("button", { name: /added/ }),
-    ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /docs/ })).toBeNull();
+    // 卡不可点，所以看的是卡上的名字：新增的摆出来了，漏掉的没留下。
+    expect(await screen.findByText("added")).toBeInTheDocument();
+    expect(screen.queryByText("docs")).toBeNull();
   });
 
   it("后端 400 的原文摆在编辑器里，面板不关", async () => {
@@ -246,6 +245,56 @@ describe("团队 MCP tab 装配", () => {
 
     expect(screen.queryByLabelText("mcpconfig.json")).toBeNull();
     expect(put).not.toHaveBeenCalled();
+  });
+
+  it("卡片摆出状态 / transport / 地址 / 超时与重试，整张卡不是按钮", async () => {
+    servers = {
+      filesystem: {
+        transport: "stdio",
+        command: "npx",
+        timeoutSecs: 30,
+        maxRetries: 2,
+      },
+      docs: { transport: "sse", url: "https://example.com/sse" },
+      archive: {
+        transport: "sse",
+        url: "https://example.com/sse",
+        enabled: false,
+      },
+    };
+    renderTab();
+
+    expect(await screen.findByText("filesystem")).toBeInTheDocument();
+    expect(screen.getByText("stdio")).toBeInTheDocument();
+    expect(screen.getByText("npx")).toBeInTheDocument();
+    expect(screen.getByText("· 30s")).toBeInTheDocument();
+    expect(screen.getByText("· 重试 2 次")).toBeInTheDocument();
+
+    // sse 认 url，不摆 command。
+    expect(screen.getAllByText("https://example.com/sse")).toHaveLength(2);
+
+    // 状态不只靠那个点：读屏能读到「已启用 / 已停用」。
+    expect(screen.getAllByText("已启用")).toHaveLength(2);
+    expect(screen.getByText("已停用")).toBeInTheDocument();
+
+    // 卡不进编辑器：没有「返回列表」，也没有把整张卡做成按钮。
+    expect(screen.queryByRole("button", { name: /返回列表/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /filesystem/ })).toBeNull();
+  });
+
+  it("配置缺字段或不是对象时卡片照常渲染", async () => {
+    servers = {
+      bare: {},
+      half: { url: "http://x/y" },
+      broken: 42,
+    };
+    renderTab();
+
+    expect(await screen.findByText("bare")).toBeInTheDocument();
+    // 没有 transport 时按 url 兜底，不把 undefined 摆到卡上。
+    expect(screen.getByText("http://x/y")).toBeInTheDocument();
+    expect(screen.getByText("broken")).toBeInTheDocument();
+    expect(screen.queryByText("undefined")).toBeNull();
   });
 
   it("空配置引导提到可以直接粘 JSON", async () => {
