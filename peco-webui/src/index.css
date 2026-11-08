@@ -25,6 +25,8 @@
 :root {
   --canvas: #fafafb;
   --panel: #ffffff;
+  --rail: #eef0f4;
+  --side: #ffffff;
   --raised: #ffffff;
   --line: #dddee1;
   --line-strong: #c3c4c9;
@@ -44,6 +46,8 @@
 .dark {
   --canvas: #090a0f;
   --panel: #12131a;
+  --rail: #101118;
+  --side: #15161d;
   --raised: #1a1b23;
   --line: #292b32;
   --line-strong: #3b3c46;
@@ -72,6 +76,8 @@ html:not(.dark) {
 @theme inline {
   --color-canvas: var(--canvas);
   --color-panel: var(--panel);
+  --color-rail: var(--rail);
+  --color-side: var(--side);
   --color-raised: var(--raised);
   --color-line: var(--line);
   --color-line-strong: var(--line-strong);

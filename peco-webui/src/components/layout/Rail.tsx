@@ -105,7 +105,7 @@ export function Rail({
     // 宽度只能由 `collapsed` 决定：让它跟着内容走，空间一多主区就被挤窄。
     <aside
       className={cn(
-        "flex h-full shrink-0 flex-col border-r border-line bg-canvas",
+        "flex h-full shrink-0 flex-col border-r border-line bg-rail",
         collapsed ? "w-16" : "w-64",
       )}
     >
@@ -119,7 +119,7 @@ export function Rail({
       >
         <BrandMark size={20} />
         {!collapsed && (
-          <span className="text-sm font-semibold text-ink">Peco</span>
+          <span className="text-heading font-semibold text-ink">Peco</span>
         )}
         {collapsible && (
           <button
@@ -150,23 +150,17 @@ export function Rail({
             title="Peco"
             data-space-row=""
             className={cn(
-              "relative flex w-full items-center transition-colors duration-[120ms]",
-              collapsed ? "h-8 justify-center" : "h-8 gap-2 pl-3 pr-2",
+              "mx-2 flex items-center rounded-full border font-semibold transition-colors duration-[120ms]",
+              collapsed ? "h-9 justify-center" : "h-9 gap-2 px-3",
               activeWsId === peco.ws_id
-                ? "bg-line/60 text-ink"
-                : "text-ink-muted hover:bg-line/40",
+                ? "border-brand/40 bg-brand/10 text-ink"
+                : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
             )}
           >
-            {activeWsId === peco.ws_id && (
-              <span
-                data-testid="rail-active-bar"
-                className="absolute inset-y-1 left-0 w-[3px] rounded-full bg-brand transition-transform duration-[120ms]"
-              />
-            )}
             <BrandMark size={14} />
             {!collapsed && (
               <>
-                <span className="min-w-0 truncate text-sm">Peco</span>
+                <span className="min-w-0 truncate text-reading">Peco</span>
                 <span className="ml-auto shrink-0 font-mono text-2xs text-ink-faint">
                   {peco.team_id}
                 </span>
@@ -178,7 +172,7 @@ export function Rail({
         <div className="mx-2 my-1 h-px bg-line" />
 
         {!collapsed && (
-          <p className="flex h-7 items-center pl-3 pr-2 text-caption font-medium text-ink-faint">
+          <p className="flex h-7 items-center pl-5 pr-2 text-caption font-semibold text-ink-faint">
             已打开
           </p>
         )}
@@ -193,7 +187,7 @@ export function Rail({
           />
         ))}
         {!collapsed && rows.length === 0 && (
-          <p className="pl-3 pr-2 py-1 text-caption font-medium text-ink-faint">
+          <p className="pl-5 pr-2 py-1 text-caption font-medium text-ink-faint">
             还没有打开空间。
           </p>
         )}
@@ -203,7 +197,7 @@ export function Rail({
           aria-label={collapsed ? "打开空间" : undefined}
           className={cn(
             "flex h-8 items-center gap-1.5 text-caption font-medium text-ink-faint hover:text-ink",
-            collapsed ? "justify-center" : "pl-3 pr-2",
+            collapsed ? "justify-center" : "pl-5 pr-2",
           )}
         >
           <Plus className="h-3 w-3 shrink-0" />
@@ -215,7 +209,7 @@ export function Rail({
         {!collapsed && (
           <Link
             to="/spaces"
-            className="flex h-8 items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
+            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
           >
             工作室
           </Link>
@@ -223,7 +217,7 @@ export function Rail({
         {!collapsed && (
           <Link
             to="/teams"
-            className="flex h-8 items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
+            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
           >
             团队
             <span className="ml-auto tabular-nums text-2xs text-ink-faint">
@@ -234,7 +228,7 @@ export function Rail({
         {!collapsed && (
           <Link
             to="/results"
-            className="flex h-8 w-full items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
+            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
           >
             成果
             <span className="ml-auto tabular-nums text-caption font-medium text-ink-faint">
@@ -245,7 +239,7 @@ export function Rail({
         {!collapsed && (
           <Link
             to="/schedules"
-            className="flex h-8 w-full items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
+            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
           >
             定时任务
             <span className="ml-auto text-caption font-medium text-ink-faint">

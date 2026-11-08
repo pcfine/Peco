@@ -153,7 +153,7 @@ export function SpaceDetailPage() {
               data-testid="space-panel"
               data-mode={panel.mode}
               aria-label="空间右栏"
-              className="flex w-80 shrink-0 flex-col border-l border-line bg-canvas"
+              className="flex w-80 shrink-0 flex-col border-l border-line bg-side"
             >
               <div className="min-h-0 flex-1">{panelBody}</div>
             </aside>

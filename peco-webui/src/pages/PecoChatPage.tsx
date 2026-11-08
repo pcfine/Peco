@@ -249,7 +249,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
                 data-testid="peco-panel"
                 data-mode={panel.mode}
                 aria-label="Peco 右栏"
-                className="flex w-80 shrink-0 flex-col border-l border-line"
+                className="flex w-80 shrink-0 flex-col border-l border-line bg-side"
               >
                 <div className="min-h-0 flex-1">
                   {panel.mode === "files" && unavailable ? (

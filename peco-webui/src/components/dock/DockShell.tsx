@@ -132,8 +132,10 @@ export function DockShell() {
         onClick={() => setTab("chat")}
         aria-pressed={tab === "chat"}
         className={cn(
-          "h-6 rounded-[4px] px-2 text-xs",
-          tab === "chat" ? "bg-line text-ink" : "text-ink-muted hover:text-ink",
+          "h-7 rounded-full border px-2.5 text-xs",
+          tab === "chat"
+            ? "border-brand/40 bg-brand/10 text-ink"
+            : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
         )}
       >
         对话
@@ -143,10 +145,10 @@ export function DockShell() {
         onClick={() => setTab("artifacts")}
         aria-pressed={tab === "artifacts"}
         className={cn(
-          "h-6 rounded-[4px] px-2 text-xs",
+          "h-7 rounded-full border px-2.5 text-xs",
           tab === "artifacts"
-            ? "bg-line text-ink"
-            : "text-ink-muted hover:text-ink",
+            ? "border-brand/40 bg-brand/10 text-ink"
+            : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
         )}
       >
         产物

@@ -148,7 +148,7 @@ describe("左栏打开集", () => {
       activeWsId: "ws_a",
       seeded: true,
     });
-    renderRail(false, "/spaces/ws_a");
+    const { container } = renderRail(false, "/spaces/ws_a");
 
     fireEvent.click(
       (await screen.findAllByRole("button", { name: "从打开列表移除" }))[0],
@@ -158,15 +158,21 @@ describe("左栏打开集", () => {
     expect(useOpenSpacesStore.getState().activeWsId).toBe("ws_b");
     expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces\/ws_b$/);
     // 激活态必须落在看得见的那一行上，不能只剩页面标题还指着旧空间。
-    expect(
-      screen.getByRole("button", { name: "空间 B（团队 research）" }),
-    ).toHaveAttribute("aria-current", "true");
+    expect(container.querySelectorAll('[aria-current="true"]')).toHaveLength(1);
+    const activeRow = screen.getByRole("button", {
+      name: "空间 B（团队 research）",
+    });
+    expect(activeRow).toHaveAttribute("aria-current", "true");
+    // 选中态的形状是行容器上的椭圆 —— 主点击区自己不带框。
+    const pill = activeRow.parentElement;
+    expect(pill?.className).toContain("rounded-full");
+    expect(pill?.className).toContain("bg-brand/10");
     expect(ensureSpaceConversation).not.toHaveBeenCalled();
     expect(closeSpace).not.toHaveBeenCalled();
   });
 
   it("× 移除最后一个打开的空间时回工作室并清空激活态", async () => {
-    renderRail(false, "/spaces/ws_a");
+    const { container } = renderRail(false, "/spaces/ws_a");
 
     fireEvent.click(
       await screen.findByRole("button", { name: "从打开列表移除" }),
@@ -175,7 +181,7 @@ describe("左栏打开集", () => {
     expect(useOpenSpacesStore.getState().openIds).toEqual([]);
     expect(useOpenSpacesStore.getState().activeWsId).toBeNull();
     expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces$/);
-    expect(screen.queryByTestId("rail-active-bar")).toBeNull();
+    expect(container.querySelectorAll('[aria-current="true"]')).toHaveLength(0);
     expect(closeSpace).not.toHaveBeenCalled();
   });
 

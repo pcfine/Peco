@@ -42,7 +42,7 @@ export function SpacePanelDrawer({
         side="right"
         aria-label="空间右栏"
         showCloseButton={false}
-        className="w-80 gap-0 overscroll-contain border-l border-line bg-canvas p-0"
+        className="w-80 gap-0 overscroll-contain border-l border-line bg-side p-0"
         onCloseAutoFocus={(event) => {
           event.preventDefault();
           returnFocusTo.current?.focus();

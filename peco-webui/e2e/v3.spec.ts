@@ -505,7 +505,7 @@ async function fontFacts(page: Page): Promise<FontFacts> {
 interface BorderFacts {
   /** 可见描边元素数：任一边 width>0、style≠none 且该边 color 不透明。 */
   stroked: number;
-  /** 排除 select 触发器后，仍带可见描边的 button（附文案）。 */
+  /** 排除 select 触发器与选中态后，仍带可见描边的 button（附文案）。 */
   buttonStroked: string[];
   /** 全站四角圆角计算值去重。 */
   radii: string[];
@@ -556,8 +556,15 @@ async function borderFacts(page: Page): Promise<BorderFacts> {
       });
       if (bordered) {
         stroked += 1;
+        // 选中态的椭圆描边是记号不是装饰：`aria-pressed` / `aria-current` /
+        // `data-state=on` 任一成立就放行，非选中态仍按 0 描边判。
+        const selected =
+          element.getAttribute("aria-pressed") === "true" ||
+          element.hasAttribute("aria-current") ||
+          element.getAttribute("data-state") === "on";
         if (
           element.tagName === "BUTTON" &&
+          !selected &&
           !element.matches('[data-slot="select-trigger"]')
         )
           buttonStroked.push(
@@ -1476,10 +1483,12 @@ test("边框与圆角（C1 / C2 / C3 / C5 / C6 / C8）", async ({ browser }) => 
   );
   check(
     "C3",
-    "button 上可见描边数 = 0（排除 select 触发器）",
+    "非选中态 button 上可见描边数 = 0（排除 select 触发器；选中态椭圆描边允许）",
     buttons,
     [],
-    buttons.length > 0 ? buttons.join(" | ") : "六路由 0 处",
+    buttons.length > 0
+      ? buttons.join(" | ")
+      : "六路由非选中态 0 处（选中态椭圆描边允许）",
   );
   const unexpected = [...radii].filter((radius) => !allowedRadius(radius));
   check(

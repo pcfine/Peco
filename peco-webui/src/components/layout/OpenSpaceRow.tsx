@@ -30,18 +30,15 @@ export function OpenSpaceRow({
   const name = spaceLabel(space);
 
   return (
+    // 椭圆落在行容器上：主点击区、「状态」、「×」同属一行，框只画一次。
     <div
       className={cn(
-        "relative flex items-center transition-colors duration-[120ms]",
-        active ? "bg-line/60" : "hover:bg-line/40",
+        "mx-2 flex items-center rounded-full border transition-colors duration-[120ms]",
+        active
+          ? "border-brand/40 bg-brand/10"
+          : "border-transparent hover:bg-line/50",
       )}
     >
-      {active && (
-        <span
-          data-testid="rail-active-bar"
-          className="absolute inset-y-1 left-0 w-[3px] rounded-full bg-brand"
-        />
-      )}
       <button
         type="button"
         onClick={onSelect}
@@ -51,15 +48,15 @@ export function OpenSpaceRow({
         data-ws-id={space.ws_id}
         data-space-row=""
         className={cn(
-          "flex h-8 min-w-0 flex-1 items-center gap-2",
-          collapsed ? "justify-center px-1" : "pl-3",
-          active ? "text-ink" : "text-ink-muted",
+          "flex h-9 min-w-0 flex-1 items-center gap-2 rounded-full font-semibold",
+          collapsed ? "justify-center px-1" : "px-3",
+          active ? "text-ink" : "text-ink-muted hover:text-ink",
         )}
       >
         <SpaceStatusMark group={spaceGroupOf(space)} />
         {!collapsed && (
           <>
-            <span className="min-w-0 truncate text-sm">{name}</span>
+            <span className="min-w-0 truncate text-reading">{name}</span>
             {space.inflight_dispatch > 0 && (
               <span className="ml-auto shrink-0 tabular-nums text-2xs text-ink-faint">
                 {space.inflight_dispatch}

@@ -51,8 +51,10 @@ export function SpacePanelModeBar({
           aria-pressed={expanded && mode === item}
           onClick={() => onSelect(item)}
           className={cn(
-            "h-7 shrink-0 rounded-[4px] px-2 text-caption font-medium text-ink-muted hover:text-ink",
-            expanded && mode === item && "bg-line text-ink",
+            "h-7 shrink-0 rounded-full border px-2 text-caption font-medium",
+            expanded && mode === item
+              ? "border-brand/40 bg-brand/10 text-ink"
+              : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
           )}
         >
           {SPACE_PANEL_LABELS[item]}
