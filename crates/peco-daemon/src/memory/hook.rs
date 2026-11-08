@@ -116,8 +116,7 @@ impl MemoryExtractionHook {
             return;
         }
 
-        // 标题只作人读定位：文档 id 由正文哈希决定，同一轮的多条 fact 靠序号
-        // 区分，跨轮靠时间戳区分。
+        // 标题只作人读定位，不参与 id：文档 id 由「空间作用域 + 正文」哈希决定。
         let base_ts = chrono::Utc::now().timestamp_millis();
         for (index, fact) in facts.iter().enumerate() {
             let source = format!("ppa_{}", fact.category.as_str());
@@ -126,13 +125,17 @@ impl MemoryExtractionHook {
                 .extra
                 .insert(WS_ID_TAG.to_string(), ws_id.to_string());
             let title = format!("memory_{base_ts}_{index}");
+            // id 必须带空间作用域：团队共用一套 KB，只按正文哈希时两个空间说出
+            // 同一句话会折叠成同一条文档，后写者的 ws_id 覆盖先写者，先写的空间
+            // 就此丢记忆。
             match km
-                .add_text_to_kb_with_metadata(
+                .add_text_to_kb_scoped(
                     &config.kb_name,
                     &title,
                     &fact.text,
                     &source,
                     metadata,
+                    Some(ws_id),
                 )
                 .await
             {
@@ -189,7 +192,9 @@ mod tests {
 
     use super::*;
     use crate::memory::analyzer::{MemoryCategory, MemoryFact};
+    use crate::memory::recall::MemoryRecallContext;
     use crate::memory::test_support::memory_kb;
+    use peco_core::agent::DynamicContext;
     use peco_core::session::MessageSource;
 
     /// 假提取器：记录被调用的转录，返回预置事实。
@@ -321,6 +326,51 @@ mod tests {
         assert!(sources.contains(&"ppa_profile"));
         assert!(sources.contains(&"ppa_semantic"));
         assert_eq!(analyzer.calls(), 1, "一轮只提取一次");
+    }
+
+    /// 同一句话在两个空间各写一次：必须是两条文档，两边召回各自命中自己的那条。
+    ///
+    /// 记忆物理上共用一套 KB、摄入是替换语义 —— id 只按正文哈希时后写者会顶掉
+    /// 先写者，先写的空间连带丢掉自己的记忆。
+    #[tokio::test]
+    async fn same_sentence_in_two_spaces_stays_two_memories() {
+        let (km, _dir) = memory_kb().await;
+        let shared = "用户偏好简洁的回答";
+        let analyzer = FakeAnalyzer::returning(vec![fact(shared, MemoryCategory::Profile)]);
+
+        for ws_id in ["ws_a", "ws_b"] {
+            MemoryExtractionHook::write_facts(
+                &km,
+                analyzer.as_ref(),
+                &config(),
+                ws_id,
+                "User: 请记住我的偏好\n".into(),
+            )
+            .await;
+        }
+
+        let written = docs(&km).await;
+        assert_eq!(written.len(), 2, "两个空间各写同一句话必须是两条文档");
+        let id_of = |ws_id: &str| {
+            written
+                .iter()
+                .find(|doc| doc.metadata.extra.get(WS_ID_TAG).map(String::as_str) == Some(ws_id))
+                .unwrap_or_else(|| panic!("{ws_id} 的记忆必须存在"))
+                .id
+                .clone()
+        };
+        assert_ne!(id_of("ws_a"), id_of("ws_b"), "两条记忆的 doc id 必须不同");
+
+        for ws_id in ["ws_a", "ws_b"] {
+            let recalled = MemoryRecallContext::new(Arc::clone(&km), config(), ws_id)
+                .query(shared)
+                .await
+                .unwrap_or_else(|| panic!("{ws_id} 必须召回自己的记忆"));
+            assert!(
+                recalled.contains(shared),
+                "{ws_id} 应召回自己那条: {recalled}"
+            );
+        }
     }
 
     /// 总开关关闭时不提取：这是「卸载记忆」的唯一开关。

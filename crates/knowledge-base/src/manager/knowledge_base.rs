@@ -86,11 +86,33 @@ async fn build_helix_components(
     ))
 }
 
+/// 文本文档的 id 口径：`id_scope` 存在时把它并进哈希输入。
+///
+/// 记忆物理上共用一套 KB，而摄入是替换语义。id 只由正文哈希决定时，「两个空间
+/// 说出同一句话」会折叠成同一条文档 —— 后写者的 `ws_id` 标签覆盖先写者，先写的
+/// 空间凭空丢记忆。把作用域并进哈希输入，同一正文在不同作用域下各自成文；
+/// `None` 保持旧口径，非记忆写入的 id 逐字不变。
+///
+/// 分隔符取 `\u{1f}`（单元分隔符）：正文里不会出现，否则
+/// `scope="a", content="b\u{1f}c"` 与 `scope="a\u{1f}b", content="c"` 会撞号。
+fn text_doc_id_scoped(id_scope: Option<&str>, content: &str) -> String {
+    match id_scope {
+        Some(scope) => crate::types::text_doc_id(&format!("{scope}\u{1f}{content}")),
+        None => crate::types::text_doc_id(content),
+    }
+}
+
 /// 构建文本型 `Document`（`add_text` / `add_text_with_mode` 共用）。
 ///
 /// `created_at` 记录写入时刻（ISO 8601），供 TTL 判定等下游逻辑使用。
-fn build_text_document(kb_name: &str, title: &str, content: &str, source: &str) -> Document {
-    let doc_id = crate::types::text_doc_id(content);
+fn build_text_document(
+    kb_name: &str,
+    title: &str,
+    content: &str,
+    source: &str,
+    id_scope: Option<&str>,
+) -> Document {
+    let doc_id = text_doc_id_scoped(id_scope, content);
 
     Document {
         id: doc_id,
@@ -117,8 +139,9 @@ fn build_text_document_with_metadata(
     content: &str,
     source: &str,
     mut metadata: DocumentMetadata,
+    id_scope: Option<&str>,
 ) -> Document {
-    let mut doc = build_text_document(kb_name, title, content, source);
+    let mut doc = build_text_document(kb_name, title, content, source, id_scope);
     metadata.file_type = metadata.file_type.or_else(|| doc.metadata.file_type.take());
     metadata.created_at = metadata
         .created_at
@@ -329,7 +352,7 @@ impl KnowledgeBase {
         source: &str,
         mode: StorageMode,
     ) -> Result<Document, KnowledgeError> {
-        let doc = build_text_document(&self.config.name, title, content, source);
+        let doc = build_text_document(&self.config.name, title, content, source, None);
 
         self.pipeline.ingest_with_mode(doc.clone(), mode).await?;
         Ok(doc)
@@ -347,8 +370,31 @@ impl KnowledgeBase {
         source: &str,
         metadata: DocumentMetadata,
     ) -> Result<Document, KnowledgeError> {
-        let doc =
-            build_text_document_with_metadata(&self.config.name, title, content, source, metadata);
+        self.add_text_with_metadata_scoped(title, content, source, metadata, None)
+            .await
+    }
+
+    /// 同 [`Self::add_text_with_metadata`]，但文档 id 可由 `id_scope` 区隔。
+    ///
+    /// 落库的正文 / 标题 / source 与不带作用域时一字不差 —— 变的只有 id 口径，
+    /// 展示与检索因此不受影响；调用方拿它给「物理同库、逻辑分空间」的内容
+    /// （如各空间的记忆）定 id，避免同一正文跨作用域互相覆盖。
+    pub async fn add_text_with_metadata_scoped(
+        &self,
+        title: &str,
+        content: &str,
+        source: &str,
+        metadata: DocumentMetadata,
+        id_scope: Option<&str>,
+    ) -> Result<Document, KnowledgeError> {
+        let doc = build_text_document_with_metadata(
+            &self.config.name,
+            title,
+            content,
+            source,
+            metadata,
+            id_scope,
+        );
 
         self.pipeline
             .ingest_with_mode(doc.clone(), self.config.default_storage_mode)
@@ -931,6 +977,138 @@ mod tests {
             Some("ws_a"),
             "标签必须随文档持久化"
         );
+    }
+
+    /// 同一正文在不同作用域下必须是两条文档、各自的标签互不改写。
+    ///
+    /// 记忆物理上共用一套 KB，摄入又是替换语义：id 只按正文哈希时后写者会
+    /// 顶掉先写者，「另一个空间说了同样的话」就等于先写的空间丢记忆。
+    #[tokio::test]
+    async fn scoped_text_ids_keep_same_content_apart_across_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr.create_kb(memory_kb_config("scoped-kb")).await.unwrap();
+
+        let content = "用户偏好简洁的回答";
+        let mut written = Vec::new();
+        for ws_id in ["ws_a", "ws_b"] {
+            let mut metadata = DocumentMetadata::default();
+            metadata.extra.insert("ws_id".into(), ws_id.to_string());
+            written.push(
+                kb.add_text_with_metadata_scoped(
+                    "memory_1",
+                    content,
+                    "ppa_profile",
+                    metadata,
+                    Some(ws_id),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        assert_ne!(
+            written[0].id, written[1].id,
+            "不同作用域必须得到不同 doc id"
+        );
+        for (doc, ws_id) in written.iter().zip(["ws_a", "ws_b"]) {
+            assert_eq!(doc.content, content, "正文一字不改");
+            assert_eq!(doc.title, "memory_1", "标题一字不改");
+            assert_eq!(doc.source_path, "ppa_profile", "source 一字不改");
+            assert_eq!(
+                doc.metadata.extra.get("ws_id").map(String::as_str),
+                Some(ws_id)
+            );
+            let read = kb
+                .get_document(&doc.id)
+                .await
+                .unwrap()
+                .expect("刚写入的文档必须能读回");
+            assert_eq!(
+                read.metadata.extra.get("ws_id").map(String::as_str),
+                Some(ws_id),
+                "先写的那条不得被后写者改写"
+            );
+        }
+        assert_eq!(
+            kb.list_documents_with_content(100).await.unwrap().len(),
+            2,
+            "两个空间的内容必须并存"
+        );
+    }
+
+    /// 同作用域重复写同一正文仍是替换语义（同一条文档），否则记忆会被同一空间
+    /// 的重复提取刷成多份。
+    #[tokio::test]
+    async fn scoped_text_ids_keep_dedup_within_one_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr
+            .create_kb(memory_kb_config("scoped-dup-kb"))
+            .await
+            .unwrap();
+
+        let content = "用户偏好简洁的回答";
+        let mut metadata = DocumentMetadata::default();
+        metadata.extra.insert("ws_id".into(), "ws_a".into());
+        let first = kb
+            .add_text_with_metadata_scoped(
+                "memory_1",
+                content,
+                "ppa_profile",
+                metadata.clone(),
+                Some("ws_a"),
+            )
+            .await
+            .unwrap();
+        let second = kb
+            .add_text_with_metadata_scoped(
+                "memory_1",
+                content,
+                "ppa_profile",
+                metadata,
+                Some("ws_a"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id, "同作用域同正文必须落同一个 id");
+        assert_eq!(
+            kb.list_documents_with_content(100).await.unwrap().len(),
+            1,
+            "重复写入仍然只留一条文档"
+        );
+    }
+
+    /// `id_scope = None` 与旧口径逐字一致：不带作用域的写入（文件、用户资料）
+    /// 的 id 不能因为这次改动而变，否则既有文档会被当成新文档重复摄入。
+    #[tokio::test]
+    async fn scoped_text_ids_fall_back_to_legacy_id_when_unscoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = KnowledgeBaseManager::load(tmp.path()).await.unwrap();
+        let kb = mgr
+            .create_kb(memory_kb_config("unscoped-kb"))
+            .await
+            .unwrap();
+
+        let content = "用户偏好简洁的回答";
+        let legacy = kb
+            .add_text("memory_1", content, "ppa_profile")
+            .await
+            .unwrap();
+        let unscoped = kb
+            .add_text_with_metadata_scoped(
+                "memory_1",
+                content,
+                "ppa_profile",
+                DocumentMetadata::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(legacy.id, crate::types::text_doc_id(content));
+        assert_eq!(unscoped.id, legacy.id, "None 必须回落到旧口径");
     }
 
     /// `resolve_helix_url` 读写进程级环境变量，用例串行执行避免相互干扰。

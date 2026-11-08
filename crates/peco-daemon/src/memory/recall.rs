@@ -160,6 +160,25 @@ mod tests {
             .unwrap();
     }
 
+    /// 写入一条带空间标签、且 id 带作用域的记忆；返回它的 doc id。
+    async fn seed_scoped(km: &KnowledgeManager, ws_id: &str, text: &str, source: &str) -> String {
+        let mut metadata = DocumentMetadata::default();
+        metadata
+            .extra
+            .insert(WS_ID_TAG.to_string(), ws_id.to_string());
+        km.add_text_to_kb_scoped(
+            "@private_memory",
+            "memory",
+            text,
+            source,
+            metadata,
+            Some(ws_id),
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
     /// 写入一条**没有**空间标签的旧记忆。
     async fn seed_legacy(km: &KnowledgeManager, text: &str, source: &str) {
         km.add_text_to_kb("@private_memory", "memory", text, source)
@@ -189,6 +208,25 @@ mod tests {
             .expect("ws_b 有自己的记忆，必须召回");
         assert!(from_b.contains("Python"), "应召回本空间记忆: {from_b}");
         assert!(!from_b.contains("Rust"), "不得召回 ws_a 的记忆: {from_b}");
+    }
+
+    /// 两个空间写了同一句话时，召回必须命中**自己那条** —— 按 doc id 判定：
+    /// 正文完全相同，标签错了在文本上根本看不出来。
+    #[tokio::test]
+    async fn recall_returns_own_document_when_content_is_identical() {
+        let (km, _dir) = memory_kb().await;
+        let shared = "用户偏好简洁的回答";
+        let id_a = seed_scoped(&km, "ws_a", shared, "ppa_profile").await;
+        let id_b = seed_scoped(&km, "ws_b", shared, "ppa_profile").await;
+        assert_ne!(id_a, id_b, "两个空间的记忆必须是两条文档");
+
+        for (ws_id, expected) in [("ws_a", &id_a), ("ws_b", &id_b)] {
+            let hits = MemoryRecallContext::new(Arc::clone(&km), config(), ws_id)
+                .recall(shared)
+                .await;
+            let ids: Vec<&str> = hits.iter().map(|hit| hit.document_id.as_str()).collect();
+            assert_eq!(ids, vec![expected.as_str()], "{ws_id} 只能召回自己那条");
+        }
     }
 
     /// 没有空间标签的旧记忆永远不会被召回：无法证明归属就不能注入。

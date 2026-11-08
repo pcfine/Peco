@@ -424,6 +424,25 @@ impl KnowledgeManager {
         source: &str,
         metadata: knowledge_base::DocumentMetadata,
     ) -> Result<knowledge_base::Document, KnowledgeModuleError> {
+        self.add_text_to_kb_scoped(kb_name, title, content, source, metadata, None)
+            .await
+    }
+
+    /// 同 [`Self::add_text_to_kb_with_metadata`]，但文档 id 由 `id_scope` 区隔。
+    ///
+    /// 物理上同库、逻辑上分空间的内容（如各空间的记忆）必须走这条路径：文档 id
+    /// 只按正文哈希时，两个空间写出同一句话会折叠成一条文档，后写者的元数据
+    /// 覆盖先写者、先写的空间丢内容。落库的正文 / 标题 / source 与元数据一字
+    /// 不改，只有 id 口径变 —— 展示与检索不受影响。
+    pub async fn add_text_to_kb_scoped(
+        &self,
+        kb_name: &str,
+        title: &str,
+        content: &str,
+        source: &str,
+        metadata: knowledge_base::DocumentMetadata,
+        id_scope: Option<&str>,
+    ) -> Result<knowledge_base::Document, KnowledgeModuleError> {
         self.ensure_loaded().await?;
 
         let guard = self.underlying.lock().await;
@@ -435,7 +454,7 @@ impl KnowledgeManager {
             .map_err(|_| KnowledgeModuleError::NotFound(kb_name.to_string()))?;
 
         let doc = kb
-            .add_text_with_metadata(title, content, source, metadata)
+            .add_text_with_metadata_scoped(title, content, source, metadata, id_scope)
             .await?;
         info!(kb = %kb_name, title = %title, doc_id = %doc.id, "Text added to knowledge base (with metadata)");
         Ok(doc)
@@ -1138,6 +1157,81 @@ mod tests {
             Some("ws_a")
         );
         assert_eq!(read.source_path, "ppa_profile");
+    }
+
+    /// 同一正文带不同 `id_scope` 写入必须是两条文档，各自的 `ws_id` 互不改写；
+    /// 而 `id_scope = None` 与 `add_text_to_kb_with_metadata` 完全等价 —— 不带
+    /// 作用域的调用方（文件、用户资料）不该因为记忆隔离而换 id。
+    #[tokio::test]
+    async fn add_text_to_kb_scoped_keeps_same_content_apart_across_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let km = KnowledgeManager::new(tmp.path().to_path_buf());
+        km.ensure_loaded().await.unwrap();
+        km.create_kb(make_test_config("@private_memory"))
+            .await
+            .unwrap();
+
+        let content = "用户偏好简洁的回答";
+        let mut ids = Vec::new();
+        for ws_id in ["ws_a", "ws_b"] {
+            let mut metadata = knowledge_base::DocumentMetadata::default();
+            metadata.extra.insert("ws_id".into(), ws_id.into());
+            let written = km
+                .add_text_to_kb_scoped(
+                    "@private_memory",
+                    "memory_1",
+                    content,
+                    "ppa_profile",
+                    metadata,
+                    Some(ws_id),
+                )
+                .await
+                .unwrap();
+            let read = km
+                .get_document("@private_memory", &written.id)
+                .await
+                .unwrap()
+                .expect("刚写入的文档必须能读回");
+            assert_eq!(
+                read.metadata.extra.get("ws_id").map(String::as_str),
+                Some(ws_id),
+                "{ws_id} 的标签不得被另一个空间改写成别的值"
+            );
+            assert_eq!(read.content, content, "正文一字不改");
+            ids.push(written.id);
+        }
+        assert_ne!(ids[0], ids[1], "不同作用域必须得到不同 doc id");
+        assert_eq!(
+            km.list_memory_documents_with_content("@private_memory", 100)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "两个空间的内容必须并存"
+        );
+
+        let legacy = km
+            .add_text_to_kb_with_metadata(
+                "@private_memory",
+                "memory_1",
+                "另一条无关的偏好",
+                "ppa_profile",
+                knowledge_base::DocumentMetadata::default(),
+            )
+            .await
+            .unwrap();
+        let unscoped = km
+            .add_text_to_kb_scoped(
+                "@private_memory",
+                "memory_1",
+                "另一条无关的偏好",
+                "ppa_profile",
+                knowledge_base::DocumentMetadata::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unscoped.id, legacy.id, "None 必须回落到旧口径");
     }
 
     #[tokio::test]
