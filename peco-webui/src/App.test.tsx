@@ -381,11 +381,21 @@ describe("dock 三形态", () => {
       useUiStore.setState({ railOpen: true });
       useDockStore.setState({ open: true, conversationByWs: {} });
       const wide = renderAt("/");
-      await waitFor(() =>
-        expect(wide.container.querySelector("#peco-dock")).not.toBeNull(),
-      );
+      const column = await waitFor(() => {
+        const node = wide.container.querySelector("#peco-dock");
+        expect(node).not.toBeNull();
+        return node as HTMLElement;
+      });
       expect(wide.container.querySelector("#peco-dock-bottom")).toBeNull();
       expect(wide.container.querySelector("#peco-dock-sheet")).toBeNull();
+      // 身份标识把 dock 与页面右栏区分开：品牌点 + 「Peco」，关法是 ×。
+      const identity = Array.from(column.querySelectorAll("span")).find(
+        (node) => node.textContent === "Peco",
+      );
+      expect(identity).toHaveClass("text-caption");
+      expect(
+        within(column).getByRole("button", { name: "关闭 Peco 对话" }),
+      ).toBeInTheDocument();
       wide.unmount();
 
       // shell = 1280 − 256 = 1024：退出右列，收起成 40px 的底部条。
@@ -418,7 +428,8 @@ describe("dock 三形态", () => {
 
       // 视口 <900：覆盖式 Sheet，语义与 radix 的弹层一致。
       setViewport(820);
-      useDockStore.setState({ open: true, conversationByWs: {} });
+      // 覆盖式 Sheet 有自己的开关：宽屏的 open 不再决定窄屏是否弹层。
+      useDockStore.setState({ open: true, sheetOpen: true, conversationByWs: {} });
       const small = renderAt("/");
       const sheet = await waitFor(() => {
         const node = small.container.querySelector("#peco-dock-sheet");
@@ -432,7 +443,7 @@ describe("dock 三形态", () => {
       expect(small.container.querySelector("#peco-dock-bottom")).toBeNull();
       small.unmount();
     } finally {
-      useDockStore.setState({ open: false });
+      useDockStore.setState({ open: false, sheetOpen: false });
       useUiStore.setState({ railOpen: true });
       restore();
     }
@@ -465,7 +476,7 @@ describe("dock 三形态", () => {
       );
       view.unmount();
     } finally {
-      useDockStore.setState({ open: false });
+      useDockStore.setState({ open: false, sheetOpen: false });
       useUiStore.setState({ railOpen: true });
       restore();
     }

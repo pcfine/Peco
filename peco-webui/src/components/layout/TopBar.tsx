@@ -10,6 +10,9 @@ import { usePecoTodayTasks } from "@/queries/tasks";
 import { TASK_RUNNING_STATES } from "@/lib/taskStates";
 import { usePeco } from "@/queries/peco";
 import { useDockStore } from "@/stores/dockStore";
+import { useUiStore } from "@/stores/uiStore";
+import { useViewportWidth } from "@/hooks/useViewportWidth";
+import { dockElementId } from "@/components/layout/shellMetrics";
 
 const PAGE_TITLES: Record<string, string> = {
   "/spaces": "工作室",
@@ -43,7 +46,15 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
   const { data: peco } = usePeco();
   const { data: tasks } = usePecoTodayTasks(peco?.ws_id ?? null);
   const dockOpen = useDockStore((state) => state.open);
+  const sheetOpen = useDockStore((state) => state.sheetOpen);
+  const setSheetOpen = useDockStore((state) => state.setSheetOpen);
   const toggleDock = useDockStore((state) => state.toggle);
+  const viewport = useViewportWidth();
+  const railOpen = useUiStore((state) => state.railOpen);
+  const dockSheet = railOffscreen;
+  const dockExpanded = dockSheet ? sheetOpen : dockOpen;
+  const onToggleDock = () =>
+    dockSheet ? setSheetOpen(!sheetOpen) : toggleDock();
 
   // 角标 = 在飞数（Peco 发起的 submitted/working）；0 时不渲染，不显示「0」。
   const inflight = (tasks ?? []).filter((task) =>
@@ -70,9 +81,9 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
       <div className="ml-auto flex items-center gap-1">
         <button
           type="button"
-          onClick={toggleDock}
-          aria-expanded={dockOpen}
-          aria-controls="peco-dock"
+          onClick={onToggleDock}
+          aria-expanded={dockExpanded}
+          aria-controls={dockElementId(viewport, railOpen)}
           aria-label="Peco 对话"
           className="relative grid h-7 w-7 place-items-center rounded-[4px] text-ink-muted hover:bg-line hover:text-ink"
         >

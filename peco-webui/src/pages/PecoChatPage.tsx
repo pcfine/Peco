@@ -113,7 +113,19 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
     (spaces.data ?? []).find((item) => item.ws_id === peco.ws_id) ?? null;
   const spaceOpen = space?.status === "open";
 
-  const panel = useSpacePanelState(peco.ws_id, "peco");
+  const panel = useSpacePanelState(peco.ws_id, "peco", {
+    modeFromUrl: searchParams.get("panel"),
+    // 只改 `panel`：`face` 决定的是另一件事，切模式不该把它带掉。replace 不加历史条目。
+    onModeChange: (mode) =>
+      setSearchParams(
+        (previous) => {
+          const next = new URLSearchParams(previous);
+          next.set("panel", mode);
+          return next;
+        },
+        { replace: true },
+      ),
+  });
   const tasks = usePecoTodayTasks(peco.ws_id);
   const inflight = (tasks.data ?? []).filter((task) =>
     TASK_RUNNING_STATES.includes(task.task_state),
@@ -166,11 +178,11 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
             {face === "chat" && (
               <SpacePanelModeBar
                 mode={panel.mode}
-                collapsed={panel.collapsed}
+                expanded={!panel.collapsed}
                 inflight={inflight}
                 modes={SPACE_PANEL_MODES.peco}
                 onSelect={panel.selectMode}
-                onToggleCollapsed={panel.toggleCollapsed}
+                onToggle={panel.toggleCollapsed}
               />
             )}
             <Button

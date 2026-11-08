@@ -2,6 +2,9 @@
 //
 // 只存 `{ mode, collapsed }` 两个字段，不进 query 缓存 —— 它是纯 UI 偏好，
 // 与 daemon 的状态无关，刷新页面也不该丢。
+//
+// 模式同时能由 URL 的 `?panel=` 给出：它是「正在看哪一栏」，值得被分享和深链，
+// 于是压过存档；`collapsed` 是偏好而不是可分享状态，只走存档。
 
 import { useCallback, useState } from "react";
 
@@ -79,28 +82,53 @@ function savePanel(wsId: string, panel: SpacePanelState): void {
   }
 }
 
+export interface SpacePanelOptions {
+  /** work < 824 时右栏改为抽屉：开关是瞬时态，不改也不落存档里的 `collapsed`。 */
+  drawer?: boolean;
+  /** URL 的 `?panel=` 原值：合法时优先于存档，让「正在看哪一栏」可分享、可深链。 */
+  modeFromUrl?: string | null;
+  /** 模式变了才写 URL —— 幂等的点击不该多一次 `replaceState`。 */
+  onModeChange?: (mode: SpacePanelMode) => void;
+}
+
 export interface SpacePanelControls {
   mode: SpacePanelMode;
+  /** 内联态的收起偏好；抽屉态恒等于存档里的值，不参与渲染。 */
   collapsed: boolean;
-  /** 点任一模式都是「展开并看这个模式」：收起时先展开再切。 */
+  /** 抽屉是否打开；内联态恒为 false。 */
+  drawerOpen: boolean;
+  /** 点任一模式都是「展开并看这个模式」：收起时先展开再切，抽屉态则打开抽屉。 */
   selectMode: (mode: SpacePanelMode) => void;
   toggleCollapsed: () => void;
+  setDrawerOpen: (open: boolean) => void;
 }
 
 export function useSpacePanelState(
   wsId: string,
   variant: SpacePanelVariant = "space",
+  options: SpacePanelOptions = {},
 ): SpacePanelControls {
+  const { drawer = false, modeFromUrl = null, onModeChange } = options;
+
   const [stored, setStored] = useState(() => ({
     wsId,
     panel: readPanel(wsId, variant),
   }));
+  // 抽屉的开关不落存档：视口变宽后再变窄，不该自动弹出来。
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   // 换空间不重挂页面：在渲染期把状态换成新空间的存档，避免先渲染一帧
   // 上一个空间的面板。
   if (stored.wsId !== wsId)
     setStored({ wsId, panel: readPanel(wsId, variant) });
   const panel = stored.wsId === wsId ? stored.panel : readPanel(wsId, variant);
+
+  // 视口放宽回到内联态后，别把「抽屉开着」留到下一次变窄。
+  if (!drawer && drawerOpen) setDrawerOpen(false);
+
+  // URL 里的模式压过存档；参数值不属于这个变体（`overview` 之于空间页、
+  // 手改坏的串）就当没给，回落到存档与默认。
+  const mode = isModeOf(variant, modeFromUrl) ? modeFromUrl : panel.mode;
 
   const write = useCallback(
     (next: SpacePanelState) => {
@@ -110,16 +138,25 @@ export function useSpacePanelState(
     [wsId],
   );
 
+  const selectMode = useCallback(
+    (next: SpacePanelMode) => {
+      // 抽屉态只改模式：`collapsed` 原样写回，视口变宽后仍按存档恢复。
+      write({ mode: next, collapsed: drawer ? panel.collapsed : false });
+      if (drawer) setDrawerOpen(true);
+      if (next !== mode) onModeChange?.(next);
+    },
+    [write, drawer, panel.collapsed, mode, onModeChange],
+  );
+
   return {
-    mode: panel.mode,
+    mode,
     collapsed: panel.collapsed,
-    selectMode: useCallback(
-      (mode: SpacePanelMode) => write({ mode, collapsed: false }),
-      [write],
-    ),
+    drawerOpen: drawer && drawerOpen,
+    selectMode,
     toggleCollapsed: useCallback(
-      () => write({ mode: panel.mode, collapsed: !panel.collapsed }),
-      [write, panel.mode, panel.collapsed],
+      () => write({ mode, collapsed: !panel.collapsed }),
+      [write, mode, panel.collapsed],
     ),
+    setDrawerOpen,
   };
 }

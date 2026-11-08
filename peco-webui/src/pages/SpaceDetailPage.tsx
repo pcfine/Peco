@@ -1,4 +1,5 @@
-// `/spaces/:wsId` —— 空间聊天页：唯一 @master 对话 + 可收起的右栏（文件 / 任务 / 记忆）。
+// `/spaces/:wsId` —— 空间聊天页：唯一 @master 对话 + 右栏（文件 / 任务 / 记忆）。
+// 右栏在 work ≥824 时内联、窄屏改覆盖抽屉：宽度不够时它是上下文，不该挤掉对话。
 //
 // 打开集里的每个空间都挂一个聊天壳，只有当前空间可见。React Router 在
 // `/spaces/A` → `/spaces/B` 之间复用同一个路由元素，页面因此不重挂载，
@@ -7,13 +8,14 @@
 // 已知限制：进 `/spaces/:wsId/status` 或 `/peco` 会离开这个路由元素，
 // 隐藏空间的流随组件卸载中断。
 
-import { useMemo } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useMemo, useRef } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CloseSpaceDialog } from "@/components/spaces/CloseSpaceDialog";
 import { SpaceChatShell } from "@/components/spaces/SpaceChatShell";
 import { SpaceDetailHeader } from "@/components/spaces/SpaceDetailHeader";
+import { SpacePanelDrawer } from "@/components/spaces/SpacePanelDrawer";
 import { SpacePanelModeBar } from "@/components/spaces/SpacePanelModeBar";
 import { SpaceSidePanel } from "@/components/spaces/SpaceSidePanel";
 import {
@@ -21,8 +23,11 @@ import {
   useSpacePanelState,
 } from "@/components/spaces/useSpacePanelState";
 import { useCloseSpace } from "@/components/spaces/useSpaceLifecycle";
+import { WORK_INLINE_MIN, workWidthOf } from "@/components/layout/shellMetrics";
+import { useViewportWidth } from "@/hooks/useViewportWidth";
 import { useInflightTaskCount, useSpace } from "@/queries/spaceDetail";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
+import { useUiStore } from "@/stores/uiStore";
 import { errorText } from "@/lib/api";
 
 export function SpaceDetailPage() {
@@ -30,7 +35,27 @@ export function SpaceDetailPage() {
   const space = useSpace(wsId);
   const close = useCloseSpace(wsId);
   const openIds = useOpenSpacesStore((state) => state.openIds);
-  const panel = useSpacePanelState(wsId);
+  const viewport = useViewportWidth();
+  const railOpen = useUiStore((state) => state.railOpen);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const panelTrigger = useRef<HTMLButtonElement>(null);
+
+  // 与壳的栅格同源：work 算下来放不下 320 右栏 + 480 聊天列，右栏就转抽屉。
+  const drawer = workWidthOf(viewport, railOpen) < WORK_INLINE_MIN;
+  const panel = useSpacePanelState(wsId, "space", {
+    drawer,
+    modeFromUrl: searchParams.get("panel"),
+    // 只改 `panel`，`face` 之类的其它参数原样留着；replace 不往历史里塞条目。
+    onModeChange: (mode) =>
+      setSearchParams(
+        (previous) => {
+          const next = new URLSearchParams(previous);
+          next.set("panel", mode);
+          return next;
+        },
+        { replace: true },
+      ),
+  });
 
   // 页头的「任务 N」角标与聊天壳里的冲突提示读同一份在飞计数（实时优先、台账兜底）。
   const inflight = useInflightTaskCount(wsId);
@@ -70,6 +95,9 @@ export function SpaceDetailPage() {
     );
   }
 
+  // 内联与抽屉渲染的是同一个组件同一组 props：两种形态不是两套面板。
+  const panelBody = <SpaceSidePanel wsId={wsId} mode={panel.mode} />;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <SpaceDetailHeader
@@ -79,11 +107,17 @@ export function SpaceDetailPage() {
         actions={
           <SpacePanelModeBar
             mode={panel.mode}
-            collapsed={panel.collapsed}
+            expanded={drawer ? panel.drawerOpen : !panel.collapsed}
+            drawer={drawer}
+            triggerRef={panelTrigger}
             inflight={inflight}
             modes={SPACE_PANEL_MODES.space}
             onSelect={panel.selectMode}
-            onToggleCollapsed={panel.toggleCollapsed}
+            onToggle={
+              drawer
+                ? () => panel.setDrawerOpen(!panel.drawerOpen)
+                : panel.toggleCollapsed
+            }
           />
         }
       />
@@ -105,17 +139,25 @@ export function SpaceDetailPage() {
           ))}
         </div>
 
-        {!panel.collapsed && (
-          <aside
-            data-testid="space-panel"
-            data-mode={panel.mode}
-            aria-label="空间右栏"
-            className="flex w-80 shrink-0 flex-col border-l border-line"
+        {drawer ? (
+          <SpacePanelDrawer
+            open={panel.drawerOpen}
+            onOpenChange={panel.setDrawerOpen}
+            returnFocusTo={panelTrigger}
           >
-            <div className="min-h-0 flex-1">
-              <SpaceSidePanel wsId={wsId} mode={panel.mode} />
-            </div>
-          </aside>
+            {panelBody}
+          </SpacePanelDrawer>
+        ) : (
+          !panel.collapsed && (
+            <aside
+              data-testid="space-panel"
+              data-mode={panel.mode}
+              aria-label="空间右栏"
+              className="flex w-80 shrink-0 flex-col border-l border-line bg-canvas"
+            >
+              <div className="min-h-0 flex-1">{panelBody}</div>
+            </aside>
+          )
         )}
       </div>
 

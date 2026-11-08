@@ -3,7 +3,7 @@
 // 换形态只换 id 与样式，子树不重挂，在途那一轮不会随形态切换断掉。
 
 import { useEffect, useRef } from "react";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronUp, X } from "lucide-react";
 import { ConnectionStatus } from "@/components/common/ConnectionStatus";
 import { DockArtifacts } from "@/components/dock/DockArtifacts";
 import { DockChat } from "@/components/dock/DockChat";
@@ -11,10 +11,9 @@ import { useDockConversation } from "@/hooks/useDockConversation";
 import { useViewportWidth } from "@/hooks/useViewportWidth";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDockStore } from "@/stores/dockStore";
-import { railWidth, useUiStore } from "@/stores/uiStore";
+import { useUiStore } from "@/stores/uiStore";
+import { dockFormOf, type DockForm } from "@/components/layout/shellMetrics";
 import { cn } from "@/lib/utils";
-
-type DockForm = "column" | "bottom" | "sheet";
 
 /** 三形态各有一个 id：底部停靠时 `#peco-dock` 只能指右列，同一串 id 不许跨形态漂移。 */
 const DOCK_ID: Record<DockForm, string> = {
@@ -23,25 +22,22 @@ const DOCK_ID: Record<DockForm, string> = {
   sheet: "peco-dock-sheet",
 };
 
-/**
- * dock 形态只由「视口 − rail」判定：容器宽已经把 dock 自己算进去，用它判定会自指。
- * 阈值 1184 与 CSS 的 `@min-[1184px]/shell` 同值。
- */
-function useDockForm(): DockForm {
-  const viewport = useViewportWidth();
-  const railOpen = useUiStore((state) => state.railOpen);
-  if (viewport < 900) return "sheet";
-  return viewport - railWidth(viewport, railOpen) >= 1184 ? "column" : "bottom";
-}
-
 /** Tab 循环只在自绘的模态层里需要；Sheet/Dialog 由 radix 管。 */
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 export function DockShell() {
-  const form = useDockForm();
-  const open = useDockStore((state) => state.open);
-  const setOpen = useDockStore((state) => state.setOpen);
+  const viewport = useViewportWidth();
+  const railOpen = useUiStore((state) => state.railOpen);
+  const form = dockFormOf(viewport, railOpen);
+  const sheet = form === "sheet";
+  const storeOpen = useDockStore((state) => state.open);
+  const setStoreOpen = useDockStore((state) => state.setOpen);
+  const sheetOpen = useDockStore((state) => state.sheetOpen);
+  const setSheetOpen = useDockStore((state) => state.setSheetOpen);
+  // 覆盖式 Sheet 有自己的开关：缩窄窗口时不继承宽屏的展开态，避免一上来就盖住整页。
+  const open = sheet ? sheetOpen : storeOpen;
+  const setOpen = sheet ? setSheetOpen : setStoreOpen;
   const tab = useDockStore((state) => state.tab);
   const setTab = useDockStore((state) => state.setTab);
   const { agentId, wsId, convId, error } = useDockConversation(open);
@@ -53,7 +49,6 @@ export function DockShell() {
   const collapsedButtonRef = useRef<HTMLButtonElement>(null);
   const openRef = useRef(open);
 
-  const sheet = form === "sheet";
   // 底部停靠条的收起态是「一条 40px 的头」，不是「没有 dock」。
   const collapsedBar = form === "bottom" && !open;
   // 渲染期就写：卸载时的 cleanup 早于本轮 effect，那里要的是本次渲染的 open。
@@ -125,6 +120,12 @@ export function DockShell() {
 
   const header = (
     <div className="flex h-9 shrink-0 items-center gap-1 border-b border-line px-2">
+      {/* 与页面右栏并排时靠这一枚「品牌点 + Peco」认身份，不靠底色。 */}
+      <span
+        aria-hidden="true"
+        className="size-2 shrink-0 rounded-full bg-brand"
+      />
+      <span className="shrink-0 text-caption font-medium text-ink">Peco</span>
       <button
         ref={chatTabRef}
         type="button"
@@ -164,7 +165,8 @@ export function DockShell() {
           重试
         </button>
       )}
-      {form === "bottom" && (
+      {/* 底部停靠条是「收起」，右列与覆盖 Sheet 是「关闭」：两者对 dock 的去留结果不同。 */}
+      {form === "bottom" ? (
         <button
           type="button"
           onClick={() => setOpen(false)}
@@ -172,6 +174,15 @@ export function DockShell() {
           className="grid h-6 w-6 shrink-0 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
         >
           <ChevronDown aria-hidden="true" className="h-4 w-4" />
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          aria-label="关闭 Peco 对话"
+          className="grid h-6 w-6 shrink-0 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
+        >
+          <X aria-hidden="true" className="h-4 w-4" />
         </button>
       )}
     </div>

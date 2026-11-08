@@ -357,6 +357,31 @@ describe("Peco 主区", () => {
     ).toEqual({ mode: "memory", collapsed: true });
   });
 
+  it("URL 的 ?panel= 压过存档，切模式只改 panel、不动 face", async () => {
+    localStorage.setItem(
+      "peco-webui:space-panel:ws_peco",
+      JSON.stringify({ mode: "files", collapsed: false }),
+    );
+    renderPeco("/peco?face=chat&panel=memory");
+    await screen.findByTestId("space-chat-shell");
+
+    // 存档说文件，URL 说记忆：URL 赢，右栏直接是记忆。
+    expect(screen.getByTestId("peco-panel")).toHaveAttribute(
+      "data-mode",
+      "memory",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^任务/ }));
+
+    expect(screen.getByTestId("peco-panel")).toHaveAttribute(
+      "data-mode",
+      "tasks",
+    );
+    expect(screen.getByTestId("path")).toHaveTextContent(
+      "/peco?face=chat&panel=tasks",
+    );
+  });
+
   it("Peco 空间未打开：聊天列与文件面板都给空态与打开入口", async () => {
     mocks.spaceStatus.value = "closed";
     renderPeco();

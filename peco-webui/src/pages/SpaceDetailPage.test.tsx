@@ -1,6 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SpaceDetailPage } from "@/pages/SpaceDetailPage";
@@ -142,6 +155,13 @@ function NavProbe() {
   );
 }
 
+/** 地址栏在 MemoryRouter 里不可见：查询串靠一个探针来断言。 */
+function SearchProbe() {
+  const { search } = useLocation();
+  return <span data-testid="search">{search}</span>;
+}
+
+/** `#main` 属于壳层，这里补一个同 id 的容器承接抽屉的 `inert`。 */
 function renderDetail(path = "/spaces/ws_a") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -150,14 +170,33 @@ function renderDetail(path = "/spaces/ws_a") {
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
-          <Routes>
-            <Route path="/spaces/:wsId" element={<SpaceDetailPage />} />
-          </Routes>
+          <main id="main">
+            <Routes>
+              <Route path="/spaces/:wsId" element={<SpaceDetailPage />} />
+            </Routes>
+          </main>
           <NavProbe />
+          <SearchProbe />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
   );
+}
+
+/** 壳的分档读 `window.innerWidth`（`useViewportWidth`）：挂载前改，挂载后补一次 resize。 */
+function setViewport(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+  act(() => {
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
+function searchOf(): URLSearchParams {
+  return new URLSearchParams(screen.getByTestId("search").textContent ?? "");
 }
 
 /** 「已打开」有两行：A→B 的保活测试要两个壳同时挂着。 */
@@ -168,6 +207,10 @@ function openBothSpaces() {
     seeded: true,
   });
 }
+
+afterEach(() => {
+  setViewport(1024);
+});
 
 beforeEach(() => {
   localStorage.clear();
@@ -386,5 +429,121 @@ describe("空间聊天页", () => {
 
     await screen.findByRole("textbox");
     expect(screen.queryByText(/个任务在这个空间运行/)).toBeNull();
+  });
+
+  it("URL 的 ?panel= 压过存档：存档是文件，URL 说任务就渲染任务", async () => {
+    localStorage.setItem(
+      "peco-webui:space-panel:ws_a",
+      JSON.stringify({ mode: "files", collapsed: false }),
+    );
+    renderDetail("/spaces/ws_a?panel=tasks");
+    await screen.findByTestId("space-chat-shell");
+
+    expect(screen.getByTestId("space-panel")).toHaveAttribute(
+      "data-mode",
+      "tasks",
+    );
+  });
+
+  it("URL 里的模式不属于这个变体时忽略，回落存档", async () => {
+    // 「总览」只属于 Peco 页：空间页收到的 overview 是无效值，不该造出一个死面板。
+    localStorage.setItem(
+      "peco-webui:space-panel:ws_a",
+      JSON.stringify({ mode: "memory", collapsed: false }),
+    );
+    renderDetail("/spaces/ws_a?panel=overview");
+    await screen.findByTestId("space-chat-shell");
+
+    expect(screen.getByTestId("space-panel")).toHaveAttribute(
+      "data-mode",
+      "memory",
+    );
+  });
+
+  it("切模式把 panel 写进 URL，其它查询参数原样保留", async () => {
+    renderDetail("/spaces/ws_a?face=chat&panel=files");
+    await screen.findByTestId("space-chat-shell");
+
+    fireEvent.click(screen.getByRole("button", { name: "任务" }));
+
+    const search = searchOf();
+    expect(search.get("panel")).toBe("tasks");
+    expect(search.get("face")).toBe("chat");
+    expect(
+      JSON.parse(localStorage.getItem("peco-webui:space-panel:ws_a") ?? "{}"),
+    ).toEqual({ mode: "tasks", collapsed: false });
+  });
+
+  it("认的 URL 参数不会被一次折叠清掉", async () => {
+    renderDetail("/spaces/ws_a?panel=memory");
+    await screen.findByTestId("space-chat-shell");
+
+    fireEvent.click(screen.getByRole("button", { name: "收起右栏" }));
+    expect(screen.queryByTestId("space-panel")).toBeNull();
+    // 收起是偏好，不进 URL；模式还在 URL 里，刷新后仍回到记忆。
+    expect(searchOf().get("panel")).toBe("memory");
+  });
+
+  it("窄屏（work < 824）右栏改抽屉：内联节点消失，抽屉里是同一个面板", async () => {
+    setViewport(820);
+    localStorage.setItem(
+      "peco-webui:space-panel:ws_a",
+      JSON.stringify({ mode: "memory", collapsed: true }),
+    );
+    renderDetail();
+    await screen.findByTestId("space-chat-shell");
+
+    // 存档说「收起」，但抽屉的开关是瞬时态：不读它，也不会自己弹出来。
+    expect(screen.queryByTestId("space-panel")).toBeNull();
+    expect(screen.queryByLabelText("空间右栏")).toBeNull();
+
+    const trigger = screen.getByRole("button", { name: "打开右栏" });
+    fireEvent.click(trigger);
+
+    const drawer = await screen.findByLabelText("空间右栏");
+    expect(drawer).toHaveClass("w-80", "overscroll-contain");
+    // 同一个 SpaceSidePanel：模式来自存档里的「记忆」。
+    expect(
+      await within(drawer).findByText("本空间还没有记忆。"),
+    ).toBeInTheDocument();
+    expect(document.getElementById("main")).toHaveAttribute("inert");
+  });
+
+  it("抽屉里切模式不碰 collapsed 存档，并把模式写进 URL", async () => {
+    setViewport(820);
+    localStorage.setItem(
+      "peco-webui:space-panel:ws_a",
+      JSON.stringify({ mode: "files", collapsed: true }),
+    );
+    renderDetail();
+    await screen.findByTestId("space-chat-shell");
+
+    fireEvent.click(screen.getByRole("button", { name: "任务" }));
+
+    const drawer = await screen.findByLabelText("空间右栏");
+    expect(await within(drawer).findByText(/没有任务/)).toBeInTheDocument();
+    expect(searchOf().get("panel")).toBe("tasks");
+    // 抽屉不写 collapsed：存档里那一份留着，视口变宽后按它恢复。
+    expect(
+      JSON.parse(localStorage.getItem("peco-webui:space-panel:ws_a") ?? "{}"),
+    ).toEqual({ mode: "tasks", collapsed: true });
+  });
+
+  it("Esc 关闭抽屉，焦点回到页面上的 chevron", async () => {
+    setViewport(820);
+    renderDetail();
+    await screen.findByTestId("space-chat-shell");
+
+    const trigger = screen.getByRole("button", { name: "打开右栏" });
+    trigger.focus();
+    fireEvent.click(trigger);
+    await screen.findByLabelText("空间右栏");
+    await waitFor(() => expect(document.activeElement).not.toBe(trigger));
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByLabelText("空间右栏")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(document.getElementById("main")).not.toHaveAttribute("inert");
   });
 });
