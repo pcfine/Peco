@@ -259,6 +259,40 @@ export interface SpaceArtifactList {
   total: number;
 }
 
+/**
+ * `GET /api/spaces/{ws_id}/memory/documents` 的一行。
+ *
+ * `category` 是 KB 的分类标签（`profile` / `semantic` / `episodic`），不在此枚举：
+ * 后端新增分类时前端应当照原样显示，而不是把行整条吞掉。
+ */
+export interface MemoryDocumentSummary {
+  id: string;
+  title: string;
+  /** 原文档的来源路径，只用于展示与详情。 */
+  source: string;
+  category: string;
+  created_at: string;
+  snippet: string;
+}
+
+/** 同一个端点的整页响应：`total` 是过滤后的总数，与 `items.length` 可不等。 */
+export interface MemoryDocumentList {
+  total: number;
+  items: MemoryDocumentSummary[];
+}
+
+/** `GET /api/spaces/{ws_id}/memory/documents/{doc_id}`：`content` 是全文。 */
+export interface MemoryDocumentDetail {
+  id: string;
+  title: string;
+  content: string;
+  source: string;
+  category: string;
+  created_at: string;
+  /** 形状由后端决定（KB 的 `DocumentMetadata` 投影），本面板只读不解释。 */
+  metadata: Record<string, unknown>;
+}
+
 /** `/files` 的一行：目录只给名字，文件还带字节数与时刻。 */
 export interface SpaceFileEntry {
   name: string;

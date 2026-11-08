@@ -73,6 +73,8 @@ vi.mock("@/api/spaces", () => ({
   spaceLiveTasks: async () => [],
   cancelSpaceTask: async () => ({ cancelled: true }),
   spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
+  // 右栏的「记忆」模式在挂载时就会取清单；这里给空列表，本文件测的是面板装配。
+  spaceMemoryDocuments: async () => ({ total: 0, items: [] }),
   spaceArtifacts: async () => ({ items: [], total: 0 }),
   closeSpace: async () => ({ stopped: true }),
   createSpace: (...args: unknown[]) => mocks.createSpace(...args),
@@ -399,5 +401,19 @@ describe("Peco 主区", () => {
     ).toBeInTheDocument();
     // 资源 tab 没有 X-Peco-Space，就不该发请求。
     expect(screen.queryByRole("tab", { name: "绑定空间" })).toBeNull();
+  });
+
+  it("配置面的「记忆」tab 浏览 Peco 空间自己的记忆，不是团队维度占位", async () => {
+    renderPeco("/peco?face=config&tab=memory");
+
+    const config = await screen.findByTestId("peco-face-config");
+    expect(
+      await within(config).findByText("本空间还没有记忆。"),
+    ).toBeInTheDocument();
+    // 搜索与类别过滤就是右栏那一份，不是「接口尚未接入」的团队占位。
+    expect(
+      within(config).getByRole("searchbox", { name: "搜索记忆" }),
+    ).toBeInTheDocument();
+    expect(within(config).queryByText(/尚未接入/)).toBeNull();
   });
 });

@@ -8,12 +8,15 @@ export function formatBytes(n: number): string {
 }
 
 /**
- * 解析服务端时间串（DB `datetime('now')` 产出的 `"2026-10-20 12:00:00"`）。
+ * 解析服务端时间串。来源有两种形状：DB `datetime('now')` 的
+ * `"2026-10-20 12:00:00"`，以及知识库 metadata 里的 ISO 8601。
  *
- * 该串是 UTC 但无时区标记，直接交给 `new Date()` 会按本地时区解析 —— 东八区
- * 下整体偏 8 小时，故补 `T` 分隔符与 `Z` 再解析。
+ * 前一种是 UTC 但无时区标记，直接交给 `new Date()` 会按本地时区解析 —— 东八区
+ * 下整体偏 8 小时，故补 `T` 分隔符与 `Z`；带 `T` 的串按原样解析（时区标记由
+ * 产生方给）。
  */
 export function parseServerTimestamp(s: string): Date {
+  if (s.includes("T")) return new Date(s);
   return new Date(s.replace(" ", "T") + "Z");
 }
 

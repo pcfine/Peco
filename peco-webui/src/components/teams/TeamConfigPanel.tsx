@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { SpaceMemoryTab } from "@/components/spaces/SpaceMemoryTab";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { TeamAgentsTab } from "@/components/teams/TeamAgentsTab";
@@ -60,6 +61,13 @@ interface TeamConfigPanelProps {
   noSpaceNotice?: ReactNode;
   /** `/teams/:teamId` 出错时要一条回团队列表的路；翻转面不需要。 */
   showBackToList?: boolean;
+  /**
+   * 提供时「记忆」tab 浏览这个空间的记忆；缺省走团队页的占位。
+   *
+   * Peco 面传 Peco 空间 —— 那里的记忆就是这一个空间的记忆，摆团队维度的占位
+   * 等于让用户在两处看到同一句「尚未接入」。
+   */
+  memoryWsId?: string | null;
 }
 
 export function TeamConfigPanel({
@@ -69,6 +77,7 @@ export function TeamConfigPanel({
   hideAssemble = false,
   noSpaceNotice,
   showBackToList = false,
+  memoryWsId = null,
 }: TeamConfigPanelProps) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -189,7 +198,12 @@ export function TeamConfigPanel({
           <TeamKnowledgeTab wsId={wsId} detail={detail} />
         )}
         {tab === "spaces" && <TeamSpacesTab spaces={detail.spaces} />}
-        {tab === "memory" && <TeamMemoryTab />}
+        {tab === "memory" &&
+          (memoryWsId ? (
+            <SpaceMemoryTab wsId={memoryWsId} />
+          ) : (
+            <TeamMemoryTab />
+          ))}
       </div>
     </div>
   );

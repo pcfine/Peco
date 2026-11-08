@@ -7,6 +7,8 @@ import {
   spaceArtifacts,
   spaceFiles,
   spaceLiveTasks,
+  spaceMemoryDocument,
+  spaceMemoryDocuments,
   spaceTasks,
 } from "@/api/spaces";
 import { liveInflightCount } from "@/lib/liveTasks";
@@ -97,5 +99,46 @@ export function useSpaceFiles(
     queryFn: () => spaceFiles(wsId, { path }),
     enabled: options.enabled ?? true,
     placeholderData: (prev) => prev,
+  });
+}
+
+/** 记忆一页取多少条：右栏是浏览面，50 行已经要滚很久。 */
+const MEMORY_PAGE_SIZE = 50;
+
+export interface MemoryFilter {
+  /** 已去空白的搜索词；空串表示不加这一维过滤。 */
+  query: string;
+  category: string | null;
+}
+
+/**
+ * 当前空间的记忆文档。`query` / `category` 进 queryKey —— 换条件必须是另一份缓存，
+ * 否则命中上一组参数的旧列表。
+ */
+export function useSpaceMemoryDocuments(
+  wsId: string,
+  filter: MemoryFilter,
+  options: { enabled?: boolean } = {},
+) {
+  return useQuery({
+    queryKey: ["space-memory-documents", wsId, filter.query, filter.category],
+    queryFn: () =>
+      spaceMemoryDocuments(wsId, {
+        query: filter.query || undefined,
+        category: filter.category ?? undefined,
+        limit: MEMORY_PAGE_SIZE,
+      }),
+    enabled: options.enabled ?? true,
+    // 改搜索词时旧列表先留着：每敲一个字都闪一次骨架，读起来比等待还累。
+    placeholderData: (prev) => prev,
+  });
+}
+
+/** 单篇全文。`docId` 为 `null` 时一个请求都不发（列表里没有展开行）。 */
+export function useSpaceMemoryDocument(wsId: string, docId: string | null) {
+  return useQuery({
+    queryKey: ["space-memory-document", wsId, docId],
+    queryFn: () => spaceMemoryDocument(wsId, docId as string),
+    enabled: docId !== null,
   });
 }

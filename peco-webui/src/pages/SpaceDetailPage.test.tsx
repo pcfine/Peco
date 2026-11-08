@@ -83,6 +83,8 @@ vi.mock("@/api/spaces", () => {
     spaceLiveTasks: (wsId: string) => mocks.live(wsId),
     cancelSpaceTask: async () => ({ cancelled: true }),
     spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
+    // 右栏的「记忆」模式在挂载时就会取清单；这里给空列表，本文件测的是面板装配。
+    spaceMemoryDocuments: async () => ({ total: 0, items: [] }),
     spaceArtifacts: async () => ({ items: [], total: 0 }),
     closeSpace: async () => ({ stopped: true }),
   };

@@ -271,6 +271,9 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
               hideSpaces
               hideAssemble
               noSpaceNotice={unavailable}
+              // 空间没打开时也传：记忆面板自己会摆「打开空间」的入口，
+              // 比团队维度的「尚未接入」占位更靠近用户想做的那件事。
+              memoryWsId={peco.ws_id}
             />
           </div>
         </div>

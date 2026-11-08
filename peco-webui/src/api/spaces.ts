@@ -2,6 +2,8 @@ import { api, spaceScope } from "@/lib/api";
 import type {
   CreateSpaceRequest,
   LiveTaskView,
+  MemoryDocumentDetail,
+  MemoryDocumentList,
   Space,
   SpaceArtifactList,
   SpaceConversation,
@@ -88,6 +90,43 @@ export async function spaceArtifacts(
     {
       params: limit ? { limit } : undefined,
     },
+  );
+  return res.data;
+}
+
+/** 记忆文档的检索条件；空串与 `null` 都表示「不加这一维过滤」。 */
+export interface MemoryDocumentQuery {
+  query?: string;
+  category?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * 当前空间的记忆文档清单。
+ *
+ * 409 `space_not_open` 不翻译成空列表：空列表会把「空间没实例」显示成
+ * 「这个空间没有记忆」，而这两件事的下一步完全不同。
+ */
+export async function spaceMemoryDocuments(
+  wsId: string,
+  options: MemoryDocumentQuery = {},
+): Promise<MemoryDocumentList> {
+  const { query, category, limit, offset } = options;
+  const res = await api.get<MemoryDocumentList>(
+    `/spaces/${encodeURIComponent(wsId)}/memory/documents`,
+    { params: { query, category, limit, offset } },
+  );
+  return res.data;
+}
+
+/** 单篇记忆的全文；跨空间访问与不存在同为 404，本空间之外的一律当不存在。 */
+export async function spaceMemoryDocument(
+  wsId: string,
+  docId: string,
+): Promise<MemoryDocumentDetail> {
+  const res = await api.get<MemoryDocumentDetail>(
+    `/spaces/${encodeURIComponent(wsId)}/memory/documents/${encodeURIComponent(docId)}`,
   );
   return res.data;
 }
