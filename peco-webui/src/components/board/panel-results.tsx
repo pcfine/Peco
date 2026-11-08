@@ -35,7 +35,7 @@ export function PanelResults() {
         <EmptyState title="最近没有完成的成果。" />
       ) : (
         <div className="max-h-[344px] overflow-y-auto">
-          <ul className="grid grid-cols-1 gap-px bg-line @min-[560px]/main:grid-cols-2">
+          <ul className="grid grid-cols-1 gap-px bg-line @min-[560px]/work:grid-cols-2">
             {rows.map((task) => (
               <li
                 key={task.task_id}

@@ -65,7 +65,7 @@ export function TeamListPage() {
       )}
 
       {isPending && (
-        <div className="grid grid-cols-1 gap-3 @min-[640px]/main:grid-cols-2 @min-[1024px]/main:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 @min-[640px]/work:grid-cols-2 @min-[1024px]/work:grid-cols-3">
           {[0, 1, 2].map((card) => (
             <Skeleton key={card} className="h-24 w-full" />
           ))}
@@ -76,7 +76,7 @@ export function TeamListPage() {
         <EmptyState title="只有一个 Peco 内置团队。" />
       )}
 
-      <ul className="grid grid-cols-1 gap-3 @min-[640px]/main:grid-cols-2 @min-[1024px]/main:grid-cols-3">
+      <ul className="grid grid-cols-1 gap-3 @min-[640px]/work:grid-cols-2 @min-[1024px]/work:grid-cols-3">
         {(teams ?? []).map((team) => (
           <TeamCard key={team.team_id} team={team} />
         ))}

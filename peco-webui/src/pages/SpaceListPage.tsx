@@ -39,13 +39,13 @@ function SpaceRow({
   return (
     <li
       data-ws-id={space.ws_id}
-      className="flex h-16 items-center gap-2 border-b border-line px-3 py-1 @min-[640px]/main:h-14 @min-[900px]/main:h-10"
+      className="flex h-16 items-center gap-2 border-b border-line px-3 py-1 @min-[640px]/work:h-14 @min-[900px]/work:h-10"
     >
       <button
         type="button"
         onClick={onEnter}
         aria-label={`进入空间 ${name}`}
-        className="flex min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/main:flex-row @min-[900px]/main:items-center @min-[900px]/main:gap-2"
+        className="flex min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
       >
         <span className="flex min-w-0 items-center gap-2">
           <SpaceStatusMark group={spaceGroupOf(space)} />
@@ -56,16 +56,16 @@ function SpaceRow({
             </span>
           )}
         </span>
-        <span className="truncate pl-6 font-mono text-mono-sm text-ink-faint @min-[900px]/main:min-w-0 @min-[900px]/main:flex-1 @min-[900px]/main:pl-0">
+        <span className="truncate pl-6 font-mono text-mono-sm text-ink-faint @min-[900px]/work:min-w-0 @min-[900px]/work:flex-1 @min-[900px]/work:pl-0">
           {space.work_dir}
         </span>
-        <span className="truncate pl-6 font-mono text-2xs text-ink-faint @min-[640px]/main:hidden @min-[900px]/main:block @min-[900px]/main:w-[120px] @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0">
+        <span className="truncate pl-6 font-mono text-2xs text-ink-faint @min-[640px]/work:hidden @min-[900px]/work:block @min-[900px]/work:w-[120px] @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0">
           {space.team_id}
         </span>
-        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[640px]/main:hidden @min-[900px]/main:block @min-[900px]/main:w-14 @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0 @min-[900px]/main:text-right">
+        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[640px]/work:hidden @min-[900px]/work:block @min-[900px]/work:w-14 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
           在飞 {space.inflight_dispatch}
         </span>
-        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-24 @min-[900px]/main:shrink-0 @min-[900px]/main:pl-0 @min-[900px]/main:text-right">
+        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[900px]/work:w-24 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
           {relativeTime(activityAt)}
         </span>
       </button>

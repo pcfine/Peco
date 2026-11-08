@@ -120,7 +120,7 @@ export function SpaceSessionsTab({
 
   return (
     <div className="flex h-full min-h-0">
-      <div className="hidden w-60 shrink-0 flex-col border-r border-line @min-[900px]/main:flex">
+      <div className="hidden w-60 shrink-0 flex-col border-r border-line @min-[900px]/work:flex">
         <ConversationList
           conversations={rows}
           activeConvId={active}
@@ -145,7 +145,7 @@ export function SpaceSessionsTab({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* 窄容器没有左栏：会话切换降级成一行横向可滚的标签。 */}
         {rows.length > 1 && (
-          <div className="flex h-8 shrink-0 items-center gap-1 overflow-x-auto border-b border-line px-2 @min-[900px]/main:hidden">
+          <div className="flex h-8 shrink-0 items-center gap-1 overflow-x-auto border-b border-line px-2 @min-[900px]/work:hidden">
             {rows.map((conversation) => (
               <button
                 key={conversation.id}

@@ -18,3 +18,13 @@ export const useUiStore = create<UiState>()(
     { name: "peco-webui:rail" },
   ),
 );
+
+/**
+ * rail 的渲染宽度：`viewport−rail` 是 shell 宽度，dock 与 main 都按它分档。
+ * 900–1099 强制图标轨，但只压渲染层 —— 存档里的偏好原样留着，视口放宽即恢复。
+ */
+export function railWidth(viewport: number, railOpen: boolean): 0 | 64 | 256 {
+  if (viewport < 900) return 0;
+  if (viewport < 1100) return 64;
+  return railOpen ? 256 : 64;
+}

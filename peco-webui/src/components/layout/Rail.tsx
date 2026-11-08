@@ -18,7 +18,14 @@ import { isToday } from "@/lib/relative";
 import { cn } from "@/lib/utils";
 import type { Space } from "@/types/daemon";
 
-export function Rail({ collapsed = false }: { collapsed?: boolean }) {
+export function Rail({
+  collapsed = false,
+  collapsible = true,
+}: {
+  collapsed?: boolean;
+  /** 视口容不容得下 256 ↔ 64 的切换：容不下时宽度是定值，就不要再给一个按钮。 */
+  collapsible?: boolean;
+}) {
   const railOpen = useUiStore((state) => state.railOpen);
   const setRailOpen = useUiStore((state) => state.setRailOpen);
   const theme = useThemeStore((state) => state.theme);
@@ -114,21 +121,23 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
         {!collapsed && (
           <span className="text-sm font-semibold text-ink">Peco</span>
         )}
-        <button
-          type="button"
-          onClick={() => setRailOpen(!railOpen)}
-          aria-label={railOpen ? "折叠左栏" : "展开左栏"}
-          className={cn(
-            "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
-            !collapsed && "ml-auto",
-          )}
-        >
-          {railOpen ? (
-            <PanelLeftClose className="h-4 w-4" />
-          ) : (
-            <PanelLeftOpen className="h-4 w-4" />
-          )}
-        </button>
+        {collapsible && (
+          <button
+            type="button"
+            onClick={() => setRailOpen(!railOpen)}
+            aria-label={railOpen ? "折叠左栏" : "展开左栏"}
+            className={cn(
+              "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
+              !collapsed && "ml-auto",
+            )}
+          >
+            {railOpen ? (
+              <PanelLeftClose className="h-4 w-4" />
+            ) : (
+              <PanelLeftOpen className="h-4 w-4" />
+            )}
+          </button>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto" onKeyDown={moveFocus}>

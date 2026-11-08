@@ -1,5 +1,6 @@
-// 顶栏 h-44：标题 + 页面动作槽 + dock 开关。窄屏时 rail 离屏，
-// 空间切换器搬到这里（同一枚组件，不另造状态）。
+// 顶栏：位置指示 + 页面动作槽 + dock 开关。视口 <900 时 rail 离屏，
+// 空间切换器搬到这里（同一枚组件，不另造状态）；<1100 时 rail 只剩图标轨，
+// 汉堡按钮改开整栏 Sheet。
 
 import { useLocation } from "react-router-dom";
 import { Menu, MessagesSquare } from "lucide-react";
@@ -36,7 +37,9 @@ function titleOf(pathname: string, search: string): string {
 
 export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
   const { pathname, search } = useLocation();
-  const wide = useMediaQuery("(min-width: 900px)");
+  // 900–1099 的左栏只剩图标轨，导航项的字全藏了，完整导航得从 Sheet 取。
+  const railOffscreen = !useMediaQuery("(min-width: 900px)");
+  const navInSheet = !useMediaQuery("(min-width: 1100px)");
   const { data: peco } = usePeco();
   const { data: tasks } = usePecoTodayTasks(peco?.ws_id ?? null);
   const dockOpen = useDockStore((state) => state.open);
@@ -49,7 +52,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
 
   return (
     <header className="flex h-11 shrink-0 items-center gap-2 border-b border-line bg-canvas px-3">
-      {!wide && (
+      {navInSheet && (
         <button
           type="button"
           onClick={onOpenNav}
@@ -59,7 +62,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
           <Menu className="h-4 w-4" />
         </button>
       )}
-      {!wide && <SpaceSwitcher />}
+      {railOffscreen && <SpaceSwitcher />}
       <h1 className="truncate text-sm font-semibold text-ink">
         {titleOf(pathname, search)}
       </h1>

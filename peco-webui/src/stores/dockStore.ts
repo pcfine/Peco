@@ -20,8 +20,8 @@ interface DockState {
 export const useDockStore = create<DockState>()(
   persist(
     (set, get) => ({
-      // 首次进入：宽屏才默认展开，窄屏默认关（dock 在窄屏是底部 Sheet）。
-      open: window.matchMedia("(min-width: 1200px)").matches,
+      // 首次进入：≥1440 才默认展开 —— 更窄时三列并列会把聊天列压到 200px 左右。
+      open: window.matchMedia("(min-width: 1440px)").matches,
       tab: "chat",
       conversationByWs: {},
       setOpen: (open) => set({ open }),

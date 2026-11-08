@@ -61,9 +61,9 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                     type="button"
                     onClick={() => setExpanded(open ? null : task.id)}
                     aria-expanded={open}
-                    className="flex min-h-11 w-full flex-col justify-center gap-0.5 py-1 text-left @min-[900px]/main:h-11 @min-[900px]/main:flex-row @min-[900px]/main:items-center @min-[900px]/main:gap-2 @min-[900px]/main:py-0"
+                    className="flex min-h-11 w-full flex-col justify-center gap-0.5 py-1 text-left @min-[900px]/work:h-11 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2 @min-[900px]/work:py-0"
                   >
-                    <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[900px]/main:w-24">
+                    <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[900px]/work:w-24">
                       {relativeTime(task.terminal_at ?? task.created_at)}
                     </span>
                     <TaskStateMark
@@ -77,10 +77,10 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                         className="shrink-0"
                       />
                     )}
-                    <span className="min-w-0 shrink-0 truncate font-mono text-2xs text-ink-faint @min-[900px]/main:w-56">
+                    <span className="min-w-0 shrink-0 truncate font-mono text-2xs text-ink-faint @min-[900px]/work:w-56">
                       {nameOf(task.origin_ws_id)} → {nameOf(task.target_ws_id)}
                     </span>
-                    <span className="shrink-0 truncate text-2xs text-ink-muted @min-[900px]/main:w-24">
+                    <span className="shrink-0 truncate text-2xs text-ink-muted @min-[900px]/work:w-24">
                       {task.agent_name}
                     </span>
                     <span className="min-w-0 flex-1 truncate text-sm text-ink">

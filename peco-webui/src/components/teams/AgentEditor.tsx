@@ -191,7 +191,7 @@ export function AgentEditor({
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
-        <section className="grid grid-cols-1 gap-2 @min-[560px]/main:grid-cols-[2fr_3fr_auto]">
+        <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-[2fr_3fr_auto]">
           <label className="space-y-1">
             <span className="text-2xs text-ink-faint">名称</span>
             <Input
@@ -221,7 +221,7 @@ export function AgentEditor({
           </label>
         </section>
 
-        <section className="grid grid-cols-1 gap-2 @min-[560px]/main:grid-cols-2">
+        <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-2">
           <AgentModelPicker
             provider={current.provider}
             model={current.model}
@@ -302,7 +302,7 @@ export function AgentEditor({
           />
         </section>
 
-        <section className="grid grid-cols-1 gap-2 @min-[560px]/main:grid-cols-3">
+        <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-3">
           <label className="space-y-1">
             <span className="text-2xs text-ink-faint">temperature</span>
             <Input

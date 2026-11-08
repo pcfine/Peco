@@ -1,5 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "@/App";
@@ -93,8 +100,9 @@ vi.mock("@/lib/events", () => ({
 }));
 
 /**
- * jsdom 的 `matchMedia` 一律返回 false（见 test/setup.ts），壳的宽屏分支要显式打开，
- * 否则 rail 只会出现在 Sheet 里、dock 也不按右列渲染。返回的函数用于复原。
+ * jsdom 的 `matchMedia` 一律返回 false（见 test/setup.ts），顶栏这类按媒体查询排版的
+ * 组件要显式打开。壳的栅格分档读的是 `window.innerWidth`，见 `setViewport`。
+ * 返回的函数用于复原。
  */
 function useWideViewport(): () => void {
   const original = window.matchMedia;
@@ -111,6 +119,21 @@ function useWideViewport(): () => void {
   return () => {
     window.matchMedia = original;
   };
+}
+
+/**
+ * 壳的分档读 `window.innerWidth`（`useViewportWidth`）：改完补一次 resize，
+ * 挂载中的壳才会跟着重排。
+ */
+function setViewport(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+  act(() => {
+    window.dispatchEvent(new Event("resize"));
+  });
 }
 
 /** MemoryRouter 不暴露地址栏：重定向要靠一个读 location 的探针来断言。 */
@@ -227,13 +250,21 @@ describe("壳与路由", () => {
 });
 
 describe("白屏与 rail 宽度", () => {
-  it("rail 宽度只由折叠态决定：展开 256、收起 64", async () => {
+  afterEach(() => {
+    setViewport(1024);
+  });
+
+  it("rail 宽度：≥1100 跟折叠偏好，900–1099 强制 64", async () => {
     const restore = useWideViewport();
     try {
+      setViewport(1440);
       useUiStore.setState({ railOpen: true });
       const expanded = renderAt("/");
       expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
       expect(expanded.container.querySelector("aside")).toHaveClass("w-64");
+      expect(
+        screen.getByRole("button", { name: "折叠左栏" }),
+      ).toBeInTheDocument();
       expanded.unmount();
 
       useUiStore.setState({ railOpen: false });
@@ -241,6 +272,18 @@ describe("白屏与 rail 宽度", () => {
       expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
       expect(collapsed.container.querySelector("aside")).toHaveClass("w-16");
       collapsed.unmount();
+
+      // 900–1099 放不下 256：宽度压成图标轨，切换按钮不进 DOM（改由顶栏开整栏 Sheet）。
+      setViewport(1024);
+      useUiStore.setState({ railOpen: true });
+      const forced = renderAt("/");
+      expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
+      expect(forced.container.querySelector("aside")).toHaveClass("w-16");
+      expect(screen.queryByRole("button", { name: "展开左栏" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "折叠左栏" })).toBeNull();
+      // 强制的只是渲染层：存档里的偏好不许被覆写，视口放宽还要能展开。
+      expect(useUiStore.getState().railOpen).toBe(true);
+      forced.unmount();
     } finally {
       useUiStore.setState({ railOpen: true });
       restore();
@@ -280,6 +323,110 @@ describe("白屏与 rail 宽度", () => {
       // Tooltip 内部有延迟计时器：挂着等它到点会以 act() 警告收尾。
       view.unmount();
       useDockStore.setState({ open: false });
+      restore();
+    }
+  });
+});
+
+describe("dock 三形态", () => {
+  afterEach(() => {
+    setViewport(1024);
+  });
+
+  it("形态跟着 shell 宽走：1440 右列、1280 底部条、820 覆盖 Sheet", async () => {
+    const restore = useWideViewport();
+    try {
+      // shell = 1440 − 256 = 1184：右列的下限。
+      setViewport(1440);
+      useUiStore.setState({ railOpen: true });
+      useDockStore.setState({ open: true, conversationByWs: {} });
+      const wide = renderAt("/");
+      await waitFor(() =>
+        expect(wide.container.querySelector("#peco-dock")).not.toBeNull(),
+      );
+      expect(wide.container.querySelector("#peco-dock-bottom")).toBeNull();
+      expect(wide.container.querySelector("#peco-dock-sheet")).toBeNull();
+      wide.unmount();
+
+      // shell = 1280 − 256 = 1024：退出右列，收起成 40px 的底部条。
+      setViewport(1280);
+      useDockStore.setState({ open: false, conversationByWs: {} });
+      const bottom = renderAt("/");
+      const bar = await waitFor(() => {
+        const node = bottom.container.querySelector("#peco-dock-bottom");
+        expect(node).not.toBeNull();
+        return node as HTMLElement;
+      });
+      expect(bottom.container.querySelector("#peco-dock")).toBeNull();
+      expect(bar).toHaveClass("h-10");
+      expect(
+        bottom.container.querySelector("[data-slot='message-scroller']"),
+      ).toBeNull();
+
+      // 收起态点整条展开：对话才挂上，头部给 ⌄ 收起。
+      fireEvent.click(within(bar).getByRole("button"));
+      expect(useDockStore.getState().open).toBe(true);
+      await waitFor(() =>
+        expect(
+          bottom.container.querySelector("button[aria-label='收起 Peco 对话']"),
+        ).not.toBeNull(),
+      );
+      expect(
+        bottom.container.querySelector("[data-slot='message-scroller']"),
+      ).not.toBeNull();
+      bottom.unmount();
+
+      // 视口 <900：覆盖式 Sheet，语义与 radix 的弹层一致。
+      setViewport(820);
+      useDockStore.setState({ open: true, conversationByWs: {} });
+      const small = renderAt("/");
+      const sheet = await waitFor(() => {
+        const node = small.container.querySelector("#peco-dock-sheet");
+        expect(node).not.toBeNull();
+        return node as HTMLElement;
+      });
+      expect(sheet).toHaveAttribute("role", "dialog");
+      expect(sheet).toHaveAttribute("aria-modal", "true");
+      expect(sheet).toHaveAttribute("aria-label", "Peco 对话");
+      expect(small.container.querySelector("#peco-dock")).toBeNull();
+      expect(small.container.querySelector("#peco-dock-bottom")).toBeNull();
+      small.unmount();
+    } finally {
+      useDockStore.setState({ open: false });
+      useUiStore.setState({ railOpen: true });
+      restore();
+    }
+  });
+
+  it("换形态不重挂子树：aside 与消息区是同一批 DOM 节点", async () => {
+    const restore = useWideViewport();
+    try {
+      setViewport(1440);
+      useUiStore.setState({ railOpen: true });
+      useDockStore.setState({ open: true, conversationByWs: {} });
+      const view = renderAt("/");
+      const before = await waitFor(() => {
+        const dock = view.container.querySelector("#peco-dock");
+        const scroller = dock?.querySelector("[data-slot='message-scroller']");
+        expect(scroller).toBeTruthy();
+        return { dock: dock as HTMLElement, scroller: scroller as HTMLElement };
+      });
+
+      setViewport(1280);
+      const after = await waitFor(() => {
+        const dock = view.container.querySelector("#peco-dock-bottom");
+        expect(dock).not.toBeNull();
+        return dock as HTMLElement;
+      });
+
+      expect(after).toBe(before.dock);
+      expect(after.querySelector("[data-slot='message-scroller']")).toBe(
+        before.scroller,
+      );
+      view.unmount();
+    } finally {
+      useDockStore.setState({ open: false });
+      useUiStore.setState({ railOpen: true });
       restore();
     }
   });

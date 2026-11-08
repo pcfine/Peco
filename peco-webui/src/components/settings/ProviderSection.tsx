@@ -428,8 +428,8 @@ export function ProviderSection({ teamId }: { teamId: string }) {
             testSaved.isPending && testSaved.variables === provider.name;
           return (
             <li key={provider.name} className="border-b border-line">
-              <div className="flex flex-col justify-center gap-0.5 px-3 py-1 @min-[760px]/main:h-10 @min-[760px]/main:flex-row @min-[760px]/main:items-center @min-[760px]/main:gap-2 @min-[760px]/main:py-0">
-                <div className="flex min-w-0 items-center gap-2 @min-[760px]/main:w-56 @min-[760px]/main:shrink-0">
+              <div className="flex flex-col justify-center gap-0.5 px-3 py-1 @min-[760px]/work:h-10 @min-[760px]/work:flex-row @min-[760px]/work:items-center @min-[760px]/work:gap-2 @min-[760px]/work:py-0">
+                <div className="flex min-w-0 items-center gap-2 @min-[760px]/work:w-56 @min-[760px]/work:shrink-0">
                   <span className="min-w-0 truncate font-mono text-sm text-ink">
                     {provider.name}
                   </span>
@@ -447,16 +447,16 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     {provider.has_api_key ? "已配置密钥" : "未配置密钥"}
                   </span>
                 </div>
-                <span className="truncate text-2xs text-ink-muted @min-[760px]/main:w-24 @min-[760px]/main:shrink-0">
+                <span className="truncate text-2xs text-ink-muted @min-[760px]/work:w-24 @min-[760px]/work:shrink-0">
                   {providerMeta?.display_name ?? provider.provider_type}
                 </span>
-                <span className="truncate font-mono text-2xs text-ink-faint @min-[760px]/main:flex-1">
+                <span className="truncate font-mono text-2xs text-ink-faint @min-[760px]/work:flex-1">
                   {provider.base_url ??
                     (providerMeta
                       ? `${providerMeta.default_base_url}（类型默认）`
                       : "类型默认地址")}
                 </span>
-                <span className="truncate text-2xs text-ink-faint @min-[760px]/main:w-40 @min-[760px]/main:shrink-0">
+                <span className="truncate text-2xs text-ink-faint @min-[760px]/work:w-40 @min-[760px]/work:shrink-0">
                   {provider.default_model ?? "未设默认模型"}
                   {provider.api ? ` · ${provider.api}` : ""}
                 </span>

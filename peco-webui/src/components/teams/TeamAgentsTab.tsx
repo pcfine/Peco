@@ -54,8 +54,8 @@ export function TeamAgentsTab({ wsId }: { wsId: string }) {
   const isMaster = rows.find((row) => row.id === activeId)?.is_master ?? false;
 
   return (
-    <div className="flex h-full min-h-0 flex-col @min-[900px]/main:flex-row">
-      <div className="shrink-0 border-line @min-[900px]/main:w-64 @min-[900px]/main:border-r">
+    <div className="flex h-full min-h-0 flex-col @min-[900px]/work:flex-row">
+      <div className="shrink-0 border-line @min-[900px]/work:w-64 @min-[900px]/work:border-r">
         {/* 空列表时新建入口只在右栏出现一次，不摆两个同名按钮。 */}
         {rows.length > 0 && (
           <div className="flex h-9 items-center border-b border-line px-2">

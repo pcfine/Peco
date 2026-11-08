@@ -60,18 +60,18 @@ export function PanelSpaces() {
           {rows.map((space: Space) => (
             <li
               key={space.ws_id}
-              className="flex h-12 flex-col justify-center @min-[640px]/main:h-8 @min-[640px]/main:flex-row @min-[640px]/main:items-center @min-[640px]/main:gap-2"
+              className="flex h-12 flex-col justify-center @min-[640px]/work:h-8 @min-[640px]/work:flex-row @min-[640px]/work:items-center @min-[640px]/work:gap-2"
             >
               <span className="min-w-0 flex-1 truncate text-sm text-ink">
                 {spaceLabel(space)}
               </span>
-              <span className="shrink-0 truncate font-mono text-2xs text-ink-faint @min-[640px]/main:w-[120px]">
+              <span className="shrink-0 truncate font-mono text-2xs text-ink-faint @min-[640px]/work:w-[120px]">
                 {space.team_id}
               </span>
-              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/main:w-14 @min-[640px]/main:text-right">
+              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/work:w-14 @min-[640px]/work:text-right">
                 在飞 {space.inflight_dispatch}
               </span>
-              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/main:w-24 @min-[640px]/main:text-right">
+              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/work:w-24 @min-[640px]/work:text-right">
                 {relativeTime(activity.get(space.ws_id) ?? null)}
               </span>
             </li>

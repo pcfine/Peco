@@ -239,8 +239,8 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
 
   return (
     <>
-      <div className="flex h-full min-h-0 flex-col @min-[900px]/main:flex-row">
-        <div className="shrink-0 border-line @min-[900px]/main:w-64 @min-[900px]/main:border-r">
+      <div className="flex h-full min-h-0 flex-col @min-[900px]/work:flex-row">
+        <div className="shrink-0 border-line @min-[900px]/work:w-64 @min-[900px]/work:border-r">
           <div className="flex h-9 items-center border-b border-line px-2">
             <Button
               size="sm"
