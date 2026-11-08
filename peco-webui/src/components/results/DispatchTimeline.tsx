@@ -35,6 +35,29 @@ function groupByDay(tasks: Task[]): { day: string; rows: Task[] }[] {
   return groups;
 }
 
+/**
+ * 空间名多是中文，而 11px 只留给 ASCII 标识符：逐段拆开，中文段用 12px/500，
+ * ASCII 段留给等宽小字，混排名字不会被整体升档。
+ */
+function NodeName({ text }: { text: string }) {
+  const runs = text.match(/[\x20-\x7E]+|[^\x20-\x7E]+/g) ?? [];
+  return (
+    <>
+      {runs.map((run, index) =>
+        /^[\x20-\x7E]+$/.test(run) ? (
+          <span key={index} className="font-mono text-2xs">
+            {run}
+          </span>
+        ) : (
+          <span key={index} className="text-caption font-medium">
+            {run}
+          </span>
+        ),
+      )}
+    </>
+  );
+}
+
 export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const nameOf = (wsId: string) => {
@@ -77,8 +100,10 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                         className="shrink-0"
                       />
                     )}
-                    <span className="min-w-0 shrink-0 truncate font-mono text-2xs text-ink-faint @min-[900px]/work:w-56">
-                      {nameOf(task.origin_ws_id)} → {nameOf(task.target_ws_id)}
+                    <span className="min-w-0 shrink-0 truncate text-2xs text-ink-faint @min-[900px]/work:w-56">
+                      <NodeName text={nameOf(task.origin_ws_id)} />
+                      <span className="text-caption font-medium"> → </span>
+                      <NodeName text={nameOf(task.target_ws_id)} />
                     </span>
                     <span className="shrink-0 truncate text-2xs text-ink-muted @min-[900px]/work:w-24">
                       {task.agent_name}

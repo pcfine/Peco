@@ -60,6 +60,15 @@
   --info: #26a9f1;
 }
 
+/* 原生控件（滚动条、select 弹层）按 color-scheme 取色：缺省跟随系统偏好，
+   暗色应用碰上亮色系统就会露出白色部件。 */
+html {
+  color-scheme: dark;
+}
+html:not(.dark) {
+  color-scheme: light;
+}
+
 @theme inline {
   --color-canvas: var(--canvas);
   --color-panel: var(--panel);
