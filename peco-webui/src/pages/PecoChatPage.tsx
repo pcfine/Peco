@@ -247,6 +247,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
                       wsId={peco.ws_id}
                       mode={panel.mode}
                       variant="peco"
+                      active={face === "chat"}
                     />
                   )}
                 </div>

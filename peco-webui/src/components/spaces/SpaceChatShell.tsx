@@ -22,6 +22,7 @@ import { useInflightTaskCount } from "@/queries/spaceDetail";
 import { errorText } from "@/lib/api";
 import { parseServerTimestamp } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { useConnectionStore } from "@/stores/connectionStore";
 import type { Message } from "@/types/chat";
 
 /** 台账历史还原成展示层消息：一轮一条 GET 流不区分 turn，故 turnIndex 恒 0。 */
@@ -47,6 +48,8 @@ function SpaceConversationChat({
   convId,
   visible,
 }: SpaceConversationChatProps) {
+  const setChat = useConnectionStore((state) => state.setChat);
+
   const history = useQuery({
     queryKey: ["messages", SPACE_MASTER_AGENT, convId],
     queryFn: () =>
@@ -96,6 +99,11 @@ function SpaceConversationChat({
             })
           }
           initialMessages={initialMessages}
+          // 一轮的起止进壳级 store：文件面板靠它在回复落地后立刻重取，
+          // 不必等下一次轮询（dock 头部的对话状态也读同一份）。
+          onStreamingChange={(streaming) =>
+            setChat(streaming ? { kind: "running" } : { kind: "idle" })
+          }
           composerNotice={<SpaceConflictHint inflight={inflight} />}
           welcomeMessage="这是这个空间唯一的 @master 对话。让它做事，或者直接问它。"
         />

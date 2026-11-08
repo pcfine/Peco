@@ -17,6 +17,7 @@ import type {
   SpacePanelMode,
   SpacePanelVariant,
 } from "@/components/spaces/useSpacePanelState";
+import { useFilesRefreshOnChatIdle } from "@/hooks/useFilesRefreshOnChatIdle";
 import { usePecoTodayTasks } from "@/queries/tasks";
 import type { Task } from "@/types/daemon";
 
@@ -53,17 +54,23 @@ interface SpaceSidePanelProps {
   wsId: string;
   mode: SpacePanelMode;
   variant?: SpacePanelVariant;
+  /** 这一栏是否真的在用户眼前（Peco 翻到配置面时右栏还挂着但看不见）。 */
+  active?: boolean;
 }
 
 export function SpaceSidePanel({
   wsId,
   mode,
   variant = "space",
+  active = true,
 }: SpaceSidePanelProps) {
+  // 挂在这里而不是每个聊天壳里：一台页面只有一个右栏，一轮结束只失效一次。
+  useFilesRefreshOnChatIdle();
+
   return (
     <div className="h-full min-h-0">
       {mode === "overview" && <SpaceOverviewTab />}
-      {mode === "files" && <SpaceFilesTab wsId={wsId} />}
+      {mode === "files" && <SpaceFilesTab wsId={wsId} active={active} />}
       {mode === "tasks" &&
         (variant === "peco" ? (
           <PecoDispatchTasks wsId={wsId} />

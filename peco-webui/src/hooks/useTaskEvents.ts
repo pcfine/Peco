@@ -20,6 +20,8 @@ export function useTaskEvents(): void {
         void queryClient.invalidateQueries({ queryKey: ["spaces"] });
         void queryClient.invalidateQueries({ queryKey: ["space-overview"] });
         void queryClient.invalidateQueries({ queryKey: ["space-tasks"] });
+        // 任务的产物落在 work_dir 里：不失效文件树，右栏就停在派发前的样子。
+        void queryClient.invalidateQueries({ queryKey: ["space-files"] });
       },
       onState: setEvents,
     });

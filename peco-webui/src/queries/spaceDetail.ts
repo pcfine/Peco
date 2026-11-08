@@ -86,18 +86,29 @@ export function useSpaceArtifacts(wsId: string) {
 }
 
 /**
+ * 文件面板的轮询节奏。daemon 没有 work_dir 的 watcher，只能靠轮的；
+ * 7 秒落在「一眼看得出在动」与请求量之间 —— 文件不像任务那样每秒都在变。
+ */
+export const SPACE_FILES_POLL_MS = 7_000;
+
+/**
  * 目录 / 文件内容。`path` 为空串即根目录；未打开的空间会 409，
  * 由调用方展示原文案（这里不把错误翻译成空列表）。
+ *
+ * `refetchInterval` 由调用方按「这一栏是不是真的在看」给：收起或切到别的模式时
+ * 传 false，看不见的树不该继续打 daemon。浏览器标签本身不可见时 react-query
+ * 默认也不轮询。
  */
 export function useSpaceFiles(
   wsId: string,
   path: string,
-  options: { enabled?: boolean } = {},
+  options: { enabled?: boolean; refetchInterval?: number | false } = {},
 ) {
   return useQuery({
     queryKey: ["space-files", wsId, path],
     queryFn: () => spaceFiles(wsId, { path }),
     enabled: options.enabled ?? true,
+    refetchInterval: options.refetchInterval ?? false,
     placeholderData: (prev) => prev,
   });
 }
