@@ -5,7 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SpaceDetailPage } from "@/pages/SpaceDetailPage";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
-import type { Space, Task } from "@/types/daemon";
+import { ApiError } from "@/lib/api";
+import type { LiveTaskView, Space, Task } from "@/types/daemon";
 import type { Message } from "@/types/chat";
 
 // 聊天页的装配面：唯一会话、聊天壳保活、右栏模式与持久化、冲突提示。
@@ -17,6 +18,13 @@ const mocks = vi.hoisted(() => ({
     created: false,
   })),
   tasks: vi.fn(async (_wsId: string): Promise<Task[]> => []),
+  /** 默认走「空间未打开」这条路：提示与角标于是回落到台账，与真实漂移一致。 */
+  live: vi.fn(async (_wsId: string): Promise<LiveTaskView[]> => {
+    throw new ApiError("空间还没打开", {
+      status: 409,
+      code: "space_not_open",
+    });
+  }),
   getMessages: vi.fn(async (..._args: unknown[]): Promise<Message[]> => []),
 }));
 
@@ -72,6 +80,8 @@ vi.mock("@/api/spaces", () => {
     getSpace: async (wsId: string) => spaces[wsId] ?? spaces.ws_a,
     ensureSpaceConversation: (wsId: string) => mocks.ensure(wsId),
     spaceTasks: (wsId: string) => mocks.tasks(wsId),
+    spaceLiveTasks: (wsId: string) => mocks.live(wsId),
+    cancelSpaceTask: async () => ({ cancelled: true }),
     spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
     spaceArtifacts: async () => ({ items: [], total: 0 }),
     closeSpace: async () => ({ stopped: true }),
@@ -101,6 +111,22 @@ function taskOf(overrides: Partial<Task>): Task {
     created_at: "2026-11-05 10:00:00",
     terminal_at: null,
     result_digest: null,
+    ...overrides,
+  };
+}
+
+function liveTask(overrides: Partial<LiveTaskView> = {}): LiveTaskView {
+  return {
+    id: "t_live",
+    kind: "echo",
+    state: "working",
+    state_detail: null,
+    progress: { phase: null, current: null, total: null },
+    output: { tail: [], start_offset: 0, end_offset: 0 },
+    outcome: null,
+    artifacts: [],
+    created_at: "2026-11-05T10:00:00Z",
+    updated_at: "2026-11-05T10:00:10Z",
     ...overrides,
   };
 }
@@ -151,6 +177,13 @@ beforeEach(() => {
     created: false,
   }));
   mocks.tasks.mockResolvedValue([]);
+  mocks.live.mockReset();
+  mocks.live.mockImplementation(async () => {
+    throw new ApiError("空间还没打开", {
+      status: 409,
+      code: "space_not_open",
+    });
+  });
   mocks.getMessages.mockResolvedValue([]);
   useOpenSpacesStore.setState({
     openIds: ["ws_a"],
@@ -261,6 +294,20 @@ describe("空间聊天页", () => {
     expect(await screen.findByText("本空间还没有记忆。")).toBeInTheDocument();
   });
 
+  it("任务模式先取实时列表，并标注实时", async () => {
+    mocks.live.mockResolvedValue([liveTask()]);
+    renderDetail();
+    await screen.findByTestId("space-chat-shell");
+
+    fireEvent.click(screen.getByRole("button", { name: /^任务/ }));
+
+    const note = await screen.findByTestId("task-fidelity");
+    expect(note).toHaveTextContent("实时");
+    expect(mocks.live).toHaveBeenCalledWith("ws_a");
+    // 台账只用来补 prompt / agent：没有对应行时照样给出「未记录」，不留白。
+    expect(screen.getByText("未记录")).toBeInTheDocument();
+  });
+
   it("重挂页面时按存档恢复右栏的模式与收起态", async () => {
     localStorage.setItem(
       "peco-webui:space-panel:ws_a",
@@ -310,6 +357,21 @@ describe("空间聊天页", () => {
     expect(hint).toBeInTheDocument();
     expect(screen.getByRole("textbox")).not.toBeDisabled();
     // 提示不阻塞：没有确认弹窗，也没有写锁。
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("冲突提示的在飞数取实时快照，不跟台账走", async () => {
+    // 台账已经落后（还是空），实时快照里有两个非终态任务：提示要按实时数说话。
+    mocks.live.mockResolvedValue([
+      liveTask({ id: "t_a" }),
+      liveTask({ id: "t_b", state: "input_required" }),
+      liveTask({ id: "t_c", state: "completed" }),
+    ]);
+    renderDetail();
+
+    const hint = await screen.findByText(/个任务在这个空间运行/);
+    expect(hint).toHaveTextContent("2");
+    expect(screen.getByRole("textbox")).not.toBeDisabled();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 

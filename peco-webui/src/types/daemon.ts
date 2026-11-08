@@ -137,6 +137,8 @@ export interface Task {
   created_at: string;
   terminal_at: string | null;
   result_digest: string | null;
+  /** 派发入参里那段任务描述的前 512 字；旧行没有记录，是 `null`。 */
+  prompt_digest?: string | null;
 }
 
 /** `/api/events` 的 `task` 事件载荷：只是台账变更信号，行本身要重取。 */
@@ -149,6 +151,66 @@ export interface TaskEvent {
   origin_kind: string;
   created_at: string;
   terminal_at: string | null;
+}
+
+/** `tag` + `payload`：载荷形状由执行体定义，UI 只按需读。 */
+export interface TaggedJson {
+  tag: string;
+  payload: unknown;
+}
+
+/** 快照的进度：三格都可缺，`current` / `total` 只表示数量，单位由执行体决定。 */
+export interface LiveTaskProgress {
+  phase: string | null;
+  current: number | null;
+  total: number | null;
+}
+
+/** 输出窗口：按字节裁剪，首尾都可能落在多字节字符中间，解码交给展示层。 */
+export interface LiveTaskOutput {
+  tail: number[];
+  start_offset: number;
+  end_offset: number;
+}
+
+export interface LiveTaskArtifact {
+  id: string;
+  kind: string;
+  offset: number;
+  append: boolean;
+  last_chunk: boolean;
+  payload: TaggedJson;
+}
+
+export interface LiveTaskError {
+  kind: string;
+  message: string;
+  detail: TaggedJson | null;
+}
+
+/** 仅终态非 `null`；终态本身由 `state` 承载，两处不互为判据。 */
+export interface LiveTaskOutcome {
+  output: TaggedJson | null;
+  error: LiveTaskError | null;
+}
+
+/**
+ * `GET /api/spaces/{ws_id}/tasks/live` 的一行：空间 TaskHub 的内存快照。
+ *
+ * 列表含已终态任务（槽在空间存活期内常驻），在飞与已完成靠 `state` 区分。
+ * `created_at` / `updated_at` 是 chrono 的 RFC3339，与台账的 `"YYYY-MM-DD hh:mm:ss"` 不同形。
+ */
+export interface LiveTaskView {
+  id: string;
+  kind: string;
+  state: string;
+  state_detail: TaggedJson | null;
+  progress: LiveTaskProgress;
+  output: LiveTaskOutput;
+  outcome: LiveTaskOutcome | null;
+  artifacts: LiveTaskArtifact[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface TodayCounts {

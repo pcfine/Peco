@@ -126,6 +126,18 @@ export function SpaceTasksTab({
                     task_id {task.task_id} · 目标 {task.target_ws_id} · 来源{" "}
                     {task.origin_ws_id}
                   </p>
+                  <div className="space-y-0.5">
+                    <p className="text-2xs text-ink-faint">Peco 让它做什么</p>
+                    <p
+                      className={cn(
+                        "max-w-[640px] whitespace-pre-wrap break-words text-sm",
+                        task.prompt_digest ? "text-ink" : "text-ink-faint",
+                      )}
+                    >
+                      {task.prompt_digest ?? "未记录"}
+                    </p>
+                  </div>
+                  <p className="text-2xs text-ink-faint">结果摘要</p>
                   <p className="max-w-[640px] whitespace-pre-wrap break-words text-sm text-ink">
                     {task.result_digest ?? "这条任务没有摘要。"}
                   </p>

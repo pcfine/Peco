@@ -1,6 +1,7 @@
 import { api, spaceScope } from "@/lib/api";
 import type {
   CreateSpaceRequest,
+  LiveTaskView,
   Space,
   SpaceArtifactList,
   SpaceConversation,
@@ -50,6 +51,30 @@ export async function spaceOverview(wsId: string): Promise<SpaceOverview> {
 export async function spaceTasks(wsId: string): Promise<Task[]> {
   const res = await api.get<Task[]>(
     `/spaces/${encodeURIComponent(wsId)}/tasks`,
+  );
+  return res.data;
+}
+
+/**
+ * 该空间 TaskHub 的实时快照；空间没打开是 409 `space_not_open`。
+ *
+ * 不把 409 翻译成空列表：空列表会让「Hub 不在」看起来像「开着但没任务」，
+ * 在飞任务于是被显示成已完成。
+ */
+export async function spaceLiveTasks(wsId: string): Promise<LiveTaskView[]> {
+  const res = await api.get<LiveTaskView[]>(
+    `/spaces/${encodeURIComponent(wsId)}/tasks/live`,
+  );
+  return res.data;
+}
+
+/** 取消只转发给 Hub：已终态收到取消也是成功，真实终态靠回读 `/tasks/live` 决定。 */
+export async function cancelSpaceTask(
+  wsId: string,
+  taskId: string,
+): Promise<{ cancelled: boolean }> {
+  const res = await api.post<{ cancelled: boolean }>(
+    `/spaces/${encodeURIComponent(wsId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
   );
   return res.data;
 }

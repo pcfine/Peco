@@ -21,10 +21,9 @@ import {
   useSpacePanelState,
 } from "@/components/spaces/useSpacePanelState";
 import { useCloseSpace } from "@/components/spaces/useSpaceLifecycle";
-import { useSpace, useSpaceTasks } from "@/queries/spaceDetail";
+import { useInflightTaskCount, useSpace } from "@/queries/spaceDetail";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { errorText } from "@/lib/api";
-import { TASK_RUNNING_STATES } from "@/lib/taskStates";
 
 export function SpaceDetailPage() {
   const { wsId = "" } = useParams();
@@ -33,11 +32,8 @@ export function SpaceDetailPage() {
   const openIds = useOpenSpacesStore((state) => state.openIds);
   const panel = useSpacePanelState(wsId);
 
-  // 页头的「任务 N」角标与聊天壳里的冲突提示读同一份台账查询。
-  const tasks = useSpaceTasks(wsId);
-  const inflight = (tasks.data ?? []).filter((task) =>
-    TASK_RUNNING_STATES.includes(task.task_state),
-  ).length;
+  // 页头的「任务 N」角标与聊天壳里的冲突提示读同一份在飞计数（实时优先、台账兜底）。
+  const inflight = useInflightTaskCount(wsId);
 
   // 直接进 URL 的空间不一定在打开集里：当前路由永远有一个壳，
   // 否则页面自己就成了白屏。

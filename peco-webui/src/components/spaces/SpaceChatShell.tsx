@@ -18,10 +18,9 @@ import {
   uploadConversationImage,
 } from "@/api/conversations";
 import { SPACE_MASTER_AGENT, useSpaceConversation } from "@/queries/spaceChat";
-import { useSpaceTasks } from "@/queries/spaceDetail";
+import { useInflightTaskCount } from "@/queries/spaceDetail";
 import { errorText } from "@/lib/api";
 import { parseServerTimestamp } from "@/lib/format";
-import { TASK_RUNNING_STATES } from "@/lib/taskStates";
 import { cn } from "@/lib/utils";
 import type { Message } from "@/types/chat";
 
@@ -57,10 +56,9 @@ function SpaceConversationChat({
     refetchOnMount: "always",
   });
 
-  const tasks = useSpaceTasks(wsId);
-  const inflight = (tasks.data ?? []).filter((task) =>
-    TASK_RUNNING_STATES.includes(task.task_state),
-  ).length;
+  // 隐藏的壳不轮询实时列表：它只影响提示与角标，为此让每个后台空间都发请求
+  // 不划算 —— 拿不到时这个 hook 自己回落到台账。
+  const inflight = useInflightTaskCount(wsId, { enabled: visible });
 
   const initialMessages = useMemo(
     () => toChatMessages(history.data ?? []),
