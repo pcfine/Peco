@@ -77,7 +77,10 @@ export function SpaceStatusPage() {
           message={errorText(space.error)}
           onRetry={() => void space.refetch()}
         />
-        <Link to="/spaces" className="text-xs text-primary-ink hover:underline">
+        <Link
+          to="/spaces"
+          className="tap-target -mx-2 self-start px-2 text-xs text-primary-ink hover:underline"
+        >
           返回工作室
         </Link>
       </div>
@@ -96,7 +99,7 @@ export function SpaceStatusPage() {
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="mx-auto flex h-full min-h-0 w-full max-w-wide flex-col">
       <SpaceDetailHeader
         space={space.data}
         onClose={close.close}
@@ -113,7 +116,7 @@ export function SpaceStatusPage() {
         </span>
         <Link
           to={`/spaces/${encodeURIComponent(wsId)}`}
-          className="ml-auto shrink-0 text-primary-ink hover:underline"
+          className="tap-target -mx-2 ml-auto shrink-0 px-2 text-primary-ink hover:underline"
         >
           进入聊天
         </Link>

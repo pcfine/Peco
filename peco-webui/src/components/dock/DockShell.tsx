@@ -180,7 +180,7 @@ export function DockShell() {
   const content = (
     <div className="min-h-0 flex-1 overflow-hidden">
       {error ? (
-        <p className="max-w-[480px] p-3 text-sm text-ink-muted">
+        <p className="max-w-narrow p-3 text-sm text-ink-muted">
           Peco 空间还没打开，无法开始对话。
         </p>
       ) : !convId || !wsId ? (

@@ -43,7 +43,7 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
   };
 
   return (
-    <div>
+    <div className="min-w-0 overflow-x-auto">
       {groupByDay(tasks).map((group) => (
         <section key={group.day}>
           <h2 className="flex h-8 items-center text-xs font-semibold text-ink-muted">
@@ -95,7 +95,7 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                       </p>
                       <p
                         className={cn(
-                          "max-w-[640px] whitespace-pre-wrap break-words text-sm",
+                          "max-w-narrow whitespace-pre-wrap break-words text-sm",
                           task.result_digest ? "text-ink" : "text-ink-faint",
                         )}
                       >

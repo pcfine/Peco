@@ -55,7 +55,7 @@ function ArtifactPreview({
           {files.error && <ErrorBanner message={errorText(files.error)} />}
           {files.isPending && <Skeleton className="h-16 w-full" />}
           {body?.binary && (
-            <p className="max-w-[480px] text-sm text-ink-muted">
+            <p className="max-w-narrow text-sm text-ink-muted">
               这是二进制文件，不在这里渲染。
             </p>
           )}

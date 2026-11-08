@@ -50,7 +50,13 @@ export function ResultsPage() {
   }, [tasks.data, state]);
 
   return (
-    <div className="space-y-4">
+    <div className="mx-auto w-full max-w-wide space-y-4">
+      <div className="flex h-8 items-center">
+        <h1 className="min-w-0 truncate text-xl font-semibold text-ink">
+          成果
+        </h1>
+      </div>
+
       <div className="flex min-h-10 flex-wrap items-center gap-2 border-b border-line pb-2">
         <div className="flex items-center gap-1">
           {STATE_FILTERS.map((filter) => (

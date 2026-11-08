@@ -141,7 +141,7 @@ export function PanelToday({ pecoWsId }: { pecoWsId: string | null }) {
             <button
               type="button"
               onClick={() => setDockOpen(true)}
-              className="text-xs text-primary-ink hover:underline"
+              className="tap-target -mx-2 px-2 text-xs text-primary-ink hover:underline"
             >
               让 Peco 开始一件事
             </button>

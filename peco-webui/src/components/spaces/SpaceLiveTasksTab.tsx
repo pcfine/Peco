@@ -218,7 +218,7 @@ function LiveTaskDetail({
         </p>
         <p
           className={cn(
-            "max-w-[640px] whitespace-pre-wrap break-words text-sm",
+            "max-w-narrow whitespace-pre-wrap break-words text-sm",
             promptDigest ? "text-ink" : "text-ink-faint",
           )}
         >
@@ -241,7 +241,7 @@ function LiveTaskDetail({
         )
       )}
       {error && (
-        <p className="max-w-[640px] break-words text-caption font-medium text-danger">
+        <p className="max-w-narrow break-words text-caption font-medium text-danger">
           失败：{error.kind} · {error.message}
         </p>
       )}
@@ -259,7 +259,7 @@ function OutputBlock({ label, text }: { label: string; text: string }) {
   return (
     <div className="space-y-0.5">
       <p className="text-caption font-medium text-ink-faint">{label}</p>
-      <pre className="max-h-60 max-w-[640px] overflow-auto whitespace-pre-wrap break-words font-mono text-2xs text-ink">
+      <pre className="max-h-60 max-w-narrow overflow-auto whitespace-pre-wrap break-words font-mono text-2xs text-ink">
         {text}
       </pre>
     </div>

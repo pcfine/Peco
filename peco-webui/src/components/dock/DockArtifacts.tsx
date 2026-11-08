@@ -45,7 +45,7 @@ export function DockArtifacts({
 
   if (!data || data.length === 0) {
     return (
-      <p className="max-w-[480px] p-3 text-sm text-ink-muted">
+      <p className="max-w-narrow p-3 text-sm text-ink-muted">
         任务完成后，产物会出现在这里。
       </p>
     );

@@ -62,6 +62,11 @@ interface TeamConfigPanelProps {
   /** `/teams/:teamId` 出错时要一条回团队列表的路；翻转面不需要。 */
   showBackToList?: boolean;
   /**
+   * 标题的标签层级。`/peco` 把它当配置面挂在已有 h1 的页面里，
+   * 那里必须是 h2，否则一页两个 h1。
+   */
+  headingLevel?: "h1" | "h2";
+  /**
    * 提供时「记忆」tab 浏览这个空间的记忆；缺省走团队页的占位。
    *
    * Peco 面传 Peco 空间 —— 那里的记忆就是这一个空间的记忆，摆团队维度的占位
@@ -77,6 +82,7 @@ export function TeamConfigPanel({
   hideAssemble = false,
   noSpaceNotice,
   showBackToList = false,
+  headingLevel = "h1",
   memoryWsId = null,
 }: TeamConfigPanelProps) {
   const navigate = useNavigate();
@@ -113,7 +119,7 @@ export function TeamConfigPanel({
         {showBackToList && (
           <Link
             to="/teams"
-            className="text-xs text-primary-ink hover:underline"
+            className="tap-target -mx-2 self-start px-2 text-xs text-primary-ink hover:underline"
           >
             返回团队列表
           </Link>
@@ -123,14 +129,15 @@ export function TeamConfigPanel({
   }
 
   const detail = team.data;
+  const Heading = headingLevel;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="shrink-0 border-b border-line px-3 py-3">
         <div className="flex h-8 items-center gap-2">
-          <h1 className="truncate text-xl font-semibold text-ink">
+          <Heading className="truncate text-xl font-semibold text-ink">
             {detail.display_name}
-          </h1>
+          </Heading>
           <span className="shrink-0 font-mono text-2xs text-ink-faint">
             {detail.id}
           </span>

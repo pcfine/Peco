@@ -48,7 +48,7 @@ function Breadcrumb({
       <button
         type="button"
         onClick={() => onNavigate("")}
-        className="shrink-0 text-ink-muted hover:text-ink"
+        className="tap-target -mx-2 shrink-0 px-2 text-ink-muted hover:text-ink"
       >
         根目录
       </button>
@@ -269,7 +269,7 @@ export function SpaceFilesTab({
               )}
               {preview.isPending && <Skeleton className="h-16 w-full" />}
               {fileData?.binary && (
-                <p className="max-w-[480px] text-sm text-ink-muted">
+                <p className="max-w-narrow text-sm text-ink-muted">
                   这是二进制文件，不在这里渲染。
                 </p>
               )}

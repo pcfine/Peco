@@ -260,7 +260,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
             inert={face !== "config"}
             aria-hidden={face !== "config"}
             className={cn(
-              "absolute inset-0 flex min-h-0 min-w-0 flex-col",
+              "absolute inset-0 mx-auto flex min-h-0 w-full max-w-wide flex-col",
               motion === "flip" &&
                 "[backface-visibility:hidden] [transform:rotateY(180deg)]",
               faceFadeClasses(face === "config"),
@@ -269,6 +269,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
             <TeamConfigPanel
               teamId={PECO_TEAM_ID}
               wsId={spaceOpen ? peco.ws_id : null}
+              headingLevel="h2"
               hideSpaces
               hideAssemble
               noSpaceNotice={unavailable}

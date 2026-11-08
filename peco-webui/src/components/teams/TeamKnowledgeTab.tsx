@@ -41,7 +41,7 @@ export function TeamKnowledgeTab({
     // 索引表与目录可能各自为空：团队详情已经告诉我们「装了哪些」，两处都说没有
     // 才是真的没有，免得把「接口空」当成「没有知识库」。
     return (
-      <p className="max-w-[480px] p-3 text-sm text-ink-muted">
+      <p className="max-w-narrow p-3 text-sm text-ink-muted">
         这个团队还没有知识库
         {detail.knowledge_bases.length > 0
           ? `（团队目录里有 ${detail.knowledge_bases.map((kb) => kb.name).join("、")}，索引还没同步）`

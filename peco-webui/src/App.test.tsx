@@ -156,6 +156,24 @@ function renderAt(path: string) {
   );
 }
 
+/** 顶栏是文档里第一个 `header`：壳先于路由渲染，页内页头都在它之后。 */
+function topBar(): HTMLElement {
+  const header = document.querySelector("header");
+  if (!header) throw new Error("没有渲染顶栏");
+  return header;
+}
+
+/** 顶栏是「位置指示」的 12px `p`，不是 h1；h1 归内容区，每页恰好一个。 */
+function expectOnePageH1() {
+  expect(document.querySelectorAll("h1")).toHaveLength(1);
+  expect(topBar().querySelector("h1")).toBeNull();
+  expect(topBar().querySelector("p")).toHaveClass("text-caption");
+}
+
+function expectTopBarIndicator(text: string) {
+  expect(within(topBar()).getByText(text)).toHaveClass("text-caption");
+}
+
 beforeEach(() => {
   localStorage.clear();
 });
@@ -180,28 +198,28 @@ describe("壳与路由", () => {
     expect(screen.getByTestId("panel-spaces")).toBeInTheDocument();
     expect(screen.getByTestId("panel-teams")).toBeInTheDocument();
     expect(screen.getByTestId("panel-results")).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "Peco 聊天" }),
-    ).toBeInTheDocument();
+    expectTopBarIndicator("Peco 聊天");
+    expectOnePageH1();
   });
 
   it("/peco?face=config 是能力配置面：顶栏跟着换标题", async () => {
     renderAt("/peco?face=config");
-    expect(
-      await screen.findByRole("heading", { name: "Peco 能力配置" }),
-    ).toBeInTheDocument();
     expect(await screen.findByTestId("peco-flip")).toHaveAttribute(
       "data-face",
       "config",
     );
+    await waitFor(() => expectTopBarIndicator("Peco 能力配置"));
+    // 配置面与聊天面常驻，「Peco」只能是唯一那个 h1；团队面板的标题降为 h2。
+    expectOnePageH1();
   });
 
   it("/spaces 是列表页，空态给一句事实", async () => {
     renderAt("/spaces");
     expect(
-      await screen.findByRole("heading", { name: "工作室" }),
+      await screen.findByRole("heading", { level: 1, name: "工作室" }),
     ).toBeInTheDocument();
     expect(await screen.findByText(/进行中/)).toBeInTheDocument();
+    expectOnePageH1();
   });
 
   it("/results 空台账给一句事实", async () => {
@@ -211,10 +229,11 @@ describe("壳与路由", () => {
 
   it("/spaces/new 两块同时可见，缺目录时主按钮禁用", async () => {
     renderAt("/spaces/new");
-    // topbar 与页面各有一个 h1「新建空间」：这里只验两块表单同屏可见。
+    // 顶栏只是位置指示，页面标题才是 h1：「新建空间」在全页只该有一个标题节点。
     expect(
-      (await screen.findAllByRole("heading", { name: "新建空间" })).length,
-    ).toBeGreaterThan(0);
+      await screen.findByRole("heading", { level: 1, name: "新建空间" }),
+    ).toBeInTheDocument();
+    expectOnePageH1();
     expect(screen.getByText("目录")).toBeInTheDocument();
     expect(screen.getByText("团队")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "创建并打开" })).toBeDisabled();
@@ -241,6 +260,27 @@ describe("壳与路由", () => {
     ).toBeInTheDocument();
     // 状态页不承载聊天：它没有单对话壳。
     expect(screen.queryByTestId("space-chat-shell")).toBeNull();
+  });
+
+  // 每页的 h1 由内容区提供，顶栏不再参与大纲：这里是全站口径的复测。
+  it.each([
+    ["/peco", "Peco"],
+    ["/peco?face=config", "Peco"],
+    ["/spaces", "工作室"],
+    ["/spaces/ws_peco", "Peco"],
+    ["/spaces/ws_peco/status", "Peco"],
+    ["/spaces/new", "新建空间"],
+    ["/teams", "团队"],
+    ["/teams/peco", "Peco"],
+    ["/results", "成果"],
+    ["/settings", "设置"],
+    ["/schedules", "定时任务"],
+  ])("%s 的内容区恰好 1 个 h1「%s」", async (path, title) => {
+    renderAt(path);
+    expect(
+      await screen.findByRole("heading", { level: 1, name: title }),
+    ).toBeInTheDocument();
+    expectOnePageH1();
   });
 
   it("未注册的路径给 404 文案，不是营销页", async () => {

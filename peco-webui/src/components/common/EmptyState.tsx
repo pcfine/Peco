@@ -12,7 +12,7 @@ interface EmptyStateProps {
 
 export function EmptyState({ title, action, className }: EmptyStateProps) {
   return (
-    <div className={cn("max-w-[480px] space-y-1 py-2", className)}>
+    <div className={cn("max-w-narrow space-y-1 py-2", className)}>
       <p className="text-sm text-ink-muted">{title}</p>
       {action}
     </div>

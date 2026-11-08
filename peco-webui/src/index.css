@@ -194,6 +194,28 @@
   }
 }
 
+/* 行内文字链只实扩高度；左右热区由调用点的 px-2 与 -mx-2 一起扩开，
+   两者配套才做到「热区变大、文字一个像素都不动」。移动档统一到 44。 */
+@layer components {
+  .tap-target {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.5rem;
+  }
+  @media (pointer: coarse) {
+    .tap-target {
+      min-height: 2.75rem;
+    }
+  }
+  /* 触摸档的主操作也要到 44：Button 的 h-8 / h-9 只在指针精确时成立。 */
+  @media (pointer: coarse) {
+    [data-slot="button"][data-size="sm"],
+    [data-slot="button"][data-size="default"] {
+      min-height: 2.75rem;
+    }
+  }
+}
+
 @layer utilities {
   .tabular-nums {
     font-variant-numeric: tabular-nums;

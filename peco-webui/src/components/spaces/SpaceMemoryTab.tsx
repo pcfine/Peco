@@ -197,7 +197,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
               }
             />
             {!filtered && (
-              <p className="mt-1 max-w-[480px] text-caption font-medium text-ink-faint">
+              <p className="mt-1 max-w-narrow text-caption font-medium text-ink-faint">
                 对话里确认下来的偏好与事实会记在这个空间名下。
               </p>
             )}
@@ -292,7 +292,7 @@ function MemoryDocumentBody({ wsId, docId }: { wsId: string; docId: string }) {
         </span>
       </div>
       {doc.content ? (
-        <p className="max-w-[640px] whitespace-pre-wrap break-words text-sm text-ink">
+        <p className="max-w-narrow whitespace-pre-wrap break-words text-sm text-ink">
           {doc.content}
         </p>
       ) : (

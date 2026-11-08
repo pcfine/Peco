@@ -34,7 +34,7 @@ export function CloseSpaceDialog({
   const total = (inflight?.dispatch ?? 0) + (inflight?.foreign ?? 0);
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onWait()}>
-      <DialogContent className="max-w-[420px]">
+      <DialogContent className="max-w-narrow">
         <DialogHeader>
           <DialogTitle>仍有 {total} 个任务在飞</DialogTitle>
           <DialogDescription>

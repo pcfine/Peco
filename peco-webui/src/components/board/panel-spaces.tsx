@@ -5,6 +5,7 @@ import { Link } from "react-router-dom";
 import { PanelShell } from "@/components/board/PanelShell";
 import { EmptyState } from "@/components/common/EmptyState";
 import { spaceLabel } from "@/components/layout/spaceLabel";
+import { Button } from "@/components/ui/button";
 import { usePeco } from "@/queries/peco";
 import { usePecoTodayTasks } from "@/queries/tasks";
 import { useSpaces } from "@/queries/spaces";
@@ -47,12 +48,9 @@ export function PanelSpaces() {
         <EmptyState
           title="还没有工作空间。空间 = 一个目录 + 一个团队。"
           action={
-            <Link
-              to="/spaces"
-              className="text-xs text-primary-ink hover:underline"
-            >
-              新建空间
-            </Link>
+            <Button asChild size="sm">
+              <Link to="/spaces">新建空间</Link>
+            </Button>
           }
         />
       ) : (
@@ -81,7 +79,7 @@ export function PanelSpaces() {
       {rest > 0 && (
         <Link
           to="/spaces"
-          className="mt-1 block text-caption font-medium text-ink-faint hover:text-ink"
+          className="tap-target mt-1 -mx-2 px-2 text-caption font-medium text-ink-faint hover:text-ink"
         >
           查看全部 {(spaces ?? []).length} 个空间 →
         </Link>

@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { PanelShell } from "@/components/board/PanelShell";
 import { EmptyState } from "@/components/common/EmptyState";
+import { Button } from "@/components/ui/button";
 import { useTeams } from "@/queries/teams";
 
 const VISIBLE_ROWS = 4;
@@ -22,12 +23,9 @@ export function PanelTeams() {
         <EmptyState
           title="只有一个 Peco 内置团队。"
           action={
-            <Link
-              to="/teams"
-              className="text-xs text-primary-ink hover:underline"
-            >
-              查看团队
-            </Link>
+            <Button asChild variant="ghost" size="sm">
+              <Link to="/teams">查看团队</Link>
+            </Button>
           }
         />
       ) : (
@@ -51,7 +49,7 @@ export function PanelTeams() {
       {(teams ?? []).length > 0 && (
         <Link
           to="/teams"
-          className="mt-1 block text-caption font-medium text-ink-faint hover:text-ink"
+          className="tap-target mt-1 -mx-2 px-2 text-caption font-medium text-ink-faint hover:text-ink"
         >
           全部团队
         </Link>

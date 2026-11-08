@@ -817,7 +817,7 @@ export function ChatView({
 
   return (
     <div
-      className={`mx-auto flex min-h-0 w-full max-w-[640px] flex-col ${className || "h-full"}`}
+      className={`mx-auto flex min-h-0 w-full max-w-narrow flex-col ${className || "h-full"}`}
     >
       {/* Header */}
       {!hideHeader && (

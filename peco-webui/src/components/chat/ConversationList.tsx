@@ -171,7 +171,7 @@ export function ConversationList({
           {/* Time — always in layout flow, invisible when actions shown */}
           <span
             className={cn(
-              "text-[10px] text-muted-foreground whitespace-nowrap group-hover:invisible",
+              "text-2xs text-muted-foreground whitespace-nowrap group-hover:invisible",
               isActive && "invisible",
             )}
           >
@@ -189,7 +189,8 @@ export function ConversationList({
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-5 w-5"
+                  className="h-6 w-6"
+                  aria-label="重命名对话"
                   onClick={(e) => {
                     e.stopPropagation();
                     startRename(conv);
@@ -200,7 +201,8 @@ export function ConversationList({
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-5 w-5"
+                  className="h-6 w-6"
+                  aria-label="归档对话"
                   onClick={(e) => {
                     e.stopPropagation();
                     onArchive(conv.id);
@@ -213,7 +215,8 @@ export function ConversationList({
             <Button
               variant="ghost"
               size="icon"
-              className="h-5 w-5 text-destructive hover:text-destructive"
+              className="h-6 w-6 text-destructive hover:text-destructive"
+              aria-label="删除对话"
               disabled={deletingId === conv.id}
               onClick={(e) => {
                 e.stopPropagation();
@@ -329,7 +332,7 @@ export function ConversationList({
                 <div className="mt-1">
                   {archivedLoading && <Skeleton className="h-6 w-full mx-2" />}
                   {!archivedLoading && archivedConversations.length === 0 && (
-                    <p className="text-[10px] text-muted-foreground px-2 py-1">
+                    <p className="text-2xs text-muted-foreground px-2 py-1">
                       暂无归档对话
                     </p>
                   )}

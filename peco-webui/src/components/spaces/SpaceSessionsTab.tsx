@@ -8,6 +8,7 @@ import { ChatView, type ChatMessage } from "@/components/chat/ChatView";
 import { ConversationList } from "@/components/chat/ConversationList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { Button } from "@/components/ui/button";
 import {
   conversationStreamUrl,
   createConversation,
@@ -169,14 +170,13 @@ export function SpaceSessionsTab({
             <EmptyState
               title="这个空间还没有会话。"
               action={
-                <button
-                  type="button"
+                <Button
+                  size="sm"
                   disabled={create.isPending}
                   onClick={() => create.mutate()}
-                  className="text-xs text-primary-ink hover:underline"
                 >
                   开始对话
-                </button>
+                </Button>
               }
             />
           </div>

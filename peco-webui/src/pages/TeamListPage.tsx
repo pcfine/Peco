@@ -56,7 +56,13 @@ export function TeamListPage() {
   const { data: teams, error, isPending, refetch } = useTeams();
 
   return (
-    <div className="space-y-4">
+    <div className="mx-auto w-full max-w-wide space-y-4">
+      <div className="flex h-8 items-center">
+        <h1 className="min-w-0 truncate text-xl font-semibold text-ink">
+          团队
+        </h1>
+      </div>
+
       {error && (
         <ErrorBanner
           message={errorText(error)}

@@ -82,9 +82,9 @@ export function NewSpacePage() {
   });
 
   return (
-    <div className="max-w-[720px] space-y-6">
+    <div className="mx-auto w-full max-w-mid space-y-6">
       <h1 className="text-xl font-semibold text-ink">新建空间</h1>
-      <p className="max-w-[640px] text-sm text-ink-muted">
+      <p className="max-w-narrow text-sm text-ink-muted">
         空间 = 一个目录 + 一个团队。目录里的 `.workspace.json` 记录它的身份，
         团队决定它能用哪些 agent 与 skill。
       </p>

@@ -41,7 +41,9 @@ export function SettingsPage() {
   const active = rows.find((team) => team.team_id === teamId) ?? null;
 
   return (
-    <div className="max-w-[880px] space-y-6">
+    <div className="mx-auto w-full max-w-mid space-y-6">
+      <h1 className="text-xl font-semibold text-ink">设置</h1>
+
       <section className="space-y-2">
         <div className="flex h-8 items-center gap-2 border-b border-line">
           <h2 className="text-xs font-semibold text-ink-muted">团队</h2>

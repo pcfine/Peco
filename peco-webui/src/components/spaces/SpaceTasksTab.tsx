@@ -132,7 +132,7 @@ export function SpaceTasksTab({
                     </p>
                     <p
                       className={cn(
-                        "max-w-[640px] whitespace-pre-wrap break-words text-sm",
+                        "max-w-narrow whitespace-pre-wrap break-words text-sm",
                         task.prompt_digest ? "text-ink" : "text-ink-faint",
                       )}
                     >
@@ -142,7 +142,7 @@ export function SpaceTasksTab({
                   <p className="text-caption font-medium text-ink-faint">
                     结果摘要
                   </p>
-                  <p className="max-w-[640px] whitespace-pre-wrap break-words text-sm text-ink">
+                  <p className="max-w-narrow whitespace-pre-wrap break-words text-sm text-ink">
                     {task.result_digest ?? "这条任务没有摘要。"}
                   </p>
                   {isNotableWakeState(task.wake_state) && (

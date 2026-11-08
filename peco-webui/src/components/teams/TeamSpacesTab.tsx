@@ -3,6 +3,7 @@
 
 import { Link } from "react-router-dom";
 import { EmptyState } from "@/components/common/EmptyState";
+import { Button } from "@/components/ui/button";
 import { relativeTime } from "@/lib/relative";
 import type { TeamSpace } from "@/types/daemon";
 
@@ -13,12 +14,9 @@ export function TeamSpacesTab({ spaces }: { spaces: TeamSpace[] }) {
         <EmptyState
           title="这个团队还没有绑定空间。"
           action={
-            <Link
-              to="/spaces/new"
-              className="text-xs text-primary-ink hover:underline"
-            >
-              新建空间
-            </Link>
+            <Button asChild size="sm">
+              <Link to="/spaces/new">新建空间</Link>
+            </Button>
           }
         />
       </div>

@@ -11,6 +11,7 @@ import {
   type SpaceGroup,
 } from "@/components/layout/SpaceStatusMark";
 import { spaceLabel } from "@/components/layout/spaceLabel";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { latestActivityByWs } from "@/components/board/panel-spaces";
 import { useEnterSpace } from "@/hooks/useOpenSpaces";
@@ -45,7 +46,7 @@ function SpaceRow({
         type="button"
         onClick={onEnter}
         aria-label={`进入空间 ${name}`}
-        className="flex min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
+        className="flex h-full min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
       >
         <span className="flex min-w-0 items-center gap-2">
           <SpaceStatusMark group={spaceGroupOf(space)} />
@@ -94,7 +95,7 @@ export function SpaceListPage() {
   }));
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto w-full max-w-wide space-y-6">
       {error && (
         <ErrorBanner
           message={errorText(error)}
@@ -102,13 +103,13 @@ export function SpaceListPage() {
         />
       )}
 
-      <div className="flex h-6 items-center justify-end">
-        <Link
-          to="/spaces/new"
-          className="text-xs text-primary-ink hover:underline"
-        >
-          新建空间
-        </Link>
+      <div className="flex h-8 items-center justify-between gap-2">
+        <h1 className="min-w-0 truncate text-xl font-semibold text-ink">
+          工作室
+        </h1>
+        <Button asChild size="sm">
+          <Link to="/spaces/new">新建空间</Link>
+        </Button>
       </div>
 
       {isPending && (
@@ -123,12 +124,9 @@ export function SpaceListPage() {
         <EmptyState
           title="还没有工作空间。空间 = 一个目录 + 一个团队。"
           action={
-            <Link
-              to="/spaces/new"
-              className="text-xs text-primary-ink hover:underline"
-            >
-              新建空间
-            </Link>
+            <Button asChild size="sm">
+              <Link to="/spaces/new">新建空间</Link>
+            </Button>
           }
         />
       )}
@@ -144,7 +142,7 @@ export function SpaceListPage() {
                 {rows.length}
               </span>
             </header>
-            <ul>
+            <ul className="min-w-0 overflow-x-auto">
               {rows.map((space) => (
                 <SpaceRow
                   key={space.ws_id}

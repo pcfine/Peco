@@ -71,7 +71,7 @@ function SpaceConversationChat({
   return (
     <>
       {history.error && (
-        <div className="max-w-[480px] shrink-0 px-3 pt-3">
+        <div className="max-w-narrow shrink-0 px-3 pt-3">
           <ErrorBanner
             message={errorText(history.error)}
             onRetry={() => void history.refetch()}
@@ -133,7 +133,7 @@ export function SpaceChatShell({ wsId, visible }: SpaceChatShellProps) {
       )}
     >
       {conversation.error ? (
-        <div className="max-w-[480px] p-3">
+        <div className="max-w-narrow p-3">
           <ErrorBanner
             message={errorText(conversation.error)}
             onRetry={() => void conversation.refetch()}

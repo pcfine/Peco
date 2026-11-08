@@ -154,7 +154,7 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
       )}
 
       {servers.length === 0 ? (
-        <p className="max-w-[480px] p-3 text-sm text-ink-muted">
+        <p className="max-w-narrow p-3 text-sm text-ink-muted">
           这个团队的 mcpconfig.json 里没有配
           server。点「编辑配置」可以直接粘一份 JSON 进来。
         </p>

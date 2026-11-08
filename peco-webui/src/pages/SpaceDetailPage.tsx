@@ -60,7 +60,10 @@ export function SpaceDetailPage() {
           message={errorText(space.error)}
           onRetry={() => void space.refetch()}
         />
-        <Link to="/spaces" className="text-xs text-primary-ink hover:underline">
+        <Link
+          to="/spaces"
+          className="tap-target -mx-2 self-start px-2 text-xs text-primary-ink hover:underline"
+        >
           返回工作室
         </Link>
       </div>

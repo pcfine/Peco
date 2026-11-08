@@ -101,7 +101,7 @@ export function SpaceDetailHeader({
         <span className="shrink-0">·</span>
         <Link
           to={`/teams/${encodeURIComponent(space.team_id)}`}
-          className="shrink-0 text-ink-muted hover:text-ink"
+          className="tap-target -mx-2 shrink-0 px-2 text-ink-muted hover:text-ink"
         >
           团队 {space.team_id}
         </Link>
@@ -123,7 +123,7 @@ export function SpaceDetailHeader({
           <button
             type="button"
             onClick={() => setCurrent(space.ws_id)}
-            className="shrink-0 text-primary-ink hover:underline"
+            className="tap-target -mx-2 shrink-0 px-2 text-primary-ink hover:underline"
           >
             设为当前
           </button>

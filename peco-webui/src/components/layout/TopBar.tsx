@@ -63,9 +63,9 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
         </button>
       )}
       {railOffscreen && <SpaceSwitcher />}
-      <h1 className="truncate text-sm font-semibold text-ink">
+      <p className="truncate text-caption font-medium text-ink-muted">
         {titleOf(pathname, search)}
-      </h1>
+      </p>
 
       <div className="ml-auto flex items-center gap-1">
         <button
