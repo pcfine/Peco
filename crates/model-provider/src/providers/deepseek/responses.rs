@@ -1052,7 +1052,6 @@ impl ModelProvider for DeepSeekResponsesAdapter {
         );
 
         async move {
-            let started = std::time::Instant::now();
             let body =
                 build_responses_request_body(request, false, self.strict_feature_validation)?;
             let input = logging::summarize_input(&request.input);
@@ -1091,6 +1090,7 @@ impl ModelProvider for DeepSeekResponsesAdapter {
                 "responses request body (full)"
             );
 
+            let started = std::time::Instant::now();
             let response = self
                 .http_client
                 .post(&endpoint)

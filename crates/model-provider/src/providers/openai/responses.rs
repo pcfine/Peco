@@ -1144,7 +1144,6 @@ impl ModelProvider for OpenAiResponsesAdapter {
         );
 
         async move {
-            let started = std::time::Instant::now();
             let body = build_responses_request_body(request, false)?;
             let input = logging::summarize_input(&request.input);
 
@@ -1177,6 +1176,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 "responses request body (full)"
             );
 
+            let started = std::time::Instant::now();
             let response = self
                 .http_client
                 .post(&endpoint)
