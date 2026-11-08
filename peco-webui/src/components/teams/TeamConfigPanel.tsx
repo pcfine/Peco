@@ -1,8 +1,16 @@
-// 团队能力配置面：头部 + tab + 内容。`/teams/:teamId` 与 Peco 翻转面共用这一份 ——
+// 团队能力配置面：头部 + 左侧分类栏 + 内容区。`/teams/:teamId` 与 Peco 翻转面共用这一份 ——
 // 两处差别只在「有没有绑定空间」「能不能再装配空间」以及页面级导航。
 
-import type { ReactNode } from "react";
+import { Fragment, type ComponentType, type ReactNode } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  BookOpen,
+  Bot,
+  BrainCircuit,
+  FolderOpen,
+  Plug,
+  Puzzle,
+} from "lucide-react";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { SpaceMemoryTab } from "@/components/spaces/SpaceMemoryTab";
@@ -18,16 +26,7 @@ import { useTeam } from "@/queries/teamDetail";
 import { errorText } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-const TAB_ORDER = [
-  "agents",
-  "skills",
-  "mcp",
-  "knowledge",
-  "spaces",
-  "memory",
-] as const;
-
-type TeamTab = (typeof TAB_ORDER)[number];
+type TeamTab = "agents" | "skills" | "mcp" | "knowledge" | "spaces" | "memory";
 
 const TAB_LABELS: Record<TeamTab, string> = {
   agents: "agents",
@@ -38,12 +37,32 @@ const TAB_LABELS: Record<TeamTab, string> = {
   memory: "记忆",
 };
 
+const TAB_ICONS: Record<TeamTab, ComponentType<{ className?: string }>> = {
+  agents: Bot,
+  skills: Puzzle,
+  mcp: Plug,
+  knowledge: BookOpen,
+  spaces: FolderOpen,
+  memory: BrainCircuit,
+};
+
+/** 需要「该团队已打开的空间」作请求头的那几个 tab：能力根都在空间里。 */
 const RESOURCE_TABS: readonly TeamTab[] = [
   "agents",
   "skills",
   "mcp",
   "knowledge",
 ];
+
+/** 分类栏的两个分组；组内顺序就是导航顺序，`TAB_ORDER` 也从这里展开。 */
+const TAB_GROUPS: readonly { title: string; items: readonly TeamTab[] }[] = [
+  { title: "能力", items: RESOURCE_TABS },
+  { title: "其他", items: ["spaces", "memory"] },
+];
+
+const TAB_ORDER: readonly TeamTab[] = TAB_GROUPS.flatMap(
+  (group) => group.items,
+);
 
 /** 存档里可能是被隐藏的 tab（Peco 面没有「绑定空间」），回落到第一个。 */
 function parseTab(raw: string | null, tabs: readonly TeamTab[]): TeamTab {
@@ -90,6 +109,10 @@ export function TeamConfigPanel({
   const tabs = hideSpaces
     ? TAB_ORDER.filter((item) => item !== "spaces")
     : TAB_ORDER;
+  const groups = TAB_GROUPS.map((group) => ({
+    title: group.title,
+    items: group.items.filter((item) => tabs.includes(item)),
+  })).filter((group) => group.items.length > 0);
   const tab = parseTab(searchParams.get("tab"), tabs);
   const team = useTeam(teamId);
 
@@ -132,7 +155,7 @@ export function TeamConfigPanel({
   const Heading = headingLevel;
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="@container/team flex h-full min-h-0 flex-col">
       <header className="shrink-0 border-b border-line px-3 py-3">
         <div className="flex h-8 items-center gap-2">
           <Heading className="truncate text-xl font-semibold text-ink">
@@ -165,52 +188,88 @@ export function TeamConfigPanel({
         )}
       </header>
 
-      <div
-        role="tablist"
-        className="flex h-9 shrink-0 items-stretch gap-1 overflow-x-auto border-b border-line"
-      >
-        {tabs.map((item) => (
-          <button
-            key={item}
-            type="button"
-            role="tab"
-            aria-selected={tab === item}
-            onClick={() => setTab(item)}
-            className={cn(
-              "my-1 shrink-0 rounded-[4px] px-3 text-sm",
-              tab === item
-                ? "bg-line text-ink"
-                : "bg-transparent text-ink-muted hover:bg-line/40",
-            )}
-          >
-            {TAB_LABELS[item]}
-          </button>
-        ))}
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {RESOURCE_TABS.includes(tab) &&
-          (wsId ? null : (
-            <div className="p-3">
-              {noSpaceNotice ?? (
-                <EmptyState title="这个团队还没有已打开的空间。先打开一个绑定空间，才能读写它的能力根。" />
+      <div className="flex min-h-0 flex-1">
+        <nav
+          role="tablist"
+          aria-orientation="vertical"
+          className="flex w-44 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-line bg-rail/50 px-2 py-2 @max-[560px]/team:w-12 @max-[560px]/team:px-1"
+        >
+          {groups.map((group, index) => (
+            <Fragment key={group.title}>
+              {index > 0 && (
+                <div className="my-2 border-t border-line" role="separator" />
               )}
-            </div>
+              <div className="px-2 py-1 text-caption font-medium text-ink-faint @max-[560px]/team:hidden">
+                {group.title}
+              </div>
+              {group.items.map((item) => {
+                const active = tab === item;
+                const Icon = TAB_ICONS[item];
+                return (
+                  <button
+                    key={item}
+                    type="button"
+                    role="tab"
+                    id={`team-tab-${item}`}
+                    aria-controls={`team-panel-${item}`}
+                    aria-selected={active}
+                    title={TAB_LABELS[item]}
+                    aria-label={TAB_LABELS[item]}
+                    onClick={() => setTab(item)}
+                    className={cn(
+                      "flex h-8 shrink-0 items-center gap-2 rounded-[6px] px-2 text-[13px] @max-[560px]/team:justify-center @max-[560px]/team:px-0",
+                      active
+                        ? "bg-line/50 font-medium text-ink"
+                        : "text-ink-muted hover:bg-line/25",
+                    )}
+                  >
+                    <Icon
+                      className={cn(
+                        "size-4 shrink-0",
+                        active ? "text-brand" : "text-ink-faint",
+                      )}
+                    />
+                    <span className="truncate @max-[560px]/team:hidden">
+                      {TAB_LABELS[item]}
+                    </span>
+                  </button>
+                );
+              })}
+            </Fragment>
           ))}
+        </nav>
 
-        {tab === "agents" && wsId && <TeamAgentsTab wsId={wsId} />}
-        {tab === "skills" && wsId && <TeamSkillsTab wsId={wsId} />}
-        {tab === "mcp" && wsId && <TeamMcpTab wsId={wsId} />}
-        {tab === "knowledge" && wsId && (
-          <TeamKnowledgeTab wsId={wsId} detail={detail} />
-        )}
-        {tab === "spaces" && <TeamSpacesTab spaces={detail.spaces} />}
-        {tab === "memory" &&
-          (memoryWsId ? (
-            <SpaceMemoryTab wsId={memoryWsId} />
-          ) : (
-            <TeamMemoryTab />
-          ))}
+        <div
+          role="tabpanel"
+          id={`team-panel-${tab}`}
+          aria-labelledby={`team-tab-${tab}`}
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+        >
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {RESOURCE_TABS.includes(tab) &&
+              (wsId ? null : (
+                <div className="p-3">
+                  {noSpaceNotice ?? (
+                    <EmptyState title="这个团队还没有已打开的空间。先打开一个绑定空间，才能读写它的能力根。" />
+                  )}
+                </div>
+              ))}
+
+            {tab === "agents" && wsId && <TeamAgentsTab wsId={wsId} />}
+            {tab === "skills" && wsId && <TeamSkillsTab wsId={wsId} />}
+            {tab === "mcp" && wsId && <TeamMcpTab wsId={wsId} />}
+            {tab === "knowledge" && wsId && (
+              <TeamKnowledgeTab wsId={wsId} detail={detail} />
+            )}
+            {tab === "spaces" && <TeamSpacesTab spaces={detail.spaces} />}
+            {tab === "memory" &&
+              (memoryWsId ? (
+                <SpaceMemoryTab wsId={memoryWsId} />
+              ) : (
+                <TeamMemoryTab />
+              ))}
+          </div>
+        </div>
       </div>
     </div>
   );

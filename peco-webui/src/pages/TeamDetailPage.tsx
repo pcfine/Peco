@@ -16,10 +16,10 @@ export function TeamDetailPage() {
       (space) => space.team_id === teamId && space.status === "open",
     )?.ws_id ?? null;
 
-  // 团队详情是 mid 档：容器锁在这里，`TeamConfigPanel` 自己不锁宽 ——
-  // `/peco` 复用同一份面板时它的配置面是 wide。
+  // 团队详情是 wide 档：分类栏 176 + 资源列表 256 + 编辑区都要放下，
+  // 容器锁在这里，`TeamConfigPanel` 自己不锁宽 —— `/peco` 复用同一份面板。
   return (
-    <div className="mx-auto h-full w-full max-w-mid">
+    <div className="mx-auto h-full w-full max-w-wide">
       <TeamConfigPanel teamId={teamId} wsId={wsId} showBackToList />
     </div>
   );
