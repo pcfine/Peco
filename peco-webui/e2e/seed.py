@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""浏览器验收台的演示数据：只写 daemon 的 SQLite，不发任何 HTTP 请求。
+"""浏览器验收台的演示数据：写 daemon 的 SQLite、团队能力根与空间工作目录，不发 HTTP 请求。
 
-数据是为了让断言「有东西可量」而造的最小集合：多行空间列表（/spaces 才有行高可测、
-main 才有滚动余量）、覆盖各 task_state / wake_state 的台账行（台账行高与唤醒标记）、
-一条带 markdown 正文的会话（正文行宽与垂直贴合）。
+数据是为了让断言「有东西可量」而造的最小集合：足够多的空间（左栏才有滚动余量）、
+覆盖各 task_state / wake_state 的台账行（任务角标与台账标记）、一条带 markdown 正文的
+会话（正文行宽与垂直贴合）、每个空间一份可浏览的文件树（右栏「文件」默认模式才有行）。
+
+团队能力根按仓库内置模板装：daemon 打开空间要求 `teams/<id>/` 存在，能力计数也在这
+一份目录上数，手抄一份 `agent.md` 迟早与模板漂开。
 
 时间列一律写 UTC 无时区串，与 daemon 的 `datetime('now')` 同格式。
 """
@@ -13,11 +16,25 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
 
 TEAMS = {"legal": "法务", "finance": "财务", "ops": "运维"}
+
+# 团队能力根的权威来源：与 daemon 引导装 Peco 用的是同一套模板。
+TEAM_TEMPLATE = (
+    Path(__file__).resolve().parents[2]
+    / "crates/peco-agents/templates/team_default"
+)
+
+# 每个空间工作目录里放两样东西：根目录下一个文件、`output/` 下一份产出。
+# 空目录会让「文件」面板的默认模式与空态分不开。
+WORK_FILES = [
+    ("README.md", "# {label}\n\n这个目录由验收台播种：右栏「文件」面板要有一棵树可浏览。\n"),
+    ("output/摘要.md", "## {label} 产出摘要\n\n- 三条待确认事项\n"),
+]
 
 # (ws_id 后缀, label, team, 是否已关闭)
 DEMO_SPACES = [
@@ -168,10 +185,28 @@ CONVERSATION_MESSAGES = [
 ]
 
 
+def materialize_team(home: Path, team_id: str) -> None:
+    """装一份团队能力根：没有它就打不开该团队的空间（daemon 会报 team_missing）。"""
+    if not TEAM_TEMPLATE.is_dir():
+        raise SystemExit(f"找不到团队模板 {TEAM_TEMPLATE}")
+    shutil.copytree(TEAM_TEMPLATE, home / "teams" / team_id, dirs_exist_ok=True)
+
+
+def materialize_work_files(work_dir: Path, label: str) -> None:
+    """给空间的工作目录写上可浏览的文件，覆盖根目录与 `output/` 两种行。"""
+    for name, template in WORK_FILES:
+        target = work_dir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(template.format(label=label))
+
+
 def seed(home: Path) -> None:
     db = home / "peco.db"
     if not db.exists():
         raise SystemExit(f"找不到 {db}：daemon 还没建库，先等它引导完成再灌数据")
+
+    for team_id in TEAMS:
+        materialize_team(home, team_id)
 
     conn = sqlite3.connect(db)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -195,6 +230,7 @@ def seed(home: Path) -> None:
                 ws_id = f"ws_demo_{suffix}"
                 work_dir = home / "spaces" / f"demo_{suffix}" / "work"
                 work_dir.mkdir(parents=True, exist_ok=True)
+                materialize_work_files(work_dir, label)
                 conn.execute(
                     "INSERT INTO workspaces (id, work_dir, team_id, label, exit_policy, "
                     "created_at, last_opened_at, closed_at) VALUES (?, ?, ?, ?, 'inherit', ?, ?, ?)",
@@ -244,7 +280,8 @@ def seed(home: Path) -> None:
         conn.close()
 
     print(
-        f"[seed] {db}: {len(DEMO_SPACES)} 个演示空间 + {len(dispatches())} 条台账行 + "
+        f"[seed] {db}: {len(TEAMS)} 个团队能力根 + {len(DEMO_SPACES)} 个演示空间"
+        f"（各 {len(WORK_FILES)} 个文件）+ {len(dispatches())} 条台账行 + "
         f"1 条会话（{len(CONVERSATION_MESSAGES)} 条消息）"
     )
 
