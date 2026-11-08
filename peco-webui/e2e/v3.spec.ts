@@ -266,7 +266,6 @@ async function openSession(
         JSON.stringify({
           state: {
             open: preset.dockOpen ?? true,
-            sheetOpen: false,
             tab: "chat",
             conversationByWs: {},
           },
@@ -380,6 +379,7 @@ async function settle(page: Page, ms = 700): Promise<void> {
 interface Bar {
   width: number;
   height: number;
+  left: number;
   right: number;
   scrollWidth: number;
   clientWidth: number;
@@ -389,7 +389,10 @@ interface ShellFacts {
   rail: Bar | null;
   chat: Bar | null;
   panel: Bar | null;
-  dockColumn: Bar | null;
+  /** Peco 抽屉：常驻挂载，关着时靠 translateX 移出视口。 */
+  dock: Bar | null;
+  /** 抽屉的水平位移（px，关着为 −抽屉宽）。 */
+  dockTranslate: number | null;
   dockBottom: Bar | null;
   dockSheet: Bar | null;
   drawer: Bar | null;
@@ -398,7 +401,7 @@ interface ShellFacts {
   expandRail: number;
 }
 
-/** 壳层几何：rail / 聊天列 / 右栏 / dock 三形态 / 抽屉 / main，一次读齐。 */
+/** 壳层几何：rail / 聊天列 / 右栏 / Peco 抽屉 / 右栏抽屉 / main，一次读齐。 */
 async function shellFacts(page: Page): Promise<ShellFacts> {
   return page.evaluate(() => {
     const bar = (element: Element | null) => {
@@ -408,10 +411,29 @@ async function shellFacts(page: Page): Promise<ShellFacts> {
       return {
         width: Math.round(rect.width),
         height: Math.round(rect.height),
+        left: Math.round(rect.left),
         right: Math.round(rect.right),
         scrollWidth: node.scrollWidth,
         clientWidth: node.clientWidth,
       };
+    };
+    /**
+     * 读水平位移：Tailwind v4 的 `translate-x-*` 落在 CSS `translate` 属性上，
+     * 不是 `transform`（后者恒为 none，读它会把「移出视口」误判成 0）。
+     * `none` 记 0；百分比按元素自身宽度折成 px。
+     */
+    const translateX = (element: Element | null) => {
+      if (!element) return null;
+      const raw = getComputedStyle(element).translate;
+      if (!raw || raw === "none") return 0;
+      const first = raw.trim().split(/\s+/)[0];
+      const value = Number.parseFloat(first);
+      if (Number.isNaN(value)) return null;
+      return Math.round(
+        first.endsWith("%")
+          ? (value / 100) * element.getBoundingClientRect().width
+          : value,
+      );
     };
     return {
       rail: bar(document.querySelector("aside:not([id]):not([data-testid])")),
@@ -421,7 +443,8 @@ async function shellFacts(page: Page): Promise<ShellFacts> {
         ),
       ),
       panel: bar(document.querySelector('[data-testid="space-panel"]')),
-      dockColumn: bar(document.querySelector("#peco-dock")),
+      dock: bar(document.querySelector("#peco-dock")),
+      dockTranslate: translateX(document.querySelector("#peco-dock")),
       dockBottom: bar(document.querySelector("#peco-dock-bottom")),
       dockSheet: bar(document.querySelector("#peco-dock-sheet")),
       drawer: bar(
@@ -556,12 +579,14 @@ async function borderFacts(page: Page): Promise<BorderFacts> {
       });
       if (bordered) {
         stroked += 1;
-        // 选中态的圆角矩形描边是记号不是装饰：`aria-pressed` / `aria-current` /
-        // `data-state=on` 任一成立就放行，非选中态仍按 0 描边判。
+        // 选中/展开态的圆角矩形描边是记号不是装饰：`aria-pressed` / `aria-current` /
+        // `data-state=on` / `aria-expanded=true` 任一成立就放行，其余仍按 0 描边判。
+        // 左栏品牌行既是 Peco 抽屉的开关，也是它的选中态（抽屉开着 ⇒ aria-expanded）。
         const selected =
           element.getAttribute("aria-pressed") === "true" ||
           element.hasAttribute("aria-current") ||
-          element.getAttribute("data-state") === "on";
+          element.getAttribute("data-state") === "on" ||
+          element.getAttribute("aria-expanded") === "true";
         if (
           element.tagName === "BUTTON" &&
           !selected &&
@@ -984,7 +1009,7 @@ function adHocContainers(root: string): string[] {
 
 // ── 断言 ───────────────────────────────────────────────────────────────────
 
-test("壳层宽度：1920 / 1440 三列全在场（A1–A4）", async ({ browser }) => {
+test("壳层宽度：1920 / 1440（A1–A4）", async ({ browser }) => {
   const session = await openSession(browser, {
     viewport: VIEW.wide,
     path: `/spaces/${CHAT_WS}`,
@@ -995,37 +1020,39 @@ test("壳层宽度：1920 / 1440 三列全在场（A1–A4）", async ({ browser
   try {
     const wide = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 1008),
+      (facts) => near(facts.chat?.width ?? 0, 1368),
     );
     check(
       "A1",
-      "1920：聊天列宽 1008（±1）",
-      near(wide.chat?.width, 1008),
+      "1920：聊天列宽 1368（±1）",
+      near(wide.chat?.width, 1368),
       true,
-      `实测 ${wide.chat?.width}px（rail ${wide.rail?.width}px / dock ${wide.dockColumn?.width}px / 右栏 ${wide.panel?.width}px）`,
+      `实测 ${wide.chat?.width}px（rail ${wide.rail?.width}px / 抽屉 ${wide.dock?.width}px / 右栏 ${wide.panel?.width}px）`,
     );
 
     await page.setViewportSize(VIEW.trio);
+    // 抽屉滑入是 120ms 过渡：位移归 0 再量，否则会采到 -61% 这种中间帧。
     const trio = await until(
       () => shellFacts(page),
       (facts) =>
-        near(facts.chat?.width ?? 0, 528) &&
-        facts.dockColumn !== null &&
+        near(facts.chat?.width ?? 0, 888) &&
+        facts.dock?.width === 400 &&
+        facts.dockTranslate === 0 &&
         facts.panel !== null,
     );
     check(
       "A2",
-      "1440：聊天列宽 528（±1）",
-      near(trio.chat?.width, 528),
+      "1440：聊天列宽 888（±1）",
+      near(trio.chat?.width, 888),
       true,
       `实测 ${trio.chat?.width}px`,
     );
     check(
       "A3",
-      "1440：#peco-dock 宽 360",
-      trio.dockColumn?.width ?? null,
-      360,
-      `实测 ${trio.dockColumn?.width}px`,
+      "1440：#peco-dock 宽 400、left = rail 208、translateX 0",
+      [trio.dock?.width ?? null, trio.dock?.left ?? null, trio.dockTranslate],
+      [400, 208, 0],
+      `实测 宽 ${trio.dock?.width}px、left ${trio.dock?.left}px、translateX ${trio.dockTranslate}px`,
     );
     check(
       "A4",
@@ -1039,7 +1066,7 @@ test("壳层宽度：1920 / 1440 三列全在场（A1–A4）", async ({ browser
   }
 });
 
-test("壳层宽度：dock 出列与 rail 图标轨（A5–A10）", async ({ browser }) => {
+test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ browser }) => {
   const session = await openSession(browser, {
     viewport: VIEW.dockBar,
     path: `/spaces/${CHAT_WS}`,
@@ -1050,14 +1077,22 @@ test("壳层宽度：dock 出列与 rail 图标轨（A5–A10）", async ({ brow
   try {
     const bar = await until(
       () => shellFacts(page),
-      (facts) => facts.dockBottom !== null && near(facts.chat?.width ?? 0, 728),
+      (facts) =>
+        near(facts.chat?.width ?? 0, 728) &&
+        facts.dock !== null &&
+        facts.dockTranslate === -400,
     );
     check(
       "A5",
-      "1280：#peco-dock 不存在、底部停靠条存在且收起高 40",
-      [bar.dockColumn, bar.dockBottom?.height ?? null],
-      [null, 40],
-      `实测 dock 右列 ${bar.dockColumn === null ? "null" : `${bar.dockColumn.width}px`}、底部条 ${bar.dockBottom?.height}px`,
+      "1280：抽屉宽 400 且整块移出视口（translateX -400）、#peco-dock-bottom 与 #peco-dock-sheet 都不存在",
+      [
+        bar.dock?.width ?? null,
+        bar.dockTranslate,
+        bar.dockBottom,
+        bar.dockSheet,
+      ],
+      [400, -400, null, null],
+      `实测 抽屉 ${bar.dock?.width}px、translateX ${bar.dockTranslate}px、底部条 ${bar.dockBottom === null ? "null" : "存在"}、覆盖 Sheet ${bar.dockSheet === null ? "null" : "存在"}`,
     );
     check(
       "A6",
@@ -1340,6 +1375,8 @@ test("h1 唯一性与顶栏标题（B5 / B6 / B7）", async ({ browser }) => {
   });
   const { page } = session;
   const counts: Record<string, number> = {};
+  /** 1440 时 shell 里没有 header：顶栏只在 <1100 存在。 */
+  let bannerAtWide: number | null = null;
   let bannerH1: number | null = null;
   let bannerParagraphs: { text: string; size: string }[] = [];
   let detailH1: string[] | null = null;
@@ -1352,8 +1389,14 @@ test("h1 唯一性与顶栏标题（B5 / B6 / B7）", async ({ browser }) => {
         () => document.querySelectorAll("h1").length,
       );
       if (route.id === "spaces") {
+        bannerAtWide = await page.evaluate(
+          () => document.querySelectorAll('[data-slot="topbar"]').length,
+        );
+        // 窄档才有顶栏：换到 1024 量它的内部构成，量完换回来。
+        await page.setViewportSize({ width: 1024, height: 800 });
+        await settle(page, 400);
         const header = await page.evaluate(() => {
-          const node = document.querySelector("header");
+          const node = document.querySelector('[data-slot="topbar"]');
           return {
             h1: node ? node.querySelectorAll("h1").length : -1,
             paragraphs: node
@@ -1366,6 +1409,8 @@ test("h1 唯一性与顶栏标题（B5 / B6 / B7）", async ({ browser }) => {
         });
         bannerH1 = header.h1;
         bannerParagraphs = header.paragraphs;
+        await page.setViewportSize(VIEW.trio);
+        await settle(page, 400);
       }
       if (route.id === "space")
         detailH1 = await page.evaluate(() => {
@@ -1393,9 +1438,9 @@ test("h1 唯一性与顶栏标题（B5 / B6 / B7）", async ({ browser }) => {
   const captions = bannerParagraphs.filter((item) => item.size === "12px");
   check(
     "B6",
-    "顶栏 header 内无 h1，标题节点是 12px 的 p",
-    [bannerH1, captions.length > 0],
-    [0, true],
+    "1440 无顶栏；1024 的顶栏内无 h1，标题节点是 12px 的 p",
+    [bannerAtWide, bannerH1, captions.length > 0],
+    [0, 0, true],
     `实测 header 内 p：${bannerParagraphs
       .map((item) => `${item.text}(${item.size})`)
       .join("，")}`,
@@ -1483,7 +1528,7 @@ test("边框与圆角（C1 / C2 / C3 / C5 / C6 / C8）", async ({ browser }) => 
   );
   check(
     "C3",
-    "非选中态 button 上可见描边数 = 0（排除 select 触发器；选中态圆角矩形描边允许）",
+    "非选中态 button 上可见描边数 = 0（排除 select 触发器；选中/展开态圆角矩形描边允许）",
     buttons,
     [],
     buttons.length > 0
@@ -1993,12 +2038,13 @@ test("滚动位置保持（F3 / F4）", async ({ browser }) => {
     });
     await settle(page, 400);
     const before = await scrollTo(page, statusScroller, 600);
-    await page.locator('header button[aria-label="Peco 对话"]').click();
+    // 宽屏的抽屉开关是左栏品牌行那枚按钮（顶栏在 ≥1100 已不存在）。
+    await page.getByRole("button", { name: "Peco 对话", exact: true }).click();
     await page.waitForTimeout(300);
     const afterDock = await scrollTopOf(page, statusScroller);
     check(
       "F4",
-      "折叠 dock 前后聊天滚动位置差 0",
+      "收起 Peco 抽屉前后聊天滚动位置差 0",
       [afterDock - before, before >= 300],
       [0, true],
       `操作前 ${before}px、操作后 ${afterDock}px（口径：main 内的 [data-slot=message-scroller]）`,
@@ -2008,7 +2054,7 @@ test("滚动位置保持（F3 / F4）", async ({ browser }) => {
   }
 });
 
-test("底部停靠条占布局高度（F5）", async ({ browser }) => {
+test("抽屉覆盖不占布局（F5）", async ({ browser }) => {
   const session = await openSession(browser, {
     viewport: VIEW.dockBar,
     path: `/spaces/${CHAT_WS}`,
@@ -2017,24 +2063,24 @@ test("底部停靠条占布局高度（F5）", async ({ browser }) => {
   });
   const { page } = session;
   try {
-    const collapsed = await until(
+    const closed = await until(
       () => shellFacts(page),
-      (facts) => facts.dockBottom !== null && facts.main !== null,
+      (facts) => facts.dock !== null && facts.main !== null,
     );
-    await page
-      .locator('#peco-dock-bottom button[aria-expanded="false"]')
-      .click();
-    const expanded = await until(
+    await page.getByRole("button", { name: "Peco 对话", exact: true }).click();
+    const opened = await until(
       () => shellFacts(page),
-      (facts) => (facts.dockBottom?.height ?? 0) > 40,
+      (facts) => facts.dockTranslate === 0,
     );
-    const delta = (collapsed.main?.height ?? 0) - (expanded.main?.height ?? 0);
+    const delta = Math.abs(
+      (opened.main?.height ?? 0) - (closed.main?.height ?? 0),
+    );
     check(
       "F5",
-      "1280：展开底部条后 #main 高度减少 ≥300（占布局高度，不 overlay）",
-      delta >= 300,
-      true,
-      `实测 main ${collapsed.main?.height}px → ${expanded.main?.height}px（差 ${delta}px），dock 高 ${collapsed.dockBottom?.height}px → ${expanded.dockBottom?.height}px`,
+      "1280：抽屉开合后 #main 高度不变（覆盖层，不占布局）",
+      delta,
+      0,
+      `实测 main ${closed.main?.height}px → ${opened.main?.height}px（差 ${delta}px），抽屉 translateX ${closed.dockTranslate}px → ${opened.dockTranslate}px`,
     );
   } finally {
     await session.dispose();

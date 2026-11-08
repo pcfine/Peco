@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Rail } from "@/components/layout/Rail";
+import { useDockStore } from "@/stores/dockStore";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useSpaceStore } from "@/stores/spaceStore";
 import type { Space } from "@/types/daemon";
@@ -87,10 +88,31 @@ beforeEach(() => {
   ensureSpaceConversation.mockClear();
   closeSpace.mockClear();
   useSpaceStore.setState({ currentWsId: "ws_peco" });
+  useDockStore.setState({ open: false });
   useOpenSpacesStore.setState({
     openIds: ["ws_a"],
     activeWsId: "ws_a",
     seeded: true,
+  });
+});
+
+describe("左栏品牌行", () => {
+  it("品牌按钮只 toggle 抽屉，不导航", async () => {
+    renderRail(false, "/peco");
+
+    const trigger = await screen.findByRole("button", { name: "Peco 对话" });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger).toHaveAttribute("aria-controls", "peco-dock");
+
+    fireEvent.click(trigger);
+    expect(useDockStore.getState().open).toBe(true);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    // 开关不是导航入口：点了还停在原页。
+    expect(screen.getByTestId("path")).toHaveTextContent(/^\/peco$/);
+
+    fireEvent.click(trigger);
+    expect(useDockStore.getState().open).toBe(false);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
 });
 

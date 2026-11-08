@@ -22,6 +22,7 @@ import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
 import { useRecentResults } from "@/queries/tasks";
 import { useTeams } from "@/queries/teams";
+import { useDockStore } from "@/stores/dockStore";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useThemeStore } from "@/stores/themeStore";
 import { useUiStore } from "@/stores/uiStore";
@@ -39,6 +40,8 @@ export function Rail({
 }) {
   const railOpen = useUiStore((state) => state.railOpen);
   const setRailOpen = useUiStore((state) => state.setRailOpen);
+  const dockOpen = useDockStore((state) => state.open);
+  const toggleDock = useDockStore((state) => state.toggle);
   const theme = useThemeStore((state) => state.theme);
   const setTheme = useThemeStore((state) => state.setTheme);
   const openIds = useOpenSpacesStore((state) => state.openIds);
@@ -114,9 +117,11 @@ export function Rail({
 
   return (
     // 宽度只能由 `collapsed` 决定：让它跟着内容走，空间一多主区就被挤窄。
+    // 左栏压在 Peco 抽屉上：抽屉收起时整块移出视口，它的右半正好落在左栏位置，
+    // 而左栏是抽屉的滑动起点，被盖住就看不见开关了。
     <aside
       className={cn(
-        "flex h-full shrink-0 flex-col border-r border-line bg-rail",
+        "relative z-50 flex h-full shrink-0 flex-col border-r border-line bg-rail",
         collapsed ? "w-16" : "w-52",
       )}
     >
@@ -128,10 +133,30 @@ export function Rail({
           collapsed ? "justify-center gap-1 px-1" : "gap-2 pl-3 pr-2",
         )}
       >
-        <BrandMark size={20} />
-        {!collapsed && (
-          <span className="text-heading font-semibold text-ink">Peco</span>
-        )}
+        {/* 品牌行就是抽屉开关：展开态整块可点，收起态只剩图标。 */}
+        <button
+          type="button"
+          onClick={toggleDock}
+          aria-label="Peco 对话"
+          aria-expanded={dockOpen}
+          aria-controls="peco-dock"
+          className={cn(
+            "flex items-center rounded-[6px] border transition-colors duration-[120ms]",
+            collapsed
+              ? "size-7 justify-center"
+              : "h-8 min-w-0 flex-1 gap-2 px-2",
+            dockOpen
+              ? "border-brand/40 bg-brand/10 text-ink"
+              : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
+          )}
+        >
+          <BrandMark size={20} />
+          {!collapsed && (
+            <span className="min-w-0 truncate text-heading font-semibold">
+              Peco
+            </span>
+          )}
+        </button>
         {collapsible && (
           <button
             type="button"
