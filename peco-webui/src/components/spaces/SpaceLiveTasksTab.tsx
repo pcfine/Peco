@@ -1,7 +1,8 @@
-// 空间右栏的「任务」：优先读 TaskHub 的实时快照，空间未打开才回落台账。
+// 空间右栏的「任务」：优先读 TaskHub 的实时快照，快照里没有这份历史时回落台账。
 //
 // 两种来源对应两种保真度：实时快照有输出尾巴与进度，台账只有 512 字摘要。
-// 数据源写不出来的话，用户会把摘要当成完整结果，所以顶部一定要标。
+// 数据源写不出来的话，用户会把摘要当成完整结果，所以顶部一定要标 —— 只在真有
+// 台账行可标时才标，空面板上挂「摘要」会让人以为结果被截断。
 //
 // 快照里没有 agent 与 prompt（Hub 只存执行体无关的部分），这两列按 `task_id`
 // 从台账行里取；台账行比快照晚一步落地的那一瞬间，两列就是空。
@@ -10,7 +11,6 @@ import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { TaskStateMark } from "@/components/common/TaskStateMark";
 import { SpaceTasksTab } from "@/components/spaces/SpaceTasksTab";
@@ -63,23 +63,20 @@ export function SpaceLiveTasksTab({ wsId }: { wsId: string }) {
     );
   }
 
-  // 409：这个空间的 Hub 不在，只剩台账里那 512 字摘要。
-  if (live.error || !live.data) {
+  // 409：这个空间的 Hub 不在，只剩台账里那 512 字摘要。判 `live.error` 而不是只看
+  // `data` 有没有行：空间在别处被关掉后，`data` 里还留着关之前的快照，照着画就是
+  // 一份再也没有后续的「实时」进度。
+  if (live.error) {
     return (
-      <div className="flex h-full min-h-0 flex-col">
-        <TaskFidelityNote
-          fidelity="digest"
-          detail="空间未打开，只剩台账里的摘要"
-        />
-        <div className="min-h-0 flex-1">
-          <SpaceTasksTab
-            tasks={ledger.data ?? []}
-            isPending={ledger.isPending}
-            error={ledger.error}
-            onRetry={() => void ledger.refetch()}
-          />
-        </div>
-      </div>
+      <DigestTasks ledger={ledger} detail="空间未打开，只剩台账里的摘要" />
+    );
+  }
+
+  // daemon 重启后空间会自动恢复打开，Hub 里没有历史，快照是 200 加空数组。
+  // 当空态处理的话，整份台账就会显示成「还没有任务」。
+  if (!live.data?.length) {
+    return (
+      <DigestTasks ledger={ledger} detail="实时快照为空，只剩台账里的摘要" />
     );
   }
 
@@ -91,22 +88,50 @@ export function SpaceLiveTasksTab({ wsId }: { wsId: string }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <TaskFidelityNote fidelity="live" />
-      {tasks.length === 0 ? (
-        <div className="p-3">
-          <EmptyState title="这个空间还没有任务。Peco 派发到这里后会出现在面板里。" />
-        </div>
-      ) : (
-        <ul className="min-h-0 flex-1 overflow-y-auto">
-          {tasks.map((task) => (
-            <LiveTaskRow
-              key={task.id}
-              wsId={wsId}
-              task={task}
-              ledgerRow={ledgerByTaskId.get(task.id)}
-            />
-          ))}
-        </ul>
+      <ul className="min-h-0 flex-1 overflow-y-auto">
+        {tasks.map((task) => (
+          <LiveTaskRow
+            key={task.id}
+            wsId={wsId}
+            task={task}
+            ledgerRow={ledgerByTaskId.get(task.id)}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+type LedgerQuery = ReturnType<typeof useSpaceTasks>;
+
+/**
+ * 只剩台账可读时的面板。
+ *
+ * 标注跟着「台账里到底有没有行」走：加载中或出错时说不出保真度，空台账也没有
+ * 摘要可标，两种情况都不挂来源说明。
+ */
+function DigestTasks({
+  ledger,
+  detail,
+}: {
+  ledger: LedgerQuery;
+  detail: string;
+}) {
+  const tasks = ledger.data ?? [];
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {tasks.length > 0 && (
+        <TaskFidelityNote fidelity="digest" detail={detail} />
       )}
+      <div className="min-h-0 flex-1">
+        <SpaceTasksTab
+          tasks={tasks}
+          isPending={ledger.isPending}
+          error={ledger.error}
+          onRetry={() => void ledger.refetch()}
+        />
+      </div>
     </div>
   );
 }

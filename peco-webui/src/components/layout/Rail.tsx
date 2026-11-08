@@ -66,6 +66,21 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
     navigate(onPecoConfigFace ? "/peco" : "/peco?face=config");
   };
 
+  // `×` 只移出打开集，不关闭空间。移掉的若正是当前空间，激活态不能就此悬空 ——
+  // 打开集是唯一的空间列表，没有一行能指「当前」就是自相矛盾的界面。移掉别的行
+  // 不动路由，也不切激活态。
+  const removeSpace = (wsId: string) => {
+    const removedActive = activeWsId === wsId;
+    removeOpen(wsId);
+    if (!removedActive) return;
+    const nextWsId = openIds.find((id) => id !== wsId && id !== peco?.ws_id);
+    if (nextWsId) {
+      activateSpace(nextWsId);
+      return;
+    }
+    navigate("/spaces");
+  };
+
   // 行之间 ↑/↓ 移动焦点：行本身是按钮，Enter/Space 天然生效。
   const moveFocus = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -165,7 +180,7 @@ export function Rail({ collapsed = false }: { collapsed?: boolean }) {
             collapsed={collapsed}
             active={activeWsId === space.ws_id}
             onSelect={() => activateSpace(space.ws_id)}
-            onRemove={() => removeOpen(space.ws_id)}
+            onRemove={() => removeSpace(space.ws_id)}
           />
         ))}
         {!collapsed && rows.length === 0 && (

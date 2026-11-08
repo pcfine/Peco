@@ -142,6 +142,60 @@ describe("左栏打开集", () => {
     fetchSpy.mockRestore();
   });
 
+  it("× 移除当前激活空间时，激活第一个剩余空间并导航过去", async () => {
+    useOpenSpacesStore.setState({
+      openIds: ["ws_a", "ws_b"],
+      activeWsId: "ws_a",
+      seeded: true,
+    });
+    renderRail(false, "/spaces/ws_a");
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: "从打开列表移除" }))[0],
+    );
+
+    expect(useOpenSpacesStore.getState().openIds).toEqual(["ws_b"]);
+    expect(useOpenSpacesStore.getState().activeWsId).toBe("ws_b");
+    expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces\/ws_b$/);
+    // 激活态必须落在看得见的那一行上，不能只剩页面标题还指着旧空间。
+    expect(
+      screen.getByRole("button", { name: "空间 B（团队 research）" }),
+    ).toHaveAttribute("aria-current", "true");
+    expect(ensureSpaceConversation).not.toHaveBeenCalled();
+    expect(closeSpace).not.toHaveBeenCalled();
+  });
+
+  it("× 移除最后一个打开的空间时回工作室并清空激活态", async () => {
+    renderRail(false, "/spaces/ws_a");
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "从打开列表移除" }),
+    );
+
+    expect(useOpenSpacesStore.getState().openIds).toEqual([]);
+    expect(useOpenSpacesStore.getState().activeWsId).toBeNull();
+    expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces$/);
+    expect(screen.queryByTestId("rail-active-bar")).toBeNull();
+    expect(closeSpace).not.toHaveBeenCalled();
+  });
+
+  it("× 移除的不是当前激活空间时不导航、不切激活", async () => {
+    useOpenSpacesStore.setState({
+      openIds: ["ws_a", "ws_b"],
+      activeWsId: "ws_b",
+      seeded: true,
+    });
+    renderRail(false, "/spaces/ws_b");
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: "从打开列表移除" }))[0],
+    );
+
+    expect(useOpenSpacesStore.getState().openIds).toEqual(["ws_b"]);
+    expect(useOpenSpacesStore.getState().activeWsId).toBe("ws_b");
+    expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces\/ws_b$/);
+  });
+
   it("收起态保留行与全名 title，隐藏「状态」与 ×", async () => {
     renderRail(true);
 
