@@ -4,7 +4,8 @@
 
 //! 全局日志初始化与按大小轮转的文件 writer。
 //!
-//! - stdout 层保持既有 `fmt()` 行为不变（systemd/journald 部署依赖 stdout）。
+//! - stdout 层行为不变（systemd/journald 部署依赖 stdout），但 fd 1 初始化为
+//!   非阻塞：终端无人读取时不阻塞运行时（见 [`set_stdout_nonblocking`]）。
 //! - 文件层默认开启：写入 `{data_dir}/logs/peco-server.log`，单文件超过上限后
 //!   轮转为 `peco-server.log.1`（最新）→ `.N-1`（最旧），总数超出保留数即删除，
 //!   因此磁盘占用有硬上界。
@@ -62,6 +63,9 @@ const DEFAULT_MAX_FILES: usize = 5;
 
 /// 初始化全局 tracing：stdout 层 + 可选的按大小轮转文件层，共享同一 `EnvFilter`。
 pub fn init_tracing() {
+    // 必须最先执行：见下方函数文档。
+    set_stdout_nonblocking();
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
@@ -100,6 +104,29 @@ pub fn init_tracing() {
         .with(file_layer)
         .init();
 }
+
+/// 把 stdout 置为非阻塞。
+///
+/// 日志在 tokio worker 上同步写出，且 stdout 层先于文件层。stdout 若挂在一个
+/// 没人读的 pty 上（SSH 终端休眠/断连），缓冲写满后 `write` 会永久阻塞，占死
+/// worker 并连带卡住整个运行时与后面的文件层。非阻塞后写满返回 `EAGAIN`，
+/// fmt 层忽略该错误，文件日志完整；终端侧日志可能被截断或丢弃。
+#[cfg(unix)]
+fn set_stdout_nonblocking() {
+    use std::os::fd::AsRawFd;
+
+    let fd = io::stdout().as_raw_fd();
+    // SAFETY: `fcntl` 只读写 fd 1 的 open file description 标志位，不涉及内存安全。
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && flags & libc::O_NONBLOCK == 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn set_stdout_nonblocking() {}
 
 // ── 配置 ─────────────────────────────────────────────────────────────────────
 
