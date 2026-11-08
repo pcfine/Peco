@@ -1,5 +1,6 @@
-// 团队能力配置面：头部 + 左侧分类栏 + 内容区。`/teams/:teamId` 与 Peco 翻转面共用这一份 ——
-// 两处差别只在「有没有绑定空间」「能不能再装配空间」以及页面级导航。
+// 团队能力配置面：左侧分类栏（顶部是团队身份）+ 内容区，整页就是这两栏。
+// `/teams/:teamId` 与 Peco 翻转面共用这一份 —— 两处差别只在「有没有绑定空间」
+// 「能不能再装配空间」以及页面级导航。
 
 import { Fragment, type ComponentType, type ReactNode } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
@@ -8,6 +9,7 @@ import {
   Bot,
   BrainCircuit,
   FolderOpen,
+  PackagePlus,
   Plug,
   Puzzle,
 } from "lucide-react";
@@ -155,44 +157,40 @@ export function TeamConfigPanel({
   const Heading = headingLevel;
 
   return (
-    <div className="@container/team flex h-full min-h-0 flex-col">
-      <header className="shrink-0 border-b border-line px-3 py-3">
-        <div className="flex h-8 items-center gap-2">
-          <Heading className="truncate text-xl font-semibold text-ink">
-            {detail.display_name}
-          </Heading>
-          <span className="shrink-0 font-mono text-2xs text-ink-faint">
-            {detail.id}
-          </span>
-          {!hideAssemble && (
-            <div className="ml-auto flex items-center gap-1">
+    <div className="@container/team flex h-full min-h-0">
+      <div className="flex w-44 shrink-0 flex-col border-r border-line bg-rail/50 @max-[560px]/team:w-12">
+        <div className="mb-1 border-b border-line px-2 pb-2 @max-[560px]/team:px-1">
+          <div className="flex items-center gap-1">
+            {/* 窄档只剩图标栏：标题视觉隐藏但留在无障碍树里，一页仍有一个 h1。 */}
+            <Heading
+              className="min-w-0 truncate text-sm font-semibold text-ink @max-[560px]/team:sr-only"
+              title={detail.root}
+            >
+              {detail.display_name}
+            </Heading>
+            {!hideAssemble && (
               <Button
-                size="sm"
-                className="h-7"
+                variant="ghost"
+                size="icon-xs"
+                className="ml-auto shrink-0"
+                aria-label="装配为空间"
                 onClick={() =>
                   navigate(`/spaces/new?team=${encodeURIComponent(detail.id)}`)
                 }
               >
-                装配为空间
+                <PackagePlus />
               </Button>
-            </div>
-          )}
-        </div>
-        <div className="mt-1 flex h-5 items-center gap-2 truncate font-mono text-mono-sm text-ink-faint">
-          {detail.root}
-        </div>
-        {!detail.has_master && (
-          <div className="mt-1 flex h-6 items-center gap-2 border-l-2 border-danger pl-2 text-xs text-danger">
-            这个团队没有 `@master`，Peco 无法向它派发任务。
+            )}
           </div>
-        )}
-      </header>
+          <p className="truncate font-mono text-2xs text-ink-faint @max-[560px]/team:hidden">
+            {detail.id}
+          </p>
+        </div>
 
-      <div className="flex min-h-0 flex-1">
         <nav
           role="tablist"
           aria-orientation="vertical"
-          className="flex w-44 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-line bg-rail/50 px-2 py-2 @max-[560px]/team:w-12 @max-[560px]/team:px-1"
+          className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 pb-2 @max-[560px]/team:px-1"
         >
           {groups.map((group, index) => (
             <Fragment key={group.title}>
@@ -238,37 +236,39 @@ export function TeamConfigPanel({
             </Fragment>
           ))}
         </nav>
+      </div>
 
-        <div
-          role="tabpanel"
-          id={`team-panel-${tab}`}
-          aria-labelledby={`team-tab-${tab}`}
-          className="flex min-h-0 min-w-0 flex-1 flex-col"
-        >
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {RESOURCE_TABS.includes(tab) &&
-              (wsId ? null : (
-                <div className="p-3">
-                  {noSpaceNotice ?? (
-                    <EmptyState title="这个团队还没有已打开的空间。先打开一个绑定空间，才能读写它的能力根。" />
-                  )}
-                </div>
-              ))}
+      <div
+        role="tabpanel"
+        id={`team-panel-${tab}`}
+        aria-labelledby={`team-tab-${tab}`}
+        className="flex min-h-0 min-w-0 flex-1 flex-col"
+      >
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {RESOURCE_TABS.includes(tab) &&
+            (wsId ? null : (
+              <div className="p-3">
+                {noSpaceNotice ?? (
+                  <EmptyState title="这个团队还没有已打开的空间。先打开一个绑定空间，才能读写它的能力根。" />
+                )}
+              </div>
+            ))}
 
-            {tab === "agents" && wsId && <TeamAgentsTab wsId={wsId} />}
-            {tab === "skills" && wsId && <TeamSkillsTab wsId={wsId} />}
-            {tab === "mcp" && wsId && <TeamMcpTab wsId={wsId} />}
-            {tab === "knowledge" && wsId && (
-              <TeamKnowledgeTab wsId={wsId} detail={detail} />
-            )}
-            {tab === "spaces" && <TeamSpacesTab spaces={detail.spaces} />}
-            {tab === "memory" &&
-              (memoryWsId ? (
-                <SpaceMemoryTab wsId={memoryWsId} />
-              ) : (
-                <TeamMemoryTab />
-              ))}
-          </div>
+          {tab === "agents" && wsId && (
+            <TeamAgentsTab wsId={wsId} noMaster={!detail.has_master} />
+          )}
+          {tab === "skills" && wsId && <TeamSkillsTab wsId={wsId} />}
+          {tab === "mcp" && wsId && <TeamMcpTab wsId={wsId} />}
+          {tab === "knowledge" && wsId && (
+            <TeamKnowledgeTab wsId={wsId} detail={detail} />
+          )}
+          {tab === "spaces" && <TeamSpacesTab spaces={detail.spaces} />}
+          {tab === "memory" &&
+            (memoryWsId ? (
+              <SpaceMemoryTab wsId={memoryWsId} />
+            ) : (
+              <TeamMemoryTab />
+            ))}
         </div>
       </div>
     </div>

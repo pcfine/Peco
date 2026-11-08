@@ -83,13 +83,15 @@ function agentDetail(overrides: Partial<AgentDetail> = {}): AgentDetail {
   };
 }
 
-const MASTER = agentDetail();
+// master 不设模型：卡片元信息行要能摆出「未设模型」而不是空白。
+const MASTER = agentDetail({ model: null });
 const HELPER = agentDetail({
   id: "a_helper",
   name: "助手",
   description: "干活的",
   system_prompt: "你是助手",
-  tools: [],
+  tools: ["shell", "files", "search"],
+  knowledge_bases: ["handbook", "faq", "wiki"],
   temperature: null,
   max_iterations: 200,
 });
@@ -114,13 +116,13 @@ function listItem(detail: AgentDetail, isMaster: boolean): AgentListItem {
 let details: Map<string, AgentDetail>;
 let rows: AgentListItem[];
 
-function renderTab() {
+function renderTab(props: { noMaster?: boolean } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <TeamAgentsTab wsId="ws_a" />
+      <TeamAgentsTab wsId="ws_a" {...props} />
     </QueryClientProvider>,
   );
 }
@@ -181,12 +183,11 @@ beforeEach(() => {
 });
 
 describe("团队 agents tab 装配", () => {
-  it("填名称提交后调用 POST，列表出现新 agent 并被选中", async () => {
+  it("填名称提交后调用 POST，新 agent 直接进编辑器并出现在列表里", async () => {
     renderTab();
-    const createButtons = await screen.findAllByRole("button", {
-      name: "＋ 新建 agent",
-    });
-    fireEvent.click(createButtons[0]);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "＋ 新建 agent" }),
+    );
 
     // 编辑器也有「描述」，查询要限定在对话框里。
     const dialog = within(await screen.findByRole("dialog"));
@@ -203,12 +204,17 @@ describe("团队 agents tab 装配", () => {
       name: "审查员",
       description: "看代码",
     });
-    expect(await screen.findByText("审查员")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("审查员")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
+    expect(
+      await screen.findByRole("button", { name: /^审查员/ }),
+    ).toBeInTheDocument();
   });
 
   it("只改描述时 PATCH body 里没有 system_prompt", async () => {
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: /助手/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
     fireEvent.change(await screen.findByLabelText("描述"), {
       target: { value: "改了描述" },
@@ -226,8 +232,55 @@ describe("团队 agents tab 装配", () => {
     await waitFor(() => expect(screen.queryByText("未保存")).toBeNull());
   });
 
+  it("改名字保存时 PATCH body 只有 name", async () => {
+    renderTab();
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
+
+    fireEvent.change(await screen.findByLabelText("名称"), {
+      target: { value: "助手二号" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
+    expect(updateAgent.mock.calls[0][2]).toEqual({ name: "助手二号" });
+  });
+
+  it("列表默认是卡片栅格，没点卡之前不渲染表单", async () => {
+    renderTab();
+    await screen.findByRole("button", { name: /^助手/ });
+
+    expect(screen.getByText("Agent")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("button", { name: /@master/ })).getByText(
+        "未设模型",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("名称")).toBeNull();
+    expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
+  });
+
+  it("点卡片进编辑器，点「返回列表」回到卡片栅格", async () => {
+    renderTab();
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
+
+    expect(await screen.findByLabelText("名称")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "返回列表" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
+
+    expect(
+      await screen.findByRole("button", { name: /^助手/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("名称")).toBeNull();
+  });
+
   it("没有改动时保存按钮禁用，改一个字才可用", async () => {
     renderTab();
+    fireEvent.click(await screen.findByRole("button", { name: /@master/ }));
+
     // 详情还在路上时编辑器是骨架屏，等它落地再看按钮。
     await screen.findByLabelText("名称");
 
@@ -242,43 +295,55 @@ describe("团队 agents tab 装配", () => {
 
   it("切换 agent 丢弃上一个的草稿", async () => {
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: /助手/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
     fireEvent.change(await screen.findByLabelText("描述"), {
       target: { value: "草稿" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /master/ }));
+    fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: /@master/ }));
     await screen.findByDisplayValue("@master");
-    fireEvent.click(screen.getByRole("button", { name: /助手/ }));
+
+    fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
     expect(await screen.findByDisplayValue("干活的")).toBeInTheDocument();
   });
 
-  it("@master 没有删除入口", async () => {
+  it("@master 既没有卡内删除，也没有编辑器里的删除入口", async () => {
     renderTab();
-    await screen.findByRole("button", { name: /@master/ });
+    const card = await screen.findByRole("button", { name: /@master/ });
+    expect(within(card).queryByRole("button", { name: /^删除/ })).toBeNull();
 
-    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    fireEvent.click(card);
+    await screen.findByLabelText("名称");
+
+    expect(screen.queryByRole("button", { name: /^删除/ })).toBeNull();
   });
 
-  it("总管是底色 chip 不描边，行分区线落在 li 而不是按钮上", async () => {
+  it("master 徽标是底色 chip 不描边，整张卡就是可点的那一层", async () => {
     renderTab();
-    const masterButton = await screen.findByRole("button", { name: /@master/ });
+    const card = await screen.findByRole("button", { name: /@master/ });
 
-    const chip = within(masterButton).getByText("总管");
-    expect(chip.className).toContain("bg-line/60");
-    expect(chip.className).not.toMatch(/\bborder(-|\b)/);
+    // 名字与徽标都写着 @master：取带 chip 底色的那一个。
+    const badge = within(card)
+      .getAllByText("@master")
+      .find((node) => node.className.includes("bg-line/60"));
+    expect(badge).toBeDefined();
+    expect(badge?.className).not.toMatch(/\bborder(-|\b)/);
 
-    expect(masterButton.className).not.toMatch(/\bborder(-|\b)/);
-    expect(masterButton.closest("li")?.className).toMatch(/\bborder-b\b/);
+    // 整张卡就是一个按钮：点卡上任何一处都是「打开这个 agent」。
+    expect(card.tagName).toBe("BUTTON");
   });
 
-  it("普通 agent 删除要过二次确认", async () => {
+  it("普通 agent 的卡内删除要过二次确认，且不会顺带打开编辑器", async () => {
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: /助手/ }));
+    await screen.findByRole("button", { name: /^助手/ });
 
-    fireEvent.click(await screen.findByRole("button", { name: "删除" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除 助手" }));
+
     expect(deleteAgent).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
     expect(screen.getByText(/删除 agent「助手」/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
@@ -299,7 +364,7 @@ describe("团队 agents tab 装配", () => {
       ),
     );
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: /助手/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
     fireEvent.click(await screen.findByRole("button", { name: "删除" }));
     fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
@@ -309,7 +374,7 @@ describe("团队 agents tab 装配", () => {
 
   it("名称清空时不提交，只把原因摆在按钮旁", async () => {
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: /助手/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
     fireEvent.change(await screen.findByLabelText("名称"), {
       target: { value: "  " },
@@ -322,7 +387,7 @@ describe("团队 agents tab 装配", () => {
 
   it("勾选 skill 后 PATCH body 的 skills 正确", async () => {
     renderTab();
-    fireEvent.click(await screen.findByRole("button", { name: /助手/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
     const chip = await screen.findByRole("button", { name: "review" });
     expect(chip).toHaveAttribute("aria-pressed", "false");
@@ -333,6 +398,37 @@ describe("团队 agents tab 装配", () => {
 
     await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
     expect(updateAgent.mock.calls[0][2]).toEqual({ skills: ["review"] });
+  });
+
+  it("卡片元信息行给 model 与前两个 tools / 知识库，其余折成 +N", async () => {
+    renderTab();
+    const card = await screen.findByRole("button", { name: /^助手/ });
+
+    expect(within(card).getByText("deepseek-flash").className).toContain(
+      "font-mono",
+    );
+    for (const chip of ["shell", "files", "handbook", "faq"]) {
+      expect(within(card).getByText(chip)).toBeInTheDocument();
+    }
+    // 第 3 项不铺出来，各自折成 +1。
+    expect(within(card).queryByText("search")).toBeNull();
+    expect(within(card).queryByText("wiki")).toBeNull();
+    expect(within(card).getAllByText("+1")).toHaveLength(2);
+  });
+
+  it("noMaster 时列表顶部就说出派发不了任务", async () => {
+    renderTab({ noMaster: true });
+
+    expect(
+      await screen.findByText("这个团队没有 @master，Peco 无法向它派发任务。"),
+    ).toBeInTheDocument();
+  });
+
+  it("团队有 @master 时摆不出那句提示", async () => {
+    renderTab();
+    await screen.findByRole("button", { name: /^助手/ });
+
+    expect(screen.queryByText(/无法向它派发任务/)).toBeNull();
   });
 
   it("空列表给出引导与新建入口", async () => {

@@ -1,9 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { TeamConfigPanel } from "@/components/teams/TeamConfigPanel";
 
-// 团队详情只提供头部与空间列表，接口层不在这里测。
+// 团队详情只提供身份块与空间列表，接口层不在这里测。
+// 有没有 @master 是团队事实，某条用例要摆「缺 master」那一支。
+const mocks = vi.hoisted(() => ({ hasMaster: true }));
+
 vi.mock("@/queries/teamDetail", () => ({
   useTeam: () => ({
     isPending: false,
@@ -14,7 +17,7 @@ vi.mock("@/queries/teamDetail", () => ({
       display_name: "研究团队",
       template_version: 1,
       root: "/teams/x",
-      has_master: true,
+      has_master: mocks.hasMaster,
       agents: [{ name: "@master", description: "" }],
       skills: [],
       mcp_servers: [],
@@ -26,7 +29,9 @@ vi.mock("@/queries/teamDetail", () => ({
 
 // 六个资源面板各有自己的网络逻辑，面板布局与它们无关。
 vi.mock("@/components/teams/TeamAgentsTab", () => ({
-  TeamAgentsTab: () => <div data-testid="agents-panel" />,
+  TeamAgentsTab: ({ noMaster }: { noMaster?: boolean }) => (
+    <div data-testid="agents-panel" data-no-master={String(noMaster)} />
+  ),
 }));
 vi.mock("@/components/teams/TeamSkillsTab", () => ({
   TeamSkillsTab: () => <div data-testid="skills-panel" />,
@@ -61,6 +66,10 @@ function renderPanel(
     </MemoryRouter>,
   );
 }
+
+beforeEach(() => {
+  mocks.hasMaster = true;
+});
 
 function navItems(): HTMLElement[] {
   const nav = screen.getByRole("tablist");
@@ -125,5 +134,45 @@ describe("TeamConfigPanel 分类导航", () => {
       "记忆",
     ]);
     expect(screen.queryByRole("tab", { name: "绑定空间" })).toBeNull();
+  });
+
+  it("去掉顶部 header：页面上没有 header 元素", () => {
+    const { container } = renderPanel();
+
+    expect(container.querySelectorAll("header")).toHaveLength(0);
+  });
+
+  it("团队名是页面唯一的 h1，root 只当它的 title", () => {
+    renderPanel();
+
+    const headings = screen.getAllByRole("heading", { level: 1 });
+    expect(headings).toHaveLength(1);
+    expect(headings[0].textContent).toBe("研究团队");
+    expect(headings[0].getAttribute("title")).toBe("/teams/x");
+  });
+
+  it("装配入口缩成团队名右侧的图标按钮", () => {
+    renderPanel();
+
+    expect(
+      screen
+        .getByRole("button", { name: "装配为空间" })
+        .getAttribute("data-size"),
+    ).toBe("icon-xs");
+  });
+
+  it("hideAssemble 时不渲染装配按钮", () => {
+    renderPanel({ hideAssemble: true });
+
+    expect(screen.queryByRole("button", { name: "装配为空间" })).toBeNull();
+  });
+
+  it("缺 @master 时把 noMaster 交给 agents 面板", () => {
+    mocks.hasMaster = false;
+    renderPanel();
+
+    expect(
+      screen.getByTestId("agents-panel").getAttribute("data-no-master"),
+    ).toBe("true");
   });
 });

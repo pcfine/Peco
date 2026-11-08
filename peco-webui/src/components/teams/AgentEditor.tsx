@@ -6,19 +6,13 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { AgentModelPicker } from "@/components/teams/AgentModelPicker";
+import { ConfigSection, FieldRow } from "@/components/teams/config-form";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
-import { deleteAgent, updateAgent } from "@/api/agents";
+import { updateAgent } from "@/api/agents";
 import {
   type AgentDraft,
   diffDraft,
@@ -114,14 +108,15 @@ interface AgentEditorProps {
   wsId: string;
   agentId: string;
   isMaster: boolean;
-  onDeleted: () => void;
+  /** 删除确认框归列表所有（卡上也能删），这里只负责把请求递出去。 */
+  onRequestDelete: () => void;
 }
 
 export function AgentEditor({
   wsId,
   agentId,
   isMaster,
-  onDeleted,
+  onRequestDelete,
 }: AgentEditorProps) {
   const queryClient = useQueryClient();
   const detail = useAgentDetail(wsId, agentId);
@@ -129,33 +124,16 @@ export function AgentEditor({
   const mcp = useMcpConfig(wsId);
   const knowledge = useKnowledgeBases(wsId);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
-  const [confirming, setConfirming] = useState(false);
-
-  // 两处写成功都会影响「列表里的名字 / 团队里的 agent 数」，扇出刷新一次。
-  const refreshAfterWrite = () => {
-    void queryClient.invalidateQueries({ queryKey: ["agents", wsId] });
-    void queryClient.invalidateQueries({ queryKey: ["team"] });
-  };
 
   const save = useMutation({
     mutationFn: (body: UpdateAgentRequest) => updateAgent(wsId, agentId, body),
     onSuccess: (updated) => {
       setDraft(null);
       queryClient.setQueryData(["agent", wsId, agentId], updated);
-      refreshAfterWrite();
+      // 「列表里的名字 / 团队里的 agent 数」都变了，扇出刷新一次。
+      void queryClient.invalidateQueries({ queryKey: ["agents", wsId] });
+      void queryClient.invalidateQueries({ queryKey: ["team"] });
       toast.success("已保存");
-    },
-    onError: (error) => toast.error(errorText(error)),
-  });
-
-  const remove = useMutation({
-    mutationFn: () => deleteAgent(wsId, agentId),
-    onSuccess: () => {
-      setConfirming(false);
-      queryClient.removeQueries({ queryKey: ["agent", wsId, agentId] });
-      refreshAfterWrite();
-      toast.success("已删除");
-      onDeleted();
     },
     onError: (error) => toast.error(errorText(error)),
   });
@@ -184,61 +162,56 @@ export function AgentEditor({
   const current = draft ?? draftFromDetail(loaded);
   const diff = diffDraft(loaded, current);
   const dirty = Object.keys(diff.body).length > 0;
-  const busy = save.isPending || remove.isPending;
+  const busy = save.isPending;
   const update = (patch: Partial<AgentDraft>) =>
     setDraft({ ...current, ...patch });
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
-        <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-[2fr_3fr_auto]">
-          <label className="space-y-1">
-            <span className="text-caption font-medium text-ink-faint">
-              名称
-            </span>
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <ConfigSection title="基本信息">
+          <FieldRow label="名称" htmlFor="agent-name">
             <Input
+              id="agent-name"
               value={current.name}
               onChange={(event) => update({ name: event.target.value })}
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
-          </label>
-          <label className="space-y-1">
-            <span className="text-caption font-medium text-ink-faint">
-              描述
-            </span>
+          </FieldRow>
+          <FieldRow label="描述" htmlFor="agent-description">
             <Input
+              id="agent-description"
               value={current.description}
               onChange={(event) => update({ description: event.target.value })}
               disabled={busy}
               className="h-8 text-xs"
             />
-          </label>
-          <label className="space-y-1">
-            <span className="text-caption font-medium text-ink-faint">
-              图标
-            </span>
+          </FieldRow>
+          <FieldRow label="图标" htmlFor="agent-icon">
             <Input
+              id="agent-icon"
               value={current.icon}
               onChange={(event) => update({ icon: event.target.value })}
               disabled={busy}
               className="h-8 w-16 text-center text-xs"
             />
-          </label>
-        </section>
+          </FieldRow>
+        </ConfigSection>
 
-        <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-2">
-          <AgentModelPicker
-            provider={current.provider}
-            model={current.model}
-            onProviderChange={(provider) => update({ provider })}
-            onModelChange={(model) => update({ model })}
-            disabled={busy}
-          />
-        </section>
+        <ConfigSection title="模型">
+          <div className="grid grid-cols-1 gap-2 @min-[560px]/team:grid-cols-2">
+            <AgentModelPicker
+              provider={current.provider}
+              model={current.model}
+              onProviderChange={(provider) => update({ provider })}
+              onModelChange={(model) => update({ model })}
+              disabled={busy}
+            />
+          </div>
+        </ConfigSection>
 
-        <section className="space-y-2">
-          <p className="text-xs font-medium text-ink">能力</p>
+        <ConfigSection title="能力">
           <CapabilityGroup
             title="tools"
             options={TOOLS.map((tool) => ({
@@ -306,12 +279,12 @@ export function AgentEditor({
             }
             disabled={busy}
           />
-        </section>
+        </ConfigSection>
 
-        <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-3">
-          <label className="space-y-1">
-            <span className="text-2xs text-ink-faint">temperature</span>
+        <ConfigSection title="参数">
+          <FieldRow label="temperature" htmlFor="agent-temperature">
             <Input
+              id="agent-temperature"
               type="number"
               step="0.1"
               value={current.temperature}
@@ -320,10 +293,10 @@ export function AgentEditor({
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
-          </label>
-          <label className="space-y-1">
-            <span className="text-2xs text-ink-faint">max_tokens</span>
+          </FieldRow>
+          <FieldRow label="max_tokens" htmlFor="agent-max-tokens">
             <Input
+              id="agent-max-tokens"
               type="number"
               value={current.max_tokens}
               onChange={(event) => update({ max_tokens: event.target.value })}
@@ -331,10 +304,10 @@ export function AgentEditor({
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
-          </label>
-          <label className="space-y-1">
-            <span className="text-2xs text-ink-faint">max_iterations</span>
+          </FieldRow>
+          <FieldRow label="max_iterations" htmlFor="agent-max-iterations">
             <Input
+              id="agent-max-iterations"
               type="number"
               value={current.max_iterations}
               onChange={(event) =>
@@ -344,20 +317,29 @@ export function AgentEditor({
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
-          </label>
-        </section>
+          </FieldRow>
+        </ConfigSection>
 
-        <label className="block space-y-1">
-          <span className="text-caption font-medium text-ink-faint">
-            正文（system_prompt）
-          </span>
-          <Textarea
-            value={current.system_prompt}
-            onChange={(event) => update({ system_prompt: event.target.value })}
-            disabled={busy}
-            className="min-h-[220px] font-mono text-mono-sm"
-          />
-        </label>
+        {/* 正文是全宽的：标签摞在框上面，不占 FieldRow 那条定宽的标签列。 */}
+        <ConfigSection title="正文">
+          <div className="space-y-1">
+            <Label
+              htmlFor="agent-system-prompt"
+              className="text-caption font-medium text-ink-faint"
+            >
+              正文（system_prompt）
+            </Label>
+            <Textarea
+              id="agent-system-prompt"
+              value={current.system_prompt}
+              onChange={(event) =>
+                update({ system_prompt: event.target.value })
+              }
+              disabled={busy}
+              className="min-h-[260px] font-mono text-mono-sm"
+            />
+          </div>
+        </ConfigSection>
       </div>
 
       <div className="flex shrink-0 items-center gap-2 border-t border-line px-3 py-2">
@@ -391,44 +373,12 @@ export function AgentEditor({
             size="sm"
             className="ml-auto text-danger"
             disabled={busy}
-            onClick={() => setConfirming(true)}
+            onClick={onRequestDelete}
           >
             删除
           </Button>
         )}
       </div>
-
-      <Dialog open={confirming} onOpenChange={setConfirming}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>删除 agent「{loaded.name}」？</DialogTitle>
-            <DialogDescription>
-              连同它的 agent.md 一起删掉，不可恢复。
-            </DialogDescription>
-          </DialogHeader>
-          {remove.error && (
-            <p className="text-xs text-danger">{errorText(remove.error)}</p>
-          )}
-          <DialogFooter>
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={remove.isPending}
-              onClick={() => setConfirming(false)}
-            >
-              取消
-            </Button>
-            <Button
-              variant="destructive"
-              size="sm"
-              disabled={remove.isPending}
-              onClick={() => remove.mutate()}
-            >
-              确认删除
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
