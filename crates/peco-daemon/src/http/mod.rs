@@ -9,6 +9,7 @@ pub mod space;
 pub mod space_artifacts;
 pub mod space_conversation;
 pub mod space_files;
+pub mod space_memory;
 pub mod space_overview;
 pub mod tasks;
 pub mod team;
@@ -59,6 +60,15 @@ pub fn router(state: AppState) -> Router {
             post(space_conversation::ensure),
         )
         .route("/api/spaces/{ws_id}/files", get(space_files::browse))
+        // 记忆浏览：`documents` 是静态段，与 `{doc_id}` 子树不重叠（前者四段、后者五段）。
+        .route(
+            "/api/spaces/{ws_id}/memory/documents",
+            get(space_memory::list),
+        )
+        .route(
+            "/api/spaces/{ws_id}/memory/documents/{doc_id}",
+            get(space_memory::detail),
+        )
         .route(
             "/api/spaces/{ws_id}/overview",
             get(space_overview::overview),

@@ -89,6 +89,11 @@ pub enum DaemonError {
     #[error("task '{task_id}' not found in the dispatch ledger")]
     TaskNotFound { task_id: String },
 
+    /// 记忆文档不存在，或存在但不属于路径里的空间。两种情况共用一个变体：
+    /// 分开报就等于确认某个 doc_id 真实存在，跨空间探测因此能逐个试出别人的文档。
+    #[error("memory document '{doc_id}' not found in space '{ws_id}'")]
+    MemoryDocumentNotFound { ws_id: String, doc_id: String },
+
     #[error("team '{team_id}' already exists")]
     TeamExists { team_id: String },
 
@@ -143,6 +148,7 @@ impl DaemonError {
             Self::SpaceNotOpen { .. } => "space_not_open",
             Self::ReservedSpace { .. } => "reserved_space",
             Self::TaskNotFound { .. } => "task_not_found",
+            Self::MemoryDocumentNotFound { .. } => "memory_document_not_found",
             Self::TeamExists { .. } => "team_exists",
             Self::TeamNotFound { .. } => "team_not_found",
             Self::ProviderNotFound { .. } => "provider_not_found",
@@ -162,6 +168,7 @@ impl DaemonError {
         match self {
             Self::SpaceNotFound { .. } => StatusCode::NOT_FOUND,
             Self::TaskNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::MemoryDocumentNotFound { .. } => StatusCode::NOT_FOUND,
             Self::TeamNotFound { .. } => StatusCode::NOT_FOUND,
             Self::ProviderNotFound { .. } => StatusCode::NOT_FOUND,
             Self::InvalidArgument { .. }
@@ -341,6 +348,14 @@ mod tests {
                     task_id: "t_a".into(),
                 },
                 "task_not_found",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                DaemonError::MemoryDocumentNotFound {
+                    ws_id: "ws_a".into(),
+                    doc_id: "doc_1".into(),
+                },
+                "memory_document_not_found",
                 StatusCode::NOT_FOUND,
             ),
             (
