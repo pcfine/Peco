@@ -35,7 +35,7 @@ export function MarkdownRenderer({
         "[&_th]:border [&_th]:border-border [&_th]:px-3 [&_th]:py-1.5 [&_th]:bg-muted/50 [&_th]:text-left [&_th]:font-semibold",
         "[&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-1.5",
         "[&_blockquote]:border-l-4 [&_blockquote]:border-l-muted-foreground/30 [&_blockquote]:pl-3 [&_blockquote]:text-muted-foreground [&_blockquote]:my-2",
-        "[&_a]:text-primary [&_a]:underline [&_a]:break-all",
+        "[&_a]:text-primary-ink [&_a]:underline [&_a]:break-all",
         "[&_img]:rounded-md [&_img]:max-w-full [&_img]:my-2",
         className,
       )}
