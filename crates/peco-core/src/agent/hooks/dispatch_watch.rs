@@ -33,6 +33,11 @@ pub(crate) const RUN_MACHINE_TASK_TOOL_NAME: &str = "run_machine_task";
 /// `Lagged` / 非终态 `End` 触发的重订阅上限；超过即认为任务已不可观察。
 const MAX_RESUBSCRIBES: usize = 3;
 
+/// 台账摘要（`prompt_digest` 与 `result_digest`）的唯一长度口径。
+///
+/// 按字符截断而不是按字节：摘要直接进 UI，字节截断会把多字节字符切成乱码。
+pub const MAX_DIGEST_CHARS: usize = 512;
+
 // ============================================================================
 // 观察载荷
 // ============================================================================
@@ -61,24 +66,33 @@ pub struct DispatchObservation {
     pub origin_kind: String,
     /// 执行该任务的 agent：派发恒为 @master，`run_machine_task` 取自结果条目。
     pub agent_name: String,
+    /// 派发入参里那段任务描述的摘要，供台账显示「谁让它做什么」。解析不到入参时
+    /// 为 `None` —— 观察本身不依赖它，缺了照常进行。
+    pub prompt_digest: Option<String>,
 }
 
 // ============================================================================
 // 观察计划：工具结果 → 要观察的任务
 // ============================================================================
 
-/// 工具结果原文 → 观察计划。
+/// 工具结果原文 + 入参摘要 → 观察计划。
 ///
 /// 只做翻译：不碰 Hub、不 spawn，因此可以直接按字符串单测。解析失败在这里记一条
 /// warn —— 静默丢弃会让「任务在跑、却没人观察」变成无从诊断的缺口。
+///
+/// `prompts` 按下标与结果条目对应（见 [`prompt_digests`]）：一次
+/// `run_machine_task` 可以提交多个任务，每条观察只该带上自己那一段描述。
 fn plan_watches(
     tool_name: &str,
     result: &str,
     origin: &DispatchOrigin,
+    prompts: &[Option<String>],
 ) -> Vec<DispatchObservation> {
     let planned = match tool_name {
-        DISPATCH_TOOL_NAME => dispatch_observations(result, origin),
-        RUN_MACHINE_TASK_TOOL_NAME => machine_task_observations(result, origin),
+        DISPATCH_TOOL_NAME => {
+            dispatch_observations(result, origin, prompts.first().and_then(|p| p.as_deref()))
+        }
+        RUN_MACHINE_TASK_TOOL_NAME => machine_task_observations(result, origin, prompts),
         _ => return Vec::new(),
     };
     match planned {
@@ -108,6 +122,7 @@ enum PlanError {
 fn dispatch_observations(
     result: &str,
     origin: &DispatchOrigin,
+    prompt: Option<&str>,
 ) -> Result<Vec<DispatchObservation>, PlanError> {
     let receipt: DispatchReceipt = serde_json::from_str(result)?;
     let task_id = TaskId(Uuid::parse_str(&receipt.task_id)?);
@@ -123,24 +138,27 @@ fn dispatch_observations(
         dispatch_id: (!receipt.dispatch_id.is_empty()).then_some(receipt.dispatch_id),
         origin_kind: DISPATCH_TOOL_NAME.to_string(),
         agent_name: MASTER_AGENT_NAME.to_string(),
+        prompt_digest: prompt.map(str::to_string),
     }])
 }
 
 fn machine_task_observations(
     result: &str,
     origin: &DispatchOrigin,
+    prompts: &[Option<String>],
 ) -> Result<Vec<DispatchObservation>, PlanError> {
     let parsed: MachineTaskResults = serde_json::from_str(result)?;
     Ok(parsed
         .results
         .into_iter()
-        .filter_map(|item| machine_task_observation(item, origin))
+        .filter_map(|item| machine_task_observation(item, origin, prompts))
         .collect())
 }
 
 fn machine_task_observation(
     item: MachineTaskResult,
     origin: &DispatchOrigin,
+    prompts: &[Option<String>],
 ) -> Option<DispatchObservation> {
     // 判据是条目自己的 `terminal`，与调用方的 `wait` 无关：wait=true 超时后任务
     // 仍在跑，按 wait 判定会漏掉它，让它变成永远没人观察的孤儿。
@@ -162,6 +180,12 @@ fn machine_task_observation(
             return None;
         }
     };
+    // 条目的 `index` 是它与入参 `tasks[i]` 的唯一联系：结果里没有入参原文。
+    let prompt_digest = item
+        .index
+        .and_then(|index| prompts.get(index))
+        .cloned()
+        .flatten();
     Some(DispatchObservation {
         origin: origin.clone(),
         target_dir: origin.origin_dir.clone(),
@@ -169,6 +193,7 @@ fn machine_task_observation(
         dispatch_id: None,
         origin_kind: RUN_MACHINE_TASK_TOOL_NAME.to_string(),
         agent_name: item.agent_name,
+        prompt_digest,
     })
 }
 
@@ -184,8 +209,70 @@ struct MachineTaskResults {
 struct MachineTaskResult {
     agent_name: String,
     task_id: Option<String>,
+    /// 缺字段时该条目只是拿不到摘要，观察照旧。
+    #[serde(default)]
+    index: Option<usize>,
     /// 缺字段按未终态处理：宁可多观察一条，也不能漏掉还在跑的任务。
     terminal: Option<bool>,
+}
+
+// ============================================================================
+// 入参摘要：工具参数 → 用户要求的任务描述
+// ============================================================================
+
+/// 工具入参原文 → 每条任务各自的描述摘要，下标与结果条目的 `index` 对齐。
+///
+/// 纯解析，不参与观察计划是否成立：入参坏掉只会让台账少一段描述，任务照旧被
+/// 观察。返回空切片表示「这个工具不提供描述」。
+fn prompt_digests(tool_name: &str, arguments: &str) -> Vec<Option<String>> {
+    match tool_name {
+        DISPATCH_TOOL_NAME => vec![dispatch_prompt(arguments)],
+        RUN_MACHINE_TASK_TOOL_NAME => machine_task_prompts(arguments),
+        _ => Vec::new(),
+    }
+}
+
+fn dispatch_prompt(arguments: &str) -> Option<String> {
+    let parsed: DispatchArgs = serde_json::from_str(arguments).ok()?;
+    digest(parsed.prompt.as_deref())
+}
+
+fn machine_task_prompts(arguments: &str) -> Vec<Option<String>> {
+    let Ok(parsed) = serde_json::from_str::<MachineTaskArgs>(arguments) else {
+        return Vec::new();
+    };
+    parsed
+        .tasks
+        .iter()
+        .map(|task| digest(task.prompt.as_deref()))
+        .collect()
+}
+
+/// 空白描述不落库：台账上一行空摘要与「未记录」是两件事，前者只会让人以为
+/// 记录成功。
+fn digest(prompt: Option<&str>) -> Option<String> {
+    let prompt = prompt?.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(prompt.chars().take(MAX_DIGEST_CHARS).collect())
+}
+
+/// `dispatch_to_workspace` 只用 `prompt`，其余字段与本摘要无关。
+#[derive(Deserialize)]
+struct DispatchArgs {
+    prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MachineTaskArgs {
+    #[serde(default)]
+    tasks: Vec<MachineTaskArg>,
+}
+
+#[derive(Deserialize)]
+struct MachineTaskArg {
+    prompt: Option<String>,
 }
 
 // ============================================================================
@@ -248,7 +335,8 @@ impl LooperHook for DispatchWatchHook {
         if is_error {
             return;
         }
-        let observations = plan_watches(&tool_call.function.name, result, &self.origin);
+        let prompts = prompt_digests(&tool_call.function.name, &tool_call.function.arguments);
+        let observations = plan_watches(&tool_call.function.name, result, &self.origin, &prompts);
         if observations.is_empty() {
             return;
         }
@@ -515,9 +603,11 @@ mod tests {
         ToolCall::new("call-1", DISPATCH_TOOL_NAME, "{}")
     }
 
+    /// 观察载荷随任务一起被搬进通道；`Registered` 比其余变体多一整份描述，
+    /// 装进 `Box` 只为让通道里每一格大小接近（测试内的传输成本，不影响生产）。
     #[derive(Debug)]
     enum Recorded {
-        Registered(DispatchObservation, TaskSnapshot),
+        Registered(Box<DispatchObservation>, TaskSnapshot),
         Terminal(TaskSnapshot),
         Orphaned(DispatchObservation, String),
         Event,
@@ -530,9 +620,10 @@ mod tests {
     #[async_trait]
     impl TaskObservationSink for RecordingSink {
         async fn on_registered(&self, obs: &DispatchObservation, snapshot: &TaskSnapshot) {
-            let _ = self
-                .tx
-                .send(Recorded::Registered(obs.clone(), snapshot.clone()));
+            let _ = self.tx.send(Recorded::Registered(
+                Box::new(obs.clone()),
+                snapshot.clone(),
+            ));
         }
 
         async fn on_event(&self, _obs: &DispatchObservation, _event: &ObsEvent) {
@@ -637,6 +728,37 @@ mod tests {
             Some("hello"),
             "the terminal output must be readable from the sink"
         );
+    }
+
+    /// hook 走的是工具入参原文而不是结果：结果里没有 `prompt`（回执只有状态与
+    /// 输出），摘要只能从 `function.arguments` 来。
+    #[tokio::test]
+    async fn the_hook_reads_the_prompt_from_the_tool_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime();
+        runtime
+            .hub()
+            .expect("hub")
+            .register(Arc::new(EchoMachine::new()))
+            .expect("register echo");
+        let id = submit(&runtime, "echo", "hello").await;
+        let hub = open_hub(dir.path(), runtime);
+
+        let (sink, mut rx) = sink();
+        let payload = serde_json::to_string(&receipt(dir.path(), id)).unwrap();
+        let call = ToolCall::new(
+            "call-1",
+            DISPATCH_TOOL_NAME,
+            json!({ "dir": dir.path(), "prompt": "整理 output/ 目录", "wait": false }).to_string(),
+        );
+        hook(&hub, sink)
+            .on_after_tool(0, &call, &payload, false)
+            .await;
+
+        let Recorded::Registered(obs, _) = next(&mut rx).await else {
+            panic!("a successful dispatch must register");
+        };
+        assert_eq!(obs.prompt_digest.as_deref(), Some("整理 output/ 目录"));
     }
 
     #[tokio::test]
@@ -866,7 +988,7 @@ mod tests {
         let id = TaskId(Uuid::new_v4());
         let payload = serde_json::to_string(&receipt(dir.path(), id)).unwrap();
 
-        let planned = plan_watches(DISPATCH_TOOL_NAME, &payload, &origin);
+        let planned = plan_watches(DISPATCH_TOOL_NAME, &payload, &origin, &[]);
 
         assert_eq!(planned.len(), 1);
         let obs = &planned[0];
@@ -903,7 +1025,7 @@ mod tests {
         })
         .to_string();
 
-        let planned = plan_watches(RUN_MACHINE_TASK_TOOL_NAME, &payload, &origin);
+        let planned = plan_watches(RUN_MACHINE_TASK_TOOL_NAME, &payload, &origin, &[]);
 
         assert_eq!(
             planned.len(),
@@ -943,7 +1065,7 @@ mod tests {
             r#"{"results":[{"task_id":1}]}"#,
         ] {
             assert!(
-                plan_watches(RUN_MACHINE_TASK_TOOL_NAME, payload, &origin).is_empty(),
+                plan_watches(RUN_MACHINE_TASK_TOOL_NAME, payload, &origin, &[]).is_empty(),
                 "payload must plan nothing: {payload}"
             );
         }
@@ -951,7 +1073,7 @@ mod tests {
         // 派发侧的坏回执同样只是「没有观察」，不是 panic。
         for payload in ["not json", "{}", r#"{"task_id":"not-a-uuid"}"#] {
             assert!(
-                plan_watches(DISPATCH_TOOL_NAME, payload, &origin).is_empty(),
+                plan_watches(DISPATCH_TOOL_NAME, payload, &origin, &[]).is_empty(),
                 "payload must plan nothing: {payload}"
             );
         }
@@ -967,10 +1089,135 @@ mod tests {
             plan_watches(
                 DISPATCH_TOOL_NAME,
                 &serde_json::to_string(&empty_workspace).unwrap(),
-                &origin
+                &origin,
+                &[]
             )
             .is_empty()
         );
+    }
+
+    // ── prompt_digests：入参 → 台账摘要 ────────────────────────────────
+
+    /// 变异点：去掉 `MAX_DIGEST_CHARS` 的 `take` ⇒ 摘要等于全文，长度断言红；
+    /// 把 `chars()` 换成 `bytes()` ⇒ 600 个汉字被切成 512 字节的乱码，字符数断言红。
+    #[test]
+    fn the_prompt_digest_is_capped_by_characters_not_bytes() {
+        let long = "汉".repeat(600);
+        let arguments = json!({ "dir": "/tmp/target", "prompt": long.clone() }).to_string();
+
+        let digests = prompt_digests(DISPATCH_TOOL_NAME, &arguments);
+
+        let digest = digests[0].as_deref().expect("the prompt must be digested");
+        assert_eq!(digest.chars().count(), MAX_DIGEST_CHARS);
+        assert!(long.starts_with(digest), "截断只能砍尾巴，不能改写开头");
+
+        // 上限以内原样保留，没有被顺手裁剪。
+        let short = json!({ "prompt": "  看看 work_dir 里有什么  " }).to_string();
+        assert_eq!(
+            prompt_digests(DISPATCH_TOOL_NAME, &short)[0].as_deref(),
+            Some("看看 work_dir 里有什么")
+        );
+    }
+
+    /// 入参读不出描述时摘要为空，但观察计划照旧 —— 摘要是锦上添花，漏了不影响
+    /// 谁被观察（变异点：让 `plan_watches` 依赖摘要非空 ⇒ 这条的观察数变 0）。
+    #[test]
+    fn an_unreadable_prompt_keeps_the_watch_and_drops_only_the_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(std::path::Path::new("/origin/ws"));
+        let id = TaskId(Uuid::new_v4());
+        let payload = serde_json::to_string(&receipt(dir.path(), id)).unwrap();
+
+        for arguments in [
+            "not json",
+            "{}",
+            r#"{"prompt": null}"#,
+            r#"{"prompt": "   "}"#,
+        ] {
+            let digests = prompt_digests(DISPATCH_TOOL_NAME, arguments);
+            assert_eq!(
+                digests,
+                vec![None],
+                "空白或缺失的描述不该编出一条摘要：{arguments}"
+            );
+            let planned = plan_watches(DISPATCH_TOOL_NAME, &payload, &origin, &digests);
+            assert_eq!(planned.len(), 1, "摘要缺失不得丢掉观察：{arguments}");
+            assert_eq!(planned[0].prompt_digest, None);
+        }
+    }
+
+    /// 派发的摘要落进那唯一一条观察。
+    #[test]
+    fn the_dispatch_prompt_reaches_the_planned_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = origin(std::path::Path::new("/origin/ws"));
+        let id = TaskId(Uuid::new_v4());
+        let payload = serde_json::to_string(&receipt(dir.path(), id)).unwrap();
+        let arguments =
+            json!({ "dir": dir.path(), "prompt": "整理 output/ 目录", "wait": false }).to_string();
+
+        let planned = plan_watches(
+            DISPATCH_TOOL_NAME,
+            &payload,
+            &origin,
+            &prompt_digests(DISPATCH_TOOL_NAME, &arguments),
+        );
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].prompt_digest.as_deref(),
+            Some("整理 output/ 目录")
+        );
+    }
+
+    /// `run_machine_task` 一次可提交多条：每条观察只拿 `index` 指的那一段描述
+    /// （变异点：所有观察共用第一条描述 ⇒ 第二条断言红）。
+    #[test]
+    fn every_machine_task_observation_carries_its_own_prompt() {
+        let origin = origin(std::path::Path::new("/origin/ws"));
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let arguments = json!({
+            "tasks": [
+                { "agent_name": "worker", "prompt": "查日志" },
+                { "agent_name": "helper", "prompt": "写报告" },
+            ],
+            "wait": false
+        })
+        .to_string();
+        let result = json!({
+            "waited": false,
+            "results": [
+                { "index": 1, "agent_name": "helper", "task_id": second.to_string(), "terminal": false },
+                { "index": 0, "agent_name": "worker", "task_id": first.to_string(), "terminal": false },
+            ]
+        })
+        .to_string();
+
+        let planned = plan_watches(
+            RUN_MACHINE_TASK_TOOL_NAME,
+            &result,
+            &origin,
+            &prompt_digests(RUN_MACHINE_TASK_TOOL_NAME, &arguments),
+        );
+
+        let digests: Vec<(TaskId, Option<&str>)> = planned
+            .iter()
+            .map(|obs| (obs.task_id, obs.prompt_digest.as_deref()))
+            .collect();
+        assert_eq!(
+            digests,
+            vec![
+                (TaskId(second), Some("写报告")),
+                (TaskId(first), Some("查日志")),
+            ],
+            "结果条目的顺序是返回顺序，摘要必须按 index 取"
+        );
+
+        // 入参里没有这一段（例如结果多出一条）时只丢摘要。
+        let planned = plan_watches(RUN_MACHINE_TASK_TOOL_NAME, &result, &origin, &[]);
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|obs| obs.prompt_digest.is_none()));
     }
 
     /// 端到端：`run_machine_task` 的两条未终态条目各得到一个 watcher，

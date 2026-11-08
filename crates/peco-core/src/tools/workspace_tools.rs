@@ -30,7 +30,9 @@ use super::{Content, StringError, ToolDyn, ToolError};
 use crate::agent::{Agent, AgentError, MASTER_AGENT_NAME};
 use crate::config::{SystemConfig, system_config};
 use crate::machine::runtime::RuntimeError;
-use crate::machine::{MachineError, MachineRuntime, ObsStream, TaskId, TaskSnapshot, TaskState};
+use crate::machine::{
+    MachineError, MachineRuntime, ObsStream, TaskFilter, TaskId, TaskSnapshot, TaskState,
+};
 use crate::workspace::manifest::{self, ManifestError, WorkspaceManifest};
 use crate::workspace::{WorkDir, WorkSpace};
 
@@ -413,6 +415,25 @@ impl WorkspaceHub {
     ) -> Result<TaskSnapshot, WorkspaceToolError> {
         let hub = self.runtime_for(dir)?.hub()?;
         Ok(hub.snapshot(&id).await?)
+    }
+
+    /// 列出目标空间里当前可观察的任务快照。
+    ///
+    /// 与 [`Self::task_snapshot`] 同一条纪律：不自动打开空间 —— 新建的 Hub 里
+    /// 任务是空的，自动打开会把「这个空间没有在飞任务」与「空间本来就没开」
+    /// 混成同一个答复。
+    pub async fn list_tasks(
+        &self,
+        dir: &Path,
+        filter: &TaskFilter,
+    ) -> Result<Vec<TaskSnapshot>, WorkspaceToolError> {
+        let hub = self.runtime_for(dir)?.hub()?;
+        let ids = hub.list(filter).await?;
+        let mut snapshots = Vec::with_capacity(ids.len());
+        for id in ids {
+            snapshots.push(hub.snapshot(&id).await?);
+        }
+        Ok(snapshots)
     }
 
     /// 等待目标空间里的任务进入终态。超时只返回错误，不取消任务。
@@ -1918,6 +1939,82 @@ mod tests {
                 .as_deref(),
             Some("done")
         );
+    }
+
+    /// 列表只含该空间自己的任务（未终态也在内）；未打开的空间是错误，不是空列表。
+    ///
+    /// 变异点：`list_tasks` 改成返回空 Vec ⇒ 条数断言红；改成不校验打开状态、
+    /// 靠一个默认 Hub 兜底 ⇒ 未打开那条从 `NotOpen` 退化成空列表，断言红。
+    #[tokio::test]
+    async fn list_tasks_returns_the_snapshots_of_that_workspace_only() {
+        let (agent, _entered, _release) = gated_master_agent();
+        let runtime = test_runtime();
+        let hub = WorkspaceHub::with_system_config(Arc::new(test_config()));
+        let dir = tempfile::tempdir().unwrap();
+        hub.insert_for_test(dir.path(), fake_handle("alice", agent, runtime.clone()));
+
+        let filter = TaskFilter::default();
+        assert!(
+            hub.list_tasks(dir.path(), &filter)
+                .await
+                .expect("empty list")
+                .is_empty(),
+            "刚打开的空间没有任务"
+        );
+
+        let first = TaskId(
+            hub.dispatch(dir.path(), "hi", false, None, None, None)
+                .await
+                .expect("dispatch")
+                .task_id
+                .parse()
+                .expect("task id"),
+        );
+        let second = TaskId(
+            hub.dispatch(dir.path(), "hello", false, None, None, None)
+                .await
+                .expect("dispatch")
+                .task_id
+                .parse()
+                .expect("task id"),
+        );
+
+        let snapshots = hub.list_tasks(dir.path(), &filter).await.expect("list");
+        let ids: Vec<TaskId> = snapshots.iter().map(|snapshot| snapshot.id).collect();
+        assert_eq!(ids, vec![first, second], "该目录自己的两条任务，按创建顺序");
+        for snapshot in &snapshots {
+            assert!(
+                !snapshot.state.is_terminal(),
+                "两条都被 gate 卡住：{}",
+                snapshot.state.as_str()
+            );
+        }
+
+        // 另一个空间是另一个 Hub 实例，任务不相干。
+        let (other_agent, _entered, _release) = gated_master_agent();
+        let other_hub = WorkspaceHub::with_system_config(Arc::new(test_config()));
+        let other = tempfile::tempdir().unwrap();
+        other_hub.insert_for_test(
+            other.path(),
+            fake_handle("bob", other_agent, test_runtime()),
+        );
+        assert!(
+            other_hub
+                .list_tasks(other.path(), &filter)
+                .await
+                .expect("the other space lists its own")
+                .is_empty(),
+            "别的空间不该看到这些任务"
+        );
+
+        // 未打开的空间是错误，不是空列表：空列表会让「空间没开」看起来像
+        // 「空间开着但没有任务」。
+        let closed = tempfile::tempdir().unwrap();
+        let err = hub
+            .list_tasks(closed.path(), &filter)
+            .await
+            .expect_err("an unopened space must be reported");
+        assert!(matches!(err, WorkspaceToolError::NotOpen { .. }), "{err}");
     }
 
     #[tokio::test]

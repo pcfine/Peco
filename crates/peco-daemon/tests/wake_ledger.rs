@@ -80,6 +80,7 @@ fn observation(target_dir: PathBuf, task_id: TaskId, origin_ws_id: &str) -> Disp
         dispatch_id: None,
         origin_kind: "run_machine_task".into(),
         agent_name: "@master".into(),
+        prompt_digest: None,
     }
 }
 

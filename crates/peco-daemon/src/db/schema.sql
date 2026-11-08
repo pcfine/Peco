@@ -248,6 +248,8 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
     wake_claimed_at TEXT,
     delivered_at    TEXT,
     result_digest   TEXT,
+    -- 派发工具入参 prompt 的前 512 字；旧行留 NULL（未记录）
+    prompt_digest   TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     terminal_at     TEXT,
     UNIQUE (target_ws_id, task_id)

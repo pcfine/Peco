@@ -70,6 +70,7 @@ mod tests {
             wake_state: "pending".to_string(),
             wake_skip_reason: None,
             result_digest: digest.map(str::to_string),
+            prompt_digest: None,
             created_at: "2026-01-01 00:00:00".to_string(),
             terminal_at: Some("2026-01-01 00:00:01".to_string()),
         }

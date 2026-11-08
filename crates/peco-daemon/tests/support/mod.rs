@@ -334,6 +334,7 @@ impl TestEnv {
                 task_state,
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await
@@ -360,6 +361,7 @@ impl TestEnv {
                 task_state: "working",
                 wake_state: WakeState::Skipped,
                 wake_skip_reason: Some(WakeSkipReason::NotPecoOrigin),
+                prompt_digest: None,
             },
         )
         .await

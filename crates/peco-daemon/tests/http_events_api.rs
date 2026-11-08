@@ -62,6 +62,7 @@ fn observation(target_dir: PathBuf, task_id: TaskId) -> DispatchObservation {
         dispatch_id: Some("disp-1".into()),
         origin_kind: "dispatch_to_workspace".into(),
         agent_name: "@master".into(),
+        prompt_digest: None,
     }
 }
 

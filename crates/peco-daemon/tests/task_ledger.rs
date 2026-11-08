@@ -64,6 +64,7 @@ fn observation(target_dir: PathBuf, task_id: TaskId) -> DispatchObservation {
         dispatch_id: Some("disp-1".into()),
         origin_kind: "dispatch_to_workspace".into(),
         agent_name: "@master".into(),
+        prompt_digest: None,
     }
 }
 
@@ -190,6 +191,77 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
         0,
         "task_state=working 必须压过 state=completed，body={}",
         reversed.body
+    );
+}
+
+/// `prompt_digest` 从观察一路落到台账与两个查询接口；列为 NULL 的旧行原样
+/// 返回 `null`（设计口径：没有记录就说没有，不编造）。
+///
+/// 变异：`NewDispatch` 不带这一列 / `insert` 少绑一个占位符 ⇒ 第一条断言红。
+#[tokio::test]
+async fn prompt_digest_roundtrips_and_legacy_rows_stay_null() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("prompt-space");
+    let ws_id = env.resolve(&work_dir, "research").await.unwrap();
+    let target_dir = env.work_dir_of(&ws_id).await;
+    let sink: &dyn TaskObservationSink = env.tasks.as_ref();
+
+    let task = TaskId(Uuid::new_v4());
+    let mut obs = observation(target_dir, task);
+    obs.prompt_digest = Some("整理 output/ 目录并写一份清单".to_string());
+    sink.on_registered(&obs, &snapshot(task, TaskState::Working, None))
+        .await;
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT prompt_digest FROM d_dispatches WHERE task_id = ?")
+            .bind(task.to_string())
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some("整理 output/ 目录并写一份清单"));
+
+    for uri in [
+        format!("/api/tasks/{task}"),
+        format!("/api/tasks?target_ws_id={ws_id}"),
+        format!("/api/spaces/{ws_id}/tasks"),
+    ] {
+        let reply = env.get(&uri).await;
+        assert_eq!(reply.status, 200, "{uri} body={}", reply.body);
+        let item = match reply.body.as_array() {
+            Some(items) => {
+                assert_eq!(items.len(), 1, "{uri} body={}", reply.body);
+                items[0].clone()
+            }
+            None => reply.body.clone(),
+        };
+        assert_eq!(
+            item["prompt_digest"],
+            json!("整理 output/ 目录并写一份清单"),
+            "{uri} 必须带 prompt_digest"
+        );
+    }
+
+    // 迁移前写入的旧行：列是 NULL，接口就是 null。
+    let legacy = TaskId(Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+         target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state) \
+         VALUES (?, ?, ?, '/tmp/work', 'research', 'peco', '@master', \
+         'dispatch_to_workspace', 'working', 'pending')",
+    )
+    .bind(format!("d_{legacy}"))
+    .bind(legacy.to_string())
+    .bind(&ws_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+
+    let legacy_reply = env.get(&format!("/api/tasks/{legacy}")).await;
+    assert_eq!(legacy_reply.status, 200, "body={}", legacy_reply.body);
+    assert_eq!(
+        legacy_reply.body["prompt_digest"],
+        json!(null),
+        "旧行不得编造一段描述"
     );
 }
 

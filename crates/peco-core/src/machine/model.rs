@@ -70,7 +70,10 @@ pub enum TaskSource {
 
 /// 全部字段都能下推为列/索引（将来换 SQLite 后端不需要改调用点），
 /// 故不接受闭包谓词；每个 `None` 表示不过滤，`labels` 全部匹配（AND）。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// `Default` 即「不过滤」：调用方只关心其中一两个维度时，不必把其余维度
+/// 逐个写一遍 None。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskFilter {
     pub kind: Option<String>,
     pub state: Option<TaskState>,

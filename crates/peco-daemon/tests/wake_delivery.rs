@@ -101,6 +101,7 @@ fn observation(task_id: TaskId, origin_ws_id: &str) -> DispatchObservation {
         dispatch_id: None,
         origin_kind: "run_machine_task".into(),
         agent_name: "@master".into(),
+        prompt_digest: None,
     }
 }
 

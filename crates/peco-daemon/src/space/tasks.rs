@@ -10,7 +10,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use peco_core::agent::hooks::{DispatchObservation, TaskObservationSink};
+use peco_core::agent::hooks::{DispatchObservation, MAX_DIGEST_CHARS, TaskObservationSink};
 use peco_core::machine::{ObsEvent, TaskSnapshot, UpdateBody};
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -24,8 +24,6 @@ use crate::space::peco::PecoIdentity;
 use crate::wake;
 use crate::wake::pump::WakePump;
 
-/// 终态摘要上限：只做 UI 的一行预览，不存整段输出。
-const MAX_DIGEST_CHARS: usize = 512;
 /// 广播缓冲：慢消费者只会收到 `Lagged`，不会阻塞 watcher。
 const EVENT_BUFFER: usize = 256;
 
@@ -158,6 +156,7 @@ impl TaskObservationSink for TaskObserver {
                 task_state: state,
                 wake_state,
                 wake_skip_reason,
+                prompt_digest: obs.prompt_digest.as_deref(),
             },
         )
         .await;

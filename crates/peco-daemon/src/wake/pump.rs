@@ -300,6 +300,7 @@ mod tests {
                 task_state: "completed",
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await

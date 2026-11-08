@@ -25,6 +25,8 @@ pub struct DispatchRow {
     /// 仅 `wake_state='skipped'` 时非空；历史行为 `None`（成因不可考）。
     pub wake_skip_reason: Option<String>,
     pub result_digest: Option<String>,
+    /// 派发入参里那段任务描述的前 512 字；旧行是 `None`（当时没有记录）。
+    pub prompt_digest: Option<String>,
     pub created_at: String,
     pub terminal_at: Option<String>,
 }
@@ -52,6 +54,8 @@ pub struct NewDispatch<'a> {
     pub wake_state: WakeState,
     /// 只在 `wake_state = Skipped` 时给值 —— reason 非空当且仅当已跳过。
     pub wake_skip_reason: Option<WakeSkipReason>,
+    /// 派发入参里的任务描述摘要；解析不到入参时为空。
+    pub prompt_digest: Option<&'a str>,
 }
 
 /// 未终态状态清单 —— 关闭门槛、`orphan` 化与启动对账共用的唯一口径。
@@ -108,8 +112,8 @@ pub async fn insert(pool: &SqlitePool, dispatch: &NewDispatch<'_>) -> Result<u64
     let result = sqlx::query(
         "INSERT INTO d_dispatches \
          (id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-          agent_name, origin_kind, task_state, wake_state, wake_skip_reason) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, prompt_digest) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(target_ws_id, task_id) DO NOTHING",
     )
     .bind(dispatch.id)
@@ -123,6 +127,7 @@ pub async fn insert(pool: &SqlitePool, dispatch: &NewDispatch<'_>) -> Result<u64
     .bind(dispatch.task_state)
     .bind(dispatch.wake_state.as_str())
     .bind(dispatch.wake_skip_reason.map(WakeSkipReason::as_str))
+    .bind(dispatch.prompt_digest)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -246,7 +251,7 @@ pub async fn get_by_task_id(
     sqlx::query_as::<_, DispatchRow>(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, created_at, terminal_at \
+         result_digest, prompt_digest, created_at, terminal_at \
          FROM d_dispatches WHERE task_id = ? \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -263,7 +268,7 @@ pub async fn list_active(pool: &SqlitePool) -> Result<Vec<DispatchRow>, sqlx::Er
     let sql = format!(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, created_at, terminal_at \
+         result_digest, prompt_digest, created_at, terminal_at \
          FROM d_dispatches WHERE task_state IN ({}) ORDER BY created_at DESC, id DESC",
         placeholders(TASK_ACTIVE_STATES)
     );
@@ -282,7 +287,7 @@ pub async fn list(
     let mut builder = QueryBuilder::new(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, created_at, terminal_at \
+         result_digest, prompt_digest, created_at, terminal_at \
          FROM d_dispatches",
     );
     let mut has_where = false;
@@ -434,7 +439,7 @@ pub async fn list_pending(
     let sql = format!(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, created_at, terminal_at \
+         result_digest, prompt_digest, created_at, terminal_at \
          FROM d_dispatches WHERE wake_state = '{pending}' AND {} ORDER BY created_at, id LIMIT ?",
         backoff_predicate(backoff),
         pending = WakeState::Pending.as_str(),
@@ -658,6 +663,7 @@ mod tests {
                 task_state: "working",
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await
@@ -692,6 +698,7 @@ mod tests {
                 task_state: "completed",
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await
@@ -796,6 +803,7 @@ mod tests {
                 task_state: "completed",
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await
@@ -829,6 +837,7 @@ mod tests {
                 task_state: "completed",
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await
@@ -985,6 +994,7 @@ mod tests {
                 task_state: "working",
                 wake_state: WakeState::Skipped,
                 wake_skip_reason: Some(reason),
+                prompt_digest: None,
             },
         )
         .await
@@ -1034,6 +1044,7 @@ mod tests {
                 task_state: "working",
                 wake_state: WakeState::Delivered,
                 wake_skip_reason: None,
+                prompt_digest: None,
             },
         )
         .await
@@ -1090,6 +1101,7 @@ mod tests {
                     task_state: "working",
                     wake_state,
                     wake_skip_reason: None,
+                    prompt_digest: None,
                 },
             )
             .await

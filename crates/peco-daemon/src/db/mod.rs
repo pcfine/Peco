@@ -568,6 +568,27 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 021 skipped: space session index already exists");
     }
 
+    // ── Migration 022: d_dispatches.prompt_digest ─────────────────────────
+    // 门控查列：ALTER ADD COLUMN 不可重复执行（重跑报 duplicate column name）。
+    let has_prompt_digest = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('d_dispatches') WHERE name = 'prompt_digest'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_prompt_digest {
+        run_migration(
+            pool,
+            "022",
+            include_str!("migrations/022_dispatch_prompt_digest.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 022 completed");
+    } else {
+        tracing::debug!("Migration 022 skipped: d_dispatches.prompt_digest already exists");
+    }
+
     Ok(())
 }
 

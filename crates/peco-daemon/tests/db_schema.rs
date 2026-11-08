@@ -258,6 +258,10 @@ fn schema_sql_declares_task_state_and_wake_skip_reason() {
         "d_dispatches 建表语句必须带 wake_skip_reason 列"
     );
     assert!(
+        schema.contains("    prompt_digest   TEXT"),
+        "d_dispatches 建表语句必须带 prompt_digest 列（新库不靠迁移补）"
+    );
+    assert!(
         !before_migrations.contains("idx_dispatches_state"),
         "迁移前段落不得建旧索引：旧库此时还没有 task_state 列"
     );
@@ -469,4 +473,55 @@ async fn migration_021_adds_the_partial_unique_space_session_index() {
     // 重跑迁移：守卫命中，索引与数据都还在。
     peco_daemon::db::run_migrations(&pool).await.unwrap();
     assert!(index_exists(&pool, "idx_conversations_space_unique").await);
+}
+
+/// 旧库（022 之前）没有 prompt_digest：启动迁移补上，且列门控让重跑安全。
+///
+/// 变异：删掉 022 的注册 ⇒ 第一条断言红；把门控写成「总是执行」⇒ 旧库补列后
+/// 第二次 `run_migrations` 报 duplicate column name，最后一步失败。
+#[tokio::test]
+async fn migration_022_adds_the_prompt_digest_column_and_is_reentrant() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/pre022.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    // 造出 022 之前的库形状：列不在，行要在。
+    sqlx::query(
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+         target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state) \
+         VALUES ('d1', 't1', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+         'run_machine_task', 'working', 'pending')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("ALTER TABLE d_dispatches DROP COLUMN prompt_digest")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !column_names(&pool)
+            .await
+            .contains(&"prompt_digest".to_string()),
+        "夹具需要一份缺列的库"
+    );
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    let columns = column_names(&pool).await;
+    assert!(
+        columns.contains(&"prompt_digest".to_string()),
+        "022 必须把缺的列补上：{columns:?}"
+    );
+    let digest = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT prompt_digest FROM d_dispatches WHERE id = 'd1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(digest, None, "补列不得给历史行编造描述");
+
+    // 再跑一次：列门控命中，形状不变（ALTER 本身不可重入）。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_eq!(column_names(&pool).await, columns);
 }

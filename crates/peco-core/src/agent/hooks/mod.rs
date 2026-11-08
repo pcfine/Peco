@@ -9,7 +9,7 @@ pub mod dispatch_watch;
 pub mod metrics;
 
 pub use dispatch_watch::{
-    DispatchObservation, DispatchOrigin, DispatchWatchHook, TaskObservationSink,
+    DispatchObservation, DispatchOrigin, DispatchWatchHook, MAX_DIGEST_CHARS, TaskObservationSink,
 };
 
 use std::collections::HashSet;

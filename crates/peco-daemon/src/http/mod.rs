@@ -40,6 +40,17 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/spaces/{ws_id}/close", post(space::close))
         .route("/api/spaces/{ws_id}/tasks", get(tasks::list_for_space))
+        // 实时观察只读该空间的 TaskHub 内存：未打开时 409，不拿空列表冒充。
+        // `live` 是静态段，与 `{task_id}` 子树不重叠（前者两段，后者三段）。
+        .route("/api/spaces/{ws_id}/tasks/live", get(tasks::live))
+        .route(
+            "/api/spaces/{ws_id}/tasks/{task_id}/stream",
+            get(tasks::stream),
+        )
+        .route(
+            "/api/spaces/{ws_id}/tasks/{task_id}/cancel",
+            post(tasks::cancel),
+        )
         // 空间维度的只读视图：路径里已带 `ws_id`，不要求 `X-Peco-Space` 头。
         .route("/api/spaces/{ws_id}/artifacts", get(space_artifacts::list))
         // 空间单会话的惰性创建：前端点开空间时才调用，幂等。

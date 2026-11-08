@@ -210,6 +210,11 @@ async fn a_dispatch_from_a_chat_turn_lands_in_the_target_ledger() {
     );
     assert_eq!(row.target_ws_id, ws_b, "目标必须是派发目录所属的空间");
     assert_eq!(row.agent_name, "@master", "派发的目标恒为团队总管");
+    assert_eq!(
+        row.prompt_digest.as_deref(),
+        Some("hi"),
+        "台账要记录派发入参里那段任务描述：卡片靠它显示「让它做什么」"
+    );
     assert_active_or_terminal(&row);
 
     // 假上游确实收到过两个模型的请求，且工具真的在模型可见的工具表里。
@@ -341,6 +346,11 @@ async fn a_same_space_async_machine_task_lands_in_the_ledger() {
     assert_eq!(row.origin_ws_id, ws, "同空间异步任务的发起方就是本空间");
     assert_eq!(row.target_ws_id, ws, "任务落在发起方自己的 Hub 里");
     assert_eq!(row.agent_name, "worker", "agent_name 取自结果条目");
+    assert_eq!(
+        row.prompt_digest.as_deref(),
+        Some("hi"),
+        "同空间任务的描述来自入参 `tasks[i].prompt`，不是结果里的回显"
+    );
     assert_active_or_terminal(&row);
     print_exchanges("T-B", &upstream);
 }
@@ -601,6 +611,7 @@ async fn insert_row(
             task_state,
             wake_state: WakeState::Pending,
             wake_skip_reason: None,
+            prompt_digest: None,
         },
     )
     .await
