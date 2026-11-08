@@ -43,7 +43,7 @@ export function AppShell() {
   return (
     <div className="flex h-full overflow-hidden bg-canvas text-ink">
       {viewport >= 900 ? (
-        <Rail collapsed={rail !== 256} collapsible={viewport >= 1100} />
+        <Rail collapsed={rail !== 208} collapsible={viewport >= 1100} />
       ) : (
         <Sheet open={navOpen} onOpenChange={setNavOpen}>
           <SheetContent

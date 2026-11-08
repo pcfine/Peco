@@ -1,9 +1,20 @@
-// 左栏：品牌 / Peco / 已打开空间 / 工作室·团队·成果 / 固定底栏。
-// 「已打开」是唯一的空间列表 —— 未打开的空间只在工作室页里，左栏不是索引。
+// 左栏：品牌 / Peco / 打开集 / 工作室·团队·成果 / 固定底栏。
+// 打开集是唯一的空间列表 —— 未打开的空间只在工作室页里，左栏不是索引。
 
 import { type KeyboardEvent } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
-import { PanelLeftClose, PanelLeftOpen, Plus, Settings } from "lucide-react";
+import {
+  Clock,
+  LayoutGrid,
+  Moon,
+  Package,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Settings,
+  Sun,
+  Users,
+} from "lucide-react";
 import { BrandMark } from "@/components/common/BrandMark";
 import { OpenSpaceRow } from "@/components/layout/OpenSpaceRow";
 import { useActivateSpace } from "@/hooks/useOpenSpaces";
@@ -23,7 +34,7 @@ export function Rail({
   collapsible = true,
 }: {
   collapsed?: boolean;
-  /** 视口容不容得下 256 ↔ 64 的切换：容不下时宽度是定值，就不要再给一个按钮。 */
+  /** 视口容不容得下 208 ↔ 64 的切换：容不下时宽度是定值，就不要再给一个按钮。 */
   collapsible?: boolean;
 }) {
   const railOpen = useUiStore((state) => state.railOpen);
@@ -106,7 +117,7 @@ export function Rail({
     <aside
       className={cn(
         "flex h-full shrink-0 flex-col border-r border-line bg-rail",
-        collapsed ? "w-16" : "w-64",
+        collapsed ? "w-16" : "w-52",
       )}
     >
       {/* 收起态 64 放不下「品牌 + 间距 + 按钮」的展开式内边距：收紧留白并居中，
@@ -142,40 +153,33 @@ export function Rail({
 
       <div className="min-h-0 flex-1 overflow-y-auto" onKeyDown={moveFocus}>
         {peco && (
-          <button
-            type="button"
-            onClick={openPeco}
-            aria-current={activeWsId === peco.ws_id ? "true" : undefined}
-            aria-label="Peco"
-            title="Peco"
-            data-space-row=""
-            className={cn(
-              "mx-2 flex items-center rounded-full border font-semibold transition-colors duration-[120ms]",
-              collapsed ? "h-9 justify-center" : "h-9 gap-2 px-3",
-              activeWsId === peco.ws_id
-                ? "border-brand/40 bg-brand/10 text-ink"
-                : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
-            )}
-          >
-            <BrandMark size={14} />
-            {!collapsed && (
-              <>
-                <span className="min-w-0 truncate text-reading">Peco</span>
-                <span className="ml-auto shrink-0 font-mono text-2xs text-ink-faint">
-                  {peco.team_id}
-                </span>
-              </>
-            )}
-          </button>
+          // `button` 的 width:auto 是 fit-content，满宽要靠块级容器；否则它比空间行窄一截。
+          <div className="mx-2">
+            <button
+              type="button"
+              onClick={openPeco}
+              aria-current={activeWsId === peco.ws_id ? "true" : undefined}
+              aria-label="Peco"
+              title="Peco"
+              data-space-row=""
+              className={cn(
+                "flex h-8 w-full items-center rounded-[6px] border font-normal transition-colors duration-[120ms]",
+                collapsed ? "justify-center" : "gap-2 px-2",
+                activeWsId === peco.ws_id
+                  ? "border-brand/40 bg-brand/10 text-ink"
+                  : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
+              )}
+            >
+              <BrandMark size={14} />
+              {!collapsed && (
+                <span className="min-w-0 truncate text-body">Peco</span>
+              )}
+            </button>
+          </div>
         )}
 
         <div className="mx-2 my-1 h-px bg-line" />
 
-        {!collapsed && (
-          <p className="flex h-7 items-center pl-5 pr-2 text-caption font-semibold text-ink-faint">
-            已打开
-          </p>
-        )}
         {rows.map((space) => (
           <OpenSpaceRow
             key={space.ws_id}
@@ -186,21 +190,16 @@ export function Rail({
             onRemove={() => removeSpace(space.ws_id)}
           />
         ))}
-        {!collapsed && rows.length === 0 && (
-          <p className="pl-5 pr-2 py-1 text-caption font-medium text-ink-faint">
-            还没有打开空间。
-          </p>
-        )}
         <Link
           to="/spaces"
           title={collapsed ? "打开空间" : undefined}
           aria-label={collapsed ? "打开空间" : undefined}
           className={cn(
-            "flex h-8 items-center gap-1.5 text-caption font-medium text-ink-faint hover:text-ink",
-            collapsed ? "justify-center" : "pl-5 pr-2",
+            "mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-faint hover:bg-line/50 hover:text-ink",
+            collapsed ? "justify-center" : "",
           )}
         >
-          <Plus className="h-3 w-3 shrink-0" />
+          <Plus className="h-4 w-4 shrink-0" />
           {!collapsed && "打开空间"}
         </Link>
 
@@ -209,16 +208,18 @@ export function Rail({
         {!collapsed && (
           <Link
             to="/spaces"
-            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
+            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
           >
+            <LayoutGrid className="h-4 w-4 shrink-0" />
             工作室
           </Link>
         )}
         {!collapsed && (
           <Link
             to="/teams"
-            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
+            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
           >
+            <Users className="h-4 w-4 shrink-0" />
             团队
             <span className="ml-auto tabular-nums text-2xs text-ink-faint">
               {teams?.length ?? 0}
@@ -228,23 +229,25 @@ export function Rail({
         {!collapsed && (
           <Link
             to="/results"
-            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
+            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
           >
+            <Package className="h-4 w-4 shrink-0" />
             成果
-            <span className="ml-auto tabular-nums text-caption font-medium text-ink-faint">
-              今日 {todayResults}
+            <span
+              title={`今日 ${todayResults}`}
+              className="ml-auto tabular-nums text-caption font-medium text-ink-faint"
+            >
+              {todayResults}
             </span>
           </Link>
         )}
         {!collapsed && (
           <Link
             to="/schedules"
-            className="mx-2 flex h-9 items-center rounded-full border border-transparent px-3 text-reading font-semibold text-ink-muted hover:bg-line/50 hover:text-ink"
+            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
           >
+            <Clock className="h-4 w-4 shrink-0" />
             定时任务
-            <span className="ml-auto text-caption font-medium text-ink-faint">
-              未实现
-            </span>
           </Link>
         )}
       </div>
@@ -262,7 +265,11 @@ export function Rail({
           aria-label={theme === "dark" ? "切到亮色" : "切到暗色"}
           className="grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
         >
-          <span className="text-xs">{theme === "dark" ? "◐" : "◑"}</span>
+          {theme === "dark" ? (
+            <Sun className="h-4 w-4" />
+          ) : (
+            <Moon className="h-4 w-4" />
+          )}
         </button>
         <Link
           to="/settings"
@@ -275,14 +282,6 @@ export function Rail({
         >
           <Settings className="h-4 w-4" />
         </Link>
-        {!collapsed && peco && (
-          <span
-            title={peco.work_dir}
-            className="ml-auto max-w-[120px] truncate font-mono text-2xs text-ink-faint"
-          >
-            {peco.ws_id}
-          </span>
-        )}
       </div>
     </aside>
   );

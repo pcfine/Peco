@@ -556,7 +556,7 @@ async function borderFacts(page: Page): Promise<BorderFacts> {
       });
       if (bordered) {
         stroked += 1;
-        // 选中态的椭圆描边是记号不是装饰：`aria-pressed` / `aria-current` /
+        // 选中态的圆角矩形描边是记号不是装饰：`aria-pressed` / `aria-current` /
         // `data-state=on` 任一成立就放行，非选中态仍按 0 描边判。
         const selected =
           element.getAttribute("aria-pressed") === "true" ||
@@ -995,12 +995,12 @@ test("壳层宽度：1920 / 1440 三列全在场（A1–A4）", async ({ browser
   try {
     const wide = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 960),
+      (facts) => near(facts.chat?.width ?? 0, 1008),
     );
     check(
       "A1",
-      "1920：聊天列宽 960（±1）",
-      near(wide.chat?.width, 960),
+      "1920：聊天列宽 1008（±1）",
+      near(wide.chat?.width, 1008),
       true,
       `实测 ${wide.chat?.width}px（rail ${wide.rail?.width}px / dock ${wide.dockColumn?.width}px / 右栏 ${wide.panel?.width}px）`,
     );
@@ -1009,14 +1009,14 @@ test("壳层宽度：1920 / 1440 三列全在场（A1–A4）", async ({ browser
     const trio = await until(
       () => shellFacts(page),
       (facts) =>
-        near(facts.chat?.width ?? 0, 480) &&
+        near(facts.chat?.width ?? 0, 528) &&
         facts.dockColumn !== null &&
         facts.panel !== null,
     );
     check(
       "A2",
-      "1440：聊天列宽 480（±1）",
-      near(trio.chat?.width, 480),
+      "1440：聊天列宽 528（±1）",
+      near(trio.chat?.width, 528),
       true,
       `实测 ${trio.chat?.width}px`,
     );
@@ -1050,7 +1050,7 @@ test("壳层宽度：dock 出列与 rail 图标轨（A5–A10）", async ({ brow
   try {
     const bar = await until(
       () => shellFacts(page),
-      (facts) => facts.dockBottom !== null && near(facts.chat?.width ?? 0, 680),
+      (facts) => facts.dockBottom !== null && near(facts.chat?.width ?? 0, 728),
     );
     check(
       "A5",
@@ -1061,8 +1061,8 @@ test("壳层宽度：dock 出列与 rail 图标轨（A5–A10）", async ({ brow
     );
     check(
       "A6",
-      "1280：聊天列宽 680（±1）",
-      near(bar.chat?.width, 680),
+      "1280：聊天列宽 728（±1）",
+      near(bar.chat?.width, 728),
       true,
       `实测 ${bar.chat?.width}px`,
     );
@@ -1070,12 +1070,12 @@ test("壳层宽度：dock 出列与 rail 图标轨（A5–A10）", async ({ brow
     await page.setViewportSize({ width: 1200, height: 800 });
     const mid = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 600),
+      (facts) => near(facts.chat?.width ?? 0, 648),
     );
     check(
       "A7",
-      "1200：聊天列宽 600（±1）",
-      near(mid.chat?.width, 600),
+      "1200：聊天列宽 648（±1）",
+      near(mid.chat?.width, 648),
       true,
       `实测 ${mid.chat?.width}px`,
     );
@@ -1483,12 +1483,12 @@ test("边框与圆角（C1 / C2 / C3 / C5 / C6 / C8）", async ({ browser }) => 
   );
   check(
     "C3",
-    "非选中态 button 上可见描边数 = 0（排除 select 触发器；选中态椭圆描边允许）",
+    "非选中态 button 上可见描边数 = 0（排除 select 触发器；选中态圆角矩形描边允许）",
     buttons,
     [],
     buttons.length > 0
       ? buttons.join(" | ")
-      : "六路由非选中态 0 处（选中态椭圆描边允许）",
+      : "六路由非选中态 0 处（选中态圆角矩形描边允许）",
   );
   const unexpected = [...radii].filter((radius) => !allowedRadius(radius));
   check(

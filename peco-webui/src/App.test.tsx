@@ -301,7 +301,7 @@ describe("白屏与 rail 宽度", () => {
       useUiStore.setState({ railOpen: true });
       const expanded = renderAt("/");
       expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
-      expect(expanded.container.querySelector("aside")).toHaveClass("w-64");
+      expect(expanded.container.querySelector("aside")).toHaveClass("w-52");
       expect(
         screen.getByRole("button", { name: "折叠左栏" }),
       ).toBeInTheDocument();
@@ -313,7 +313,7 @@ describe("白屏与 rail 宽度", () => {
       expect(collapsed.container.querySelector("aside")).toHaveClass("w-16");
       collapsed.unmount();
 
-      // 900–1099 放不下 256：宽度压成图标轨，切换按钮不进 DOM（改由顶栏开整栏 Sheet）。
+      // 900–1099 放不下 208：宽度压成图标轨，切换按钮不进 DOM（改由顶栏开整栏 Sheet）。
       setViewport(1024);
       useUiStore.setState({ railOpen: true });
       const forced = renderAt("/");
@@ -376,7 +376,7 @@ describe("dock 三形态", () => {
   it("形态跟着 shell 宽走：1440 右列、1280 底部条、820 覆盖 Sheet", async () => {
     const restore = useWideViewport();
     try {
-      // shell = 1440 − 256 = 1184：右列的下限。
+      // shell = 1440 − 208 = 1232：右列的下限。
       setViewport(1440);
       useUiStore.setState({ railOpen: true });
       useDockStore.setState({ open: true, conversationByWs: {} });
@@ -398,7 +398,7 @@ describe("dock 三形态", () => {
       ).toBeInTheDocument();
       wide.unmount();
 
-      // shell = 1280 − 256 = 1024：退出右列，收起成 40px 的底部条。
+      // shell = 1280 − 208 = 1072：退出右列，收起成 40px 的底部条。
       setViewport(1280);
       useDockStore.setState({ open: false, conversationByWs: {} });
       const bottom = renderAt("/");

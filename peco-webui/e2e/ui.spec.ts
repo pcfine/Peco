@@ -688,9 +688,9 @@ test("左栏：打开集渲染、主点击进聊天、状态页链接、× 只�
     );
     check(
       "B3",
-      "rail 宽度 = 256px",
+      "rail 宽度 = 208px",
       initial.rail?.width ?? null,
-      256,
+      208,
       `实测 ${initial.rail?.width}px`,
     );
     check("B4", "激活行 = 预置的 activeWsId", initial.active, [ACTIVE_WS]);

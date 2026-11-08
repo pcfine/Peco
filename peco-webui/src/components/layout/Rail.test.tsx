@@ -104,7 +104,6 @@ describe("左栏打开集", () => {
     expect(
       screen.queryByRole("button", { name: /空间 B/ }),
     ).not.toBeInTheDocument();
-    expect(screen.getByText("已打开")).toBeInTheDocument();
   });
 
   it("「状态」链接指向该空间的状态页", async () => {
@@ -163,9 +162,9 @@ describe("左栏打开集", () => {
       name: "空间 B（团队 research）",
     });
     expect(activeRow).toHaveAttribute("aria-current", "true");
-    // 选中态的形状是行容器上的椭圆 —— 主点击区自己不带框。
+    // 选中态的形状是行容器上的圆角矩形 —— 主点击区自己不带框。
     const pill = activeRow.parentElement;
-    expect(pill?.className).toContain("rounded-full");
+    expect(pill?.className).toContain("rounded-[6px]");
     expect(pill?.className).toContain("bg-brand/10");
     expect(ensureSpaceConversation).not.toHaveBeenCalled();
     expect(closeSpace).not.toHaveBeenCalled();
