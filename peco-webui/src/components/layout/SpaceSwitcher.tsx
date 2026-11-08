@@ -40,7 +40,7 @@ export function SpaceSwitcher() {
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-64">
-        <DropdownMenuLabel className="text-2xs text-ink-faint">
+        <DropdownMenuLabel className="text-caption font-medium text-ink-faint">
           当前空间
         </DropdownMenuLabel>
         <DropdownMenuRadioGroup

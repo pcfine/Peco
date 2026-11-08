@@ -158,7 +158,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
             {peco.ws_id}
           </span>
           {space && (
-            <span className="shrink-0 text-2xs text-ink-faint">
+            <span className="shrink-0 text-caption font-medium text-ink-faint">
               {spaceOpen ? "进行中" : "未打开"}
             </span>
           )}
@@ -174,7 +174,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
               />
             )}
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               className="h-7"
               onClick={toggleFace}
@@ -183,7 +183,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
             </Button>
           </div>
         </div>
-        <div className="mt-1 flex h-5 min-w-0 items-center gap-2 text-2xs text-ink-faint">
+        <div className="mt-1 flex h-5 min-w-0 items-center gap-2 text-caption font-medium text-ink-faint">
           <span
             className="truncate font-mono text-mono-sm"
             title={peco.work_dir}

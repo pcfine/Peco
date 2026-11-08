@@ -23,7 +23,7 @@ export function ConnectionStatus({
         aria-hidden="true"
         className={cn("size-2 shrink-0 rounded-full", sseDotClass(state))}
       />
-      <span className="text-2xs text-ink-faint">
+      <span className="text-caption font-medium text-ink-faint">
         {label ? `${label} · ${sseLabel(state)}` : sseLabel(state)}
       </span>
     </span>

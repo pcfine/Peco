@@ -71,12 +71,12 @@ export function TeamAgentsTab({ wsId }: { wsId: string }) {
         )}
         <ul>
           {rows.map((agent) => (
-            <li key={agent.id}>
+            <li key={agent.id} className="border-b border-line">
               <button
                 type="button"
                 onClick={() => setSelected(agent.id)}
                 className={cn(
-                  "flex h-9 w-full items-center gap-2 border-b border-line px-3 text-left",
+                  "flex h-9 w-full items-center gap-2 px-3 text-left",
                   agent.id === activeId ? "bg-line/40" : "hover:bg-line/20",
                 )}
               >
@@ -84,7 +84,7 @@ export function TeamAgentsTab({ wsId }: { wsId: string }) {
                   {agent.name}
                 </span>
                 {agent.is_master && (
-                  <span className="shrink-0 rounded-[4px] border border-line px-1 text-2xs text-ink-faint">
+                  <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
                     总管
                   </span>
                 )}
@@ -108,12 +108,7 @@ export function TeamAgentsTab({ wsId }: { wsId: string }) {
           <EmptyState
             title="这个团队还没有 agent。"
             action={
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7"
-                onClick={() => setCreating(true)}
-              >
+              <Button size="sm" onClick={() => setCreating(true)}>
                 ＋ 新建 agent
               </Button>
             }

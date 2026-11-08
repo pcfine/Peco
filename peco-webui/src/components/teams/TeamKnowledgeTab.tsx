@@ -60,7 +60,7 @@ export function TeamKnowledgeTab({
           <span className="min-w-0 flex-1 truncate text-sm text-ink">
             {kb.name}
           </span>
-          <span className="shrink-0 tabular-nums text-2xs text-ink-faint">
+          <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint">
             文档 {kb.document_count}
           </span>
           <span className="w-28 shrink-0 truncate text-right font-mono text-2xs text-ink-faint">

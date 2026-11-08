@@ -64,7 +64,7 @@ function ArtifactPreview({
           )}
         </div>
         {artifact && (
-          <div className="flex shrink-0 items-center gap-3 border-t border-line pt-2 text-2xs text-ink-faint">
+          <div className="flex shrink-0 items-center gap-3 border-t border-line pt-2 text-caption font-medium text-ink-faint">
             <a
               href={`/api/artifacts/${encodeURIComponent(artifact.id)}/download`}
               className="text-primary-ink hover:underline"
@@ -117,7 +117,7 @@ export function SpaceArtifactsTab({
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-line bg-panel px-3 text-2xs text-ink-faint">
+      <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-line bg-panel px-3 text-caption font-medium text-ink-faint">
         <span className="w-16 shrink-0">类型</span>
         <span className="min-w-0 flex-1">名称</span>
         <span className="w-20 shrink-0 text-right">大小</span>
@@ -140,7 +140,7 @@ export function SpaceArtifactsTab({
               <span className="w-20 shrink-0 text-right tabular-nums text-2xs text-ink-faint">
                 {formatBytes(artifact.size_bytes)}
               </span>
-              <span className="w-24 shrink-0 text-right tabular-nums text-2xs text-ink-faint">
+              <span className="w-24 shrink-0 text-right tabular-nums text-caption font-medium text-ink-faint">
                 {relativeTime(artifact.created_at)}
               </span>
             </button>

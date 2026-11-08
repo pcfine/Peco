@@ -72,7 +72,7 @@ export function OpenSpaceRow({
         <Link
           to={`/spaces/${encodeURIComponent(space.ws_id)}/status`}
           aria-label={`${name} 状态`}
-          className="grid h-6 shrink-0 place-items-center rounded-[4px] px-1 text-2xs text-ink-faint hover:bg-line hover:text-ink"
+          className="grid h-6 shrink-0 place-items-center rounded-[4px] px-1 text-caption font-medium text-ink-faint hover:bg-line hover:text-ink"
         >
           状态
         </Link>

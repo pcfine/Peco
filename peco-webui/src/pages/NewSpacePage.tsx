@@ -105,7 +105,7 @@ export function NewSpacePage() {
             className="font-mono"
             autoComplete="off"
           />
-          <p className="text-2xs text-ink-faint">
+          <p className="text-caption font-medium text-ink-faint">
             绝对路径。目录不存在会为你创建；已有 `.workspace.json`
             的目录按记录里的身份处理。
           </p>
@@ -140,19 +140,19 @@ export function NewSpacePage() {
                 }
                 aria-pressed={selected}
                 className={cn(
-                  "flex h-9 w-full items-center gap-2 rounded-[6px] border px-2 text-left",
+                  "flex h-9 w-full items-center gap-2 rounded-[6px] px-2 text-left",
                   selected
-                    ? "border-brand bg-line/40"
-                    : "border-line hover:bg-line/20",
+                    ? "bg-line text-ink"
+                    : "bg-transparent text-ink-muted hover:bg-line/40",
                 )}
               >
-                <span className="min-w-0 flex-1 truncate text-sm text-ink">
+                <span className="min-w-0 flex-1 truncate text-sm">
                   {team.display_name}
                 </span>
                 <span className="shrink-0 font-mono text-2xs text-ink-faint">
                   {team.team_id}
                 </span>
-                <span className="w-28 shrink-0 text-right text-2xs text-ink-faint">
+                <span className="w-28 shrink-0 text-right text-caption font-medium text-ink-faint">
                   已有 {count} 个空间
                 </span>
               </button>
@@ -165,10 +165,10 @@ export function NewSpacePage() {
           onClick={() => setMode({ kind: "new" })}
           aria-pressed={mode.kind === "new"}
           className={cn(
-            "flex h-9 w-full items-center rounded-[6px] border px-2 text-left text-sm",
+            "flex h-9 w-full items-center rounded-[6px] px-2 text-left text-sm",
             mode.kind === "new"
-              ? "border-brand bg-line/40 text-ink"
-              : "border-line text-ink-muted hover:bg-line/20",
+              ? "bg-line text-ink"
+              : "bg-transparent text-ink-muted hover:bg-line/40",
           )}
         >
           由模板新建团队
@@ -186,7 +186,7 @@ export function NewSpacePage() {
                 className="font-mono"
                 autoComplete="off"
               />
-              <p className="text-2xs text-ink-faint">
+              <p className="text-caption font-medium text-ink-faint">
                 小写字母开头，可含数字与连字符，2–32 个字符。
               </p>
             </div>
@@ -205,7 +205,9 @@ export function NewSpacePage() {
 
       <div className="flex items-center justify-end gap-2 border-t border-line pt-4">
         {!dirOk && workDir !== "" && (
-          <span className="mr-auto text-2xs text-warn">目录要写绝对路径</span>
+          <span className="mr-auto text-caption font-medium text-warn">
+            目录要写绝对路径
+          </span>
         )}
         <Button
           disabled={!dirOk || !teamOk || submit.isPending}

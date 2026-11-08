@@ -68,10 +68,10 @@ export function PanelSpaces() {
               <span className="shrink-0 truncate font-mono text-2xs text-ink-faint @min-[640px]/work:w-[120px]">
                 {space.team_id}
               </span>
-              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/work:w-14 @min-[640px]/work:text-right">
+              <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint @min-[640px]/work:w-14 @min-[640px]/work:text-right">
                 在飞 {space.inflight_dispatch}
               </span>
-              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/work:w-24 @min-[640px]/work:text-right">
+              <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint @min-[640px]/work:w-24 @min-[640px]/work:text-right">
                 {relativeTime(activity.get(space.ws_id) ?? null)}
               </span>
             </li>
@@ -81,7 +81,7 @@ export function PanelSpaces() {
       {rest > 0 && (
         <Link
           to="/spaces"
-          className="mt-1 block text-2xs text-ink-faint hover:text-ink"
+          className="mt-1 block text-caption font-medium text-ink-faint hover:text-ink"
         >
           查看全部 {(spaces ?? []).length} 个空间 →
         </Link>

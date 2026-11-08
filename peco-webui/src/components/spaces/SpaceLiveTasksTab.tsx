@@ -213,7 +213,9 @@ function LiveTaskDetail({
     <div className="space-y-2 border-t border-line bg-canvas/40 px-3 py-2">
       <p className="font-mono text-2xs text-ink-faint">task_id {task.id}</p>
       <div className="space-y-0.5">
-        <p className="text-2xs text-ink-faint">Peco 让它做什么</p>
+        <p className="text-caption font-medium text-ink-faint">
+          Peco 让它做什么
+        </p>
         <p
           className={cn(
             "max-w-[640px] whitespace-pre-wrap break-words text-sm",
@@ -232,14 +234,21 @@ function LiveTaskDetail({
           text={tail.text}
         />
       ) : (
-        !terminal && <p className="text-2xs text-ink-faint">还没有输出。</p>
+        !terminal && (
+          <p className="text-caption font-medium text-ink-faint">
+            还没有输出。
+          </p>
+        )
       )}
       {error && (
-        <p className="max-w-[640px] break-words text-2xs text-danger">
+        <p className="max-w-[640px] break-words text-caption font-medium text-danger">
           失败：{error.kind} · {error.message}
         </p>
       )}
-      <p data-testid="live-task-artifacts" className="text-2xs text-ink-faint">
+      <p
+        data-testid="live-task-artifacts"
+        className="text-caption font-medium text-ink-faint"
+      >
         产物 <span className="tabular-nums">{task.artifacts.length}</span> 个
       </p>
     </div>
@@ -249,7 +258,7 @@ function LiveTaskDetail({
 function OutputBlock({ label, text }: { label: string; text: string }) {
   return (
     <div className="space-y-0.5">
-      <p className="text-2xs text-ink-faint">{label}</p>
+      <p className="text-caption font-medium text-ink-faint">{label}</p>
       <pre className="max-h-60 max-w-[640px] overflow-auto whitespace-pre-wrap break-words font-mono text-2xs text-ink">
         {text}
       </pre>

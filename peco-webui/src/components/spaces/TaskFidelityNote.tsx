@@ -25,11 +25,11 @@ export function TaskFidelityNote({ fidelity, detail }: TaskFidelityNoteProps) {
     <div
       data-testid="task-fidelity"
       data-fidelity={fidelity}
-      className="flex h-8 shrink-0 items-center gap-2 border-b border-line px-3 text-2xs"
+      className="flex h-8 shrink-0 items-center gap-2 border-b border-line px-3 text-caption font-medium"
     >
       <span
         className={cn(
-          "shrink-0 rounded-[3px] border border-line px-1",
+          "inline-flex min-h-6 shrink-0 items-center rounded-[4px] bg-line/60 px-1.5",
           fidelity === "live" ? "text-ok" : "text-ink-muted",
         )}
       >

@@ -45,13 +45,12 @@ export function CloseSpaceDialog({
         </DialogHeader>
         {error ? <ErrorBanner message={errorText(error)} /> : null}
         <DialogFooter>
-          <Button variant="outline" size="sm" onClick={onWait}>
+          <Button variant="ghost" size="sm" onClick={onWait}>
             等待完成
           </Button>
           <Button
-            variant="outline"
+            variant="destructive"
             size="sm"
-            className="border-danger/40 text-danger"
             disabled={forcing}
             onClick={onForce}
           >

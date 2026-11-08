@@ -70,7 +70,7 @@ export function SpaceTasksTab({
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-line bg-panel px-3 text-2xs text-ink-faint">
+      <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-line bg-panel px-3 text-caption font-medium text-ink-faint">
         <ConnectionStatus state={eventsState} className="mr-2 shrink-0" />
         <span className="w-36 shrink-0">状态</span>
         <span className="w-24 shrink-0">agent</span>
@@ -122,12 +122,14 @@ export function SpaceTasksTab({
               </button>
               {open && (
                 <div className="space-y-1 border-t border-line bg-canvas/40 px-3 py-2">
-                  <p className="font-mono text-2xs text-ink-faint">
+                  <p className="font-mono text-caption font-medium text-ink-faint">
                     task_id {task.task_id} · 目标 {task.target_ws_id} · 来源{" "}
                     {task.origin_ws_id}
                   </p>
                   <div className="space-y-0.5">
-                    <p className="text-2xs text-ink-faint">Peco 让它做什么</p>
+                    <p className="text-caption font-medium text-ink-faint">
+                      Peco 让它做什么
+                    </p>
                     <p
                       className={cn(
                         "max-w-[640px] whitespace-pre-wrap break-words text-sm",
@@ -137,12 +139,14 @@ export function SpaceTasksTab({
                       {task.prompt_digest ?? "未记录"}
                     </p>
                   </div>
-                  <p className="text-2xs text-ink-faint">结果摘要</p>
+                  <p className="text-caption font-medium text-ink-faint">
+                    结果摘要
+                  </p>
                   <p className="max-w-[640px] whitespace-pre-wrap break-words text-sm text-ink">
                     {task.result_digest ?? "这条任务没有摘要。"}
                   </p>
                   {isNotableWakeState(task.wake_state) && (
-                    <p className="text-2xs text-ink-muted">
+                    <p className="text-caption font-medium text-ink-muted">
                       唤醒：
                       {wakeDescription(task.wake_state, task.wake_skip_reason)}
                     </p>

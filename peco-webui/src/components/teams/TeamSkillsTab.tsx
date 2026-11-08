@@ -191,7 +191,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
           )}
           <DialogFooter>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               disabled={remove.isPending}
               onClick={closeDelete}
@@ -221,12 +221,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
           <EmptyState
             title="这个团队还没有安装 skill。"
             action={
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7"
-                onClick={() => setCreating(true)}
-              >
+              <Button size="sm" onClick={() => setCreating(true)}>
                 ＋ 新建技能
               </Button>
             }
@@ -268,7 +263,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
                     <span className="truncate font-mono text-sm text-ink">
                       {skill.name}
                     </span>
-                    <span className="truncate text-2xs text-ink-faint">
+                    <span className="truncate text-caption font-medium text-ink-faint">
                       {skill.description || "没有描述"}
                     </span>
                   </button>
@@ -308,7 +303,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
                   保存
                 </Button>
                 <Button
-                  variant="outline"
+                  variant="ghost"
                   size="xs"
                   disabled={save.isPending}
                   onClick={() => {
@@ -321,7 +316,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
               </>
             ) : (
               <Button
-                variant="outline"
+                variant="ghost"
                 size="xs"
                 disabled={!body.data}
                 onClick={startEditing}
@@ -331,7 +326,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
             )}
           </div>
           {save.error !== null && (
-            <p className="shrink-0 border-b border-line px-3 py-1 text-2xs text-danger">
+            <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
               {errorText(save.error)}
             </p>
           )}

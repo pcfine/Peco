@@ -58,7 +58,7 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 
 function CategoryChip({ category }: { category: string }) {
   return (
-    <span className="shrink-0 rounded-[4px] bg-line px-1 text-2xs text-ink-muted">
+    <span className="shrink-0 rounded-[4px] bg-line px-1 text-caption font-medium text-ink-muted">
       {categoryLabel(category)}
     </span>
   );
@@ -137,7 +137,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
                 aria-pressed={category === option.value}
                 onClick={() => setCategory(option.value)}
                 className={cn(
-                  "h-7 shrink-0 rounded-[4px] px-2 text-2xs text-ink-muted hover:text-ink",
+                  "h-7 shrink-0 rounded-[4px] px-2 text-caption font-medium text-ink-muted hover:text-ink",
                   category === option.value && "bg-line text-ink",
                 )}
               >
@@ -197,7 +197,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
               }
             />
             {!filtered && (
-              <p className="mt-1 max-w-[480px] text-2xs text-ink-faint">
+              <p className="mt-1 max-w-[480px] text-caption font-medium text-ink-faint">
                 对话里确认下来的偏好与事实会记在这个空间名下。
               </p>
             )}
@@ -222,7 +222,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
                         {doc.title || "无标题"}
                       </span>
                       {time && (
-                        <span className="shrink-0 tabular-nums text-2xs text-ink-faint">
+                        <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint">
                           {time}
                         </span>
                       )}
@@ -243,7 +243,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
 
         {/* 只取第一页：说清「还有没列出来的」，别让总数和可见行数对不上。 */}
         {readable && list.data && list.data.total > items.length && (
-          <p className="px-3 py-2 text-2xs text-ink-faint">
+          <p className="px-3 py-2 text-caption font-medium text-ink-faint">
             已列出前 <span className="tabular-nums">{items.length}</span> 条，共{" "}
             <span className="tabular-nums">{list.data.total}</span>{" "}
             条；用搜索或类别过滤缩小范围。
@@ -284,7 +284,7 @@ function MemoryDocumentBody({ wsId, docId }: { wsId: string; docId: string }) {
 
   return (
     <div className="space-y-1.5 border-t border-line bg-canvas/40 px-3 py-2">
-      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-2xs text-ink-faint">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-caption font-medium text-ink-faint">
         <CategoryChip category={doc.category} />
         {time && <span className="shrink-0 tabular-nums">{time}</span>}
         <span className="min-w-0 flex-1 truncate font-mono" title={doc.source}>
@@ -296,7 +296,9 @@ function MemoryDocumentBody({ wsId, docId }: { wsId: string; docId: string }) {
           {doc.content}
         </p>
       ) : (
-        <p className="text-2xs text-ink-faint">这篇记忆没有正文。</p>
+        <p className="text-caption font-medium text-ink-faint">
+          这篇记忆没有正文。
+        </p>
       )}
     </div>
   );

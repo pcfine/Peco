@@ -5,16 +5,14 @@ import { Slot } from "radix-ui";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 rounded-md text-sm font-medium whitespace-nowrap transition-all outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/35 disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  "inline-flex shrink-0 items-center justify-center gap-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
         default:
           "bg-primary text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/92 active:translate-y-px active:shadow-none",
         destructive:
-          "bg-destructive text-white shadow-sm shadow-destructive/20 hover:bg-destructive/90 active:translate-y-px active:shadow-none focus-visible:ring-destructive/25 dark:focus-visible:ring-destructive/40",
-        outline:
-          "border bg-card shadow-xs hover:bg-accent hover:text-accent-foreground hover:border-ring/30 active:translate-y-px",
+          "bg-destructive text-white shadow-sm shadow-destructive/20 hover:bg-destructive/90 active:translate-y-px active:shadow-none",
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/70 active:translate-y-px",
         ghost: "hover:bg-accent hover:text-accent-foreground",

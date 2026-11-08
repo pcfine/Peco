@@ -63,7 +63,7 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                     aria-expanded={open}
                     className="flex min-h-11 w-full flex-col justify-center gap-0.5 py-1 text-left @min-[900px]/work:h-11 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2 @min-[900px]/work:py-0"
                   >
-                    <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[900px]/work:w-24">
+                    <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint @min-[900px]/work:w-24">
                       {relativeTime(task.terminal_at ?? task.created_at)}
                     </span>
                     <TaskStateMark
@@ -89,7 +89,7 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                   </button>
                   {open && (
                     <div className="space-y-1 border-t border-line bg-canvas/40 px-3 py-2">
-                      <p className="font-mono text-2xs text-ink-faint">
+                      <p className="font-mono text-caption font-medium text-ink-faint">
                         task_id {task.task_id} · 来源 {task.origin_kind} · agent{" "}
                         {task.agent_name}
                       </p>
@@ -102,7 +102,7 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                         {task.result_digest ?? "这条任务没有摘要。"}
                       </p>
                       {isNotableWakeState(task.wake_state) && (
-                        <p className="text-2xs text-ink-muted">
+                        <p className="text-caption font-medium text-ink-muted">
                           唤醒：
                           {wakeDescription(
                             task.wake_state,
@@ -110,7 +110,7 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                           )}
                         </p>
                       )}
-                      <p className="font-mono text-2xs text-ink-faint">
+                      <p className="font-mono text-caption font-medium text-ink-faint">
                         {task.created_at} → {task.terminal_at ?? "未终态"}
                       </p>
                     </div>

@@ -44,7 +44,7 @@ export function PanelResults() {
                 <span className="truncate text-sm text-ink">
                   {task.result_digest ?? task.task_id}
                 </span>
-                <span className="truncate font-mono text-2xs text-ink-faint">
+                <span className="truncate font-mono text-caption font-medium text-ink-faint">
                   {nameOf(task.origin_ws_id)} → {nameOf(task.target_ws_id)} ·{" "}
                   {relativeTime(task.terminal_at ?? task.created_at)}
                 </span>

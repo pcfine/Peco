@@ -37,11 +37,11 @@ export function PanelTeams() {
               <span className="min-w-0 flex-1 truncate text-sm text-ink">
                 {team.display_name}
               </span>
-              <span className="shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/work:w-[72px] @min-[640px]/work:text-right">
+              <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint @min-[640px]/work:w-[72px] @min-[640px]/work:text-right">
                 空间 {team.bound_spaces.length}
               </span>
               {/* 窄档隐藏 agents 列：两列已经够读，第三列会把团队名压没。 */}
-              <span className="hidden shrink-0 tabular-nums text-2xs text-ink-faint @min-[640px]/work:inline @min-[640px]/work:w-16 @min-[640px]/work:text-right">
+              <span className="hidden shrink-0 tabular-nums text-caption font-medium text-ink-faint @min-[640px]/work:inline @min-[640px]/work:w-16 @min-[640px]/work:text-right">
                 agents {team.agents.length}
               </span>
             </li>
@@ -51,7 +51,7 @@ export function PanelTeams() {
       {(teams ?? []).length > 0 && (
         <Link
           to="/teams"
-          className="mt-1 block text-2xs text-ink-faint hover:text-ink"
+          className="mt-1 block text-caption font-medium text-ink-faint hover:text-ink"
         >
           全部团队
         </Link>

@@ -13,7 +13,7 @@ export function ErrorBanner({ message, onDismiss, onRetry }: ErrorBannerProps) {
       <XCircle className="h-5 w-5 text-destructive shrink-0" />
       <p className="flex-1 text-sm text-destructive">{message}</p>
       {onRetry && (
-        <Button variant="outline" size="sm" onClick={onRetry}>
+        <Button size="sm" onClick={onRetry}>
           重试
         </Button>
       )}

@@ -73,7 +73,9 @@ function NewSkillForm({ wsId, onCancel, onCreated }: NewSkillFormProps) {
       }}
     >
       <label className="block space-y-1">
-        <span className="text-2xs text-ink-faint">名称（必填）</span>
+        <span className="text-caption font-medium text-ink-faint">
+          名称（必填）
+        </span>
         <Input
           value={name}
           onChange={(event) => setName(event.target.value)}
@@ -83,10 +85,14 @@ function NewSkillForm({ wsId, onCancel, onCreated }: NewSkillFormProps) {
           className="h-8 font-mono text-xs"
         />
       </label>
-      {name && nameError && <p className="text-2xs text-danger">{nameError}</p>}
+      {name && nameError && (
+        <p className="text-caption font-medium text-danger">{nameError}</p>
+      )}
 
       <label className="block space-y-1">
-        <span className="text-2xs text-ink-faint">内容（SKILL.md）</span>
+        <span className="text-caption font-medium text-ink-faint">
+          内容（SKILL.md）
+        </span>
         <Textarea
           value={content}
           onChange={(event) => setContent(event.target.value)}
@@ -96,7 +102,7 @@ function NewSkillForm({ wsId, onCancel, onCreated }: NewSkillFormProps) {
           className="min-h-[200px] font-mono text-mono-sm"
         />
       </label>
-      <p className="text-2xs text-ink-faint">
+      <p className="text-caption font-medium text-ink-faint">
         SKILL.md 必须以 frontmatter 开头，其中 name
         与上面的名称一致、description 不能为空。
       </p>
@@ -104,7 +110,7 @@ function NewSkillForm({ wsId, onCancel, onCreated }: NewSkillFormProps) {
       <DialogFooter>
         <Button
           type="button"
-          variant="outline"
+          variant="ghost"
           size="sm"
           disabled={create.isPending}
           onClick={onCancel}

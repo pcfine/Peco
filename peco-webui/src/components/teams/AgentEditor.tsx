@@ -78,9 +78,9 @@ function CapabilityGroup({
 
   return (
     <div className="space-y-1">
-      <span className="text-2xs text-ink-faint">{title}</span>
+      <span className="text-caption font-medium text-ink-faint">{title}</span>
       {merged.length === 0 ? (
-        <p className="text-2xs text-ink-faint">{empty}</p>
+        <p className="text-caption font-medium text-ink-faint">{empty}</p>
       ) : (
         <div className="flex flex-wrap gap-1">
           {merged.map((option) => {
@@ -93,10 +93,10 @@ function CapabilityGroup({
                 disabled={disabled}
                 onClick={() => onToggle(option.value)}
                 className={cn(
-                  "h-7 rounded-[6px] border px-2 font-mono text-xs",
+                  "h-7 rounded-[6px] px-2 font-mono text-xs",
                   on
-                    ? "border-brand bg-line/40 text-ink"
-                    : "border-line text-ink-muted hover:bg-line/20",
+                    ? "bg-line text-ink"
+                    : "bg-transparent text-ink-muted hover:bg-line/40",
                 )}
               >
                 {option.label}
@@ -105,7 +105,7 @@ function CapabilityGroup({
           })}
         </div>
       )}
-      {error && <p className="text-2xs text-danger">{error}</p>}
+      {error && <p className="text-caption font-medium text-danger">{error}</p>}
     </div>
   );
 }
@@ -193,7 +193,9 @@ export function AgentEditor({
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
         <section className="grid grid-cols-1 gap-2 @min-[560px]/work:grid-cols-[2fr_3fr_auto]">
           <label className="space-y-1">
-            <span className="text-2xs text-ink-faint">名称</span>
+            <span className="text-caption font-medium text-ink-faint">
+              名称
+            </span>
             <Input
               value={current.name}
               onChange={(event) => update({ name: event.target.value })}
@@ -202,7 +204,9 @@ export function AgentEditor({
             />
           </label>
           <label className="space-y-1">
-            <span className="text-2xs text-ink-faint">描述</span>
+            <span className="text-caption font-medium text-ink-faint">
+              描述
+            </span>
             <Input
               value={current.description}
               onChange={(event) => update({ description: event.target.value })}
@@ -211,7 +215,9 @@ export function AgentEditor({
             />
           </label>
           <label className="space-y-1">
-            <span className="text-2xs text-ink-faint">图标</span>
+            <span className="text-caption font-medium text-ink-faint">
+              图标
+            </span>
             <Input
               value={current.icon}
               onChange={(event) => update({ icon: event.target.value })}
@@ -342,7 +348,9 @@ export function AgentEditor({
         </section>
 
         <label className="block space-y-1">
-          <span className="text-2xs text-ink-faint">正文（system_prompt）</span>
+          <span className="text-caption font-medium text-ink-faint">
+            正文（system_prompt）
+          </span>
           <Textarea
             value={current.system_prompt}
             onChange={(event) => update({ system_prompt: event.target.value })}
@@ -361,7 +369,7 @@ export function AgentEditor({
           保存
         </Button>
         <Button
-          variant="outline"
+          variant="ghost"
           size="sm"
           disabled={!dirty || busy}
           onClick={() => setDraft(null)}
@@ -369,9 +377,13 @@ export function AgentEditor({
           放弃修改
         </Button>
         {diff.invalid.length > 0 ? (
-          <span className="text-2xs text-danger">{diff.invalid[0]}</span>
+          <span className="text-caption font-medium text-danger">
+            {diff.invalid[0]}
+          </span>
         ) : (
-          dirty && <span className="text-2xs text-warn">未保存</span>
+          dirty && (
+            <span className="text-caption font-medium text-warn">未保存</span>
+          )
         )}
         {!isMaster && (
           <Button
@@ -399,7 +411,7 @@ export function AgentEditor({
           )}
           <DialogFooter>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               disabled={remove.isPending}
               onClick={() => setConfirming(false)}

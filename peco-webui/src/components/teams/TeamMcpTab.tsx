@@ -128,7 +128,7 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
               保存
             </Button>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               disabled={save.isPending}
               onClick={() => {
@@ -140,10 +140,12 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
               撤销
             </Button>
             {syntaxError && (
-              <span className="text-2xs text-danger">{syntaxError}</span>
+              <span className="text-caption font-medium text-danger">
+                {syntaxError}
+              </span>
             )}
             {save.error !== null && (
-              <span className="text-2xs text-danger">
+              <span className="text-caption font-medium text-danger">
                 {errorText(save.error)}
               </span>
             )}
@@ -174,13 +176,13 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
                     <span className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
                       {name}
                     </span>
-                    <span className="shrink-0 text-2xs text-ink-faint">
+                    <span className="shrink-0 text-caption font-medium text-ink-faint">
                       {expanded === name ? "收起" : "看配置"}
                     </span>
                   </button>
                   {/* 试连一次要真起进程 / 打网络：并发的第二个没有意义。 */}
                   <Button
-                    variant="outline"
+                    variant="ghost"
                     size="xs"
                     className="shrink-0"
                     disabled={test.isPending}
@@ -197,7 +199,7 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
                 {line && (
                   <p
                     className={cn(
-                      "border-t border-line px-3 py-1 text-2xs",
+                      "border-t border-line px-3 py-1 text-caption font-medium",
                       line.ok ? "text-ink-muted" : "text-danger",
                     )}
                   >

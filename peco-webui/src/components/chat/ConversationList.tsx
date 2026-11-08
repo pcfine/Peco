@@ -261,7 +261,7 @@ export function ConversationList({
           {!loading && error && (
             <div className="text-center py-8 px-2">
               <p className="text-xs text-muted-foreground mb-2">{error}</p>
-              <Button variant="outline" size="sm" onClick={onRetry}>
+              <Button size="sm" onClick={onRetry}>
                 重试
               </Button>
             </div>

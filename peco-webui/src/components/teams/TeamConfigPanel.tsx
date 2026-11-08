@@ -170,10 +170,10 @@ export function TeamConfigPanel({
             aria-selected={tab === item}
             onClick={() => setTab(item)}
             className={cn(
-              "shrink-0 border-b-2 px-3 text-sm",
+              "my-1 shrink-0 rounded-[4px] px-3 text-sm",
               tab === item
-                ? "border-brand text-ink"
-                : "border-transparent text-ink-muted hover:text-ink",
+                ? "bg-line text-ink"
+                : "bg-transparent text-ink-muted hover:bg-line/40",
             )}
           >
             {TAB_LABELS[item]}

@@ -51,7 +51,7 @@ function SpaceRow({
           <SpaceStatusMark group={spaceGroupOf(space)} />
           <span className="min-w-0 truncate text-sm text-ink">{name}</span>
           {active && (
-            <span className="shrink-0 rounded-[4px] border border-line px-1 text-2xs text-ink-faint">
+            <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
               当前
             </span>
           )}
@@ -62,17 +62,17 @@ function SpaceRow({
         <span className="truncate pl-6 font-mono text-2xs text-ink-faint @min-[640px]/work:hidden @min-[900px]/work:block @min-[900px]/work:w-[120px] @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0">
           {space.team_id}
         </span>
-        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[640px]/work:hidden @min-[900px]/work:block @min-[900px]/work:w-14 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
+        <span className="pl-6 tabular-nums text-caption font-medium text-ink-faint @min-[640px]/work:hidden @min-[900px]/work:block @min-[900px]/work:w-14 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
           在飞 {space.inflight_dispatch}
         </span>
-        <span className="pl-6 tabular-nums text-2xs text-ink-faint @min-[900px]/work:w-24 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
+        <span className="pl-6 tabular-nums text-caption font-medium text-ink-faint @min-[900px]/work:w-24 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
           {relativeTime(activityAt)}
         </span>
       </button>
       <Link
         to={`/spaces/${encodeURIComponent(space.ws_id)}/status`}
         aria-label={`${name} 状态`}
-        className="grid h-6 shrink-0 place-items-center rounded-[4px] border border-line px-2 text-2xs text-ink-muted hover:bg-line hover:text-ink"
+        className="grid h-6 shrink-0 place-items-center rounded-[4px] bg-line/60 px-2 text-caption font-medium text-ink-muted hover:bg-line hover:text-ink"
       >
         状态
       </Link>

@@ -60,7 +60,9 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
     >
       <div className="grid grid-cols-[2fr_3fr_auto] gap-2">
         <label className="space-y-1">
-          <span className="text-2xs text-ink-faint">名称（必填）</span>
+          <span className="text-caption font-medium text-ink-faint">
+            名称（必填）
+          </span>
           <Input
             value={draft.name}
             onChange={(event) => update({ name: event.target.value })}
@@ -70,7 +72,7 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
           />
         </label>
         <label className="space-y-1">
-          <span className="text-2xs text-ink-faint">描述</span>
+          <span className="text-caption font-medium text-ink-faint">描述</span>
           <Input
             value={draft.description}
             onChange={(event) => update({ description: event.target.value })}
@@ -80,7 +82,7 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
           />
         </label>
         <label className="space-y-1">
-          <span className="text-2xs text-ink-faint">图标</span>
+          <span className="text-caption font-medium text-ink-faint">图标</span>
           <Input
             value={draft.icon}
             onChange={(event) => update({ icon: event.target.value })}
@@ -103,7 +105,9 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
       </div>
 
       <label className="block space-y-1">
-        <span className="text-2xs text-ink-faint">正文（system_prompt）</span>
+        <span className="text-caption font-medium text-ink-faint">
+          正文（system_prompt）
+        </span>
         <Textarea
           value={draft.system_prompt}
           onChange={(event) => update({ system_prompt: event.target.value })}
@@ -116,7 +120,7 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
       <DialogFooter>
         <Button
           type="button"
-          variant="outline"
+          variant="ghost"
           size="sm"
           disabled={create.isPending}
           onClick={onCancel}

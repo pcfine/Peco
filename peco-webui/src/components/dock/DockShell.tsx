@@ -159,7 +159,7 @@ export function DockShell() {
         <button
           type="button"
           onClick={retryEvents}
-          className="h-6 shrink-0 rounded-[4px] px-1.5 text-2xs text-primary-ink hover:underline"
+          className="h-6 shrink-0 rounded-[4px] px-1.5 text-caption font-medium text-primary-ink hover:underline"
         >
           重试
         </button>

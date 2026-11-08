@@ -383,13 +383,12 @@ export function ProviderSection({ teamId }: { teamId: string }) {
         <span className="tabular-nums text-2xs text-ink-faint">
           {providers.length}
         </span>
-        <span className="min-w-0 truncate text-2xs text-ink-faint">
+        <span className="min-w-0 truncate text-caption font-medium text-ink-faint">
           providers.toml · 名称即 agent.md 里 llm.provider 引用的 key
         </span>
         <Button
-          variant="outline"
           size="sm"
-          className="ml-auto h-7 shrink-0"
+          className="ml-auto shrink-0"
           disabled={types.length === 0}
           onClick={openCreate}
         >
@@ -434,29 +433,29 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     {provider.name}
                   </span>
                   {provider.is_default && (
-                    <span className="shrink-0 rounded-[4px] border border-line px-1 text-2xs text-ink-faint">
+                    <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
                       默认
                     </span>
                   )}
                   <span
                     className={cn(
-                      "shrink-0 text-2xs",
+                      "shrink-0 text-caption font-medium",
                       provider.has_api_key ? "text-ink-faint" : "text-danger",
                     )}
                   >
                     {provider.has_api_key ? "已配置密钥" : "未配置密钥"}
                   </span>
                 </div>
-                <span className="truncate text-2xs text-ink-muted @min-[760px]/work:w-24 @min-[760px]/work:shrink-0">
+                <span className="truncate text-caption font-medium text-ink-muted @min-[760px]/work:w-24 @min-[760px]/work:shrink-0">
                   {providerMeta?.display_name ?? provider.provider_type}
                 </span>
-                <span className="truncate font-mono text-2xs text-ink-faint @min-[760px]/work:flex-1">
+                <span className="truncate font-mono text-caption font-medium text-ink-faint @min-[760px]/work:flex-1">
                   {provider.base_url ??
                     (providerMeta
                       ? `${providerMeta.default_base_url}（类型默认）`
                       : "类型默认地址")}
                 </span>
-                <span className="truncate text-2xs text-ink-faint @min-[760px]/work:w-40 @min-[760px]/work:shrink-0">
+                <span className="truncate text-caption font-medium text-ink-faint @min-[760px]/work:w-40 @min-[760px]/work:shrink-0">
                   {provider.default_model ?? "未设默认模型"}
                   {provider.api ? ` · ${provider.api}` : ""}
                 </span>
@@ -498,7 +497,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
               {outcome && (
                 <p
                   className={cn(
-                    "border-t border-line px-3 py-1 text-2xs",
+                    "border-t border-line px-3 py-1 text-caption font-medium",
                     outcome.ok ? "text-ink-muted" : "text-danger",
                   )}
                 >
@@ -532,7 +531,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
           <div className="space-y-3">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1">
-                <span className="text-2xs text-ink-faint">类型</span>
+                <span className="text-caption font-medium text-ink-faint">
+                  类型
+                </span>
                 <Select
                   value={form.providerType}
                   onValueChange={changeType}
@@ -559,7 +560,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
 
               <div className="space-y-1">
                 <label className="block space-y-1">
-                  <span className="text-2xs text-ink-faint">名称</span>
+                  <span className="text-caption font-medium text-ink-faint">
+                    名称
+                  </span>
                   <Input
                     value={form.name}
                     onChange={(event) => update({ name: event.target.value })}
@@ -569,7 +572,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     className="h-8 font-mono text-xs"
                   />
                 </label>
-                <p className="text-2xs text-ink-faint">
+                <p className="text-caption font-medium text-ink-faint">
                   {editing
                     ? "名称是 agent.md 里 llm.provider 引用的 key，创建后不可修改"
                     : nameTaken
@@ -596,7 +599,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     className="h-8 font-mono text-xs"
                   />
                 </label>
-                <p className="text-2xs text-ink-faint">
+                <p className="text-caption font-medium text-ink-faint">
                   {editing
                     ? editing.has_api_key
                       ? "已配置密钥；留空表示不修改"
@@ -618,7 +621,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     className="h-8 font-mono text-xs"
                   />
                 </label>
-                <p className="text-2xs text-ink-faint">
+                <p className="text-caption font-medium text-ink-faint">
                   {meta
                     ? `留空则用 ${meta.default_base_url}；自建兼容端点可改成自己的地址`
                     : "留空则用该类型的默认地址"}
@@ -627,7 +630,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
 
               <div className="space-y-1">
                 <label className="block space-y-1">
-                  <span className="text-2xs text-ink-faint">默认模型</span>
+                  <span className="text-caption font-medium text-ink-faint">
+                    默认模型
+                  </span>
                   <Input
                     list="provider-model-options"
                     value={form.model}
@@ -642,13 +647,15 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     <option key={model} value={model} />
                   ))}
                 </datalist>
-                <p className="text-2xs text-ink-faint">
+                <p className="text-caption font-medium text-ink-faint">
                   agent.md 未指定 llm.model 时用它
                 </p>
               </div>
 
               <div className="space-y-1">
-                <span className="text-2xs text-ink-faint">API 风格</span>
+                <span className="text-caption font-medium text-ink-faint">
+                  API 风格
+                </span>
                 <Select
                   value={form.api || API_DEFAULT}
                   onValueChange={(value) =>
@@ -672,7 +679,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     ))}
                   </SelectContent>
                 </Select>
-                <p className="text-2xs text-ink-faint">
+                <p className="text-caption font-medium text-ink-faint">
                   两种风格的请求体不同；不确定就跟随默认
                 </p>
               </div>
@@ -688,7 +695,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
               <label htmlFor="provider-default" className="text-xs text-ink">
                 设为默认 provider
               </label>
-              <span className="text-2xs text-ink-faint">
+              <span className="text-caption font-medium text-ink-faint">
                 {editing?.is_default
                   ? "它已经是默认 provider"
                   : "agent.md 未指定 provider 的 agent 走它"}
@@ -698,7 +705,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
             {draftResult && (
               <p
                 className={cn(
-                  "whitespace-pre-wrap break-words border-l-2 pl-2 text-2xs",
+                  "whitespace-pre-wrap break-words border-l-2 pl-2 text-caption font-medium",
                   draftResult.success
                     ? "border-line-strong text-ink-muted"
                     : "border-danger text-danger",
@@ -709,7 +716,11 @@ export function ProviderSection({ teamId }: { teamId: string }) {
               </p>
             )}
 
-            {formError && <p className="text-2xs text-danger">{formError}</p>}
+            {formError && (
+              <p className="text-caption font-medium text-danger">
+                {formError}
+              </p>
+            )}
 
             {save.error !== null && (
               <ErrorBanner message={errorText(save.error)} />
@@ -720,7 +731,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
             <div className="flex flex-col gap-1">
               <Button
                 type="button"
-                variant="outline"
+                variant="ghost"
                 size="sm"
                 disabled={
                   testDraftMutation.isPending || draftTestBlocked !== null
@@ -736,14 +747,14 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                 {testDraftMutation.isPending ? "试连中…" : "试连"}
               </Button>
               {draftTestBlocked && (
-                <span className="text-2xs text-ink-faint">
+                <span className="text-caption font-medium text-ink-faint">
                   {draftTestBlocked}
                 </span>
               )}
             </div>
             <div className="flex flex-col-reverse gap-2 sm:flex-row">
               <Button
-                variant="outline"
+                variant="ghost"
                 size="sm"
                 disabled={save.isPending}
                 onClick={closeDialog}
@@ -777,7 +788,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
           )}
           <DialogFooter>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
               disabled={remove.isPending}
               onClick={closeDelete}

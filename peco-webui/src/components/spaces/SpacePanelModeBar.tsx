@@ -39,7 +39,7 @@ export function SpacePanelModeBar({
           aria-pressed={!collapsed && mode === item}
           onClick={() => onSelect(item)}
           className={cn(
-            "h-7 shrink-0 rounded-[4px] px-2 text-2xs text-ink-muted hover:text-ink",
+            "h-7 shrink-0 rounded-[4px] px-2 text-caption font-medium text-ink-muted hover:text-ink",
             !collapsed && mode === item && "bg-line text-ink",
           )}
         >

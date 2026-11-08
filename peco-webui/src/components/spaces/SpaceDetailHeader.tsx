@@ -53,14 +53,14 @@ export function SpaceDetailHeader({
       <div className="flex h-8 items-center gap-2">
         <h1 className="truncate text-xl font-semibold text-ink">{name}</h1>
         <SpaceStatusMark group={spaceGroupOf(space)} />
-        <span className="shrink-0 text-2xs text-ink-faint">
+        <span className="shrink-0 text-caption font-medium text-ink-faint">
           {spaceGroupOf(space) === "running" ? "进行中" : "未打开"}
         </span>
         {!isCurrent && (
           <button
             type="button"
             onClick={() => setCurrent(space.ws_id)}
-            className="shrink-0 rounded-[4px] border border-line px-1.5 text-2xs text-ink-muted hover:text-ink"
+            className="inline-flex min-h-6 shrink-0 items-center rounded-[4px] bg-line px-2 text-caption font-medium text-ink-muted transition-colors hover:text-ink"
           >
             非当前空间
           </button>
@@ -68,20 +68,14 @@ export function SpaceDetailHeader({
         <div className="ml-auto flex shrink-0 items-center gap-1">
           {actions}
           {space.status === "closed" && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7"
-              disabled={opening}
-              onClick={open}
-            >
+            <Button size="sm" disabled={opening} onClick={open}>
               打开
             </Button>
           )}
           <Button
-            variant="outline"
+            variant="ghost"
             size="sm"
-            className="h-7 border-danger/40 text-danger"
+            className="text-danger hover:text-danger"
             disabled={closing || space.status === "closed"}
             onClick={onClose}
           >
@@ -90,7 +84,7 @@ export function SpaceDetailHeader({
         </div>
       </div>
 
-      <div className="mt-1 flex h-5 min-w-0 items-center gap-2 text-2xs text-ink-faint">
+      <div className="mt-1 flex h-5 min-w-0 items-center gap-2 text-caption font-medium text-ink-faint">
         <span
           className="truncate font-mono text-mono-sm"
           title={space.work_dir}
@@ -100,7 +94,7 @@ export function SpaceDetailHeader({
         <button
           type="button"
           onClick={() => void copyWorkDir()}
-          className="shrink-0 text-2xs text-ink-muted hover:text-ink"
+          className="-mx-2 -my-1.5 inline-flex min-h-6 shrink-0 items-center rounded-[4px] px-2 text-caption font-medium text-ink-muted transition-colors hover:bg-line/40 hover:text-ink"
         >
           复制
         </button>
@@ -124,7 +118,7 @@ export function SpaceDetailHeader({
       </div>
 
       {!isCurrent && (
-        <div className="mt-1 flex h-5 items-center gap-2 text-2xs text-ink-muted">
+        <div className="mt-1 flex h-5 items-center gap-2 text-caption font-medium text-ink-muted">
           <span className="truncate">正在查看 {name}，非当前空间</span>
           <button
             type="button"

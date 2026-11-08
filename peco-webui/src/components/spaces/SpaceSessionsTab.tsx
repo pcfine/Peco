@@ -152,7 +152,7 @@ export function SpaceSessionsTab({
                 type="button"
                 onClick={() => onSelectSession(conversation.id)}
                 className={cn(
-                  "shrink-0 rounded-[4px] px-2 text-2xs",
+                  "shrink-0 rounded-[4px] px-2 text-caption font-medium",
                   conversation.id === active
                     ? "bg-line text-ink"
                     : "text-ink-muted hover:text-ink",

@@ -44,7 +44,7 @@ function Breadcrumb({
 }) {
   const segments = dir ? dir.split("/") : [];
   return (
-    <div className="flex h-8 shrink-0 items-center gap-1 overflow-x-auto border-b border-line px-2 font-mono text-2xs">
+    <div className="flex h-8 shrink-0 items-center gap-1 overflow-x-auto border-b border-line px-2 font-mono text-caption font-medium">
       <button
         type="button"
         onClick={() => onNavigate("")}
@@ -229,7 +229,7 @@ export function SpaceFilesTab({
             })}
           </ul>
           {dirData?.truncated && (
-            <p className="px-3 py-2 text-2xs text-ink-faint">
+            <p className="px-3 py-2 text-caption font-medium text-ink-faint">
               这个目录的条目超过 1000，只列出前 1000 个。
             </p>
           )}
@@ -252,7 +252,7 @@ export function SpaceFilesTab({
               <button
                 type="button"
                 onClick={() => setOpenPath(null)}
-                className="shrink-0 text-2xs text-ink-muted hover:text-ink @min-[768px]/work:hidden"
+                className="shrink-0 text-caption font-medium text-ink-muted hover:text-ink @min-[768px]/work:hidden"
               >
                 ← 返回目录
               </button>
@@ -282,7 +282,7 @@ export function SpaceFilesTab({
                   </pre>
                 ))}
               {fileData?.truncated && (
-                <p className="mt-2 text-2xs text-ink-faint">
+                <p className="mt-2 text-caption font-medium text-ink-faint">
                   只显示前 256 KB，完整内容请到目录里打开。
                 </p>
               )}

@@ -38,7 +38,7 @@ export function PanelShell({
         <h2 className="text-sm font-semibold text-ink">{title}</h2>
         {isFetching && !isPending && (
           <span
-            className="text-2xs text-ink-faint"
+            className="text-caption font-medium text-ink-faint"
             data-testid="panel-fetching"
           >
             更新中

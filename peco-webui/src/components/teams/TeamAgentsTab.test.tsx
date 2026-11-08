@@ -261,6 +261,18 @@ describe("团队 agents tab 装配", () => {
     expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
   });
 
+  it("总管是底色 chip 不描边，行分区线落在 li 而不是按钮上", async () => {
+    renderTab();
+    const masterButton = await screen.findByRole("button", { name: /@master/ });
+
+    const chip = within(masterButton).getByText("总管");
+    expect(chip.className).toContain("bg-line/60");
+    expect(chip.className).not.toMatch(/\bborder(-|\b)/);
+
+    expect(masterButton.className).not.toMatch(/\bborder(-|\b)/);
+    expect(masterButton.closest("li")?.className).toMatch(/\bborder-b\b/);
+  });
+
   it("普通 agent 删除要过二次确认", async () => {
     renderTab();
     fireEvent.click(await screen.findByRole("button", { name: /助手/ }));

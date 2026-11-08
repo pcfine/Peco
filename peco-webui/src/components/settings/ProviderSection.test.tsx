@@ -265,7 +265,9 @@ describe("ProviderSection", () => {
     renderSection();
 
     expect(await screen.findByText("已配置密钥")).toBeInTheDocument();
-    expect(screen.getByText("默认")).toBeInTheDocument();
+    // chip 靠底色分组，不再用描边表达「这是标签」。
+    expect(screen.getByText("默认").className).toContain("bg-line/60");
+    expect(screen.getByText("默认").className).not.toMatch(/\bborder(-|\b)/);
     expect(screen.getByText("未配置密钥").className).toContain("text-danger");
     expect(screen.getByText("DeepSeek")).toBeInTheDocument();
     expect(screen.getByText("https://api.deepseek.com")).toBeInTheDocument();

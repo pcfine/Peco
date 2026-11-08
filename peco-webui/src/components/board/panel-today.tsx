@@ -54,14 +54,14 @@ export function bucketToday(
 function TaskRow({ task }: { task: Task }) {
   return (
     <li className="flex h-7 items-center gap-2">
-      <span className="min-w-0 flex-1 truncate font-mono text-2xs text-ink-muted">
+      <span className="min-w-0 flex-1 truncate font-mono text-caption font-medium text-ink-muted">
         {task.result_digest ?? task.task_id}
       </span>
       {/* 420–719 只留标题+时间：agent/团队元信息在窄列里挤成噪音。 */}
       <span className="hidden shrink-0 text-2xs text-ink-faint @min-[720px]/kanban:inline">
         {task.agent_name}
       </span>
-      <span className="shrink-0 tabular-nums text-2xs text-ink-faint">
+      <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint">
         {relativeTime(task.terminal_at ?? task.created_at)}
       </span>
     </li>
@@ -90,7 +90,7 @@ function Column({
           <span
             data-testid="today-failed-badge"
             title={`失败 ${badge}`}
-            className="rounded-[4px] border border-danger/40 px-1 tabular-nums text-2xs text-danger"
+            className="rounded-[4px] bg-danger/15 px-1 tabular-nums text-2xs text-danger"
           >
             {badge}
           </span>

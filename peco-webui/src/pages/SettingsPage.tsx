@@ -45,7 +45,7 @@ export function SettingsPage() {
       <section className="space-y-2">
         <div className="flex h-8 items-center gap-2 border-b border-line">
           <h2 className="text-xs font-semibold text-ink-muted">团队</h2>
-          <span className="truncate text-2xs text-ink-faint">
+          <span className="truncate text-caption font-medium text-ink-faint">
             provider 配置存在团队能力根里，切换团队就切换配置
           </span>
         </div>

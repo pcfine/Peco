@@ -36,10 +36,10 @@ export function TeamSpacesTab({ spaces }: { spaces: TeamSpace[] }) {
             <span className="min-w-0 flex-1 truncate font-mono text-2xs text-ink">
               {space.work_dir}
             </span>
-            <span className="shrink-0 text-2xs text-ink-faint">
+            <span className="shrink-0 text-caption font-medium text-ink-faint">
               {space.closed_at ? "已关闭" : "进行中"}
             </span>
-            <span className="w-20 shrink-0 text-right text-2xs text-ink-faint">
+            <span className="w-20 shrink-0 text-right text-caption font-medium text-ink-faint">
               {relativeTime(space.closed_at)}
             </span>
           </Link>

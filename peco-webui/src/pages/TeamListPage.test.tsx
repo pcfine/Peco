@@ -80,6 +80,18 @@ describe("团队卡片", () => {
     expect(card).toHaveTextContent("research");
   });
 
+  it("卡片栅格靠共享分隔线分组，卡片自身不描边", async () => {
+    const { container } = renderTeams();
+    await screen.findByRole("link", { name: /研究团队/ });
+
+    expect(container.querySelector(".board-grid")?.tagName).toBe("UL");
+
+    for (const teamId of ["research", "writer"]) {
+      const card = cardOf(container, teamId).querySelector("a");
+      expect(card?.className).not.toMatch(/\bborder(-|\b)/);
+    }
+  });
+
   it("字段缺失显示「–」，不冒充 0", async () => {
     const { container } = renderTeams();
     await screen.findByRole("link", { name: /写作团队/ });

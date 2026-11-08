@@ -14,7 +14,7 @@ export function SpaceConflictHint({ inflight }: SpaceConflictHintProps) {
     <p
       data-slot="space-conflict-hint"
       role="status"
-      className="mb-2 flex items-center gap-1.5 text-2xs text-ink-muted"
+      className="mb-2 flex items-center gap-1.5 text-caption font-medium text-ink-muted"
     >
       <span
         className="size-1.5 shrink-0 rounded-full bg-warn"

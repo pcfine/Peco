@@ -103,9 +103,11 @@ export function SpaceStatusPage() {
         closing={close.closing}
       />
 
-      <div className="flex h-8 shrink-0 items-center gap-2 border-b border-line px-3 text-2xs text-ink-faint">
+      <div className="flex h-8 shrink-0 items-center gap-2 border-b border-line px-3 text-caption font-medium text-ink-faint">
         <span className="shrink-0">在飞任务</span>
-        <span className="shrink-0 tabular-nums text-ink">{inflight.length}</span>
+        <span className="shrink-0 tabular-nums text-ink">
+          {inflight.length}
+        </span>
         <span className="min-w-0 truncate" title={summary}>
           {summary}
         </span>
@@ -129,10 +131,10 @@ export function SpaceStatusPage() {
             aria-selected={tab === item}
             onClick={() => setParam("tab", item)}
             className={cn(
-              "shrink-0 border-b-2 px-3 text-sm",
+              "my-1 shrink-0 rounded-[4px] px-3 text-sm",
               tab === item
-                ? "border-brand text-ink"
-                : "border-transparent text-ink-muted hover:text-ink",
+                ? "bg-line text-ink"
+                : "bg-transparent text-ink-muted hover:bg-line/40",
             )}
           >
             {TAB_LABELS[item]}

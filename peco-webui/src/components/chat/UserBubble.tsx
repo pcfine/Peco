@@ -7,17 +7,17 @@ import { UserImageLightbox } from "./UserImageLightbox";
 
 /** 96px 方形缩略图，`w-24` 是上限；窄列下靠 min-w-0 + shrink 收缩 */
 const IMAGE_TRIGGER_CLASS =
-  "flex w-24 min-w-0 shrink cursor-zoom-in aspect-square items-center justify-center overflow-hidden rounded-md border border-border bg-transparent p-0";
+  "flex w-24 min-w-0 shrink cursor-zoom-in aspect-square items-center justify-center overflow-hidden rounded-md bg-transparent p-0";
 
-/** cover 裁切铺满按钮，圆角与边框由按钮承担 */
+/** cover 裁切铺满按钮，圆角由按钮承担 */
 const IMAGE_CLASS = "block h-full w-full object-cover";
 
-/** 默认 outline 在深色主题下几乎不可见，改用 ring token */
+/** 缩略图浮在主色气泡上，主色环与底色同色等于没有，故取气泡前景色 */
 const TRIGGER_FOCUS_CLASS =
-  "outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/35";
+  "outline-none focus-visible:ring-2 focus-visible:ring-primary-foreground";
 
 const ERROR_CLASS =
-  "flex w-24 min-w-0 shrink aspect-square items-center justify-center rounded-md border border-border bg-muted text-xs text-muted-foreground";
+  "flex w-24 min-w-0 shrink aspect-square items-center justify-center rounded-md bg-muted text-xs text-muted-foreground";
 
 /** 缩略图行左对齐，与输入框「文字在上、附件在下」一致 */
 const ROW_CLASS = "flex justify-start gap-1.5 max-w-full";
@@ -26,7 +26,7 @@ const ROW_CLASS = "flex justify-start gap-1.5 max-w-full";
 const MAX_IMAGES_PER_ROW = 6;
 
 const TEXT_BLOCK_CLASS =
-  "bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2 text-sm max-w-full";
+  "bg-primary text-primary-foreground rounded-[6px] px-4 py-2 text-sm max-w-full";
 
 /** 单图视图名与触发按钮名刻意不同：一个是「视图」，一个是「控件」 */
 function lightboxLabel(index: number, total: number): string {
@@ -72,7 +72,7 @@ export function UserBubble({ message }: { message: ChatMessage }) {
       <div className="flex justify-end">
         <div
           data-slot="user-bubble"
-          className="group relative bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2 max-w-[80%] text-sm"
+          className="group relative bg-primary text-primary-foreground rounded-[6px] px-4 py-2 max-w-[80%] text-sm"
         >
           <AttachmentChips items={attachments} withMargin />
           {message.content}

@@ -24,7 +24,7 @@ function TeamCard({ team }: { team: Team }) {
     <li data-team-id={team.team_id} className="min-w-0">
       <Link
         to={`/teams/${encodeURIComponent(team.team_id)}`}
-        className="flex h-full min-w-0 flex-col gap-1.5 rounded-[8px] border border-line bg-panel p-3 hover:border-line-strong hover:bg-raised"
+        className="flex h-full min-w-0 flex-col gap-1.5 rounded-[6px] bg-panel p-3 hover:bg-raised"
       >
         <span className="flex min-w-0 items-center gap-2">
           <span className="min-w-0 truncate text-sm font-semibold text-ink">
@@ -37,7 +37,7 @@ function TeamCard({ team }: { team: Team }) {
         <span className="truncate font-mono text-2xs text-ink-faint">
           {team.team_id}
         </span>
-        <span className="mt-auto flex flex-wrap items-baseline gap-x-3 gap-y-1 pt-1 text-2xs">
+        <span className="mt-auto flex flex-wrap items-baseline gap-x-3 gap-y-1 pt-1 text-caption font-medium">
           {STATS.map((stat) => (
             <span key={stat.key} className="flex items-baseline gap-1">
               <span className="text-ink-faint">{stat.label}</span>
@@ -76,7 +76,7 @@ export function TeamListPage() {
         <EmptyState title="只有一个 Peco 内置团队。" />
       )}
 
-      <ul className="grid grid-cols-1 gap-3 @min-[640px]/work:grid-cols-2 @min-[1024px]/work:grid-cols-3">
+      <ul className="board-grid grid grid-cols-1 @min-[640px]/work:grid-cols-2 @min-[1024px]/work:grid-cols-3">
         {(teams ?? []).map((team) => (
           <TeamCard key={team.team_id} team={team} />
         ))}

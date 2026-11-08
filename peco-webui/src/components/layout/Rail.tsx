@@ -178,7 +178,7 @@ export function Rail({
         <div className="mx-2 my-1 h-px bg-line" />
 
         {!collapsed && (
-          <p className="flex h-7 items-center pl-3 pr-2 text-2xs font-semibold text-ink-faint">
+          <p className="flex h-7 items-center pl-3 pr-2 text-caption font-medium text-ink-faint">
             已打开
           </p>
         )}
@@ -193,7 +193,7 @@ export function Rail({
           />
         ))}
         {!collapsed && rows.length === 0 && (
-          <p className="pl-3 pr-2 py-1 text-2xs text-ink-faint">
+          <p className="pl-3 pr-2 py-1 text-caption font-medium text-ink-faint">
             还没有打开空间。
           </p>
         )}
@@ -202,7 +202,7 @@ export function Rail({
           title={collapsed ? "打开空间" : undefined}
           aria-label={collapsed ? "打开空间" : undefined}
           className={cn(
-            "flex h-8 items-center gap-1.5 text-2xs text-ink-faint hover:text-ink",
+            "flex h-8 items-center gap-1.5 text-caption font-medium text-ink-faint hover:text-ink",
             collapsed ? "justify-center" : "pl-3 pr-2",
           )}
         >
@@ -237,7 +237,7 @@ export function Rail({
             className="flex h-8 w-full items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
           >
             成果
-            <span className="ml-auto tabular-nums text-2xs text-ink-faint">
+            <span className="ml-auto tabular-nums text-caption font-medium text-ink-faint">
               今日 {todayResults}
             </span>
           </Link>
@@ -248,7 +248,9 @@ export function Rail({
             className="flex h-8 w-full items-center pl-3 pr-2 text-sm text-ink-muted hover:bg-line/40 hover:text-ink"
           >
             定时任务
-            <span className="ml-auto text-2xs text-ink-faint">未实现</span>
+            <span className="ml-auto text-caption font-medium text-ink-faint">
+              未实现
+            </span>
           </Link>
         )}
       </div>
