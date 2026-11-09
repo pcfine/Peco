@@ -265,7 +265,6 @@ describe("壳与路由", () => {
   // 每页的 h1 由内容区提供，顶栏不再参与大纲：这里是全站口径的复测。
   it.each([
     ["/peco", "Peco"],
-    ["/peco?face=config", "Peco"],
     ["/spaces", "工作室"],
     ["/spaces/ws_peco", "Peco"],
     ["/spaces/ws_peco/status", "Peco"],
@@ -281,6 +280,24 @@ describe("壳与路由", () => {
       await screen.findByRole("heading", { level: 1, name: title }),
     ).toBeInTheDocument();
     expectOnePageH1();
+  });
+
+  // 配置面把整个聊天面 aria-hidden 掉：读屏在这一面拿到的是它自己的标题，
+  // 而大纲里那个 h1 仍是聊天面左头那一行（两块常驻，DOM 不卸载）。
+  it("/peco?face=config 的可见标题是 h2「能力配置」，h1 仍是左头的 Peco", async () => {
+    renderAt("/peco?face=config");
+    expect(await screen.findByTestId("peco-flip")).toHaveAttribute(
+      "data-face",
+      "config",
+    );
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "能力配置" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { level: 1, name: "Peco" }),
+    ).toBeNull();
+    expectOnePageH1();
+    expect(document.querySelector("h1")).toHaveTextContent("Peco");
   });
 
   it("未注册的路径给 404 文案，不是营销页", async () => {

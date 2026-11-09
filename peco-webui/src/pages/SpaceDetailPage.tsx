@@ -1,5 +1,6 @@
 // `/spaces/:wsId` —— 空间聊天页：左边一条 @master 对话，右边一块 tab 面板。
 //
+// 双开时两块均分整宽：右栏的列表行本来就是通栏，钉死一个宽度在宽屏上只是白留缝。
 // 两块都能藏起自己、让另一块占满整宽：窄屏拥挤没有第二种解法，覆盖抽屉那套因此删掉，
 // 页面只剩一种形态。谁被藏起来，谁就从对面的头部接一个「展开」按钮回来。
 //
@@ -27,6 +28,7 @@ import {
   SPACE_PANEL_MODES,
   useSpacePanelState,
 } from "@/components/spaces/useSpacePanelState";
+import { useConversationClear } from "@/components/spaces/useConversationClear";
 import {
   useCloseSpace,
   useOpenSpace,
@@ -34,10 +36,6 @@ import {
 import { WORK_INLINE_MIN, workWidthOf } from "@/components/layout/shellMetrics";
 import { useViewportWidth } from "@/hooks/useViewportWidth";
 import { useInflightTaskCount, useSpace } from "@/queries/spaceDetail";
-import {
-  useClearSpaceConversation,
-  useSpaceConversation,
-} from "@/queries/spaceChat";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useUiStore } from "@/stores/uiStore";
 import { errorText } from "@/lib/api";
@@ -76,7 +74,7 @@ export function SpaceDetailPage() {
   const railOpen = useUiStore((state) => state.railOpen);
   const [searchParams, setSearchParams] = useSearchParams();
 
-  // 与壳的栅格同源：work 放不下 320 右栏 + 480 聊天列时，两块互斥。
+  // 与壳的栅格同源：work 均分后每块不足 412 时，两块互斥。
   const exclusive = workWidthOf(viewport, railOpen) < WORK_INLINE_MIN;
   const panel = useSpacePanelState(wsId, "space", {
     exclusive,
@@ -96,12 +94,6 @@ export function SpaceDetailPage() {
   // 右栏「任务」tab 的角标与聊天壳里的冲突提示读同一份在飞计数（实时优先、台账兜底）。
   const inflight = useInflightTaskCount(wsId);
 
-  // 与聊天壳同一个 key：这里只为拿到 convId 去清空，不会多打一次 ensure。
-  const conversation = useSpaceConversation(wsId);
-  const convId = conversation.data?.conversation_id ?? null;
-  const clearConversation = useClearSpaceConversation(wsId);
-  const [clearOpen, setClearOpen] = useState(false);
-
   // 哪个空间的对话正在跑。`connectionStore.chat` 是全局一份、隐藏空间的流也写它，
   // 拿它判断本页就会把别人的「进行中」算到自己头上：这里按 wsId 各记一位。
   const [streamingWs, setStreamingWs] = useState<Record<string, boolean>>({});
@@ -110,6 +102,8 @@ export function SpaceDetailPage() {
       previous[id] === streaming ? previous : { ...previous, [id]: streaming },
     );
   }, []);
+
+  const clear = useConversationClear(wsId, streamingWs[wsId] ?? false);
 
   const expandChatRef = useRef<HTMLButtonElement>(null);
   const expandPanelRef = useRef<HTMLButtonElement>(null);
@@ -136,14 +130,6 @@ export function SpaceDetailPage() {
   const togglePanel = () => {
     toggledByUser.current = true;
     panel.toggleCollapsed();
-  };
-
-  // 失败不关弹窗：错误原因已经 toast 出来，用户还能再试或取消。
-  const confirmClear = () => {
-    if (!convId) return;
-    clearConversation.mutate(convId, {
-      onSuccess: () => setClearOpen(false),
-    });
   };
 
   // 直接进 URL 的空间不一定在打开集里：当前路由永远有一个壳，
@@ -190,7 +176,7 @@ export function SpaceDetailPage() {
         data-testid="space-chat-column"
         data-collapsed={panel.chatCollapsed ? "true" : "false"}
         className={cn(
-          "min-w-0 flex-1 flex-col",
+          "min-w-0 flex-1 basis-0 flex-col",
           panel.chatCollapsed ? "hidden" : "flex",
         )}
       >
@@ -200,11 +186,9 @@ export function SpaceDetailPage() {
           onExpandPanel={togglePanel}
           onCollapseChat={toggleChat}
           expandPanelRef={expandPanelRef}
-          onClearConversation={() => setClearOpen(true)}
-          clearDisabled={!convId}
-          clearDisabledReason={
-            streamingWs[wsId] ? "对话进行中，结束后再清除" : undefined
-          }
+          onClearConversation={clear.openDialog}
+          clearDisabled={clear.disabled}
+          clearDisabledReason={clear.disabledReason}
         />
         <div className="flex min-h-0 flex-1 flex-col px-4 pb-3">
           {/* 未打开的空间没有实例：历史还能看，但每一轮都会 409。
@@ -229,10 +213,7 @@ export function SpaceDetailPage() {
           data-testid="space-panel"
           data-mode={panel.mode}
           aria-label="空间右栏"
-          className={cn(
-            "flex flex-col border-l border-line bg-side",
-            solePanel ? "min-w-0 flex-1" : "w-80 shrink-0",
-          )}
+          className="flex min-w-0 flex-1 basis-0 flex-col border-l border-line bg-side"
         >
           <SpacePanelHeader
             mode={panel.mode}
@@ -257,10 +238,10 @@ export function SpaceDetailPage() {
       )}
 
       <ClearConversationDialog
-        open={clearOpen}
-        pending={clearConversation.isPending}
-        onCancel={() => setClearOpen(false)}
-        onConfirm={confirmClear}
+        open={clear.dialogOpen}
+        pending={clear.pending}
+        onCancel={clear.cancel}
+        onConfirm={clear.confirm}
       />
 
       <CloseSpaceDialog

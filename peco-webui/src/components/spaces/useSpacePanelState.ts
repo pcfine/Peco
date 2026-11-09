@@ -32,7 +32,7 @@ export interface SpacePanelState {
   mode: SpacePanelMode;
   /** 右栏是否收起。 */
   collapsed: boolean;
-  /** 聊天列是否收起。Peco 页没有这一块，恒为 false。 */
+  /** 聊天列是否收起。两块同藏等于白屏，所以它压过右栏的折叠。 */
   chatCollapsed: boolean;
 }
 

@@ -1021,12 +1021,12 @@ test("壳层宽度：1920 / 1440（A1–A4）", async ({ browser }) => {
   try {
     const wide = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 1360),
+      (facts) => near(facts.chat?.width ?? 0, 824),
     );
     check(
       "A1",
-      "1920：聊天列宽 1360（±1）",
-      near(wide.chat?.width, 1360),
+      "1920：双开 50/50，聊天列 856 / 聊天壳 824（±1）",
+      near(wide.chat?.width, 824),
       true,
       `实测 ${wide.chat?.width}px（rail ${wide.rail?.width}px / 抽屉 ${wide.dock?.width}px / 右栏 ${wide.panel?.width}px）`,
     );
@@ -1036,15 +1036,15 @@ test("壳层宽度：1920 / 1440（A1–A4）", async ({ browser }) => {
     const trio = await until(
       () => shellFacts(page),
       (facts) =>
-        near(facts.chat?.width ?? 0, 880) &&
+        near(facts.chat?.width ?? 0, 584) &&
         facts.dock?.width === 400 &&
         facts.dockTranslate === 0 &&
         facts.panel !== null,
     );
     check(
       "A2",
-      "1440：聊天列宽 880（±1）",
-      near(trio.chat?.width, 880),
+      "1440：双开 50/50，聊天壳 584（±1）",
+      near(trio.chat?.width, 584),
       true,
       `实测 ${trio.chat?.width}px`,
     );
@@ -1057,9 +1057,9 @@ test("壳层宽度：1920 / 1440（A1–A4）", async ({ browser }) => {
     );
     check(
       "A4",
-      "1440：[data-testid=space-panel] 宽 320",
+      "1440：右栏占一半 616（含 border-l 落 617）",
       trio.panel?.width ?? null,
-      320,
+      617,
       `实测 ${trio.panel?.width}px`,
     );
   } finally {
@@ -1079,7 +1079,7 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     const bar = await until(
       () => shellFacts(page),
       (facts) =>
-        near(facts.chat?.width ?? 0, 720) &&
+        near(facts.chat?.width ?? 0, 504) &&
         facts.dock !== null &&
         facts.dockTranslate === -400,
     );
@@ -1097,8 +1097,8 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     );
     check(
       "A6",
-      "1280：聊天列宽 720（±1）",
-      near(bar.chat?.width, 720),
+      "1280：聊天壳 504（±1）",
+      near(bar.chat?.width, 504),
       true,
       `实测 ${bar.chat?.width}px`,
     );
@@ -1106,12 +1106,12 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     await page.setViewportSize({ width: 1200, height: 800 });
     const mid = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 640),
+      (facts) => near(facts.chat?.width ?? 0, 464),
     );
     check(
       "A7",
-      "1200：聊天列宽 640（±1）",
-      near(mid.chat?.width, 640),
+      "1200：聊天壳 464（±1）",
+      near(mid.chat?.width, 464),
       true,
       `实测 ${mid.chat?.width}px`,
     );
@@ -1119,7 +1119,7 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     await page.setViewportSize({ width: 1024, height: 800 });
     const icon = await until(
       () => shellFacts(page),
-      (facts) => facts.rail?.width === 64 && near(facts.chat?.width ?? 0, 608),
+      (facts) => facts.rail?.width === 64 && near(facts.chat?.width ?? 0, 448),
     );
     check(
       "A8",
@@ -1130,8 +1130,8 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     );
     check(
       "A9",
-      "1024：聊天列宽 608（±1）",
-      near(icon.chat?.width, 608),
+      "1024：聊天壳 448（±1）",
+      near(icon.chat?.width, 448),
       true,
       `实测 ${icon.chat?.width}px`,
     );
@@ -1139,12 +1139,12 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     await page.setViewportSize(VIEW.narrow);
     const narrow = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 484),
+      (facts) => near(facts.chat?.width ?? 0, 386),
     );
     check(
       "A10",
-      "900：聊天列宽 484（±1）",
-      near(narrow.chat?.width, 484),
+      "900：聊天壳 386（±1）",
+      near(narrow.chat?.width, 386),
       true,
       `实测 ${narrow.chat?.width}px`,
     );
@@ -1236,7 +1236,7 @@ test("820：两块互斥且聊天优先（A11 / F7 / F8）", async ({ browser })
   }
 });
 
-test("rail 两态 × 六档：聊天列恒 ≥480（A12 / A13）", async ({ browser }) => {
+test("rail 两态 × 六档：聊天壳恒 ≥380（A12 / A13）", async ({ browser }) => {
   test.setTimeout(180_000);
   const session = await openSession(browser, {
     viewport: VIEW.wide,
@@ -1282,11 +1282,11 @@ test("rail 两态 × 六档：聊天列恒 ≥480（A12 / A13）", async ({ brow
     await session.dispose();
   }
   const below = measured
-    .filter((row) => (row.chat ?? 0) < 480)
+    .filter((row) => (row.chat ?? 0) < 380)
     .map((row) => `${row.tier}${row.rail}=${row.chat}`);
   check(
     "A12",
-    "六档 × rail 展开/收起：聊天列宽恒 ≥480",
+    "六档 × rail 展开/收起：聊天壳恒 ≥380（列 ≥412）",
     below,
     [],
     `实测 ${measured.map((row) => `${row.tier}${row.rail}:${row.chat}`).join("，")}`,

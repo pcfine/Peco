@@ -5,7 +5,7 @@ import { railWidth } from "@/stores/uiStore";
 /** 抽屉宽度上限，与 `DockShell` 的 `min(92vw, 400px)` 是同一组数。 */
 export const DOCK_DRAWER_WIDTH = 400;
 
-/** work 的下限：320（右栏）+ 480（聊天列可用宽）+ 24（列 gutter）。 */
+/** work 的下限：双开均分后每块 ≥412（824 = 412 × 2）。 */
 export const WORK_INLINE_MIN = 824;
 
 /**

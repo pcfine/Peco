@@ -223,6 +223,22 @@ function searchOf(): URLSearchParams {
   return new URLSearchParams(screen.getByTestId("search").textContent ?? "");
 }
 
+/**
+ * 双开的几何是「两块同权」：都 `flex-1 basis-0 min-w-0`，谁也不再固定宽度。
+ * jsdom 量不了像素，这里钉住产生均分的类是哪些；宽度由 e2e 兜。
+ */
+function expectEvenSplit() {
+  const chat = screen.getByTestId("space-chat-column");
+  const panel = screen.getByTestId("space-panel");
+  for (const block of [chat, panel]) {
+    expect(block).toHaveClass("flex-1");
+    expect(block).toHaveClass("basis-0");
+    expect(block).toHaveClass("min-w-0");
+  }
+  expect(panel).not.toHaveClass("w-80");
+  expect(panel).not.toHaveClass("shrink-0");
+}
+
 /** 页面根就是那一条 flex 行：左对话列 + 右栏，两个都可能在。 */
 function pageRoot(): HTMLElement {
   const root = document.querySelector("main > div");
@@ -343,8 +359,8 @@ describe("空间聊天页", () => {
       "data-mode",
       "files",
     );
-    // 默认双开：右栏是固定的 320。
-    expect(screen.getByTestId("space-panel")).toHaveClass("w-80");
+    // 默认双开：两块均分整宽。
+    expectEvenSplit();
     // 唯一的 @master 会话：历史按空间的 ws 取。
     expect(mocks.ensure).toHaveBeenCalledWith("ws_a");
   });
@@ -427,7 +443,7 @@ describe("空间聊天页", () => {
       within(chatColumn).getByRole("button", { name: "展开右栏" }),
     );
 
-    expect(screen.getByTestId("space-panel")).toHaveClass("w-80");
+    expectEvenSplit();
     expect(screen.queryByRole("button", { name: "展开右栏" })).toBeNull();
     expect(storedPanel()).toEqual({
       mode: "files",
@@ -455,8 +471,11 @@ describe("空间聊天页", () => {
       "data-visible",
       "true",
     );
+    // 右栏成了唯一露面的一块：没有兄弟争宽度，它自然吃满整宽。
     const panel = screen.getByTestId("space-panel");
+    expect(pageRoot().children[1]).toBe(panel);
     expect(panel).toHaveClass("flex-1");
+    expect(panel).toHaveClass("basis-0");
     expect(panel).not.toHaveClass("w-80");
     // 独占时内容按 880 居中，不是拉满整行。
     expect((panel.lastElementChild as HTMLElement).className).toContain(
@@ -473,7 +492,7 @@ describe("空间聊天页", () => {
     expect(await screen.findByTestId("space-chat-shell")).toBeInTheDocument();
     expect(screen.getByTestId("space-chat-column")).toHaveClass("flex");
     expect(screen.getByTestId("space-chat-column")).not.toHaveClass("hidden");
-    expect(screen.getByTestId("space-panel")).toHaveClass("w-80");
+    expectEvenSplit();
     expect(
       (screen.getByTestId("space-panel").lastElementChild as HTMLElement)
         .className,

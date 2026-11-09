@@ -428,7 +428,6 @@ interface FlipFacts {
   animating: string | null;
   motion: string | null;
   tabs: string[];
-  modeButtons: string[];
   overviewPanels: number;
   assembleButtons: number;
 }
@@ -446,9 +445,6 @@ async function flipFacts(page: Page): Promise<FlipFacts> {
       tabs: Array.from(document.querySelectorAll('[role="tab"]')).map((node) =>
         (node.textContent ?? "").trim(),
       ),
-      modeButtons: Array.from(
-        document.querySelectorAll('[role="group"][aria-label="右栏"] button'),
-      ).map((node) => (node.textContent ?? "").trim()),
       overviewPanels: document.querySelectorAll(
         '[data-testid="peco-panel"] [data-testid^="panel-"]',
       ).length,
@@ -950,9 +946,9 @@ test("Peco 页：默认聊天面 + 总览，可翻转到配置面", async ({ bro
     check("E2", "Peco 右栏默认「总览」", panel?.mode ?? null, "overview");
     check(
       "E3",
-      "右栏宽度 = 320px",
+      "右栏占一半 856（含 border-l 落 857）",
       panel?.width ?? null,
-      320,
+      857,
       `实测 ${panel?.width}px`,
     );
     check(
@@ -1066,9 +1062,9 @@ test("空间页：默认文件、切任务后刷新仍任务、收起后一次�
     check("F1", "空间页右栏默认「文件」", files?.mode ?? null, "files");
     check(
       "F2",
-      "右栏宽度 = 320px",
+      "右栏占一半 856（含 border-l 落 857）",
       files?.width ?? null,
-      320,
+      857,
       `实测 ${files?.width}px`,
     );
     const entries = files?.entries ?? [];
@@ -1159,9 +1155,9 @@ test("空间页：默认文件、切任务后刷新仍任务、收起后一次�
     );
     check(
       "F9",
-      "记忆面板宽度 = 320px",
+      "右栏占一半 856（含 border-l 落 857）",
       memory?.width ?? null,
-      320,
+      857,
       `实测 ${memory?.width}px`,
     );
     check(

@@ -4,7 +4,7 @@
 // 图标组永远靠右，不随名称长短漂移。整行与聊天正文同宽同轴：标题、消息与
 // composer 落在同一条竖线上，两侧留白随列宽收放。
 
-import type { Ref } from "react";
+import type { ReactNode, Ref } from "react";
 import { Eraser, PanelLeftClose, PanelRightOpen } from "lucide-react";
 import { Link } from "react-router-dom";
 import { SpaceHeaderIconButton } from "@/components/spaces/SpaceHeaderIconButton";
@@ -16,7 +16,11 @@ import { spaceLabel } from "@/components/layout/spaceLabel";
 import type { Space } from "@/types/daemon";
 
 interface SpaceChatHeaderProps {
-  space: Space;
+  /**
+   * 只要这五项：Peco 页在空间清单到手前用 Peco 身份顶上，也得能画出这一行
+   * —— 唯一的 h1 与三个动作都长在这里。
+   */
+  space: Pick<Space, "label" | "work_dir" | "team_id" | "status" | "closed_at">;
   /** 右栏收起时这里接一个「展开右栏」：两块互相是对方的回来路径。 */
   panelCollapsed: boolean;
   onExpandPanel: () => void;
@@ -31,6 +35,15 @@ interface SpaceChatHeaderProps {
    * 用户不必点一次、吃一个 409 才知道。
    */
   clearDisabledReason?: string;
+  /** 页面自己的动作（Peco 页的「能力配置」），排在「清除对话」之前。 */
+  extraActions?: ReactNode;
+  /** 覆盖标题：空间名来自目录，Peco 页要的是品牌名而不是那个小写目录名。 */
+  title?: string;
+  /**
+   * 标题的补充说明，挂到 h1 的 `title` 上：工作目录这类长字符串要能悬停看全，
+   * 又不该挤进标题（不改变文案，也不改变可访问名）。
+   */
+  titleHint?: string;
 }
 
 export function SpaceChatHeader({
@@ -42,13 +55,19 @@ export function SpaceChatHeader({
   onClearConversation,
   clearDisabled,
   clearDisabledReason,
+  extraActions,
+  title,
+  titleHint,
 }: SpaceChatHeaderProps) {
   return (
     <header className="flex h-12 shrink-0 items-center border-b border-line px-3">
       <div className="mx-auto flex w-full max-w-chat min-w-0 items-center gap-2">
         <SpaceStatusMark group={spaceGroupOf(space)} />
-        <h1 className="min-w-0 truncate text-xl font-semibold text-ink">
-          {spaceLabel(space)}
+        <h1
+          className="min-w-0 truncate text-xl font-semibold text-ink"
+          title={titleHint}
+        >
+          {title ?? spaceLabel(space)}
         </h1>
         <Link
           to={`/teams/${encodeURIComponent(space.team_id)}`}
@@ -58,6 +77,7 @@ export function SpaceChatHeader({
           ·{space.team_id}
         </Link>
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
+          {extraActions}
           <SpaceHeaderIconButton
             label="清除对话"
             icon={Eraser}

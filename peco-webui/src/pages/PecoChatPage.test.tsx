@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -36,13 +37,15 @@ const mocks = vi.hoisted(() => ({
   })),
   /** 同一个页面两种空间状态：未打开那条路要走完整的空态与打开入口。 */
   spaceStatus: { value: "open" as "open" | "closed" },
+  /** 空间名来自目录：真机上 Peco 空间的 label 就是小写目录名。 */
+  spaceLabel: { value: "Peco" },
 }));
 
 const pecoSpace = (): Space => ({
   ws_id: "ws_peco",
   work_dir: "/tmp/peco/work",
   team_id: "peco",
-  label: "Peco",
+  label: mocks.spaceLabel.value,
   exit_policy: "inherit",
   effective_exit_policy: "keep",
   status: mocks.spaceStatus.value,
@@ -159,6 +162,23 @@ function stageOf(flip: HTMLElement): HTMLElement {
   return flip.firstElementChild as HTMLElement;
 }
 
+/** 壳的分档读 `window.innerWidth`（`useViewportWidth`）：挂载前改，挂载后补一次 resize。 */
+function setViewport(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+  act(() => {
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
+/** 聊天列是聊天面的第一个子块（右栏收起时是唯一的一个）。 */
+function chatColumnOf(): HTMLElement {
+  return screen.getByTestId("peco-face-chat").firstElementChild as HTMLElement;
+}
+
 /** jsdom 的 matchMedia 一律 false；减弱动效分支要显式打开。 */
 function useReducedMotion(): () => void {
   const original = window.matchMedia;
@@ -176,6 +196,12 @@ function useReducedMotion(): () => void {
     window.matchMedia = original;
   };
 }
+
+const DEFAULT_VIEWPORT = 1024;
+
+afterEach(() => {
+  setViewport(DEFAULT_VIEWPORT);
+});
 
 beforeEach(() => {
   localStorage.clear();
@@ -204,6 +230,75 @@ describe("Peco 主区", () => {
     expect(document.querySelector(".board-grid")).toBeNull();
   });
 
+  it("两块骨架：没有跨整宽页头，左头有唯一的 h1 与三枚图标按钮，右头是四个 tab", async () => {
+    renderPeco();
+
+    const chatFace = await screen.findByTestId("peco-face-chat");
+    // 跨整宽的页头没了：每个 header 都长在某个面内部，一个都不在面外。
+    const headers = Array.from(document.querySelectorAll("header"));
+    expect(headers).not.toHaveLength(0);
+    for (const header of headers) {
+      expect(
+        header.closest(
+          '[data-testid="peco-face-chat"], [data-testid="peco-face-config"]',
+        ),
+      ).not.toBeNull();
+    }
+    // 聊天面自己两块：左头 + 右栏头。
+    expect(chatFace.querySelectorAll("header")).toHaveLength(2);
+    // 全页仍只有一个 h1。
+    expect(document.querySelectorAll("h1")).toHaveLength(1);
+
+    const leftHeader = chatFace.querySelector("header") as HTMLElement;
+    expect(leftHeader.className).toContain("h-12");
+    expect(leftHeader.className).toContain("border-b");
+    expect(
+      within(leftHeader).getByRole("heading", { level: 1, name: "Peco" }),
+    ).toBeInTheDocument();
+    // 三枚纯图标按钮：名字只能靠 aria-label，零文本节点。
+    for (const label of ["清除对话", "能力配置", "收起对话"]) {
+      const button = within(leftHeader).getByRole("button", { name: label });
+      expect(button.textContent).toBe("");
+    }
+
+    const rightHeader = screen
+      .getByTestId("peco-panel")
+      .querySelector("header") as HTMLElement;
+    expect(rightHeader.className).toContain("h-12");
+    const tablist = within(rightHeader).getByRole("tablist", { name: "右栏" });
+    expect(within(tablist).getAllByRole("tab")).toHaveLength(4);
+  });
+
+  it("收起对话：左块藏起来但聊天壳不卸载，右栏接手整宽，回来的路在右头", async () => {
+    renderPeco();
+    await screen.findByTestId("space-chat-shell");
+
+    fireEvent.click(screen.getByRole("button", { name: "收起对话" }));
+
+    // 视觉消失 ≠ 卸载：壳还在文档里，在途那一轮不会被打断。
+    expect(screen.getByTestId("space-chat-shell")).toHaveAttribute(
+      "data-visible",
+      "true",
+    );
+    const panel = screen.getByTestId("peco-panel");
+    expect(panel).toHaveClass("flex-1");
+    // 独占时内容按 880 居中，与空间页同一条轴。
+    expect((panel.lastElementChild as HTMLElement).className).toContain(
+      "max-w-mid",
+    );
+    expect(screen.getByRole("button", { name: "展开对话" })).toHaveFocus();
+    expect(
+      JSON.parse(
+        localStorage.getItem("peco-webui:space-panel:ws_peco") ?? "{}",
+      ),
+    ).toEqual({ mode: "overview", collapsed: false, chatCollapsed: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "展开对话" }));
+    expect(
+      screen.getByRole("button", { name: "收起对话" }),
+    ).toBeInTheDocument();
+  });
+
   it("点「能力配置」翻到配置面：URL 带 face=config，没有绑定空间与装配为空间", async () => {
     renderPeco();
     await screen.findByTestId("space-chat-shell");
@@ -214,8 +309,8 @@ describe("Peco 主区", () => {
     const flip = screen.getByTestId("peco-flip");
     expect(flip).toHaveAttribute("data-face", "config");
     expect(flip).toHaveAttribute("data-animating", "true");
-    // 配置面挡住了右栏，模式按钮不留在页头上做死控件。
-    expect(screen.queryByRole("button", { name: "总览" })).toBeNull();
+    // 配置面挡住了右栏，模式 tab 不留在页头上做死控件。
+    expect(screen.queryByRole("tablist", { name: "右栏" })).toBeNull();
 
     const config = screen.getByTestId("peco-face-config");
     expect(
@@ -336,7 +431,7 @@ describe("Peco 主区", () => {
     renderPeco();
     await screen.findByTestId("space-chat-shell");
 
-    fireEvent.click(screen.getByRole("button", { name: "记忆" }));
+    fireEvent.click(screen.getByRole("tab", { name: "记忆" }));
 
     expect(screen.getByTestId("peco-panel")).toHaveAttribute(
       "data-mode",
@@ -350,6 +445,10 @@ describe("Peco 主区", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "收起右栏" }));
     expect(screen.queryByTestId("peco-panel")).toBeNull();
+    // 收起后的回来路径在左头：右栏藏着时才出现一枚「展开右栏」。
+    expect(
+      screen.getByRole("button", { name: "展开右栏" }),
+    ).toBeInTheDocument();
     expect(
       JSON.parse(
         localStorage.getItem("peco-webui:space-panel:ws_peco") ?? "{}",
@@ -371,7 +470,7 @@ describe("Peco 主区", () => {
       "memory",
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /^任务/ }));
+    fireEvent.click(screen.getByRole("tab", { name: /^任务/ }));
 
     expect(screen.getByTestId("peco-panel")).toHaveAttribute(
       "data-mode",
@@ -394,7 +493,7 @@ describe("Peco 主区", () => {
     expect(screen.queryByTestId("space-chat-shell")).toBeNull();
     expect(mocks.ensure).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "文件" }));
+    fireEvent.click(screen.getByRole("tab", { name: "文件" }));
     expect(screen.getByTestId("peco-panel")).toHaveAttribute(
       "data-mode",
       "files",
@@ -426,6 +525,57 @@ describe("Peco 主区", () => {
     ).toBeInTheDocument();
     // 资源 tab 没有 X-Peco-Space，就不该发请求。
     expect(screen.queryByRole("tab", { name: "绑定空间" })).toBeNull();
+  });
+
+  it("窄屏（work < 824）两块互斥且聊天优先：展开右栏换位，展开对话换回来", async () => {
+    setViewport(820);
+    renderPeco();
+    await screen.findByTestId("space-chat-shell");
+
+    // 放不下两块：默认只留聊天，右栏连同它的 tab 栏一起不在。
+    expect(screen.queryByTestId("peco-panel")).toBeNull();
+    expect(screen.queryByRole("tablist", { name: "右栏" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "展开右栏" }));
+
+    expect(screen.getByTestId("peco-panel")).toHaveClass("flex-1");
+    // 让位是 display:none，不是卸载：在途那一轮不随换位中断。
+    expect(chatColumnOf()).toHaveClass("hidden");
+    expect(screen.getByTestId("space-chat-shell")).toHaveAttribute(
+      "data-visible",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "展开对话" })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: "展开对话" }));
+
+    expect(screen.queryByTestId("peco-panel")).toBeNull();
+    expect(chatColumnOf()).not.toHaveClass("hidden");
+  });
+
+  it("左头的 h1 用 title 挂着工作目录，可访问名仍是空间名", async () => {
+    // 空间名取自目录：这里就是小写的那种，页面得显示品牌名。
+    mocks.spaceLabel.value = "peco";
+    renderPeco();
+
+    const heading = await screen.findByRole("heading", {
+      level: 1,
+      name: "Peco",
+    });
+    expect(heading).toHaveAttribute("title", "/tmp/peco/work");
+    // title 只是悬停补充：读屏念到的名称不能变成路径。
+    expect(heading).toHaveAccessibleName("Peco");
+  });
+
+  it("聊天正文的内距与空间页同构：聊天壳宽 = 列宽 − 32", async () => {
+    renderPeco();
+
+    const shell = await screen.findByTestId("space-chat-shell");
+    const body = shell.parentElement as HTMLElement;
+    // 左右各 16 才是六档实测里的「列 − 32」；退回 p-3 会让整条口径漂 8px。
+    expect(body).toHaveClass("px-4");
+    expect(body).toHaveClass("pb-3");
+    expect(body).not.toHaveClass("p-3");
   });
 
   it("配置面的「记忆」tab 浏览 Peco 空间自己的记忆，不是团队维度占位", async () => {

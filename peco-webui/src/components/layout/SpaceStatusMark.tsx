@@ -10,7 +10,9 @@ export type SpaceGroup = "running" | "dormant" | "closed";
  * `/api/spaces` 只回 `status`（是否在 Hub 里）与 `closed_at`：`closed` 且没被
  * 显式关闭过 = 库里有行、本次没开，正是「已存在」。
  */
-export function spaceGroupOf(space: Space): SpaceGroup {
+export function spaceGroupOf(
+  space: Pick<Space, "status" | "closed_at">,
+): SpaceGroup {
   if (space.status === "open") return "running";
   if (space.closed_at) return "closed";
   return "dormant";

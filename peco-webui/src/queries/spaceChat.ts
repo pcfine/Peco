@@ -19,10 +19,15 @@ function messagesKey(convId: string) {
   return ["messages", SPACE_MASTER_AGENT, convId];
 }
 
-export function useSpaceConversation(wsId: string) {
+export function useSpaceConversation(
+  wsId: string,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
   return useQuery({
     queryKey: spaceConversationKey(wsId),
     queryFn: () => ensureSpaceConversation(wsId),
+    // 空间还没打开时不该打这一枪：POST 只会 409，入口在「打开」那一边。
+    enabled,
     // 会话 id 一旦定下来就不再变：重取只会白打一次 POST。
     staleTime: Infinity,
     gcTime: Infinity,
