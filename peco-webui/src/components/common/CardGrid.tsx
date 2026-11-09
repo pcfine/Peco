@@ -1,9 +1,10 @@
 // 资源面板共用的卡片栅格：列数只看面板宽度（`@container/team`），与视口无关 ——
 // 同一份栅格在团队页与 Peco 翻转面里都要成立。
 //
-// 阈值按「卡不小于 260px」反推：`@container/team` 量的是含左侧分类栏的整块，
-// 所以每加一列要先扣掉 176px 导航与 24px 内边距。上限 3 列 —— 容器被
-// `max-w-wide`(1200) 封顶，第 4 列在 1440 上只剩 237px。
+// 阈值按「卡不小于 280px」反推：`@container/team` 量的是含左侧分类栏的整块，
+// 所以每加一列要先扣掉 176px 导航、24px 内边距与列间距。团队页贴边后容器
+// 可到 1712，3 列会撑到 496px/卡，故补 1360 一档走 4 列；再往上不加列，
+// 卡宽停在 ~370 — 400px 比 5 列 290px 更好读。
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
@@ -17,7 +18,7 @@ export function CardGrid({ children, className }: CardGridProps) {
   return (
     <div
       className={cn(
-        "grid grid-cols-1 gap-3 @min-[720px]/team:grid-cols-2 @min-[1060px]/team:grid-cols-3",
+        "grid grid-cols-1 gap-3 @min-[720px]/team:grid-cols-2 @min-[1060px]/team:grid-cols-3 @min-[1360px]/team:grid-cols-4",
         className,
       )}
     >

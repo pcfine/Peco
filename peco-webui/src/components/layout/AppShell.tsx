@@ -22,6 +22,9 @@ import { cn } from "@/lib/utils";
 /** 工作台页自带列 gutter：main 的留白归零，否则两侧重复留白吃掉聊天列宽度。 */
 function isWorkbench(pathname: string): boolean {
   if (pathname === "/peco") return true;
+  // 团队详情是全高面板页（左分类导航 + 右内容各自滚动）：main 一留白，
+  // 分类导航就和 rail 之间多出一条缝，且 max-w-wide 居中在宽屏留下更大空白。
+  if (/^\/teams\/[^/]+$/.test(pathname)) return true;
   if (pathname === "/spaces/new") return false;
   return /^\/spaces\/[^/]+(\/status)?$/.test(pathname);
 }
