@@ -102,6 +102,8 @@ const EXPECTED_IDS = [
   "G4",
   "G5",
   "G6",
+  "G7",
+  "G8",
 ];
 
 /**
@@ -1054,7 +1056,8 @@ test("空间页：默认文件、切任务后刷新仍任务、收起后一次�
     ready: '[data-testid="space-panel"]',
   });
   const { page } = session;
-  const modeBar = page.getByRole("group", { name: "右栏" });
+  // 右栏头部是 `role=tablist aria-label="右栏"`：模式按钮现在是 tab，不是 aria-pressed 按钮。
+  const modeBar = page.getByRole("tablist", { name: "右栏" });
   try {
     const files = await until(
       () => panelFacts(page),
@@ -1078,8 +1081,8 @@ test("空间页：默认文件、切任务后刷新仍任务、收起后一次�
       `实测 ${entries.length} 行：${entries.join(" / ")}`,
     );
 
-    // 按钮名可能带在飞角标（「任务 1」），按前缀匹配；只在这一组里找，不会撞到台账 tab。
-    await modeBar.getByRole("button", { name: /^任务/ }).click();
+    // tab 名可能带在飞角标（「任务 1」），按前缀匹配；只在这一组里找，不会撞到别处的 tab。
+    await modeBar.getByRole("tab", { name: /^任务/ }).click();
     const tasks = await until(
       () => panelFacts(page),
       (facts) => facts?.mode === "tasks" && taskPanelSettled(facts),
@@ -1130,18 +1133,29 @@ test("空间页：默认文件、切任务后刷新仍任务、收起后一次�
     );
     check("F7", "收起后右栏不渲染", collapsed === null, true);
 
-    await modeBar.getByRole("button", { name: "记忆", exact: true }).click();
+    // 收起态没有 tab 栏可点：回来路径在左头 —— 一枚「展开右栏」，点一次就回来。
+    const expandVisible = await page
+      .getByRole("button", { name: "展开右栏" })
+      .isVisible();
+    await page.getByRole("button", { name: "展开右栏" }).click();
+    const reopened = await until(
+      () => panelFacts(page),
+      (facts) => facts !== null,
+    );
+    check(
+      "F8",
+      "收起态从左头「展开右栏」一次点击回到右栏（模式仍是任务）",
+      [expandVisible, reopened?.mode ?? null],
+      [true, "tasks"],
+      `回来时 space-panel ${reopened === null ? "null" : `mode=${reopened.mode}`}`,
+    );
+
+    await modeBar.getByRole("tab", { name: "记忆", exact: true }).click();
     // 模式先落、清单后到：等空态文案出现再量，否则量到的是列表还在路上的那一帧。
     const memory = await until(
       () => panelFacts(page),
       (facts) =>
         facts?.mode === "memory" && facts.text.includes("本空间还没有记忆。"),
-    );
-    check(
-      "F8",
-      "收起态点「记忆」一次点击即展开并切到记忆",
-      memory?.mode ?? null,
-      "memory",
     );
     check(
       "F9",
@@ -1180,8 +1194,8 @@ test("空间页：实时快照与台账都为空时只剩空态，且不标来�
   const { page } = session;
   try {
     await page
-      .getByRole("group", { name: "右栏" })
-      .getByRole("button", { name: /^任务/ })
+      .getByRole("tablist", { name: "右栏" })
+      .getByRole("tab", { name: /^任务/ })
       .click();
     const tasks = await until(
       () => panelFacts(page),
@@ -1219,6 +1233,8 @@ test("溢出：1920×1080 与 900×800 的三种页面都没有横向溢出", as
     viewport: { width: number; height: number };
     path: string;
     ready: string;
+    /** 空间页两种独占态各量一次：折叠后单块吃满整宽是新的溢出高发面。 */
+    collapse?: "chat" | "panel";
   }[] = [
     {
       id: "G1",
@@ -1246,6 +1262,20 @@ test("溢出：1920×1080 与 900×800 的三种页面都没有横向溢出", as
       ready: '[data-testid="space-panel"]',
     },
     { id: "G6", viewport: NARROW, path: "/teams", ready: "[data-team-id]" },
+    {
+      id: "G7",
+      viewport: WIDE,
+      path: `/spaces/${SPACE_WS}`,
+      ready: '[data-testid="space-panel"]',
+      collapse: "panel",
+    },
+    {
+      id: "G8",
+      viewport: WIDE,
+      path: `/spaces/${SPACE_WS}`,
+      ready: '[data-testid="space-panel"]',
+      collapse: "chat",
+    },
   ];
 
   for (const entry of cases) {
@@ -1257,10 +1287,22 @@ test("溢出：1920×1080 与 900×800 的三种页面都没有横向溢出", as
       ready: entry.ready,
     });
     try {
+      if (entry.collapse) {
+        await session.page
+          .getByRole("button", {
+            name: entry.collapse === "chat" ? "收起对话" : "收起右栏",
+          })
+          .click();
+        await session.page.waitForTimeout(300);
+      }
       const facts = await pageFacts(session.page);
       check(
         entry.id,
-        `${entry.viewport.width}×${entry.viewport.height} 的 ${entry.path} 无横向溢出（scrollWidth = clientWidth）`,
+        `${entry.viewport.width}×${entry.viewport.height} 的 ${entry.path}${
+          entry.collapse
+            ? `（${entry.collapse === "chat" ? "收起对话" : "收起右栏"}后独占）`
+            : ""
+        } 无横向溢出（scrollWidth = clientWidth）`,
         [
           facts.html.scrollWidth - facts.html.clientWidth,
           facts.body.scrollWidth - facts.body.clientWidth,

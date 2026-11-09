@@ -346,7 +346,7 @@ describe("Peco 主区", () => {
       JSON.parse(
         localStorage.getItem("peco-webui:space-panel:ws_peco") ?? "{}",
       ),
-    ).toEqual({ mode: "memory", collapsed: false });
+    ).toEqual({ mode: "memory", collapsed: false, chatCollapsed: false });
 
     fireEvent.click(screen.getByRole("button", { name: "收起右栏" }));
     expect(screen.queryByTestId("peco-panel")).toBeNull();
@@ -354,7 +354,7 @@ describe("Peco 主区", () => {
       JSON.parse(
         localStorage.getItem("peco-webui:space-panel:ws_peco") ?? "{}",
       ),
-    ).toEqual({ mode: "memory", collapsed: true });
+    ).toEqual({ mode: "memory", collapsed: true, chatCollapsed: false });
   });
 
   it("URL 的 ?panel= 压过存档，切模式只改 panel、不动 face", async () => {

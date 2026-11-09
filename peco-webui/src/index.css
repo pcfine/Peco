@@ -5,7 +5,7 @@
 
 /* 按需生成：没有调用点的类不会进产物。显式登记容器宽度与语义字号，
    这几档取值才有构建产物可取证。 */
-@source inline("max-w-narrow max-w-mid max-w-wide text-micro text-caption text-body text-reading text-heading text-display");
+@source inline("max-w-narrow max-w-chat max-w-mid max-w-wide text-micro text-caption text-body text-reading text-heading text-display");
 
 @font-face {
   font-family: "Geist";
@@ -137,6 +137,7 @@ html:not(.dark) {
   --spacing-topbar: 44px;
 
   --container-narrow: 520px;
+  --container-chat: 760px;
   --container-mid: 880px;
   --container-wide: 1200px;
 

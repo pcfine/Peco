@@ -1,4 +1,5 @@
 import { api, spaceScope } from "@/lib/api";
+import type { SuccessResponse } from "@/types/common";
 import type {
   CreateSpaceRequest,
   LiveTaskView,
@@ -38,6 +39,24 @@ export async function ensureSpaceConversation(
   const res = await api.post<SpaceConversation>(
     `/spaces/${encodeURIComponent(wsId)}/conversation/ensure`,
     {},
+    spaceScope(wsId),
+  );
+  return res.data;
+}
+
+/**
+ * 清空该空间唯一会话的消息；会话行与已产出的成果都保留。
+ *
+ * 幂等：还没有会话的空间也回成功，调用方不必把「本来就干净」当成失败。
+ * `agent_name` 缺省由后端补 `@master`，与 `ensure` 同一条约定。
+ */
+export async function clearSpaceConversation(
+  wsId: string,
+  agentName?: string,
+): Promise<SuccessResponse> {
+  const res = await api.post<SuccessResponse>(
+    `/spaces/${encodeURIComponent(wsId)}/conversation/clear`,
+    agentName ? { agent_name: agentName } : {},
     spaceScope(wsId),
   );
   return res.data;

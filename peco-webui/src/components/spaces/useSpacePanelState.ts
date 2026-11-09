@@ -1,10 +1,9 @@
-// 右栏的模式与收起态按空间各记一份：回到某个空间时看到的是上次离开时的样子。
+// 右栏的模式与两块的折叠态按空间各记一份：回到某个空间时看到的是上次离开时的样子。
 //
-// 只存 `{ mode, collapsed }` 两个字段，不进 query 缓存 —— 它是纯 UI 偏好，
-// 与 daemon 的状态无关，刷新页面也不该丢。
+// 只存 UI 偏好，不进 query 缓存 —— 它与 daemon 的状态无关，刷新页面也不该丢。
 //
 // 模式同时能由 URL 的 `?panel=` 给出：它是「正在看哪一栏」，值得被分享和深链，
-// 于是压过存档；`collapsed` 是偏好而不是可分享状态，只走存档。
+// 于是压过存档；折叠是偏好而不是可分享状态，只走存档。
 
 import { useCallback, useState } from "react";
 
@@ -31,11 +30,18 @@ export const SPACE_PANEL_LABELS: Record<SpacePanelMode, string> = {
 
 export interface SpacePanelState {
   mode: SpacePanelMode;
+  /** 右栏是否收起。 */
   collapsed: boolean;
+  /** 聊天列是否收起。Peco 页没有这一块，恒为 false。 */
+  chatCollapsed: boolean;
 }
 
 function defaultPanel(variant: SpacePanelVariant): SpacePanelState {
-  return { mode: variant === "peco" ? "overview" : "files", collapsed: false };
+  return {
+    mode: variant === "peco" ? "overview" : "files",
+    collapsed: false,
+    chatCollapsed: false,
+  };
 }
 
 function storageKey(wsId: string): string {
@@ -49,7 +55,7 @@ function isModeOf(
   return SPACE_PANEL_MODES[variant].includes(value as SpacePanelMode);
 }
 
-/** 存档读不出来就用默认态：一份坏掉的偏好不该让右栏变成不可用。 */
+/** 存档读不出来就用默认态：一份坏掉的偏好不该让页面变成不可用。 */
 function readPanel(wsId: string, variant: SpacePanelVariant): SpacePanelState {
   try {
     const raw = localStorage.getItem(storageKey(wsId));
@@ -57,9 +63,10 @@ function readPanel(wsId: string, variant: SpacePanelVariant): SpacePanelState {
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null)
       return defaultPanel(variant);
-    const { mode, collapsed } = parsed as {
+    const { mode, collapsed, chatCollapsed } = parsed as {
       mode?: unknown;
       collapsed?: unknown;
+      chatCollapsed?: unknown;
     };
     const fallback = defaultPanel(variant);
     return {
@@ -67,6 +74,10 @@ function readPanel(wsId: string, variant: SpacePanelVariant): SpacePanelState {
       mode: isModeOf(variant, mode) ? mode : fallback.mode,
       collapsed:
         typeof collapsed === "boolean" ? collapsed : fallback.collapsed,
+      chatCollapsed:
+        typeof chatCollapsed === "boolean"
+          ? chatCollapsed
+          : fallback.chatCollapsed,
     };
   } catch {
     // 隐私模式会禁用 localStorage；旧版本写下的 JSON 也可能已经解析不了。
@@ -83,8 +94,11 @@ function savePanel(wsId: string, panel: SpacePanelState): void {
 }
 
 export interface SpacePanelOptions {
-  /** work < 824 时右栏改为抽屉：开关是瞬时态，不改也不落存档里的 `collapsed`。 */
-  drawer?: boolean;
+  /**
+   * 视口放不下两列：两块互斥且聊天优先，右栏只在聊天收起后才占位。
+   * 开关本身仍是偏好，不随视口变化改写存档。
+   */
+  exclusive?: boolean;
   /** URL 的 `?panel=` 原值：合法时优先于存档，让「正在看哪一栏」可分享、可深链。 */
   modeFromUrl?: string | null;
   /** 模式变了才写 URL —— 幂等的点击不该多一次 `replaceState`。 */
@@ -93,14 +107,15 @@ export interface SpacePanelOptions {
 
 export interface SpacePanelControls {
   mode: SpacePanelMode;
-  /** 内联态的收起偏好；抽屉态恒等于存档里的值，不参与渲染。 */
+  /** 右栏此刻是否收起（含 `exclusive` 的派生结果，直接决定渲染）。 */
   collapsed: boolean;
-  /** 抽屉是否打开；内联态恒为 false。 */
-  drawerOpen: boolean;
-  /** 点任一模式都是「展开并看这个模式」：收起时先展开再切，抽屉态则打开抽屉。 */
+  chatCollapsed: boolean;
+  /** 点任一模式都是「去看这个模式」：收起时先展开再切。 */
   selectMode: (mode: SpacePanelMode) => void;
+  /** 收起 / 展开右栏。收起时聊天接位，展开时窄屏把聊天让出去。 */
   toggleCollapsed: () => void;
-  setDrawerOpen: (open: boolean) => void;
+  /** 收起 / 展开聊天列。收起时右栏接位，展开时窄屏把右栏让回去。 */
+  toggleChat: () => void;
 }
 
 export function useSpacePanelState(
@@ -108,14 +123,12 @@ export function useSpacePanelState(
   variant: SpacePanelVariant = "space",
   options: SpacePanelOptions = {},
 ): SpacePanelControls {
-  const { drawer = false, modeFromUrl = null, onModeChange } = options;
+  const { exclusive = false, modeFromUrl = null, onModeChange } = options;
 
   const [stored, setStored] = useState(() => ({
     wsId,
     panel: readPanel(wsId, variant),
   }));
-  // 抽屉的开关不落存档：视口变宽后再变窄，不该自动弹出来。
-  const [drawerOpen, setDrawerOpen] = useState(false);
 
   // 换空间不重挂页面：在渲染期把状态换成新空间的存档，避免先渲染一帧
   // 上一个空间的面板。
@@ -123,12 +136,13 @@ export function useSpacePanelState(
     setStored({ wsId, panel: readPanel(wsId, variant) });
   const panel = stored.wsId === wsId ? stored.panel : readPanel(wsId, variant);
 
-  // 视口放宽回到内联态后，别把「抽屉开着」留到下一次变窄。
-  if (!drawer && drawerOpen) setDrawerOpen(false);
-
   // URL 里的模式压过存档；参数值不属于这个变体（`overview` 之于空间页、
   // 手改坏的串）就当没给，回落到存档与默认。
   const mode = isModeOf(variant, modeFromUrl) ? modeFromUrl : panel.mode;
+
+  // 两块同藏等于白屏，所以聊天的折叠压过右栏的折叠：聊天收起来时右栏一定在。
+  // 窄屏上再叠一层「聊天优先」：默认只摆聊天，右栏要等聊天让位。
+  const collapsed = !panel.chatCollapsed && (exclusive || panel.collapsed);
 
   const write = useCallback(
     (next: SpacePanelState) => {
@@ -140,23 +154,44 @@ export function useSpacePanelState(
 
   const selectMode = useCallback(
     (next: SpacePanelMode) => {
-      // 抽屉态只改模式：`collapsed` 原样写回，视口变宽后仍按存档恢复。
-      write({ mode: next, collapsed: drawer ? panel.collapsed : false });
-      if (drawer) setDrawerOpen(true);
+      // 用户点的是「看任务」而不是「切模式」：收起态下先展开。
+      write({ ...panel, mode: next, collapsed: false });
       if (next !== mode) onModeChange?.(next);
     },
-    [write, drawer, panel.collapsed, mode, onModeChange],
+    [write, panel, mode, onModeChange],
   );
 
   return {
     mode,
-    collapsed: panel.collapsed,
-    drawerOpen: drawer && drawerOpen,
+    collapsed,
+    chatCollapsed: panel.chatCollapsed,
     selectMode,
+    // 展开一块时，窄屏只能留它自己；另一块原本就收着的话也照旧收着。
     toggleCollapsed: useCallback(
-      () => write({ mode, collapsed: !panel.collapsed }),
-      [write, mode, panel.collapsed],
+      () =>
+        write(
+          collapsed
+            ? {
+                ...panel,
+                collapsed: false,
+                chatCollapsed: panel.chatCollapsed || exclusive,
+              }
+            : { ...panel, collapsed: true, chatCollapsed: false },
+        ),
+      [write, panel, collapsed, exclusive],
     ),
-    setDrawerOpen,
+    toggleChat: useCallback(
+      () =>
+        write(
+          panel.chatCollapsed
+            ? {
+                ...panel,
+                chatCollapsed: false,
+                collapsed: exclusive || panel.collapsed,
+              }
+            : { ...panel, chatCollapsed: true, collapsed: false },
+        ),
+      [write, panel, exclusive],
+    ),
   };
 }

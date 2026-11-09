@@ -103,6 +103,7 @@ const EXPECTED_IDS = [
   "F5",
   "F7",
   "F8",
+  "F9",
   "F10",
   "F11",
   "G1",
@@ -1020,12 +1021,12 @@ test("壳层宽度：1920 / 1440（A1–A4）", async ({ browser }) => {
   try {
     const wide = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 1368),
+      (facts) => near(facts.chat?.width ?? 0, 1360),
     );
     check(
       "A1",
-      "1920：聊天列宽 1368（±1）",
-      near(wide.chat?.width, 1368),
+      "1920：聊天列宽 1360（±1）",
+      near(wide.chat?.width, 1360),
       true,
       `实测 ${wide.chat?.width}px（rail ${wide.rail?.width}px / 抽屉 ${wide.dock?.width}px / 右栏 ${wide.panel?.width}px）`,
     );
@@ -1035,15 +1036,15 @@ test("壳层宽度：1920 / 1440（A1–A4）", async ({ browser }) => {
     const trio = await until(
       () => shellFacts(page),
       (facts) =>
-        near(facts.chat?.width ?? 0, 888) &&
+        near(facts.chat?.width ?? 0, 880) &&
         facts.dock?.width === 400 &&
         facts.dockTranslate === 0 &&
         facts.panel !== null,
     );
     check(
       "A2",
-      "1440：聊天列宽 888（±1）",
-      near(trio.chat?.width, 888),
+      "1440：聊天列宽 880（±1）",
+      near(trio.chat?.width, 880),
       true,
       `实测 ${trio.chat?.width}px`,
     );
@@ -1078,7 +1079,7 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     const bar = await until(
       () => shellFacts(page),
       (facts) =>
-        near(facts.chat?.width ?? 0, 728) &&
+        near(facts.chat?.width ?? 0, 720) &&
         facts.dock !== null &&
         facts.dockTranslate === -400,
     );
@@ -1096,8 +1097,8 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     );
     check(
       "A6",
-      "1280：聊天列宽 728（±1）",
-      near(bar.chat?.width, 728),
+      "1280：聊天列宽 720（±1）",
+      near(bar.chat?.width, 720),
       true,
       `实测 ${bar.chat?.width}px`,
     );
@@ -1105,12 +1106,12 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     await page.setViewportSize({ width: 1200, height: 800 });
     const mid = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 648),
+      (facts) => near(facts.chat?.width ?? 0, 640),
     );
     check(
       "A7",
-      "1200：聊天列宽 648（±1）",
-      near(mid.chat?.width, 648),
+      "1200：聊天列宽 640（±1）",
+      near(mid.chat?.width, 640),
       true,
       `实测 ${mid.chat?.width}px`,
     );
@@ -1118,7 +1119,7 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     await page.setViewportSize({ width: 1024, height: 800 });
     const icon = await until(
       () => shellFacts(page),
-      (facts) => facts.rail?.width === 64 && near(facts.chat?.width ?? 0, 616),
+      (facts) => facts.rail?.width === 64 && near(facts.chat?.width ?? 0, 608),
     );
     check(
       "A8",
@@ -1129,8 +1130,8 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     );
     check(
       "A9",
-      "1024：聊天列宽 616（±1）",
-      near(icon.chat?.width, 616),
+      "1024：聊天列宽 608（±1）",
+      near(icon.chat?.width, 608),
       true,
       `实测 ${icon.chat?.width}px`,
     );
@@ -1138,12 +1139,12 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
     await page.setViewportSize(VIEW.narrow);
     const narrow = await until(
       () => shellFacts(page),
-      (facts) => near(facts.chat?.width ?? 0, 492),
+      (facts) => near(facts.chat?.width ?? 0, 484),
     );
     check(
       "A10",
-      "900：聊天列宽 492（±1）",
-      near(narrow.chat?.width, 492),
+      "900：聊天列宽 484（±1）",
+      near(narrow.chat?.width, 484),
       true,
       `实测 ${narrow.chat?.width}px`,
     );
@@ -1152,7 +1153,7 @@ test("壳层宽度：抽屉收起与 rail 图标轨（A5–A10）", async ({ bro
   }
 });
 
-test("820：右栏转覆盖抽屉（A11 / F7 / F8）", async ({ browser }) => {
+test("820：两块互斥且聊天优先（A11 / F7 / F8）", async ({ browser }) => {
   const session = await openSession(browser, {
     viewport: { width: 820, height: 800 },
     path: `/spaces/${CHAT_WS}`,
@@ -1160,60 +1161,75 @@ test("820：右栏转覆盖抽屉（A11 / F7 / F8）", async ({ browser }) => {
     preset: { dockOpen: false, railOpen: true },
   });
   const { page } = session;
-  const drawerSelector = '[data-slot="sheet-content"][aria-label="空间右栏"]';
-  try {
-    const closed = await shellFacts(page);
-    await page.getByRole("button", { name: "打开右栏" }).click();
-    const opened = await until(
-      () => shellFacts(page),
-      (facts) => facts.drawer !== null,
+  const focusLabel = () =>
+    page.evaluate(
+      () =>
+        (document.activeElement as HTMLElement | null)?.getAttribute(
+          "aria-label",
+        ) ??
+        (document.activeElement as HTMLElement | null)?.tagName ??
+        "（无）",
     );
+  const readingWidth = () =>
+    page.evaluate(() => {
+      const scroller = document.querySelector(
+        '[data-testid="space-chat-shell"][data-visible="true"] [data-slot="message-scroller"]',
+      );
+      const column = scroller?.parentElement ?? null;
+      return column ? Math.round(column.getBoundingClientRect().width) : null;
+    });
+  try {
+    const onlyChat = await until(
+      () => shellFacts(page),
+      (facts) => facts.panel === null && (facts.chat?.width ?? 0) > 0,
+    );
+    const chatReading = await readingWidth();
+
+    await page.getByRole("button", { name: "展开右栏" }).click();
+    const onlyPanel = await until(
+      () => shellFacts(page),
+      (facts) => facts.panel !== null && (facts.chat?.width ?? 0) === 0,
+    );
+    const focusOnExpandChat = await focusLabel();
+
     check(
       "A11",
-      "820：[data-testid=space-panel] 不存在；点「打开右栏」后抽屉出现且宽 320",
-      [closed.panel, opened.drawer?.width ?? null],
-      [null, 320],
-      `关着时 space-panel ${closed.panel === null ? "null" : "存在"}、抽屉 ${opened.drawer?.width}px`,
-    );
-
-    const overscroll = await page.evaluate((sel) => {
-      const drawer = document.querySelector(sel);
-      return drawer ? getComputedStyle(drawer).overscrollBehavior : null;
-    }, drawerSelector);
-    check(
-      "F8",
-      "抽屉 overscroll-behavior 含 contain",
-      overscroll?.includes("contain") ?? false,
-      true,
-      `实测 ${overscroll}`,
-    );
-
-    const focused = await page.evaluate((sel) => {
-      const drawer = document.querySelector(sel);
-      const active = document.activeElement as HTMLElement | null;
-      return {
-        inDrawer: Boolean(drawer && active && drawer.contains(active)),
-        label:
-          active?.getAttribute("aria-label") ?? active?.tagName ?? "（无）",
-      };
-    }, drawerSelector);
-    await page.keyboard.press("Escape");
-    const returned = await until(
-      () =>
-        page.evaluate(() => {
-          const active = document.activeElement as HTMLElement | null;
-          return (
-            active?.getAttribute("aria-label") ?? active?.tagName ?? "（无）"
-          );
-        }),
-      (label) => label === "打开右栏",
+      "820：默认只有聊天；点「展开右栏」→ 聊天让位、右栏独占整宽（聊天壳 display:none 不占宽）",
+      [
+        onlyChat.panel,
+        onlyChat.chat?.width ?? null,
+        onlyPanel.panel?.width ?? null,
+        onlyPanel.chat?.width ?? 0,
+      ],
+      [null, 788, 820, 0],
+      `关着时 space-panel ${onlyChat.panel === null ? "null" : "存在"}、聊天壳 ${onlyChat.chat?.width}px；展开后右栏 ${onlyPanel.panel?.width}px、聊天壳 ${onlyPanel.chat?.width ?? 0}px`,
     );
     check(
       "F7",
-      "抽屉打开后焦点在抽屉内；Esc 后回到触发按钮",
-      [focused.inDrawer, returned],
-      [true, "打开右栏"],
-      `打开后焦点 ${focused.label}`,
+      "折叠把被点的那枚按钮一起带走：点「展开右栏」后焦点落在对面头部的「展开对话」",
+      focusOnExpandChat,
+      "展开对话",
+    );
+    check(
+      "F8",
+      "820：聊天独占时正文列吃满上限 760（±1）",
+      near(chatReading, 760),
+      true,
+      `实测 ${chatReading}px（列 788 减去 px-4 后仍是 756→上限 760 生效）`,
+    );
+
+    await page.getByRole("button", { name: "展开对话" }).click();
+    const backToChat = await until(
+      () => shellFacts(page),
+      (facts) => facts.panel === null && (facts.chat?.width ?? 0) > 0,
+    );
+    const focusOnExpandPanel = await focusLabel();
+    check(
+      "F9",
+      "820：点「展开对话」反向 —— 右栏收起、聊天独占，且焦点落在「展开右栏」",
+      [backToChat.panel, backToChat.chat?.width ?? null, focusOnExpandPanel],
+      [null, 788, "展开右栏"],
+      `实测 documentOverflowX ${backToChat.documentOverflow}`,
     );
   } finally {
     await session.dispose();
@@ -1646,30 +1662,31 @@ test("点击区：历史违规项逐个复测（D2 / D3）", async ({ browser })
       },
       {
         label: "复制",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "button",
         name: "复制",
       },
       {
         label: "团队 id",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        // 聊天页头部只剩图标动作，带「团队 <id>」文案的链接在状态页那一份页头里。
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "link",
         // 左栏那行的可访问名是「团队 3」（计数拼进去），只认团队 id 的小写字母。
         name: /^团队 [a-z]+$/,
       },
       {
         label: "非当前空间",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "button",
         name: "非当前空间",
       },
       {
         label: "设为当前",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "button",
         name: "设为当前",
       },
@@ -1764,30 +1781,31 @@ test("点击区：触摸档命中区 ≥44（D5）", async ({ browser }) => {
       },
       {
         label: "复制",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "button",
         name: "复制",
       },
       {
         label: "团队 id",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        // 聊天页头部只剩图标动作，带「团队 <id>」文案的链接在状态页那一份页头里。
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "link",
         // 左栏那行的可访问名是「团队 3」（计数拼进去），只认团队 id 的小写字母。
         name: /^团队 [a-z]+$/,
       },
       {
         label: "非当前空间",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "button",
         name: "非当前空间",
       },
       {
         label: "设为当前",
-        path: `/spaces/${CHAT_WS}`,
-        ready: '[data-testid="space-chat-shell"]',
+        path: `/spaces/${CHAT_WS}/status`,
+        ready: '[role="tablist"]',
         role: "button",
         name: "设为当前",
       },
@@ -1912,10 +1930,10 @@ test("容器宽度（E2–E8）", async ({ browser }) => {
     });
     check(
       "E7",
-      "聊天正文容器 @1920 = 520（±1）",
-      near(reading, 520),
+      "聊天正文容器 @1920 = 760（±1）",
+      near(reading, 760),
       true,
-      `实测 ${reading}px（[data-slot=message-scroller] 的父节点，即 max-w-narrow 阅读列）`,
+      `实测 ${reading}px（[data-slot=message-scroller] 的父节点，即 max-w-chat 阅读列）`,
     );
 
     await page.goto("/schedules", { waitUntil: "load" });
@@ -1951,7 +1969,7 @@ test("右栏模式进 URL 且 URL 优先于存档（F1 / F2）", async ({ browse
   });
   const { page } = session;
   try {
-    await page.getByRole("button", { name: "任务", exact: true }).click();
+    await page.getByRole("tab", { name: "任务", exact: true }).click();
     const search = await until(
       () => page.evaluate(() => location.search),
       (value) => value.includes("panel=tasks"),
@@ -2007,8 +2025,8 @@ test("右栏模式进 URL 且 URL 优先于存档（F1 / F2）", async ({ browse
 test("滚动位置保持（F3 / F4）", async ({ browser }) => {
   const session = await openSession(browser, {
     // 空间会话是 ensure 新建的空会话（种子的转录挂在 agent 级会话上），
-    // 矮视口把欢迎块变成可滚的，基线才是真的滚出来的位置。
-    viewport: { width: VIEW.trio.width, height: 420 },
+    // 矮视口把欢迎块变成可滚的，基线才是真的滚出来的位置：360 时正文比可视区高 59px。
+    viewport: { width: VIEW.trio.width, height: 360 },
     path: `/spaces/${CHAT_WS}`,
     ready: '[data-slot="message-scroller"]',
     preset: { dockOpen: true, railOpen: true },
@@ -2019,7 +2037,7 @@ test("滚动位置保持（F3 / F4）", async ({ browser }) => {
   const statusScroller = 'main [data-slot="message-scroller"]';
   try {
     const base = await scrollTo(page, chatScroller, 40);
-    await page.getByRole("button", { name: "记忆", exact: true }).click();
+    await page.getByRole("tab", { name: "记忆", exact: true }).click();
     await page.waitForTimeout(300);
     const afterMode = await scrollTopOf(page, chatScroller);
     check(

@@ -40,6 +40,7 @@ interface SpaceConversationChatProps {
   wsId: string;
   convId: string;
   visible: boolean;
+  onStreamingChange?: (wsId: string, streaming: boolean) => void;
 }
 
 /** 会话 id 到手之后的聊天本体：历史、流地址与冲突提示都需要它。 */
@@ -47,6 +48,7 @@ function SpaceConversationChat({
   wsId,
   convId,
   visible,
+  onStreamingChange,
 }: SpaceConversationChatProps) {
   const setChat = useConnectionStore((state) => state.setChat);
 
@@ -71,7 +73,7 @@ function SpaceConversationChat({
   return (
     <>
       {history.error && (
-        <div className="max-w-narrow shrink-0 px-3 pt-3">
+        <div className="mx-auto w-full max-w-chat shrink-0 px-3 pt-3">
           <ErrorBanner
             message={errorText(history.error)}
             onRetry={() => void history.refetch()}
@@ -101,9 +103,12 @@ function SpaceConversationChat({
           initialMessages={initialMessages}
           // 一轮的起止进壳级 store：文件面板靠它在回复落地后立刻重取，
           // 不必等下一次轮询（dock 头部的对话状态也读同一份）。
-          onStreamingChange={(streaming) =>
-            setChat(streaming ? { kind: "running" } : { kind: "idle" })
-          }
+          onStreamingChange={(streaming) => {
+            setChat(streaming ? { kind: "running" } : { kind: "idle" });
+            // store 里只有一份「谁在跑」：隐藏的空间也写同一个位。要按空间
+            // 判断的调用方（清除对话的可用性）得另收一份带 wsId 的上报。
+            onStreamingChange?.(wsId, streaming);
+          }}
           composerNotice={<SpaceConflictHint inflight={inflight} />}
           welcomeMessage="这是这个空间唯一的 @master 对话。让它做事，或者直接问它。"
         />
@@ -116,9 +121,15 @@ interface SpaceChatShellProps {
   wsId: string;
   /** 只有当前空间可见；隐藏的壳保持挂载与在途 SSE。 */
   visible: boolean;
+  /** 这一轮起止的按空间上报；隐藏的壳同样会报，调用方按 wsId 自取。 */
+  onStreamingChange?: (wsId: string, streaming: boolean) => void;
 }
 
-export function SpaceChatShell({ wsId, visible }: SpaceChatShellProps) {
+export function SpaceChatShell({
+  wsId,
+  visible,
+  onStreamingChange,
+}: SpaceChatShellProps) {
   const conversation = useSpaceConversation(wsId);
   const convId = conversation.data?.conversation_id ?? null;
 
@@ -133,7 +144,7 @@ export function SpaceChatShell({ wsId, visible }: SpaceChatShellProps) {
       )}
     >
       {conversation.error ? (
-        <div className="max-w-narrow p-3">
+        <div className="mx-auto w-full max-w-chat p-3">
           <ErrorBanner
             message={errorText(conversation.error)}
             onRetry={() => void conversation.refetch()}
@@ -151,6 +162,7 @@ export function SpaceChatShell({ wsId, visible }: SpaceChatShellProps) {
           wsId={wsId}
           convId={convId}
           visible={visible}
+          onStreamingChange={onStreamingChange}
         />
       )}
     </div>
