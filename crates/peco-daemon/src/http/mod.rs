@@ -59,6 +59,11 @@ pub fn router(state: AppState) -> Router {
             "/api/spaces/{ws_id}/conversation/ensure",
             post(space_conversation::ensure),
         )
+        // 清空这条会话的消息；会话行与其产物留着，重试也是同样的结果。
+        .route(
+            "/api/spaces/{ws_id}/conversation/clear",
+            post(space_conversation::clear),
+        )
         .route("/api/spaces/{ws_id}/files", get(space_files::browse))
         // 记忆浏览：`documents` 是静态段，与 `{doc_id}` 子树不重叠（前者四段、后者五段）。
         .route(

@@ -77,6 +77,11 @@ pub enum DaemonError {
         inflight_foreign: i64,
     },
 
+    /// 该空间对话有一轮还在跑。文案是中文，因为它同前端禁用按钮的 Tooltip
+    /// 共用一句话：用户从 409 和悬浮提示里读到的是同一句解释。
+    #[error("对话进行中，结束后再清除")]
+    ConversationInFlight { ws_id: String },
+
     #[error("space row '{ws_id}' not found")]
     SpaceNotFound { ws_id: String },
 
@@ -144,6 +149,7 @@ impl DaemonError {
             Self::WorkDirMissing { .. } => "work_dir_missing",
             Self::WsBusy { .. } => "ws_busy",
             Self::InflightTasks { .. } => "inflight_tasks",
+            Self::ConversationInFlight { .. } => "conversation_in_flight",
             Self::SpaceNotFound { .. } => "space_not_found",
             Self::SpaceNotOpen { .. } => "space_not_open",
             Self::ReservedSpace { .. } => "reserved_space",
@@ -186,6 +192,7 @@ impl DaemonError {
             | Self::WorkDirMissing { .. }
             | Self::SpaceNotOpen { .. }
             | Self::WsBusy { .. }
+            | Self::ConversationInFlight { .. }
             | Self::InflightTasks { .. } => StatusCode::CONFLICT,
             Self::MarkerWriteFailed { .. }
             | Self::AlreadyRunning { .. }
@@ -320,6 +327,13 @@ mod tests {
                     inflight_foreign: 1,
                 },
                 "inflight_tasks",
+                StatusCode::CONFLICT,
+            ),
+            (
+                DaemonError::ConversationInFlight {
+                    ws_id: "ws_a".into(),
+                },
+                "conversation_in_flight",
                 StatusCode::CONFLICT,
             ),
             (

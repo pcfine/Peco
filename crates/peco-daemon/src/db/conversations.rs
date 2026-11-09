@@ -129,7 +129,11 @@ pub async fn ensure_space_session(
     }
 }
 
-async fn find_space_session(
+/// 取该空间该 agent 的 `scope='space'` 会话 id；不存在则 `None`。
+///
+/// 清空端点用它判定「有没有会话要清」，因此它是 `pub` 的：只有 `scope='space'`
+/// 这一种取值算空间会话，调用方自己拼 SQL 迟早会漏掉这个条件。
+pub async fn find_space_session(
     pool: &SqlitePool,
     workspace_id: &str,
     agent_name: &str,

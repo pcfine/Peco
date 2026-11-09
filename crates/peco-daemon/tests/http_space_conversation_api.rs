@@ -165,3 +165,250 @@ async fn concurrent_ensure_yields_one_session() {
     assert_eq!(created, 1, "只有一个请求能新建");
     assert_eq!(space_sessions(&env, &ws_id).await.len(), 1);
 }
+
+/// 该会话的历史条数。
+async fn message_count(env: &support::TestEnv, conv_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+        .bind(conv_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+}
+
+/// 造两条消息、一条产物登记与一份会话快照：清空要处理的三张表。
+async fn seed_conversation_history(env: &support::TestEnv, conv_id: &str) {
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, role, content) \
+         VALUES ('m_1', ?, 'user', '清除前的提问'), ('m_2', ?, 'assistant', '清除前的回答')",
+    )
+    .bind(conv_id)
+    .bind(conv_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO artifacts (id, conversation_id, user_id, kind, mime, title, rel_path, size_bytes) \
+         VALUES ('a_1', ?, 'local', 'image', 'image/png', '出的图', 'output/x.png', 12)",
+    )
+    .bind(conv_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO session_snapshots (conversation_id, session_id, description, created_at, snapshot_json) \
+         VALUES (?, ?, '空间对话', 1, '{}')",
+    )
+    .bind(conv_id)
+    .bind(conv_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+}
+
+/// 造一行在途检查点：这一轮还没收尾，或上一轮崩在这里留下的残渣。
+///
+/// `payload_json` 是已落地工具结果的序列，`'[]'` 即空检查点。
+async fn seed_inflight_turn(env: &support::TestEnv, conv_id: &str) {
+    sqlx::query(
+        "INSERT INTO conversation_inflight_turns \
+         (conversation_id, session_id, turn_index, reason, payload_json) \
+         VALUES (?, ?, 0, 'executing_tools', '[]')",
+    )
+    .bind(conv_id)
+    .bind(conv_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+}
+
+/// 清空只删消息与上下文：会话行、产物行都留着。
+///
+/// 会话行不能删 —— `artifacts.conversation_id` 是 `ON DELETE CASCADE`，删行会
+/// 连带抹掉产物登记；快照必须删 —— 留着它，下一轮会把已删的消息水化回模型
+/// 上下文。这里不造在途检查点：能清空的前提就是没有一轮在跑。
+#[tokio::test]
+async fn clear_empties_messages_and_keeps_the_session() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+    let ensure_uri = format!("/api/spaces/{ws_id}/conversation/ensure");
+    let cleared = env.post(&ensure_uri, json!({})).await;
+    let conv_id = cleared.body["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    seed_conversation_history(&env, &conv_id).await;
+
+    let reply = env
+        .post(
+            &format!("/api/spaces/{ws_id}/conversation/clear"),
+            json!({}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["success"], json!(true));
+    assert_eq!(message_count(&env, &conv_id).await, 0, "消息必须清空");
+    assert_eq!(
+        space_sessions(&env, &ws_id).await.len(),
+        1,
+        "会话行本身留着"
+    );
+    let artifacts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE conversation_id = ?")
+            .bind(&conv_id)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(artifacts, 1, "产物登记行不能随清空消失");
+    assert_eq!(
+        snapshot_count(&env, &conv_id).await,
+        0,
+        "快照留着会让下一轮水化出旧上下文"
+    );
+    assert_eq!(
+        inflight_count(&env, &conv_id).await,
+        0,
+        "清空后不得留下在途检查点"
+    );
+
+    // 会话 id 不变，所以前端不必重挂聊天壳：再 ensure 拿回的是同一条空会话。
+    let again = env.post(&ensure_uri, json!({})).await;
+    assert_eq!(again.status, 200, "body={}", again.body);
+    assert_eq!(again.body["conversation_id"], json!(conv_id));
+    assert_eq!(again.body["created"], json!(false), "不得新建会话");
+    assert_eq!(message_count(&env, &conv_id).await, 0);
+}
+
+/// 该会话快照的条数。
+async fn snapshot_count(env: &support::TestEnv, conv_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM session_snapshots WHERE conversation_id = ?")
+        .bind(conv_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+}
+
+/// 在途检查点的条数。
+async fn inflight_count(env: &support::TestEnv, conv_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM conversation_inflight_turns WHERE conversation_id = ?")
+        .bind(conv_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap()
+}
+
+/// 一轮还在跑时拒绝清空：在途轮的落库排在清空之后，放它过去就只清了一半。
+///
+/// 只注册运行、不写检查点：409 必须由「真的在跑」引起，与库里有没有残渣无关。
+/// 断言 messages 一条没少 —— 拒绝必须发生在删消息之前，否则 409 也救不回
+/// 已经删掉的那一半。
+#[tokio::test]
+async fn clear_is_refused_while_a_turn_is_in_flight() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+    let ensure_uri = format!("/api/spaces/{ws_id}/conversation/ensure");
+    let ensured = env.post(&ensure_uri, json!({})).await;
+    let conv_id = ensured.body["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    seed_conversation_history(&env, &conv_id).await;
+
+    // 注册表随 `AppState` 持有，`env.post` 每次都新建一份，故这里自己捏住同一个
+    // 状态直到请求跑完：接收端与守卫都不能提前 drop，否则条目不算在跑。
+    let state = env.app_state();
+    let (_control_rx, _guard) = state.chat_runs.register(&conv_id);
+    let reply = call(
+        &peco_daemon::http::router(state),
+        Method::POST,
+        &format!("/api/spaces/{ws_id}/conversation/clear"),
+        Some(json!({})),
+    )
+    .await;
+
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+    assert_eq!(reply.code(), "conversation_in_flight");
+    assert_eq!(
+        message_count(&env, &conv_id).await,
+        2,
+        "拒绝必须先于删消息：一条都不能少"
+    );
+    assert_eq!(
+        snapshot_count(&env, &conv_id).await,
+        1,
+        "被拒的请求不得动会话快照"
+    );
+}
+
+/// 崩溃残留的检查点不许挡住清空：那一行只说明上一轮没跑完，不代表现在有运行。
+///
+/// 变异：门槛改回 `load_inflight().is_some()` → 这条永久 409，清空对崩过一次的
+/// 会话彻底失效。
+#[tokio::test]
+async fn stale_inflight_checkpoint_does_not_block_clear() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+    let ensure_uri = format!("/api/spaces/{ws_id}/conversation/ensure");
+    let ensured = env.post(&ensure_uri, json!({})).await;
+    let conv_id = ensured.body["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    seed_conversation_history(&env, &conv_id).await;
+    seed_inflight_turn(&env, &conv_id).await;
+
+    let reply = env
+        .post(
+            &format!("/api/spaces/{ws_id}/conversation/clear"),
+            json!({}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["success"], json!(true));
+    assert_eq!(message_count(&env, &conv_id).await, 0, "消息必须清空");
+    assert_eq!(
+        snapshot_count(&env, &conv_id).await,
+        0,
+        "快照留着会让下一轮水化出旧上下文"
+    );
+    assert_eq!(
+        inflight_count(&env, &conv_id).await,
+        0,
+        "残渣检查点要随清空一起清掉"
+    );
+}
+
+/// 没有会话可清时也是成功：前端不必为「本来就干净」分辨一次失败。
+#[tokio::test]
+async fn clear_without_a_session_is_idempotently_ok() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+
+    let reply = env
+        .post(
+            &format!("/api/spaces/{ws_id}/conversation/clear"),
+            json!({}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["success"], json!(true));
+    assert!(
+        space_sessions(&env, &ws_id).await.is_empty(),
+        "清空不该顺手建出会话"
+    );
+}
+
+/// 不存在的 `ws_id` 与 ensure 同一个错误映射。
+#[tokio::test]
+async fn clear_on_unknown_space_is_404() {
+    let env = new_env(&["research"]).await;
+
+    let reply = env
+        .post("/api/spaces/ws_ghost/conversation/clear", json!({}))
+        .await;
+
+    assert_eq!(reply.status, 404, "body={}", reply.body);
+    assert_eq!(reply.code(), "space_not_found");
+}
