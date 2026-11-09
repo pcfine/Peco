@@ -70,13 +70,20 @@ export function SpaceTasksTab({
 
   return (
     <div className="h-full overflow-y-auto">
+      {/* 列跟着面板宽度逐级出现：481 只留状态与 agent，616 再加耗时，840 以上才是六列。 */}
       <div className="sticky top-0 z-10 flex h-8 items-center gap-2 border-b border-line bg-panel px-3 text-caption font-medium text-ink-faint">
         <ConnectionStatus state={eventsState} className="mr-2 shrink-0" />
         <span className="w-36 shrink-0">状态</span>
         <span className="w-24 shrink-0">agent</span>
-        <span className="w-32 shrink-0">来源</span>
-        <span className="w-20 shrink-0 text-right">耗时</span>
-        <span className="w-28 shrink-0 text-right">提交</span>
+        <span className="hidden w-32 shrink-0 @min-[840px]/panel:block">
+          来源
+        </span>
+        <span className="hidden w-20 shrink-0 text-right @min-[520px]/panel:block">
+          耗时
+        </span>
+        <span className="hidden w-28 shrink-0 text-right @min-[840px]/panel:block">
+          提交
+        </span>
         <span className="min-w-0 flex-1">摘要</span>
       </div>
       <ul>
@@ -102,13 +109,13 @@ export function SpaceTasksTab({
                 <span className="w-24 shrink-0 truncate text-sm text-ink">
                   {task.agent_name}
                 </span>
-                <span className="w-32 shrink-0 truncate font-mono text-2xs text-ink-faint">
+                <span className="hidden w-32 shrink-0 truncate font-mono text-2xs text-ink-faint @min-[840px]/panel:block">
                   {task.origin_kind}
                 </span>
-                <span className="w-20 shrink-0 text-right tabular-nums text-2xs text-ink-faint">
+                <span className="hidden w-20 shrink-0 text-right tabular-nums text-2xs text-ink-faint @min-[520px]/panel:block">
                   {durationOf(task) ?? "—"}
                 </span>
-                <span className="w-28 shrink-0 text-right tabular-nums text-2xs text-ink-faint">
+                <span className="hidden w-28 shrink-0 text-right tabular-nums text-2xs text-ink-faint @min-[840px]/panel:block">
                   {formatCreatedAt(task.created_at)}
                 </span>
                 <span
@@ -125,6 +132,12 @@ export function SpaceTasksTab({
                   <p className="font-mono text-caption font-medium text-ink-faint">
                     task_id {task.task_id} · 目标 {task.target_ws_id} · 来源{" "}
                     {task.origin_ws_id}
+                  </p>
+                  <p className="text-caption font-medium text-ink-faint">
+                    提交{" "}
+                    <span className="tabular-nums">
+                      {formatCreatedAt(task.created_at)}
+                    </span>
                   </p>
                   <div className="space-y-0.5">
                     <p className="text-caption font-medium text-ink-faint">

@@ -39,7 +39,7 @@ export function SpacePanelHeader({
   expandChatRef,
 }: SpacePanelHeaderProps) {
   return (
-    <header className="flex h-12 shrink-0 items-center border-b border-line px-2">
+    <header className="flex h-12 shrink-0 items-center border-b border-line px-3">
       <div
         className={cn(
           "flex w-full min-w-0 items-center gap-0.5",

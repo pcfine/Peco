@@ -332,7 +332,7 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
                 />
                 <div
                   className={cn(
-                    "min-h-0 flex-1",
+                    "@container/panel min-h-0 flex-1",
                     panel.chatCollapsed && "mx-auto w-full max-w-mid px-3",
                   )}
                 >
@@ -356,13 +356,13 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
             inert={face !== "config"}
             aria-hidden={face !== "config"}
             className={cn(
-              "absolute inset-0 mx-auto flex min-h-0 w-full max-w-wide flex-col",
+              "absolute inset-0 flex min-h-0 w-full flex-col",
               motion === "flip" &&
                 "[backface-visibility:hidden] [transform:rotateY(180deg)]",
               faceFadeClasses(face === "config"),
             )}
           >
-            <header className="flex h-12 shrink-0 items-center border-b border-line px-3">
+            <header className="flex h-12 shrink-0 items-center border-b border-line px-4">
               <h2 className="min-w-0 truncate text-xl font-semibold text-ink">
                 能力配置
               </h2>

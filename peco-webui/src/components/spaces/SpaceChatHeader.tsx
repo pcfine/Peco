@@ -60,7 +60,7 @@ export function SpaceChatHeader({
   titleHint,
 }: SpaceChatHeaderProps) {
   return (
-    <header className="flex h-12 shrink-0 items-center border-b border-line px-3">
+    <header className="flex h-12 shrink-0 items-center border-b border-line px-4">
       <div className="mx-auto flex w-full max-w-chat min-w-0 items-center gap-2">
         <SpaceStatusMark group={spaceGroupOf(space)} />
         <h1

@@ -150,7 +150,7 @@ export function SpaceStatusPage() {
         ))}
       </div>
 
-      <div className="min-h-0 flex-1">
+      <div className="@container/panel min-h-0 flex-1">
         {tab === "sessions" && (
           <SpaceSessionsTab
             wsId={wsId}

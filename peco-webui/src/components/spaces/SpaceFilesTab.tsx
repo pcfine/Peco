@@ -152,11 +152,11 @@ export function SpaceFilesTab({
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col @min-[768px]/work:flex-row">
+    <div className="flex h-full min-h-0 flex-col @min-[640px]/panel:flex-row">
       <div
         className={cn(
-          "flex min-h-0 flex-col border-line @min-[768px]/work:w-60 @min-[768px]/work:shrink-0 @min-[768px]/work:border-r",
-          openPath !== null && "@max-[767px]/work:hidden",
+          "flex min-h-0 flex-col border-line @min-[640px]/panel:w-60 @min-[640px]/panel:shrink-0 @min-[640px]/panel:border-r",
+          openPath !== null && "@max-[639px]/panel:hidden",
         )}
       >
         <Breadcrumb dir={dir} onNavigate={openDir} />
@@ -239,7 +239,7 @@ export function SpaceFilesTab({
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-1 flex-col",
-          openPath === null && "@max-[767px]/work:hidden",
+          openPath === null && "@max-[639px]/panel:hidden",
         )}
       >
         {openPath === null ? (
@@ -252,7 +252,7 @@ export function SpaceFilesTab({
               <button
                 type="button"
                 onClick={() => setOpenPath(null)}
-                className="shrink-0 text-caption font-medium text-ink-muted hover:text-ink @min-[768px]/work:hidden"
+                className="shrink-0 text-caption font-medium text-ink-muted hover:text-ink @min-[640px]/panel:hidden"
               >
                 ← 返回目录
               </button>

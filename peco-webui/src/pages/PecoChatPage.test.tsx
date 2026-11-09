@@ -578,6 +578,46 @@ describe("Peco 主区", () => {
     expect(body).not.toHaveClass("p-3");
   });
 
+  it("右栏内容声明 panel 容器，头部与内容同一内距（px-3）", async () => {
+    renderPeco();
+    await screen.findByTestId("space-chat-shell");
+
+    const panel = screen.getByTestId("peco-panel");
+    const header = panel.querySelector("header") as HTMLElement;
+    expect(header.className).toContain("px-3");
+
+    // 缺了 `@container/panel`，文件/台账的容器查询会一路量到 main 的整宽。
+    const content = panel.lastElementChild as HTMLElement;
+    expect(content.className).toContain("@container/panel");
+  });
+
+  it("配置面与聊天面同宽：不留 1200 的居中孤岛", async () => {
+    renderPeco("/peco?face=config");
+    const config = await screen.findByTestId("peco-face-config");
+
+    // 两个面都得铺满 work：任一面被 max-w 收窄，翻转后头部的 border-b 就接不上。
+    expect(config.className).not.toContain("max-w-wide");
+    expect(config.className).not.toContain("mx-auto");
+    // 两个面都从 work 的左缘铺到右缘。
+    expect(screen.getByTestId("peco-face-chat").className).toContain(
+      "absolute inset-0",
+    );
+    expect(config.className).toContain("absolute inset-0");
+  });
+
+  it("配置面头部与聊天面头部同内距：两侧都从 work 内 16px 起", async () => {
+    renderPeco("/peco?face=config");
+    const config = await screen.findByTestId("peco-face-config");
+    const header = config.querySelector("header") as HTMLElement;
+    const chatHeader = screen
+      .getByTestId("peco-face-chat")
+      .querySelector("header") as HTMLElement;
+
+    // 内距不一致时，翻转过去标题会横向跳一段。
+    expect(header.className).toContain("px-4");
+    expect(chatHeader.className).toContain("px-4");
+  });
+
   it("配置面的「记忆」tab 浏览 Peco 空间自己的记忆，不是团队维度占位", async () => {
     renderPeco("/peco?face=config&tab=memory");
 

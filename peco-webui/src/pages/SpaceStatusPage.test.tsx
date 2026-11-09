@@ -122,6 +122,22 @@ describe("空间状态页", () => {
     ).toHaveTextContent("1");
   });
 
+  it("台账 tab 的内容声明 panel 容器：列按面板宽度放，不按状态页的整宽", async () => {
+    spaceTasks.mockResolvedValue([task()]);
+    renderStatus();
+
+    fireEvent.click(await screen.findByRole("tab", { name: /任务台账/ }));
+    const headerRow = (await screen.findByText("状态"))
+      .parentElement as HTMLElement | null;
+
+    // 状态页与聊天右栏复用同一批组件：缺了这块容器，列会被永久隐藏。
+    const container = document.querySelector(
+      '[class*="@container/panel"]',
+    ) as HTMLElement | null;
+    expect(container).not.toBeNull();
+    expect(container?.contains(headerRow as HTMLElement)).toBe(true);
+  });
+
   it("A26：关闭被 409 拦下时 Dialog 仍在，展示两个计数与「强制关闭」", async () => {
     useSpaceStore.setState({ currentWsId: "ws_a" });
     closeSpace.mockRejectedValueOnce(

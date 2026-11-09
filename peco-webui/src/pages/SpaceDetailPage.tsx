@@ -228,7 +228,7 @@ export function SpaceDetailPage() {
           />
           <div
             className={cn(
-              "min-h-0 flex-1",
+              "@container/panel min-h-0 flex-1",
               solePanel && "mx-auto w-full max-w-mid px-3",
             )}
           >

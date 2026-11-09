@@ -67,6 +67,7 @@ function renderTab(props: { active?: boolean } = {}) {
   const view = render(element(props.active ?? true));
   return {
     client,
+    container: view.container,
     rerender: (next: { active?: boolean }) =>
       view.rerender(element(next.active ?? true)),
   };
@@ -184,5 +185,30 @@ describe("SpaceFilesTab 自动刷新", () => {
       await vi.advanceTimersByTimeAsync(SPACE_FILES_POLL_MS + 500);
     });
     expect(mocks.files).toHaveBeenCalledTimes(beforeInterval + 1);
+  });
+});
+
+describe("SpaceFilesTab 的分栏档", () => {
+  it("按面板宽度分栏：640 以上才并排，616 里不出现「树 + 预览」", async () => {
+    mocks.files.mockResolvedValue(listing([entry({ name: "a.txt" })]));
+    const { container } = renderTab();
+
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    const root = container.firstElementChild as HTMLElement;
+    const [listColumn, previewColumn] = Array.from(
+      root.children,
+    ) as HTMLElement[];
+
+    // 双开的右栏是 616：门槛落在 640 才回到单栏 +「根目录」切换。
+    expect(root).toHaveClass("flex-col");
+    expect(root).toHaveClass("@min-[640px]/panel:flex-row");
+    expect(listColumn).toHaveClass("@min-[640px]/panel:w-60");
+    expect(listColumn).toHaveClass("@min-[640px]/panel:border-r");
+    // 门槛以下预览让位，树独占整栏，而不是被挤成 376。
+    expect(previewColumn).toHaveClass("@max-[639px]/panel:hidden");
+
+    // 量的是右栏自己的宽度，不再是 main 的 `work`。
+    expect(root.className).not.toContain("/work");
+    expect(root.innerHTML).not.toContain("/work");
   });
 });

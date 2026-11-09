@@ -724,6 +724,30 @@ describe("空间聊天页", () => {
     );
   });
 
+  it("右栏头部与内容同轴，且表头行落在 panel 容器里（不是 main 的 work）", async () => {
+    mocks.tasks.mockResolvedValue([taskOf({ task_state: "working" })]);
+    renderDetail("/spaces/ws_a?panel=tasks");
+    await screen.findByTestId("space-chat-shell");
+
+    const panel = screen.getByTestId("space-panel");
+    const panelHeader = panel.querySelector("header") as HTMLElement;
+    // 「摘要」在两个地方出现（保真度标注也是一枚「摘要」徽标），这里认表头那一个。
+    const headerRow = (await screen.findByText("状态"))
+      .parentElement as HTMLElement;
+
+    // 右栏内容行自带 px-3：头部跟着同一条竖线，差 4px 就是两套内距。
+    expect(panelHeader.className).toContain("px-3");
+    expect(headerRow.className).toContain("px-3");
+
+    // 容器查询挂在这块内容上：缺了它 616 宽的右栏量到的是 main 的 1232，列全开。
+    const container = document.querySelector(
+      '[class*="@container/panel"]',
+    ) as HTMLElement | null;
+    expect(container).not.toBeNull();
+    expect(container?.contains(headerRow)).toBe(true);
+    expect(panel.contains(container as HTMLElement)).toBe(true);
+  });
+
   it("URL 里的模式不属于这个变体时忽略，回落存档", async () => {
     // 「总览」只属于 Peco 页：空间页收到的 overview 是无效值，不该造出一个死面板。
     localStorage.setItem(
@@ -796,12 +820,16 @@ describe("空间聊天页", () => {
     expect(screen.getByRole("button", { name: "展开右栏" })).toHaveFocus();
   });
 
-  it("左头内容行与聊天正文同轴：mx-auto + max-w-chat，header 保留 px-3", async () => {
+  it("左头内容行与聊天正文同轴：mx-auto + max-w-chat，两侧内距同为 px-4", async () => {
     renderDetail();
     const shell = await screen.findByTestId("space-chat-shell");
 
+    // 双开时两块均分，x 轴不由 max-w-chat 封顶：头部与正文差 4px 就是两条竖线。
     const header = document.querySelector("header") as HTMLElement;
-    expect(header.className).toContain("px-3");
+    expect(header.className).toContain("px-4");
+    expect(
+      (shell.parentElement as HTMLElement).className.split(/\s+/),
+    ).toContain("px-4");
     const row = header.firstElementChild as HTMLElement;
     expect(row.className).toContain("mx-auto");
     expect(row.className).toContain("max-w-chat");
