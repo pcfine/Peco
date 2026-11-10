@@ -3,6 +3,10 @@
 // 表单以「类型」为起点：类型一定，默认地址与默认模型就按目录自动填好，通常只需
 // 粘一个 API Key。地址与模型仍可手改（自建兼容端点），但不会让人对着空输入框
 // 手打默认值。
+//
+// 列表是生效并集：`team` 是本团队文件里的条目，`peco` / `system` 是继承来的。
+// 继承条目改不了也删不掉 —— 上层文件不在本团队手里，删除只会得到 400；唯一能做的
+// 是在本团队写下同名条目把它覆盖掉。
 
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -33,6 +37,7 @@ import {
   deleteProvider,
   listProviderTypes,
   listProviders,
+  providerSource,
   testProviderConnection,
   testProviderDraft,
   upsertProvider,
@@ -122,6 +127,16 @@ export function formFromProvider(provider: ProviderInfo): FormState {
     model: provider.default_model ?? "",
     setDefault: provider.is_default,
   };
+}
+
+/**
+ * 继承条目 → 覆盖表单：名字锁定为该条目名，其余字段填**生效值**。
+ *
+ * 填生效值而不是留空：留空的 `base_url` 会以空串写进本团队文件，把继承来的地址
+ * 冲成类型默认地址 —— 覆盖之后行为就变了。
+ */
+export function formForOverride(provider: ProviderInfo): FormState {
+  return { ...formFromProvider(provider), setDefault: false };
 }
 
 /** 字段为空、或还停留在上一个类型的默认值时，才跟随新类型的默认值。 */
@@ -236,6 +251,10 @@ export function ProviderSection({ teamId }: { teamId: string }) {
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<ProviderInfo | null>(null);
+  /** 正在被覆盖的继承条目：名字锁定，保存后成为本团队的同名条目。 */
+  const [overrideTarget, setOverrideTarget] = useState<ProviderInfo | null>(
+    null,
+  );
   const [form, setForm] = useState<FormState>(() => blankForm([]));
   const [formError, setFormError] = useState<string | null>(null);
   /** 草稿试连结论；带上载荷指纹，表单改过之后旧结论就不再展示。 */
@@ -300,14 +319,16 @@ export function ProviderSection({ teamId }: { teamId: string }) {
   const update = (patch: Partial<FormState>) =>
     setForm((prev) => ({ ...prev, ...patch }));
 
+  // 只有本团队写的名字算占用：继承条目正是「覆盖」的目标，算进去就没有可用的覆盖名了。
+  const ownNames = providers
+    .filter((provider) => providerSource(provider) === "team")
+    .map((provider) => provider.name);
+  const nameLocked = editing !== null || overrideTarget !== null;
+
   const openCreate = () => {
     setEditing(null);
-    setForm(
-      blankForm(
-        types,
-        providers.map((p) => p.name),
-      ),
-    );
+    setOverrideTarget(null);
+    setForm(blankForm(types, ownNames));
     setFormError(null);
     setDraftTest(null);
     save.reset();
@@ -316,7 +337,18 @@ export function ProviderSection({ teamId }: { teamId: string }) {
 
   const openEdit = (provider: ProviderInfo) => {
     setEditing(provider);
+    setOverrideTarget(null);
     setForm(formFromProvider(provider));
+    setFormError(null);
+    setDraftTest(null);
+    save.reset();
+    setDialogOpen(true);
+  };
+
+  const openOverride = (provider: ProviderInfo) => {
+    setEditing(null);
+    setOverrideTarget(provider);
+    setForm(formForOverride(provider));
     setFormError(null);
     setDraftTest(null);
     save.reset();
@@ -325,6 +357,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
 
   const closeDialog = () => {
     setDialogOpen(false);
+    setOverrideTarget(null);
     setFormError(null);
     save.reset();
   };
@@ -340,7 +373,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
         prev,
         typeMeta(types, prev.providerType),
         typeMeta(types, nextType),
-        { isNew: !editing, taken: providers.map((p) => p.name) },
+        { isNew: !nameLocked, taken: ownNames },
       ),
     );
   };
@@ -373,8 +406,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
     : !form.model.trim()
       ? "填入默认模型后可试连"
       : null;
-  const nameTaken =
-    !editing && providers.some((p) => p.name === form.name.trim());
+  const nameTaken = !nameLocked && ownNames.includes(form.name.trim());
 
   return (
     <section className="space-y-3">
@@ -425,6 +457,8 @@ export function ProviderSection({ teamId }: { teamId: string }) {
           const outcome = tested?.name === provider.name ? tested : null;
           const testing =
             testSaved.isPending && testSaved.variables === provider.name;
+          const source = providerSource(provider);
+          const inherited = source !== "team";
           return (
             <li key={provider.name} className="border-b border-line">
               <div className="flex flex-col justify-center gap-0.5 px-3 py-1 @min-[760px]/work:h-10 @min-[760px]/work:flex-row @min-[760px]/work:items-center @min-[760px]/work:gap-2 @min-[760px]/work:py-0">
@@ -432,6 +466,11 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                   <span className="min-w-0 truncate font-mono text-sm text-ink">
                     {provider.name}
                   </span>
+                  {inherited && (
+                    <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
+                      {source === "peco" ? "继承自 Peco" : "系统"}
+                    </span>
+                  )}
                   {provider.is_default && (
                     <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
                       默认
@@ -460,38 +499,52 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                   {provider.api ? ` · ${provider.api}` : ""}
                 </span>
                 <div className="flex shrink-0 items-center gap-1">
-                  {/* 试连是一次真实计费请求：并发的第二个没有意义。 */}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2"
-                    disabled={testSaved.isPending}
-                    onClick={() => testSaved.mutate(provider.name)}
-                  >
-                    <Wifi />
-                    {testing ? "试连中…" : "试连"}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="text-ink-faint"
-                    aria-label={`编辑 ${provider.name}`}
-                    onClick={() => openEdit(provider)}
-                  >
-                    <Pencil />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    className="text-ink-faint hover:text-danger"
-                    aria-label={`删除 ${provider.name}`}
-                    onClick={() => {
-                      setDeleteTarget(provider);
-                      remove.reset();
-                    }}
-                  >
-                    <Trash2 />
-                  </Button>
+                  {inherited ? (
+                    // 覆盖 = 在本团队文件里写下同名条目；上层文件不在本团队手里，改不到。
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2"
+                      onClick={() => openOverride(provider)}
+                    >
+                      覆盖
+                    </Button>
+                  ) : (
+                    <>
+                      {/* 试连是一次真实计费请求：并发的第二个没有意义。 */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2"
+                        disabled={testSaved.isPending}
+                        onClick={() => testSaved.mutate(provider.name)}
+                      >
+                        <Wifi />
+                        {testing ? "试连中…" : "试连"}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="text-ink-faint"
+                        aria-label={`编辑 ${provider.name}`}
+                        onClick={() => openEdit(provider)}
+                      >
+                        <Pencil />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="text-ink-faint hover:text-danger"
+                        aria-label={`删除 ${provider.name}`}
+                        onClick={() => {
+                          setDeleteTarget(provider);
+                          remove.reset();
+                        }}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </>
+                  )}
                 </div>
               </div>
               {outcome && (
@@ -519,12 +572,18 @@ export function ProviderSection({ teamId }: { teamId: string }) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              {editing ? `编辑「${editing.name}」` : "新建 Provider"}
+              {editing
+                ? `编辑「${editing.name}」`
+                : overrideTarget
+                  ? `覆盖「${overrideTarget.name}」`
+                  : "新建 Provider"}
             </DialogTitle>
             <DialogDescription>
               {editing
                 ? "留空的字段保持已存值；密钥不回读，只能覆盖不能查看。"
-                : "类型选好后地址与模型已按默认值填好，填入 API Key 即可。"}
+                : overrideTarget
+                  ? "同名条目会写进本团队的 providers.toml，从此这一层说了算；未填的字段继续继承上一层。"
+                  : "类型选好后地址与模型已按默认值填好，填入 API Key 即可。"}
             </DialogDescription>
           </DialogHeader>
 
@@ -567,7 +626,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     value={form.name}
                     onChange={(event) => update({ name: event.target.value })}
                     placeholder={form.providerType || "deepseek"}
-                    disabled={editing !== null || save.isPending}
+                    disabled={nameLocked || save.isPending}
                     autoComplete="off"
                     className="h-8 font-mono text-xs"
                   />
@@ -575,9 +634,11 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                 <p className="text-caption font-medium text-ink-faint">
                   {editing
                     ? "名称是 agent.md 里 llm.provider 引用的 key，创建后不可修改"
-                    : nameTaken
-                      ? "已存在同名 Provider，保存将更新它的配置（不是新建）"
-                      : "同名端点请另起别名"}
+                    : overrideTarget
+                      ? "名称锁定为该条目名：覆盖靠同名条目生效"
+                      : nameTaken
+                        ? "已存在同名 Provider，保存将更新它的配置（不是新建）"
+                        : "同名端点请另起别名"}
                 </p>
               </div>
 

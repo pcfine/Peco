@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use axum::Json;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -32,6 +32,27 @@ pub struct TeamView {
     pub space_count: i64,
     pub agents: Vec<String>,
     pub bound_spaces: Vec<String>,
+    /// 保留团队（目前只有 Peco）：不能创建也不能删除，默认不进清单。
+    pub reserved: bool,
+}
+
+/// `GET /api/teams` 的查询参数。
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    /// 逗号分隔的附加集合，目前只认 `peco`（保留团队）。逗号分隔是为了
+    /// 以后追加其它保留集合时不必换参数格式；不认识的取值忽略。
+    #[serde(default)]
+    include: Option<String>,
+}
+
+impl ListParams {
+    fn includes(&self, source: &str) -> bool {
+        self.include
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .any(|token| token.trim() == source)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,12 +87,17 @@ fn validate_icon(icon: &str) -> Result<(), DaemonError> {
     }
 }
 
-pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<TeamView>>, DaemonError> {
+pub async fn list(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Vec<TeamView>>, DaemonError> {
+    // 默认把 Peco 挡在清单外：团队列表页是「用户自己的团队」，配置界面要
+    // 显式要它（`?include=peco`）才拿得到。
+    let include_reserved_peco = params.includes(PECO_TEAM_ID);
     let spaces = workspaces::list(&state.pool).await?;
     let mut views = Vec::new();
     for team_id in team_ids(&state).await? {
-        // Peco 是保留团队，不进清单。
-        if team_id == PECO_TEAM_ID {
+        if team_id == PECO_TEAM_ID && !include_reserved_peco {
             continue;
         }
         views.push(team_view(&state, &team_id, &spaces).await?);
@@ -197,6 +223,7 @@ async fn team_view(
         space_count: bound_spaces.len() as i64,
         agents,
         bound_spaces,
+        reserved: team_id == PECO_TEAM_ID,
     })
 }
 

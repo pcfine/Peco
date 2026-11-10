@@ -153,12 +153,19 @@ function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
 }
 
 interface TeamAgentsTabProps {
+  /** `X-Peco-Space`：哪个已打开空间的能力根。 */
   wsId: string;
+  /** provider 配置按团队取，取这个名字下的 providers.toml。 */
+  teamId: string;
   /** 团队没有 `@master` 时派发不了任务，列表顶部要把这句话说出来。 */
   noMaster?: boolean;
 }
 
-export function TeamAgentsTab({ wsId, noMaster = false }: TeamAgentsTabProps) {
+export function TeamAgentsTab({
+  wsId,
+  teamId,
+  noMaster = false,
+}: TeamAgentsTabProps) {
   const queryClient = useQueryClient();
   const agents = useTeamAgents(wsId);
   const [selected, setSelected] = useState<string | null>(null);
@@ -269,6 +276,7 @@ export function TeamAgentsTab({ wsId, noMaster = false }: TeamAgentsTabProps) {
           // 换 agent 就重挂：上一个的草稿不留到下一个身上。
           key={selected}
           wsId={wsId}
+          teamId={teamId}
           agentId={selected}
           isMaster={active?.is_master ?? false}
           onRequestDelete={() =>
@@ -326,6 +334,7 @@ export function TeamAgentsTab({ wsId, noMaster = false }: TeamAgentsTabProps) {
 
       <NewAgentDialog
         wsId={wsId}
+        teamId={teamId}
         open={creating}
         onOpenChange={setCreating}
         onCreated={setSelected}

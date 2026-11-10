@@ -6,8 +6,23 @@ import type {
   UpdateTeamRequest,
 } from "@/types/daemon";
 
-export async function listTeams(): Promise<Team[]> {
-  const res = await api.get<Team[]>("/teams");
+export interface ListTeamsOptions {
+  /**
+   * 把保留团队 Peco 一起取回来。
+   *
+   * 它不在默认清单里（团队列表页不该出现「去打开 Peco」这种入口），但 Peco 是
+   * provider 继承链的默认层，设置页必须能选中它。
+   */
+  includePeco?: boolean;
+}
+
+export async function listTeams(
+  options: ListTeamsOptions = {},
+): Promise<Team[]> {
+  const res = await api.get<Team[]>(
+    "/teams",
+    options.includePeco ? { params: { include: "peco" } } : undefined,
+  );
   return res.data;
 }
 

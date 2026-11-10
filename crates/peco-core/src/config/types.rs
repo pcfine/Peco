@@ -25,7 +25,14 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvidersConfig {
     /// 默认 provider 名称(如 "deepseek")，必须匹配 `providers` 中的某个 key。
-    #[serde(default = "default_provider_name")]
+    ///
+    /// 空串表示本层没有声明默认位：合并时沿用低层默认，写回时也不产生这个键。
+    /// 否则「本层没写」会被 serde 默认值填成一个真实默认位，任何一次保存都会
+    /// 静默顶掉低层选定的默认 provider。
+    #[serde(
+        default = "default_provider_name",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub default_provider: String,
 
     /// provider 逻辑名 → 配置条目 的映射。

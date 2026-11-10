@@ -17,6 +17,7 @@ import type {
 } from "@/types/daemon";
 import type { SkillInfo } from "@/types/daemon";
 import type { KnowledgeBase } from "@/types/daemon";
+import type { ProviderInfo, ProviderTypeInfo } from "@/api/providers";
 
 // 装配页的写入口全靠这四个模块，接口层不 mock 就测不到「发了什么请求体」。
 const listAgents = vi.fn<(wsId: string) => Promise<AgentListItem[]>>();
@@ -30,6 +31,9 @@ const updateAgent =
 const deleteAgent =
   vi.fn<(wsId: string, id: string) => Promise<{ success: boolean }>>();
 const listSkills = vi.fn<(wsId: string) => Promise<SkillInfo[]>>();
+const listProviders = vi.fn<(teamId: string) => Promise<ProviderInfo[]>>();
+const listProviderTypes =
+  vi.fn<(teamId: string) => Promise<ProviderTypeInfo[]>>();
 const getMcpConfig = vi.fn<(wsId: string) => Promise<{ mcpServers: object }>>();
 const listKnowledgeBases = vi.fn<(wsId: string) => Promise<KnowledgeBase[]>>();
 
@@ -55,6 +59,16 @@ vi.mock("@/api/mcp", () => ({
 vi.mock("@/api/knowledge", () => ({
   listKnowledgeBases: (wsId: string) => listKnowledgeBases(wsId),
 }));
+
+// 模型下拉按团队取生效 provider；这一页不关心它的内容，给一份空清单让它回退常量表。
+vi.mock("@/api/providers", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/providers")>();
+  return {
+    ...actual,
+    listProviders: (teamId: string) => listProviders(teamId),
+    listProviderTypes: (teamId: string) => listProviderTypes(teamId),
+  };
+});
 
 function agentDetail(overrides: Partial<AgentDetail> = {}): AgentDetail {
   return {
@@ -122,7 +136,7 @@ function renderTab(props: { noMaster?: boolean } = {}) {
   });
   return render(
     <QueryClientProvider client={client}>
-      <TeamAgentsTab wsId="ws_a" {...props} />
+      <TeamAgentsTab wsId="ws_a" teamId="t1" {...props} />
     </QueryClientProvider>,
   );
 }
@@ -167,6 +181,8 @@ beforeEach(() => {
   getMcpConfig.mockReset().mockResolvedValue({
     mcpServers: { filesystem: {} },
   });
+  listProviders.mockReset().mockResolvedValue([]);
+  listProviderTypes.mockReset().mockResolvedValue([]);
   listKnowledgeBases.mockReset().mockResolvedValue([
     {
       id: "kb_1",

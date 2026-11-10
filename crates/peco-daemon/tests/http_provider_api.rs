@@ -1,5 +1,6 @@
-//! 团队级 provider 配置的 HTTP 语义：只列用户文件、凭据不回读、字段级部分更新、
-//! 写后重载已打开实例、非法类型 400。
+//! 团队级 provider 配置的 HTTP 语义：生效并集与来源标注、多层继承与字段级合并、
+//! 默认 provider 的显式性、继承条目不可删、凭据不回读、写后重载已打开实例、
+//! 非法类型 400。
 
 mod support;
 
@@ -7,7 +8,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use axum::http::Method;
-use peco_core::config::{LlmApiParams, McpConfig, ProviderEntry, ProvidersConfig, SystemConfig};
+use peco_core::config::{
+    LlmApiParams, McpConfig, ProviderEntry, ProvidersConfig, SystemConfig, UserConfig,
+};
+use peco_daemon::space::peco::PECO_TEAM_ID;
 use serde_json::{Value, json};
 use support::upstream::{FakeUpstream, Reply};
 use support::{HttpReply, TestEnv, call, new_env};
@@ -24,6 +28,34 @@ fn write_providers(env: &TestEnv, team: &str, body: &str) {
 
 fn read_providers(env: &TestEnv, team: &str) -> String {
     std::fs::read_to_string(team_root(env, team).join("providers.toml")).unwrap_or_default()
+}
+
+/// 团队文件里**显式写出**的 `default_provider` —— 没写就是 `None`。
+///
+/// 按 TOML 键判而不是按字符串判：团队没接管默认位时，文件里连这个键都不该出现，
+/// 否则合并时会被当成团队自己声明的默认值。
+fn written_default(env: &TestEnv, team: &str) -> Option<String> {
+    let raw = read_providers(env, team);
+    let document: toml::Value =
+        toml::from_str(&raw).unwrap_or_else(|e| panic!("团队文件不是合法 TOML（{e}）：\n{raw}"));
+    document
+        .get("default_provider")
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+}
+
+/// 系统层没有任何 provider：低层「无可继承的默认」的场景用它。
+///
+/// `default_provider` 保留 serde 的默认值，但 providers 是空的 —— 名字指不到
+/// 端点，因此不构成可继承的默认。
+fn no_provider_system_config() -> SystemConfig {
+    SystemConfig {
+        providers: ProvidersConfig {
+            default_provider: "deepseek".to_string(),
+            providers: HashMap::new(),
+            web_search: None,
+        },
+        mcp: McpConfig::empty(),
+    }
 }
 
 /// 系统层只留一条兜底 provider，让「合并」与「只用用户文件」两种判据可分辨。
@@ -81,6 +113,44 @@ fn find<'a>(list: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("列表里没有 '{name}'：{list}"))
 }
 
+/// 列表里由本团队文件定义的条目 —— 继承来的不可编辑，不该混进本文件的断言。
+fn team_owned_names(list: &Value) -> Vec<String> {
+    list.as_array()
+        .expect("列表必须是数组")
+        .iter()
+        .filter(|item| item["source"] == json!("team"))
+        .map(|item| item["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// 已打开实例的生效配置快照。
+async fn open_config(env: &TestEnv, ws_id: &str) -> UserConfig {
+    let dir = env.work_dir_of(ws_id).await;
+    let handle = env
+        .hub
+        .get(Path::new(&dir))
+        .unwrap_or_else(|| panic!("{ws_id} 必须仍在实例表里"));
+    handle.workspace().config()
+}
+
+/// Peco 层（团队全局默认）：一条带 key 的 provider，默认也是它。
+///
+/// 默认名刻意与 serde 的 `"deepseek"` 默认值不同：两者相同的话，
+/// 「没写 default_provider 的层沿用低层」与「采纳 serde 默认值」会给出同样结果，
+/// 断言分辨不出来。
+const PECO_PROVIDERS: &str = r#"
+default_provider = "peco-shared"
+
+[providers.peco-shared]
+type = "deepseek"
+api_key = "sk-peco"
+base_url = "https://peco.example.com/v1"
+
+[providers.peco-shared.default]
+model = "peco-model"
+temperature = 0.1
+"#;
+
 /// 用户文件里没有 `api_key` 的条目，且系统层也没配 ⇒ 未配置。
 const GATEWAY_WITHOUT_KEY: &str = r#"
 default_provider = "gateway"
@@ -94,30 +164,63 @@ model = "gpt-5.2"
 temperature = 0.2
 "#;
 
-/// 列表只含用户 providers.toml 里的条目；系统层条目由合并兜底，不进列表。
+/// 列表返回生效并集：团队层没写的条目从 Peco / 系统层继承，并标注来源。
 ///
-/// 变异方法：把列表数据源换成合并后的生效配置 → `deepseek` 会一起出现，本测试变红。
+/// 变异方法：把 `layers_for` 里的 Peco 层去掉 → 继承条目整条消失，本测试变红。
 #[tokio::test]
-async fn list_returns_only_user_file_entries() {
-    let env = new_env(&["research"]).await;
-    write_providers(&env, "research", GATEWAY_WITHOUT_KEY);
+async fn list_returns_the_effective_union_with_source() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
 
     let router = peco_daemon::http::router(
-        env.app_state_with_system_config(system_config("deepseek", Some("sk-system"))),
+        env.app_state_with_system_config(system_config("sys-fallback", Some("sk-sys"))),
     );
     let reply = call(&router, Method::GET, "/api/teams/research/providers", None).await;
 
     assert_eq!(reply.status, 200, "body={}", reply.body);
-    assert_eq!(names(&reply.body), vec!["gateway".to_string()]);
-    let gateway = find(&reply.body, "gateway");
-    assert_eq!(gateway["provider_type"], json!("openai"));
     assert_eq!(
-        gateway["base_url"],
-        json!("https://proxy.example.com/v1"),
-        "呈现的是用户文件里的值"
+        names(&reply.body),
+        vec!["peco-shared".to_string(), "sys-fallback".to_string()],
+        "团队层没写条目：Peco 在前，系统层在后"
     );
-    assert_eq!(gateway["default_model"], json!("gpt-5.2"));
-    assert_eq!(gateway["is_default"], json!(true));
+
+    let inherited = find(&reply.body, "peco-shared");
+    assert_eq!(inherited["source"], json!("peco"));
+    assert_eq!(inherited["provider_type"], json!("deepseek"));
+    assert_eq!(inherited["base_url"], json!("https://peco.example.com/v1"));
+    assert_eq!(inherited["default_model"], json!("peco-model"));
+    assert_eq!(inherited["has_api_key"], json!(true));
+    assert_eq!(
+        inherited["is_default"],
+        json!(true),
+        "默认位按生效配置判定：{}",
+        reply.body
+    );
+    assert!(
+        !reply.body.to_string().contains("sk-peco"),
+        "凭据不得回读：{}",
+        reply.body
+    );
+
+    let system = find(&reply.body, "sys-fallback");
+    assert_eq!(system["source"], json!("system"));
+    assert_eq!(system["has_api_key"], json!(true));
+    assert_eq!(system["is_default"], json!(false));
+
+    // 详情与列表同源：继承条目也能读单条。
+    let detail = call(
+        &router,
+        Method::GET,
+        "/api/teams/research/providers/peco-shared",
+        None,
+    )
+    .await;
+    assert_eq!(detail.status, 200, "body={}", detail.body);
+    assert_eq!(detail.body["source"], json!("peco"));
+    assert_eq!(
+        detail.body["base_url"],
+        json!("https://peco.example.com/v1")
+    );
 }
 
 /// `api_key` 永不回读；`has_api_key` 认合并后的生效配置。
@@ -245,7 +348,7 @@ api_key = "sk-other"
 
     // 另一条 provider 原样还在（写入只替换命中的条目）。
     let listed = call(&router, Method::GET, "/api/teams/research/providers", None).await;
-    let mut got = names(&listed.body);
+    let mut got = team_owned_names(&listed.body);
     got.sort();
     assert_eq!(got, vec!["gateway".to_string(), "other".to_string()]);
     assert_eq!(
@@ -483,14 +586,25 @@ type = "openai"
 type = "qwen"
 "#,
     );
+    // 系统层显式注入：清单是生效并集，让它随开发机的 providers.toml 漂移
+    // 会让「余下条目」的断言失去意义。
+    let router = peco_daemon::http::router(
+        env.app_state_with_system_config(system_config("sys-fallback", Some("sk-sys"))),
+    );
 
-    let deleted = env.delete("/api/teams/research/providers/gateway").await;
+    let deleted = call(
+        &router,
+        Method::DELETE,
+        "/api/teams/research/providers/gateway",
+        None,
+    )
+    .await;
     assert_eq!(deleted.status, 200, "body={}", deleted.body);
     assert_eq!(deleted.body["success"], json!(true));
 
-    let listed = env.get("/api/teams/research/providers").await;
+    let listed = call(&router, Method::GET, "/api/teams/research/providers", None).await;
     assert_eq!(listed.status, 200, "body={}", listed.body);
-    assert_eq!(names(&listed.body), vec!["alpha".to_string()]);
+    assert_eq!(team_owned_names(&listed.body), vec!["alpha".to_string()]);
     assert_eq!(
         find(&listed.body, "alpha")["is_default"],
         json!(true),
@@ -514,4 +628,453 @@ async fn types_catalog_is_served_under_the_team() {
         .collect();
     assert!(types.contains(&"deepseek"), "body={}", reply.body);
     assert!(!types.contains(&"anthropic"), "body={}", reply.body);
+}
+
+/// 打开团队空间时，生效配置里的条目来自 Peco 层（key / 地址 / 模型三个字段）。
+///
+/// 变异方法：把 `layers_for` 里的 Peco 层去掉（opener 因此只传团队根）→
+/// 生效配置里没有 `peco-shared`，本测试变红。
+#[tokio::test]
+async fn opened_space_inherits_the_peco_layer() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
+
+    let ws_id = env.open_space("alpha", "research").await;
+    let config = open_config(&env, &ws_id).await;
+
+    let entry = config
+        .provider_entry(Some("peco-shared"))
+        .expect("团队没写条目，生效配置必须来自 Peco 层");
+    assert_eq!(entry.api_key.as_deref(), Some("sk-peco"));
+    assert_eq!(
+        entry.base_url.as_deref(),
+        Some("https://peco.example.com/v1")
+    );
+    assert_eq!(
+        entry.default.as_ref().map(|d| d.model.as_str()),
+        Some("peco-model")
+    );
+    assert_eq!(config.default_provider_name(), "peco-shared");
+}
+
+/// 团队层只写 `api_key` ⇒ 地址与模型仍来自 Peco（字段级合并，不是整条替换）。
+#[tokio::test]
+async fn team_layer_overrides_only_the_fields_it_writes() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
+    write_providers(
+        &env,
+        "research",
+        r#"
+[providers.peco-shared]
+type = "deepseek"
+api_key = "sk-team"
+"#,
+    );
+
+    let router = peco_daemon::http::router(
+        env.app_state_with_system_config(system_config("sys-fallback", Some("sk-sys"))),
+    );
+    let listed = call(&router, Method::GET, "/api/teams/research/providers", None).await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+
+    let entry = find(&listed.body, "peco-shared");
+    assert_eq!(entry["source"], json!("team"), "本层写了它，来源就是本层");
+    assert_eq!(entry["has_api_key"], json!(true));
+    assert_eq!(
+        entry["base_url"],
+        json!("https://peco.example.com/v1"),
+        "本层没写地址，保留 Peco 的：{}",
+        listed.body
+    );
+    assert_eq!(
+        entry["default_model"],
+        json!("peco-model"),
+        "本层没写模型，保留 Peco 的：{}",
+        listed.body
+    );
+    assert!(
+        !listed.body.to_string().contains("sk-team"),
+        "凭据不得回读：{}",
+        listed.body
+    );
+}
+
+/// 默认 provider 只在本层显式写出时生效：只加 provider 不写默认 ⇒ 仍是 Peco 的默认。
+#[tokio::test]
+async fn team_default_provider_applies_only_when_written() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+    // 低层里还要有一条名叫 `deepseek` 的 provider：serde 的默认值恰好是
+    // `"deepseek"`，有同名条目时「采纳默认值」才会真的把默认位改掉 —— 少了它，
+    // 这类实现也能靠「名字不存在，回落到低层默认」侥幸通过。
+    write_providers(
+        &env,
+        PECO_TEAM_ID,
+        &format!(
+            "{PECO_PROVIDERS}\n[providers.deepseek]\ntype = \"deepseek\"\napi_key = \"sk-plain\"\n"
+        ),
+    );
+    write_providers(
+        &env,
+        "research",
+        r#"
+[providers.team-qwen]
+type = "qwen"
+api_key = "sk-qwen"
+"#,
+    );
+
+    let router = peco_daemon::http::router(
+        env.app_state_with_system_config(system_config("sys-fallback", Some("sk-sys"))),
+    );
+    let listed = call(&router, Method::GET, "/api/teams/research/providers", None).await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(
+        find(&listed.body, "peco-shared")["is_default"],
+        json!(true),
+        "没写 default_provider 的团队层不得顶掉 Peco 的默认：{}",
+        listed.body
+    );
+    assert_eq!(
+        find(&listed.body, "team-qwen")["is_default"],
+        json!(false),
+        "body={}",
+        listed.body
+    );
+
+    write_providers(
+        &env,
+        "research",
+        r#"
+default_provider = "team-qwen"
+
+[providers.team-qwen]
+type = "qwen"
+api_key = "sk-qwen"
+"#,
+    );
+    let listed = call(&router, Method::GET, "/api/teams/research/providers", None).await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(
+        find(&listed.body, "team-qwen")["is_default"],
+        json!(true),
+        "显式写出默认位才接管：{}",
+        listed.body
+    );
+    assert_eq!(
+        find(&listed.body, "peco-shared")["is_default"],
+        json!(false),
+        "body={}",
+        listed.body
+    );
+}
+
+/// 团队没文件、低层已有默认 ⇒ 首条 provider 不接管默认位（请求里 set_default 关着）。
+///
+/// 变异方法：把 `apply_upsert` 的接管条件改回「新条目且是文件里第一条」→
+/// 团队文件被写入 `default_provider`，`is_default` 从 Peco 的候选上掉下来，
+/// 三条断言全红。
+#[tokio::test]
+async fn first_provider_keeps_the_inherited_default() {
+    let env = new_env(&[PECO_TEAM_ID, "shop"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
+    let router =
+        peco_daemon::http::router(env.app_state_with_system_config(no_provider_system_config()));
+
+    let saved = call(
+        &router,
+        Method::PUT,
+        "/api/teams/shop/providers",
+        Some(json!({
+            "name": "qwen-side",
+            "type": "qwen",
+            "api_key": "sk-qwen",
+            "set_default": false,
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "body={}", saved.body);
+
+    assert_eq!(
+        written_default(&env, "shop"),
+        None,
+        "没接管默认位就不该把 default_provider 写进团队文件：{}",
+        read_providers(&env, "shop")
+    );
+    assert!(
+        read_providers(&env, "shop").contains("qwen-side"),
+        "条目本身必须落盘：{}",
+        read_providers(&env, "shop")
+    );
+
+    let listed = call(&router, Method::GET, "/api/teams/shop/providers", None).await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(
+        find(&listed.body, "peco-shared")["is_default"],
+        json!(true),
+        "默认位仍属于继承来的 provider：{}",
+        listed.body
+    );
+    assert_eq!(
+        find(&listed.body, "qwen-side")["is_default"],
+        json!(false),
+        "新增的条目没被要求接管默认位：{}",
+        listed.body
+    );
+}
+
+/// 同一个场景下显式 `set_default: true` ⇒ 一定接管（低层有默认也照旧）。
+#[tokio::test]
+async fn explicit_set_default_takes_over_the_inherited_default() {
+    let env = new_env(&[PECO_TEAM_ID, "shop"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
+    let router =
+        peco_daemon::http::router(env.app_state_with_system_config(no_provider_system_config()));
+
+    let saved = call(
+        &router,
+        Method::PUT,
+        "/api/teams/shop/providers",
+        Some(json!({
+            "name": "qwen-side",
+            "type": "qwen",
+            "api_key": "sk-qwen",
+            "set_default": true,
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "body={}", saved.body);
+    assert_eq!(
+        written_default(&env, "shop").as_deref(),
+        Some("qwen-side"),
+        "显式接管必须写进团队文件：{}",
+        read_providers(&env, "shop")
+    );
+
+    let listed = call(&router, Method::GET, "/api/teams/shop/providers", None).await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(
+        find(&listed.body, "qwen-side")["is_default"],
+        json!(true),
+        "body={}",
+        listed.body
+    );
+    assert_eq!(
+        find(&listed.body, "peco-shared")["is_default"],
+        json!(false),
+        "body={}",
+        listed.body
+    );
+}
+
+/// 低层没有任何 provider ⇒ 首条仍按旧规则接管（否则新增的 provider 永远用不到）。
+///
+/// 变异方法：把接管条件收成「只在 `set_default` 为真时接管」→ 文件里没有
+/// `default_provider`，两条断言变红。
+#[tokio::test]
+async fn first_provider_takes_over_when_nothing_to_inherit() {
+    let env = new_env(&[PECO_TEAM_ID, "shop"]).await;
+    let router =
+        peco_daemon::http::router(env.app_state_with_system_config(no_provider_system_config()));
+
+    let saved = call(
+        &router,
+        Method::PUT,
+        "/api/teams/shop/providers",
+        Some(json!({
+            "name": "qwen-side",
+            "type": "qwen",
+            "api_key": "sk-qwen",
+            "set_default": false,
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "body={}", saved.body);
+    assert_eq!(
+        written_default(&env, "shop").as_deref(),
+        Some("qwen-side"),
+        "无可继承的默认时首条要接管：{}",
+        read_providers(&env, "shop")
+    );
+
+    let listed = call(&router, Method::GET, "/api/teams/shop/providers", None).await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(
+        find(&listed.body, "qwen-side")["is_default"],
+        json!(true),
+        "body={}",
+        listed.body
+    );
+}
+
+/// Peco 团队自己保存时，「低层」是系统层：系统已有可用的默认 ⇒ 首条不接管。
+#[tokio::test]
+async fn peco_team_keeps_the_system_default() {
+    let env = new_env(&[PECO_TEAM_ID]).await;
+    let router = peco_daemon::http::router(
+        env.app_state_with_system_config(system_config("sys-main", Some("sk-sys"))),
+    );
+
+    let saved = call(
+        &router,
+        Method::PUT,
+        &format!("/api/teams/{PECO_TEAM_ID}/providers"),
+        Some(json!({
+            "name": "peco-qwen",
+            "type": "qwen",
+            "api_key": "sk-qwen",
+            "set_default": false,
+        })),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "body={}", saved.body);
+    assert_eq!(
+        written_default(&env, PECO_TEAM_ID),
+        None,
+        "系统层已给出默认，Peco 层不该抢：{}",
+        read_providers(&env, PECO_TEAM_ID)
+    );
+
+    let listed = call(
+        &router,
+        Method::GET,
+        &format!("/api/teams/{PECO_TEAM_ID}/providers"),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(
+        find(&listed.body, "sys-main")["is_default"],
+        json!(true),
+        "body={}",
+        listed.body
+    );
+    assert_eq!(
+        find(&listed.body, "peco-qwen")["is_default"],
+        json!(false),
+        "body={}",
+        listed.body
+    );
+}
+
+/// 改 Peco 层 ⇒ 所有团队的已打开空间都跟着刷新；改团队层 ⇒ 只刷自己。
+#[tokio::test]
+async fn peco_save_reloads_spaces_of_every_team() {
+    let env = new_env(&[PECO_TEAM_ID, "research", "writing"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
+    let alpha = env.open_space("alpha", "research").await;
+    let beta = env.open_space("beta", "writing").await;
+
+    let saved = put_provider(
+        &env,
+        PECO_TEAM_ID,
+        json!({
+            "name": "peco-shared",
+            "type": "deepseek",
+            "base_url": "http://127.0.0.1:9/v1",
+        }),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "body={}", saved.body);
+    assert!(
+        saved.body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reloaded 2"),
+        "改 Peco 要重载所有已打开空间：{}",
+        saved.body
+    );
+    for ws_id in [&alpha, &beta] {
+        let config = open_config(&env, ws_id).await;
+        assert_eq!(
+            config.providers.providers["peco-shared"]
+                .base_url
+                .as_deref(),
+            Some("http://127.0.0.1:9/v1"),
+            "{ws_id} 继承 Peco 的条目必须已刷新"
+        );
+    }
+
+    let saved = put_provider(
+        &env,
+        "research",
+        json!({"name": "team-only", "type": "qwen", "api_key": "sk-qwen"}),
+    )
+    .await;
+    assert_eq!(saved.status, 200, "body={}", saved.body);
+    assert!(
+        saved.body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reloaded 1"),
+        "改团队只该重载本团队：{}",
+        saved.body
+    );
+    assert!(
+        open_config(&env, &alpha)
+            .await
+            .providers
+            .providers
+            .contains_key("team-only"),
+        "本团队的空间必须拿到新条目"
+    );
+    assert!(
+        !open_config(&env, &beta)
+            .await
+            .providers
+            .providers
+            .contains_key("team-only"),
+        "别的团队不该被重载"
+    );
+}
+
+/// 只在继承层存在的条目删不掉：400 `inherited_provider`，文案说明怎么办，且不写盘。
+#[tokio::test]
+async fn deleting_an_inherited_provider_is_400() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+    write_providers(&env, PECO_TEAM_ID, PECO_PROVIDERS);
+    write_providers(&env, "research", GATEWAY_WITHOUT_KEY);
+    let before = read_providers(&env, "research");
+
+    let router = peco_daemon::http::router(
+        env.app_state_with_system_config(system_config("sys-fallback", Some("sk-sys"))),
+    );
+
+    let inherited = call(
+        &router,
+        Method::DELETE,
+        "/api/teams/research/providers/peco-shared",
+        None,
+    )
+    .await;
+    assert_eq!(inherited.status, 400, "body={}", inherited.body);
+    assert_eq!(inherited.code(), "inherited_provider");
+    let message = inherited.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("继承自 Peco"), "{message}");
+    assert!(message.contains("无法删除"), "{message}");
+    assert_eq!(
+        read_providers(&env, "research"),
+        before,
+        "被拒的删除不得写盘"
+    );
+
+    // 系统层的同名条目同样不能删。
+    let system = call(
+        &router,
+        Method::DELETE,
+        "/api/teams/research/providers/sys-fallback",
+        None,
+    )
+    .await;
+    assert_eq!(system.status, 400, "body={}", system.body);
+    assert_eq!(system.code(), "inherited_provider");
+    assert!(
+        system.body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("系统配置"),
+        "body={}",
+        system.body
+    );
+    assert_eq!(read_providers(&env, "research"), before);
 }

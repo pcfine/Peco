@@ -65,6 +65,9 @@ pub struct WorkSpace {
     /// 系统级配置快照 — 用户 providers.toml 与之深递归合并。
     /// 进程内不变，但需保留以支持 [`WorkSpace::reload_providers`] 重新合并。
     system_config: SystemConfig,
+    /// provider 配置的层级能力根（低 → 高，最后一层是 `root`）。
+    /// 记住它才能让重载读到与打开时同一份配置。
+    provider_layers: Vec<PathBuf>,
     /// 当前生效的用户配置（providers + mcp），可被热重载整体替换。
     config: RwLock<UserConfig>,
     skill_registry: Arc<SkillRegister>,
@@ -74,12 +77,26 @@ pub struct WorkSpace {
 }
 
 impl WorkSpace {
-    /// 打开（必要时创建）一个 workspace。
+    /// 打开（必要时创建）一个 workspace，provider 配置只读 `root` 一层。
     pub fn open(
         root: PathBuf,
         user_id: String,
         system_config: &SystemConfig,
         work_dir: WorkDir,
+    ) -> Result<Self, WorkspaceError> {
+        let provider_layers = vec![root.clone()];
+        Self::open_layered(root, user_id, system_config, work_dir, provider_layers)
+    }
+
+    /// 打开 workspace，provider 配置按 `provider_layers` 从低到高逐层合并。
+    ///
+    /// 最后一层必须是 `root`：MCP 配置不分层，读的就是它的 `mcpconfig.json`。
+    pub fn open_layered(
+        root: PathBuf,
+        user_id: String,
+        system_config: &SystemConfig,
+        work_dir: WorkDir,
+        provider_layers: Vec<PathBuf>,
     ) -> Result<Self, WorkspaceError> {
         std::fs::create_dir_all(&root).map_err(|e| {
             WorkspaceError::WorkspaceDir(format!(
@@ -100,7 +117,7 @@ impl WorkSpace {
             }
         }
 
-        let config = UserConfig::load(system_config, &root)?;
+        let config = UserConfig::load_layered(system_config, &provider_layers)?;
 
         let user_skills_dir = root.join("skills");
         let skill_registry = match SkillRegister::new(user_skills_dir.clone()) {
@@ -146,6 +163,7 @@ impl WorkSpace {
             root,
             work_dir,
             system_config: system_config.clone(),
+            provider_layers,
             config: RwLock::new(config),
             skill_registry,
             knowledge_manager,
@@ -292,7 +310,7 @@ impl WorkSpace {
     /// 后续新加载的 Agent，provider 是**已建实例内的凭据**，必须主动失效缓存，
     /// 否则改完 api_key 仍走旧凭据。
     pub fn reload_providers(&self) -> Result<usize, crate::config::ConfigError> {
-        let new_config = UserConfig::load(&self.system_config, &self.root)?;
+        let new_config = UserConfig::load_layered(&self.system_config, &self.provider_layers)?;
         let invalidated = self.agent_manager.reload_providers(new_config.clone());
         *self.config.write().unwrap() = new_config;
         Ok(invalidated)
@@ -986,6 +1004,66 @@ mod tests {
         assert!(
             !Arc::ptr_eq(before.provider(), after.provider()),
             "provider 实例应随配置重载而重建"
+        );
+    }
+
+    /// 写一层的 providers.toml：`key` 为空时不写 api_key，`model` 为空时不写
+    /// 默认段 —— 靠「哪层写了哪个字段」分辨合并结果来自哪一层。
+    fn write_layer(root: &std::path::Path, key: Option<&str>, model: Option<&str>) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut content = String::from("[providers.deepseek]\ntype = \"deepseek\"\n");
+        if let Some(key) = key {
+            content.push_str(&format!("api_key = \"{key}\"\n"));
+        }
+        if let Some(model) = model {
+            content.push_str(&format!(
+                "\n[providers.deepseek.default]\nmodel = \"{model}\"\n"
+            ));
+        }
+        std::fs::write(root.join("providers.toml"), content).unwrap();
+    }
+
+    /// 重载必须走打开时那一套层级：改低优先层（Peco 那份）的文件，重载后
+    /// 生效，而高层仍按字段覆盖。
+    #[tokio::test]
+    async fn reload_providers_rereads_every_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peco = tmp.path().join("teams/peco");
+        let root = tmp.path().join("teams/research");
+        write_layer(&peco, Some("sk-old"), None);
+        write_layer(&root, None, Some("team-model"));
+
+        let ws = WorkSpace::open_layered(
+            root.clone(),
+            "test-user".into(),
+            &system_config(),
+            WorkDir::new(tmp.path().join("work")),
+            vec![peco.clone(), root],
+        )
+        .unwrap();
+
+        let entry = ws.config().provider_entry(Some("deepseek")).cloned();
+        let entry = entry.expect("合并后的 deepseek 必须存在");
+        assert_eq!(entry.api_key.as_deref(), Some("sk-old"), "key 来自低层");
+        assert_eq!(
+            entry.default.as_ref().map(|d| d.model.as_str()),
+            Some("team-model"),
+            "模型来自高层"
+        );
+
+        write_layer(&peco, Some("sk-new"), None);
+        ws.reload_providers().unwrap();
+
+        let entry = ws.config().provider_entry(Some("deepseek")).cloned();
+        let entry = entry.expect("合并后的 deepseek 必须存在");
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("sk-new"),
+            "重载必须重读每一层，不能只看 workspace 根"
+        );
+        assert_eq!(
+            entry.default.as_ref().map(|d| d.model.as_str()),
+            Some("team-model")
         );
     }
 

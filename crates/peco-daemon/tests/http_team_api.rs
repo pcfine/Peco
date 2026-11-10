@@ -334,6 +334,49 @@ async fn peco_is_absent_from_the_list_but_readable_in_detail() {
     assert_eq!(detail.body["id"], json!(PECO_TEAM_ID));
 }
 
+/// `?include=peco` 才把保留团队并入清单，`reserved` 标出谁是保留团队。
+#[tokio::test]
+async fn include_peco_adds_the_reserved_team() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+
+    // 不带参数：与现状一致（Peco 被挡在清单外）。
+    let listed = env.get("/api/teams").await;
+    assert_eq!(listed.status, 200, "body={}", listed.body);
+    assert_eq!(team_ids(&listed), vec!["research"]);
+    assert_eq!(
+        listed.body[0]["reserved"],
+        json!(false),
+        "普通团队不是保留团队"
+    );
+
+    let with_peco = env.get("/api/teams?include=peco").await;
+    assert_eq!(with_peco.status, 200, "body={}", with_peco.body);
+    assert_eq!(
+        team_ids(&with_peco),
+        vec![PECO_TEAM_ID.to_string(), "research".to_string()]
+    );
+    let peco = with_peco
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["team_id"] == json!(PECO_TEAM_ID))
+        .expect("Peco 应在清单里");
+    assert_eq!(peco["reserved"], json!(true));
+    let research = with_peco
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["team_id"] == json!("research"))
+        .expect("research 应在清单里");
+    assert_eq!(research["reserved"], json!(false));
+
+    // 不认识的取值忽略：参数拼错不该把保留团队放进来。
+    let unknown = env.get("/api/teams?include=ghost").await;
+    assert_eq!(team_ids(&unknown), vec!["research"]);
+}
+
 /// 保留 id 不能创建。
 #[tokio::test]
 async fn creating_the_reserved_peco_team_is_400() {

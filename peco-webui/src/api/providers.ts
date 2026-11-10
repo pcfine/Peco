@@ -16,6 +16,19 @@ export interface ProviderInfo {
   api: string | null;
   has_api_key: boolean;
   is_default: boolean;
+  /**
+   * 这条配置来自哪一层：`team` 是本团队文件里写的（可改），`peco` 与 `system`
+   * 是继承来的（只读）。
+   */
+  source?: ProviderSource;
+}
+
+/** 生效 provider 的层来源；低 → 高为 `system` → `peco` → `team`。 */
+export type ProviderSource = "team" | "peco" | "system";
+
+/** 条目来自哪一层。字段缺失按 `team` 处理：整列表一律只读比误判更糟。 */
+export function providerSource(provider: ProviderInfo): ProviderSource {
+  return provider.source ?? "team";
 }
 
 /** provider 类型目录 —— 表单默认值的唯一来源，前端不另存一份映射表。 */

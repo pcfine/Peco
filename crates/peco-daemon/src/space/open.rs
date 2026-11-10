@@ -28,6 +28,7 @@ use crate::error::DaemonError;
 use crate::file_watcher::FileWatcher;
 use crate::memory::cleanup;
 use crate::memory::config::MemoryConfig;
+use crate::provider::{layer_roots, layers_for};
 use crate::space::SpaceEnv;
 use crate::space::index;
 use crate::space::manifest;
@@ -117,18 +118,22 @@ impl DaemonOpener {
 
         // kb_scope 一律传 team_id：同 team 的 N 个空间必须共用一套知识库命名空间。
         //
-        // `WorkSpace::open` 是同步阻塞的（读盘、开 LanceDB、建管理器），直接在
-        // async worker 上调用会占住整条 runtime 线程；交给 blocking 池。
+        // `WorkSpace::open_layered` 是同步阻塞的（读盘、开 LanceDB、建管理器），
+        // 直接在 async worker 上调用会占住整条 runtime 线程；交给 blocking 池。
         let ws = {
             let root = env.team_root(&team);
+            // provider 继承链与 provider 模块共用一处推导：打开的空间与
+            // `GET .../providers` 必须看到同一份生效配置。
+            let provider_layers = layer_roots(&layers_for(env, &team));
             let kb_scope = team.clone();
             let open_dir = work_dir.clone();
             let opened = tokio::task::spawn_blocking(move || {
-                WorkSpace::open(
+                WorkSpace::open_layered(
                     root,
                     kb_scope,
                     system_config.as_ref(),
                     WorkDir::new(open_dir),
+                    provider_layers,
                 )
             })
             .await

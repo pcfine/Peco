@@ -7,18 +7,19 @@ use std::path::{Path, PathBuf};
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};
-use peco_core::config::{PROVIDER_TYPES, ProvidersConfig};
+use peco_core::config::{PROVIDER_TYPES, ProvidersConfig, SystemConfig};
 use peco_core::provider::probe::{ProbeTarget, run_probe};
 use tracing::{info, warn};
 
 use super::{
-    PROVIDERS_FILE, ProviderInfo, ProviderTypeInfo, SuccessResponse, TestDraftRequest,
-    TestResponse, UpsertProviderRequest, apply_delete, apply_upsert, effective_config,
-    ensure_supported_type, load_user_providers, provider_info, save_providers_atomic,
-    saved_message,
+    PROVIDERS_FILE, ProviderInfo, ProviderLayer, ProviderTypeInfo, SuccessResponse,
+    TestDraftRequest, TestResponse, UpsertProviderRequest, apply_delete, apply_upsert,
+    effective_with_sources, ensure_supported_type, layers_for, load_user_providers, provider_info,
+    save_providers_atomic, saved_message, sort_for_display, source_of,
 };
 use crate::db::workspaces;
 use crate::error::DaemonError;
+use crate::space::peco::PECO_TEAM_ID;
 use crate::state::AppState;
 
 /// `GET /api/teams/{team_id}/providers/types` — 各 provider 类型的默认值目录。
@@ -42,37 +43,47 @@ pub async fn list_types(
     ))
 }
 
-/// `GET /api/teams/{team_id}/providers` — 用户 providers.toml 中的条目。
+/// `GET /api/teams/{team_id}/providers` — 生效并集，每项标注定义层。
+///
+/// 只列本团队文件会让继承来的条目看不见 —— 用户以为配好的 provider 没生效。
 pub async fn list(
     UrlPath(team_id): UrlPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ProviderInfo>>, DaemonError> {
-    let root = team_root(&state, &team_id)?;
-    let user = load_user_providers(&root.join(PROVIDERS_FILE))?;
-    let effective = effective_config(&state.env.system_config, &root)?;
+    team_root(&state, &team_id)?;
+    let layers = layers_for(&state.env, &team_id);
+    let (effective, sources) = effective_with_sources(&state.env.system_config, &layers)?;
 
-    Ok(Json(
-        user.providers
-            .iter()
-            .map(|(name, entry)| provider_info(name, entry, &effective))
-            .collect(),
-    ))
+    let mut infos: Vec<ProviderInfo> = effective
+        .providers
+        .providers
+        .iter()
+        .map(|(name, entry)| provider_info(name, entry, &effective, source_of(&sources, name)))
+        .collect();
+    sort_for_display(&mut infos);
+    Ok(Json(infos))
 }
 
-/// `GET /api/teams/{team_id}/providers/{name}` — 单条详情。
+/// `GET /api/teams/{team_id}/providers/{name}` — 单条详情（含继承条目）。
 pub async fn get(
     UrlPath((team_id, name)): UrlPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<ProviderInfo>, DaemonError> {
-    let root = team_root(&state, &team_id)?;
-    let user = load_user_providers(&root.join(PROVIDERS_FILE))?;
-    let entry = user
+    team_root(&state, &team_id)?;
+    let layers = layers_for(&state.env, &team_id);
+    let (effective, sources) = effective_with_sources(&state.env.system_config, &layers)?;
+    let entry = effective
+        .providers
         .providers
         .get(&name)
         .ok_or_else(|| DaemonError::ProviderNotFound { name: name.clone() })?;
-    let effective = effective_config(&state.env.system_config, &root)?;
 
-    Ok(Json(provider_info(&name, entry, &effective)))
+    Ok(Json(provider_info(
+        &name,
+        entry,
+        &effective,
+        source_of(&sources, &name),
+    )))
 }
 
 /// `PUT /api/teams/{team_id}/providers` — 新增或部分更新一个 provider。
@@ -85,7 +96,9 @@ pub async fn upsert(
     let path = root.join(PROVIDERS_FILE);
     let mut config = load_user_providers(&path)?;
 
-    let name = apply_upsert(&mut config, &req)?;
+    let layers = layers_for(&state.env, &team_id);
+    let inherited = inheritable_default(&state.env.system_config, &layers)?;
+    let name = apply_upsert(&mut config, &req, inherited.as_deref())?;
 
     persist(
         &state,
@@ -97,7 +110,10 @@ pub async fn upsert(
     .await
 }
 
-/// `DELETE /api/teams/{team_id}/providers/{name}` — 删除一个 provider。
+/// `DELETE /api/teams/{team_id}/providers/{name}` — 删除本团队文件里的一条。
+///
+/// 只在继承层存在的名字删不掉：那层不属于这个团队，删了也不会消失。此时报
+/// `inherited_provider` 而不是 `provider_not_found` —— 后者会让用户以为配置坏了。
 pub async fn delete(
     UrlPath((team_id, name)): UrlPath<(String, String)>,
     State(state): State<AppState>,
@@ -105,6 +121,18 @@ pub async fn delete(
     let root = team_root(&state, &team_id)?;
     let path = root.join(PROVIDERS_FILE);
     let mut config = load_user_providers(&path)?;
+    if !config.providers.contains_key(&name) {
+        let layers = layers_for(&state.env, &team_id);
+        let (effective, sources) = effective_with_sources(&state.env.system_config, &layers)?;
+        return Err(if effective.providers.providers.contains_key(&name) {
+            DaemonError::InheritedProvider {
+                name: name.clone(),
+                origin: source_of(&sources, &name).origin_label(),
+            }
+        } else {
+            DaemonError::ProviderNotFound { name }
+        });
+    }
     apply_delete(&mut config, &name)?;
 
     persist(
@@ -156,8 +184,9 @@ pub async fn test_connection(
     UrlPath((team_id, name)): UrlPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<TestResponse>, DaemonError> {
-    let root = team_root(&state, &team_id)?;
-    let effective = effective_config(&state.env.system_config, &root)?;
+    team_root(&state, &team_id)?;
+    let layers = layers_for(&state.env, &team_id);
+    let (effective, _) = effective_with_sources(&state.env.system_config, &layers)?;
     let entry = effective
         .provider_entry(Some(&name))
         .ok_or_else(|| DaemonError::ProviderNotFound { name: name.clone() })?;
@@ -187,6 +216,30 @@ fn team_root(state: &AppState, team_id: &str) -> Result<PathBuf, DaemonError> {
     Ok(state.env.team_root(team_id))
 }
 
+/// 低层此刻是否已经给出可继承的默认 provider。
+///
+/// 只看本层之下的层（[`layers_for`] 的最后一层是本团队，Peco 团队自己身上则是
+/// 系统层）：要判定的是「接管默认位会不会顶掉别人」，本层文件写了什么与此无关。
+/// 低层写了 `default_provider` 但低层 providers 里没有这个名字时不算 —— 那个
+/// 名字指不到任何端点，团队首条条目仍该接管。
+fn inheritable_default(
+    system: &SystemConfig,
+    layers: &[ProviderLayer],
+) -> Result<Option<String>, DaemonError> {
+    let Some((_, lower)) = layers.split_last() else {
+        return Ok(None);
+    };
+    // 走与列表/详情同一条读法：低层文件损坏报 400（用户可修的输入错误），
+    // 而不是 PUT 时才冒出一个 500。
+    let (config, _) = effective_with_sources(system, lower)?;
+    let name = config.default_provider_name();
+    Ok(config
+        .providers
+        .providers
+        .contains_key(name)
+        .then(|| name.to_string()))
+}
+
 /// 写盘 → 让已打开实例用上新配置 → 拼文案。
 ///
 /// 重载失败不当作保存失败：文件此刻已经落盘，报错只会让用户反复重试一个
@@ -208,7 +261,7 @@ async fn persist(
     }))
 }
 
-/// 写后刷新该团队**已打开**的空间，让已缓存 Agent 重建。
+/// 一次写后重载的结论：刷了几个实例、哪些失败。
 #[derive(Debug, Default)]
 struct ReloadOutcome {
     reloaded: usize,
@@ -229,8 +282,17 @@ impl ReloadOutcome {
     }
 }
 
+/// 写后刷新受影响的已打开空间。
+///
+/// 改 Peco 层会影响所有团队（它们都继承 Peco），只刷 Peco 自己的空间等于
+/// 让其余团队一直拿着旧快照；改别的团队只影响自己。
 async fn reload_open_spaces(state: &AppState, team_id: &str) -> ReloadOutcome {
-    let dirs = match workspaces::open_work_dirs_by_team(&state.pool, team_id).await {
+    let dirs = if team_id == PECO_TEAM_ID {
+        workspaces::open_work_dirs(&state.pool).await
+    } else {
+        workspaces::open_work_dirs_by_team(&state.pool, team_id).await
+    };
+    let dirs = match dirs {
         Ok(dirs) => dirs,
         Err(e) => {
             warn!(team_id, error = %e, "cannot list open spaces; skipping provider reload");

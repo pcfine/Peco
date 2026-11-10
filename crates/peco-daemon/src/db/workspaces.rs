@@ -97,6 +97,16 @@ pub async fn open_work_dirs_by_team(
     .await
 }
 
+/// 全部仍未关闭的空间目录（`closed_at IS NULL`），跨团队。
+///
+/// 改 Peco 的 provider 会波及所有继承它的团队，只刷 Peco 自己的空间等于让
+/// 其余团队一直拿着旧快照。
+pub async fn open_work_dirs(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT work_dir FROM workspaces WHERE closed_at IS NULL")
+        .fetch_all(pool)
+        .await
+}
+
 pub async fn list(pool: &SqlitePool) -> Result<Vec<WorkspaceRow>, sqlx::Error> {
     sqlx::query_as::<_, WorkspaceRow>(
         "SELECT id, work_dir, team_id, label, exit_policy, created_at, last_opened_at, closed_at \

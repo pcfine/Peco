@@ -11,6 +11,7 @@ import { ApiError } from "@/lib/api";
 import {
   ProviderSection,
   blankForm,
+  formForOverride,
   formForTypeChange,
   formFromProvider,
   toTestRequest,
@@ -79,6 +80,7 @@ const EXISTING: ProviderInfo = {
   api: null,
   has_api_key: true,
   is_default: true,
+  source: "team",
 };
 
 const GATEWAY: ProviderInfo = {
@@ -89,6 +91,31 @@ const GATEWAY: ProviderInfo = {
   api: "chat",
   has_api_key: false,
   is_default: false,
+  source: "team",
+};
+
+/** 从 Peco 继承来的条目：只读，只能覆盖。 */
+const INHERITED: ProviderInfo = {
+  name: "qwen",
+  provider_type: "qwen",
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  default_model: "qwen3.7-max",
+  api: "responses",
+  has_api_key: true,
+  is_default: false,
+  source: "peco",
+};
+
+/** 系统层（`~/.config/peco/providers.toml`）的条目：同样只读。 */
+const SYSTEM: ProviderInfo = {
+  name: "openai",
+  provider_type: "openai",
+  base_url: null,
+  default_model: "gpt-5",
+  api: null,
+  has_api_key: false,
+  is_default: false,
+  source: "system",
 };
 
 const TEAM = "t1";
@@ -116,6 +143,20 @@ async function openCreate() {
 
 async function openEdit(name: string) {
   fireEvent.click(await screen.findByRole("button", { name: `编辑 ${name}` }));
+  return screen.findByRole("dialog");
+}
+
+/** 某一行里的按钮：列表每一行是一个 `li`，按名字定位它再取行内按钮。 */
+async function rowOf(name: string): Promise<HTMLElement> {
+  const row = (await screen.findByText(name)).closest("li");
+  if (!row) throw new Error(`找不到「${name}」那一行`);
+  return row;
+}
+
+/** 继承条目的「覆盖」：打开的是新建对话框，只是名字已锁定。 */
+async function openOverride(name: string) {
+  const row = await rowOf(name);
+  fireEvent.click(within(row).getByRole("button", { name: "覆盖" }));
   return screen.findByRole("dialog");
 }
 
@@ -234,6 +275,27 @@ describe("表单纯函数", () => {
     expect(req).not.toHaveProperty("api_key");
     expect(req.base_url).toBe("");
     expect(req.default_model).toBe("");
+  });
+
+  it("覆盖表单锁定同名条目，字段填生效值而不是留空", () => {
+    const form = formForOverride(INHERITED);
+
+    expect(form).toMatchObject({
+      name: "qwen",
+      providerType: "qwen",
+      baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      api: "responses",
+      model: "qwen3.7-max",
+      apiKey: "",
+      // 覆盖一条继承条目不该顺手改「哪个 provider 是默认」
+      setDefault: false,
+    });
+    // 留空会被后端当「清空该字段」，把继承来的值冲掉。
+    const req = toUpsertRequest(form);
+    expect(req.base_url).toBe(
+      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    );
+    expect(req.default_model).toBe("qwen3.7-max");
   });
 
   it("新建要求 API Key 与模型，编辑允许两者留空", () => {
@@ -423,5 +485,94 @@ describe("ProviderSection", () => {
 
     expect(await screen.findByText(/请填写 API Key/)).toBeInTheDocument();
     expect(put).not.toHaveBeenCalled();
+  });
+
+  it("继承条目只读：标出层来源，只有「覆盖」，没有编辑/删除/试连", async () => {
+    providers = [EXISTING, INHERITED, SYSTEM];
+    renderSection();
+
+    expect(await screen.findByText("继承自 Peco")).toBeInTheDocument();
+    expect(screen.getByText("系统")).toBeInTheDocument();
+
+    const pecoRow = await rowOf("qwen");
+    expect(within(pecoRow).getByRole("button", { name: "覆盖" })).toBeEnabled();
+    expect(within(pecoRow).queryByRole("button", { name: /^编辑/ })).toBeNull();
+    expect(within(pecoRow).queryByRole("button", { name: /^删除/ })).toBeNull();
+    expect(within(pecoRow).queryByRole("button", { name: "试连" })).toBeNull();
+
+    // 团队自己的条目照旧：编辑、删除、试连都在。
+    const ownRow = await rowOf("deepseek");
+    expect(
+      within(ownRow).getByRole("button", { name: "编辑 deepseek" }),
+    ).toBeInTheDocument();
+    expect(
+      within(ownRow).getByRole("button", { name: "删除 deepseek" }),
+    ).toBeInTheDocument();
+    expect(
+      within(ownRow).getByRole("button", { name: "试连" }),
+    ).toBeInTheDocument();
+    expect(within(ownRow).queryByRole("button", { name: "覆盖" })).toBeNull();
+  });
+
+  it("「覆盖」打开新建对话框：名字锁定为该条目名，类型/地址/模型预填", async () => {
+    providers = [INHERITED];
+    renderSection();
+    const dialog = await openOverride("qwen");
+
+    expect(within(dialog).getByText("覆盖「qwen」")).toBeInTheDocument();
+    const name = within(dialog).getByLabelText("名称");
+    expect(name).toHaveValue("qwen");
+    expect(name).toBeDisabled();
+    expect(
+      within(dialog).getByRole("combobox", { name: "Provider 类型" }),
+    ).toHaveTextContent("通义千问（DashScope）");
+    expect(within(dialog).getByLabelText("Base URL")).toHaveValue(
+      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    );
+    expect(within(dialog).getByLabelText("默认模型")).toHaveValue(
+      "qwen3.7-max",
+    );
+
+    fireEvent.change(within(dialog).getByLabelText("API Key"), {
+      target: { value: "sk-team" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put.mock.calls[0][1]).toEqual({
+      name: "qwen",
+      type: "qwen",
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      api: "responses",
+      default_model: "qwen3.7-max",
+      api_key: "sk-team",
+    });
+  });
+
+  it("重名检查只看团队自己的条目：继承来的名字不算占用", async () => {
+    providers = [INHERITED];
+    renderSection();
+    const dialog = await openCreate();
+
+    // 填继承条目的名字不算重名 —— 这正是「覆盖」想要的入口，不能拦。
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "qwen" },
+    });
+
+    expect(within(dialog).queryByText(/已存在同名 Provider/)).toBeNull();
+  });
+
+  it("团队自己已经用掉的名字仍然避让，撞上时提示会被更新", async () => {
+    providers = [EXISTING];
+    renderSection();
+    const dialog = await openCreate();
+
+    expect(within(dialog).getByLabelText("名称")).toHaveValue("deepseek-2");
+
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "deepseek" },
+    });
+
+    expect(within(dialog).getByText(/已存在同名 Provider/)).toBeInTheDocument();
   });
 });

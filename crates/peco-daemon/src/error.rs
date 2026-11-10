@@ -105,6 +105,11 @@ pub enum DaemonError {
     #[error("team '{team_id}' has neither a directory nor an index row")]
     TeamNotFound { team_id: String },
 
+    /// 条目只在继承层（Peco / 系统）里存在。文案要说清「删不掉」和「怎么覆盖」：
+    /// 报成 not found 会让用户以为配置坏了。
+    #[error("provider '{name}' 继承自 {origin}，无法删除；请为团队覆盖该条目")]
+    InheritedProvider { name: String, origin: &'static str },
+
     #[error("provider '{name}' is not configured for this team")]
     ProviderNotFound { name: String },
 
@@ -158,6 +163,7 @@ impl DaemonError {
             Self::TeamExists { .. } => "team_exists",
             Self::TeamNotFound { .. } => "team_not_found",
             Self::ProviderNotFound { .. } => "provider_not_found",
+            Self::InheritedProvider { .. } => "inherited_provider",
             Self::InvalidPath { .. } => "invalid_path",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::Internal { .. } => "internal",
@@ -177,7 +183,8 @@ impl DaemonError {
             Self::MemoryDocumentNotFound { .. } => StatusCode::NOT_FOUND,
             Self::TeamNotFound { .. } => StatusCode::NOT_FOUND,
             Self::ProviderNotFound { .. } => StatusCode::NOT_FOUND,
-            Self::InvalidArgument { .. }
+            Self::InheritedProvider { .. }
+            | Self::InvalidArgument { .. }
             | Self::InvalidPath { .. }
             | Self::ReservedSpace { .. }
             | Self::WorkDirNotAbsolute { .. }
@@ -242,6 +249,14 @@ mod tests {
                 },
                 "provider_not_found",
                 StatusCode::NOT_FOUND,
+            ),
+            (
+                DaemonError::InheritedProvider {
+                    name: "gateway".into(),
+                    origin: "Peco",
+                },
+                "inherited_provider",
+                StatusCode::BAD_REQUEST,
             ),
             (
                 DaemonError::TeamConflict {

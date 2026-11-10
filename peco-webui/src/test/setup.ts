@@ -14,6 +14,11 @@ if (!window.matchMedia) {
   })) as unknown as typeof window.matchMedia;
 }
 
+// jsdom 没有 scrollIntoView：Radix Select 打开时要把选中项滚进视口。
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
 // Radix（Popover / DropdownMenu 的 popper）在测试环境里要它。
 if (!globalThis.ResizeObserver) {
   globalThis.ResizeObserver = class {

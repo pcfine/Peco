@@ -97,6 +97,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 空串默认位不落盘：文件里没有这个键，读回来才知道「本层没声明」，
+    /// 合并时才会沿用低层默认。
+    #[test]
+    fn empty_default_provider_is_not_written() {
+        let config = ProvidersConfig {
+            default_provider: String::new(),
+            providers: Default::default(),
+            web_search: None,
+        };
+
+        let dir = std::env::temp_dir().join("peco-config-empty-default-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("providers.toml");
+
+        save_config(&config, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("default_provider"),
+            "空默认位不该写出该键：{raw}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_provider_names_sorted() {
         use super::super::types::ProviderEntry;

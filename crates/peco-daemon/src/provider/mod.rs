@@ -4,10 +4,12 @@
 //! 值才覆盖（空串表示清空）。两个原因：`api_key` 永不回读，前端编辑时手里没有
 //! 旧值，全量替换会把它清空；模型/默认参数同理，只改 `base_url` 时不该丢。
 //!
-//! 呈现只列用户文件里的条目（它们可编辑）；系统层 provider 由合并逻辑兜底，
-//! 不出现在列表里，但影响 `is_default` 与 `has_api_key` 的判定 —— 「能跑」和
-//! 「用户文件里写了 key」是两件事。
+//! 生效配置是多层合并的结果：系统 → Peco → 团队（见 [`layers_for`]）。列表返回
+//! 生效并集，每项标注它由哪一层定义（[`ProviderSource`]）——只列本团队文件会
+//! 让继承来的条目看不见，像是没生效。`is_default` 与 `has_api_key` 按合并结果
+//! 判定：「能跑」和「本层文件里写了 key」是两件事。
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +20,8 @@ use peco_core::provider::probe::ProbeOutcome;
 use serde::{Deserialize, Serialize};
 
 use crate::error::DaemonError;
+use crate::space::SpaceEnv;
+use crate::space::peco::PECO_TEAM_ID;
 
 mod handler;
 
@@ -43,6 +47,73 @@ pub struct ProviderInfo {
     pub has_api_key: bool,
     /// 是否为当前默认 provider（agent.md 未指定 provider 时走它）。
     pub is_default: bool,
+    /// 该条目由哪一层定义 —— 只有 `"team"` 能在本团队文件里编辑/删除。
+    pub source: ProviderSource,
+}
+
+/// provider 条目的定义层，也是列表里的 `source` 取值。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderSource {
+    /// 团队自己的 `providers.toml`。
+    Team,
+    /// 保留团队 Peco 的 `providers.toml`（团队全局默认）。
+    Peco,
+    /// 系统层 `~/.config/peco/providers.toml`。
+    System,
+}
+
+impl ProviderSource {
+    /// 列表顺序：团队条目在前，其次 Peco，最后系统层。
+    fn rank(self) -> u8 {
+        match self {
+            Self::Team => 0,
+            Self::Peco => 1,
+            Self::System => 2,
+        }
+    }
+
+    /// 继承条目不可删时，告诉用户「这条是从哪继承来的」。
+    fn origin_label(self) -> &'static str {
+        match self {
+            Self::Peco => "Peco",
+            Self::System => "系统配置",
+            Self::Team => "本团队",
+        }
+    }
+}
+
+/// 生效 provider 配置的一层：能力根 + 该层在列表里的来源标注。
+#[derive(Debug, Clone)]
+pub struct ProviderLayer {
+    pub root: PathBuf,
+    pub source: ProviderSource,
+}
+
+/// 一个团队的 provider 层级（低 → 高）。
+///
+/// Peco 自己只有两层：系统 + 自己，不自我继承 —— 否则 `teams/peco` 会被
+/// 当成两层读同一份文件。
+pub fn layers_for(env: &SpaceEnv, team_id: &str) -> Vec<ProviderLayer> {
+    let team = ProviderLayer {
+        root: env.team_root(team_id),
+        source: ProviderSource::Team,
+    };
+    if team_id == PECO_TEAM_ID {
+        return vec![team];
+    }
+    vec![
+        ProviderLayer {
+            root: env.team_root(PECO_TEAM_ID),
+            source: ProviderSource::Peco,
+        },
+        team,
+    ]
+}
+
+/// 交给 [`UserConfig::load_layered`] 的路径序列（低 → 高）。
+pub fn layer_roots(layers: &[ProviderLayer]) -> Vec<PathBuf> {
+    layers.iter().map(|layer| layer.root.clone()).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,13 +196,15 @@ pub struct TestDraftRequest {
 ///
 /// 文件缺失是常态（团队还没配过 provider），此时给一份空表而不是报错：
 /// 第一次 PUT 才有地方落笔。
+///
+/// 文件没写 `default_provider` 时留空串，而不是 serde 的默认值：空串在合并里
+/// 表示「沿用低层默认」，写回时也不产生该键。填上默认值就把「本层没声明」变成
+/// 一个真实默认位，团队保存任何一条 provider 都会静默顶掉低层选定的默认。
 pub fn load_user_providers(path: &Path) -> Result<ProvidersConfig, DaemonError> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => toml::from_str(&raw).map_err(|e| DaemonError::InvalidArgument {
-            message: format!("invalid {}: {e}", path.display()),
-        }),
+        Ok(raw) => parse_user_providers(path, &raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProvidersConfig {
-            default_provider: "deepseek".to_string(),
+            default_provider: String::new(),
             providers: Default::default(),
             web_search: None,
         }),
@@ -141,19 +214,71 @@ pub fn load_user_providers(path: &Path) -> Result<ProvidersConfig, DaemonError> 
     }
 }
 
-/// 合并后的生效配置（用户文件 + 系统兜底）。
+/// 解析一层用户文件，并把「没声明默认位」保留成空串。
 ///
-/// 与对话路径读同一份：判定「凭据够不够用」「谁是默认」都必须看合并结果，
-/// 只看原始文件会误报系统层已补上的 key 未配置。
-pub fn effective_config(
-    system: &SystemConfig,
-    team_root: &Path,
-) -> Result<UserConfig, DaemonError> {
-    UserConfig::load(system, team_root).map_err(|e| DaemonError::Config(e.to_string()))
+/// 先解析成通用 TOML 再转结构体：`default_provider` 是否写了只能从原始文档判断，
+/// 结构体里缺失键与 serde 填的默认值长得一模一样。
+fn parse_user_providers(path: &Path, raw: &str) -> Result<ProvidersConfig, DaemonError> {
+    let document: toml::Value = toml::from_str(raw).map_err(|e| invalid_file(path, &e))?;
+    let declares_default = document.get("default_provider").is_some();
+    let mut config: ProvidersConfig = document.try_into().map_err(|e| invalid_file(path, &e))?;
+    if !declares_default {
+        config.default_provider.clear();
+    }
+    Ok(config)
 }
 
-/// 一条用户条目在合并后的生效配置里的呈现。
-pub fn provider_info(name: &str, entry: &ProviderEntry, effective: &UserConfig) -> ProviderInfo {
+/// 损坏的用户文件是用户能自己修的输入错误 —— 400，不是 500。
+fn invalid_file(path: &Path, source: &toml::de::Error) -> DaemonError {
+    DaemonError::InvalidArgument {
+        message: format!("invalid {}: {source}", path.display()),
+    }
+}
+
+/// 合并后的生效配置（各层文件 + 系统兜底）。
+///
+/// 与对话路径读同一份：判定「凭据够不够用」「谁是默认」都必须看合并结果，
+/// 只看原始文件会误报低层已补上的 key 未配置。
+pub fn effective_config(
+    system: &SystemConfig,
+    layers: &[PathBuf],
+) -> Result<UserConfig, DaemonError> {
+    UserConfig::load_layered(system, layers).map_err(|e| DaemonError::Config(e.to_string()))
+}
+
+/// 生效配置 + 每个 provider 名的定义层（列表与详情的 `source` 都来自它）。
+///
+/// 先算来源：损坏的层文件由此报成 400（用户可修的输入错误），而不是等到
+/// `load_layered` 才变成 config 错误。
+pub fn effective_with_sources(
+    system: &SystemConfig,
+    layers: &[ProviderLayer],
+) -> Result<(UserConfig, HashMap<String, ProviderSource>), DaemonError> {
+    let mut sources = HashMap::new();
+    // 从最高优先层往回走，先写入的赢：团队层覆盖 Peco 同名条目时，
+    // 列表该显示「团队写的」。
+    for layer in layers.iter().rev() {
+        let config = load_user_providers(&layer.root.join(PROVIDERS_FILE))?;
+        for name in config.providers.keys() {
+            sources.entry(name.clone()).or_insert(layer.source);
+        }
+    }
+    let effective = effective_config(system, &layer_roots(layers))?;
+    Ok((effective, sources))
+}
+
+/// 该名字的定义层；没有任何层文件写过它 ⇒ 系统层。
+pub fn source_of(sources: &HashMap<String, ProviderSource>, name: &str) -> ProviderSource {
+    sources.get(name).copied().unwrap_or(ProviderSource::System)
+}
+
+/// 一条生效条目在合并后的生效配置里的呈现。
+pub fn provider_info(
+    name: &str,
+    entry: &ProviderEntry,
+    effective: &UserConfig,
+    source: ProviderSource,
+) -> ProviderInfo {
     ProviderInfo {
         name: name.to_string(),
         provider_type: entry.provider_type.clone(),
@@ -162,7 +287,18 @@ pub fn provider_info(name: &str, entry: &ProviderEntry, effective: &UserConfig) 
         api: entry.api.clone(),
         has_api_key: has_effective_api_key(effective, name),
         is_default: name == effective.default_provider_name(),
+        source,
     }
+}
+
+/// 列表顺序：团队条目在前（按名），再 Peco、系统层（各按名）。
+pub fn sort_for_display(infos: &mut [ProviderInfo]) {
+    infos.sort_by(|a, b| {
+        a.source
+            .rank()
+            .cmp(&b.source.rank())
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 /// 合并后的生效配置里该 provider 是否带凭据。
@@ -224,9 +360,14 @@ fn merge_default_model(
 ///
 /// 纯函数（不碰文件系统），字段级部分更新的全部语义都在这里：
 /// 省略即保留、空串即清空、换类型即不继承、新条目可在满足条件时接管默认位。
+///
+/// `inherited_default` 是低层（见 [`layers_for`] 里本层之下的那些层）此刻已经
+/// 给出的默认 provider，由调用方解析后传入 —— 判定它需要读文件系统，不属于本
+/// 函数。`None` 表示低层没有可用的默认，此刻新增的首条条目才该接管默认位。
 pub fn apply_upsert(
     config: &mut ProvidersConfig,
     req: &UpsertProviderRequest,
+    inherited_default: Option<&str>,
 ) -> Result<String, DaemonError> {
     // 目录查找大小写不敏感，但适配器分派是精确匹配 —— 存目录里的规范值，
     // 否则 "OpenAI" 这类写法能通过校验，却在构建 Agent 时报 unsupported。
@@ -292,10 +433,10 @@ pub fn apply_upsert(
         },
     );
 
-    // `set_default` 显式接管；或这是配置里的第一个 provider —— 否则新增的
-    // provider 永远不会被「agent.md 未指定 provider」的 Agent 用到，
-    // 表现为「加好了却没有任何变化」。
-    if req.set_default || (is_new && config.providers.len() == 1) {
+    // `set_default` 一律显式接管；首条新条目只在低层没有可继承的默认时才顺手
+    // 接管 —— 否则「加好了却没有任何变化」会被静默换端点这件事替掉：团队本可以
+    // 沿用低层默认，多写一个 provider 就把所有未指定 provider 的 Agent 迁走了。
+    if req.set_default || (is_new && config.providers.len() == 1 && inherited_default.is_none()) {
         config.default_provider = name.clone();
     }
 
@@ -523,7 +664,7 @@ mod tests {
 
         let mut r = req(Some("gateway"), "openai");
         r.base_url = Some("https://proxy.example.com/v1".into());
-        let name = apply_upsert(&mut config, &r).unwrap();
+        let name = apply_upsert(&mut config, &r, None).unwrap();
 
         assert_eq!(name, "gateway");
         let stored = &config.providers["gateway"];
@@ -549,7 +690,7 @@ mod tests {
 
         let mut r = req(Some("gateway"), "qwen");
         r.default_model = Some("qwen3.7-max".into());
-        apply_upsert(&mut config, &r).unwrap();
+        apply_upsert(&mut config, &r, None).unwrap();
 
         let stored = &config.providers["gateway"];
         assert_eq!(stored.provider_type, "qwen");
@@ -562,17 +703,55 @@ mod tests {
         );
     }
 
-    /// 首次新增（表原本为空）→ 自动接管默认位。
+    /// 首次新增（表原本为空）且低层没有可继承的默认 → 自动接管默认位。
     #[test]
-    fn first_provider_becomes_default() {
+    fn first_provider_becomes_default_when_nothing_to_inherit() {
         let mut config = empty_config();
         let mut r = req(Some("openai"), "openai");
         r.api_key = Some("sk-openai".into());
 
-        let name = apply_upsert(&mut config, &r).unwrap();
+        let name = apply_upsert(&mut config, &r, None).unwrap();
 
         assert_eq!(name, "openai");
         assert_eq!(config.default_provider, "openai");
+    }
+
+    /// 低层已有可继承的默认 ⇒ 首条新增不接管，本层文件里保持「没声明默认位」。
+    #[test]
+    fn first_provider_keeps_the_inherited_default() {
+        let mut config = empty_config();
+        config.default_provider.clear();
+        let mut r = req(Some("qwen-side"), "qwen");
+        r.api_key = Some("sk-qwen".into());
+
+        let name = apply_upsert(&mut config, &r, Some("peco-shared")).unwrap();
+
+        assert_eq!(name, "qwen-side");
+        assert_eq!(
+            config.default_provider, "",
+            "没接管就该保持未声明，保存时才不会写出 default_provider"
+        );
+
+        r.set_default = true;
+        apply_upsert(&mut config, &r, Some("peco-shared")).unwrap();
+        assert_eq!(
+            config.default_provider, "qwen-side",
+            "显式 set_default 一定接管，与低层有没有默认无关"
+        );
+    }
+
+    /// 低层有默认但不是首条新增 ⇒ 同样不接管。
+    #[test]
+    fn inherited_default_is_irrelevant_for_later_entries() {
+        let mut config = empty_config();
+        config
+            .providers
+            .insert("gateway".into(), entry("openai", Some("sk"), None));
+        config.default_provider.clear();
+
+        apply_upsert(&mut config, &req(Some("qwen"), "qwen"), None).unwrap();
+
+        assert_eq!(config.default_provider, "");
     }
 
     /// 非首个新增不抢默认位；显式 `set_default` 才接管。
@@ -586,11 +765,11 @@ mod tests {
 
         let mut r = req(Some("qwen"), "qwen");
         r.api_key = Some("sk-qwen".into());
-        apply_upsert(&mut config, &r).unwrap();
+        apply_upsert(&mut config, &r, None).unwrap();
         assert_eq!(config.default_provider, "gateway");
 
         r.set_default = true;
-        apply_upsert(&mut config, &r).unwrap();
+        apply_upsert(&mut config, &r, None).unwrap();
         assert_eq!(config.default_provider, "qwen");
     }
 
@@ -598,7 +777,7 @@ mod tests {
     #[test]
     fn unsupported_type_is_a_client_error() {
         let mut config = empty_config();
-        let err = apply_upsert(&mut config, &req(None, "anthropic")).unwrap_err();
+        let err = apply_upsert(&mut config, &req(None, "anthropic"), None).unwrap_err();
         assert_eq!(err.code(), "invalid_argument");
         assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
         assert!(err.to_string().contains("deepseek"), "{err}");
@@ -611,7 +790,7 @@ mod tests {
         let mut config = empty_config();
         let mut r = req(Some("qwen"), "qwen");
         r.api = Some("anthropic".into());
-        let err = apply_upsert(&mut config, &r).unwrap_err();
+        let err = apply_upsert(&mut config, &r, None).unwrap_err();
         assert_eq!(err.code(), "invalid_argument");
         assert!(err.to_string().contains("qwen"), "{err}");
     }
@@ -703,12 +882,40 @@ mod tests {
     }
 
     /// 文件缺失时给空表（团队还没配过 provider 是常态，不是错误）。
+    ///
+    /// 默认位留空：没写这个键的层不声明默认，保存时也就不该写出它。
     #[test]
     fn missing_file_loads_empty() {
         let dir = tempfile::tempdir().unwrap();
         let config = load_user_providers(&dir.path().join(PROVIDERS_FILE)).unwrap();
         assert!(config.providers.is_empty());
-        assert_eq!(config.default_provider, "deepseek");
+        assert_eq!(config.default_provider, "");
+    }
+
+    /// 文件写了 `default_provider` 才是本层声明的默认位，读回时必须保留。
+    #[test]
+    fn declared_default_provider_survives_a_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROVIDERS_FILE);
+        std::fs::write(
+            &path,
+            "default_provider = \"gateway\"\n\n[providers.gateway]\ntype = \"openai\"\n",
+        )
+        .unwrap();
+
+        let config = load_user_providers(&path).unwrap();
+        assert_eq!(config.default_provider, "gateway");
+    }
+
+    /// 没写 `default_provider` 的文件读回来仍是「未声明」，不是 serde 的默认值。
+    #[test]
+    fn undeclared_default_provider_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROVIDERS_FILE);
+        std::fs::write(&path, "[providers.gateway]\ntype = \"openai\"\n").unwrap();
+
+        let config = load_user_providers(&path).unwrap();
+        assert_eq!(config.default_provider, "");
     }
 
     /// 损坏的用户文件是用户可修的输入错误 ⇒ 400，不是 500。

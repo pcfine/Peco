@@ -26,11 +26,17 @@ import { errorText } from "@/lib/api";
 
 interface NewAgentFormProps {
   wsId: string;
+  teamId: string;
   onCancel: () => void;
   onCreated: (agentId: string) => void;
 }
 
-function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
+function NewAgentForm({
+  wsId,
+  teamId,
+  onCancel,
+  onCreated,
+}: NewAgentFormProps) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState<NewAgentDraft>(EMPTY_NEW_AGENT);
 
@@ -96,6 +102,7 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
 
       <div className="grid grid-cols-2 gap-2">
         <AgentModelPicker
+          teamId={teamId}
           provider={draft.provider}
           model={draft.model}
           onProviderChange={(provider) => update({ provider })}
@@ -141,6 +148,7 @@ function NewAgentForm({ wsId, onCancel, onCreated }: NewAgentFormProps) {
 
 interface NewAgentDialogProps {
   wsId: string;
+  teamId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (agentId: string) => void;
@@ -148,6 +156,7 @@ interface NewAgentDialogProps {
 
 export function NewAgentDialog({
   wsId,
+  teamId,
   open,
   onOpenChange,
   onCreated,
@@ -163,6 +172,7 @@ export function NewAgentDialog({
         </DialogHeader>
         <NewAgentForm
           wsId={wsId}
+          teamId={teamId}
           onCancel={() => onOpenChange(false)}
           onCreated={(agentId) => {
             // 先关再选：关掉即卸载表单，下次打开是干净的一份。

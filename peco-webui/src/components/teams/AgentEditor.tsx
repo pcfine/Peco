@@ -106,6 +106,8 @@ function CapabilityGroup({
 
 interface AgentEditorProps {
   wsId: string;
+  /** provider 配置按团队取；`wsId` 只是能力根的请求头。 */
+  teamId: string;
   agentId: string;
   isMaster: boolean;
   /** 删除确认框归列表所有（卡上也能删），这里只负责把请求递出去。 */
@@ -114,6 +116,7 @@ interface AgentEditorProps {
 
 export function AgentEditor({
   wsId,
+  teamId,
   agentId,
   isMaster,
   onRequestDelete,
@@ -202,6 +205,7 @@ export function AgentEditor({
         <ConfigSection title="模型">
           <div className="grid grid-cols-1 gap-2 @min-[560px]/team:grid-cols-2">
             <AgentModelPicker
+              teamId={teamId}
               provider={current.provider}
               model={current.model}
               onProviderChange={(provider) => update({ provider })}

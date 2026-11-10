@@ -6,11 +6,28 @@ import type { CreateTeamRequest } from "@/types/daemon";
 
 export const teamsKey = ["teams"] as const;
 
+/**
+ * 含保留团队 Peco 的独立 key。
+ *
+ * 不复用 `teamsKey`：那份清单是团队列表页与各处团队选择器的来源，多出一个 Peco
+ * 会改变它们的语义。`teamsKey` 是它的前缀，团队增删照样能把它一起失效掉。
+ */
+export const teamsWithPecoKey = ["teams", "include=peco"] as const;
+
 /** 团队清单。 */
 export function useTeams() {
   return useQuery({
     queryKey: teamsKey,
-    queryFn: listTeams,
+    queryFn: () => listTeams(),
+    staleTime: 60_000,
+  });
+}
+
+/** 团队清单 + 保留团队 Peco：只有要选「哪一层配置」的地方需要它。 */
+export function useTeamsWithPeco() {
+  return useQuery({
+    queryKey: teamsWithPecoKey,
+    queryFn: () => listTeams({ includePeco: true }),
     staleTime: 60_000,
   });
 }

@@ -65,6 +65,8 @@ export interface Team {
   icon: string;
   agents: string[];
   bound_spaces: string[];
+  /** 保留团队（Peco）标记：默认清单不含它，`?include=peco` 才带。 */
+  reserved?: boolean;
   /** 计数由服务端聚合；缺失时显示「–」。 */
   agent_count?: number;
   skill_count?: number;

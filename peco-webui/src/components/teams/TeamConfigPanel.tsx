@@ -257,7 +257,11 @@ export function TeamConfigPanel({
             ))}
 
           {tab === "agents" && wsId && (
-            <TeamAgentsTab wsId={wsId} noMaster={!detail.has_master} />
+            <TeamAgentsTab
+              wsId={wsId}
+              teamId={detail.id}
+              noMaster={!detail.has_master}
+            />
           )}
           {tab === "skills" && wsId && <TeamSkillsTab wsId={wsId} />}
           {tab === "mcp" && wsId && <TeamMcpTab wsId={wsId} />}
