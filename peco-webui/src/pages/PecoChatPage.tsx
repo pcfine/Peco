@@ -324,18 +324,12 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
                   modes={SPACE_PANEL_MODES.peco}
                   inflight={inflight}
                   chatCollapsed={panel.chatCollapsed}
-                  standalone={panel.chatCollapsed}
                   onSelect={panel.selectMode}
                   onExpandChat={toggleChat}
                   onCollapsePanel={togglePanel}
                   expandChatRef={expandChatRef}
                 />
-                <div
-                  className={cn(
-                    "@container/panel min-h-0 flex-1",
-                    panel.chatCollapsed && "mx-auto w-full max-w-mid px-3",
-                  )}
-                >
+                <div className="@container/panel min-h-0 flex-1">
                   {panel.mode === "files" && unavailable ? (
                     unavailable
                   ) : (

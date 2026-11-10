@@ -1,10 +1,10 @@
 // 右栏头部：三个模式 tab + 折叠开关，与对话列头部同高、border-b 连成一条线。
 //
 // 对话列收起后左头随它一起消失，「展开对话」只能落在这里 —— 两块各自是对方的回来路径。
-// 右栏独占整行时，头部与内容按同一条 880 轴居中，否则 tab 与内容各靠一边。
+// 头部始终贴满右栏，tab 靠左、折叠靠右；右栏独占整行时内容同样吃满，两侧不会错开。
 
 import type { Ref } from "react";
-import { PanelLeftOpen, PanelRightClose } from "lucide-react";
+import { CircleChevronRight } from "lucide-react";
 import { SpaceHeaderIconButton } from "@/components/spaces/SpaceHeaderIconButton";
 import {
   SPACE_PANEL_LABELS,
@@ -19,7 +19,6 @@ interface SpacePanelHeaderProps {
   /** 在飞任务数；0 时不出角标 —— 「任务 0」比不写更吵。 */
   inflight: number;
   chatCollapsed: boolean;
-  standalone: boolean;
   onSelect: (mode: SpacePanelMode) => void;
   onExpandChat: () => void;
   onCollapsePanel: () => void;
@@ -32,7 +31,6 @@ export function SpacePanelHeader({
   modes,
   inflight,
   chatCollapsed,
-  standalone,
   onSelect,
   onExpandChat,
   onCollapsePanel,
@@ -40,17 +38,12 @@ export function SpacePanelHeader({
 }: SpacePanelHeaderProps) {
   return (
     <header className="flex h-12 shrink-0 items-center border-b border-line px-3">
-      <div
-        className={cn(
-          "flex w-full min-w-0 items-center gap-0.5",
-          standalone && "mx-auto max-w-mid",
-        )}
-      >
+      <div className="flex w-full min-w-0 items-center gap-0.5">
         {chatCollapsed && (
           <SpaceHeaderIconButton
             ref={expandChatRef}
             label="展开对话"
-            icon={PanelLeftOpen}
+            icon={CircleChevronRight}
             onClick={onExpandChat}
           />
         )}
@@ -82,7 +75,7 @@ export function SpacePanelHeader({
         <div className="ml-auto flex shrink-0 items-center">
           <SpaceHeaderIconButton
             label="收起右栏"
-            icon={PanelRightClose}
+            icon={CircleChevronRight}
             onClick={onCollapsePanel}
           />
         </div>

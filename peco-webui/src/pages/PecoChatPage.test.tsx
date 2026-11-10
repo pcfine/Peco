@@ -285,8 +285,8 @@ describe("Peco 主区", () => {
     );
     const panel = screen.getByTestId("peco-panel");
     expect(panel).toHaveClass("flex-1");
-    // 独占时内容按 880 居中，与空间页同一条轴。
-    expect((panel.lastElementChild as HTMLElement).className).toContain(
+    // 独占时内容吃满整行，与空间页同一口径。
+    expect((panel.lastElementChild as HTMLElement).className).not.toContain(
       "max-w-mid",
     );
     expect(screen.getByRole("button", { name: "展开对话" })).toHaveFocus();

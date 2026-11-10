@@ -1,11 +1,12 @@
 // 对话列头部：状态点 + 工作名称 + 团队 + 图标组，一行 48px。
 //
-// 名称可能很长而团队名很短，所以截断落在 h1 上、团队名整体让位；
-// 图标组永远靠右，不随名称长短漂移。整行与聊天正文同宽同轴：标题、消息与
-// composer 落在同一条竖线上，两侧留白随列宽收放。
+// 两个折叠入口贴着头的两端：「收起对话」在最左，「展开右栏」在最右。
+// 两道边槽同宽，中间内容行仍是 `mx-auto max-w-chat` —— 一边收放时按钮不挪位，
+// 标题、消息与 composer 也继续落在同一条竖线上。名称可能很长而团队名很短，
+// 所以截断落在 h1 上、团队名整体让位；图标组不随名称长短漂移。
 
 import type { ReactNode, Ref } from "react";
-import { Eraser, PanelLeftClose, PanelRightOpen } from "lucide-react";
+import { CircleChevronLeft, Eraser } from "lucide-react";
 import { Link } from "react-router-dom";
 import { SpaceHeaderIconButton } from "@/components/spaces/SpaceHeaderIconButton";
 import {
@@ -61,6 +62,14 @@ export function SpaceChatHeader({
 }: SpaceChatHeaderProps) {
   return (
     <header className="flex h-12 shrink-0 items-center border-b border-line px-4">
+      {/* 两道边界槽同宽（size-7 = 一枚图标按钮）：内容行因此仍以列中心为轴。 */}
+      <div className="flex w-7 shrink-0 items-center">
+        <SpaceHeaderIconButton
+          label="收起对话"
+          icon={CircleChevronLeft}
+          onClick={onCollapseChat}
+        />
+      </div>
       <div className="mx-auto flex w-full max-w-chat min-w-0 items-center gap-2">
         <SpaceStatusMark group={spaceGroupOf(space)} />
         <h1
@@ -86,20 +95,17 @@ export function SpaceChatHeader({
             disabled={clearDisabled || clearDisabledReason !== undefined}
             onClick={onClearConversation}
           />
-          {panelCollapsed && (
-            <SpaceHeaderIconButton
-              ref={expandPanelRef}
-              label="展开右栏"
-              icon={PanelRightOpen}
-              onClick={onExpandPanel}
-            />
-          )}
-          <SpaceHeaderIconButton
-            label="收起对话"
-            icon={PanelLeftClose}
-            onClick={onCollapseChat}
-          />
         </div>
+      </div>
+      <div className="flex w-7 shrink-0 items-center justify-end">
+        {panelCollapsed && (
+          <SpaceHeaderIconButton
+            ref={expandPanelRef}
+            label="展开右栏"
+            icon={CircleChevronLeft}
+            onClick={onExpandPanel}
+          />
+        )}
       </div>
     </header>
   );

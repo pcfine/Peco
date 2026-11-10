@@ -167,9 +167,6 @@ export function SpaceDetailPage() {
     );
   }
 
-  // 独占时右栏是唯一的一块：它接手整行，内容按 880 居中而不是拉满。
-  const solePanel = panel.chatCollapsed;
-
   return (
     <div className="flex h-full min-h-0">
       <div
@@ -220,18 +217,13 @@ export function SpaceDetailPage() {
             modes={SPACE_PANEL_MODES.space}
             inflight={inflight}
             chatCollapsed={panel.chatCollapsed}
-            standalone={solePanel}
             onSelect={panel.selectMode}
             onExpandChat={toggleChat}
             onCollapsePanel={togglePanel}
             expandChatRef={expandChatRef}
           />
-          <div
-            className={cn(
-              "@container/panel min-h-0 flex-1",
-              solePanel && "mx-auto w-full max-w-mid px-3",
-            )}
-          >
+          {/* 收起对话后右栏接手整行：内容跟着吃满可用宽度，不再按 880 居中留白。 */}
+          <div className="@container/panel min-h-0 flex-1">
             <SpaceSidePanel wsId={wsId} mode={panel.mode} />
           </div>
         </aside>

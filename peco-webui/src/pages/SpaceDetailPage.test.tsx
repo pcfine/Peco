@@ -452,6 +452,46 @@ describe("空间聊天页", () => {
     });
   });
 
+  it("折叠入口贴着头两端：收起对话在左，右栏开关在右，收起右栏后不挪位", async () => {
+    renderDetail();
+    await screen.findByTestId("space-chat-shell");
+
+    const chatHeader = () =>
+      screen
+        .getByTestId("space-chat-column")
+        .querySelector("header") as HTMLElement;
+
+    // 双开时右栏开关在右栏头的最右，聊天头右槽空着但宽度照留。
+    expect(chatHeader().children).toHaveLength(3);
+    expect(
+      within(chatHeader().children[0] as HTMLElement).getByRole("button", {
+        name: "收起对话",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(chatHeader().children[2] as HTMLElement).queryByRole("button"),
+    ).toBeNull();
+    const panelHeader = screen
+      .getByTestId("space-panel")
+      .querySelector("header") as HTMLElement;
+    expect(
+      within(panelHeader).getAllByRole("button").at(-1),
+    ).toHaveAccessibleName("收起右栏");
+
+    // 收起右栏：右端原地换成「展开右栏」，左端仍是「收起对话」。
+    fireEvent.click(screen.getByRole("button", { name: "收起右栏" }));
+    expect(
+      within(chatHeader().children[0] as HTMLElement).getByRole("button", {
+        name: "收起对话",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(chatHeader().children[2] as HTMLElement).getByRole("button", {
+        name: "展开右栏",
+      }),
+    ).toBeInTheDocument();
+  });
+
   it("收起对话：右栏接手整行，聊天壳留着不卸载；点「展开对话」回到双开", async () => {
     renderDetail();
     await screen.findByTestId("space-chat-shell");
@@ -477,8 +517,8 @@ describe("空间聊天页", () => {
     expect(panel).toHaveClass("flex-1");
     expect(panel).toHaveClass("basis-0");
     expect(panel).not.toHaveClass("w-80");
-    // 独占时内容按 880 居中，不是拉满整行。
-    expect((panel.lastElementChild as HTMLElement).className).toContain(
+    // 独占时 tab 内容跟着吃满整行，不再按 880 居中留白。
+    expect((panel.lastElementChild as HTMLElement).className).not.toContain(
       "max-w-mid",
     );
     expect(storedPanel()).toEqual({
@@ -830,7 +870,9 @@ describe("空间聊天页", () => {
     expect(
       (shell.parentElement as HTMLElement).className.split(/\s+/),
     ).toContain("px-4");
-    const row = header.firstElementChild as HTMLElement;
+    // 三条：左边界槽、居中内容行、右边界槽。内容行以列中心为轴。
+    expect(header.children).toHaveLength(3);
+    const row = header.querySelector(".max-w-chat") as HTMLElement;
     expect(row.className).toContain("mx-auto");
     expect(row.className).toContain("max-w-chat");
     // h1 在这一行里：标题与消息落在同一条竖线上。
