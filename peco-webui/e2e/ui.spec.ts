@@ -478,7 +478,6 @@ async function pathOf(page: Page): Promise<string> {
   return page.evaluate(() => `${location.pathname}${location.search}`);
 }
 
-/** 空间行容器（主按钮 / 状态链接 / × 三个动作的父节点）。 */
 function spaceRow(page: Page, wsId: string) {
   return page
     .locator(`[data-space-row][data-ws-id="${wsId}"]`)
@@ -629,7 +628,7 @@ test("首屏：/ 落到 /peco，无白屏与报错", async ({ browser }) => {
   }
 });
 
-test("左栏：打开集渲染、主点击进聊天、状态页链接、× 只移出不关空间", async ({
+test("左栏：打开集渲染、主点击进聊天、× 只移出不关空间", async ({
   browser,
 }) => {
   const session = await openSession(browser, {
@@ -666,17 +665,17 @@ test("左栏：打开集渲染、主点击进聊天、状态页链接、× 只�
       208,
       `实测 ${initial.rail?.width}px`,
     );
-    check("B4", "激活行 = 预置的 activeWsId", initial.active, [ACTIVE_WS]);
-
-    const statusHref = await spaceRow(page, ACTIVE_WS)
-      .getByRole("link", { name: /状态$/ })
-      .getAttribute("href");
     check(
-      "B5",
-      "「状态」链接指向 /spaces/:wsId/status",
-      statusHref,
-      `/spaces/${ACTIVE_WS}/status`,
+      "B4",
+      "在 /peco 时没有空间行处于激活态（边框只跟当前路由）",
+      initial.active,
+      [],
     );
+
+    const recentDots = await spaceRow(page, ACTIVE_WS)
+      .getByRole("img", { name: "最近打开" })
+      .count();
+    check("B5", "蓝点落在预置的 activeWsId 行", recentDots, 1);
 
     const target = "ws_demo_finance";
     await page.locator(`[data-space-row][data-ws-id="${target}"]`).click();

@@ -38,6 +38,7 @@ const spaces: Space[] = [
   space({ ws_id: "ws_peco", team_id: "peco", label: "Peco", reserved: true }),
   space({ ws_id: "ws_a", label: "空间 A" }),
   space({ ws_id: "ws_b", label: "空间 B" }),
+  space({ ws_id: "ws_c", label: "空间 C", inflight_dispatch: 2 }),
 ];
 
 vi.mock("@/api/peco", () => ({
@@ -133,14 +134,6 @@ describe("左栏打开集", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("「状态」链接指向该空间的状态页", async () => {
-    renderRail();
-
-    expect(
-      await screen.findByRole("link", { name: "空间 A 状态" }),
-    ).toHaveAttribute("href", "/spaces/ws_a/status");
-  });
-
   it("主点击切激活态并进聊天页，不重发 ensure", async () => {
     renderRail();
 
@@ -228,7 +221,7 @@ describe("左栏打开集", () => {
     expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces\/ws_b$/);
   });
 
-  it("收起态保留行与全名 title，隐藏「状态」与 ×", async () => {
+  it("收起态保留行与全名 title，只留首字标记", async () => {
     renderRail(true);
 
     const row = await screen.findByRole("button", {
@@ -237,14 +230,78 @@ describe("左栏打开集", () => {
     expect(row).toHaveAttribute("title", "空间 A");
     expect(screen.queryByRole("link", { name: "空间 A 状态" })).toBeNull();
     expect(screen.queryByRole("button", { name: "从打开列表移除" })).toBeNull();
+    expect(screen.queryByLabelText("最近打开")).toBeNull();
+    expect(screen.getByText("空")).toBeInTheDocument();
   });
 
-  it("「打开空间」进工作室页", async () => {
+  it("蓝点只点最近打开的那一行，其余空间留同宽空槽", async () => {
+    useOpenSpacesStore.setState({
+      openIds: ["ws_a", "ws_b"],
+      activeWsId: "ws_a",
+      seeded: true,
+    });
     renderRail();
 
-    expect(
-      await screen.findByRole("link", { name: "打开空间" }),
-    ).toHaveAttribute("href", "/spaces");
+    const recentRow = await screen.findByRole("button", {
+      name: "空间 A（团队 research）",
+    });
+    expect(screen.getByLabelText("最近打开")).toBeInTheDocument();
+    expect(recentRow).toContainElement(screen.getByLabelText("最近打开"));
+
+    const otherRow = screen.getByRole("button", {
+      name: "空间 B（团队 research）",
+    });
+    expect(otherRow).not.toContainElement(screen.getByLabelText("最近打开"));
+  });
+
+  it("最近打开的行有在飞任务时，照常给数量徽标", async () => {
+    useOpenSpacesStore.setState({
+      openIds: ["ws_c"],
+      activeWsId: "ws_c",
+      seeded: true,
+    });
+    renderRail();
+
+    await screen.findByRole("button", { name: "空间 C（团队 research）" });
+    expect(screen.getByLabelText("最近打开")).toBeInTheDocument();
+    expect(screen.getByLabelText("2 个任务在飞")).toHaveTextContent("2");
+  });
+
+  it("边框只跟当前路由：在团队页时空间行不高亮，团队入口高亮", async () => {
+    renderRail(false, "/teams");
+
+    const teamLink = await screen.findByRole("link", { name: /团队/ });
+    expect(teamLink).toHaveClass("bg-brand/10");
+
+    const row = await screen.findByRole("button", {
+      name: "空间 A（团队 research）",
+    });
+    expect(row.parentElement?.className).not.toContain("bg-brand/10");
+    expect(row).not.toHaveAttribute("aria-current");
+    expect(screen.getByLabelText("最近打开")).toBeInTheDocument();
+  });
+
+  it("边框只跟当前路由：空间页高亮空间行，工作室入口不高亮", async () => {
+    renderRail(false, "/spaces/ws_a");
+
+    const row = await screen.findByRole("button", {
+      name: "空间 A（团队 research）",
+    });
+    expect(row.parentElement?.className).toContain("bg-brand/10");
+    expect(row).toHaveAttribute("aria-current", "true");
+    expect(screen.getByRole("link", { name: "工作室" })).not.toHaveClass(
+      "bg-brand/10",
+    );
+  });
+
+  it("收起态保留栏目图标，文字退到 title / aria-label", async () => {
+    renderRail(true);
+
+    for (const name of ["工作室", "团队", "成果", "定时任务"]) {
+      const link = await screen.findByRole("link", { name });
+      expect(link).toHaveAttribute("title", name);
+      expect(link).toHaveAttribute("href");
+    }
   });
 
   it("不在 Peco 页时点 Peco 行：进 /peco 聊天并把请求归属切回 Peco", async () => {

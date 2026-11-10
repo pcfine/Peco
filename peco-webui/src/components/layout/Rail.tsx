@@ -1,5 +1,6 @@
 // 左栏：品牌 / Peco / 打开集 / 工作室·团队·成果 / 固定底栏。
-// 打开集是唯一的空间列表 —— 未打开的空间只在工作室页里，左栏不是索引。
+// 打开集是唯一的空间列表 —— 未打开的空间只在工作室页里，左栏不是索引；
+// 「工作室」入口同时承担打开空间。
 
 import { type KeyboardEvent } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -10,9 +11,9 @@ import {
   Package,
   PanelLeftClose,
   PanelLeftOpen,
-  Plus,
   Settings,
   Sun,
+  UserCog,
   Users,
 } from "lucide-react";
 import { BrandMark } from "@/components/common/BrandMark";
@@ -29,6 +30,20 @@ import { useUiStore } from "@/stores/uiStore";
 import { isToday } from "@/lib/relative";
 import { cn } from "@/lib/utils";
 import type { Space } from "@/types/daemon";
+
+/**
+ * 当前路由落在哪个空间上：详情页与状态页都算这个空间。
+ * `/spaces`、`/spaces/new` 是工作室栏目，不归到任何空间行。
+ */
+function spaceIdInPath(pathname: string): string | null {
+  const match = /^\/spaces\/([^/]+)(?:\/status)?$/.exec(pathname);
+  if (!match || match[1] === "new") return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
 
 export function Rail({
   collapsed = false,
@@ -107,6 +122,25 @@ export function Rail({
     rowNodes[Math.min(Math.max(next, 0), rowNodes.length - 1)]?.focus();
   };
 
+  // 边框只跟当前路由：在哪个栏目/空间，哪一行才高亮。
+  const routeWsId =
+    pathname === "/peco" ? (peco?.ws_id ?? null) : spaceIdInPath(pathname);
+  const onSpacesPage = pathname === "/spaces" || pathname === "/spaces/new";
+  const onTeamsPage = pathname === "/teams" || pathname.startsWith("/teams/");
+  const onResultsPage = pathname === "/results";
+  const onSchedulesPage = pathname === "/schedules";
+  const onSettingsPage = pathname === "/settings";
+
+  // 栏目入口的两种排版共用一串底类：收起态只留图标并居中；激活态与空间行同一枚胶囊。
+  const navRowClass = (active: boolean) =>
+    cn(
+      "mx-2 flex h-8 items-center rounded-[6px] border text-body font-normal transition-colors duration-[120ms]",
+      collapsed ? "justify-center" : "gap-2 px-2",
+      active
+        ? "border-brand/40 bg-brand/10 text-ink"
+        : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
+    );
+
   return (
     // 宽度只能由 `collapsed` 决定：让它跟着内容走，空间一多主区就被挤窄。
     // 左栏压在 Peco 抽屉上：抽屉收起时整块移出视口，它的右半正好落在左栏位置，
@@ -117,55 +151,25 @@ export function Rail({
         collapsed ? "w-16" : "w-52",
       )}
     >
-      {/* 收起态 64 放不下「品牌 + 间距 + 按钮」的展开式内边距：收紧留白并居中，
-          否则标题行会横向溢出压到主区。 */}
-      <div
-        className={cn(
-          "flex h-11 shrink-0 items-center",
-          collapsed ? "justify-center gap-1 px-1" : "gap-2 pl-3 pr-2",
-        )}
-      >
-        {/* 品牌行就是抽屉开关：展开态整块可点，收起态只剩图标。 */}
+      {/* 品牌带使用独立底色，图标居中；这一行只承担 logo 与抽屉开关。 */}
+      <div className="flex h-11 shrink-0 items-center justify-center border-b border-line bg-raised">
+        {/* 品牌行是抽屉开关；工作空间名由下方 Peco 行承担。 */}
         <button
           type="button"
           onClick={toggleDock}
           aria-label="Peco 对话"
+          title="Peco 对话"
           aria-expanded={dockOpen}
           aria-controls="peco-dock"
           className={cn(
-            "flex items-center rounded-[6px] border transition-colors duration-[120ms]",
-            collapsed
-              ? "size-7 justify-center"
-              : "h-8 min-w-0 flex-1 gap-2 px-2",
+            "grid size-8 place-items-center rounded-[6px] border transition-colors duration-[120ms]",
             dockOpen
-              ? "border-brand/40 bg-brand/10 text-ink"
-              : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
+              ? "border-brand/40 bg-brand/10"
+              : "border-transparent hover:bg-line/50",
           )}
         >
-          <BrandMark size={20} />
-          {!collapsed && (
-            <span className="min-w-0 truncate text-heading font-semibold">
-              Peco
-            </span>
-          )}
+          <BrandMark size={24} />
         </button>
-        {collapsible && (
-          <button
-            type="button"
-            onClick={() => setRailOpen(!railOpen)}
-            aria-label={railOpen ? "折叠左栏" : "展开左栏"}
-            className={cn(
-              "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
-              !collapsed && "ml-auto",
-            )}
-          >
-            {railOpen ? (
-              <PanelLeftClose className="h-4 w-4" />
-            ) : (
-              <PanelLeftOpen className="h-4 w-4" />
-            )}
-          </button>
-        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto" onKeyDown={moveFocus}>
@@ -175,19 +179,19 @@ export function Rail({
             <button
               type="button"
               onClick={openPeco}
-              aria-current={activeWsId === peco.ws_id ? "true" : undefined}
+              aria-current={routeWsId === peco.ws_id ? "true" : undefined}
               aria-label="Peco"
               title="Peco"
               data-space-row=""
               className={cn(
                 "flex h-8 w-full items-center rounded-[6px] border font-normal transition-colors duration-[120ms]",
                 collapsed ? "justify-center" : "gap-2 px-2",
-                activeWsId === peco.ws_id
+                routeWsId === peco.ws_id
                   ? "border-brand/40 bg-brand/10 text-ink"
                   : "border-transparent text-ink-muted hover:bg-line/50 hover:text-ink",
               )}
             >
-              <BrandMark size={14} />
+              <UserCog className="h-4 w-4 shrink-0" />
               {!collapsed && (
                 <span className="min-w-0 truncate text-body">Peco</span>
               )}
@@ -202,104 +206,134 @@ export function Rail({
             key={space.ws_id}
             space={space}
             collapsed={collapsed}
-            active={activeWsId === space.ws_id}
+            active={routeWsId === space.ws_id}
+            recent={activeWsId === space.ws_id}
             onSelect={() => activateSpace(space.ws_id)}
             onRemove={() => removeSpace(space.ws_id)}
           />
         ))}
+        {rows.length > 0 && <div className="mx-2 my-1 h-px bg-line" />}
+
+        {/* 栏目入口在收起态只留图标，文字由 title / aria-label 承担；
+            「工作室」同时是打开空间的入口。 */}
         <Link
           to="/spaces"
-          title={collapsed ? "打开空间" : undefined}
-          aria-label={collapsed ? "打开空间" : undefined}
-          className={cn(
-            "mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-faint hover:bg-line/50 hover:text-ink",
-            collapsed ? "justify-center" : "",
-          )}
+          title={collapsed ? "工作室" : undefined}
+          aria-label={collapsed ? "工作室" : undefined}
+          aria-current={onSpacesPage ? "page" : undefined}
+          className={navRowClass(onSpacesPage)}
         >
-          <Plus className="h-4 w-4 shrink-0" />
-          {!collapsed && "打开空间"}
+          <LayoutGrid className="h-4 w-4 shrink-0" />
+          {!collapsed && "工作室"}
         </Link>
-
-        <div className="mx-2 my-1 h-px bg-line" />
-
-        {!collapsed && (
-          <Link
-            to="/spaces"
-            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
-          >
-            <LayoutGrid className="h-4 w-4 shrink-0" />
-            工作室
-          </Link>
-        )}
-        {!collapsed && (
-          <Link
-            to="/teams"
-            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
-          >
-            <Users className="h-4 w-4 shrink-0" />
-            团队
-            <span className="ml-auto tabular-nums text-2xs text-ink-faint">
-              {teams?.length ?? 0}
-            </span>
-          </Link>
-        )}
-        {!collapsed && (
-          <Link
-            to="/results"
-            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
-          >
-            <Package className="h-4 w-4 shrink-0" />
-            成果
-            <span
-              title={`今日 ${todayResults}`}
-              className="ml-auto tabular-nums text-caption font-medium text-ink-faint"
-            >
-              {todayResults}
-            </span>
-          </Link>
-        )}
-        {!collapsed && (
-          <Link
-            to="/schedules"
-            className="mx-2 flex h-8 items-center gap-2 rounded-[6px] border border-transparent px-2 text-body font-normal text-ink-muted hover:bg-line/50 hover:text-ink"
-          >
-            <Clock className="h-4 w-4 shrink-0" />
-            定时任务
-          </Link>
-        )}
-      </div>
-
-      {/* 收起态 64 宽：两块 24 的按钮加上间距正好放得下，内边距要收窄。 */}
-      <div
-        className={cn(
-          "flex h-11 shrink-0 items-center border-t border-line",
-          collapsed ? "justify-center gap-1 px-1" : "px-2",
-        )}
-      >
-        <button
-          type="button"
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-          aria-label={theme === "dark" ? "切到亮色" : "切到暗色"}
-          className="grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
-        >
-          {theme === "dark" ? (
-            <Sun className="h-4 w-4" />
-          ) : (
-            <Moon className="h-4 w-4" />
-          )}
-        </button>
         <Link
-          to="/settings"
-          title="设置"
-          aria-label="设置"
-          className={cn(
-            "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
-            !collapsed && "ml-1",
-          )}
+          to="/teams"
+          title={collapsed ? "团队" : undefined}
+          aria-label={collapsed ? "团队" : undefined}
+          aria-current={onTeamsPage ? "page" : undefined}
+          className={navRowClass(onTeamsPage)}
         >
-          <Settings className="h-4 w-4" />
+          <Users className="h-4 w-4 shrink-0" />
+          {!collapsed && (
+            <>
+              团队
+              <span className="ml-auto tabular-nums text-2xs text-ink-faint">
+                {teams?.length ?? 0}
+              </span>
+            </>
+          )}
+        </Link>
+        <Link
+          to="/results"
+          title={collapsed ? "成果" : undefined}
+          aria-label={collapsed ? "成果" : undefined}
+          aria-current={onResultsPage ? "page" : undefined}
+          className={navRowClass(onResultsPage)}
+        >
+          <Package className="h-4 w-4 shrink-0" />
+          {!collapsed && (
+            <>
+              成果
+              <span
+                title={`今日 ${todayResults}`}
+                className="ml-auto tabular-nums text-caption font-medium text-ink-faint"
+              >
+                {todayResults}
+              </span>
+            </>
+          )}
+        </Link>
+        <Link
+          to="/schedules"
+          title={collapsed ? "定时任务" : undefined}
+          aria-label={collapsed ? "定时任务" : undefined}
+          aria-current={onSchedulesPage ? "page" : undefined}
+          className={navRowClass(onSchedulesPage)}
+        >
+          <Clock className="h-4 w-4 shrink-0" />
+          {!collapsed && "定时任务"}
         </Link>
       </div>
+
+      {/* 底栏：展开态主题与设置靠左、折叠靠右；收起态只留最底部的折叠按钮。 */}
+      {(!collapsed || collapsible) && (
+        <div
+          className={cn(
+            "shrink-0 border-t border-line",
+            collapsed
+              ? "flex items-center justify-center py-1"
+              : "flex h-11 items-center px-2",
+          )}
+        >
+          {!collapsed && (
+            <>
+              <button
+                type="button"
+                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                aria-label={theme === "dark" ? "切到亮色" : "切到暗色"}
+                className="grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
+              >
+                {theme === "dark" ? (
+                  <Sun className="h-4 w-4" />
+                ) : (
+                  <Moon className="h-4 w-4" />
+                )}
+              </button>
+              <Link
+                to="/settings"
+                title="设置"
+                aria-label="设置"
+                aria-current={onSettingsPage ? "page" : undefined}
+                className={cn(
+                  "ml-1 grid h-6 w-6 place-items-center rounded-[4px] hover:bg-line",
+                  onSettingsPage
+                    ? "bg-brand/10 text-ink"
+                    : "text-ink-faint hover:text-ink",
+                )}
+              >
+                <Settings className="h-4 w-4" />
+              </Link>
+            </>
+          )}
+          {collapsible && (
+            <button
+              type="button"
+              onClick={() => setRailOpen(!railOpen)}
+              aria-label={railOpen ? "折叠左栏" : "展开左栏"}
+              className={cn(
+                "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
+                !collapsed && "ml-auto",
+              )}
+            >
+              {railOpen ? (
+                <PanelLeftClose className="h-4 w-4" />
+              ) : (
+                <PanelLeftOpen className="h-4 w-4" />
+              )}
+            </button>
+          )}
+        </div>
+      )}
     </aside>
   );
 }

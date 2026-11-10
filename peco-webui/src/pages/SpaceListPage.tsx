@@ -1,4 +1,4 @@
-// `/spaces` 工作室列表：三组行式表（进行中 / 已存在 / 已关闭）。
+// `/spaces` 工作室列表：三组行式表（已打开 / 未打开 / 已关闭）。
 // 组头 sticky 但不做表头 —— 列义明显，4 行表头会吃掉密度。
 
 import { Link } from "react-router-dom";
@@ -37,6 +37,8 @@ function SpaceRow({
   onEnter: () => void;
 }) {
   const name = spaceLabel(space);
+  // 在飞任务含外来；蓝点跟在最近打开（本页即当前）的空间上。
+  const inflight = space.inflight_dispatch + space.inflight_foreign;
   return (
     <li
       data-ws-id={space.ws_id}
@@ -49,7 +51,7 @@ function SpaceRow({
         className="flex h-full min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
       >
         <span className="flex min-w-0 items-center gap-2">
-          <SpaceStatusMark group={spaceGroupOf(space)} />
+          <SpaceStatusMark group={spaceGroupOf(space)} recent={active} />
           <span className="min-w-0 truncate text-sm text-ink">{name}</span>
           {active && (
             <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
@@ -64,7 +66,7 @@ function SpaceRow({
           {space.team_id}
         </span>
         <span className="pl-6 tabular-nums text-caption font-medium text-ink-faint @min-[640px]/work:hidden @min-[900px]/work:block @min-[900px]/work:w-14 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
-          在飞 {space.inflight_dispatch}
+          在飞 {inflight}
         </span>
         <span className="pl-6 tabular-nums text-caption font-medium text-ink-faint @min-[900px]/work:w-24 @min-[900px]/work:shrink-0 @min-[900px]/work:pl-0 @min-[900px]/work:text-right">
           {relativeTime(activityAt)}

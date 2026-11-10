@@ -210,7 +210,7 @@ describe("壳与路由", () => {
     expect(
       await screen.findByRole("heading", { level: 1, name: "工作室" }),
     ).toBeInTheDocument();
-    expect(await screen.findByText(/进行中/)).toBeInTheDocument();
+    expect(await screen.findByText(/已打开/)).toBeInTheDocument();
     expectOnePageH1();
   });
 
@@ -346,17 +346,19 @@ describe("白屏与 rail 宽度", () => {
     }
   });
 
-  it("rail 收起态也能进设置页", async () => {
+  it("rail 收起态不显示设置与主题，底栏只留折叠", async () => {
     const restore = useWideViewport();
     try {
+      setViewport(1440);
       useUiStore.setState({ railOpen: false });
       const view = renderAt("/");
       // 先等壳的数据落地，收尾时就不会留下测试之外的异步 setState。
       expect(await screen.findByTestId("panel-today")).toBeInTheDocument();
-      expect(screen.getByRole("link", { name: "设置" })).toHaveAttribute(
-        "href",
-        "/settings",
-      );
+      expect(screen.queryByRole("link", { name: "设置" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /切到/ })).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "展开左栏" }),
+      ).toBeInTheDocument();
       view.unmount();
     } finally {
       useUiStore.setState({ railOpen: true });

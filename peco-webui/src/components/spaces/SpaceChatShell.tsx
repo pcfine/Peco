@@ -6,7 +6,7 @@
 // 已知限制：离开承载它的路由（`/spaces/:wsId`、`/peco` 或状态页）就会卸载本壳，
 // 在途的流随之中断 —— 应用内跨空间切换不受影响。
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChatView, type ChatMessage } from "@/components/chat/ChatView";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
@@ -23,6 +23,7 @@ import { errorText } from "@/lib/api";
 import { parseServerTimestamp } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useSpaceActivityStore } from "@/stores/spaceActivityStore";
 import type { Message } from "@/types/chat";
 
 /** 台账历史还原成展示层消息：一轮一条 GET 流不区分 turn，故 turnIndex 恒 0。 */
@@ -42,7 +43,6 @@ interface SpaceConversationChatProps {
   visible: boolean;
   /** 空对话的说明要知道自己属于哪个团队；拿不到时退回通用文案。 */
   teamId: string | null;
-  onStreamingChange?: (wsId: string, streaming: boolean) => void;
 }
 
 /** 会话 id 到手之后的聊天本体：历史、流地址与冲突提示都需要它。 */
@@ -51,7 +51,6 @@ function SpaceConversationChat({
   convId,
   visible,
   teamId,
-  onStreamingChange,
 }: SpaceConversationChatProps) {
   const setChat = useConnectionStore((state) => state.setChat);
 
@@ -121,9 +120,8 @@ function SpaceConversationChat({
           // 不必等下一次轮询（dock 头部的对话状态也读同一份）。
           onStreamingChange={(streaming) => {
             setChat(streaming ? { kind: "running" } : { kind: "idle" });
-            // store 里只有一份「谁在跑」：隐藏的空间也写同一个位。要按空间
-            // 判断的调用方（清除对话的可用性）得另收一份带 wsId 的上报。
-            onStreamingChange?.(wsId, streaming);
+            // 连接态只有一份，活动按 wsId 记录；隐藏的壳同样上报，供清除对话的禁用态读取。
+            useSpaceActivityStore.getState().setStreaming(wsId, streaming);
           }}
           composerNotice={<SpaceConflictHint inflight={inflight} />}
           welcomeMessage={welcomeMessage}
@@ -139,18 +137,20 @@ interface SpaceChatShellProps {
   visible: boolean;
   /** 空间所属团队；空对话的说明用它拼出「哪个团队的工作空间」。 */
   teamId?: string | null;
-  /** 这一轮起止的按空间上报；隐藏的壳同样会报，调用方按 wsId 自取。 */
-  onStreamingChange?: (wsId: string, streaming: boolean) => void;
 }
 
 export function SpaceChatShell({
   wsId,
   visible,
   teamId = null,
-  onStreamingChange,
 }: SpaceChatShellProps) {
   const conversation = useSpaceConversation(wsId);
   const convId = conversation.data?.conversation_id ?? null;
+
+  // 壳卸载时这一轮随之中断，活动位必须复位，否则清除按钮会一直不可用。
+  useEffect(() => {
+    return () => useSpaceActivityStore.getState().setStreaming(wsId, false);
+  }, [wsId]);
 
   return (
     <div
@@ -182,7 +182,6 @@ export function SpaceChatShell({
           convId={convId}
           visible={visible}
           teamId={teamId}
-          onStreamingChange={onStreamingChange}
         />
       )}
     </div>

@@ -13,7 +13,7 @@
 // 已知限制：进 `/spaces/:wsId/status` 或 `/peco` 会离开这个路由元素，
 // 隐藏空间的流随组件卸载中断。
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Button } from "@/components/ui/button";
@@ -37,6 +37,7 @@ import { WORK_INLINE_MIN, workWidthOf } from "@/components/layout/shellMetrics";
 import { useViewportWidth } from "@/hooks/useViewportWidth";
 import { useInflightTaskCount, useSpace } from "@/queries/spaceDetail";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
+import { useSpaceStreaming } from "@/stores/spaceActivityStore";
 import { useUiStore } from "@/stores/uiStore";
 import { errorText } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -94,16 +95,10 @@ export function SpaceDetailPage() {
   // 右栏「任务」tab 的角标与聊天壳里的冲突提示读同一份在飞计数（实时优先、台账兜底）。
   const inflight = useInflightTaskCount(wsId);
 
-  // 哪个空间的对话正在跑。`connectionStore.chat` 是全局一份、隐藏空间的流也写它，
-  // 拿它判断本页就会把别人的「进行中」算到自己头上：这里按 wsId 各记一位。
-  const [streamingWs, setStreamingWs] = useState<Record<string, boolean>>({});
-  const setWsStreaming = useCallback((id: string, streaming: boolean) => {
-    setStreamingWs((previous) =>
-      previous[id] === streaming ? previous : { ...previous, [id]: streaming },
-    );
-  }, []);
+  // 对话是否在跑由聊天壳按 wsId 上报到活动 store；清除按钮按 wsId 读取。
+  const streaming = useSpaceStreaming(wsId);
 
-  const clear = useConversationClear(wsId, streamingWs[wsId] ?? false);
+  const clear = useConversationClear(wsId, streaming);
 
   const expandChatRef = useRef<HTMLButtonElement>(null);
   const expandPanelRef = useRef<HTMLButtonElement>(null);
@@ -202,7 +197,6 @@ export function SpaceDetailPage() {
               // 隐藏的壳拿着当前路由空间的团队也无所谓：切到它时路由已换，
               // 这一行会跟着重渲染成正确的团队。
               teamId={space.data.team_id}
-              onStreamingChange={setWsStreaming}
             />
           ))}
         </div>

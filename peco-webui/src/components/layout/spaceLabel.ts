@@ -10,3 +10,12 @@ export function spaceLabel(space: Pick<Space, "label" | "work_dir">): string {
   const parts = space.work_dir.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? space.work_dir;
 }
+
+/**
+ * 收起态的单字标记：取显示名的第一个「字」。
+ *
+ * 用码点而不是下标切：emoji 之类是代理对，按 UTF-16 切会留下半个字。
+ */
+export function spaceInitial(space: Pick<Space, "label" | "work_dir">): string {
+  return Array.from(spaceLabel(space).trim())[0] ?? "·";
+}

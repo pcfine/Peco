@@ -7,13 +7,7 @@
 // 文件模式要一个已打开的 Peco 空间作 `X-Peco-Space`；空间没打开时聊天列与文件模式
 // 统一摆 `PecoClosedNotice`，不各写一句。
 
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
@@ -37,6 +31,7 @@ import { cn } from "@/lib/utils";
 import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
 import { usePecoTodayTasks } from "@/queries/tasks";
+import { useSpaceStreaming } from "@/stores/spaceActivityStore";
 import { useUiStore } from "@/stores/uiStore";
 import type { PecoIdentity, Space } from "@/types/daemon";
 
@@ -148,21 +143,13 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
 
   const unavailable = spaceUnavailableNotice(space, spaceOpen, spaces);
 
-  // 哪个空间的对话正在跑。`connectionStore.chat` 是全局一份，拿它判断本页会把
-  // 别的空间的「进行中」算到自己头上：这里按 wsId 记一位，与空间页同一套写法。
-  const [streamingWs, setStreamingWs] = useState<Record<string, boolean>>({});
-  const setWsStreaming = useCallback((id: string, streaming: boolean) => {
-    setStreamingWs((previous) =>
-      previous[id] === streaming ? previous : { ...previous, [id]: streaming },
-    );
-  }, []);
+  // 对话是否在跑由聊天壳按 wsId 上报到活动 store，与空间页同一份事实。
+  const streaming = useSpaceStreaming(peco.ws_id);
 
   // 空间没打开时不发 ensure：先去「打开」，别让用户在清除对话上先吃一个 409。
-  const clear = useConversationClear(
-    peco.ws_id,
-    streamingWs[peco.ws_id] ?? false,
-    { enabled: spaceOpen },
-  );
+  const clear = useConversationClear(peco.ws_id, streaming, {
+    enabled: spaceOpen,
+  });
 
   const expandChatRef = useRef<HTMLButtonElement>(null);
   const expandPanelRef = useRef<HTMLButtonElement>(null);
@@ -219,7 +206,6 @@ function PecoWorkspace({ peco }: { peco: PecoIdentity }) {
                 wsId={peco.ws_id}
                 visible
                 teamId={space?.team_id ?? peco.team_id}
-                onStreamingChange={setWsStreaming}
               />
             )}
           </div>
