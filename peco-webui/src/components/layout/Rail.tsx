@@ -50,10 +50,7 @@ export function Rail({
   const setActive = useOpenSpacesStore((state) => state.setActive);
   const activateSpace = useActivateSpace();
   const navigate = useNavigate();
-  const { pathname, search } = useLocation();
-  const onPecoConfigFace =
-    pathname === "/peco" &&
-    new URLSearchParams(search).get("face") === "config";
+  const { pathname } = useLocation();
 
   const { data: peco } = usePeco();
   const { data: spaces } = useSpaces();
@@ -75,16 +72,11 @@ export function Rail({
     isToday(task.terminal_at ?? task.created_at),
   ).length;
 
-  // 第一下进聊天，已经在聊天面时第二下翻到能力配置，再点回来 —— Peco 是唯一
-  // 一行「再点一次」有额外含义的入口；空间行仍然只切激活态。
+  // 与空间行一致：只切激活态。Peco 的能力配置从聊天页左头的 `·peco` 链接进团队配置页。
   const openPeco = () => {
     if (!peco) return;
     setActive(peco.ws_id);
-    if (pathname !== "/peco") {
-      navigate("/peco");
-      return;
-    }
-    navigate(onPecoConfigFace ? "/peco" : "/peco?face=config");
+    if (pathname !== "/peco") navigate("/peco");
   };
 
   // `×` 只移出打开集，不关闭空间。移掉的若正是当前空间，激活态不能就此悬空 ——

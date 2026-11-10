@@ -54,7 +54,7 @@ interface SpaceSidePanelProps {
   wsId: string;
   mode: SpacePanelMode;
   variant?: SpacePanelVariant;
-  /** 这一栏是否真的在用户眼前（Peco 翻到配置面时右栏还挂着但看不见）。 */
+  /** 这一栏是否真的在用户眼前（隐藏的栏仍挂载，但不轮询）。 */
   active?: boolean;
 }
 

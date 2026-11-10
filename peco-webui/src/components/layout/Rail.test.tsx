@@ -254,24 +254,22 @@ describe("左栏打开集", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Peco" }));
 
     expect(screen.getByTestId("path")).toHaveTextContent("/peco");
-    expect(screen.getByTestId("path")).not.toHaveTextContent("face=config");
     expect(useSpaceStore.getState().currentWsId).toBe("ws_peco");
   });
 
-  it("已在 Peco 聊天面时再点 Peco 行：翻到能力配置", async () => {
+  it("已在 Peco 页时再点 Peco 行：只保持激活", async () => {
     renderRail();
 
     fireEvent.click(await screen.findByRole("button", { name: "Peco" }));
 
-    expect(screen.getByTestId("path")).toHaveTextContent("/peco?face=config");
+    expect(screen.getByTestId("path")).toHaveTextContent(/^\/peco$/);
   });
 
-  it("在 Peco 能力配置面时点 Peco 行：回到聊天面", async () => {
-    renderRail(false, "/peco?face=config");
+  it("在 Peco 团队配置页时点 Peco 行：回到聊天页", async () => {
+    renderRail(false, "/teams/peco");
 
     fireEvent.click(await screen.findByRole("button", { name: "Peco" }));
 
     expect(screen.getByTestId("path")).toHaveTextContent("/peco");
-    expect(screen.getByTestId("path")).not.toHaveTextContent("face=config");
   });
 });

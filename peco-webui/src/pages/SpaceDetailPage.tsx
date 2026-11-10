@@ -199,6 +199,9 @@ export function SpaceDetailPage() {
               key={id}
               wsId={id}
               visible={id === wsId}
+              // 隐藏的壳拿着当前路由空间的团队也无所谓：切到它时路由已换，
+              // 这一行会跟着重渲染成正确的团队。
+              teamId={space.data.team_id}
               onStreamingChange={setWsStreaming}
             />
           ))}

@@ -63,7 +63,7 @@ vi.mock("@/api/teams", () => ({
   createTeam: vi.fn(),
   updateTeam: vi.fn(),
   deleteTeam: vi.fn(),
-  // Peco 翻转面常驻挂着，`/peco` 一开始就会读它的团队详情。
+  // `/teams/peco` 是 Peco 的配置页：团队详情照样要能取到。
   getTeam: async (teamId: string) => ({
     id: teamId,
     display_name: "Peco",
@@ -205,17 +205,6 @@ describe("壳与路由", () => {
     expectOnePageH1();
   });
 
-  it("/peco?face=config 是能力配置面：顶栏跟着换标题", async () => {
-    renderAt("/peco?face=config");
-    expect(await screen.findByTestId("peco-flip")).toHaveAttribute(
-      "data-face",
-      "config",
-    );
-    await waitFor(() => expectTopBarIndicator("Peco 能力配置"));
-    // 配置面与聊天面常驻，「Peco」只能是唯一那个 h1；团队面板的标题降为 h2。
-    expectOnePageH1();
-  });
-
   it("/spaces 是列表页，空态给一句事实", async () => {
     renderAt("/spaces");
     expect(
@@ -283,24 +272,6 @@ describe("壳与路由", () => {
       await screen.findByRole("heading", { level: 1, name: title }),
     ).toBeInTheDocument();
     expectOnePageH1();
-  });
-
-  // 配置面把整个聊天面 aria-hidden 掉：读屏在这一面拿到的是它自己的标题，
-  // 而大纲里那个 h1 仍是聊天面左头那一行（两块常驻，DOM 不卸载）。
-  it("/peco?face=config 的可见标题是 h2「能力配置」，h1 仍是左头的 Peco", async () => {
-    renderAt("/peco?face=config");
-    expect(await screen.findByTestId("peco-flip")).toHaveAttribute(
-      "data-face",
-      "config",
-    );
-    expect(
-      await screen.findByRole("heading", { level: 2, name: "能力配置" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { level: 1, name: "Peco" }),
-    ).toBeNull();
-    expectOnePageH1();
-    expect(document.querySelector("h1")).toHaveTextContent("Peco");
   });
 
   it("未注册的路径给 404 文案，不是营销页", async () => {

@@ -18,7 +18,7 @@ import {
   uploadConversationImage,
 } from "@/api/conversations";
 import { SPACE_MASTER_AGENT, useSpaceConversation } from "@/queries/spaceChat";
-import { useInflightTaskCount } from "@/queries/spaceDetail";
+import { useInflightTaskCount, useSpaceTasks } from "@/queries/spaceDetail";
 import { errorText } from "@/lib/api";
 import { parseServerTimestamp } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -40,6 +40,8 @@ interface SpaceConversationChatProps {
   wsId: string;
   convId: string;
   visible: boolean;
+  /** 空对话的说明要知道自己属于哪个团队；拿不到时退回通用文案。 */
+  teamId: string | null;
   onStreamingChange?: (wsId: string, streaming: boolean) => void;
 }
 
@@ -48,6 +50,7 @@ function SpaceConversationChat({
   wsId,
   convId,
   visible,
+  teamId,
   onStreamingChange,
 }: SpaceConversationChatProps) {
   const setChat = useConnectionStore((state) => state.setChat);
@@ -64,6 +67,19 @@ function SpaceConversationChat({
   // 隐藏的壳不轮询实时列表：它只影响提示与角标，为此让每个后台空间都发请求
   // 不划算 —— 拿不到时这个 hook 自己回落到台账。
   const inflight = useInflightTaskCount(wsId, { enabled: visible });
+
+  // 空对话的说明只在台账到手后才敢说「还没有执行过任务」：任务也可能由 Peco
+  // 或别的空间派发进来，没有会话不等于没跑过东西。
+  const tasks = useSpaceTasks(wsId);
+  const welcomeMessage = useMemo(() => {
+    if (!teamId) {
+      return "这是这个空间唯一的 @master 对话。让它做事，或者直接问它。";
+    }
+    const team = `「${teamId}」团队`;
+    return tasks.data?.length === 0
+      ? `这是${team}的工作空间，还没有执行过任务。`
+      : `这是${team}的工作空间。让它做事，或者直接问它。`;
+  }, [teamId, tasks.data]);
 
   const initialMessages = useMemo(
     () => toChatMessages(history.data ?? []),
@@ -110,7 +126,7 @@ function SpaceConversationChat({
             onStreamingChange?.(wsId, streaming);
           }}
           composerNotice={<SpaceConflictHint inflight={inflight} />}
-          welcomeMessage="这是这个空间唯一的 @master 对话。让它做事，或者直接问它。"
+          welcomeMessage={welcomeMessage}
         />
       </div>
     </>
@@ -121,6 +137,8 @@ interface SpaceChatShellProps {
   wsId: string;
   /** 只有当前空间可见；隐藏的壳保持挂载与在途 SSE。 */
   visible: boolean;
+  /** 空间所属团队；空对话的说明用它拼出「哪个团队的工作空间」。 */
+  teamId?: string | null;
   /** 这一轮起止的按空间上报；隐藏的壳同样会报，调用方按 wsId 自取。 */
   onStreamingChange?: (wsId: string, streaming: boolean) => void;
 }
@@ -128,6 +146,7 @@ interface SpaceChatShellProps {
 export function SpaceChatShell({
   wsId,
   visible,
+  teamId = null,
   onStreamingChange,
 }: SpaceChatShellProps) {
   const conversation = useSpaceConversation(wsId);
@@ -162,6 +181,7 @@ export function SpaceChatShell({
           wsId={wsId}
           convId={convId}
           visible={visible}
+          teamId={teamId}
           onStreamingChange={onStreamingChange}
         />
       )}

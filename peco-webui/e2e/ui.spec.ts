@@ -1,4 +1,4 @@
-// [浏览器] 档验收：v2 信息架构 —— 左栏打开集、Peco 翻转面、空间页右栏、团队卡片。
+// [浏览器] 档验收：v2 信息架构 —— 左栏打开集、Peco 团队配置、空间页右栏、团队卡片。
 // 全部在真实 Chromium（headless:false，X 下）里量测，每条断言打印「期望 vs 实测」并在末尾汇总。
 //
 // 测量口径固定：暗色主题、rail 展开、右栏展开；打开集与当前空间用 addInitScript 预置到
@@ -176,7 +176,6 @@ interface SessionOptions {
   path: string;
   openIds?: string[];
   activeWsId?: string | null;
-  reduceMotion?: boolean;
   /** 首屏就绪的选择器：等到它出现，后续量测才有意义。 */
   ready: string;
 }
@@ -197,7 +196,6 @@ async function openSession(
   const context = await browser.newContext({
     viewport: options.viewport,
     baseURL: BASE_URL,
-    reducedMotion: options.reduceMotion ? "reduce" : "no-preference",
   });
   const page = await context.newPage();
   const consoleErrors: string[] = [];
@@ -422,37 +420,26 @@ function taskPanelSettled(facts: PanelFacts | null): boolean {
   return facts.fidelity !== null || facts.text.includes("这个空间还没有任务");
 }
 
-interface FlipFacts {
+interface PecoFacts {
   url: string;
-  face: string | null;
-  animating: string | null;
-  motion: string | null;
   tabs: string[];
   overviewPanels: number;
-  assembleButtons: number;
+  newSpaceButtons: number;
 }
 
-async function flipFacts(page: Page): Promise<FlipFacts> {
-  return page.evaluate(() => {
-    const flip = document.querySelector<HTMLElement>(
-      '[data-testid="peco-flip"]',
-    );
-    return {
-      url: `${location.pathname}${location.search}`,
-      face: flip?.dataset.face ?? null,
-      animating: flip?.dataset.animating ?? null,
-      motion: flip?.dataset.motion ?? null,
-      tabs: Array.from(document.querySelectorAll('[role="tab"]')).map((node) =>
-        (node.textContent ?? "").trim(),
-      ),
-      overviewPanels: document.querySelectorAll(
-        '[data-testid="peco-panel"] [data-testid^="panel-"]',
-      ).length,
-      assembleButtons: Array.from(document.querySelectorAll("button")).filter(
-        (node) => (node.textContent ?? "").includes("装配为空间"),
-      ).length,
-    };
-  });
+async function pecoFacts(page: Page): Promise<PecoFacts> {
+  return page.evaluate(() => ({
+    url: `${location.pathname}${location.search}`,
+    tabs: Array.from(document.querySelectorAll('[role="tab"]')).map((node) =>
+      (node.textContent ?? "").trim(),
+    ),
+    overviewPanels: document.querySelectorAll(
+      '[data-testid="peco-panel"] [data-testid^="panel-"]',
+    ).length,
+    newSpaceButtons: Array.from(document.querySelectorAll("button")).filter(
+      (node) => (node.textContent ?? "").includes("新建空间"),
+    ).length,
+  }));
 }
 
 interface TeamFacts {
@@ -489,18 +476,6 @@ async function teamFacts(page: Page): Promise<TeamFacts> {
 
 async function pathOf(page: Page): Promise<string> {
   return page.evaluate(() => `${location.pathname}${location.search}`);
-}
-
-async function attribute(
-  page: Page,
-  selector: string,
-  name: string,
-): Promise<string | null> {
-  return page
-    .locator(selector)
-    .first()
-    .getAttribute(name, { timeout: 500 })
-    .catch(() => null);
 }
 
 /** 空间行容器（主按钮 / 状态链接 / × 三个动作的父节点）。 */
@@ -924,25 +899,32 @@ test("团队页：卡片网格、四个计数、Peco 不在列表", async ({ bro
   }
 });
 
-test("Peco 页：默认聊天面 + 总览，可翻转到配置面", async ({ browser }) => {
+test("Peco 页：默认聊天 + 总览；·peco 链接进团队配置页", async ({
+  browser,
+}) => {
   const session = await openSession(browser, {
     viewport: WIDE,
     path: "/peco",
     openIds: OPEN_IDS,
     activeWsId: ACTIVE_WS,
-    ready: '[data-testid="peco-flip"]',
+    ready: '[data-testid="peco-chat-column"]',
   });
   const { page } = session;
   try {
     const initial = await until(
-      () => flipFacts(page),
-      (facts) => facts.face === "chat",
+      () => pecoFacts(page),
+      (facts) => facts.overviewPanels === 4,
     );
     const panel = await until(
       () => panelFacts(page),
       (facts) => facts !== null,
     );
-    check("E1", "默认在聊天面（data-face=chat）", initial.face, "chat");
+    check(
+      "E1",
+      "默认聊天列在（peco-chat-column）",
+      await page.locator('[data-testid="peco-chat-column"]').count(),
+      1,
+    );
     check("E2", "Peco 右栏默认「总览」", panel?.mode ?? null, "overview");
     check(
       "E3",
@@ -958,83 +940,46 @@ test("Peco 页：默认聊天面 + 总览，可翻转到配置面", async ({ bro
       4,
     );
 
-    await page.getByRole("button", { name: "能力配置" }).click();
-    const animating = await until(
-      () => attribute(page, '[data-testid="peco-flip"]', "data-animating"),
-      (value) => value === "true",
-      5_000,
+    await page.getByRole("link", { name: "·peco" }).click();
+    const config = await until(
+      () => pecoFacts(page),
+      (facts) => facts.url.startsWith("/teams/peco"),
     );
     check(
-      "E5",
-      "点击切换时进入动画态（data-animating=true）",
-      animating,
-      "true",
+      "E6",
+      "·peco 链接进团队配置页",
+      config.url.split("?")[0],
+      "/teams/peco",
     );
-    const flipped = await until(
-      () => flipFacts(page),
-      (facts) => facts.face === "config",
+    check(
+      "E7",
+      "配置页有分类导航",
+      config.tabs.length > 0,
+      true,
+      `实测 tab：${config.tabs.join(" / ")}`,
     );
-    check("E6", "切换后 URL 带 face=config", flipped.url, "/peco?face=config");
-    check("E7", "翻到能力配置面（data-face=config）", flipped.face, "config");
     check(
       "E8",
-      "配置面没有「绑定空间」tab",
-      flipped.tabs.includes("绑定空间"),
+      "Peco 团队没有「绑定空间」tab",
+      config.tabs.includes("绑定空间"),
       false,
-      `实测 tab：${flipped.tabs.join(" / ")}`,
+      `实测 tab：${config.tabs.join(" / ")}`,
     );
-    check("E9", "配置面没有「装配为空间」按钮", flipped.assembleButtons, 0);
+    check("E9", "Peco 团队没有「新建空间」入口", config.newSpaceButtons, 0);
 
-    await page.goto("/peco?face=config", { waitUntil: "load" });
-    await page.waitForSelector('[data-testid="peco-flip"]');
+    await page.goto("/teams/peco", { waitUntil: "load" });
+    await page.waitForSelector("main h1");
     const direct = await until(
-      () => flipFacts(page),
-      (facts) => facts.face === "config",
+      () => pecoFacts(page),
+      (facts) => facts.url === "/teams/peco",
     );
     check(
       "E10",
-      "直达 ?face=config 不播入场动画（data-animating=false）",
-      direct.animating,
-      "false",
+      "直达 /teams/peco 上屏即配置页（无「绑定空间」）",
+      direct.tabs.includes("绑定空间"),
+      false,
     );
-    check(
-      "E11",
-      "直达时 URL 保持 /peco?face=config",
-      direct.url,
-      "/peco?face=config",
-    );
-  } finally {
-    await session.dispose();
-  }
-});
-
-test("Peco 页：减弱动效时改用淡入淡出", async ({ browser }) => {
-  const session = await openSession(browser, {
-    viewport: WIDE,
-    path: "/peco",
-    openIds: OPEN_IDS,
-    activeWsId: ACTIVE_WS,
-    reduceMotion: true,
-    ready: '[data-testid="peco-flip"]',
-  });
-  const { page } = session;
-  try {
-    const facts = await until(
-      () => flipFacts(page),
-      (value) => value.face === "chat",
-    );
-    check(
-      "E12",
-      "prefers-reduced-motion: reduce 时 data-motion=fade（不转 3D）",
-      facts.motion,
-      "fade",
-    );
-    await page.getByRole("button", { name: "能力配置" }).click();
-    const switched = await until(
-      () => flipFacts(page),
-      (value) => value.face === "config",
-    );
-    check("E13", "减弱动效下仍能切到配置面", switched.face, "config");
+    check("E11", "直达时 URL 保持 /teams/peco", direct.url, "/teams/peco");
   } finally {
     await session.dispose();
   }

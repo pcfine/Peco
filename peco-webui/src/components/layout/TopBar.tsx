@@ -20,13 +20,8 @@ const PAGE_TITLES: Record<string, string> = {
 };
 
 /** 动态段（`/spaces/:wsId`、`/teams/:teamId`）只按前缀取标题。 */
-function titleOf(pathname: string, search: string): string {
-  // Peco 的两个面共用一个路径：标题跟着 `face` 走，否则翻转后顶栏还在说聊天。
-  if (pathname === "/peco") {
-    return new URLSearchParams(search).get("face") === "config"
-      ? "Peco 能力配置"
-      : "Peco 聊天";
-  }
+function titleOf(pathname: string): string {
+  if (pathname === "/peco") return "Peco 聊天";
   if (PAGE_TITLES[pathname]) return PAGE_TITLES[pathname];
   if (/^\/spaces\/[^/]+\/status$/.test(pathname)) return "空间状态";
   if (pathname.startsWith("/spaces/")) return "空间聊天";
@@ -35,7 +30,7 @@ function titleOf(pathname: string, search: string): string {
 }
 
 export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
-  const { pathname, search } = useLocation();
+  const { pathname } = useLocation();
   // <900 时 rail 离屏，抽屉开关只能落在这里；900–1099 走左栏那枚图标。
   const railOffscreen = !useMediaQuery("(min-width: 900px)");
   const { data: peco } = usePeco();
@@ -63,7 +58,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
       </button>
       {railOffscreen && <SpaceSwitcher />}
       <p className="truncate text-caption font-medium text-ink-muted">
-        {titleOf(pathname, search)}
+        {titleOf(pathname)}
       </p>
 
       {railOffscreen && (

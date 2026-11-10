@@ -7,21 +7,15 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import {
-  MemoryRouter,
-  Route,
-  Routes,
-  useLocation,
-  useNavigate,
-} from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { PecoChatPage } from "@/pages/PecoChatPage";
 import type { Space, Task } from "@/types/daemon";
 import type { Message } from "@/types/chat";
 
-// Peco 主区：聊天面 + 右栏四模式 + 3D 翻转。取数全换成固定值 ——
-// 这一层测的是页面装配与翻面语义，真接口由 daemon 的集成测试覆盖。
+// Peco 主区：聊天列 + 右栏四模式。取数全换成固定值 ——
+// 这一层测的是页面装配与右栏语义，真接口由 daemon 的集成测试覆盖。
 
 const mocks = vi.hoisted(() => ({
   ensure: vi.fn(async (_wsId: string) => ({
@@ -121,16 +115,6 @@ vi.mock("@/api/conversations", () => ({
   uploadConversationImage: async () => ({ id: "img", url: "/img" }),
 }));
 
-/** 左栏点 Peco 行只改 URL：这一条路也要走一程翻转动画。 */
-function FaceNav() {
-  const navigate = useNavigate();
-  return (
-    <button type="button" onClick={() => navigate("/peco?face=config")}>
-      模拟左栏
-    </button>
-  );
-}
-
 function PathProbe() {
   const { pathname, search } = useLocation();
   return (
@@ -153,16 +137,10 @@ function renderPeco(path = "/peco") {
             <Route path="/peco" element={<PecoChatPage />} />
           </Routes>
           <PathProbe />
-          <FaceNav />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
   );
-}
-
-/** 打开的舞台是翻转容器的唯一子元素：过渡类挂在它身上。 */
-function stageOf(flip: HTMLElement): HTMLElement {
-  return flip.firstElementChild as HTMLElement;
 }
 
 /** 壳的分档读 `window.innerWidth`（`useViewportWidth`）：挂载前改，挂载后补一次 resize。 */
@@ -177,27 +155,9 @@ function setViewport(width: number) {
   });
 }
 
-/** 聊天列是聊天面的第一个子块（右栏收起时是唯一的一个）。 */
+/** 聊天列（右栏收起时是唯一的一块）。 */
 function chatColumnOf(): HTMLElement {
-  return screen.getByTestId("peco-face-chat").firstElementChild as HTMLElement;
-}
-
-/** jsdom 的 matchMedia 一律 false；减弱动效分支要显式打开。 */
-function useReducedMotion(): () => void {
-  const original = window.matchMedia;
-  window.matchMedia = ((query: string) => ({
-    matches: query.includes("prefers-reduced-motion"),
-    media: query,
-    onchange: null,
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    addListener: () => {},
-    removeListener: () => {},
-    dispatchEvent: () => false,
-  })) as unknown as typeof window.matchMedia;
-  return () => {
-    window.matchMedia = original;
-  };
+  return screen.getByTestId("peco-chat-column");
 }
 
 const DEFAULT_VIEWPORT = 1024;
@@ -233,36 +193,40 @@ describe("Peco 主区", () => {
     expect(document.querySelector(".board-grid")).toBeNull();
   });
 
-  it("两块骨架：没有跨整宽页头，左头有唯一的 h1 与三枚图标按钮，右头是四个 tab", async () => {
+  it("两块骨架：左头有唯一的 h1 与两枚图标按钮，右头是四个 tab", async () => {
     renderPeco();
 
-    const chatFace = await screen.findByTestId("peco-face-chat");
-    // 跨整宽的页头没了：每个 header 都长在某个面内部，一个都不在面外。
+    const chatColumn = await screen.findByTestId("peco-chat-column");
+    // 这一页就两块，两块各有一行头部，没有第三块。
     const headers = Array.from(document.querySelectorAll("header"));
-    expect(headers).not.toHaveLength(0);
+    expect(headers).toHaveLength(2);
     for (const header of headers) {
       expect(
-        header.closest(
-          '[data-testid="peco-face-chat"], [data-testid="peco-face-config"]',
-        ),
-      ).not.toBeNull();
+        chatColumn.contains(header) ||
+          screen.getByTestId("peco-panel").contains(header),
+      ).toBe(true);
     }
-    // 聊天面自己两块：左头 + 右栏头。
-    expect(chatFace.querySelectorAll("header")).toHaveLength(2);
     // 全页仍只有一个 h1。
     expect(document.querySelectorAll("h1")).toHaveLength(1);
 
-    const leftHeader = chatFace.querySelector("header") as HTMLElement;
+    const leftHeader = chatColumn.querySelector("header") as HTMLElement;
     expect(leftHeader.className).toContain("h-12");
     expect(leftHeader.className).toContain("border-b");
     expect(
       within(leftHeader).getByRole("heading", { level: 1, name: "Peco" }),
     ).toBeInTheDocument();
-    // 三枚纯图标按钮：名字只能靠 aria-label，零文本节点。
-    for (const label of ["清除对话", "能力配置", "收起对话"]) {
+    // 两枚纯图标按钮：名字只能靠 aria-label，零文本节点。
+    for (const label of ["清除对话", "收起对话"]) {
       const button = within(leftHeader).getByRole("button", { name: label });
       expect(button.textContent).toBe("");
     }
+    // 团队配置的唯一入口是标题旁的 ·peco 链接。
+    expect(
+      within(leftHeader).getByRole("link", { name: /peco/ }),
+    ).toHaveAttribute("href", "/teams/peco");
+    expect(
+      within(leftHeader).queryByRole("button", { name: "能力配置" }),
+    ).toBeNull();
 
     const rightHeader = screen
       .getByTestId("peco-panel")
@@ -302,134 +266,6 @@ describe("Peco 主区", () => {
     ).toBeInTheDocument();
   });
 
-  it("点「能力配置」翻到配置面：URL 带 face=config，没有绑定空间与装配为空间", async () => {
-    renderPeco();
-    await screen.findByTestId("space-chat-shell");
-
-    fireEvent.click(screen.getByRole("button", { name: "能力配置" }));
-
-    expect(screen.getByTestId("path")).toHaveTextContent("/peco?face=config");
-    const flip = screen.getByTestId("peco-flip");
-    expect(flip).toHaveAttribute("data-face", "config");
-    expect(flip).toHaveAttribute("data-animating", "true");
-    // 配置面挡住了右栏，模式 tab 不留在页头上做死控件。
-    expect(screen.queryByRole("tablist", { name: "右栏" })).toBeNull();
-
-    const config = screen.getByTestId("peco-face-config");
-    expect(
-      await within(config).findByRole("tab", { name: "agents" }),
-    ).toBeInTheDocument();
-    expect(within(config).queryByRole("tab", { name: "绑定空间" })).toBeNull();
-    expect(
-      within(config).queryByRole("button", { name: "装配为空间" }),
-    ).toBeNull();
-  });
-
-  it("翻转进行中锁掉重复点击，锁到期后能翻回来", async () => {
-    renderPeco();
-    await screen.findByTestId("space-chat-shell");
-
-    fireEvent.click(screen.getByRole("button", { name: "能力配置" }));
-    // 半途再点会从中间反向，观感是抖动：这一程走完前不接受第二次点击。
-    fireEvent.click(screen.getByRole("button", { name: "返回聊天" }));
-
-    expect(screen.getByTestId("path")).toHaveTextContent("?face=config");
-    expect(screen.getByTestId("peco-flip")).toHaveAttribute(
-      "data-face",
-      "config",
-    );
-
-    await waitFor(
-      () =>
-        expect(screen.getByTestId("peco-flip")).toHaveAttribute(
-          "data-animating",
-          "false",
-        ),
-      { timeout: 2000 },
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "返回聊天" }));
-    expect(screen.getByTestId("path")).not.toHaveTextContent("face=config");
-    expect(screen.getByTestId("peco-flip")).toHaveAttribute(
-      "data-face",
-      "chat",
-    );
-  });
-
-  it("从别处改 URL 换面（左栏点 Peco 行）同样播一程翻转", async () => {
-    renderPeco();
-    await screen.findByTestId("space-chat-shell");
-    expect(screen.getByTestId("peco-flip")).toHaveAttribute(
-      "data-animating",
-      "false",
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "模拟左栏" }));
-
-    const flip = screen.getByTestId("peco-flip");
-    expect(flip).toHaveAttribute("data-face", "config");
-    expect(flip).toHaveAttribute("data-animating", "true");
-    expect(stageOf(flip).className).toContain("transition-transform");
-  });
-
-  it("直达 ?face=config 不播入场动画：上屏即终态、无 isAnimating", async () => {
-    renderPeco("/peco?face=config");
-
-    const flip = await screen.findByTestId("peco-flip");
-    expect(flip).toHaveAttribute("data-face", "config");
-    expect(flip).toHaveAttribute("data-animating", "false");
-    const stage = stageOf(flip);
-    expect(stage.className).not.toContain("transition-transform");
-    // 3D 的终态直接在首次渲染里，没有从 0 到 180 的那一程。
-    expect(stage.className).toContain("rotateY(180deg)");
-  });
-
-  it("两个面常驻：隐藏面 inert + aria-hidden，焦点与读屏都进不去", async () => {
-    renderPeco();
-
-    const chatFace = await screen.findByTestId("peco-face-chat");
-    const configFace = screen.getByTestId("peco-face-config");
-    expect(chatFace).toHaveAttribute("aria-hidden", "false");
-    expect(chatFace).not.toHaveAttribute("inert");
-    expect(configFace).toHaveAttribute("aria-hidden", "true");
-    expect(configFace).toHaveAttribute("inert");
-    // byRole 默认忽略 aria-hidden 子树：配置面的 tab 不该被读屏念到。
-    expect(screen.queryByRole("tab", { name: "agents" })).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "能力配置" }));
-
-    expect(
-      await screen.findByRole("tab", { name: "agents" }),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("peco-face-config")).not.toHaveAttribute("inert");
-    expect(screen.getByTestId("peco-face-chat")).toHaveAttribute("inert");
-    expect(screen.getByTestId("peco-face-chat")).toHaveAttribute(
-      "aria-hidden",
-      "true",
-    );
-  });
-
-  it("减弱动效时走 120ms 淡入淡出，不转 3D", async () => {
-    const restore = useReducedMotion();
-    try {
-      renderPeco();
-      const flip = await screen.findByTestId("peco-flip");
-      expect(flip).toHaveAttribute("data-motion", "fade");
-      expect(stageOf(flip).className).not.toContain("rotateY");
-
-      fireEvent.click(screen.getByRole("button", { name: "能力配置" }));
-
-      const chatFace = screen.getByTestId("peco-face-chat");
-      expect(chatFace.className).toContain("opacity-0");
-      expect(chatFace.className).toContain("transition-opacity");
-      expect(chatFace.className).toContain("peco-flip-fade");
-      const configFace = screen.getByTestId("peco-face-config");
-      expect(configFace.className).not.toContain("opacity-0");
-    } finally {
-      restore();
-    }
-  });
-
   it("右栏模式按空间持久化，key 是 peco-webui:space-panel:<ws_id>", async () => {
     renderPeco();
     await screen.findByTestId("space-chat-shell");
@@ -459,12 +295,12 @@ describe("Peco 主区", () => {
     ).toEqual({ mode: "memory", collapsed: true, chatCollapsed: false });
   });
 
-  it("URL 的 ?panel= 压过存档，切模式只改 panel、不动 face", async () => {
+  it("URL 的 ?panel= 压过存档，切模式只改 panel", async () => {
     localStorage.setItem(
       "peco-webui:space-panel:ws_peco",
       JSON.stringify({ mode: "files", collapsed: false }),
     );
-    renderPeco("/peco?face=chat&panel=memory");
+    renderPeco("/peco?panel=memory");
     await screen.findByTestId("space-chat-shell");
 
     // 存档说文件，URL 说记忆：URL 赢，右栏直接是记忆。
@@ -479,18 +315,16 @@ describe("Peco 主区", () => {
       "data-mode",
       "tasks",
     );
-    expect(screen.getByTestId("path")).toHaveTextContent(
-      "/peco?face=chat&panel=tasks",
-    );
+    expect(screen.getByTestId("path")).toHaveTextContent("/peco?panel=tasks");
   });
 
   it("Peco 空间未打开：聊天列与文件面板都给空态与打开入口", async () => {
     mocks.spaceStatus.value = "closed";
     renderPeco();
 
-    const chatFace = await screen.findByTestId("peco-face-chat");
+    const chatColumn = await screen.findByTestId("peco-chat-column");
     expect(
-      await within(chatFace).findByText(/Peco 空间还没打开/),
+      await within(chatColumn).findByText(/Peco 空间还没打开/),
     ).toBeInTheDocument();
     // 没有实例就不发 ensure：先去打开，而不是在 composer 里撞一次 409。
     expect(screen.queryByTestId("space-chat-shell")).toBeNull();
@@ -513,21 +347,6 @@ describe("Peco 主区", () => {
         team_id: "peco",
       }),
     );
-  });
-
-  it("Peco 空间未打开时，配置面的资源 tab 也摆同一条空态", async () => {
-    mocks.spaceStatus.value = "closed";
-    renderPeco("/peco?face=config");
-
-    const config = await screen.findByTestId("peco-face-config");
-    expect(
-      await within(config).findByText(/Peco 空间还没打开/),
-    ).toBeInTheDocument();
-    expect(
-      within(config).getByRole("button", { name: "打开 Peco 空间" }),
-    ).toBeInTheDocument();
-    // 资源 tab 没有 X-Peco-Space，就不该发请求。
-    expect(screen.queryByRole("tab", { name: "绑定空间" })).toBeNull();
   });
 
   it("窄屏（work < 824）两块互斥且聊天优先：展开右栏换位，展开对话换回来", async () => {
@@ -592,46 +411,5 @@ describe("Peco 主区", () => {
     // 缺了 `@container/panel`，文件/台账的容器查询会一路量到 main 的整宽。
     const content = panel.lastElementChild as HTMLElement;
     expect(content.className).toContain("@container/panel");
-  });
-
-  it("配置面与聊天面同宽：不留 1200 的居中孤岛", async () => {
-    renderPeco("/peco?face=config");
-    const config = await screen.findByTestId("peco-face-config");
-
-    // 两个面都得铺满 work：任一面被 max-w 收窄，翻转后头部的 border-b 就接不上。
-    expect(config.className).not.toContain("max-w-wide");
-    expect(config.className).not.toContain("mx-auto");
-    // 两个面都从 work 的左缘铺到右缘。
-    expect(screen.getByTestId("peco-face-chat").className).toContain(
-      "absolute inset-0",
-    );
-    expect(config.className).toContain("absolute inset-0");
-  });
-
-  it("配置面头部与聊天面头部同内距：两侧都从 work 内 16px 起", async () => {
-    renderPeco("/peco?face=config");
-    const config = await screen.findByTestId("peco-face-config");
-    const header = config.querySelector("header") as HTMLElement;
-    const chatHeader = screen
-      .getByTestId("peco-face-chat")
-      .querySelector("header") as HTMLElement;
-
-    // 内距不一致时，翻转过去标题会横向跳一段。
-    expect(header.className).toContain("px-4");
-    expect(chatHeader.className).toContain("px-4");
-  });
-
-  it("配置面的「记忆」tab 浏览 Peco 空间自己的记忆，不是团队维度占位", async () => {
-    renderPeco("/peco?face=config&tab=memory");
-
-    const config = await screen.findByTestId("peco-face-config");
-    expect(
-      await within(config).findByText("本空间还没有记忆。"),
-    ).toBeInTheDocument();
-    // 搜索与类别过滤就是右栏那一份，不是「接口尚未接入」的团队占位。
-    expect(
-      within(config).getByRole("searchbox", { name: "搜索记忆" }),
-    ).toBeInTheDocument();
-    expect(within(config).queryByText(/尚未接入/)).toBeNull();
   });
 });

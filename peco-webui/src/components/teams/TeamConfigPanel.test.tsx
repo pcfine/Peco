@@ -55,6 +55,11 @@ function SearchProbe() {
   return <output data-testid="search">{search}</output>;
 }
 
+function PathProbe() {
+  const { pathname } = useLocation();
+  return <output data-testid="path">{pathname}</output>;
+}
+
 function renderPanel(
   props: Partial<Parameters<typeof TeamConfigPanel>[0]> = {},
   entry = "/teams/x",
@@ -63,6 +68,7 @@ function renderPanel(
     <MemoryRouter initialEntries={[entry]}>
       <TeamConfigPanel teamId="x" wsId="ws_1" {...props} />
       <SearchProbe />
+      <PathProbe />
     </MemoryRouter>,
   );
 }
@@ -81,7 +87,7 @@ function labelsOf(items: HTMLElement[]): (string | null)[] {
 }
 
 describe("TeamConfigPanel 分类导航", () => {
-  it("按 agents/skills/mcp/knowledge/spaces/memory 排出 6 项", () => {
+  it("按 agents/skills/mcp/knowledge/memory/spaces 排出 6 项", () => {
     renderPanel();
 
     expect(labelsOf(navItems())).toEqual([
@@ -89,9 +95,22 @@ describe("TeamConfigPanel 分类导航", () => {
       "skills",
       "MCP",
       "知识库",
-      "绑定空间",
       "记忆",
+      "绑定空间",
     ]);
+  });
+
+  it("分组是「能力」与「工作」，记忆收在能力栏里知识库下方", () => {
+    renderPanel();
+
+    const nav = screen.getByRole("tablist");
+    expect(within(nav).getByText("能力")).toBeInTheDocument();
+    expect(within(nav).getByText("工作")).toBeInTheDocument();
+    expect(within(nav).queryByText("其他")).toBeNull();
+
+    // 记忆紧跟在知识库后面：能力栏先看完知识库，下一行就是记忆。
+    const labels = labelsOf(navItems());
+    expect(labels.indexOf("记忆")).toBe(labels.indexOf("知识库") + 1);
   });
 
   it("?tab=skills 只有 skills 项被选中", () => {
@@ -123,7 +142,7 @@ describe("TeamConfigPanel 分类导航", () => {
     expect(navs[0].getAttribute("aria-orientation")).toBe("vertical");
   });
 
-  it("hideSpaces 时不出现「绑定空间」", () => {
+  it("hideSpaces 时不出现「绑定空间」，连整个「工作」分组一起收掉", () => {
     renderPanel({ hideSpaces: true });
 
     expect(labelsOf(navItems())).toEqual([
@@ -134,6 +153,8 @@ describe("TeamConfigPanel 分类导航", () => {
       "记忆",
     ]);
     expect(screen.queryByRole("tab", { name: "绑定空间" })).toBeNull();
+    expect(screen.queryByText("工作")).toBeNull();
+    expect(screen.queryByRole("button", { name: "新建空间" })).toBeNull();
   });
 
   it("去掉顶部 header：页面上没有 header 元素", () => {
@@ -142,29 +163,29 @@ describe("TeamConfigPanel 分类导航", () => {
     expect(container.querySelectorAll("header")).toHaveLength(0);
   });
 
-  it("团队名是页面唯一的 h1，root 只当它的 title", () => {
+  it("团队名是页面唯一的 h1，root 只当它的 title，团队 id 不上屏", () => {
     renderPanel();
 
     const headings = screen.getAllByRole("heading", { level: 1 });
     expect(headings).toHaveLength(1);
     expect(headings[0].textContent).toBe("研究团队");
     expect(headings[0].getAttribute("title")).toBe("/teams/x");
+    // id 只在路由里：分类栏顶部只留名称一行。
+    expect(screen.queryByText("x")).toBeNull();
   });
 
-  it("装配入口缩成团队名右侧的图标按钮", () => {
+  it("团队名左侧有返回图标：直接打开时退回团队列表", () => {
     renderPanel();
+    const heading = screen.getByRole("heading", { level: 1, name: "研究团队" });
+    const back = screen.getByRole("button", { name: "返回上一页" });
 
     expect(
-      screen
-        .getByRole("button", { name: "装配为空间" })
-        .getAttribute("data-size"),
-    ).toBe("icon-xs");
-  });
+      back.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
 
-  it("hideAssemble 时不渲染装配按钮", () => {
-    renderPanel({ hideAssemble: true });
-
-    expect(screen.queryByRole("button", { name: "装配为空间" })).toBeNull();
+    // 直开没有上一页时兜底到团队列表。
+    fireEvent.click(back);
+    expect(screen.getByTestId("path")).toHaveTextContent("/teams");
   });
 
   it("缺 @master 时把 noMaster 交给 agents 面板", () => {

@@ -36,7 +36,7 @@ interface SpaceChatHeaderProps {
    * 用户不必点一次、吃一个 409 才知道。
    */
   clearDisabledReason?: string;
-  /** 页面自己的动作（Peco 页的「能力配置」），排在「清除对话」之前。 */
+  /** 页面自己的动作，排在「清除对话」之前。 */
   extraActions?: ReactNode;
   /** 覆盖标题：空间名来自目录，Peco 页要的是品牌名而不是那个小写目录名。 */
   title?: string;

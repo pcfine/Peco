@@ -1,27 +1,57 @@
-// `/teams/:teamId` —— 只是一个薄包装：团队页与 Peco 翻转面共用 `TeamConfigPanel`，
-// 这里只补团队页自己的两件事：从空间列表里挑一个已打开空间作 `X-Peco-Space`，
+// `/teams/:teamId` —— 团队页，与 Peco 聊天页左头的 `·peco` 共用 `TeamConfigPanel`。
+//
+// 这里补团队页自己的两件事：从空间列表里挑一个已打开空间作 `X-Peco-Space`，
 // 以及出错时回团队列表的路。
+//
+// Peco 是后端保留团队，特例化两层：能力根固定挂在 Peco 空间上、记忆直接浏览
+// Peco 空间自己的记忆；「绑定空间」整栏用 hideSpaces 收掉 —— 连带它内容区的
+// 「新建空间」入口。
 
 import { useParams } from "react-router-dom";
+import { PecoClosedNotice } from "@/components/spaces/PecoClosedNotice";
 import { TeamConfigPanel } from "@/components/teams/TeamConfigPanel";
+import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
+
+const PECO_TEAM_ID = "peco";
 
 export function TeamDetailPage() {
   const { teamId = "" } = useParams();
+  const peco = usePeco();
   const spaces = useSpaces();
+  const isPeco = teamId === PECO_TEAM_ID;
 
-  // 团队是能力边界：哪个已打开空间作请求头不影响结果，取第一个。
-  const wsId =
-    (spaces.data ?? []).find(
-      (space) => space.team_id === teamId && space.status === "open",
-    )?.ws_id ?? null;
+  const pecoSpace =
+    (spaces.data ?? []).find((space) => space.ws_id === peco.data?.ws_id) ??
+    null;
 
-  // 整页就是「左分类导航 + 右内容」两侧，容器不再居中封宽：
-  // 封到 1200 后宽屏会在 rail 与分类导航之间留出几百像素空白。
-  // `/peco` 翻转面复用同一份面板，宽度由那一面自己决定。
+  // 团队是能力边界：哪个已打开空间作请求头不影响结果。Peco 只听身份里的 ws_id。
+  const wsId = isPeco
+    ? pecoSpace?.status === "open"
+      ? pecoSpace.ws_id
+      : null
+    : ((spaces.data ?? []).find(
+        (space) => space.team_id === teamId && space.status === "open",
+      )?.ws_id ?? null);
+
   return (
+    // 整页就是「左分类导航 + 右内容」两侧，容器不居中封宽：
+    // 封到 1200 后宽屏会在 rail 与分类导航之间留出几百像素空白。
     <div className="h-full w-full">
-      <TeamConfigPanel teamId={teamId} wsId={wsId} showBackToList />
+      <TeamConfigPanel
+        teamId={teamId}
+        wsId={wsId}
+        showBackToList
+        hideSpaces={isPeco}
+        // 空间没打开时也传：记忆面板自己会摆「打开空间」的入口，
+        // 比团队维度的「尚未接入」占位更靠近用户想做的那件事。
+        memoryWsId={isPeco ? (peco.data?.ws_id ?? null) : null}
+        noSpaceNotice={
+          isPeco && pecoSpace && pecoSpace.status !== "open" ? (
+            <PecoClosedNotice space={pecoSpace} />
+          ) : undefined
+        }
+      />
     </div>
   );
 }

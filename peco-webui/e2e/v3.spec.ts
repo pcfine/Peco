@@ -338,11 +338,8 @@ let emptySessionWs = "";
 function allRoutes(): Route[] {
   return [
     { id: "peco", path: "/peco", ready: '[data-testid="peco-panel"]' },
-    {
-      id: "peco-config",
-      path: "/peco?face=config",
-      ready: '[data-testid="peco-face-config"]',
-    },
+    // Peco 的配置页就是团队配置页：保留团队不能建空间，但 h1 / 顶栏口径一致。
+    { id: "team-peco", path: "/teams/peco", ready: "main h1" },
     { id: "spaces", path: "/spaces", ready: "main h1" },
     { id: "spaces-new", path: "/spaces/new", ready: "main h1" },
     {
@@ -1373,7 +1370,7 @@ test("字号与排版（B2 / B3 / B4 / B9）", async ({ browser }) => {
 test("h1 唯一性与顶栏标题（B5 / B6 / B7）", async ({ browser }) => {
   const routes = routesOf([
     "peco",
-    "peco-config",
+    "team-peco",
     "spaces",
     "spaces-new",
     "space",

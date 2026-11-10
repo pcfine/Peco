@@ -124,7 +124,7 @@ test("UI audit metrics", async ({ page, request }) => {
 
   const routes = [
     ["peco", "/peco"],
-    ["peco-config", "/peco?face=config"],
+    ["team-peco", "/teams/peco"],
     ["spaces", "/spaces"],
     ["space", `/spaces/${wsId}`],
     ["space-status", `/spaces/${wsId}/status`],

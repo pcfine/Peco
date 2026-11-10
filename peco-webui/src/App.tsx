@@ -16,8 +16,8 @@ import { TeamListPage } from "@/pages/TeamListPage";
 /**
  * `/` 只剩一条重定向：Peco 有自己的路由，不再借用首页。
  *
- * `/peco?face=config` 走同一个路由元素：翻转面的状态在 query 里，`/peco` 只有
- * 一个页面，切面不重挂载、不重建聊天。
+ * Peco 的能力配置走左头的 `·peco` 链接：`/teams/peco` 与其它团队共用
+ * 同一份配置页。
  *
  * `/spaces/new` 与 `/spaces/:wsId/status` 是静态段收尾/追加，必须能与 `/spaces/:wsId`
  * 区分开：`new` 不能被当成 ws_id，`status` 不能被当成 ws_id 的一部分。

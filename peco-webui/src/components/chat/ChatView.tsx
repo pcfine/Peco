@@ -860,7 +860,7 @@ export function ChatView({
       </div>
 
       {/* Input */}
-      <div className="pt-4 mt-4 border-t border-border">
+      <div className="pt-4 mt-4">
         {composerNotice}
         <div className="flex flex-col rounded-[6px] border bg-card focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
           {/* 在途轮已排队、尚未被模型请求消费的输入。送达后由 store 落成正式

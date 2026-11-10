@@ -1,6 +1,7 @@
-// 团队能力配置面：左侧分类栏（顶部是团队身份）+ 内容区，整页就是这两栏。
-// `/teams/:teamId` 与 Peco 翻转面共用这一份 —— 两处差别只在「有没有绑定空间」
-// 「能不能再装配空间」以及页面级导航。
+// 团队配置页：左侧分类栏（顶部是团队身份）+ 内容区，整页就是这两栏。
+// 左侧只放导航；「新建空间」是绑定空间内容区的头部动作。
+// `/teams/peco` 也走这一份 —— Peco 是保留团队，差别只在「没有绑定空间可看」，
+// 由调用方用 hideSpaces 表达。
 
 import { Fragment, type ComponentType, type ReactNode } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
@@ -8,8 +9,8 @@ import {
   BookOpen,
   Bot,
   BrainCircuit,
+  ChevronLeft,
   FolderOpen,
-  PackagePlus,
   Plug,
   Puzzle,
 } from "lucide-react";
@@ -56,17 +57,21 @@ const RESOURCE_TABS: readonly TeamTab[] = [
   "knowledge",
 ];
 
-/** 分类栏的两个分组；组内顺序就是导航顺序，`TAB_ORDER` 也从这里展开。 */
+/**
+ * 分类栏的两个分组；组内顺序就是导航顺序，`TAB_ORDER` 也从这里展开。
+ * 「能力」把记忆收在知识库下方：两者都是看这个团队/空间沉淀了什么；
+ * 「工作」下是绑定空间。
+ */
 const TAB_GROUPS: readonly { title: string; items: readonly TeamTab[] }[] = [
-  { title: "能力", items: RESOURCE_TABS },
-  { title: "其他", items: ["spaces", "memory"] },
+  { title: "能力", items: [...RESOURCE_TABS, "memory"] },
+  { title: "工作", items: ["spaces"] },
 ];
 
 const TAB_ORDER: readonly TeamTab[] = TAB_GROUPS.flatMap(
   (group) => group.items,
 );
 
-/** 存档里可能是被隐藏的 tab（Peco 面没有「绑定空间」），回落到第一个。 */
+/** 存档里可能是被隐藏的 tab（Peco 团队没有「绑定空间」），回落到第一个。 */
 function parseTab(raw: string | null, tabs: readonly TeamTab[]): TeamTab {
   return tabs.includes(raw as TeamTab) ? (raw as TeamTab) : tabs[0];
 }
@@ -75,22 +80,16 @@ interface TeamConfigPanelProps {
   teamId: string;
   /** 资源 tab 的 `X-Peco-Space`：哪个已打开空间的能力根。空表示没有可用空间。 */
   wsId: string | null;
-  /** 配置面藏掉「绑定空间」：Peco 不能再建空间，别暗示可以。 */
+  /** 藏掉「绑定空间」与整个「工作」分组：Peco 是保留团队，不能再建/绑空间。 */
   hideSpaces?: boolean;
-  hideAssemble?: boolean;
-  /** 没有可用空间时资源 tab 的占位；缺省是团队页那句「先打开一个绑定空间」。 */
+  /** 没有可用空间时资源 tab 的占位；缺省是那句「先打开一个绑定空间」。 */
   noSpaceNotice?: ReactNode;
-  /** `/teams/:teamId` 出错时要一条回团队列表的路；翻转面不需要。 */
+  /** `/teams/:teamId` 出错时要一条回团队列表的路。 */
   showBackToList?: boolean;
   /**
-   * 标题的标签层级。`/peco` 把它当配置面挂在已有 h1 的页面里，
-   * 那里必须是 h2，否则一页两个 h1。
-   */
-  headingLevel?: "h1" | "h2";
-  /**
-   * 提供时「记忆」tab 浏览这个空间的记忆；缺省走团队页的占位。
+   * 提供时「记忆」tab 浏览这个空间的记忆；缺省走团队维度的占位。
    *
-   * Peco 面传 Peco 空间 —— 那里的记忆就是这一个空间的记忆，摆团队维度的占位
+   * Peco 团队传 Peco 空间 —— 那里的记忆就是这一个空间的记忆，摆团队维度的占位
    * 等于让用户在两处看到同一句「尚未接入」。
    */
   memoryWsId?: string | null;
@@ -100,10 +99,8 @@ export function TeamConfigPanel({
   teamId,
   wsId,
   hideSpaces = false,
-  hideAssemble = false,
   noSpaceNotice,
   showBackToList = false,
-  headingLevel = "h1",
   memoryWsId = null,
 }: TeamConfigPanelProps) {
   const navigate = useNavigate();
@@ -122,6 +119,13 @@ export function TeamConfigPanel({
     const params = new URLSearchParams(searchParams);
     params.set("tab", next);
     setSearchParams(params, { replace: true });
+  };
+
+  // 返回上一页；直接贴 URL 打开时没有上一页，退到团队列表。
+  const goBack = () => {
+    const state = window.history.state as { idx?: number } | null;
+    if ((state?.idx ?? 0) > 0) navigate(-1);
+    else navigate("/teams");
   };
 
   if (team.isPending) {
@@ -154,37 +158,35 @@ export function TeamConfigPanel({
   }
 
   const detail = team.data;
-  const Heading = headingLevel;
 
   return (
     <div className="@container/team flex h-full min-h-0">
       <div className="flex w-44 shrink-0 flex-col border-r border-line bg-rail/50 @max-[560px]/team:w-12">
-        <div className="mb-1 border-b border-line px-2 pb-2 @max-[560px]/team:px-1">
-          <div className="flex items-center gap-1">
-            {/* 窄档只剩图标栏：标题视觉隐藏但留在无障碍树里，一页仍有一个 h1。 */}
-            <Heading
-              className="min-w-0 truncate text-sm font-semibold text-ink @max-[560px]/team:sr-only"
+        <div className="mb-1 border-b border-line px-2 py-1 @max-[560px]/team:px-1">
+          {/* 三栏等宽栅格：左右各留 28px，名称在中间那栏居中，返回键随
+              `items-center` 垂直居中。 */}
+          <div className="grid h-8 grid-cols-[28px_1fr_28px] items-center @max-[560px]/team:flex @max-[560px]/team:justify-center">
+            {/* 颜色与下方导航一致（ink-muted）。 */}
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="text-ink-muted"
+              aria-label="返回上一页"
+              title="返回上一页"
+              onClick={goBack}
+            >
+              <ChevronLeft className="size-5" />
+            </Button>
+            {/* 窄档只剩图标栏：标题视觉隐藏但留在无障碍树里，一页仍有一个 h1。
+                团队 id 不上屏 —— 路由地址里已经带着它。 */}
+            <h1
+              className="min-w-0 truncate text-center text-sm font-semibold text-ink @max-[560px]/team:sr-only"
               title={detail.root}
             >
               {detail.display_name}
-            </Heading>
-            {!hideAssemble && (
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="ml-auto shrink-0"
-                aria-label="装配为空间"
-                onClick={() =>
-                  navigate(`/spaces/new?team=${encodeURIComponent(detail.id)}`)
-                }
-              >
-                <PackagePlus />
-              </Button>
-            )}
+            </h1>
+            <span aria-hidden />
           </div>
-          <p className="truncate font-mono text-2xs text-ink-faint @max-[560px]/team:hidden">
-            {detail.id}
-          </p>
         </div>
 
         <nav
@@ -262,7 +264,9 @@ export function TeamConfigPanel({
           {tab === "knowledge" && wsId && (
             <TeamKnowledgeTab wsId={wsId} detail={detail} />
           )}
-          {tab === "spaces" && <TeamSpacesTab spaces={detail.spaces} />}
+          {tab === "spaces" && (
+            <TeamSpacesTab teamId={detail.id} spaces={detail.spaces} />
+          )}
           {tab === "memory" &&
             (memoryWsId ? (
               <SpaceMemoryTab wsId={memoryWsId} />
