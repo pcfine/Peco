@@ -589,6 +589,21 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 022 skipped: d_dispatches.prompt_digest already exists");
     }
 
+    // ── Migration 023: teams.icon ─────────────────────────────────────────
+    let teams_has_icon = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('teams') WHERE name = 'icon'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !teams_has_icon {
+        run_migration(pool, "023", include_str!("migrations/023_team_icon.sql")).await?;
+        tracing::info!("Migration 023 completed");
+    } else {
+        tracing::debug!("Migration 023 skipped: teams.icon already exists");
+    }
+
     Ok(())
 }
 

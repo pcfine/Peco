@@ -13,13 +13,16 @@ pub mod space_memory;
 pub mod space_overview;
 pub mod tasks;
 pub mod team;
+pub mod upload;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Serialize;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
 use crate::agent;
@@ -33,6 +36,7 @@ use crate::skill;
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
+    let uploads_dir = state.config.peco_home.join("uploads");
     Router::new()
         .route("/api/spaces", get(space::list).post(space::create))
         .route(
@@ -81,7 +85,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks", get(tasks::list))
         .route("/api/tasks/{task_id}", get(tasks::detail))
         .route("/api/teams", get(team::list).post(team::create))
-        .route("/api/teams/{team_id}", get(team::detail))
+        .route(
+            "/api/teams/{team_id}",
+            get(team::detail).patch(team::update).delete(team::delete),
+        )
+        .route(
+            "/api/upload",
+            post(upload::upload_image).layer(DefaultBodyLimit::max(upload::MAX_UPLOAD_BODY_BYTES)),
+        )
         // 团队级 provider 配置：providers.toml 属于团队能力根，不在某个空间里。
         .route(
             "/api/teams/{team_id}/providers",
@@ -115,6 +126,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/knowledge", knowledge::router())
         .nest("/api/chat", chat::router())
         .nest("/api/artifacts", artifact::router())
+        .nest_service("/uploads", ServeDir::new(uploads_dir))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

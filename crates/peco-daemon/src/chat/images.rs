@@ -54,6 +54,36 @@ pub(crate) fn chat_upload_dir(home: &StdPath, ws_id: &str) -> PathBuf {
     home.join("uploads").join("chat").join(ws_id)
 }
 
+/// 校验图片 MIME 与大小，返回扩展名。
+pub(crate) fn validate_image(
+    content_type: Option<&str>,
+    data: &[u8],
+) -> Result<&'static str, ApiError> {
+    let mime = content_type
+        .ok_or_else(|| ApiError::BadRequest("missing 'file' field in upload".into()))?;
+    if !ALLOWED_MIME_TYPES.contains(&mime) {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported file type: {mime}. allowed: png, jpeg, gif, webp"
+        )));
+    }
+    if data.is_empty() {
+        return Err(ApiError::BadRequest("empty file".into()));
+    }
+    if data.len() > MAX_IMAGE_SIZE {
+        return Err(ApiError::BadRequest(format!(
+            "file too large: {} bytes (max {MAX_IMAGE_SIZE})",
+            data.len()
+        )));
+    }
+    Ok(match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    })
+}
+
 /// multipart 校验 + 落盘。
 ///
 /// 字段名 `file`，MIME/大小校验通过后写入该空间的上传目录，
@@ -77,30 +107,7 @@ pub(crate) async fn store_uploaded_image(
         }
     }
 
-    let mime = content_type
-        .ok_or_else(|| ApiError::BadRequest("missing 'file' field in upload".into()))?;
-    if !ALLOWED_MIME_TYPES.contains(&mime.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "unsupported file type: {mime}. allowed: png, jpeg, gif, webp"
-        )));
-    }
-    if data.is_empty() {
-        return Err(ApiError::BadRequest("empty file".into()));
-    }
-    if data.len() > MAX_IMAGE_SIZE {
-        return Err(ApiError::BadRequest(format!(
-            "file too large: {} bytes (max {MAX_IMAGE_SIZE})",
-            data.len()
-        )));
-    }
-
-    let ext = match mime.as_str() {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => "bin",
-    };
+    let ext = validate_image(content_type.as_deref(), &data)?;
     let filename = format!("{}.{ext}", Uuid::new_v4());
     let dir = chat_upload_dir(&state.config.peco_home, ws_id);
     tokio::fs::create_dir_all(&dir)
@@ -222,6 +229,20 @@ mod tests {
         assert!(validate_image_id("").is_err());
         assert!(validate_image_id("img/../../etc.png").is_err());
         assert!(validate_image_id("白.png").is_err());
+    }
+
+    #[test]
+    fn validate_image_maps_mime_to_extension() {
+        assert_eq!(validate_image(Some("image/png"), b"x").unwrap(), "png");
+        assert_eq!(validate_image(Some("image/jpeg"), b"x").unwrap(), "jpg");
+        assert_eq!(validate_image(Some("image/webp"), b"x").unwrap(), "webp");
+    }
+
+    #[test]
+    fn validate_image_rejects_bad_mime_and_empty() {
+        assert!(validate_image(Some("image/svg+xml"), b"x").is_err());
+        assert!(validate_image(Some("image/png"), b"").is_err());
+        assert!(validate_image(None, b"x").is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use peco_daemon::space::peco::PECO_TEAM_ID;
 use serde_json::json;
 use support::new_env;
 
-/// 一份带模板版本的 `@master/agent.md` —— 磁盘上的版本才是装着的模板。
+/// 写入带模板版本的 `@master/agent.md`。
 fn write_master_agent(env: &support::TestEnv, team: &str, version: u32) {
     let dir = env.home.join("teams").join(team).join("agents/@master");
     std::fs::create_dir_all(&dir).unwrap();
@@ -21,7 +21,7 @@ fn write_master_agent(env: &support::TestEnv, team: &str, version: u32) {
     .unwrap();
 }
 
-/// `team.json` 是首装时的快照：模板升级不会改写它。
+/// 写入 `team.json`。
 fn write_team_json(env: &support::TestEnv, team: &str, display_name: &str, version: i64) {
     let body = json!({
         "team_id": team,
@@ -46,7 +46,7 @@ fn team_ids(reply: &support::HttpReply) -> Vec<String> {
         .collect()
 }
 
-/// 目录有、索引行没有的团队也要出现在清单里（索引可重建，目录是权威）。
+/// 目录-only 团队也出现在清单。
 #[tokio::test]
 async fn list_reports_directory_only_teams() {
     let env = new_env(&["research", "writing"]).await;
@@ -59,7 +59,7 @@ async fn list_reports_directory_only_teams() {
     assert_eq!(reply.body[0]["agents"], json!([]), "空目录没有 agent");
 }
 
-/// 模板安装：`@master` 与私有记忆库落到 `teams/<id>/`，索引行与 `team.json` 同步。
+/// 模板安装写入能力文件与索引行。
 #[tokio::test]
 async fn create_team_installs_template_and_index_row() {
     let env = new_env(&["research"]).await;
@@ -125,7 +125,7 @@ async fn create_team_installs_template_and_index_row() {
     );
 }
 
-/// 空团队：`from_template` 缺省时只建目录，不装任何能力文件。
+/// 空团队只建目录。
 #[tokio::test]
 async fn create_empty_team_without_template() {
     let env = new_env(&["research"]).await;
@@ -139,7 +139,7 @@ async fn create_empty_team_without_template() {
     assert!(!env.home.join("teams/blank/agents/@master").exists());
 }
 
-/// 重名（目录已存在）⇒ `409 team_exists`，不得覆盖既有能力文件。
+/// 重名返回 409。
 #[tokio::test]
 async fn duplicate_team_is_409_and_keeps_existing_files() {
     let env = new_env(&["research"]).await;
@@ -163,7 +163,7 @@ async fn duplicate_team_is_409_and_keeps_existing_files() {
     );
 }
 
-/// 非法 id 与不支持的模板都走 `400 invalid_argument`。
+/// 非法 id 与未知模板返回 400。
 #[tokio::test]
 async fn invalid_team_id_and_unknown_template_are_400() {
     let env = new_env(&["research"]).await;
@@ -193,11 +193,7 @@ async fn invalid_team_id_and_unknown_template_are_400() {
     );
 }
 
-/// 已装好的空间升过模板：`agent.md` 是 13，`team.json` 与索引行都还是 12 ——
-/// 清单必须报磁盘上的版本，否则 UI 永远看不到模板已经升级。
-///
-/// 变异：`meta_from_dir` 只读 `team.json`，或清单只信索引行的版本 → 下面的
-/// 断言拿到 12 变红。
+/// 清单版本以磁盘为准。
 #[tokio::test]
 async fn list_reports_the_version_installed_on_disk() {
     let env = new_env(&["research"]).await;
@@ -230,10 +226,7 @@ async fn list_reports_the_version_installed_on_disk() {
     );
 }
 
-/// 团队卡片要的四个计数：来源就是详情页那几份清单的长度。
-///
-/// 夹具刻意让「装了但缺 `SKILL.md` 的目录」与「损坏的 mcpconfig」各出现一次：
-/// 计数必须与详情接口同口径，否则卡片说 2 个 skill 而详情页只列 1 个。
+/// 清单计数与详情同口径。
 #[tokio::test]
 async fn list_reports_agent_skill_mcp_and_space_counts() {
     let env = new_env(&["research", "writing"]).await;
@@ -323,9 +316,7 @@ async fn list_reports_agent_skill_mcp_and_space_counts() {
     assert_eq!(writing["space_count"], json!(1));
 }
 
-/// Peco 是保留团队：清单里过滤掉它，详情接口仍要能读到。
-///
-/// 变异：去掉 `list` 里的 `PECO_TEAM_ID` 过滤 → 第一条断言拿到 ["peco","research"] 变红。
+/// Peco 不进清单，详情可读。
 #[tokio::test]
 async fn peco_is_absent_from_the_list_but_readable_in_detail() {
     let env = new_env(&[PECO_TEAM_ID, "research"]).await;
@@ -343,8 +334,7 @@ async fn peco_is_absent_from_the_list_but_readable_in_detail() {
     assert_eq!(detail.body["id"], json!(PECO_TEAM_ID));
 }
 
-/// 保留团队 id 不能通过接口创建：这是 `400 invalid_argument`，不是 `409 team_exists`
-/// （目录已存在只是夹具的既成事实，语义上这条 id 永远不许建）。
+/// 保留 id 不能创建。
 #[tokio::test]
 async fn creating_the_reserved_peco_team_is_400() {
     let env = new_env(&[PECO_TEAM_ID]).await;
@@ -357,4 +347,242 @@ async fn creating_the_reserved_peco_team_is_400() {
         env.home.join("teams").join(PECO_TEAM_ID).is_dir(),
         "被拒的创建不得动既有目录"
     );
+}
+
+/// PATCH 只改图标。
+#[tokio::test]
+async fn patch_icon_persists_and_preserves_metadata() {
+    let env = new_env(&["research"]).await;
+    teams::upsert(
+        &env.pool,
+        &NewTeam {
+            id: "research",
+            display_name: "研究组",
+            template_version: 3,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reply = env
+        .patch(
+            "/api/teams/research",
+            json!({"icon": "/uploads/teams/a.png"}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["icon"], json!("/uploads/teams/a.png"));
+
+    let row: (String, i64, String) = sqlx::query_as(
+        "SELECT display_name, template_version, icon FROM teams WHERE id = 'research'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        ("研究组".to_string(), 3, "/uploads/teams/a.png".to_string())
+    );
+}
+
+/// 目录-only 团队可改图标。
+#[tokio::test]
+async fn patch_icon_creates_row_for_directory_only_team() {
+    let env = new_env(&["research"]).await;
+
+    let reply = env
+        .patch(
+            "/api/teams/research",
+            json!({"icon": "/uploads/teams/a.png"}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+
+    let row: (String, i64, String) = sqlx::query_as(
+        "SELECT display_name, template_version, icon FROM teams WHERE id = 'research'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            "research".to_string(),
+            0,
+            "/uploads/teams/a.png".to_string()
+        )
+    );
+}
+
+/// 图标 URL 白名单。
+#[tokio::test]
+async fn patch_rejects_non_upload_icon_urls() {
+    let env = new_env(&["research"]).await;
+
+    for bad in [
+        "javascript:alert(1)",
+        "https://x/a.png",
+        "/uploads/../etc/passwd",
+        "pixel:abc",
+    ] {
+        let reply = env.patch("/api/teams/research", json!({"icon": bad})).await;
+        assert_eq!(reply.status, 400, "icon={bad} body={}", reply.body);
+        assert_eq!(reply.code(), "invalid_argument");
+    }
+
+    let cleared = env.patch("/api/teams/research", json!({"icon": ""})).await;
+    assert_eq!(cleared.status, 200, "空串表示清空: {}", cleared.body);
+}
+
+/// 未知团队返回 404。
+#[tokio::test]
+async fn patch_unknown_team_is_404() {
+    let env = new_env(&["research"]).await;
+
+    let reply = env
+        .patch("/api/teams/ghost", json!({"icon": "/uploads/teams/a.png"}))
+        .await;
+
+    assert_eq!(reply.status, 404, "body={}", reply.body);
+    assert_eq!(reply.code(), "team_not_found");
+}
+
+/// 从已有团队复制。
+#[tokio::test]
+async fn create_team_by_copying_an_existing_team() {
+    let env = new_env(&["research"]).await;
+    let source = env.home.join("teams/research");
+    let agent_dir = source.join("agents/@master");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("agent.md"),
+        "---\nagent:\n  name: \"@master\"\n  description: \"总管\"\n\
+         template_version: 3\n---\n\n# prompt\n",
+    )
+    .unwrap();
+    let skill_dir = source.join("skills/review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "# review\n").unwrap();
+    std::fs::write(
+        source.join("mcpconfig.json"),
+        json!({"mcpServers": {"fs": {"transport": "stdio", "command": "npx"}}}).to_string(),
+    )
+    .unwrap();
+    write_team_json(&env, "research", "研究组", 3);
+    let source_team_json = std::fs::read_to_string(source.join("team.json")).unwrap();
+
+    let reply = env
+        .post(
+            "/api/teams",
+            json!({"id": "clone", "display_name": "克隆团队", "from_team": "research"}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 201, "body={}", reply.body);
+    assert_eq!(reply.body["team_id"], json!("clone"));
+    assert_eq!(reply.body["display_name"], json!("克隆团队"));
+    assert_eq!(reply.body["template_version"], json!(3));
+    assert_eq!(reply.body["agent_count"], json!(1));
+    assert_eq!(reply.body["skill_count"], json!(1));
+    assert_eq!(reply.body["mcp_count"], json!(1));
+
+    let clone = env.home.join("teams/clone");
+    assert!(clone.join("agents/@master/agent.md").is_file());
+    assert!(clone.join("skills/review/SKILL.md").is_file());
+    assert!(clone.join("mcpconfig.json").is_file());
+
+    let cloned_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(clone.join("team.json")).unwrap()).unwrap();
+    assert_eq!(cloned_json["team_id"], json!("clone"));
+    assert_eq!(cloned_json["display_name"], json!("克隆团队"));
+    assert_eq!(cloned_json["template_version"], json!(3));
+
+    assert_eq!(
+        std::fs::read_to_string(source.join("team.json")).unwrap(),
+        source_team_json,
+        "复制不得改写源团队"
+    );
+    assert!(
+        teams::get(&env.pool, "clone").await.unwrap().is_some(),
+        "复制出来的团队要有索引行"
+    );
+}
+
+/// 复制继承源团队图标。
+#[tokio::test]
+async fn copy_team_inherits_source_icon() {
+    let env = new_env(&["research"]).await;
+    let patched = env
+        .patch(
+            "/api/teams/research",
+            json!({"icon": "/uploads/teams/research.png"}),
+        )
+        .await;
+    assert_eq!(patched.status, 200, "body={}", patched.body);
+
+    let reply = env
+        .post(
+            "/api/teams",
+            json!({"id": "clone", "from_team": "research"}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 201, "body={}", reply.body);
+    assert_eq!(reply.body["icon"], json!("/uploads/teams/research.png"));
+}
+
+/// 非法或保留来源被拒绝。
+#[tokio::test]
+async fn copy_team_rejects_bad_sources() {
+    let env = new_env(&[PECO_TEAM_ID, "research"]).await;
+
+    let missing = env
+        .post("/api/teams", json!({"id": "clone", "from_team": "ghost"}))
+        .await;
+    assert_eq!(missing.status, 404, "body={}", missing.body);
+    assert_eq!(missing.code(), "team_not_found");
+    assert!(!env.home.join("teams/clone").exists());
+
+    for bad in [PECO_TEAM_ID, "..", "Writing"] {
+        let reply = env
+            .post("/api/teams", json!({"id": "clone", "from_team": bad}))
+            .await;
+        assert_eq!(reply.status, 400, "source={bad} body={}", reply.body);
+        assert_eq!(reply.code(), "invalid_argument");
+        assert!(
+            !env.home.join("teams/clone").exists(),
+            "被拒的复制不得留下目标目录"
+        );
+    }
+
+    let both = env
+        .post(
+            "/api/teams",
+            json!({"id": "clone", "from_team": "research", "from_template": "team_default"}),
+        )
+        .await;
+    assert_eq!(both.status, 400, "body={}", both.body);
+    assert_eq!(both.code(), "invalid_argument");
+    assert!(!env.home.join("teams/clone").exists());
+}
+
+/// Peco 图标只写 DB。
+#[tokio::test]
+async fn patch_peco_icon_leaves_team_json_untouched() {
+    let env = new_env(&[PECO_TEAM_ID]).await;
+    let path = env.home.join("teams").join(PECO_TEAM_ID).join("team.json");
+    std::fs::write(&path, "{\"team_id\":\"peco\"}").unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let reply = env
+        .patch(
+            &format!("/api/teams/{PECO_TEAM_ID}"),
+            json!({"icon": "/uploads/teams/a.png"}),
+        )
+        .await;
+
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 }

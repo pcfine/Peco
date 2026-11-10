@@ -86,6 +86,9 @@ vi.mock("@/api/spaces", () => ({
 
 vi.mock("@/api/teams", () => ({
   listTeams: async () => [],
+  createTeam: vi.fn(),
+  updateTeam: vi.fn(),
+  deleteTeam: vi.fn(),
   getTeam: async (teamId: string) => ({
     id: teamId,
     display_name: "Peco",

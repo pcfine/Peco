@@ -26,6 +26,7 @@ function team(teamId: string, displayName: string): Team {
     team_id: teamId,
     display_name: displayName,
     template_version: 1,
+    icon: "",
     agents: [],
     bound_spaces: [],
   };

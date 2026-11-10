@@ -1,6 +1,4 @@
-//! teams 表 DAO —— 能力根 `teams/<team_id>/` 的 DB 索引。
-//!
-//! 真源是目录：本表只在 `ws rescan` 与首次写入时补行，删团队没有入口。
+//! teams 表 DAO。
 
 use std::path::Path;
 
@@ -12,6 +10,8 @@ pub struct TeamRow {
     pub id: String,
     pub display_name: String,
     pub template_version: i64,
+    /// `/uploads/...` URL；空串表示未设置。
+    pub icon: String,
     pub created_at: String,
 }
 
@@ -22,7 +22,7 @@ pub struct NewTeam<'a> {
     pub template_version: i64,
 }
 
-/// 幂等写入：同 id 覆盖展示名与模板版本（模板升级后 rescan 才能反映真值）。
+/// 幂等写入；不覆盖 `icon`。
 pub async fn upsert(pool: &SqlitePool, team: &NewTeam<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO teams (id, display_name, template_version) VALUES (?, ?, ?) \
@@ -39,7 +39,7 @@ pub async fn upsert(pool: &SqlitePool, team: &NewTeam<'_>) -> Result<(), sqlx::E
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<TeamRow>, sqlx::Error> {
     sqlx::query_as::<_, TeamRow>(
-        "SELECT id, display_name, template_version, created_at FROM teams WHERE id = ?",
+        "SELECT id, display_name, template_version, icon, created_at FROM teams WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -48,10 +48,31 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<TeamRow>, sqlx::E
 
 pub async fn list(pool: &SqlitePool) -> Result<Vec<TeamRow>, sqlx::Error> {
     sqlx::query_as::<_, TeamRow>(
-        "SELECT id, display_name, template_version, created_at FROM teams ORDER BY id",
+        "SELECT id, display_name, template_version, icon, created_at FROM teams ORDER BY id",
     )
     .fetch_all(pool)
     .await
+}
+
+/// 写入图标；缺行时补行。
+pub async fn set_icon(
+    pool: &SqlitePool,
+    id: &str,
+    icon: &str,
+    display_name: &str,
+    template_version: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO teams (id, display_name, template_version, icon) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET icon = excluded.icon",
+    )
+    .bind(id)
+    .bind(display_name)
+    .bind(template_version)
+    .bind(icon)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_ids(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
@@ -60,14 +81,37 @@ pub async fn list_ids(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
         .await
 }
 
-/// 目录名 + 可选 `team.json` → 索引字段。
-///
-/// `team.json` 缺失或损坏时按目录名兜底：rescan 的职责是「磁盘有就索引」，
-/// 不因一个坏文件让整个团队消失在 UI 上。
-///
-/// 模板版本取 `team.json` 与 `@master/agent.md` 中的较大者：模板升级只覆盖
-/// `agent.md`，`team.json` 停在首装时的版本，只读它会让已升过级的空间一直
-/// 报着旧版本。
+/// 删除团队及其索引与绑定空间行，返回删除的空间数。
+pub async fn delete_team(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM documents WHERE kb_id IN \
+         (SELECT id FROM knowledge_bases WHERE team_id = ?)",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM knowledge_bases WHERE team_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM agents WHERE team_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let spaces = sqlx::query("DELETE FROM workspaces WHERE team_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM teams WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(spaces.rows_affected())
+}
+
+/// 目录名 + `team.json` → 展示名与模板版本。
 pub fn meta_from_dir(dir: &Path, team_id: &str) -> (String, i64) {
     let (display_name, recorded) = team_json_meta(dir, team_id);
     let version = match crate::team::template_version_on_disk(dir) {
@@ -77,10 +121,7 @@ pub fn meta_from_dir(dir: &Path, team_id: &str) -> (String, i64) {
     (display_name, version)
 }
 
-/// 索引行 ∪ 目录 → 对外回答的展示名与模板版本。
-///
-/// 展示名信索引行（用户改过的名字要留住），模板版本取索引行与磁盘中的较大者：
-/// 索引行只是上一次普查时抄下的快照，落后的那次抄写不该盖住磁盘上的实际版本。
+/// 合并索引行与目录元数据；版本取较大者。
 pub fn resolve_meta(row: Option<TeamRow>, dir: &Path, team_id: &str) -> (String, i64) {
     let (dir_name, dir_version) = meta_from_dir(dir, team_id);
     match row {
@@ -89,7 +130,7 @@ pub fn resolve_meta(row: Option<TeamRow>, dir: &Path, team_id: &str) -> (String,
     }
 }
 
-/// `team.json` 里的展示名与记录的模板版本；读不到或解不出时按目录名与 0 兜底。
+/// 读取 `team.json` 的展示名与版本。
 fn team_json_meta(dir: &Path, team_id: &str) -> (String, i64) {
     let raw = match std::fs::read_to_string(dir.join("team.json")) {
         Ok(raw) => raw,
@@ -118,7 +159,7 @@ fn team_json_meta(dir: &Path, team_id: &str) -> (String, i64) {
 mod tests {
     use super::*;
 
-    /// 一份能解出模板版本的 `@master/agent.md`；`version` 就是它实际装着的模板。
+    /// 写入带模板版本的 `@master/agent.md`。
     fn write_master_agent(dir: &Path, version: u32) {
         let path = dir.join(crate::team::MASTER_AGENT_REL);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -142,7 +183,7 @@ mod tests {
         std::fs::write(dir.join("team.json"), body.to_string()).unwrap();
     }
 
-    /// 模板升级只改 `agent.md`，`team.json` 停在首装版本 —— 索引必须报磁盘上的版本。
+    /// 磁盘版本高于 team.json 时以磁盘为准。
     #[test]
     fn a_stale_team_json_loses_to_the_version_on_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -156,7 +197,7 @@ mod tests {
         );
     }
 
-    /// `team.json` 缺失仍要能报出磁盘版本：模板文件才是版本的真源。
+    /// team.json 缺失时用磁盘版本。
     #[test]
     fn a_missing_team_json_falls_back_to_the_version_on_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -168,7 +209,7 @@ mod tests {
         );
     }
 
-    /// 坏 `team.json` 只让展示名退回目录名，不该顺手把模板版本也清零。
+    /// 坏 team.json 不影响磁盘版本。
     #[test]
     fn a_broken_team_json_still_reports_the_version_on_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -181,7 +222,7 @@ mod tests {
         );
     }
 
-    /// 空壳团队（只有目录）没有版本可报：0 是「未装模板」的既有语义。
+    /// 空团队版本为 0。
     #[test]
     fn an_empty_team_has_no_template_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -192,7 +233,7 @@ mod tests {
         );
     }
 
-    /// 索引行只贡献展示名：模板版本永远不低报磁盘上的实际版本。
+    /// 索引行版本不低报磁盘版本。
     #[test]
     fn a_row_never_reports_an_older_version_than_the_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -203,6 +244,7 @@ mod tests {
             id: "research".to_string(),
             display_name: "研究组".to_string(),
             template_version: 12,
+            icon: String::new(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
         };
 
@@ -213,7 +255,7 @@ mod tests {
         );
     }
 
-    /// 索引行版本更高时保留它：磁盘读不到版本（手写 agent.md）不代表版本归零。
+    /// 索引行版本更高时保留。
     #[test]
     fn a_row_ahead_of_the_disk_keeps_its_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -223,6 +265,7 @@ mod tests {
             id: "research".to_string(),
             display_name: "研究组".to_string(),
             template_version: 13,
+            icon: String::new(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
         };
 
@@ -232,7 +275,7 @@ mod tests {
         );
     }
 
-    /// 缺行时展示名与版本都按目录兜底。
+    /// 缺行时按目录兜底。
     #[test]
     fn a_missing_row_falls_back_to_the_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -242,5 +285,52 @@ mod tests {
             resolve_meta(None, dir.path(), "research"),
             ("research".to_string(), 13)
         );
+    }
+
+    async fn test_pool() -> (SqlitePool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        (pool, dir)
+    }
+
+    /// 目录-only 团队首次改图标补行。
+    #[tokio::test]
+    async fn set_icon_creates_row_with_fallback_meta() {
+        let (pool, _dir) = test_pool().await;
+
+        set_icon(&pool, "research", "/uploads/teams/a.png", "research", 0)
+            .await
+            .unwrap();
+
+        let row = get(&pool, "research").await.unwrap().unwrap();
+        assert_eq!(row.display_name, "research");
+        assert_eq!(row.template_version, 0);
+        assert_eq!(row.icon, "/uploads/teams/a.png");
+    }
+
+    /// upsert 不覆盖图标。
+    #[tokio::test]
+    async fn upsert_does_not_clobber_icon() {
+        let (pool, _dir) = test_pool().await;
+        set_icon(&pool, "research", "/uploads/teams/a.png", "研究组", 1)
+            .await
+            .unwrap();
+
+        upsert(
+            &pool,
+            &NewTeam {
+                id: "research",
+                display_name: "研究组",
+                template_version: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        let row = get(&pool, "research").await.unwrap().unwrap();
+        assert_eq!(row.icon, "/uploads/teams/a.png");
+        assert_eq!(row.template_version, 2);
     }
 }

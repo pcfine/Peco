@@ -60,6 +60,9 @@ vi.mock("@/api/spaces", () => ({
 
 vi.mock("@/api/teams", () => ({
   listTeams: async () => [],
+  createTeam: vi.fn(),
+  updateTeam: vi.fn(),
+  deleteTeam: vi.fn(),
   // Peco 翻转面常驻挂着，`/peco` 一开始就会读它的团队详情。
   getTeam: async (teamId: string) => ({
     id: teamId,

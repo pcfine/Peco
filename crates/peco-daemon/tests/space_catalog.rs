@@ -24,7 +24,7 @@ fn catalog(env: &TestEnv) -> SpaceCatalogContext {
 
 async fn install_teams(env: &TestEnv, teams: &[&str]) {
     for team in teams {
-        peco_daemon::team::create_team(&env.env, team, None, Some("team_default"))
+        peco_daemon::team::create_team(&env.env, team, None, Some("team_default"), None)
             .await
             .unwrap();
     }

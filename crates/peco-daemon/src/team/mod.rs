@@ -1,7 +1,4 @@
 //! 团队（能力根 `teams/<team_id>/`）的创建与模板安装。
-//!
-//! 目录是唯一真源：先把模板文件落盘，再补 `teams` 索引行。反过来做会在
-//! 「行已插、目录没建」时留下一个指向空气的索引，`open` 只会报 `team_missing`。
 
 use std::path::Path;
 
@@ -10,56 +7,129 @@ use peco_agents::BuiltinTemplate;
 use crate::db::teams::{self, NewTeam};
 use crate::error::DaemonError;
 use crate::space::SpaceEnv;
+use crate::space::peco::PECO_TEAM_ID;
 
-/// `from_template` 本期唯一支持的内置模板。
-///
-/// `peco` 模板属于 Peco 自己的能力根（`teams/peco/`），不由此接口创建。
+/// 目前唯一支持的内置模板。
 const SUPPORTED_TEMPLATE: &str = "team_default";
 
 /// `team_id` 规范是 `^[a-z][a-z0-9-]{1,31}$`（总长 2..=32）。
 const MAX_TEAM_ID_LEN: usize = 32;
 
-/// 新建 `teams/<id>/` 并建立索引行。
+/// 新建 `teams/<id>/` 并建立索引行；`from_template` 与 `from_team` 二选一。
 pub async fn create_team(
     env: &SpaceEnv,
     id: &str,
     display_name: Option<&str>,
     from_template: Option<&str>,
+    from_team: Option<&str>,
 ) -> Result<(), DaemonError> {
     validate_team_id(id)?;
+    if from_template.is_some() && from_team.is_some() {
+        return Err(DaemonError::InvalidArgument {
+            message: "from_template and from_team are mutually exclusive".into(),
+        });
+    }
 
     let root = env.team_root(id);
-    // 目录已存在也算「已存在」：删团队没有入口，重建同名团队会覆盖别人的能力文件。
     if root.exists() || teams::get(&env.pool, id).await?.is_some() {
         return Err(DaemonError::TeamExists {
             team_id: id.to_string(),
         });
     }
 
-    let template_version = match from_template {
-        Some(name) => install_template(&root, name)?,
-        None => {
-            std::fs::create_dir_all(&root)?;
-            0
+    let display_name = display_name.unwrap_or(id).to_string();
+    if let Err(error) =
+        create_and_index(env, &root, id, &display_name, from_template, from_team).await
+    {
+        // 失败时清理半装目录与索引行，避免重试撞上 `team_exists`。
+        if let Err(cleanup) = teams::delete_team(&env.pool, id).await {
+            tracing::warn!(team_id = id, error = %cleanup, "cannot remove partial team row");
         }
+        if root.exists()
+            && let Err(cleanup) = std::fs::remove_dir_all(&root)
+        {
+            tracing::warn!(team_id = id, error = %cleanup, "cannot remove partial team directory");
+        }
+        return Err(error);
+    }
+
+    tracing::info!(team_id = id, "team created");
+    Ok(())
+}
+
+/// 落盘并建立索引行；失败由 [`create_team`] 统一清理。
+async fn create_and_index(
+    env: &SpaceEnv,
+    root: &Path,
+    id: &str,
+    display_name: &str,
+    from_template: Option<&str>,
+    from_team: Option<&str>,
+) -> Result<(), DaemonError> {
+    let (template_version, copy_icon) = if let Some(source) = from_team {
+        validate_team_id(source)?;
+        if source == PECO_TEAM_ID {
+            return Err(DaemonError::InvalidArgument {
+                message: format!("team id '{PECO_TEAM_ID}' is reserved and cannot be copied"),
+            });
+        }
+        let source_root = env.team_root(source);
+        if !source_root.is_dir() {
+            return Err(DaemonError::TeamNotFound {
+                team_id: source.to_string(),
+            });
+        }
+        let source_row = teams::get(&env.pool, source).await?;
+        let icon = source_row
+            .as_ref()
+            .map(|row| row.icon.clone())
+            .unwrap_or_default();
+        let (_, version) = teams::resolve_meta(source_row, &source_root, source);
+        copy_tree(&source_root, root)?;
+        (version, Some(icon))
+    } else if let Some(name) = from_template {
+        (install_template(root, name)?, None)
+    } else {
+        std::fs::create_dir_all(root)?;
+        (0, None)
     };
 
-    let display_name = display_name.unwrap_or(id).to_string();
-    write_team_json(&root, id, &display_name, template_version)?;
+    write_team_json(root, id, display_name, template_version)?;
     teams::upsert(
         &env.pool,
         &NewTeam {
             id,
-            display_name: &display_name,
+            display_name,
             template_version,
         },
     )
     .await?;
-    tracing::info!(team_id = id, template_version, "team created");
+    if let Some(icon) = copy_icon.as_deref().filter(|icon| !icon.is_empty()) {
+        teams::set_icon(&env.pool, id, icon, display_name, template_version).await?;
+    }
     Ok(())
 }
 
-fn validate_team_id(id: &str) -> Result<(), DaemonError> {
+/// 递归复制目录，跳过符号链接。
+fn copy_tree(src: &Path, dest: &Path) -> Result<(), DaemonError> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)?;
+        } else {
+            tracing::warn!(path = %from.display(), "skipping non-regular file while copying team");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_team_id(id: &str) -> Result<(), DaemonError> {
     let mut chars = id.chars();
     let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase());
     let valid = head_ok
@@ -74,11 +144,7 @@ fn validate_team_id(id: &str) -> Result<(), DaemonError> {
     }
 }
 
-/// 把内置模板的文件按相对路径铺进能力根，返回模板版本。
-///
-/// 只铺文件、不实例化 `WorkSpace`：知识库真正的建库发生在该团队的某个空间
-/// 打开时（`KnowledgeBaseManager` 扫 `knowledge/*/kb_config.json`），而
-/// `init_from_template` 会在此刻连知识库后端 —— 建团队这一步不需要它。
+/// 将内置模板铺进能力根，返回模板版本。
 fn install_template(root: &Path, name: &str) -> Result<i64, DaemonError> {
     if name != SUPPORTED_TEMPLATE {
         return Err(DaemonError::InvalidArgument {
@@ -100,11 +166,10 @@ fn install_template(root: &Path, name: &str) -> Result<i64, DaemonError> {
     Ok(template_version_of(template.files))
 }
 
-/// `@master` 的 `agent.md` 相对路径 —— 版本字段与「团队是否装好」都看它。
+/// `@master` 的 `agent.md` 相对路径。
 pub(crate) const MASTER_AGENT_REL: &str = "agents/@master/agent.md";
 
-/// 模板版本取 `@master` 的 `agent.md` frontmatter —— 与 `init_from_template`
-/// 的升级闸门读同一个字段，写死常量会与模板漂移。
+/// 取模板内的版本号。
 fn template_version_of(files: &[(&str, &[u8])]) -> i64 {
     files
         .iter()
@@ -115,7 +180,7 @@ fn template_version_of(files: &[(&str, &[u8])]) -> i64 {
         .unwrap_or(0)
 }
 
-/// 从磁盘上的 `@master/agent.md` 解析模板版本；读不到或解不出返回 `None`。
+/// 读取磁盘上的模板版本。
 pub(crate) fn template_version_on_disk(team_root: &Path) -> Option<i64> {
     std::fs::read_to_string(team_root.join(MASTER_AGENT_REL))
         .ok()
@@ -129,8 +194,7 @@ fn template_version_from_agent_md(raw: &str) -> Option<u32> {
         .and_then(|(profile, _)| profile.template_version)
 }
 
-/// 一份 agent.md 的模板版本；无字段、解析失败或文件读不到一律当 0 ——
-/// 存量文件与手写文件都没有版本号，视为 0 才能让模板的升级内容落到它们上面。
+/// agent.md 的模板版本；缺失或解析失败为 0。
 pub(crate) fn agent_md_template_version(agent_md: &Path) -> u32 {
     std::fs::read_to_string(agent_md)
         .ok()
@@ -138,8 +202,7 @@ pub(crate) fn agent_md_template_version(agent_md: &Path) -> u32 {
         .unwrap_or(0)
 }
 
-/// `team.json` 是 `rescan`/`meta_from_dir` 的读入面：不写它，展示名会在下一次
-/// 普查里被目录名顶掉。
+/// 写入 `team.json`。
 pub(crate) fn write_team_json(
     root: &Path,
     id: &str,

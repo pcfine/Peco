@@ -61,12 +61,11 @@ export interface Team {
   team_id: string;
   display_name: string;
   template_version: number;
+  /** `/uploads/...` URL；空串表示未设置。 */
+  icon: string;
   agents: string[];
   bound_spaces: string[];
-  /**
-   * 计数由服务端聚合。四个字段与后端并行上线，缺失时卡片显示「–」而不是 0 ——
-   * 「0」是断言事实，「–」只是「还没告诉我」。
-   */
+  /** 计数由服务端聚合；缺失时显示「–」。 */
   agent_count?: number;
   skill_count?: number;
   mcp_count?: number;
@@ -93,6 +92,8 @@ export interface TeamDetail {
   id: string;
   display_name: string;
   template_version: number;
+  /** `/uploads/...` URL；空串表示未设置。 */
+  icon: string;
   root: string;
   has_master: boolean;
   agents: TeamAgent[];
@@ -105,7 +106,15 @@ export interface TeamDetail {
 export interface CreateTeamRequest {
   id: string;
   display_name?: string;
+  /** 内置模板名；与 `from_team` 二选一。 */
   from_template?: string;
+  /** 复制来源团队 id；与 `from_template` 二选一。 */
+  from_team?: string;
+}
+
+/** `PATCH /api/teams/{id}` 的请求体；空串表示清空图标。 */
+export interface UpdateTeamRequest {
+  icon: string;
 }
 
 /** 唤醒投递的五态；与任务生命周期是两套独立状态，一条任务可以已终态而唤醒仍待投递。 */

@@ -87,13 +87,7 @@ fn names(items: &Value) -> Vec<String> {
         .collect()
 }
 
-/// 2 agent / 1 skill / 1 MCP server / 1 知识库（2 文档）/ 2 绑定空间，逐项核对。
-///
-/// 变异：
-/// - agents 从 `agents/` 目录名取而不看 `agent.md` → 本测试仍绿，但下面
-///   「空壳团队」用例会把 `has_master` 判据暴露出来；
-/// - `document_count` 写死 0 → KB 断言变红；
-/// - `spaces` 换成全库空间列表 → 数量断言变红。
+/// 详情逐项报告团队能力。
 #[tokio::test]
 async fn detail_reports_every_capability_of_a_team() {
     let env = new_env(&["research", "writing"]).await;
@@ -157,6 +151,7 @@ async fn detail_reports_every_capability_of_a_team() {
         "装配页要显示能力根"
     );
     assert_eq!(reply.body["has_master"], json!(true));
+    assert_eq!(reply.body["icon"], json!(""), "未设置图标时为空串");
 
     let agents = reply.body["agents"].as_array().unwrap();
     assert_eq!(agents.len(), 2, "agents={}", reply.body["agents"]);
@@ -188,9 +183,7 @@ async fn detail_reports_every_capability_of_a_team() {
     assert_eq!(spaces[0]["closed_at"], Value::Null);
 }
 
-/// 目录与索引行都没有 ⇒ `404 team_not_found`。
-///
-/// 变异：删掉 handler 里的存在性判断（缺行就按目录名兜底）→ 本测试变红。
+/// 目录与索引行都没有时返回 404。
 #[tokio::test]
 async fn unknown_team_is_404() {
     let env = new_env(&["research"]).await;
@@ -201,9 +194,7 @@ async fn unknown_team_is_404() {
     assert_eq!(reply.code(), "team_not_found");
 }
 
-/// 只有目录、没有任何能力文件的空壳团队仍是 200，`has_master=false`。
-///
-/// 变异：把 `has_master` 写死 true（或按目录是否存在判断）→ 本测试变红。
+/// 空团队返回 200，`has_master=false`。
 #[tokio::test]
 async fn an_empty_team_has_no_master_and_still_answers() {
     let env = new_env(&["blank"]).await;
@@ -223,9 +214,7 @@ async fn an_empty_team_has_no_master_and_still_answers() {
     assert_eq!(reply.body["spaces"], json!([]));
 }
 
-/// 模板升过级但 `team.json` 与索引行都停在旧版本：详情必须报磁盘上的 13。
-///
-/// 变异：详情只信索引行的 `template_version` → 下面拿到 12 变红。
+/// 详情版本以磁盘为准。
 #[tokio::test]
 async fn detail_reports_the_version_installed_on_disk() {
     let env = new_env(&["research"]).await;
@@ -258,7 +247,7 @@ async fn detail_reports_the_version_installed_on_disk() {
     assert_eq!(reply.body["has_master"], json!(true));
 }
 
-/// 缺 `team.json`（外部工具手搭的团队）也要按磁盘上报版本，展示名退回目录名。
+/// 缺 team.json 时按磁盘上报版本。
 #[tokio::test]
 async fn detail_falls_back_to_the_disk_version_without_team_json() {
     let env = new_env(&["research"]).await;

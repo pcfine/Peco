@@ -16,7 +16,7 @@ import type {
 
 export async function listSpaces(): Promise<Space[]> {
   const res = await api.get<Space[]>("/spaces", {
-    // 已关闭的空间也留在列表里：删团队/删空间没有入口，隐藏等于丢历史。
+    // 已关闭的空间也留在列表里：关闭只表示实例不再打开，台账与历史仍指向它。
     params: { include_closed: true },
   });
   return res.data;

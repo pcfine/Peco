@@ -39,6 +39,59 @@ async fn migrations_are_rerunnable_without_duplicating_seed() {
     assert_eq!(env.count_users().await, 1, "重跑迁移不得插入第二个用户");
 }
 
+/// 全新库的 `teams` 表自带 icon 列。
+#[tokio::test]
+async fn teams_table_has_icon_column() {
+    let env = new_env(&[]).await;
+
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('teams') WHERE name = 'icon'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(count, 1, "teams 必须含 icon 列");
+}
+
+/// 023 为旧库补 icon 列且保留原有行。
+#[tokio::test]
+async fn migration_023_adds_team_icon_to_legacy_db_without_data_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/legacy.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+
+    sqlx::raw_sql(
+        "CREATE TABLE teams (\
+           id TEXT PRIMARY KEY, display_name TEXT NOT NULL, \
+           template_version INTEGER NOT NULL DEFAULT 0, \
+           created_at TEXT NOT NULL DEFAULT (datetime('now'))); \
+         INSERT INTO teams (id, display_name, template_version) \
+         VALUES ('research', '研究组', 3);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    let icon_col = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('teams') WHERE name = 'icon'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(icon_col, 1);
+
+    let row: (String, i64, String) = sqlx::query_as(
+        "SELECT display_name, template_version, icon FROM teams WHERE id = 'research'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, ("研究组".to_string(), 3, String::new()));
+}
+
 /// P1-3：`team_id` 指向不存在的团队时外键必须拦下。
 #[tokio::test]
 async fn workspaces_reject_unknown_team_with_foreign_key_error() {

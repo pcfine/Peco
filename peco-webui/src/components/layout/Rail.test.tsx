@@ -56,7 +56,12 @@ vi.mock("@/api/spaces", () => ({
   closeSpace: (wsId: string, force?: boolean) => closeSpace(wsId, force),
 }));
 
-vi.mock("@/api/teams", () => ({ listTeams: async () => [] }));
+vi.mock("@/api/teams", () => ({
+  listTeams: async () => [],
+  createTeam: vi.fn(),
+  updateTeam: vi.fn(),
+  deleteTeam: vi.fn(),
+}));
 vi.mock("@/api/tasks", () => ({ listTasks: async () => [] }));
 
 function PathProbe() {
