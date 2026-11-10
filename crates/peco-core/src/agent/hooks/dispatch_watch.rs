@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::LooperHook;
 use crate::agent::MASTER_AGENT_NAME;
-use crate::machine::{ObsEvent, ObsStream, TaskId, TaskSnapshot};
+use crate::machine::{ObsEvent, ObsStream, TaskId, TaskSnapshot, TaskState};
 use crate::tools::{DispatchReceipt, WorkspaceHub, WorkspaceToolError};
 
 /// 被观察的工具名，同时作为观察记录的 `origin_kind`。
@@ -125,6 +125,12 @@ fn dispatch_observations(
     prompt: Option<&str>,
 ) -> Result<Vec<DispatchObservation>, PlanError> {
     let receipt: DispatchReceipt = serde_json::from_str(result)?;
+    // 观察的价值是补上调用方看不到的终态结果。回执自报终态时结果（含 `output`）
+    // 已经在调用方手里，再观察一轮只会让它为同一份结果白跑一遍：`wait=true`
+    // 拿到的就是终态回执，`wait=false` 撞上瞬间完成的任务同理。
+    if receipt_state(&receipt.state).is_some_and(|state| state.is_terminal()) {
+        return Ok(Vec::new());
+    }
     let task_id = TaskId(Uuid::parse_str(&receipt.task_id)?);
     let target = receipt.workspace.trim();
     if target.is_empty() {
@@ -140,6 +146,15 @@ fn dispatch_observations(
         agent_name: MASTER_AGENT_NAME.to_string(),
         prompt_digest: prompt.map(str::to_string),
     }])
+}
+
+/// 回执里的状态串 → 状态。走 `TaskState` 自己的反序列化，而不在这里另抄一份
+/// 状态名：wire name 与 `as_str` 是同一份契约，抄第二份迟早漂移。
+///
+/// 认不出的串返回 `None`，调用方按非终态处理 —— 宁可多观察一条，也不能漏掉
+/// 还在跑的任务。
+fn receipt_state(raw: &str) -> Option<TaskState> {
+    serde_json::from_value(serde_json::Value::String(raw.to_string())).ok()
 }
 
 fn machine_task_observations(
@@ -797,6 +812,47 @@ mod tests {
         assert_eq!(terminal.state, TaskState::Completed);
     }
 
+    /// `wait=true` 到点仍未终态：回执只说明「这次没等到」，任务还在跑，必须照旧
+    /// 观察（变异点：把 `timed_out` 当成终态 ⇒ 这里永远等不到 `on_registered`）。
+    #[tokio::test]
+    async fn a_timed_out_dispatch_keeps_observing_the_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime();
+        let gate = Arc::new(Notify::new());
+        runtime
+            .hub()
+            .expect("hub")
+            .register(Arc::new(ScriptedMachine::new(
+                "scripted",
+                Arc::clone(&gate),
+            )))
+            .expect("register scripted");
+        let id = submit(&runtime, "scripted", "gated").await;
+        wait_for_working(&runtime, &id).await;
+        let hub = open_hub(dir.path(), runtime);
+
+        let (sink, mut rx) = sink();
+        let mut timed_out = receipt(dir.path(), id);
+        timed_out.state = TaskState::Working.as_str().to_string();
+        timed_out.timed_out = true;
+        let payload = serde_json::to_string(&timed_out).unwrap();
+        hook(&hub, sink)
+            .on_after_tool(0, &dispatch_call(), &payload, false)
+            .await;
+
+        let Recorded::Registered(_, snapshot) = next(&mut rx).await else {
+            panic!("a dispatch that timed out must still be observed");
+        };
+        assert!(
+            !snapshot.state.is_terminal(),
+            "the task keeps running after the wait gave up"
+        );
+
+        gate.notify_one();
+        let terminal = next_terminal(&mut rx).await;
+        assert_eq!(terminal.state, TaskState::Completed);
+    }
+
     #[tokio::test]
     async fn non_dispatch_tools_errors_and_bad_payloads_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -1002,6 +1058,61 @@ mod tests {
         assert_eq!(obs.origin_kind, DISPATCH_TOOL_NAME);
         assert_eq!(obs.agent_name, MASTER_AGENT_NAME);
         assert_eq!(obs.origin, origin);
+    }
+
+    /// 回执状态串 → 派发侧的观察条数。目录与 task_id 与「排不排观察」无关。
+    fn watches_for_dispatch_state(state: &str) -> usize {
+        let mut receipt = receipt(std::path::Path::new("/target/ws"), TaskId(Uuid::new_v4()));
+        receipt.state = state.to_string();
+        receipt.output = Some("delivered already".to_string());
+        plan_watches(
+            DISPATCH_TOOL_NAME,
+            &serde_json::to_string(&receipt).unwrap(),
+            &origin(std::path::Path::new("/origin/ws")),
+            &[],
+        )
+        .len()
+    }
+
+    /// 变异点：去掉 `dispatch_observations` 的终态早退 ⇒ 回执已带结果却仍排一条
+    /// 观察，发起方为同一份结果再白跑一整轮。
+    #[test]
+    fn a_terminal_dispatch_receipt_plans_no_watch() {
+        assert_eq!(watches_for_dispatch_state("completed"), 0);
+        // 其余终态由 `as_str` 驱动，不在测试里再抄一份状态名。
+        for state in [
+            TaskState::Failed,
+            TaskState::Canceled,
+            TaskState::TimedOut,
+            TaskState::Rejected,
+        ] {
+            assert_eq!(
+                watches_for_dispatch_state(state.as_str()),
+                0,
+                "a terminal receipt must not be watched: state={state:?}"
+            );
+        }
+    }
+
+    /// 只有终态才省掉观察：还在跑的必须照旧有人看。认不出的状态串按非终态处理
+    /// —— 多观察一条只是多一次订阅，漏掉一条就是没人收尾的孤儿任务
+    /// （变异点：认不出的串也跳过 ⇒ 后三条断言红）。
+    #[test]
+    fn a_live_or_unreadable_dispatch_state_still_plans_one_watch() {
+        for state in ["submitted", "working", "input_required", "auth_required"] {
+            assert_eq!(
+                watches_for_dispatch_state(state),
+                1,
+                "a non-terminal receipt must be watched: state={state}"
+            );
+        }
+        for state in ["running", "COMPLETED", " completed", ""] {
+            assert_eq!(
+                watches_for_dispatch_state(state),
+                1,
+                "an unreadable state must stay conservative: state={state:?}"
+            );
+        }
     }
 
     /// 变异点：把 `terminal == Some(true)` 的跳过改成按 `wait`/整体终态判定 ⇒
