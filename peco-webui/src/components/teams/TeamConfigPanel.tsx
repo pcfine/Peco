@@ -162,10 +162,10 @@ export function TeamConfigPanel({
   return (
     <div className="@container/team flex h-full min-h-0">
       <div className="flex w-44 shrink-0 flex-col border-r border-line bg-rail/50 @max-[560px]/team:w-12">
-        <div className="mb-1 border-b border-line px-2 py-1 @max-[560px]/team:px-1">
+        <div className="mb-1 flex h-11 items-center border-b border-line px-2 @max-[560px]/team:px-1">
           {/* 三栏等宽栅格：左右各留 28px，名称在中间那栏居中，返回键随
               `items-center` 垂直居中。 */}
-          <div className="grid h-8 grid-cols-[28px_1fr_28px] items-center @max-[560px]/team:flex @max-[560px]/team:justify-center">
+          <div className="grid w-full grid-cols-[28px_1fr_28px] items-center @max-[560px]/team:flex @max-[560px]/team:justify-center">
             {/* 颜色与下方导航一致（ink-muted）。 */}
             <Button
               variant="ghost"

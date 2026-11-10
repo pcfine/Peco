@@ -107,7 +107,7 @@ export function DockShell() {
         width: `min(92vw, ${DOCK_DRAWER_WIDTH}px)`,
       }}
     >
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-line px-2">
+      <div className="flex h-11 shrink-0 items-center gap-1 border-b border-line px-2">
         <button
           type="button"
           onClick={() => setTab("chat")}

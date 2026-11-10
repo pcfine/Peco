@@ -33,7 +33,7 @@ export function WakeMark({
         )}
       />
       {/* 窄列里靠省略号收尾：完整文案在 title 与展开详情里。 */}
-      <span className="truncate font-mono text-caption font-medium text-ink-muted">
+      <span className="min-w-0 truncate font-mono text-caption font-medium text-ink-muted">
         {description}
       </span>
     </span>

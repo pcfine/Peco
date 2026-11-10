@@ -37,7 +37,7 @@ export function SpacePanelHeader({
   expandChatRef,
 }: SpacePanelHeaderProps) {
   return (
-    <header className="flex h-12 shrink-0 items-center border-b border-line px-3">
+    <header className="flex h-11 shrink-0 items-center border-b border-line px-3">
       <div className="flex w-full min-w-0 items-center gap-0.5">
         {chatCollapsed && (
           <SpaceHeaderIconButton

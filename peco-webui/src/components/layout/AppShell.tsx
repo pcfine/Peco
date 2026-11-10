@@ -2,7 +2,7 @@
 // Peco 抽屉是覆盖层，不占列也不占行，所以这里只有一列。
 
 import { useState } from "react";
-import { Outlet, useLocation } from "react-router-dom";
+import { Outlet } from "react-router-dom";
 import { Rail } from "@/components/layout/Rail";
 import { TopBar } from "@/components/layout/TopBar";
 import { DockShell } from "@/components/dock/DockShell";
@@ -17,22 +17,10 @@ import { useSeedOpenSpaces } from "@/hooks/useOpenSpaces";
 import { useTaskEvents } from "@/hooks/useTaskEvents";
 import { useViewportWidth } from "@/hooks/useViewportWidth";
 import { railWidth, useUiStore } from "@/stores/uiStore";
-import { cn } from "@/lib/utils";
-
-/** 工作台页自带列 gutter：main 的留白归零，否则两侧重复留白吃掉聊天列宽度。 */
-function isWorkbench(pathname: string): boolean {
-  if (pathname === "/peco") return true;
-  // 团队详情是全高面板页（左分类导航 + 右内容各自滚动）：main 一留白，
-  // 分类导航就和 rail 之间多出一条缝，且 max-w-wide 居中在宽屏留下更大空白。
-  if (/^\/teams\/[^/]+$/.test(pathname)) return true;
-  if (pathname === "/spaces/new") return false;
-  return /^\/spaces\/[^/]+(\/status)?$/.test(pathname);
-}
 
 export function AppShell() {
   const viewport = useViewportWidth();
   const railOpen = useUiStore((state) => state.railOpen);
-  const { pathname } = useLocation();
   const [navOpen, setNavOpen] = useState(false);
   useTaskEvents();
   useResolveCurrentSpace();
@@ -70,13 +58,12 @@ export function AppShell() {
         >
           跳到内容
         </a>
+        {/* main 一律不留白：gutter 由页面自己承担 —— 工作台页在列内部，
+            栏目页在 `PageFrame`。分档只存在于页面内，壳不再维护路由白名单。 */}
         <main
           id="main"
           tabIndex={-1}
-          className={cn(
-            "min-h-0 min-w-0 flex-1 overflow-y-auto",
-            isWorkbench(pathname) ? "p-0" : "p-4 @min-[900px]/shell:p-6",
-          )}
+          className="min-h-0 min-w-0 flex-1 overflow-hidden"
         >
           {/* 高度必须确定：详情页的 tab 内容靠 flex-1 min-h-0 自滚，
               `min-h-full` 会让它的 `h-full` 解析回 auto，表格就没有滚动区。 */}

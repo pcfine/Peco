@@ -4,6 +4,7 @@
 import { useState } from "react";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { PageFrame } from "@/components/layout/PageFrame";
 import { ProviderSection } from "@/components/settings/ProviderSection";
 import {
   Select,
@@ -41,56 +42,56 @@ export function SettingsPage() {
   const active = rows.find((team) => team.team_id === teamId) ?? null;
 
   return (
-    <div className="mx-auto w-full max-w-mid space-y-6">
-      <h1 className="text-xl font-semibold text-ink">设置</h1>
-
-      <section className="space-y-2">
-        <div className="flex h-8 items-center gap-2 border-b border-line">
-          <h2 className="text-xs font-semibold text-ink-muted">团队</h2>
-          <span className="truncate text-caption font-medium text-ink-faint">
-            provider 配置存在团队能力根里，切换团队就切换配置
-          </span>
-        </div>
-
-        {teams.error !== null && (
-          <ErrorBanner
-            message={errorText(teams.error)}
-            onRetry={() => void teams.refetch()}
-          />
-        )}
-
-        {teams.isPending && <Skeleton className="h-8 w-56" />}
-
-        {teams.data && rows.length === 0 && (
-          <EmptyState title="还没有团队，provider 配置没有落点。" />
-        )}
-
-        {active && (
-          <div className="flex h-9 items-center gap-2">
-            {rows.length === 1 ? (
-              <span className="text-sm text-ink">{active.display_name}</span>
-            ) : (
-              <Select value={active.team_id} onValueChange={setPickedTeamId}>
-                <SelectTrigger className="h-8 w-56" aria-label="团队">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {rows.map((team) => (
-                    <SelectItem key={team.team_id} value={team.team_id}>
-                      {team.display_name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-            <span className="font-mono text-mono-sm text-ink-faint">
-              {active.team_id}
+    <PageFrame title="设置" contentWidth="mid">
+      <div className="space-y-6">
+        <section className="space-y-2">
+          <div className="flex h-8 items-center gap-2 border-b border-line">
+            <h2 className="text-xs font-semibold text-ink-muted">团队</h2>
+            <span className="truncate text-caption font-medium text-ink-faint">
+              provider 配置存在团队能力根里，切换团队就切换配置
             </span>
           </div>
-        )}
-      </section>
 
-      {teamId !== null && <ProviderSection teamId={teamId} />}
-    </div>
+          {teams.error !== null && (
+            <ErrorBanner
+              message={errorText(teams.error)}
+              onRetry={() => void teams.refetch()}
+            />
+          )}
+
+          {teams.isPending && <Skeleton className="h-8 w-56" />}
+
+          {teams.data && rows.length === 0 && (
+            <EmptyState title="还没有团队，provider 配置没有落点。" />
+          )}
+
+          {active && (
+            <div className="flex h-9 items-center gap-2">
+              {rows.length === 1 ? (
+                <span className="text-sm text-ink">{active.display_name}</span>
+              ) : (
+                <Select value={active.team_id} onValueChange={setPickedTeamId}>
+                  <SelectTrigger className="h-8 w-56" aria-label="团队">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {rows.map((team) => (
+                      <SelectItem key={team.team_id} value={team.team_id}>
+                        {team.display_name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+              <span className="font-mono text-mono-sm text-ink-faint">
+                {active.team_id}
+              </span>
+            </div>
+          )}
+        </section>
+
+        {teamId !== null && <ProviderSection teamId={teamId} />}
+      </div>
+    </PageFrame>
   );
 }

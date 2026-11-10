@@ -61,7 +61,7 @@ export function SpaceChatHeader({
   titleHint,
 }: SpaceChatHeaderProps) {
   return (
-    <header className="flex h-12 shrink-0 items-center border-b border-line px-4">
+    <header className="flex h-11 shrink-0 items-center border-b border-line px-4">
       {/* 两道边界槽同宽（size-7 = 一枚图标按钮）：内容行因此仍以列中心为轴。 */}
       <div className="flex w-7 shrink-0 items-center">
         <SpaceHeaderIconButton

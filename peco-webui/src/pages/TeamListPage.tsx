@@ -9,6 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { PixelIdenticon } from "@/components/common/PixelIdenticon";
+import { PageFrame } from "@/components/layout/PageFrame";
 import { DeleteTeamDialog } from "@/components/teams/DeleteTeamDialog";
 import { NewTeamDialog } from "@/components/teams/NewTeamDialog";
 import { uploadImage } from "@/api/upload";
@@ -180,71 +181,71 @@ export function TeamListPage() {
   }
 
   return (
-    <div className="w-full space-y-4">
-      <div className="flex h-8 items-center justify-between gap-2">
-        <h1 className="min-w-0 truncate text-xl font-semibold text-ink">
-          团队
-        </h1>
+    <PageFrame
+      title="团队"
+      actions={
         <Button size="sm" onClick={() => setNewOpen(true)}>
           <Plus className="size-4" />
           新建团队
         </Button>
-      </div>
-
-      {error && (
-        <ErrorBanner
-          message={errorText(error)}
-          onRetry={() => void refetch()}
-        />
-      )}
-
-      {isPending && (
-        <div className={GRID}>
-          {[0, 1, 2, 3, 4, 5].map((card) => (
-            <Skeleton key={card} className="h-[115px] w-full rounded-xl" />
-          ))}
-        </div>
-      )}
-
-      {teams && teams.length === 0 && (
-        <EmptyState
-          title="还没有可管理的团队。"
-          action={
-            <Button size="sm" onClick={() => setNewOpen(true)}>
-              <Plus className="size-4" />
-              新建团队
-            </Button>
-          }
-        />
-      )}
-
-      <ul className={GRID}>
-        {(teams ?? []).map((team) => (
-          <TeamCard
-            key={team.team_id}
-            team={team}
-            onDelete={() => requestDelete(team)}
+      }
+    >
+      <div className="space-y-4">
+        {error && (
+          <ErrorBanner
+            message={errorText(error)}
+            onRetry={() => void refetch()}
           />
-        ))}
-      </ul>
+        )}
 
-      <NewTeamDialog
-        open={newOpen}
-        onOpenChange={setNewOpen}
-        teams={teams ?? []}
-        onCreated={(team) => {
-          setNewOpen(false);
-          navigate(`/teams/${encodeURIComponent(team.team_id)}`);
-        }}
-      />
+        {isPending && (
+          <div className={GRID}>
+            {[0, 1, 2, 3, 4, 5].map((card) => (
+              <Skeleton key={card} className="h-[115px] w-full rounded-xl" />
+            ))}
+          </div>
+        )}
 
-      <DeleteTeamDialog
-        team={pendingDelete}
-        onOpenChange={(open) => {
-          if (!open) setPendingDelete(null);
-        }}
-        onDeleted={() => setPendingDelete(null)}
-      />
-    </div>
+        {teams && teams.length === 0 && (
+          <EmptyState
+            title="还没有可管理的团队。"
+            action={
+              <Button size="sm" onClick={() => setNewOpen(true)}>
+                <Plus className="size-4" />
+                新建团队
+              </Button>
+            }
+          />
+        )}
+
+        <ul className={GRID}>
+          {(teams ?? []).map((team) => (
+            <TeamCard
+              key={team.team_id}
+              team={team}
+              onDelete={() => requestDelete(team)}
+            />
+          ))}
+        </ul>
+
+        <NewTeamDialog
+          open={newOpen}
+          onOpenChange={setNewOpen}
+          teams={teams ?? []}
+          onCreated={(team) => {
+            setNewOpen(false);
+            navigate(`/teams/${encodeURIComponent(team.team_id)}`);
+          }}
+        />
+
+        <DeleteTeamDialog
+          team={pendingDelete}
+          onOpenChange={(open) => {
+            if (!open) setPendingDelete(null);
+          }}
+          onDeleted={() => setPendingDelete(null)}
+        />
+      </div>
+    </PageFrame>
   );
 }

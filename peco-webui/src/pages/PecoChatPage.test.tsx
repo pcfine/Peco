@@ -210,7 +210,7 @@ describe("Peco 主区", () => {
     expect(document.querySelectorAll("h1")).toHaveLength(1);
 
     const leftHeader = chatColumn.querySelector("header") as HTMLElement;
-    expect(leftHeader.className).toContain("h-12");
+    expect(leftHeader.className).toContain("h-11");
     expect(leftHeader.className).toContain("border-b");
     expect(
       within(leftHeader).getByRole("heading", { level: 1, name: "Peco" }),
@@ -231,7 +231,7 @@ describe("Peco 主区", () => {
     const rightHeader = screen
       .getByTestId("peco-panel")
       .querySelector("header") as HTMLElement;
-    expect(rightHeader.className).toContain("h-12");
+    expect(rightHeader.className).toContain("h-11");
     const tablist = within(rightHeader).getByRole("tablist", { name: "右栏" });
     expect(within(tablist).getAllByRole("tab")).toHaveLength(4);
   });

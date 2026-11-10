@@ -10,6 +10,7 @@ import {
   spaceGroupOf,
   type SpaceGroup,
 } from "@/components/layout/SpaceStatusMark";
+import { PageFrame } from "@/components/layout/PageFrame";
 import { spaceLabel } from "@/components/layout/spaceLabel";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -97,67 +98,67 @@ export function SpaceListPage() {
   }));
 
   return (
-    <div className="mx-auto w-full max-w-wide space-y-6">
-      {error && (
-        <ErrorBanner
-          message={errorText(error)}
-          onRetry={() => void refetch()}
-        />
-      )}
-
-      <div className="flex h-8 items-center justify-between gap-2">
-        <h1 className="min-w-0 truncate text-xl font-semibold text-ink">
-          工作室
-        </h1>
+    <PageFrame
+      title="工作室"
+      actions={
         <Button asChild size="sm">
           <Link to="/spaces/new">新建空间</Link>
         </Button>
+      }
+    >
+      <div className="space-y-6">
+        {error && (
+          <ErrorBanner
+            message={errorText(error)}
+            onRetry={() => void refetch()}
+          />
+        )}
+
+        {isPending && (
+          <div className="space-y-px">
+            {[0, 1, 2].map((row) => (
+              <Skeleton key={row} className="h-10 w-full" />
+            ))}
+          </div>
+        )}
+
+        {spaces && spaces.length === 0 && (
+          <EmptyState
+            title="还没有工作空间。空间 = 一个目录 + 一个团队。"
+            action={
+              <Button asChild size="sm">
+                <Link to="/spaces/new">新建空间</Link>
+              </Button>
+            }
+          />
+        )}
+
+        {groups.map(({ group, rows }) =>
+          rows.length === 0 ? null : (
+            <section key={group}>
+              <header className="sticky top-0 z-10 flex h-8 items-center gap-2 bg-canvas">
+                <h2 className="text-xs font-semibold text-ink-muted">
+                  {SPACE_GROUP_LABELS[group]}
+                </h2>
+                <span className="tabular-nums text-2xs text-ink-faint">
+                  {rows.length}
+                </span>
+              </header>
+              <ul className="min-w-0 overflow-x-auto">
+                {rows.map((space) => (
+                  <SpaceRow
+                    key={space.ws_id}
+                    space={space}
+                    active={space.ws_id === currentWsId}
+                    activityAt={activity.get(space.ws_id) ?? null}
+                    onEnter={() => enterSpace(space.ws_id)}
+                  />
+                ))}
+              </ul>
+            </section>
+          ),
+        )}
       </div>
-
-      {isPending && (
-        <div className="space-y-px">
-          {[0, 1, 2].map((row) => (
-            <Skeleton key={row} className="h-10 w-full" />
-          ))}
-        </div>
-      )}
-
-      {spaces && spaces.length === 0 && (
-        <EmptyState
-          title="还没有工作空间。空间 = 一个目录 + 一个团队。"
-          action={
-            <Button asChild size="sm">
-              <Link to="/spaces/new">新建空间</Link>
-            </Button>
-          }
-        />
-      )}
-
-      {groups.map(({ group, rows }) =>
-        rows.length === 0 ? null : (
-          <section key={group}>
-            <header className="sticky top-0 z-10 flex h-8 items-center gap-2 bg-canvas">
-              <h2 className="text-xs font-semibold text-ink-muted">
-                {SPACE_GROUP_LABELS[group]}
-              </h2>
-              <span className="tabular-nums text-2xs text-ink-faint">
-                {rows.length}
-              </span>
-            </header>
-            <ul className="min-w-0 overflow-x-auto">
-              {rows.map((space) => (
-                <SpaceRow
-                  key={space.ws_id}
-                  space={space}
-                  active={space.ws_id === currentWsId}
-                  activityAt={activity.get(space.ws_id) ?? null}
-                  onEnter={() => enterSpace(space.ws_id)}
-                />
-              ))}
-            </ul>
-          </section>
-        ),
-      )}
-    </div>
+    </PageFrame>
   );
 }

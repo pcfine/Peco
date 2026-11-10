@@ -151,8 +151,7 @@ export function Rail({
         collapsed ? "w-16" : "w-52",
       )}
     >
-      {/* 品牌带使用独立底色，图标居中；这一行只承担 logo 与抽屉开关。 */}
-      <div className="flex h-11 shrink-0 items-center justify-center border-b border-line bg-raised">
+      <div className="flex h-11 shrink-0 items-center justify-center border-b border-line">
         {/* 品牌行是抽屉开关；工作空间名由下方 Peco 行承担。 */}
         <button
           type="button"
@@ -172,7 +171,10 @@ export function Rail({
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto" onKeyDown={moveFocus}>
+      <div
+        className="min-h-0 flex-1 overflow-y-auto pt-1"
+        onKeyDown={moveFocus}
+      >
         {peco && (
           // `button` 的 width:auto 是 fit-content，满宽要靠块级容器；否则它比空间行窄一截。
           <div className="mx-2">

@@ -89,17 +89,18 @@ export function DispatchTimeline({ tasks, spaces }: DispatchTimelineProps) {
                     <span className="shrink-0 tabular-nums text-caption font-medium text-ink-faint @min-[900px]/work:w-24">
                       {relativeTime(task.terminal_at ?? task.created_at)}
                     </span>
-                    <TaskStateMark
-                      taskState={task.task_state}
-                      className="shrink-0"
-                    />
-                    {isNotableWakeState(task.wake_state) && (
-                      <WakeMark
-                        wakeState={task.wake_state}
-                        wakeSkipReason={task.wake_skip_reason}
-                        className="shrink-0"
-                      />
-                    )}
+                    <span className="shrink-0 @min-[900px]/work:w-28 @min-[900px]/work:overflow-hidden">
+                      <TaskStateMark taskState={task.task_state} />
+                    </span>
+                    <span className="contents @min-[900px]/work:block @min-[900px]/work:w-44 @min-[900px]/work:shrink-0 @min-[900px]/work:overflow-hidden">
+                      {isNotableWakeState(task.wake_state) && (
+                        <WakeMark
+                          wakeState={task.wake_state}
+                          wakeSkipReason={task.wake_skip_reason}
+                          className="@min-[900px]/work:w-full"
+                        />
+                      )}
+                    </span>
                     <span className="min-w-0 shrink-0 truncate text-2xs text-ink-faint @min-[900px]/work:w-56">
                       <NodeName text={nameOf(task.origin_ws_id)} />
                       <span className="text-caption font-medium"> → </span>
