@@ -60,7 +60,7 @@ export function SpaceDetailHeader({
           <button
             type="button"
             onClick={() => setCurrent(space.ws_id)}
-            className="tap-target shrink-0 rounded-[4px] bg-line px-2 text-caption font-medium text-ink-muted transition-colors hover:text-ink"
+            className="tap-target shrink-0 rounded-sm bg-line px-2 text-caption font-medium text-ink-muted transition-colors hover:text-ink"
           >
             非当前空间
           </button>
@@ -94,7 +94,7 @@ export function SpaceDetailHeader({
         <button
           type="button"
           onClick={() => void copyWorkDir()}
-          className="tap-target -mx-2 -my-1.5 shrink-0 rounded-[4px] px-2 text-caption font-medium text-ink-muted transition-colors hover:bg-line/40 hover:text-ink"
+          className="tap-target -mx-2 -my-1.5 shrink-0 rounded-sm px-2 text-caption font-medium text-ink-muted transition-colors hover:bg-line/40 hover:text-ink"
         >
           复制
         </button>

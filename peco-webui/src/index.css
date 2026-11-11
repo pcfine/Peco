@@ -127,8 +127,15 @@ html:not(.dark) {
   --text-mono-sm: var(--text-caption);
   --text-mono-sm--line-height: var(--text-caption--line-height);
 
-  --radius-chip: 4px;
-  --radius-control: 6px;
+  /* 圆角阶梯与老 webui 同值：基准 10px，sm/md/lg/xl = 6/8/10/14。
+     拷来的 shadcn 原子（rounded-md/lg/xl）因此和旧项目逐像素一致。 */
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-chip: 6px;
+  --radius-control: 8px;
 
   --spacing-row-sm: 28px;
   --spacing-row: 32px;

@@ -87,7 +87,7 @@ function CapabilityGroup({
                 disabled={disabled}
                 onClick={() => onToggle(option.value)}
                 className={cn(
-                  "h-7 rounded-[6px] px-2 font-mono text-xs",
+                  "h-7 rounded-md px-2 font-mono text-xs",
                   on
                     ? "bg-line text-ink"
                     : "bg-transparent text-ink-muted hover:bg-line/40",

@@ -52,7 +52,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
         type="button"
         onClick={onOpenNav}
         aria-label="打开导航"
-        className="grid h-7 w-7 place-items-center rounded-[4px] text-ink-muted hover:bg-line hover:text-ink"
+        className="grid h-7 w-7 place-items-center rounded-sm text-ink-muted hover:bg-line hover:text-ink"
       >
         <Menu className="h-4 w-4" />
       </button>
@@ -69,7 +69,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
             aria-expanded={dockOpen}
             aria-controls="peco-dock"
             aria-label="Peco 对话"
-            className="relative grid h-7 w-7 place-items-center rounded-[4px] text-ink-muted hover:bg-line hover:text-ink"
+            className="relative grid h-7 w-7 place-items-center rounded-sm text-ink-muted hover:bg-line hover:text-ink"
           >
             <MessagesSquare className="h-4 w-4" />
             {inflight > 0 && (

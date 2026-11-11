@@ -58,7 +58,7 @@ export function SpacePanelHeader({
                 aria-selected={selected}
                 onClick={() => onSelect(item)}
                 className={cn(
-                  "h-7 shrink-0 rounded-[4px] px-2.5 text-body transition-colors duration-[120ms]",
+                  "h-7 shrink-0 rounded-sm px-2.5 text-body transition-colors duration-[120ms]",
                   selected
                     ? "bg-line text-ink"
                     : "text-ink-muted hover:bg-line/50",

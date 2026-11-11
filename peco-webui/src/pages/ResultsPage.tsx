@@ -62,7 +62,7 @@ export function ResultsPage() {
                 onClick={() => setState(filter.key)}
                 aria-pressed={state === filter.key}
                 className={cn(
-                  "h-7 rounded-[4px] px-2 text-xs",
+                  "h-7 rounded-sm px-2 text-xs",
                   state === filter.key
                     ? "bg-line text-ink"
                     : "text-ink-muted hover:text-ink",
@@ -78,7 +78,7 @@ export function ResultsPage() {
             <select
               value={origin}
               onChange={(event) => setOrigin(event.target.value)}
-              className="h-8 rounded-[6px] border border-line-strong bg-panel px-1 text-xs text-ink"
+              className="h-8 rounded-md border border-line-strong bg-panel px-1 text-xs text-ink"
             >
               <option value="">全部空间</option>
               {(spaces.data ?? []).map((space) => (
@@ -93,7 +93,7 @@ export function ResultsPage() {
             <select
               value={limit}
               onChange={(event) => setLimit(Number(event.target.value))}
-              className="h-8 rounded-[6px] border border-line-strong bg-panel px-1 text-xs text-ink"
+              className="h-8 rounded-md border border-line-strong bg-panel px-1 text-xs text-ink"
             >
               {LIMITS.map((value) => (
                 <option key={value} value={value}>

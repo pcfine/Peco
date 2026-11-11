@@ -217,7 +217,7 @@ export function TeamConfigPanel({
                     aria-label={TAB_LABELS[item]}
                     onClick={() => setTab(item)}
                     className={cn(
-                      "flex h-8 shrink-0 items-center gap-2 rounded-[6px] px-2 text-[13px] @max-[560px]/team:justify-center @max-[560px]/team:px-0",
+                      "flex h-8 shrink-0 items-center gap-2 rounded-md px-2 text-[13px] @max-[560px]/team:justify-center @max-[560px]/team:px-0",
                       active
                         ? "bg-line/50 font-medium text-ink"
                         : "text-ink-muted hover:bg-line/25",

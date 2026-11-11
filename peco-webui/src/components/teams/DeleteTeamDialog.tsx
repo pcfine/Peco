@@ -56,7 +56,7 @@ export function DeleteTeamDialog({
         </DialogHeader>
 
         {spaces.length > 0 && (
-          <div className="space-y-2 rounded-[6px] border border-destructive/40 bg-destructive/10 p-3">
+          <div className="space-y-2 rounded-md border border-destructive/40 bg-destructive/10 p-3">
             <p className="text-xs font-medium text-ink">
               这 {spaces.length} 个工作空间会从空间索引中移除并失效：
             </p>

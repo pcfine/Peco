@@ -29,7 +29,7 @@ export function TaskFidelityNote({ fidelity, detail }: TaskFidelityNoteProps) {
     >
       <span
         className={cn(
-          "inline-flex min-h-6 shrink-0 items-center rounded-[4px] bg-line/60 px-1.5",
+          "inline-flex min-h-6 shrink-0 items-center rounded-sm bg-line/60 px-1.5",
           fidelity === "live" ? "text-ok" : "text-ink-muted",
         )}
       >

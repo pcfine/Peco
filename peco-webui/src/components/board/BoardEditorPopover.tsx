@@ -25,7 +25,7 @@ export function BoardEditorPopover() {
         <button
           type="button"
           aria-haspopup="dialog"
-          className="flex h-7 items-center gap-1.5 rounded-[6px] px-2 text-xs text-ink-muted hover:bg-line hover:text-ink"
+          className="flex h-7 items-center gap-1.5 rounded-md px-2 text-xs text-ink-muted hover:bg-line hover:text-ink"
         >
           <SlidersHorizontal className="h-3.5 w-3.5" />
           调整看板
@@ -52,7 +52,7 @@ export function BoardEditorPopover() {
                 aria-label={`${BOARD_PANEL_LABELS[id]}上移`}
                 disabled={index === 0}
                 onClick={() => move(id, -1)}
-                className="grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink disabled:pointer-events-none disabled:opacity-40"
+                className="grid h-6 w-6 place-items-center rounded-sm text-ink-faint hover:bg-line hover:text-ink disabled:pointer-events-none disabled:opacity-40"
               >
                 <ArrowUp className="h-3.5 w-3.5" />
               </button>
@@ -61,7 +61,7 @@ export function BoardEditorPopover() {
                 aria-label={`${BOARD_PANEL_LABELS[id]}下移`}
                 disabled={index === order.length - 1}
                 onClick={() => move(id, 1)}
-                className="grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink disabled:pointer-events-none disabled:opacity-40"
+                className="grid h-6 w-6 place-items-center rounded-sm text-ink-faint hover:bg-line hover:text-ink disabled:pointer-events-none disabled:opacity-40"
               >
                 <ArrowDown className="h-3.5 w-3.5" />
               </button>

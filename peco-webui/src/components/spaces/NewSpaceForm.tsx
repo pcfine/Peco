@@ -151,7 +151,7 @@ export function NewSpaceForm({
                   }
                   aria-pressed={selected}
                   className={cn(
-                    "flex h-9 w-full items-center gap-2 rounded-[6px] px-2 text-left",
+                    "flex h-9 w-full items-center gap-2 rounded-md px-2 text-left",
                     selected
                       ? "bg-line text-ink"
                       : "bg-transparent text-ink-muted hover:bg-line/40",
@@ -176,7 +176,7 @@ export function NewSpaceForm({
             onClick={() => setMode({ kind: "new" })}
             aria-pressed={mode.kind === "new"}
             className={cn(
-              "flex h-9 w-full items-center rounded-[6px] px-2 text-left text-sm",
+              "flex h-9 w-full items-center rounded-md px-2 text-left text-sm",
               mode.kind === "new"
                 ? "bg-line text-ink"
                 : "bg-transparent text-ink-muted hover:bg-line/40",

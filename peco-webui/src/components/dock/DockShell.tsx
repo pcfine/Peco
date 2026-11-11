@@ -98,13 +98,19 @@ export function DockShell() {
       inert={!open}
       className={cn(
         "fixed inset-y-0 z-40 flex flex-col overscroll-contain border-r border-line-strong bg-raised",
-        "transition-transform duration-[120ms] ease-out",
         open ? "translate-x-0" : "-translate-x-full pointer-events-none",
       )}
-      // 抽屉起点跟着左栏宽度走：这是布局位置，不做动画。
+      // 抽屉起点跟着左栏宽度走，且必须与左栏同步做 300ms 动画：左栏是 flex 布局里
+      // 连续变宽的，left 若瞬间跳到终点，收起态停在视野外的抽屉右缘就会从正在变宽
+      // 的左栏下方露出一条（头部右侧的连接状态）。
+      // 曲线必须写字面量：Tailwind 的 ease-out 是 cubic-bezier(0,0,0.2,1)，CSS 关键字
+      // ease-out 是 cubic-bezier(0,0,0.58,1)，混用会让两条动画中途错开近 30px。
+      // 开合走 translate（Tailwind v4 的 translate-x-* 不再写进 transform）。
       style={{
         left: railWidth(viewport, railOpen),
         width: `min(92vw, ${DOCK_DRAWER_WIDTH}px)`,
+        transition:
+          "left 300ms cubic-bezier(0, 0, 0.2, 1), translate 120ms cubic-bezier(0, 0, 0.2, 1)",
       }}
     >
       <div className="flex h-11 shrink-0 items-center gap-1 border-b border-line px-2">
@@ -143,7 +149,7 @@ export function DockShell() {
           <button
             type="button"
             onClick={retryEvents}
-            className="h-6 shrink-0 rounded-[4px] px-1.5 text-caption font-medium text-primary-ink hover:underline"
+            className="h-6 shrink-0 rounded-sm px-1.5 text-caption font-medium text-primary-ink hover:underline"
           >
             重试
           </button>
@@ -152,7 +158,7 @@ export function DockShell() {
           type="button"
           onClick={() => setOpen(false)}
           aria-label="关闭 Peco 对话"
-          className="grid h-6 w-6 shrink-0 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
+          className="grid h-6 w-6 shrink-0 place-items-center rounded-sm text-ink-faint hover:bg-line hover:text-ink"
         >
           <X aria-hidden="true" className="h-4 w-4" />
         </button>

@@ -134,7 +134,7 @@ export function SpaceStatusPage() {
             aria-selected={tab === item}
             onClick={() => setParam("tab", item)}
             className={cn(
-              "my-1 shrink-0 rounded-[4px] px-3 text-sm",
+              "my-1 shrink-0 rounded-sm px-3 text-sm",
               tab === item
                 ? "bg-line text-ink"
                 : "bg-transparent text-ink-muted hover:bg-line/40",

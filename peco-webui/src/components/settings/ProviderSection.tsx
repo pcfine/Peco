@@ -467,12 +467,12 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     {provider.name}
                   </span>
                   {inherited && (
-                    <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
+                    <span className="shrink-0 rounded-sm bg-line/60 px-1 text-caption font-medium text-ink-faint">
                       {source === "peco" ? "继承自 Peco" : "系统"}
                     </span>
                   )}
                   {provider.is_default && (
-                    <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
+                    <span className="shrink-0 rounded-sm bg-line/60 px-1 text-caption font-medium text-ink-faint">
                       默认
                     </span>
                   )}

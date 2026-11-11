@@ -114,7 +114,7 @@ function ServerCard({
           {name}
         </span>
         {summary.transport && (
-          <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-2xs font-mono text-ink-muted">
+          <span className="shrink-0 rounded-sm bg-line/60 px-1 text-2xs font-mono text-ink-muted">
             {summary.transport}
           </span>
         )}

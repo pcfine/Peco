@@ -30,7 +30,7 @@ export function SpaceSwitcher() {
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          className="flex h-7 max-w-[220px] items-center gap-1.5 rounded-[6px] px-2 text-sm text-ink hover:bg-line"
+          className="flex h-7 max-w-[220px] items-center gap-1.5 rounded-md px-2 text-sm text-ink hover:bg-line"
           aria-label="切换当前空间"
         >
           <span className="truncate">

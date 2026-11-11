@@ -68,7 +68,7 @@ function AgentMark({ agent }: { agent: AgentListItem }) {
     <span
       aria-hidden
       className={cn(
-        "flex size-14 shrink-0 items-center justify-center rounded-[6px] text-xl",
+        "flex size-14 shrink-0 items-center justify-center rounded-md text-xl",
         !agent.background_color && "bg-line/40",
       )}
       style={
@@ -115,7 +115,7 @@ function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
               {agent.name}
             </span>
             {agent.is_master && (
-              <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-2xs font-medium text-ink-faint">
+              <span className="shrink-0 rounded-sm bg-line/60 px-1 text-2xs font-medium text-ink-faint">
                 @master
               </span>
             )}

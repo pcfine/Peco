@@ -134,7 +134,7 @@ export function Rail({
   // 栏目入口的两种排版共用一串底类：收起态只留图标并居中；激活态与空间行同一枚胶囊。
   const navRowClass = (active: boolean) =>
     cn(
-      "mx-2 flex h-8 items-center rounded-[6px] border text-body font-normal transition-colors duration-[120ms]",
+      "mx-2 flex h-8 items-center rounded-lg border text-body font-normal transition-colors",
       collapsed ? "justify-center" : "gap-2 px-2",
       active
         ? "border-brand/40 bg-brand/10 text-ink"
@@ -147,7 +147,7 @@ export function Rail({
     // 而左栏是抽屉的滑动起点，被盖住就看不见开关了。
     <aside
       className={cn(
-        "relative z-50 flex h-full shrink-0 flex-col border-r border-line bg-rail",
+        "relative z-50 flex h-full shrink-0 flex-col overflow-hidden border-r border-line bg-rail transition-[width] duration-300 ease-out",
         collapsed ? "w-16" : "w-52",
       )}
     >
@@ -161,7 +161,7 @@ export function Rail({
           aria-expanded={dockOpen}
           aria-controls="peco-dock"
           className={cn(
-            "grid size-8 place-items-center rounded-[6px] border transition-colors duration-[120ms]",
+            "grid size-8 place-items-center rounded-lg border transition-colors",
             dockOpen
               ? "border-brand/40 bg-brand/10"
               : "border-transparent hover:bg-line/50",
@@ -186,7 +186,7 @@ export function Rail({
               title="Peco"
               data-space-row=""
               className={cn(
-                "flex h-8 w-full items-center rounded-[6px] border font-normal transition-colors duration-[120ms]",
+                "flex h-8 w-full items-center rounded-lg border font-normal transition-colors",
                 collapsed ? "justify-center" : "gap-2 px-2",
                 routeWsId === peco.ws_id
                   ? "border-brand/40 bg-brand/10 text-ink"
@@ -293,7 +293,7 @@ export function Rail({
                 type="button"
                 onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
                 aria-label={theme === "dark" ? "切到亮色" : "切到暗色"}
-                className="grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink"
+                className="grid h-6 w-6 place-items-center rounded-md text-ink-faint transition-colors hover:bg-line hover:text-ink"
               >
                 {theme === "dark" ? (
                   <Sun className="h-4 w-4" />
@@ -307,7 +307,7 @@ export function Rail({
                 aria-label="设置"
                 aria-current={onSettingsPage ? "page" : undefined}
                 className={cn(
-                  "ml-1 grid h-6 w-6 place-items-center rounded-[4px] hover:bg-line",
+                  "ml-1 grid h-6 w-6 place-items-center rounded-md transition-colors hover:bg-line",
                   onSettingsPage
                     ? "bg-brand/10 text-ink"
                     : "text-ink-faint hover:text-ink",
@@ -323,7 +323,7 @@ export function Rail({
               onClick={() => setRailOpen(!railOpen)}
               aria-label={railOpen ? "折叠左栏" : "展开左栏"}
               className={cn(
-                "grid h-6 w-6 place-items-center rounded-[4px] text-ink-faint hover:bg-line hover:text-ink",
+                "grid h-6 w-6 place-items-center rounded-md text-ink-faint transition-colors hover:bg-line hover:text-ink",
                 !collapsed && "ml-auto",
               )}
             >

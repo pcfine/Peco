@@ -28,7 +28,7 @@ export function BoardGrid({ panels }: { panels: PanelRenderers }) {
   const shown = visiblePanels({ order, hidden }).filter(isPanelId);
 
   return (
-    <div className="board-grid grid grid-cols-1 overflow-hidden rounded-[8px] border border-line @min-[640px]/work:grid-cols-2 @min-[1024px]/work:grid-cols-6 @min-[1400px]/work:grid-cols-12">
+    <div className="board-grid grid grid-cols-1 overflow-hidden rounded-lg border border-line @min-[640px]/work:grid-cols-2 @min-[1024px]/work:grid-cols-6 @min-[1400px]/work:grid-cols-12">
       {shown.map((id) => (
         <div
           key={id}

@@ -49,7 +49,7 @@ export function EntityCard({
   className,
 }: EntityCardProps) {
   const bodyClass = cn(
-    "flex min-h-[132px] w-full flex-col gap-2 rounded-[6px] bg-side p-3 text-left transition-colors",
+    "flex min-h-[132px] w-full flex-col gap-2 rounded-md bg-side p-3 text-left transition-colors",
     onClick &&
       "hover:bg-side/80 hover:ring-1 hover:ring-brand/40 focus-visible:ring-2 focus-visible:ring-brand",
     className,

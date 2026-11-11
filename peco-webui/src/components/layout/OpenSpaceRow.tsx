@@ -38,7 +38,7 @@ export function OpenSpaceRow({
     // `group` 是给「×」用的：删除只在指针进入这一行（或键盘焦点落进来）时出现。
     <div
       className={cn(
-        "group mx-2 flex items-center rounded-[6px] border transition-colors duration-[120ms]",
+        "group mx-2 flex items-center rounded-lg border transition-colors",
         active
           ? "border-brand/40 bg-brand/10"
           : "border-transparent hover:bg-line/50",
@@ -53,7 +53,7 @@ export function OpenSpaceRow({
         data-ws-id={space.ws_id}
         data-space-row=""
         className={cn(
-          "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[6px] font-normal",
+          "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg font-normal",
           collapsed ? "justify-center px-1" : "px-2",
           active ? "text-ink" : "text-ink-muted hover:text-ink",
         )}
@@ -86,7 +86,7 @@ export function OpenSpaceRow({
           onClick={onRemove}
           aria-label="从打开列表移除"
           title="从打开列表移除"
-          className="mr-1 grid h-6 w-6 shrink-0 place-items-center rounded-[4px] text-ink-faint opacity-0 transition-opacity duration-[120ms] hover:bg-line hover:text-ink group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+          className="mr-1 grid h-6 w-6 shrink-0 place-items-center rounded-md text-ink-faint opacity-0 transition-opacity duration-[120ms] hover:bg-line hover:text-ink group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
         >
           <X className="h-3.5 w-3.5" />
         </button>

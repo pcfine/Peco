@@ -184,7 +184,7 @@ describe("左栏打开集", () => {
     expect(activeRow).toHaveAttribute("aria-current", "true");
     // 选中态的形状是行容器上的圆角矩形 —— 主点击区自己不带框。
     const pill = activeRow.parentElement;
-    expect(pill?.className).toContain("rounded-[6px]");
+    expect(pill?.className).toContain("rounded-lg");
     expect(pill?.className).toContain("bg-brand/10");
     expect(ensureSpaceConversation).not.toHaveBeenCalled();
     expect(closeSpace).not.toHaveBeenCalled();

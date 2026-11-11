@@ -26,7 +26,7 @@ const ROW_CLASS = "flex justify-start gap-1.5 max-w-full";
 const MAX_IMAGES_PER_ROW = 6;
 
 const TEXT_BLOCK_CLASS =
-  "bg-primary text-primary-foreground rounded-[6px] px-4 py-2 text-sm max-w-full";
+  "bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2 text-sm max-w-full";
 
 /** 单图视图名与触发按钮名刻意不同：一个是「视图」，一个是「控件」 */
 function lightboxLabel(index: number, total: number): string {
@@ -72,7 +72,7 @@ export function UserBubble({ message }: { message: ChatMessage }) {
       <div className="flex justify-end">
         <div
           data-slot="user-bubble"
-          className="group relative bg-primary text-primary-foreground rounded-[6px] px-4 py-2 max-w-[80%] text-sm"
+          className="group relative bg-primary text-primary-foreground rounded-2xl rounded-br-md px-4 py-2 max-w-[80%] text-sm"
         >
           <AttachmentChips items={attachments} withMargin />
           {message.content}

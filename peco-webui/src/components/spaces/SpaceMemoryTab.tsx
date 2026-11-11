@@ -58,7 +58,7 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 
 function CategoryChip({ category }: { category: string }) {
   return (
-    <span className="shrink-0 rounded-[4px] bg-line px-1 text-caption font-medium text-ink-muted">
+    <span className="shrink-0 rounded-sm bg-line px-1 text-caption font-medium text-ink-muted">
       {categoryLabel(category)}
     </span>
   );
@@ -137,7 +137,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
                 aria-pressed={category === option.value}
                 onClick={() => setCategory(option.value)}
                 className={cn(
-                  "h-7 shrink-0 rounded-[4px] px-2 text-caption font-medium text-ink-muted hover:text-ink",
+                  "h-7 shrink-0 rounded-sm px-2 text-caption font-medium text-ink-muted hover:text-ink",
                   category === option.value && "bg-line text-ink",
                 )}
               >

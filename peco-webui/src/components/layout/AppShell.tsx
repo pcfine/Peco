@@ -54,7 +54,7 @@ export function AppShell() {
         {viewport < 1100 && <TopBar onOpenNav={() => setNavOpen(true)} />}
         <a
           href="#main"
-          className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-2 focus:z-50 focus:rounded-[4px] focus:bg-raised focus:px-2 focus:py-1 focus:text-xs focus:text-ink"
+          className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-2 focus:z-50 focus:rounded-sm focus:bg-raised focus:px-2 focus:py-1 focus:text-xs focus:text-ink"
         >
           跳到内容
         </a>

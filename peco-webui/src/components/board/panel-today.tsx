@@ -90,7 +90,7 @@ function Column({
           <span
             data-testid="today-failed-badge"
             title={`失败 ${badge}`}
-            className="rounded-[4px] bg-danger/15 px-1 tabular-nums text-2xs text-danger"
+            className="rounded-sm bg-danger/15 px-1 tabular-nums text-2xs text-danger"
           >
             {badge}
           </span>

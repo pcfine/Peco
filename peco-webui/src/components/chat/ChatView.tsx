@@ -862,7 +862,7 @@ export function ChatView({
       {/* Input */}
       <div className="pt-4 mt-4">
         {composerNotice}
-        <div className="flex flex-col rounded-[6px] border bg-card focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
+        <div className="flex flex-col rounded-2xl border bg-card focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
           {/* 在途轮已排队、尚未被模型请求消费的输入。送达后由 store 落成正式
               气泡（`user_steer` / 轮次收尾兜底），这里只承担「没有石沉大海」的
               即时回显。 */}
@@ -1105,7 +1105,7 @@ function WelcomeHero({
 }) {
   return (
     <div className="flex flex-col items-center justify-center gap-6 py-16 text-center">
-      <BrandMark size={56} className="rounded-[6px]" />
+      <BrandMark size={56} className="rounded-2xl" />
       <div className="max-w-md space-y-1.5 text-muted-foreground">
         {message}
       </div>
@@ -1236,7 +1236,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   if (message.role === "agent-call") {
     return (
       <div className="flex gap-2 items-start">
-        <div className="bg-accent rounded-[6px] px-4 py-2 text-sm border border-accent-foreground/10 max-w-[80%]">
+        <div className="bg-accent rounded-2xl rounded-bl-md px-4 py-2 text-sm border border-accent-foreground/10 max-w-[80%]">
           <p className="font-medium text-xs text-muted-foreground">
             🤖 子 Agent: {message.agentName}
           </p>
@@ -1258,7 +1258,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           {message.turnResult && <TurnStatusRow result={message.turnResult} />}
           <div
             data-slot="assistant-bubble"
-            className="bg-destructive/10 border border-destructive/30 text-destructive rounded-[6px] px-4 py-2 text-sm max-w-[80%]"
+            className="bg-destructive/10 border border-destructive/30 text-destructive rounded-2xl rounded-bl-md px-4 py-2 text-sm max-w-[80%]"
           >
             <MarkdownRenderer content={message.content} />
           </div>
@@ -1319,7 +1319,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           <div
             data-slot="assistant-result"
             data-has-process={hasProcess ? "true" : undefined}
-            className="group relative w-full rounded-[6px] bg-bubble border border-border px-4 py-2 text-sm"
+            className="group relative w-full rounded-2xl rounded-bl-md bg-bubble border border-border px-4 py-2 text-sm"
           >
             <MarkdownRenderer content={message.content} />
             {resultTime && (

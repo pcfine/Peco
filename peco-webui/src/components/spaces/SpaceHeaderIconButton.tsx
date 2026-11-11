@@ -47,7 +47,7 @@ export function SpaceHeaderIconButton({
           aria-disabled={disabled || undefined}
           onClick={disabled ? undefined : onClick}
           className={cn(
-            "grid size-7 shrink-0 place-items-center rounded-[4px] text-ink-faint transition-colors duration-[120ms] hover:bg-line hover:text-ink",
+            "grid size-7 shrink-0 place-items-center rounded-sm text-ink-faint transition-colors duration-[120ms] hover:bg-line hover:text-ink",
             tone === "danger" && "hover:text-danger",
             disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
             className,

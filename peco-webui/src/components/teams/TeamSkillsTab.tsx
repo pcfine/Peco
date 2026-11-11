@@ -59,7 +59,7 @@ function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
       <div className="flex min-w-0 items-start gap-2">
         <span
           aria-hidden
-          className="flex size-10 shrink-0 items-center justify-center rounded-[6px] bg-line/40"
+          className="flex size-10 shrink-0 items-center justify-center rounded-md bg-line/40"
         >
           <Puzzle className="size-4 text-ink-muted" />
         </span>

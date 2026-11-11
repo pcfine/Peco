@@ -49,13 +49,13 @@ function SpaceRow({
         type="button"
         onClick={onEnter}
         aria-label={`进入空间 ${name}`}
-        className="flex h-full min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-[4px] text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
+        className="flex h-full min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-sm text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
       >
         <span className="flex min-w-0 items-center gap-2">
           <SpaceStatusMark group={spaceGroupOf(space)} recent={active} />
           <span className="min-w-0 truncate text-sm text-ink">{name}</span>
           {active && (
-            <span className="shrink-0 rounded-[4px] bg-line/60 px-1 text-caption font-medium text-ink-faint">
+            <span className="shrink-0 rounded-sm bg-line/60 px-1 text-caption font-medium text-ink-faint">
               当前
             </span>
           )}
@@ -76,7 +76,7 @@ function SpaceRow({
       <Link
         to={`/spaces/${encodeURIComponent(space.ws_id)}/status`}
         aria-label={`${name} 状态`}
-        className="grid h-6 shrink-0 place-items-center rounded-[4px] bg-line/60 px-2 text-caption font-medium text-ink-muted hover:bg-line hover:text-ink"
+        className="grid h-6 shrink-0 place-items-center rounded-sm bg-line/60 px-2 text-caption font-medium text-ink-muted hover:bg-line hover:text-ink"
       >
         状态
       </Link>
