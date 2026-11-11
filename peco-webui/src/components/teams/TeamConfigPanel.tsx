@@ -246,7 +246,14 @@ export function TeamConfigPanel({
         aria-labelledby={`team-tab-${tab}`}
         className="flex min-h-0 min-w-0 flex-1 flex-col"
       >
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        {/* skills 自己撑满高度并内部滚动（编辑器需要确定高度的双栏）；
+            其余 tab 沿用整块滚动。 */}
+        <div
+          className={cn(
+            "min-h-0 flex-1",
+            tab === "skills" ? "overflow-hidden" : "overflow-y-auto",
+          )}
+        >
           {RESOURCE_TABS.includes(tab) &&
             (wsId ? null : (
               <div className="p-3">

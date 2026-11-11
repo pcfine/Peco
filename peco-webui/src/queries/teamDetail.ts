@@ -4,7 +4,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { getTeam } from "@/api/teams";
 import { getAgent, listAgents } from "@/api/agents";
-import { getSkillMd, listSkills } from "@/api/skills";
+import { listSkills } from "@/api/skills";
 import { getMcpConfig } from "@/api/mcp";
 import { listKnowledgeBases } from "@/api/knowledge";
 
@@ -37,14 +37,6 @@ export function useTeamSkills(wsId: string | null) {
     queryKey: ["skills", wsId],
     queryFn: () => listSkills(wsId as string),
     enabled: Boolean(wsId),
-  });
-}
-
-export function useSkillMd(wsId: string | null, name: string | null) {
-  return useQuery({
-    queryKey: ["skill", wsId, name],
-    queryFn: () => getSkillMd(wsId as string, name as string),
-    enabled: Boolean(wsId && name),
   });
 }
 

@@ -84,14 +84,12 @@ function listItem(detail: AgentDetail, isMaster: boolean): AgentListItem {
   };
 }
 
-/** 卡是入口：点卡进编辑器，再点「编辑」才拿到 SKILL.md 的草稿框。 */
+/** 卡是入口：点卡直接进编辑器，SKILL.md 的源码框就在里面。 */
 async function openEditor(name = "review") {
   fireEvent.click(
     await screen.findByRole("button", { name: new RegExp(`^${name}`) }),
   );
-  const button = await screen.findByRole("button", { name: "编辑" });
-  await waitFor(() => expect(button).toBeEnabled());
-  fireEvent.click(button);
+  await screen.findByRole("button", { name: "保存修改" });
 }
 
 function renderTab() {
@@ -133,6 +131,8 @@ beforeEach(() => {
       const id = url.slice("/agents/".length);
       return { data: details.get(id) };
     }
+    // 编辑器打开时先拉目录清单；测试里都按「没有资源文件」处理。
+    if (url.endsWith("/files")) return { data: { files: [] } };
     if (url.startsWith("/skills/")) {
       const name = url.slice("/skills/".length);
       const content = contents.get(name);
@@ -205,41 +205,46 @@ describe("团队 skills tab 装配", () => {
     expect(put).not.toHaveBeenCalled();
   });
 
-  it("编辑保存走同一个 PUT，成功后回到预览", async () => {
+  it("编辑保存走同一个 PUT，成功后留在编辑器里", async () => {
     const next = "---\nname: review\ndescription: 代码审查\n---\n\n新正文\n";
     renderTab();
 
     await openEditor();
-    const box = screen.getByLabelText("SKILL.md");
+    const box = screen.getByLabelText("SKILL.md 内容");
     expect(box).toHaveValue(REVIEW_MD);
 
     fireEvent.change(box, { target: { value: next } });
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
     await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
-    expect(put.mock.calls[0][0]).toBe("/skills/review");
     expect(put.mock.calls[0][1]).toEqual({ content: next, files: [] });
+    expect(put.mock.calls[0][2]).toEqual(SCOPE);
 
-    await waitFor(() => expect(screen.queryByLabelText("SKILL.md")).toBeNull());
-    expect(await screen.findByText("新正文")).toBeInTheDocument();
+    // 多文件编辑下保存不跳走，否则会打断其它缓冲。
+    expect(screen.getByLabelText("SKILL.md 内容")).toHaveValue(next);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "保存修改" })).toBeDisabled(),
+    );
   });
 
-  it("保存被后端拒绝时把原文摆在预览上方，草稿不丢", async () => {
+  it("保存被后端拒绝时把原文摆在编辑器上方，草稿不丢", async () => {
     put.mockRejectedValue(
       new ApiError("SKILL.md must start with '---'", { status: 400 }),
     );
     renderTab();
 
     await openEditor();
-    fireEvent.change(screen.getByLabelText("SKILL.md"), {
+    fireEvent.change(screen.getByLabelText("SKILL.md 内容"), {
       target: { value: "没有 frontmatter" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
     expect(
       await screen.findByText(/SKILL\.md must start with '---'/),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("SKILL.md")).toHaveValue("没有 frontmatter");
+    expect(screen.getByLabelText("SKILL.md 内容")).toHaveValue(
+      "没有 frontmatter",
+    );
   });
 
   it("删除要过二次确认，并在确认框里列出引用了它的 agent", async () => {
@@ -323,8 +328,8 @@ describe("团队 skills tab 装配", () => {
     expect(screen.getByText("2")).toBeInTheDocument();
     // 卡上只留名字，描述不再铺出来。
     expect(within(card).queryByText("代码审查")).toBeNull();
-    expect(screen.queryByLabelText("SKILL.md")).toBeNull();
-    expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
+    expect(screen.queryByLabelText("SKILL.md 内容")).toBeNull();
+    expect(screen.queryByRole("button", { name: "保存修改" })).toBeNull();
     expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
   });
 
@@ -333,7 +338,7 @@ describe("团队 skills tab 装配", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /^translate/ }));
     expect(
-      screen.getByRole("button", { name: "返回列表" }),
+      await screen.findByRole("button", { name: "返回列表" }),
     ).toBeInTheDocument();
     expect(await screen.findByText("translate 的正文")).toBeInTheDocument();
 
@@ -353,7 +358,7 @@ describe("团队 skills tab 装配", () => {
     // 首屏不闪空：进编辑态的第一帧就是磁盘上的正文。
     expect(screen.getByText("review 的正文")).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("SKILL.md"), {
+    fireEvent.change(screen.getByLabelText("SKILL.md 内容"), {
       target: { value: "---\nname: review\n---\n\n改过的正文\n" },
     });
 
@@ -370,6 +375,6 @@ describe("团队 skills tab 装配", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除 review" }));
 
     expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
-    expect(screen.queryByLabelText("SKILL.md")).toBeNull();
+    expect(screen.queryByLabelText("SKILL.md 内容")).toBeNull();
   });
 });
