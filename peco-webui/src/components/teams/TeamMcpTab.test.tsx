@@ -150,103 +150,6 @@ describe("团队 MCP tab 装配", () => {
     ).toBeInTheDocument();
   });
 
-  it("编辑面板里是格式化好的整份配置", async () => {
-    renderTab();
-
-    fireEvent.click(await screen.findByRole("button", { name: "编辑配置" }));
-
-    expect(screen.getByLabelText("mcpconfig.json")).toHaveValue(
-      JSON.stringify({ mcpServers: servers }, null, 2),
-    );
-  });
-
-  it("顶层其它键也进编辑面板，保存时不会顺手丢", async () => {
-    const whole = { mcpServers: servers, settings: { log: true } };
-    get.mockImplementation(async (url: string) => {
-      if (url === "/mcp") return { data: whole };
-      throw new Error(`unexpected GET ${url}`);
-    });
-    renderTab();
-
-    fireEvent.click(await screen.findByRole("button", { name: "编辑配置" }));
-
-    expect(screen.getByLabelText("mcpconfig.json")).toHaveValue(
-      JSON.stringify(whole, null, 2),
-    );
-  });
-
-  it("JSON 语法错误就地提示，不发请求", async () => {
-    renderTab();
-
-    fireEvent.click(await screen.findByRole("button", { name: "编辑配置" }));
-    fireEvent.change(screen.getByLabelText("mcpconfig.json"), {
-      target: { value: '{ "mcpServers": ' },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
-
-    expect(await screen.findByText(/JSON 语法错误/)).toBeInTheDocument();
-    expect(put).not.toHaveBeenCalled();
-  });
-
-  it("保存以整份对象调到 PUT /mcp，成功后收起编辑并刷新列表", async () => {
-    renderTab();
-
-    fireEvent.click(await screen.findByRole("button", { name: "编辑配置" }));
-    const next = {
-      mcpServers: {
-        filesystem: { command: "uvx" },
-        added: { url: "http://x" },
-      },
-    };
-    fireEvent.change(screen.getByLabelText("mcpconfig.json"), {
-      target: { value: JSON.stringify(next, null, 2) },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
-
-    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
-    expect(put.mock.calls[0][0]).toBe("/mcp");
-    expect(put.mock.calls[0][1]).toEqual(next);
-    expect(put.mock.calls[0][2]).toEqual(SCOPE);
-
-    await waitFor(() =>
-      expect(screen.queryByLabelText("mcpconfig.json")).toBeNull(),
-    );
-    // 卡不可点，所以看的是卡上的名字：新增的摆出来了，漏掉的没留下。
-    expect(await screen.findByText("added")).toBeInTheDocument();
-    expect(screen.queryByText("docs")).toBeNull();
-  });
-
-  it("后端 400 的原文摆在编辑器里，面板不关", async () => {
-    put.mockRejectedValue(
-      new ApiError(
-        "Invalid MCP config: server 'filesystem': stdio transport requires 'command'",
-        { status: 400 },
-      ),
-    );
-    renderTab();
-
-    fireEvent.click(await screen.findByRole("button", { name: "编辑配置" }));
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
-
-    expect(
-      await screen.findByText(/stdio transport requires 'command'/),
-    ).toBeInTheDocument();
-    expect(screen.getByLabelText("mcpconfig.json")).toBeInTheDocument();
-  });
-
-  it("撤销丢掉草稿，不发请求", async () => {
-    renderTab();
-
-    fireEvent.click(await screen.findByRole("button", { name: "编辑配置" }));
-    fireEvent.change(screen.getByLabelText("mcpconfig.json"), {
-      target: { value: '{ "mcpServers": {} }' },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
-
-    expect(screen.queryByLabelText("mcpconfig.json")).toBeNull();
-    expect(put).not.toHaveBeenCalled();
-  });
-
   it("卡片摆出状态 / transport / 地址 / 超时与重试，整张卡不是按钮", async () => {
     servers = {
       filesystem: {
@@ -297,11 +200,107 @@ describe("团队 MCP tab 装配", () => {
     expect(screen.queryByText("undefined")).toBeNull();
   });
 
-  it("空配置引导提到可以直接粘 JSON", async () => {
+  it("「添加MCP」弹表单，提交后只加这一项并保留其余 server", async () => {
+    renderTab();
+
+    fireEvent.click(await screen.findByRole("button", { name: "＋ 添加MCP" }));
+
+    fireEvent.change(screen.getByLabelText("名称（必填）"), {
+      target: { value: "weather" },
+    });
+    fireEvent.change(screen.getByLabelText("命令（必填）"), {
+      target: { value: "uvx" },
+    });
+    fireEvent.change(screen.getByLabelText("参数（每行一个）"), {
+      target: { value: "weather-mcp\n--port 8080" },
+    });
+    fireEvent.change(screen.getByLabelText("环境变量（KEY=VALUE，每行一个）"), {
+      target: { value: "API_KEY='secret'" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put.mock.calls[0][0]).toBe("/mcp");
+    expect(put.mock.calls[0][1]).toEqual({
+      mcpServers: {
+        ...servers,
+        weather: {
+          transport: "stdio",
+          enabled: true,
+          command: "uvx",
+          args: ["weather-mcp", "--port 8080"],
+          env: { API_KEY: "secret" },
+          timeoutSecs: 30,
+          maxRetries: 3,
+        },
+      },
+    });
+    expect(put.mock.calls[0][2]).toEqual(SCOPE);
+
+    // 弹窗收起，新卡随着重新拉取摆出来。
+    await waitFor(() =>
+      expect(screen.queryByText("添加 MCP server")).toBeNull(),
+    );
+    expect(await screen.findByText("weather")).toBeInTheDocument();
+  });
+
+  it("名称重复时挡住提交，不再发 PUT", async () => {
+    renderTab();
+
+    fireEvent.click(await screen.findByRole("button", { name: "＋ 添加MCP" }));
+    fireEvent.change(screen.getByLabelText("名称（必填）"), {
+      target: { value: "filesystem" },
+    });
+    fireEvent.change(screen.getByLabelText("命令（必填）"), {
+      target: { value: "npx" },
+    });
+
+    expect(await screen.findByText("该名称已存在")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "添加" })).toBeDisabled();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("必填命令没填时「添加」不可点", async () => {
+    renderTab();
+
+    fireEvent.click(await screen.findByRole("button", { name: "＋ 添加MCP" }));
+    fireEvent.change(screen.getByLabelText("名称（必填）"), {
+      target: { value: "weather" },
+    });
+
+    expect(screen.getByRole("button", { name: "添加" })).toBeDisabled();
+  });
+
+  it("添加时顶层其它键原样带回去", async () => {
+    const whole = { mcpServers: servers, settings: { log: true } };
+    get.mockImplementation(async (url: string) => {
+      if (url === "/mcp") return { data: whole };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderTab();
+
+    fireEvent.click(await screen.findByRole("button", { name: "＋ 添加MCP" }));
+    fireEvent.change(screen.getByLabelText("名称（必填）"), {
+      target: { value: "weather" },
+    });
+    fireEvent.change(screen.getByLabelText("命令（必填）"), {
+      target: { value: "uvx" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put.mock.calls[0][1]).toMatchObject({
+      settings: { log: true },
+      mcpServers: { weather: { command: "uvx" } },
+    });
+  });
+
+  it("空配置只留一句空态，不再摆操作说明", async () => {
     servers = {};
     renderTab();
 
-    expect(await screen.findByText(/可以直接粘一份/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "编辑配置" })).toBeEnabled();
+    expect(await screen.findByText("这里什么也没有")).toBeInTheDocument();
+    expect(screen.queryByText(/可以直接粘一份/)).toBeNull();
+    expect(screen.getByRole("button", { name: "＋ 添加MCP" })).toBeEnabled();
   });
 });

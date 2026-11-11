@@ -433,6 +433,12 @@ export interface McpTestResult {
   error_type?: string;
 }
 
+/** `POST /api/knowledge` 的请求体；新建表单只用 name + description。 */
+export interface CreateKnowledgeBaseRequest {
+  name: string;
+  description?: string;
+}
+
 /** `/api/knowledge` 的一行；`document_count` 由服务端聚合，前端不再数一遍。 */
 export interface KnowledgeBase {
   id: string;

@@ -286,7 +286,7 @@ describe("团队 skills tab 装配", () => {
     expect(screen.queryByText("translate 的正文")).toBeNull();
   });
 
-  it("删掉最后一个技能后回到空态", async () => {
+  it("删掉最后一个技能后只剩新建入口与空态文案", async () => {
     rows = [{ name: "review", description: "代码审查" }];
     renderTab();
 
@@ -295,9 +295,13 @@ describe("团队 skills tab 装配", () => {
     await waitFor(() => expect(confirm).toBeEnabled());
     fireEvent.click(confirm);
 
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /^review/ })).toBeNull(),
+    );
     expect(
-      await screen.findByText("这个团队还没有安装 skill。"),
+      screen.getByRole("button", { name: "＋ 新建技能" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("这里什么也没有")).toBeInTheDocument();
   });
 
   it("取消删除不发请求", async () => {
@@ -317,18 +321,11 @@ describe("团队 skills tab 装配", () => {
     const card = await screen.findByRole("button", { name: /^review/ });
     expect(screen.getByText("Skill")).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
-    expect(within(card).getByText("代码审查")).toBeInTheDocument();
+    // 卡上只留名字，描述不再铺出来。
+    expect(within(card).queryByText("代码审查")).toBeNull();
     expect(screen.queryByLabelText("SKILL.md")).toBeNull();
     expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
     expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
-  });
-
-  it("没有描述的技能在卡上写「无描述」", async () => {
-    rows = [{ name: "review", description: "" }];
-    renderTab();
-
-    const card = await screen.findByRole("button", { name: /^review/ });
-    expect(within(card).getByText("无描述")).toBeInTheDocument();
   });
 
   it("点卡片进编辑器，点「返回列表」回到卡片栅格", async () => {

@@ -1,17 +1,15 @@
-// MCP tab：卡片列表（状态 / transport / 地址）+ 整份配置的 JSON 编辑。
-// 不做表单化新增：stdio / sse / streamable_http 三种形态的字段差异太大，
-// 与 mcpconfig.json 同构的 JSON 才是最小充分入口。
+// MCP tab：卡片列表（状态 / transport / 地址）+ 表单化新增。
+// 新增走 NewMcpDialog（与 webui 的 MCP 新建弹窗同构），按钮即唯一入口。
 
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft } from "lucide-react";
-import { toast } from "sonner";
+import { useMutation } from "@tanstack/react-query";
 import { CardGrid, EntityCard } from "@/components/common/CardGrid";
+import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { NewMcpDialog } from "@/components/teams/NewMcpDialog";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
-import { testMcpServer, updateMcpConfig } from "@/api/mcp";
+import { testMcpServer } from "@/api/mcp";
 import { errorText } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useMcpConfig } from "@/queries/teamDetail";
@@ -149,26 +147,11 @@ function ServerCard({
 }
 
 export function TeamMcpTab({ wsId }: { wsId: string }) {
-  const queryClient = useQueryClient();
   const config = useMcpConfig(wsId);
-  /** 非 null 即「正在编辑」：内容是整份 mcpconfig.json 的文本。 */
-  const [draft, setDraft] = useState<string | null>(null);
-  const [syntaxError, setSyntaxError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
 
   const test = useMutation({
     mutationFn: (name: string) => testMcpServer(wsId, name),
-  });
-
-  const save = useMutation({
-    mutationFn: (parsed: unknown) => updateMcpConfig(wsId, parsed),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["mcp", wsId] });
-      // agent 编辑器的 MCP 候选也读这份配置，扇出刷新一次。
-      void queryClient.invalidateQueries({ queryKey: ["team"] });
-      setDraft(null);
-      setSyntaxError(null);
-      toast.success("MCP 配置已保存");
-    },
   });
 
   if (config.error) {
@@ -191,100 +174,22 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
     );
   }
 
-  const servers = Object.entries(config.data?.mcpServers ?? {});
-
-  const startEditing = () => {
-    // 草稿就是整份文件：顶层除了 mcpServers 还有别的键时，编辑不能把它们弄丢。
-    setDraft(JSON.stringify(config.data ?? { mcpServers: {} }, null, 2));
-    setSyntaxError(null);
-    save.reset();
-  };
-
-  const cancelEditing = () => {
-    setDraft(null);
-    setSyntaxError(null);
-    save.reset();
-  };
-
-  // 本地只挡语法：字段对不对由服务端说了算，400 的原文要给用户看到。
-  const submit = () => {
-    if (draft === null) return;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(draft);
-    } catch (error) {
-      setSyntaxError(`JSON 语法错误：${errorText(error)}`);
-      return;
-    }
-    setSyntaxError(null);
-    save.mutate(parsed);
-  };
-
-  if (draft !== null) {
-    return (
-      <div className="flex h-full min-h-0 flex-col">
-        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line px-2">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="返回列表"
-            onClick={cancelEditing}
-          >
-            <ArrowLeft />
-          </Button>
-          <span className="min-w-0 flex-1 truncate font-mono text-2xs text-ink-faint">
-            mcpconfig.json
-          </span>
-          <Button size="xs" disabled={save.isPending} onClick={submit}>
-            保存
-          </Button>
-          <Button
-            variant="ghost"
-            size="xs"
-            disabled={save.isPending}
-            onClick={cancelEditing}
-          >
-            撤销
-          </Button>
-        </div>
-        {syntaxError && (
-          <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
-            {syntaxError}
-          </p>
-        )}
-        {save.error !== null && (
-          <p className="shrink-0 border-b border-line px-3 py-1 text-caption font-medium text-danger">
-            {errorText(save.error)}
-          </p>
-        )}
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          <Textarea
-            aria-label="mcpconfig.json"
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            disabled={save.isPending}
-            spellCheck={false}
-            className="min-h-[420px] font-mono text-mono-sm"
-          />
-        </div>
-      </div>
-    );
-  }
+  const mcpConfig = config.data ?? { mcpServers: {} };
+  const servers = Object.entries(mcpConfig.mcpServers);
 
   return (
     <div className="p-3">
       <div className="mb-3 flex items-center gap-2">
-        <span className="text-sm font-medium text-ink">MCP</span>
-        <span className="text-caption text-ink-faint">{servers.length}</span>
-        <Button size="sm" className="ml-auto" onClick={startEditing}>
-          编辑配置
+        <Button size="sm" onClick={() => setAdding(true)}>
+          ＋ 添加MCP
         </Button>
+        <span className="ml-auto flex items-center gap-2">
+          <span className="text-sm font-medium text-ink">MCP</span>
+          <span className="text-caption text-ink-faint">{servers.length}</span>
+        </span>
       </div>
       {servers.length === 0 ? (
-        <p className="max-w-narrow text-sm text-ink-muted">
-          这个团队的 mcpconfig.json 里没有配
-          server。点「编辑配置」可以直接粘一份 JSON 进来。
-        </p>
+        <EmptyState title="这里什么也没有" />
       ) : (
         <CardGrid>
           {servers.map(([name, value]) => (
@@ -302,6 +207,12 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
           ))}
         </CardGrid>
       )}
+      <NewMcpDialog
+        wsId={wsId}
+        config={mcpConfig}
+        open={adding}
+        onOpenChange={setAdding}
+      />
     </div>
   );
 }

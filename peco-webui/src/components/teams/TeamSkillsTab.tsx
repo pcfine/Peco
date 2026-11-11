@@ -40,6 +40,7 @@ function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
   return (
     <EntityCard
       onClick={onOpen}
+      className="min-h-[72px]"
       actions={
         <Button
           variant="ghost"
@@ -63,16 +64,13 @@ function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
         >
           <Puzzle className="size-4 text-ink-muted" />
         </span>
-        <div className="min-w-0 flex-1 space-y-1">
+        <div className="min-w-0 flex-1">
           {/* 右上角留给删除按钮，名字行不铺到那里。 */}
           <div className="flex min-w-0 items-center pr-6">
             <span className="truncate font-mono text-sm text-ink">
               {skill.name}
             </span>
           </div>
-          <p className="line-clamp-2 text-caption text-ink-muted">
-            {skill.description || "无描述"}
-          </p>
         </div>
       </div>
     </EntityCard>
@@ -362,43 +360,31 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
     );
   }
 
-  if (rows.length === 0) {
-    return (
-      <>
-        <div className="p-3">
-          <EmptyState
-            title="这个团队还没有安装 skill。"
-            action={
-              <Button size="sm" onClick={() => setCreating(true)}>
-                ＋ 新建技能
-              </Button>
-            }
-          />
-        </div>
-        {dialog}
-      </>
-    );
-  }
-
   return (
     <div className="p-3">
       <div className="mb-3 flex items-center gap-2">
-        <span className="text-sm font-medium text-ink">Skill</span>
-        <span className="text-caption text-ink-faint">{rows.length}</span>
-        <Button size="sm" className="ml-auto" onClick={() => setCreating(true)}>
+        <Button size="sm" onClick={() => setCreating(true)}>
           ＋ 新建技能
         </Button>
+        <span className="ml-auto flex items-center gap-2">
+          <span className="text-sm font-medium text-ink">Skill</span>
+          <span className="text-caption text-ink-faint">{rows.length}</span>
+        </span>
       </div>
-      <CardGrid>
-        {rows.map((skill) => (
-          <SkillCard
-            key={skill.name}
-            skill={skill}
-            onOpen={() => select(skill.name)}
-            onDelete={() => askDelete(skill.name)}
-          />
-        ))}
-      </CardGrid>
+      {rows.length === 0 ? (
+        <EmptyState title="这里什么也没有" />
+      ) : (
+        <CardGrid>
+          {rows.map((skill) => (
+            <SkillCard
+              key={skill.name}
+              skill={skill}
+              onOpen={() => select(skill.name)}
+              onDelete={() => askDelete(skill.name)}
+            />
+          ))}
+        </CardGrid>
+      )}
       {dialog}
     </div>
   );

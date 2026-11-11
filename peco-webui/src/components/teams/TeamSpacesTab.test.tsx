@@ -77,7 +77,7 @@ describe("TeamSpacesTab", () => {
     expect(
       screen.getByRole("button", { name: /新建空间/ }),
     ).toBeInTheDocument();
-    expect(screen.getByText("这个团队还没有绑定空间。")).toBeInTheDocument();
+    expect(screen.getByText("这个团队还没有绑定空间")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /新建空间/ })).toHaveLength(1);
   });
 });

@@ -1,8 +1,12 @@
-// 知识库 tab：卡片列表（名字 + 描述 + 规模）。清单来自 `/api/knowledge`（团队命名空间），
-// `document_count` 也用接口给的那份，不在前端数文档列表。
+// 知识库 tab：卡片列表（名字 + 描述 + 规模）+ 表单化新建。清单来自 `/api/knowledge`
+// （团队命名空间），`document_count` 也用接口给的那份，不在前端数文档列表。
 
+import { useState } from "react";
 import { CardGrid, EntityCard } from "@/components/common/CardGrid";
+import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
+import { NewKnowledgeDialog } from "@/components/teams/NewKnowledgeDialog";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useKnowledgeBases } from "@/queries/teamDetail";
 import { errorText } from "@/lib/api";
@@ -35,6 +39,7 @@ export function TeamKnowledgeTab({
   detail: TeamDetail;
 }) {
   const bases = useKnowledgeBases(wsId);
+  const [creating, setCreating] = useState(false);
 
   if (bases.error) {
     return (
@@ -57,26 +62,38 @@ export function TeamKnowledgeTab({
   }
 
   const rows = bases.data ?? [];
-  if (rows.length === 0) {
-    // 索引表与目录可能各自为空：团队详情已经告诉我们「装了哪些」，两处都说没有
-    // 才是真的没有，免得把「接口空」当成「没有知识库」。
-    return (
-      <p className="max-w-narrow p-3 text-sm text-ink-muted">
-        这个团队还没有知识库
-        {detail.knowledge_bases.length > 0
-          ? `（团队目录里有 ${detail.knowledge_bases.map((kb) => kb.name).join("、")}，索引还没同步）`
-          : "。"}
-      </p>
-    );
-  }
+  // 索引表与目录可能各自为空：团队详情已经告诉我们「装了哪些」，两处都说没有
+  // 才是真的没有，免得把「接口空」当成「没有知识库」。
+  const emptyText =
+    detail.knowledge_bases.length > 0
+      ? `这个团队还没有知识库（团队目录里有 ${detail.knowledge_bases.map((kb) => kb.name).join("、")}，索引还没同步）`
+      : "这里什么也没有";
 
   return (
     <div className="p-3">
-      <CardGrid>
-        {rows.map((kb) => (
-          <KnowledgeCard key={kb.id} kb={kb} />
-        ))}
-      </CardGrid>
+      <div className="mb-3 flex items-center gap-2">
+        <Button size="sm" onClick={() => setCreating(true)}>
+          ＋ 新建知识库
+        </Button>
+        <span className="ml-auto flex items-center gap-2">
+          <span className="text-sm font-medium text-ink">知识库</span>
+          <span className="text-caption text-ink-faint">{rows.length}</span>
+        </span>
+      </div>
+      {rows.length === 0 ? (
+        <EmptyState title={emptyText} />
+      ) : (
+        <CardGrid>
+          {rows.map((kb) => (
+            <KnowledgeCard key={kb.id} kb={kb} />
+          ))}
+        </CardGrid>
+      )}
+      <NewKnowledgeDialog
+        wsId={wsId}
+        open={creating}
+        onOpenChange={setCreating}
+      />
     </div>
   );
 }

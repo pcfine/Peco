@@ -46,15 +46,17 @@ export function TeamSpacesTab({
   return (
     <div className="p-3">
       <div className="mb-3 flex items-center gap-2">
-        <span className="text-sm font-medium text-ink">绑定空间</span>
-        <span className="text-caption text-ink-faint">{spaces.length}</span>
-        <Button size="sm" className="ml-auto" onClick={() => setCreating(true)}>
+        <Button size="sm" onClick={() => setCreating(true)}>
           ＋ 新建空间
         </Button>
+        <span className="ml-auto flex items-center gap-2">
+          <span className="text-sm font-medium text-ink">绑定空间</span>
+          <span className="text-caption text-ink-faint">{spaces.length}</span>
+        </span>
       </div>
 
       {spaces.length === 0 ? (
-        <EmptyState title="这个团队还没有绑定空间。" />
+        <EmptyState title="这个团队还没有绑定空间" />
       ) : (
         <ul>
           {spaces.map((space) => (
