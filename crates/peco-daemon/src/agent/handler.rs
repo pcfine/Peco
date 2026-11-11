@@ -34,10 +34,6 @@ pub struct CreateAgentRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
-    #[serde(default = "default_icon")]
-    pub icon: String,
-    #[serde(default)]
-    pub background_color: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
@@ -58,10 +54,6 @@ pub struct CreateAgentRequest {
     pub knowledge_bases: Option<Vec<String>>,
 }
 
-fn default_icon() -> String {
-    "🤖".into()
-}
-
 /// 更新 Agent 的请求体（全部字段可选）。
 #[derive(Debug, Deserialize)]
 pub struct UpdateAgentRequest {
@@ -70,8 +62,6 @@ pub struct UpdateAgentRequest {
     pub system_prompt: Option<String>,
     pub model: Option<Option<String>>, // Option<Option<T>>: None=不更新, Some(None)=清空
     pub provider: Option<Option<String>>,
-    pub icon: Option<String>,
-    pub background_color: Option<String>,
     pub tools: Option<Vec<String>>,
     pub mcp_servers: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
@@ -91,10 +81,10 @@ pub struct AgentListItem {
     pub description: String,
     pub model: Option<String>,
     pub provider: Option<String>,
-    pub icon: String,
-    pub background_color: String,
     pub status: String,
     pub tools: Vec<String>,
+    pub mcp_servers: Vec<String>,
+    pub skills: Vec<String>,
     pub knowledge_bases: Vec<String>,
     /// 是否为当前 workspace 的总管 Agent（名字由 peco-core 内部约定，不外露）
     pub is_master: bool,
@@ -110,8 +100,6 @@ pub struct AgentDetail {
     pub system_prompt: String,            // agent.md body
     pub model: Option<String>,            // agent.md llm.model（可能未指定）
     pub provider: Option<String>,         // agent.md llm.provider（可能未指定）
-    pub icon: String,                     // DB only
-    pub background_color: String,         // DB only
     pub status: String,                   // DB only
     pub tools: Vec<String>,               // agent.md tools
     pub mcp_servers: Vec<String>,         // agent.md mcp
@@ -152,8 +140,6 @@ fn agent_detail_from_profile(
         system_prompt: body.to_string(),
         model: llm.and_then(|l| l.model.clone()),
         provider: llm.and_then(|l| l.provider.clone()),
-        icon: db_row.icon.clone(),
-        background_color: db_row.background_color.clone(),
         status: db_row.status.clone(),
         tools: profile.tools.clone(),
         mcp_servers: profile.mcp.clone(),
@@ -299,20 +285,21 @@ pub async fn list(
             );
             continue;
         }
-        // 尝试从 agent.md 读取 tools/model/provider/knowledge_bases（失败则使用空默认值）
-        let (tools, model, provider, knowledge_bases) =
-            read_agent_md_light(ws.agent_manager(), &r.name);
+        // 尝试从 agent.md 读取轻量字段（失败则回落到 DB 缓存与空默认值）。
+        // description 优先用文件：卡片名称由它推导，外部编辑器 / save_agent
+        // 改过描述后索引行可能还是旧的。
+        let light = read_agent_md_light(ws.agent_manager(), &r.name);
         items.push(AgentListItem {
             id: r.id.clone(),
             name: r.name.clone(),
-            description: r.description.clone(),
-            model,
-            provider,
-            icon: r.icon.clone(),
-            background_color: r.background_color.clone(),
+            description: light.description.unwrap_or_else(|| r.description.clone()),
+            model: light.model,
+            provider: light.provider,
             status: r.status.clone(),
-            tools,
-            knowledge_bases,
+            tools: light.tools,
+            mcp_servers: light.mcp_servers,
+            skills: light.skills,
+            knowledge_bases: light.knowledge_bases,
             is_master: ws.is_master_agent(&r.name),
             created_at: r.created_at.clone(),
         });
@@ -321,24 +308,37 @@ pub async fn list(
     Ok(Json(items))
 }
 
-/// 从 agent.md 读取轻量字段（tools, model, provider, knowledge_bases）。
-/// 读取失败时返回空默认值，不阻塞列表渲染。
-fn read_agent_md_light(
-    agent_manager: &peco_core::agent::AgentManager,
-    name: &str,
-) -> (Vec<String>, Option<String>, Option<String>, Vec<String>) {
+/// 列表页要用的 agent.md 轻量字段；读取失败时全部为空，不阻塞列表渲染。
+#[derive(Debug, Default)]
+struct AgentMdLight {
+    description: Option<String>,
+    tools: Vec<String>,
+    mcp_servers: Vec<String>,
+    skills: Vec<String>,
+    knowledge_bases: Vec<String>,
+    model: Option<String>,
+    provider: Option<String>,
+}
+
+fn read_agent_md_light(agent_manager: &peco_core::agent::AgentManager, name: &str) -> AgentMdLight {
     let path = agent_manager.md_path(name);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return (Vec::new(), None, None, Vec::new()),
+        Err(_) => return AgentMdLight::default(),
     };
     let (profile, _body) = match peco_core::agent::agent_config::parse_agent_md(&content) {
         Ok(p) => p,
-        Err(_) => return (Vec::new(), None, None, Vec::new()),
+        Err(_) => return AgentMdLight::default(),
     };
-    let model = profile.llm.as_ref().and_then(|l| l.model.clone());
-    let provider = profile.llm.as_ref().and_then(|l| l.provider.clone());
-    (profile.tools, model, provider, profile.knowledge_bases)
+    AgentMdLight {
+        description: Some(profile.agent.description),
+        tools: profile.tools,
+        mcp_servers: profile.mcp,
+        skills: profile.skills,
+        knowledge_bases: profile.knowledge_bases,
+        model: profile.llm.as_ref().and_then(|l| l.model.clone()),
+        provider: profile.llm.as_ref().and_then(|l| l.provider.clone()),
+    }
 }
 
 /// `master` 的裸写法：前端与脚本常这么指总管 Agent，语义与 core 的保留名相同。
@@ -383,8 +383,7 @@ fn deletable_error(name: &str, error: WorkspaceError) -> ApiError {
 ///   "description": "负责代码质量审查",
 ///   "system_prompt": "你是一位资深代码审查专家...",
 ///   "model": "deepseek-v4-flash",
-///   "tools": ["shell", "fetch"],
-///   "icon": "🔍"
+///   "tools": ["shell", "fetch"]
 /// }
 /// ```
 pub async fn create(
@@ -423,8 +422,6 @@ pub async fn create(
         team_id: team_id.clone(),
         name: name.to_string(),
         description: req.description.trim().to_string(),
-        icon: req.icon.clone(),
-        background_color: req.background_color.clone().unwrap_or_default(),
     };
     agents::insert(&state.pool, &db_params).await?;
 
@@ -451,8 +448,6 @@ pub async fn create(
             team_id: team_id.clone(),
             name: name.to_string(),
             description: String::new(),
-            icon: req.icon.clone(),
-            background_color: req.background_color.clone().unwrap_or_default(),
             status: "idle".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -481,8 +476,6 @@ pub async fn create(
         } else {
             Some(assemble_params.provider)
         },
-        icon: req.icon,
-        background_color: db_row.background_color,
         status: db_row.status,
         tools: assemble_params.tools,
         mcp_servers: assemble_params.mcp_servers,
@@ -619,8 +612,6 @@ pub async fn update(
                 None
             },
             description: Some(merged.description.clone()),
-            icon: req.icon.clone(),
-            background_color: req.background_color.clone(),
         },
     )
     .await?;
@@ -665,8 +656,6 @@ pub async fn update(
         } else {
             Some(merged.provider)
         },
-        icon: updated_row.icon,
-        background_color: updated_row.background_color,
         status: updated_row.status,
         tools: merged.tools,
         mcp_servers: merged.mcp_servers,
@@ -762,8 +751,6 @@ body
             system_prompt: None,
             model: None,
             provider: None,
-            icon: None,
-            background_color: None,
             tools: None,
             mcp_servers: None,
             skills: None,

@@ -113,8 +113,9 @@ impl ToolDyn for SaveAgent {
                 agents (e.g., '@master'). Do NOT prefix user-created agents with '@'.\n\
                 \n\
                 Required frontmatter fields:\n\
-                  agent.name: unique agent identifier\n\
-                  agent.description: what this agent does\n\
+                  agent.name: unique agent identifier (directory name, not the display name)\n\
+                  agent.description: display name + \" — \" + what this agent does. The UI shows \
+                the text before the dash as the agent's name, so keep that part short (at most 8 characters)\n\
                 \n\
                 Optional fields: llm (provider, model, temperature, max_tokens, stream, \
                 reasoning_effort), tools, mcp, skills, knowledge_bases, max_iterations (default 500).\n\
@@ -128,7 +129,7 @@ impl ToolDyn for SaveAgent {
                 ---\n\
                 agent:\n\
                   name: \"code-reviewer\"\n\
-                  description: \"Reviews code for bugs and style issues\"\n\
+                  description: \"代码审查员 — Reviews code for bugs and style issues\"\n\
                 llm:\n\
                   provider: \"deepseek\"\n\
                   model: \"deepseek-v4-flash\"\n\

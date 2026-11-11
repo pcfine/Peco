@@ -9,7 +9,6 @@ import { AgentModelPicker } from "@/components/teams/AgentModelPicker";
 import { ConfigSection, FieldRow } from "@/components/teams/config-form";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { updateAgent } from "@/api/agents";
@@ -54,7 +53,6 @@ interface CapabilityGroupProps {
   options: CapabilityOption[];
   selected: string[];
   onToggle: (value: string) => void;
-  empty: string;
   error?: string | null;
   disabled: boolean;
 }
@@ -64,7 +62,6 @@ function CapabilityGroup({
   options,
   selected,
   onToggle,
-  empty,
   error,
   disabled,
 }: CapabilityGroupProps) {
@@ -73,9 +70,7 @@ function CapabilityGroup({
   return (
     <div className="space-y-1">
       <span className="text-caption font-medium text-ink-faint">{title}</span>
-      {merged.length === 0 ? (
-        <p className="text-caption font-medium text-ink-faint">{empty}</p>
-      ) : (
+      {merged.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {merged.map((option) => {
             const on = selected.includes(option.value);
@@ -173,7 +168,7 @@ export function AgentEditor({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto">
         <ConfigSection title="基本信息">
-          <FieldRow label="名称" htmlFor="agent-name">
+          <FieldRow label="id" htmlFor="agent-name">
             <Input
               id="agent-name"
               value={current.name}
@@ -187,17 +182,9 @@ export function AgentEditor({
               id="agent-description"
               value={current.description}
               onChange={(event) => update({ description: event.target.value })}
+              placeholder="名称 — 说明"
               disabled={busy}
               className="h-8 text-xs"
-            />
-          </FieldRow>
-          <FieldRow label="图标" htmlFor="agent-icon">
-            <Input
-              id="agent-icon"
-              value={current.icon}
-              onChange={(event) => update({ icon: event.target.value })}
-              disabled={busy}
-              className="h-8 w-16 text-center text-xs"
             />
           </FieldRow>
         </ConfigSection>
@@ -226,7 +213,6 @@ export function AgentEditor({
             onToggle={(value) =>
               update({ tools: toggleValue(current.tools, value) })
             }
-            empty="没有可选的工具。"
             disabled={busy}
           />
           <CapabilityGroup
@@ -239,12 +225,7 @@ export function AgentEditor({
             onToggle={(value) =>
               update({ skills: toggleValue(current.skills, value) })
             }
-            empty="这个团队还没有安装 skill。"
-            error={
-              skills.error
-                ? `skill 列表读取失败：${errorText(skills.error)}`
-                : null
-            }
+            error={skills.error ? `读取失败：${errorText(skills.error)}` : null}
             disabled={busy}
           />
           <CapabilityGroup
@@ -257,10 +238,7 @@ export function AgentEditor({
             onToggle={(value) =>
               update({ mcp_servers: toggleValue(current.mcp_servers, value) })
             }
-            empty="这个团队的 mcpconfig.json 里没有配 server。"
-            error={
-              mcp.error ? `MCP 配置读取失败：${errorText(mcp.error)}` : null
-            }
+            error={mcp.error ? `读取失败：${errorText(mcp.error)}` : null}
             disabled={busy}
           />
           <CapabilityGroup
@@ -275,11 +253,8 @@ export function AgentEditor({
                 knowledge_bases: toggleValue(current.knowledge_bases, value),
               })
             }
-            empty="这个团队还没有知识库。"
             error={
-              knowledge.error
-                ? `知识库列表读取失败：${errorText(knowledge.error)}`
-                : null
+              knowledge.error ? `读取失败：${errorText(knowledge.error)}` : null
             }
             disabled={busy}
           />
@@ -293,7 +268,6 @@ export function AgentEditor({
               step="0.1"
               value={current.temperature}
               onChange={(event) => update({ temperature: event.target.value })}
-              placeholder="不改"
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
@@ -304,7 +278,6 @@ export function AgentEditor({
               type="number"
               value={current.max_tokens}
               onChange={(event) => update({ max_tokens: event.target.value })}
-              placeholder="不改"
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
@@ -317,32 +290,20 @@ export function AgentEditor({
               onChange={(event) =>
                 update({ max_iterations: event.target.value })
               }
-              placeholder="不改"
               disabled={busy}
               className="h-8 font-mono text-xs"
             />
           </FieldRow>
         </ConfigSection>
 
-        {/* 正文是全宽的：标签摞在框上面，不占 FieldRow 那条定宽的标签列。 */}
         <ConfigSection title="正文">
-          <div className="space-y-1">
-            <Label
-              htmlFor="agent-system-prompt"
-              className="text-caption font-medium text-ink-faint"
-            >
-              正文（system_prompt）
-            </Label>
-            <Textarea
-              id="agent-system-prompt"
-              value={current.system_prompt}
-              onChange={(event) =>
-                update({ system_prompt: event.target.value })
-              }
-              disabled={busy}
-              className="min-h-[260px] font-mono text-mono-sm"
-            />
-          </div>
+          <Textarea
+            aria-label="正文"
+            value={current.system_prompt}
+            onChange={(event) => update({ system_prompt: event.target.value })}
+            disabled={busy}
+            className="min-h-[260px] font-mono text-mono-sm"
+          />
         </ConfigSection>
       </div>
 

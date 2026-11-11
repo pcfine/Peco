@@ -20,11 +20,9 @@ pub struct AgentRow {
     pub user_id: String,
     /// 资源归属维度：同名 agent 在不同团队是不同的行。
     pub team_id: String,
-    pub name: String,             // 对应 agents/{name}/ 目录名
-    pub description: String,      // 缓存副本，来自 agent.md YAML（列表加速）
-    pub icon: String,             // 纯 UI
-    pub background_color: String, // 纯 UI — 卡片背景色
-    pub status: String,           // 运行时状态
+    pub name: String,        // 对应 agents/{name}/ 目录名
+    pub description: String, // 缓存副本，来自 agent.md YAML（列表加速）
+    pub status: String,      // 运行时状态
     pub created_at: String,
     pub updated_at: String,
 }
@@ -35,16 +33,12 @@ pub struct CreateAgentParams {
     pub team_id: String,
     pub name: String,
     pub description: String,
-    pub icon: String,
-    pub background_color: String,
 }
 
 /// 更新 Agent 索引的参数（所有字段可选）。
 pub struct UpdateAgentParams {
     pub name: Option<String>,
     pub description: Option<String>,
-    pub icon: Option<String>,
-    pub background_color: Option<String>,
 }
 
 // ── 查询函数 ──────────────────────────────────────────────────────────────────────
@@ -55,7 +49,7 @@ pub async fn list_index_by_team(
     team_id: &str,
 ) -> Result<Vec<AgentRow>, sqlx::Error> {
     sqlx::query_as::<_, AgentRow>(
-        "SELECT id, user_id, team_id, name, description, icon, background_color, status, created_at, updated_at \
+        "SELECT id, user_id, team_id, name, description, status, created_at, updated_at \
          FROM agents WHERE team_id = ? ORDER BY created_at DESC",
     )
     .bind(team_id)
@@ -81,7 +75,7 @@ pub async fn find_index_by_id_and_team(
     team_id: &str,
 ) -> Result<Option<AgentRow>, sqlx::Error> {
     sqlx::query_as::<_, AgentRow>(
-        "SELECT id, user_id, team_id, name, description, icon, background_color, status, created_at, updated_at \
+        "SELECT id, user_id, team_id, name, description, status, created_at, updated_at \
          FROM agents WHERE id = ? AND team_id = ?",
     )
     .bind(agent_id)
@@ -111,16 +105,13 @@ pub async fn find_id_by_name_and_team(
 /// 免得把空间或团队塞进用户列。
 pub async fn insert(pool: &SqlitePool, params: &CreateAgentParams) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO agents (id, user_id, team_id, name, description, icon, background_color) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agents (id, user_id, team_id, name, description) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&params.id)
     .bind(LOCAL_USER_ID)
     .bind(&params.team_id)
     .bind(&params.name)
     .bind(&params.description)
-    .bind(&params.icon)
-    .bind(&params.background_color)
     .execute(pool)
     .await?;
     Ok(())
@@ -129,8 +120,8 @@ pub async fn insert(pool: &SqlitePool, params: &CreateAgentParams) -> Result<(),
 /// 插入一行索引；`(team_id, name)` 已存在时什么都不做。
 ///
 /// 返回 1 表示本次真的写了新行 —— 「磁盘有、库里没有」的补行靠它计数，
-/// 重复调用必须是 0。`icon` / `background_color` / `status` 列留给 DDL 默认值：
-/// 它们是纯 UI 字段，磁盘上的 `agent.md` 没有任何对应来源。
+/// 重复调用必须是 0。`status` 列留给 DDL 默认值：它是纯运行时字段，
+/// 磁盘上的 `agent.md` 没有任何对应来源。
 pub async fn insert_if_absent(
     pool: &SqlitePool,
     team_id: &str,
@@ -171,15 +162,6 @@ pub async fn update(
         sets.push(format!("description = ?{}", binds.len() + 1));
         binds.push(description.clone());
     }
-    if let Some(ref icon) = params.icon {
-        sets.push(format!("icon = ?{}", binds.len() + 1));
-        binds.push(icon.clone());
-    }
-    if let Some(ref bg_color) = params.background_color {
-        sets.push(format!("background_color = ?{}", binds.len() + 1));
-        binds.push(bg_color.clone());
-    }
-
     if sets.is_empty() {
         return Ok(false);
     }

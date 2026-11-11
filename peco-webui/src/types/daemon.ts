@@ -338,10 +338,10 @@ export interface AgentListItem {
   description: string;
   model: string | null;
   provider: string | null;
-  icon: string;
-  background_color: string;
   status: string;
   tools: string[];
+  mcp_servers: string[];
+  skills: string[];
   knowledge_bases: string[];
   /** 名字由 core 约定，前端不写死 `@master` 字符串。 */
   is_master: boolean;
@@ -356,8 +356,6 @@ export interface AgentDetail {
   system_prompt: string;
   model: string | null;
   provider: string | null;
-  icon: string;
-  background_color: string;
   status: string;
   tools: string[];
   mcp_servers: string[];
@@ -380,8 +378,6 @@ export interface CreateAgentRequest {
   system_prompt?: string;
   model?: string;
   provider?: string;
-  icon?: string;
-  background_color?: string;
   tools?: string[];
   mcp_servers?: string[];
   skills?: string[];
@@ -405,8 +401,6 @@ export interface UpdateAgentRequest {
   system_prompt?: string;
   model?: string | null;
   provider?: string | null;
-  icon?: string;
-  background_color?: string;
   tools?: string[];
   mcp_servers?: string[];
   skills?: string[];

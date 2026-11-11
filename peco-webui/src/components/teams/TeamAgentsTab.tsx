@@ -1,9 +1,9 @@
 // agents tab：卡片列表 → 点卡进同一个位置的编辑器。列表是装配入口 —— 新建、改、删。
 // 只在团队有已打开空间时可用：请求头 `X-Peco-Space` 决定读哪个团队的能力根。
 
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Bot, Trash2 } from "lucide-react";
+import { ChevronLeft, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { CardGrid, EntityCard } from "@/components/common/CardGrid";
 import { EmptyState } from "@/components/common/EmptyState";
@@ -21,63 +21,48 @@ import {
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { deleteAgent } from "@/api/agents";
+import {
+  agentDescriptionDetail,
+  agentDisplayName,
+  firstGrapheme,
+} from "@/lib/agentName";
 import { errorText } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { seedHue } from "@/lib/identicon";
 import { useTeamAgents } from "@/queries/teamDetail";
 import type { AgentListItem } from "@/types/daemon";
 
-/** 元信息行里最多摆几个 chip，其余折成 `+N`。 */
-const META_CHIPS = 2;
+function agentLabel(agent: AgentListItem): string {
+  return agentDisplayName(agent.description, agent.name);
+}
 
 function sortAgents(agents: AgentListItem[]): AgentListItem[] {
-  return [...agents].sort((a, b) =>
-    a.is_master === b.is_master
-      ? a.name.localeCompare(b.name)
-      : a.is_master
-        ? -1
-        : 1,
-  );
+  return [...agents].sort((a, b) => {
+    if (a.is_master !== b.is_master) return a.is_master ? -1 : 1;
+    return (
+      agentLabel(a).localeCompare(agentLabel(b), "zh") ||
+      a.id.localeCompare(b.id)
+    );
+  });
 }
 
-/** 删除确认只认 id 与名字：卡与编辑器两处入口都用得上，别处不必知道更多。 */
+/** 删除确认只认 id 与展示名：卡与编辑器两处入口都用得上，别处不必知道更多。 */
 interface DeleteTarget {
   id: string;
-  name: string;
-}
-
-function MetaChip({ children }: { children: string }) {
-  return (
-    <span className="rounded bg-line/60 px-1 font-mono text-caption text-ink-muted">
-      {children}
-    </span>
-  );
+  label: string;
 }
 
 /**
- * 卡左侧的色块：`icon` 是可填的短图标串（emoji 之类），塞不下就退到名字首字，
- * 都没有时给一个通用图标 —— 空方块比「猜错了」更难认。
+ * 卡左侧的首字标识：色相由 agent id 派生（同 id 永远同色），首字取展示名。
+ * 不再使用图标字段 —— 用户填的 emoji 辨识度不如「名字本身」。
  */
-function AgentMark({ agent }: { agent: AgentListItem }) {
-  const icon = agent.icon.trim();
-  const glyph =
-    icon && Array.from(icon).length <= 4
-      ? icon
-      : Array.from(agent.name.trim())[0];
-
+function AgentMonogram({ agent }: { agent: AgentListItem }) {
   return (
     <span
       aria-hidden
-      className={cn(
-        "flex size-14 shrink-0 items-center justify-center rounded-md text-xl",
-        !agent.background_color && "bg-line/40",
-      )}
-      style={
-        agent.background_color
-          ? { backgroundColor: agent.background_color }
-          : undefined
-      }
+      className="agent-monogram -my-3 -ml-3 flex w-14 shrink-0 items-center justify-center self-stretch rounded-l-md text-2xl font-semibold"
+      style={{ "--mono-hue": String(seedHue(agent.id)) } as CSSProperties}
     >
-      {glyph ?? <Bot className="size-5" />}
+      {firstGrapheme(agentLabel(agent)) || "?"}
     </span>
   );
 }
@@ -89,16 +74,28 @@ interface AgentCardProps {
 }
 
 function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
+  const label = agentLabel(agent);
+  const detail = agentDescriptionDetail(agent.description);
+  // 前端热更新可能先于 daemon 重启到达：旧接口没有这两个字段，缺值时按 0 计，
+  // 不能让一个 undefined.length 把整页打成白屏。
+  const toolCount = agent.tools?.length ?? 0;
+  const mcpCount = agent.mcp_servers?.length ?? 0;
+  const skillCount = agent.skills?.length ?? 0;
+  // id 只出现一次：普通 agent 用副行，master 用徽标（标题已是 @master 时两者都不画）。
+  const showId = !agent.is_master && label !== agent.name;
+  const showMasterBadge = agent.is_master && label !== agent.name;
+
   return (
     <EntityCard
       onClick={onOpen}
+      className="min-h-[104px]"
       actions={
         agent.is_master ? null : (
           <Button
             variant="ghost"
             size="icon-xs"
             className="text-ink-faint hover:text-danger"
-            aria-label={`删除 ${agent.name}`}
+            aria-label={`删除 ${label}`}
             onClick={onDelete}
           >
             <Trash2 />
@@ -106,47 +103,42 @@ function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
         )
       }
     >
-      <div className="flex min-w-0 items-start gap-2">
-        <AgentMark agent={agent} />
-        <div className="min-w-0 flex-1 space-y-1">
-          {/* 右上角留给操作按钮，名字行不铺到那里。 */}
-          <div className="flex min-w-0 items-center gap-1 pr-6">
-            <span className="truncate text-sm font-semibold text-ink">
-              {agent.name}
-            </span>
-            {agent.is_master && (
-              <span className="shrink-0 rounded-sm bg-line/60 px-1 text-2xs font-medium text-ink-faint">
-                @master
+      <div className="flex min-w-0 flex-1 items-stretch gap-3">
+        <AgentMonogram agent={agent} />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="space-y-0.5">
+            {/* 右上角留给操作按钮，名字行不铺到那里。 */}
+            <div className="flex min-w-0 items-baseline gap-1.5 pr-6">
+              <span className="truncate text-base font-semibold text-ink">
+                {label}
               </span>
+              {showMasterBadge && (
+                <span className="shrink-0 rounded-sm bg-line/60 px-1 text-2xs font-medium text-ink-faint">
+                  @master
+                </span>
+              )}
+            </div>
+            {showId && (
+              <p
+                className="truncate font-mono text-2xs text-ink-faint"
+                title={agent.name}
+              >
+                {agent.name}
+              </p>
+            )}
+            {detail && detail !== label && (
+              <p className="mt-1 line-clamp-2 text-caption text-ink-muted">
+                {detail}
+              </p>
             )}
           </div>
-          {agent.description && (
-            <p className="line-clamp-2 text-caption text-ink-muted">
-              {agent.description}
-            </p>
-          )}
+          {/* 计数压到卡底：短描述时也不留一截空白。 */}
+          <p className="mt-auto flex flex-wrap items-center gap-x-3 gap-y-0.5 pt-2 font-mono text-2xs text-ink-faint">
+            <span className="whitespace-nowrap">tools: {toolCount}</span>
+            <span className="whitespace-nowrap">mcp: {mcpCount}</span>
+            <span className="whitespace-nowrap">skill: {skillCount}</span>
+          </p>
         </div>
-      </div>
-      <div className="mt-auto flex min-w-0 flex-wrap items-center gap-1">
-        {agent.model ? (
-          <span className="truncate font-mono text-2xs text-ink-faint">
-            {agent.model}
-          </span>
-        ) : (
-          <span className="text-caption text-ink-faint">未设模型</span>
-        )}
-        {agent.tools.slice(0, META_CHIPS).map((tool) => (
-          <MetaChip key={tool}>{tool}</MetaChip>
-        ))}
-        {agent.tools.length > META_CHIPS && (
-          <MetaChip>{`+${agent.tools.length - META_CHIPS}`}</MetaChip>
-        )}
-        {agent.knowledge_bases.slice(0, META_CHIPS).map((kb) => (
-          <MetaChip key={kb}>{kb}</MetaChip>
-        ))}
-        {agent.knowledge_bases.length > META_CHIPS && (
-          <MetaChip>{`+${agent.knowledge_bases.length - META_CHIPS}`}</MetaChip>
-        )}
       </div>
     </EntityCard>
   );
@@ -210,7 +202,7 @@ export function TeamAgentsTab({
   const rows = sortAgents(agents.data ?? []);
   // 刚建好的 agent 要等一次重新拉取才进列表：这段时间里标题回落成 id，编辑器照样能开。
   const active = rows.find((row) => row.id === selected) ?? null;
-  const activeName = active?.name ?? selected ?? "";
+  const activeLabel = active ? agentLabel(active) : (selected ?? "");
 
   const confirmDialog = (
     <Dialog
@@ -224,7 +216,7 @@ export function TeamAgentsTab({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>删除 agent「{pendingDelete?.name}」？</DialogTitle>
+          <DialogTitle>删除 agent「{pendingDelete?.label}」？</DialogTitle>
           <DialogDescription>
             连同它的 agent.md 一起删掉，不可恢复。
           </DialogDescription>
@@ -259,18 +251,25 @@ export function TeamAgentsTab({
   if (selected !== null) {
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line px-2">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="返回列表"
-            onClick={() => setSelected(null)}
-          >
-            <ArrowLeft />
-          </Button>
-          <span className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
-            {activeName}
-          </span>
+        {/* 与上一级 TeamConfigPanel 的侧栏头同形：44px 高、三栏等宽栅格，
+            返回键与标题都靠 items-center 落在同一条中线上。 */}
+        <div className="flex h-11 shrink-0 items-center border-b border-line px-3">
+          <div className="grid w-full grid-cols-[28px_1fr_28px] items-center">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="text-ink-muted"
+              aria-label="返回列表"
+              title="返回列表"
+              onClick={() => setSelected(null)}
+            >
+              <ChevronLeft className="size-5" />
+            </Button>
+            <h1 className="min-w-0 truncate text-center text-sm font-semibold text-ink">
+              {activeLabel}
+            </h1>
+            <span aria-hidden />
+          </div>
         </div>
         <AgentEditor
           // 换 agent 就重挂：上一个的草稿不留到下一个身上。
@@ -280,7 +279,7 @@ export function TeamAgentsTab({
           agentId={selected}
           isMaster={active?.is_master ?? false}
           onRequestDelete={() =>
-            setPendingDelete({ id: selected, name: activeName })
+            setPendingDelete({ id: selected, label: activeLabel })
           }
         />
         {confirmDialog}
@@ -291,14 +290,8 @@ export function TeamAgentsTab({
   return (
     <div className="p-3">
       {rows.length > 0 && (
-        <div className="mb-3 flex items-center gap-2">
-          <span className="text-sm font-medium text-ink">Agent</span>
-          <span className="text-caption text-ink-faint">{rows.length}</span>
-          <Button
-            size="sm"
-            className="ml-auto"
-            onClick={() => setCreating(true)}
-          >
+        <div className="mb-3">
+          <Button size="sm" onClick={() => setCreating(true)}>
             ＋ 新建 agent
           </Button>
         </div>
@@ -325,7 +318,7 @@ export function TeamAgentsTab({
               agent={agent}
               onOpen={() => setSelected(agent.id)}
               onDelete={() =>
-                setPendingDelete({ id: agent.id, name: agent.name })
+                setPendingDelete({ id: agent.id, label: agentLabel(agent) })
               }
             />
           ))}

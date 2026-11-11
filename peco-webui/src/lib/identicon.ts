@@ -38,6 +38,11 @@ export function pixelIconValue(seed: string): string {
   return `${PIXEL_PREFIX}${seed}`;
 }
 
+/** 由种子派生的稳定色相（0–359）：同一 id 永远同一色，刷新不变。 */
+export function seedHue(seed: string): number {
+  return hashSeed(seed || "agent")() % 360;
+}
+
 export function createIdenticon(seed: string): Identicon {
   const next = hashSeed(seed || "team");
   const hue = next() % 360;

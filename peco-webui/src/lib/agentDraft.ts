@@ -16,7 +16,6 @@ import type {
 export interface AgentDraft {
   name: string;
   description: string;
-  icon: string;
   model: string | null;
   provider: string | null;
   system_prompt: string;
@@ -33,7 +32,6 @@ export interface AgentDraft {
 export interface NewAgentDraft {
   name: string;
   description: string;
-  icon: string;
   provider: string | null;
   model: string | null;
   system_prompt: string;
@@ -42,7 +40,6 @@ export interface NewAgentDraft {
 export const EMPTY_NEW_AGENT: NewAgentDraft = {
   name: "",
   description: "",
-  icon: "",
   provider: null,
   model: null,
   system_prompt: "",
@@ -56,7 +53,6 @@ export function draftFromDetail(detail: AgentDetail): AgentDraft {
   return {
     name: detail.name,
     description: detail.description,
-    icon: detail.icon,
     model: detail.model,
     provider: detail.provider,
     system_prompt: detail.system_prompt,
@@ -114,12 +110,11 @@ export function diffDraft(detail: AgentDetail, draft: AgentDraft): DraftDiff {
   const invalid: string[] = [];
 
   const name = draft.name.trim();
-  if (name === "") invalid.push("名称不能为空");
+  if (name === "") invalid.push("id 不能为空");
   else if (name !== detail.name) body.name = name;
 
   if (draft.description !== detail.description)
     body.description = draft.description;
-  if (draft.icon !== detail.icon) body.icon = draft.icon;
   if (draft.model !== detail.model) body.model = draft.model;
   if (draft.provider !== detail.provider) body.provider = draft.provider;
   if (draft.system_prompt !== detail.system_prompt)
@@ -168,7 +163,6 @@ export function createRequestFromDraft(
 ): CreateAgentRequest {
   const body: CreateAgentRequest = { name: draft.name.trim() };
   if (draft.description.trim()) body.description = draft.description.trim();
-  if (draft.icon.trim()) body.icon = draft.icon.trim();
   if (draft.provider) body.provider = draft.provider;
   if (draft.model) body.model = draft.model;
   if (draft.system_prompt) body.system_prompt = draft.system_prompt;

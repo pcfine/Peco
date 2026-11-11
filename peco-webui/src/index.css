@@ -239,6 +239,19 @@ html:not(.dark) {
   }
 }
 
+@layer components {
+  /* Agent 卡片的标识块：色相由 agent id 派生（内联 --mono-hue），
+     亮/暗两套明度，避免深色主题里出现刺眼的浅色圆点。 */
+  .agent-monogram {
+    background-color: hsl(var(--mono-hue) 46% 87%);
+    color: hsl(var(--mono-hue) 58% 24%);
+  }
+  .dark .agent-monogram {
+    background-color: hsl(var(--mono-hue) 30% 26%);
+    color: hsl(var(--mono-hue) 70% 82%);
+  }
+}
+
 @layer utilities {
   .tabular-nums {
     font-variant-numeric: tabular-nums;

@@ -239,6 +239,7 @@ async fn migration_018_rebuilds_agents_per_team_and_survives_rerun() {
     .await
     .unwrap();
     assert_eq!(team_id_col, 1, "迁移 018 后 agents 应含 team_id 列");
+    assert_agent_ui_columns_absent(&pool).await;
 
     let kept =
         sqlx::query_scalar::<_, String>("SELECT description FROM agents WHERE id = 'a_master'")
@@ -272,6 +273,62 @@ async fn migration_018_rebuilds_agents_per_team_and_survives_rerun() {
         .await
         .unwrap();
     assert_eq!(rows, 3, "重跑迁移不得重建表或丢行");
+    assert_agent_ui_columns_absent(&pool).await;
+}
+
+/// agents 的 UI 列已全部移除；行数据不受影响，且迁移可重跑。
+#[tokio::test]
+async fn migration_024_025_drop_agent_ui_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/post018.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+
+    // 018 之后的形状：已有 team_id，但仍带两列 UI 字段。
+    sqlx::raw_sql(
+        "CREATE TABLE agents (\
+           id TEXT PRIMARY KEY, user_id TEXT NOT NULL, team_id TEXT NOT NULL DEFAULT '', \
+           name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', \
+           icon TEXT NOT NULL DEFAULT '🤖', background_color TEXT NOT NULL DEFAULT '', \
+           status TEXT NOT NULL DEFAULT 'idle', \
+           created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+           updated_at TEXT NOT NULL DEFAULT (datetime('now')), \
+           UNIQUE(team_id, name))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO agents (id, user_id, team_id, name, description, icon, background_color) \
+         VALUES ('a1', 'local', 'research', 'reviewer', '代码审查员 — 看代码', '🔍', '#fff')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_agent_ui_columns_absent(&pool).await;
+
+    let kept = sqlx::query_as::<_, (String, String)>(
+        "SELECT name, description FROM agents WHERE id = 'a1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, ("reviewer".into(), "代码审查员 — 看代码".into()));
+
+    // 重跑：门控命中，列形状与行都不变。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_agent_ui_columns_absent(&pool).await;
+}
+
+async fn assert_agent_ui_columns_absent(pool: &sqlx::SqlitePool) {
+    let ui_cols = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name IN ('icon', 'background_color')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ui_cols, 0, "agents 不应再有 icon / background_color 列");
 }
 
 /// 全新库的列形状：`schema.sql` 必须自带团队/空间维度，否则 018 的列门控
@@ -283,12 +340,23 @@ fn schema_sql_declares_team_and_workspace_scope() {
         "team_id TEXT NOT NULL DEFAULT ''",
         "workspace_id TEXT NOT NULL DEFAULT ''",
         "UNIQUE(team_id, name)",
+        "status TEXT NOT NULL DEFAULT 'idle'",
         "idx_knowledge_bases_team",
         "idx_conversations_workspace_agent",
         "-- @after-migrations",
     ] {
         assert!(schema.contains(needle), "schema.sql 必须含 {needle}");
     }
+
+    // agents 的 UI 字段已移除；teams.icon 仍在，所以只断言 agents 的形状。
+    assert!(
+        !schema.contains("background_color"),
+        "schema.sql 不应再声明 agents.background_color"
+    );
+    assert!(
+        !schema.contains("icon TEXT NOT NULL DEFAULT '🤖'"),
+        "schema.sql 不应再声明 agents.icon"
+    );
 }
 
 /// `schema.sql` 必须自带两套状态列与新索引名。

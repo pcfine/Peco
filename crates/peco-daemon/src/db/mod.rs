@@ -118,14 +118,23 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
     }
 
     // ── Migration 004: agents background_color ────────────────────────────
+    // 004 只为 018 的表重建补列：018 会 `SELECT ... background_color` 搬行。
+    // 025 之后该列被删除，若无条件按「缺列就补」执行，每次启动都会补回再删掉。
+    // 因此只在 018 尚未执行（没有 team_id）的旧库上补。
     let has_bg_color = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'background_color'",
     )
     .fetch_one(pool)
     .await?
         > 0;
+    let agents_has_team_id = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'team_id'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
 
-    if !has_bg_color {
+    if !has_bg_color && !agents_has_team_id {
         tracing::info!("Running migration 004: agents background_color");
         let migration_sql = include_str!("migrations/004_agent_background.sql");
         for statement in migration_sql.split(';') {
@@ -141,7 +150,7 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         }
         tracing::info!("Migration 004 completed");
     } else {
-        tracing::debug!("Migration 004 skipped: background_color column already exists");
+        tracing::debug!("Migration 004 skipped: background_color exists or agents.team_id present");
     }
 
     // ── Migration 003: conversations v2 (agent_name + archived_at) ──────────
@@ -474,13 +483,6 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
     // 门控查 `agents.team_id`：全新库由 schema.sql 带出该列 → 跳过；旧库缺失
     // 才需要重建 agents（表级 UNIQUE 无法用 ALTER 删除）。看列而不是看表 ——
     // agents 表一直存在，只看表会让 018 永久 skip。
-    let agents_has_team_id = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'team_id'",
-    )
-    .fetch_one(pool)
-    .await?
-        > 0;
-
     if !agents_has_team_id {
         run_migration(
             pool,
@@ -602,6 +604,46 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::info!("Migration 023 completed");
     } else {
         tracing::debug!("Migration 023 skipped: teams.icon already exists");
+    }
+
+    // ── Migration 024: drop agents.icon ───────────────────────────────────
+    let agents_has_icon = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'icon'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if agents_has_icon {
+        run_migration(
+            pool,
+            "024",
+            include_str!("migrations/024_drop_agent_icon.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 024 completed");
+    } else {
+        tracing::debug!("Migration 024 skipped: agents.icon already absent");
+    }
+
+    // ── Migration 025: drop agents.background_color ───────────────────────
+    let agents_has_bg_color = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'background_color'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if agents_has_bg_color {
+        run_migration(
+            pool,
+            "025",
+            include_str!("migrations/025_drop_agent_background_color.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 025 completed");
+    } else {
+        tracing::debug!("Migration 025 skipped: agents.background_color already absent");
     }
 
     Ok(())

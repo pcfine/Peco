@@ -74,12 +74,10 @@ function agentDetail(overrides: Partial<AgentDetail> = {}): AgentDetail {
   return {
     id: "a_master",
     name: "@master",
-    description: "总管",
+    description: "团队总管 — 派发任务",
     system_prompt: "你是总管",
     model: "deepseek-flash",
     provider: "deepseek",
-    icon: "🤖",
-    background_color: "",
     status: "idle",
     tools: ["shell"],
     mcp_servers: [],
@@ -101,10 +99,12 @@ function agentDetail(overrides: Partial<AgentDetail> = {}): AgentDetail {
 const MASTER = agentDetail({ model: null });
 const HELPER = agentDetail({
   id: "a_helper",
-  name: "助手",
-  description: "干活的",
+  name: "helper",
+  description: "助手 — 干活的",
   system_prompt: "你是助手",
   tools: ["shell", "files", "search"],
+  mcp_servers: ["filesystem"],
+  skills: ["lint"],
   knowledge_bases: ["handbook", "faq", "wiki"],
   temperature: null,
   max_iterations: 200,
@@ -117,10 +117,10 @@ function listItem(detail: AgentDetail, isMaster: boolean): AgentListItem {
     description: detail.description,
     model: detail.model,
     provider: detail.provider,
-    icon: detail.icon,
-    background_color: detail.background_color,
     status: detail.status,
     tools: detail.tools,
+    mcp_servers: detail.mcp_servers,
+    skills: detail.skills,
     knowledge_bases: detail.knowledge_bases,
     is_master: isMaster,
     created_at: detail.created_at,
@@ -160,7 +160,6 @@ beforeEach(() => {
       system_prompt: body.system_prompt ?? "",
       model: body.model ?? null,
       provider: body.provider ?? null,
-      icon: body.icon ?? "🤖",
       tools: [],
       temperature: null,
       max_iterations: 500,
@@ -199,7 +198,7 @@ beforeEach(() => {
 });
 
 describe("团队 agents tab 装配", () => {
-  it("填名称提交后调用 POST，新 agent 直接进编辑器并出现在列表里", async () => {
+  it("填 id 提交后调用 POST，新 agent 直接进编辑器并出现在列表里", async () => {
     renderTab();
     fireEvent.click(
       await screen.findByRole("button", { name: "＋ 新建 agent" }),
@@ -207,20 +206,20 @@ describe("团队 agents tab 装配", () => {
 
     // 编辑器也有「描述」，查询要限定在对话框里。
     const dialog = within(await screen.findByRole("dialog"));
-    fireEvent.change(dialog.getByLabelText("名称（必填）"), {
-      target: { value: "审查员" },
+    fireEvent.change(dialog.getByLabelText("id（必填）"), {
+      target: { value: "reviewer" },
     });
     fireEvent.change(dialog.getByLabelText("描述"), {
-      target: { value: "看代码" },
+      target: { value: "审查员 — 看代码" },
     });
     fireEvent.click(dialog.getByRole("button", { name: "创建" }));
 
     await waitFor(() => expect(createAgent).toHaveBeenCalledTimes(1));
     expect(createAgent).toHaveBeenCalledWith("ws_a", {
-      name: "审查员",
-      description: "看代码",
+      name: "reviewer",
+      description: "审查员 — 看代码",
     });
-    expect(await screen.findByDisplayValue("审查员")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("reviewer")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
     expect(
@@ -248,11 +247,11 @@ describe("团队 agents tab 装配", () => {
     await waitFor(() => expect(screen.queryByText("未保存")).toBeNull());
   });
 
-  it("改名字保存时 PATCH body 只有 name", async () => {
+  it("改 id 保存时 PATCH body 只有 name", async () => {
     renderTab();
     fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
-    fireEvent.change(await screen.findByLabelText("名称"), {
+    fireEvent.change(await screen.findByLabelText("id"), {
       target: { value: "助手二号" },
     });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
@@ -265,14 +264,12 @@ describe("团队 agents tab 装配", () => {
     renderTab();
     await screen.findByRole("button", { name: /^助手/ });
 
-    expect(screen.getByText("Agent")).toBeInTheDocument();
-    expect(screen.getByText("2")).toBeInTheDocument();
     expect(
       within(screen.getByRole("button", { name: /@master/ })).getByText(
-        "未设模型",
+        "mcp: 0",
       ),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText("名称")).toBeNull();
+    expect(screen.queryByLabelText("id")).toBeNull();
     expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
   });
 
@@ -280,7 +277,7 @@ describe("团队 agents tab 装配", () => {
     renderTab();
     fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
-    expect(await screen.findByLabelText("名称")).toBeInTheDocument();
+    expect(await screen.findByLabelText("id")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "返回列表" }),
     ).toBeInTheDocument();
@@ -290,7 +287,7 @@ describe("团队 agents tab 装配", () => {
     expect(
       await screen.findByRole("button", { name: /^助手/ }),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText("名称")).toBeNull();
+    expect(screen.queryByLabelText("id")).toBeNull();
   });
 
   it("没有改动时保存按钮禁用，改一个字才可用", async () => {
@@ -298,11 +295,11 @@ describe("团队 agents tab 装配", () => {
     fireEvent.click(await screen.findByRole("button", { name: /@master/ }));
 
     // 详情还在路上时编辑器是骨架屏，等它落地再看按钮。
-    await screen.findByLabelText("名称");
+    await screen.findByLabelText("id");
 
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
 
-    fireEvent.change(screen.getByLabelText("名称"), {
+    fireEvent.change(screen.getByLabelText("id"), {
       target: { value: "助手二号" },
     });
 
@@ -323,7 +320,9 @@ describe("团队 agents tab 装配", () => {
     fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
     fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
-    expect(await screen.findByDisplayValue("干活的")).toBeInTheDocument();
+    expect(
+      await screen.findByDisplayValue("助手 — 干活的"),
+    ).toBeInTheDocument();
   });
 
   it("@master 既没有卡内删除，也没有编辑器里的删除入口", async () => {
@@ -332,7 +331,7 @@ describe("团队 agents tab 装配", () => {
     expect(within(card).queryByRole("button", { name: /^删除/ })).toBeNull();
 
     fireEvent.click(card);
-    await screen.findByLabelText("名称");
+    await screen.findByLabelText("id");
 
     expect(screen.queryByRole("button", { name: /^删除/ })).toBeNull();
   });
@@ -388,15 +387,15 @@ describe("团队 agents tab 装配", () => {
     expect(await screen.findByText(/is reserved/)).toBeInTheDocument();
   });
 
-  it("名称清空时不提交，只把原因摆在按钮旁", async () => {
+  it("id 清空时不提交，只把原因摆在按钮旁", async () => {
     renderTab();
     fireEvent.click(await screen.findByRole("button", { name: /^助手/ }));
 
-    fireEvent.change(await screen.findByLabelText("名称"), {
+    fireEvent.change(await screen.findByLabelText("id"), {
       target: { value: "  " },
     });
 
-    expect(screen.getByText("名称不能为空")).toBeInTheDocument();
+    expect(screen.getByText("id 不能为空")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
     expect(updateAgent).not.toHaveBeenCalled();
   });
@@ -413,23 +412,63 @@ describe("团队 agents tab 装配", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
-    expect(updateAgent.mock.calls[0][2]).toEqual({ skills: ["review"] });
+    expect(updateAgent.mock.calls[0][2]).toEqual({
+      skills: ["lint", "review"],
+    });
   });
 
-  it("卡片元信息行给 model 与前两个 tools / 知识库，其余折成 +N", async () => {
+  it("卡片以描述推导的中文名为标题，id 退居副行，首字块代替图标", async () => {
+    rows = [
+      ...rows,
+      listItem(
+        agentDetail({
+          id: "a_reviewer",
+          name: "reviewer",
+          description: "代码审查员 — 看代码",
+        }),
+        false,
+      ),
+    ];
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^代码审查员/ });
+    expect(within(card).getByText("代码审查员")).toBeInTheDocument();
+    expect(within(card).getByText("reviewer")).toHaveClass("font-mono");
+    expect(within(card).getByText("看代码")).toBeInTheDocument();
+    expect(within(card).queryByText("代码审查员 — 看代码")).toBeNull();
+
+    const monogram = within(card).getByText("代");
+    expect(monogram.className).toContain("agent-monogram");
+  });
+
+  it("卡片只摆 tools / MCP / skill 的数量，不再列模型与具体条目", async () => {
     renderTab();
     const card = await screen.findByRole("button", { name: /^助手/ });
 
-    expect(within(card).getByText("deepseek-flash").className).toContain(
-      "font-mono",
-    );
-    for (const chip of ["shell", "files", "handbook", "faq"]) {
-      expect(within(card).getByText(chip)).toBeInTheDocument();
+    expect(within(card).getByText("tools: 3")).toBeInTheDocument();
+    expect(within(card).getByText("mcp: 1")).toBeInTheDocument();
+    expect(within(card).getByText("skill: 1")).toBeInTheDocument();
+
+    // 具体工具名、模型、知识库都不再上卡。
+    expect(within(card).queryByText("deepseek-flash")).toBeNull();
+    for (const hidden of ["shell", "files", "search", "handbook", "faq"]) {
+      expect(within(card).queryByText(hidden)).toBeNull();
     }
-    // 第 3 项不铺出来，各自折成 +1。
-    expect(within(card).queryByText("search")).toBeNull();
-    expect(within(card).queryByText("wiki")).toBeNull();
-    expect(within(card).getAllByText("+1")).toHaveLength(2);
+  });
+
+  it("旧版 daemon 缺 mcp/skills 字段时按 0 计，不把页面打崩", async () => {
+    rows = [
+      {
+        ...listItem(HELPER, false),
+        mcp_servers: undefined as unknown as string[],
+        skills: undefined as unknown as string[],
+      },
+    ];
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^助手/ });
+    expect(within(card).getByText("mcp: 0")).toBeInTheDocument();
+    expect(within(card).getByText("skill: 0")).toBeInTheDocument();
   });
 
   it("noMaster 时列表顶部就说出派发不了任务", async () => {

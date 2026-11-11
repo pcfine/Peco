@@ -16,8 +16,6 @@ function agentDetail(overrides: Partial<AgentDetail> = {}): AgentDetail {
     system_prompt: "你是助手",
     model: "deepseek-flash",
     provider: "deepseek",
-    icon: "🤖",
-    background_color: "",
     status: "idle",
     tools: ["shell"],
     mcp_servers: [],
@@ -78,7 +76,7 @@ describe("agentDraft", () => {
     expect(diffDraft(detail, removed).body).toEqual({ tools: ["fetch"] });
   });
 
-  it("名称清空与非法数字都不进请求体，而是给出原因", () => {
+  it("id 清空与非法数字都不进请求体，而是给出原因", () => {
     const detail = agentDetail();
     const draft = {
       ...draftFromDetail(detail),
@@ -90,7 +88,7 @@ describe("agentDraft", () => {
 
     expect(diff.body).toEqual({});
     expect(diff.invalid).toHaveLength(2);
-    expect(diff.invalid[0]).toContain("名称");
+    expect(diff.invalid[0]).toContain("id");
   });
 
   it("max_iterations 留空算不改：服务端没有清空它的形态", () => {

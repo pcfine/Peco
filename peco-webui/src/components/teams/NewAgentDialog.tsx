@@ -22,6 +22,7 @@ import {
   type NewAgentDraft,
   createRequestFromDraft,
 } from "@/lib/agentDraft";
+import { agentDisplayName } from "@/lib/agentName";
 import { errorText } from "@/lib/api";
 
 interface NewAgentFormProps {
@@ -47,7 +48,9 @@ function NewAgentForm({
       queryClient.setQueryData(["agent", wsId, agent.id], agent);
       void queryClient.invalidateQueries({ queryKey: ["agents", wsId] });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
-      toast.success(`已新建 agent「${agent.name}」`);
+      toast.success(
+        `已新建 agent「${agentDisplayName(agent.description, agent.name)}」`,
+      );
       onCreated(agent.id);
     },
     onError: (error) => toast.error(errorText(error)),
@@ -64,10 +67,10 @@ function NewAgentForm({
         create.mutate();
       }}
     >
-      <div className="grid grid-cols-[2fr_3fr_auto] gap-2">
+      <div className="grid grid-cols-2 gap-2">
         <label className="space-y-1">
           <span className="text-caption font-medium text-ink-faint">
-            名称（必填）
+            id（必填）
           </span>
           <Input
             value={draft.name}
@@ -82,20 +85,10 @@ function NewAgentForm({
           <Input
             value={draft.description}
             onChange={(event) => update({ description: event.target.value })}
+            placeholder="名称 — 说明"
             disabled={create.isPending}
             autoComplete="off"
             className="h-8 text-xs"
-          />
-        </label>
-        <label className="space-y-1">
-          <span className="text-caption font-medium text-ink-faint">图标</span>
-          <Input
-            value={draft.icon}
-            onChange={(event) => update({ icon: event.target.value })}
-            placeholder="🤖"
-            disabled={create.isPending}
-            autoComplete="off"
-            className="h-8 w-16 text-center text-xs"
           />
         </label>
       </div>
@@ -112,13 +105,10 @@ function NewAgentForm({
       </div>
 
       <label className="block space-y-1">
-        <span className="text-caption font-medium text-ink-faint">
-          正文（system_prompt）
-        </span>
+        <span className="text-caption font-medium text-ink-faint">正文</span>
         <Textarea
           value={draft.system_prompt}
           onChange={(event) => update({ system_prompt: event.target.value })}
-          placeholder="你是一位……"
           disabled={create.isPending}
           className="min-h-[120px] font-mono text-mono-sm"
         />
@@ -166,9 +156,7 @@ export function NewAgentDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>新建 agent</DialogTitle>
-          <DialogDescription>
-            只有名称必填，其余留空由服务端补默认值；建好后可继续补能力与运行参数。
-          </DialogDescription>
+          <DialogDescription>只有 id 必填，其余可留空。</DialogDescription>
         </DialogHeader>
         <NewAgentForm
           wsId={wsId}
