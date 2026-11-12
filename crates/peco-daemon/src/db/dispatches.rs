@@ -27,6 +27,8 @@ pub struct DispatchRow {
     pub result_digest: Option<String>,
     /// 派发入参里那段任务描述的前 512 字；旧行是 `None`（当时没有记录）。
     pub prompt_digest: Option<String>,
+    /// 派发回执里的 dispatch_id；旧行是 `None`（当时没有记录）。
+    pub dispatch_id: Option<String>,
     pub created_at: String,
     pub terminal_at: Option<String>,
 }
@@ -56,6 +58,8 @@ pub struct NewDispatch<'a> {
     pub wake_skip_reason: Option<WakeSkipReason>,
     /// 派发入参里的任务描述摘要；解析不到入参时为空。
     pub prompt_digest: Option<&'a str>,
+    /// 派发回执里的 dispatch_id；观察不到回执时为空。
+    pub dispatch_id: Option<&'a str>,
 }
 
 /// 未终态状态清单 —— 关闭门槛、`orphan` 化与启动对账共用的唯一口径。
@@ -112,8 +116,9 @@ pub async fn insert(pool: &SqlitePool, dispatch: &NewDispatch<'_>) -> Result<u64
     let result = sqlx::query(
         "INSERT INTO d_dispatches \
          (id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, prompt_digest) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, prompt_digest, \
+          dispatch_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(target_ws_id, task_id) DO NOTHING",
     )
     .bind(dispatch.id)
@@ -128,6 +133,7 @@ pub async fn insert(pool: &SqlitePool, dispatch: &NewDispatch<'_>) -> Result<u64
     .bind(dispatch.wake_state.as_str())
     .bind(dispatch.wake_skip_reason.map(WakeSkipReason::as_str))
     .bind(dispatch.prompt_digest)
+    .bind(dispatch.dispatch_id)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -251,7 +257,7 @@ pub async fn get_by_task_id(
     sqlx::query_as::<_, DispatchRow>(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, created_at, terminal_at \
+         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
          FROM d_dispatches WHERE task_id = ? \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -268,7 +274,7 @@ pub async fn list_active(pool: &SqlitePool) -> Result<Vec<DispatchRow>, sqlx::Er
     let sql = format!(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, created_at, terminal_at \
+         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
          FROM d_dispatches WHERE task_state IN ({}) ORDER BY created_at DESC, id DESC",
         placeholders(TASK_ACTIVE_STATES)
     );
@@ -287,7 +293,7 @@ pub async fn list(
     let mut builder = QueryBuilder::new(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, created_at, terminal_at \
+         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
          FROM d_dispatches",
     );
     let mut has_where = false;
@@ -342,53 +348,77 @@ pub async fn set_task_state(
     Ok(result.rows_affected())
 }
 
-/// 终态落库：状态、终态时间与结果摘要。
+/// 「等终态的行该入队了」的赋值片段：`awaiting` 转 `pending`，其余唤醒态原样返回。
+///
+/// 三条写入路径（终态落库、运行期失联、重启对账）共用这一处 —— 各写一遍的话，
+/// 改判据时漏一处就会让那些任务永远停在 `awaiting`，而没有任何路径会再碰到它们。
+fn queue_awaiting_assignment() -> String {
+    format!(
+        "wake_state = CASE WHEN wake_state = '{awaiting}' THEN '{pending}' ELSE wake_state END",
+        awaiting = WakeState::Awaiting.as_str(),
+        pending = WakeState::Pending.as_str(),
+    )
+}
+
+/// 终态落库：状态、终态时间、结果摘要，以及「该入队了」。
+///
+/// 入队与终态必须同一条语句：拆成两步做，中间崩溃会留下「行已终态、唤醒永远
+/// 停在 awaiting」的任务，而没有任何路径会再碰到它。
+///
+/// `awaiting` 是本条语句唯一改写的唤醒态 —— 它只存在于终态之前，终态一落就
+/// 该投；其余唤醒态（`delivering` / `delivered` / `skipped`）描述的是一次已经
+/// 发生的投递，倒回队列会把同一条消息发第二遍。
 pub async fn finish(
     pool: &SqlitePool,
     task_id: &str,
     state: &str,
     result_digest: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
+    let sql = format!(
         "UPDATE d_dispatches SET task_state = ?, terminal_at = datetime('now'), \
-         result_digest = COALESCE(?, result_digest) \
+         result_digest = COALESCE(?, result_digest), {} \
          WHERE task_id = ? AND task_state <> 'orphan'",
-    )
-    .bind(state)
-    .bind(result_digest)
-    .bind(task_id)
-    .execute(pool)
-    .await?;
+        queue_awaiting_assignment(),
+    );
+    let result = sqlx::query(&sql)
+        .bind(state)
+        .bind(result_digest)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
 /// 单行 orphan 化：任务已不可观察（空间关闭、Hub 消失、重订阅耗尽）。
 ///
-/// 原因只在行还没被跳过时补写：一行可能是先因来源不符被跳过、之后才失联的，
-/// 覆盖掉 `not_peco_origin` 会把「为什么本来就不该唤醒」换成次要成因。
+/// `awaiting` 行转 `pending` 而不是 `skipped`：Peco 正是要知道「你派出去的那条
+/// 断了」，而这条通知只能由一次投递送出去。已经在队列里或正在投的行保持原样，
+/// 已投出去的行（`delivered`）也不回退 —— 消息发出过就是发出过。
+///
+/// 原因列一概不动：它会随 `skipped` 行留到下一次真正被跳过的时候。
 pub async fn orphan_by_task(pool: &SqlitePool, task_id: &str) -> Result<u64, sqlx::Error> {
     let sql = format!(
-        "UPDATE d_dispatches SET task_state = '{orphan}', terminal_at = datetime('now'), \
-         wake_state = '{skipped}', \
-         wake_skip_reason = COALESCE(wake_skip_reason, '{orphaned}') \
+        "UPDATE d_dispatches SET task_state = '{orphan}', terminal_at = datetime('now'), {} \
          WHERE task_id = ?",
+        queue_awaiting_assignment(),
         orphan = TASK_ORPHAN_STATE,
-        skipped = WakeState::Skipped.as_str(),
-        orphaned = WakeSkipReason::Orphaned.as_str(),
     );
     let result = sqlx::query(&sql).bind(task_id).execute(pool).await?;
     Ok(result.rows_affected())
 }
 
-/// 在飞台账置 `orphan` 并停止唤醒，返回受影响行数。
+/// 在飞台账置 `orphan`，返回受影响行数。
 ///
 /// 关闭空间会销毁唯一持有结果的 Hub，未落库的在飞任务将永远查不到结果；
-/// 先标 `orphan` 是重启后对账的唯一依据。`wake_state` 同时置 `skipped`：
-/// 空间都没了，再唤醒 Peco 去查只会拿到「任务不存在」。
+/// 先标 `orphan` 是重启后对账的唯一依据，台账本身长于空间行。
 ///
-/// 但只对还没投出去的行改唤醒态。已 `delivering` / `delivered` 的行已经有
-/// 一条唤醒消息在途或已送达 —— 把它倒回 `skipped`，台账就变成了「消息发出过，
-/// 却记着没发」，重投与去重都失去依据。状态本身照旧一律 orphan 化。
+/// 唤醒态分三类：
+/// - `awaiting`（任务还没到终态）→ `pending`：这正是要通知 Peco「断了一条」的
+///   时刻，跳过就没人在看板之外知道这件事。
+/// - `pending` / `failed`（还没投出去）→ `skipped` + `space_closed`：空间都没了，
+///   再唤醒 Peco 去查只会拿到「任务不存在」，投出去只是白跑一轮。
+/// - `delivering` / `delivered`：一条唤醒已经发出或已送达 —— 倒回 `skipped`，
+///   台账就变成「消息发出过，却记着没发」，重投与去重都失去依据。
 ///
 /// 两个 CASE 都读旧行值：SQLite 在写任何列之前求值 `SET` 里的全部表达式，故原因
 /// 与唤醒态看到的是同一份更新前的 `wake_state`。原因那列排在前，是为了即使实现
@@ -399,6 +429,7 @@ pub async fn mark_orphan(pool: &SqlitePool, target_ws_id: &str) -> Result<u64, s
          wake_skip_reason = CASE WHEN wake_state IN ('{pending}','{failed}') \
          THEN '{space_closed}' ELSE wake_skip_reason END, \
          wake_state = CASE WHEN wake_state IN ('{pending}','{failed}') THEN '{skipped}' \
+         WHEN wake_state = '{awaiting}' THEN '{pending}' \
          ELSE wake_state END \
          WHERE target_ws_id = ? AND task_state IN ({active})",
         orphan = TASK_ORPHAN_STATE,
@@ -406,6 +437,7 @@ pub async fn mark_orphan(pool: &SqlitePool, target_ws_id: &str) -> Result<u64, s
         failed = WakeState::Failed.as_str(),
         space_closed = WakeSkipReason::SpaceClosed.as_str(),
         skipped = WakeState::Skipped.as_str(),
+        awaiting = WakeState::Awaiting.as_str(),
         active = placeholders(TASK_ACTIVE_STATES),
     );
     let mut query = sqlx::query(&sql).bind(target_ws_id);
@@ -417,14 +449,17 @@ pub async fn mark_orphan(pool: &SqlitePool, target_ws_id: &str) -> Result<u64, s
 }
 
 // ============================================================================
-// 唤醒队列：wake_state 的五态迁移
+// 唤醒队列：wake_state 的六态迁移
 // ============================================================================
 //
-// `pending → delivering → delivered / failed`，外加三条回收路径（启动回收、
-// 60s 超时、failed 重排）。全部是条件更新：并发投递与事件重放的幂等都靠
-// 「条件不满足就是 0 行」，不在内存里另立一把锁。
+// `awaiting → pending → delivering → delivered / failed`，外加三条回收路径
+// （启动回收、60s 超时、failed 重排）。全部是条件更新：并发投递与事件重放的幂等
+// 都靠「条件不满足就是 0 行」，不在内存里另立一把锁。
 
 /// 待唤醒的行，最老的在前；仍在退避窗口里的行不返回，留给后面的 tick。
+///
+/// 只认 `pending`：`awaiting` 是「任务还没到终态」，此刻投出去只能报一个中间态，
+/// 而终态会自己把它转成 `pending`。
 ///
 /// 排序两列缺一不可：同一秒写入的成批行 `created_at` 相同，只按它排序会让
 /// 「先到先投」退化成随机顺序。
@@ -439,7 +474,7 @@ pub async fn list_pending(
     let sql = format!(
         "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, created_at, terminal_at \
+         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
          FROM d_dispatches WHERE wake_state = '{pending}' AND {} ORDER BY created_at, id LIMIT ?",
         backoff_predicate(backoff),
         pending = WakeState::Pending.as_str(),
@@ -615,20 +650,18 @@ pub async fn reschedule_failed(pool: &SqlitePool, max_attempts: i64) -> Result<u
 
 /// 启动对账发现的 orphan 行：任务随上个进程一起消失了。
 ///
-/// 与 [`orphan_by_task`] 只差 `wake_state`：运行期失联（订阅断了、Hub 不认识这个
-/// 任务）已无结果可查，故一并停掉唤醒；重启对账的行本来就在等唤醒，保留待投递
-/// 才能让 Peco 知道「你派出去的那条断了」。
+/// 与 [`orphan_by_task`] 一样把 `awaiting` 转成 `pending`：一行可能是终态之前就被
+/// 上个进程带走的，它从没被通知过，也就还没有一条能告诉 Peco「那条断了」的消息。
 pub async fn orphan_by_task_on_restart(
     pool: &SqlitePool,
     task_id: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE d_dispatches SET task_state = 'orphan', terminal_at = datetime('now') \
+    let sql = format!(
+        "UPDATE d_dispatches SET task_state = 'orphan', terminal_at = datetime('now'), {} \
          WHERE task_id = ?",
-    )
-    .bind(task_id)
-    .execute(pool)
-    .await?;
+        queue_awaiting_assignment(),
+    );
+    let result = sqlx::query(&sql).bind(task_id).execute(pool).await?;
     Ok(result.rows_affected())
 }
 
@@ -664,6 +697,7 @@ mod tests {
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -680,6 +714,85 @@ mod tests {
         .unwrap();
         assert_eq!(state, "orphan");
         assert_eq!(wake_state, "pending", "重启对账的孤儿行仍要唤醒");
+    }
+
+    /// 重启对账同样把 `awaiting` 行转入待投递：上个进程可能在任务终态之前就没了，
+    /// 那些行从没被通知过，「你派出去的那条断了」还没有任何一条消息说过。
+    #[tokio::test]
+    async fn restart_orphaning_queues_the_awaiting_rows() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_awaiting", "working", WakeState::Awaiting, None).await;
+
+        orphan_by_task_on_restart(&pool, "d_awaiting")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger_of(&pool, "d_awaiting").await,
+            (TASK_ORPHAN_STATE.to_string(), "pending".to_string(), None),
+            "等终态的行失联后要转入待投递"
+        );
+    }
+
+    /// 终态落库与入队是同一条 UPDATE：分开写的话，中间崩溃会留下「已终态、唤醒
+    /// 永远停在 awaiting」的行，而没有任何路径会再碰到它。
+    ///
+    /// 反证同时在场：`skipped` 行跑完之后仍是 `skipped` —— 终态不是重新决定
+    /// 「要不要唤醒」的理由，否则一条被明确跳过的任务会因为跑完而被叫醒。
+    #[tokio::test]
+    async fn finishing_a_task_queues_the_awaiting_row_and_leaves_skipped_alone() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_live", "working", WakeState::Awaiting, None).await;
+        seed_skipped(&pool, "d_skipped", WakeSkipReason::NotPecoOrigin).await;
+
+        assert_eq!(
+            finish(&pool, "d_live", "completed", Some("12 个测试通过"))
+                .await
+                .unwrap(),
+            1
+        );
+        finish(&pool, "d_skipped", "completed", None).await.unwrap();
+
+        assert_eq!(
+            ledger_of(&pool, "d_live").await,
+            ("completed".to_string(), "pending".to_string(), None),
+            "awaiting 必须随终态一起入队"
+        );
+        let (terminal_at, digest) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT terminal_at, result_digest FROM d_dispatches WHERE id = 'd_live'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(terminal_at.is_some(), "终态时间要落");
+        assert_eq!(digest.as_deref(), Some("12 个测试通过"));
+
+        assert_eq!(
+            ledger_of(&pool, "d_skipped").await,
+            (
+                "completed".to_string(),
+                "skipped".to_string(),
+                Some("not_peco_origin".to_string())
+            ),
+            "已跳过的行不因终态被叫醒"
+        );
+    }
+
+    /// `awaiting` 不进待投递队列：任务还没终态，此刻投出去只能报一个中间态，而
+    /// 终态会自己把它转成 `pending`。
+    #[tokio::test]
+    async fn awaiting_rows_are_not_listed_as_pending() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_awaiting", "working", WakeState::Awaiting, None).await;
+        seed_row(&pool, "d_ready", "completed", WakeState::Pending, None).await;
+
+        let listed = list_pending(&pool, 10, short_backoff()).await.unwrap();
+
+        assert_eq!(
+            listed.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["d_ready"],
+            "只有 pending 进队列"
+        );
     }
 
     /// 播种一行待唤醒台账。
@@ -699,6 +812,7 @@ mod tests {
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -722,6 +836,46 @@ mod tests {
         .bind(claimed_ago)
         .bind(id)
         .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// 把一行直接摆到指定唤醒态。
+    async fn set_wake_state(pool: &SqlitePool, id: &str, state: WakeState) {
+        sqlx::query("UPDATE d_dispatches SET wake_state = ? WHERE id = ?")
+            .bind(state.as_str())
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// 播种一行任意状态的台账；`task_id` 取 `id`，便于按行点名。
+    async fn seed_row(
+        pool: &SqlitePool,
+        id: &str,
+        task_state: &str,
+        wake_state: WakeState,
+        reason: Option<WakeSkipReason>,
+    ) {
+        insert(
+            pool,
+            &NewDispatch {
+                id,
+                task_id: id,
+                target_ws_id: "ws_a",
+                target_work_dir: "/tmp/work",
+                target_team_id: "research",
+                origin_ws_id: "ws_peco",
+                agent_name: "@master",
+                origin_kind: "run_machine_task",
+                task_state,
+                wake_state,
+                wake_skip_reason: reason,
+                prompt_digest: None,
+                dispatch_id: None,
+            },
+        )
         .await
         .unwrap();
     }
@@ -804,6 +958,7 @@ mod tests {
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -838,6 +993,7 @@ mod tests {
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -995,6 +1151,7 @@ mod tests {
                 wake_state: WakeState::Skipped,
                 wake_skip_reason: Some(reason),
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -1024,10 +1181,32 @@ mod tests {
         assert!(rejected.is_err(), "CHECK 必须拒绝清单外的原因");
     }
 
-    /// 运行期失联补写 `orphaned`，但保留更早的成因：一行先因来源不符被跳过、
-    /// 之后才失联时，「本来就不该唤醒」才是要回答的问题。
+    /// 六态的字符串都得能落库：CHECK 与 [`WakeState::ALL`] 各写一份清单，任一边
+    /// 漏一个值，写入就会在运行期报 constraint failed。
     #[tokio::test]
-    async fn runtime_orphaning_records_the_reason_only_when_none_is_recorded() {
+    async fn every_wake_state_passes_the_column_constraint() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_state", "completed", WakeState::Pending, None).await;
+
+        for state in WakeState::ALL {
+            set_wake_state(&pool, "d_state", state).await;
+            assert_eq!(wake_state_of(&pool, "d_state").await, state.as_str());
+        }
+
+        // 反证：清单外的值必须被 CHECK 挡住 —— 否则上面的循环对一张没有约束的
+        // 表同样绿。
+        let rejected =
+            sqlx::query("UPDATE d_dispatches SET wake_state = 'sent' WHERE id = 'd_state'")
+                .execute(&pool)
+                .await;
+        assert!(rejected.is_err(), "CHECK 必须拒绝清单外的唤醒态");
+    }
+
+    /// 运行期失联不改写已跳过行的原因：一行先因来源不符被跳过、之后才失联时，
+    /// 「本来就不该唤醒」才是要回答的问题。已送达的行同样不动 —— 一条唤醒已经
+    /// 发出去过，把台账改成 `skipped` 会让去重与重投都失去依据。
+    #[tokio::test]
+    async fn runtime_orphaning_keeps_rows_that_were_already_skipped_or_delivered() {
         let (pool, _dir) = test_pool().await;
         seed_skipped(&pool, "d_notified", WakeSkipReason::NotPecoOrigin).await;
         insert(
@@ -1045,6 +1224,7 @@ mod tests {
                 wake_state: WakeState::Delivered,
                 wake_skip_reason: None,
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -1064,12 +1244,38 @@ mod tests {
         );
         assert_eq!(
             ledger_of(&pool, "d_quiet").await,
+            (TASK_ORPHAN_STATE.to_string(), "delivered".to_string(), None),
+            "已送达的唤醒不得倒回 skipped，也不该凭空多出一条原因"
+        );
+    }
+
+    /// 运行期失联的待唤醒行要进队列，不是被跳过：Peco 得知道「你派出去的那条
+    /// 断了」，而这条通知只能由一次投递送出去。
+    ///
+    /// `skipped` 行同时在场：它本来就决定过不唤醒，失联不该把它拖回队列。
+    #[tokio::test]
+    async fn runtime_orphaning_queues_the_rows_that_were_still_waiting() {
+        let (pool, _dir) = test_pool().await;
+        seed_wake_row(&pool, "d_awaiting", "t_awaiting").await;
+        set_wake_state(&pool, "d_awaiting", WakeState::Awaiting).await;
+        seed_skipped(&pool, "d_skipped", WakeSkipReason::NotPecoOrigin).await;
+
+        orphan_by_task(&pool, "t_awaiting").await.unwrap();
+        orphan_by_task(&pool, "d_skipped").await.unwrap();
+
+        assert_eq!(
+            ledger_of(&pool, "d_awaiting").await,
+            (TASK_ORPHAN_STATE.to_string(), "pending".to_string(), None),
+            "等终态的行失联后要转入待投递"
+        );
+        assert_eq!(
+            ledger_of(&pool, "d_skipped").await,
             (
                 TASK_ORPHAN_STATE.to_string(),
                 "skipped".to_string(),
-                Some("orphaned".to_string())
+                Some("not_peco_origin".to_string())
             ),
-            "没记过原因的跳过行要补上 orphaned"
+            "已跳过的行保持 skipped，原因也不动"
         );
     }
 
@@ -1102,6 +1308,7 @@ mod tests {
                     wake_state,
                     wake_skip_reason: None,
                     prompt_digest: None,
+                    dispatch_id: None,
                 },
             )
             .await
@@ -1135,6 +1342,33 @@ mod tests {
         assert_eq!(
             ledger_of(&pool, "d_delivered").await,
             (task_orphan, "delivered".to_string(), None)
+        );
+    }
+
+    /// 空间关闭时 `awaiting` 行转待投递：断掉的任务正是要通知 Peco 的那件事，
+    /// 跳过它等于让「派出去的东西断了」只在日志里发生过。已跳过的行保持跳过、
+    /// 原因也保持原样。
+    #[tokio::test]
+    async fn closing_a_space_queues_the_awaiting_rows_and_leaves_skipped_alone() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_awaiting", "working", WakeState::Awaiting, None).await;
+        seed_skipped(&pool, "d_skipped", WakeSkipReason::NotPecoOrigin).await;
+
+        assert_eq!(mark_orphan(&pool, "ws_a").await.unwrap(), 2);
+
+        assert_eq!(
+            ledger_of(&pool, "d_awaiting").await,
+            (TASK_ORPHAN_STATE.to_string(), "pending".to_string(), None),
+            "等终态的行失联后要转入待投递，且 pending 不带原因"
+        );
+        assert_eq!(
+            ledger_of(&pool, "d_skipped").await,
+            (
+                TASK_ORPHAN_STATE.to_string(),
+                "skipped".to_string(),
+                Some("not_peco_origin".to_string())
+            ),
+            "已跳过的行保持 skipped，更早的成因不被 space_closed 顶掉"
         );
     }
 

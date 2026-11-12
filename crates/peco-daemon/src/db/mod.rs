@@ -646,7 +646,111 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 025 skipped: agents.background_color already absent");
     }
 
+    // ── 026 的中断恢复：残表 d_dispatches_new ─────────────────────────────
+    // 必须赶在门控之前：迁移逐条执行且没有事务，崩在「删旧表」与「改名」之间时，
+    // 下次启动 `schema.sql` 会先建出空的正式表，门控看到 `dispatch_id` 就跳过
+    // 026，唯一一份台账便永远留在残表里。
+    recover_interrupted_026(pool).await?;
+
+    // ── Migration 026: d_dispatches 重建（awaiting 唤醒态 + dispatch_id）────
+    // 门控查 `dispatch_id`：全新库由 schema.sql 直接建全 → 跳过；旧库缺这一列
+    // 才需要重建（表级 CHECK 无法用 ALTER 改）。看列而不是看 wake_state 的取值，
+    // 行里没有 awaiting 的老库同样要补这一列。
+    let has_dispatch_id = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('d_dispatches') WHERE name = 'dispatch_id'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+    // 两列同时在场的库是手工改过的（019 已 warn 并拒绝改名）。这里同样不动它：
+    // 重建要把 `task_state` 搬进 NOT NULL 列，而那一列在这些行里是 NULL —— 搬
+    // 过去只能替用户编一个状态，或者直接让启动失败。
+    let ledger_is_hand_edited = has_legacy_state && has_task_state;
+
+    if !has_dispatch_id && !ledger_is_hand_edited {
+        run_migration(
+            pool,
+            "026",
+            include_str!("migrations/026_dispatch_awaiting_wake.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 026 completed");
+    } else if has_dispatch_id {
+        tracing::debug!("Migration 026 skipped: d_dispatches.dispatch_id already exists");
+    } else {
+        // 拒绝启动会把这类库的用户挡在门外，只能放开启动并说清后果：台账的每条
+        // 查询与写入都带 dispatch_id，缺列的库上一行都读不出来、也写不进去。
+        tracing::warn!(
+            "d_dispatches has both state and task_state; skipping migration 026, so dispatch_id \
+             stays missing: every ledger read and write will fail until that column is added by \
+             hand (ALTER TABLE d_dispatches ADD COLUMN dispatch_id TEXT)"
+        );
+    }
+
     Ok(())
+}
+
+/// 026 被中断在「删旧表」与「改名」之间时，把残表升格回正式表。
+///
+/// 那一步之后的库有两个特征：正式表为空（`schema.sql` 刚建出的空壳，或旧表已被
+/// 删掉），`d_dispatches_new` 装着唯一一份台账。残表已按 026 的新形状建好，故
+/// 升格只需重复 026 尾部的动作，不再搬一次行。
+///
+/// 正式表非空时不猜谁对：两边都留着，把残表名与行数写进日志交给人判断 —— 静默
+/// 删除唯一可能正确的数据，比留一张看得见的残表糟得多。
+async fn recover_interrupted_026(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let Some(leftover_rows) = count_rows_if_table(pool, "d_dispatches_new").await? else {
+        return Ok(());
+    };
+    let live_rows = count_rows_if_table(pool, "d_dispatches")
+        .await?
+        .unwrap_or(0);
+
+    if live_rows > 0 {
+        tracing::warn!(
+            leftover_table = "d_dispatches_new",
+            leftover_rows,
+            live_rows,
+            "d_dispatches_new was left behind by an interrupted 026; the live table already \
+             holds rows, so nothing is merged into it — check by hand before dropping the leftover"
+        );
+        return Ok(());
+    }
+
+    run_sql_file(pool, PROMOTE_LEFTOVER_026).await?;
+    tracing::warn!(
+        leftover_table = "d_dispatches_new",
+        rows = leftover_rows,
+        "migration 026 was interrupted between DROP and RENAME; the leftover table was promoted \
+         back to d_dispatches"
+    );
+    Ok(())
+}
+
+/// 026 尾部的三个动作，与那份 SQL 分开写：残表里已经装好了行，整份重跑只会卡在
+/// 「建表不带 IF NOT EXISTS」那一步。
+const PROMOTE_LEFTOVER_026: &str = "\
+DROP TABLE IF EXISTS d_dispatches;
+ALTER TABLE d_dispatches_new RENAME TO d_dispatches;
+CREATE INDEX IF NOT EXISTS idx_dispatches_wake ON d_dispatches(wake_state, wake_claimed_at);
+CREATE INDEX IF NOT EXISTS idx_dispatches_task_state ON d_dispatches(target_ws_id, task_state)";
+
+/// 表存在时返回它的行数，不存在返回 `None`。
+async fn count_rows_if_table(pool: &SqlitePool, table: &str) -> Result<Option<i64>, sqlx::Error> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await?
+        > 0;
+    if !exists {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM \"{table}\""))
+        .fetch_one(pool)
+        .await
+        .map(Some)
 }
 
 /// 执行一段幂等迁移 SQL（按 `;` 拆分逐条执行，跳过空语句与纯注释）。
@@ -1205,9 +1309,10 @@ mod tests {
         );
     }
 
-    /// `schema.sql` 的全新库形状必须自带 `task_state` / `wake_skip_reason`，
-    /// 且不得在迁移前段落建 `state` 索引：019/020 的列守卫对「`schema.sql` 漏改」
-    /// 是瞎的 —— 漏了也照样能迁移收敛，只是全新库会白跑一次 DDL。
+    /// `schema.sql` 的全新库形状必须自带 `task_state` / `wake_skip_reason` /
+    /// `dispatch_id` 与六档唤醒态，且不得在迁移前段落建 `state` 索引：019/020/026
+    /// 的门控对「`schema.sql` 漏改」都是瞎的 —— 漏了也照样能迁移收敛，只是全新库
+    /// 会白跑一次 DDL，而 026 之后新库还得再重建一遍表。
     #[test]
     fn schema_sql_declares_the_dispatch_state_columns() {
         let schema = include_str!("schema.sql");
@@ -1218,6 +1323,14 @@ mod tests {
         assert!(
             schema.contains("    wake_skip_reason TEXT"),
             "d_dispatches 建表语句必须带 wake_skip_reason 列"
+        );
+        assert!(
+            schema.contains("    dispatch_id     TEXT,"),
+            "d_dispatches 建表语句必须带 dispatch_id 列（新库不靠迁移补）"
+        );
+        assert!(
+            schema.contains("'awaiting','pending','delivering','delivered','skipped','failed'"),
+            "wake_state 的 CHECK 必须含 awaiting"
         );
 
         let (before_migrations, after_migrations) =

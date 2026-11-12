@@ -335,6 +335,7 @@ impl TestEnv {
                 wake_state: WakeState::Pending,
                 wake_skip_reason: None,
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await
@@ -362,6 +363,7 @@ impl TestEnv {
                 wake_state: WakeState::Skipped,
                 wake_skip_reason: Some(WakeSkipReason::NotPecoOrigin),
                 prompt_digest: None,
+                dispatch_id: None,
             },
         )
         .await

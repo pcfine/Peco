@@ -4,8 +4,8 @@
 //! 终态 / 失联翻译成本模块的四个回调。本模块只做两件事：写 `d_dispatches`
 //! 台账，并发一条进程内广播事件（供后续 SSE 使用）。
 //!
-//! 注册那一刻按 [`wake::qualifies`] 决定这行要不要进唤醒队列：来源判据只有
-//! 那一份，这里不再写一遍名单。
+//! 注册那一刻按 [`wake::qualifies`] 决定这行要不要进唤醒队列（进则停在
+//! `awaiting`，终态落库时才转 `pending`）：来源判据只有那一份，这里不再写一遍名单。
 
 use std::sync::{Arc, OnceLock};
 
@@ -30,13 +30,17 @@ const EVENT_BUFFER: usize = 256;
 /// 台账变化通知（供后续 SSE 层消费）。
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskEvent {
-    /// `registered` / `state` / `terminal` / `orphaned`。
+    /// `registered` / `state` / `terminal` / `orphaned` / `wake_turn_done`。
     pub kind: &'static str,
+    /// `wake_turn_done` 是空串：那类事件没有台账行。
     pub task_id: String,
     /// 仅在 `registered` 时能直接确定；其余事件从台账查询。
     pub target_ws_id: Option<String>,
     pub state: String,
     pub dispatch_id: Option<String>,
+    /// 只有 `wake_turn_done` 有值：它说的是「某个会话里多了一条消息」，
+    /// 订阅方据此判定该刷新消息，不去查台账。
+    pub conversation_id: Option<String>,
 }
 
 /// `d_dispatches` 的写入端 + 进程内广播。
@@ -103,10 +107,26 @@ impl TaskObserver {
             );
         };
         if wake::qualifies(&obs.origin.ws_id, &obs.origin_kind, peco) {
-            (WakeState::Pending, None)
+            // 注册时任务还没跑完：此刻没有可投的内容，终态落库时才入队。
+            (WakeState::Awaiting, None)
         } else {
             (WakeState::Skipped, Some(WakeSkipReason::NotPecoOrigin))
         }
+    }
+
+    /// 唤醒轮跑完了：让前端知道 `conversation_id` 里多了一条新消息。
+    ///
+    /// 与台账无关 —— 唤醒轮本身不产生台账行，故 `task_id` 留空串。订阅方据
+    /// `conversation_id` 判定「该刷新消息」，不拿它去查台账。
+    pub fn notify_wake_turn(&self, ws_id: &str, conversation_id: &str) {
+        self.emit(TaskEvent {
+            kind: "wake_turn_done",
+            task_id: String::new(),
+            target_ws_id: Some(ws_id.to_string()),
+            state: String::new(),
+            dispatch_id: None,
+            conversation_id: Some(conversation_id.to_string()),
+        });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TaskEvent> {
@@ -157,6 +177,7 @@ impl TaskObservationSink for TaskObserver {
                 wake_state,
                 wake_skip_reason,
                 prompt_digest: obs.prompt_digest.as_deref(),
+                dispatch_id: obs.dispatch_id.as_deref(),
             },
         )
         .await;
@@ -167,6 +188,7 @@ impl TaskObservationSink for TaskObserver {
                 target_ws_id: Some(row.id),
                 state: state.to_string(),
                 dispatch_id: obs.dispatch_id.clone(),
+                conversation_id: None,
             }),
             Err(e) => warn!(task_id = %obs.task_id, error = %e, "dispatch ledger insert failed"),
         }
@@ -188,6 +210,7 @@ impl TaskObservationSink for TaskObserver {
                 target_ws_id: None,
                 state: state_text.to_string(),
                 dispatch_id: obs.dispatch_id.clone(),
+                conversation_id: None,
             }),
             Err(e) => {
                 warn!(task_id = %obs.task_id, error = %e, "dispatch ledger state update failed")
@@ -213,6 +236,7 @@ impl TaskObservationSink for TaskObserver {
                     target_ws_id: None,
                     state: state.to_string(),
                     dispatch_id: obs.dispatch_id.clone(),
+                    conversation_id: None,
                 });
                 // 无条件叫醒：这一行该不该投、能不能投，由判据与 `claim` 的条件
                 // 更新决定；在这里先猜一遍等于多出第二份判据。重放是幂等的。
@@ -232,6 +256,7 @@ impl TaskObservationSink for TaskObserver {
                     target_ws_id: None,
                     state: "orphan".to_string(),
                     dispatch_id: obs.dispatch_id.clone(),
+                    conversation_id: None,
                 });
             }
             Err(e) => {

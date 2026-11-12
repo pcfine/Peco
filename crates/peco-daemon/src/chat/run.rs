@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::sse::Event as SseEvent;
-use model_provider::{Content, text_of_blocks};
+use model_provider::{Content, Usage, text_of_blocks};
 use peco_core::agent::{AgentLooper, LooperEvent, LooperState, ResponseOrigin};
 use peco_core::session::Session;
 use peco_core::session::SessionPersister;
@@ -65,6 +65,24 @@ impl RunSink {
 
     fn is_headless(&self) -> bool {
         matches!(self, Self::Headless)
+    }
+}
+
+/// 唤醒轮结束的信号：Drop 即广播一条 `wake_turn_done`。
+///
+/// 挂在 Drop 上而不是在循环末尾写一句调用：早退（查询送不进去、控制通道关闭、
+/// 看门狗到点）与 panic 展开都会跳过末尾语句，而「前端不刷新就看不到这一轮」
+/// 恰恰要在这些路径上也成立。
+struct WakeTurnSignal {
+    tasks: Arc<crate::space::tasks::TaskObserver>,
+    ws_id: String,
+    conversation_id: String,
+}
+
+impl Drop for WakeTurnSignal {
+    fn drop(&mut self) {
+        self.tasks
+            .notify_wake_turn(&self.ws_id, &self.conversation_id);
     }
 }
 
@@ -125,6 +143,36 @@ fn backfill_assistant_text(
         return;
     }
     assistant_text.push_str(text);
+}
+
+/// 记下本轮的 token 用量 —— `TurnComplete` 是它唯一出现的载荷。
+///
+/// 走到 Idle 时本轮会话已不可读（`total_usage()` 随之不可再取），而结束帧要带的
+/// 用量只能是这一轮的量，故在事件扫过来时当场留下。
+fn remember_turn_usage(last_usage: &mut Usage, event: &LooperEvent) {
+    if let LooperEvent::TurnComplete { usage, .. } = event {
+        *last_usage = usage.clone();
+    }
+}
+
+/// 一轮收尾要下发的 SSE 事件序列：先那条状态迁移，再结束帧。
+///
+/// `done` 是「流结束」的唯一信号 —— 少了它，客户端只能把每次正常收尾当成意外
+/// 断流，进而去重取。用量来自本轮的 `TurnComplete.usage`（即
+/// `session.total_usage()`），与 `Shutdown.total_usage` 同源。
+fn turn_end_events(
+    state_change: LooperEvent,
+    last_usage: Usage,
+    conversation_id: &str,
+) -> Vec<ChatSseEvent> {
+    let mut events: Vec<ChatSseEvent> = map_looper_event(state_change, conversation_id)
+        .into_iter()
+        .collect();
+    events.push(ChatSseEvent::Done {
+        usage: last_usage.into(),
+        conversation_id: conversation_id.to_string(),
+    });
+    events
 }
 
 /// 跑一轮：把 `message` / `content` 交给会话的 looper，事件经 `sink` 出去，
@@ -236,6 +284,9 @@ pub(crate) async fn spawn_run(
     );
 
     let db_for_bg = deps.pool.clone();
+    // 唤醒轮没有客户端，只能靠广播告诉前端「这个会话里多了一条消息」。
+    let tasks_for_bg = Arc::clone(&deps.env.tasks);
+    let ws_id_for_bg = ws_id.to_string();
     let conv_id_for_bg = conv_id.clone();
     let message_for_bg = message.clone();
     let message_content_for_bg = content;
@@ -246,6 +297,13 @@ pub(crate) async fn spawn_run(
     tokio::spawn(async move {
         // 持有至任务结束：守卫 drop 才移除注册表条目（见 `chat::active`）。
         let _run_guard = guard;
+
+        // 只有无客户端的一轮需要这条信号：SSE 侧的前端已经在看事件流。
+        let _wake_turn_signal = sink.is_headless().then(|| WakeTurnSignal {
+            tasks: tasks_for_bg,
+            ws_id: ws_id_for_bg,
+            conversation_id: conv_id_for_bg.clone(),
+        });
 
         let persister: Arc<dyn SessionPersister> =
             Arc::new(SqliteSessionPersister::new(db_for_bg.clone()));
@@ -289,6 +347,8 @@ pub(crate) async fn spawn_run(
         let mut assistant_text = String::new();
         // 流式轮是否真的收到过增量：决定 TurnComplete 的兜底能否追加整段文本。
         let mut saw_text_delta = false;
+        // 最近一轮的用量：轮末的结束帧只能用它（见 `remember_turn_usage`）。
+        let mut last_usage = Usage::default();
         let mut sub_agent_registry: HashMap<String, Vec<SubAgentInfo>> = HashMap::new();
         // is_first_turn is captured from the outer scope — based on session
         // snapshot committed_turns, NOT reset per SSE connection.
@@ -457,6 +517,7 @@ pub(crate) async fn spawn_run(
                     // batch 轮文本只来自可丢弃的 `ModelOutput(Batch)`：慢客户端
                     // 把通道塞满时事件会被丢掉。TurnComplete 必达，用它兜底，
                     // 否则成功轮会写不出 assistant 行。
+                    remember_turn_usage(&mut last_usage, &event);
                     if let LooperEvent::TurnComplete { outcome, .. } = &event {
                         backfill_assistant_text(
                             &mut assistant_text,
@@ -576,13 +637,30 @@ pub(crate) async fn spawn_run(
                     }
                 }
 
-                // 唤醒投递的一轮结束在 Idle：没人会关连接，不在这里退出就会一直
-                // 挂在空闲态等一个不会到来的查询。`set()` 对同态迁移是 no-op，
-                // 收到 Idle 即意味着这一轮真的停了。
-                Some(LooperEvent::StateChange {
+                // 一轮结束在 Idle，两种 sink 都退出：一轮一条流，注册条目随任务
+                // drop，于是「忙」等于「这一轮真的在跑」，而不是「连接还开着」。
+                // `set()` 对同态迁移是 no-op，收到 Idle 即意味着这一轮真的停了。
+                //
+                // SSE 也要把这一轮的事件发完再退：状态迁移承载「迁出暂停态」，
+                // 少了它一轮结束后前端会停在「暂停中」；`done` 是「流结束」的
+                // 唯一信号，少了它前端会把每次正常收尾当成意外断流。两者顺序
+                // 固定 —— 先状态、后结束帧。
+                //
+                // headless 没有人接收，一条都不发。
+                Some(event @ LooperEvent::StateChange {
                     to: LooperState::Idle,
                     ..
-                }) if sink.is_headless() => break,
+                }) => {
+                    if !sink.is_headless() {
+                        for sse_ev in turn_end_events(event, last_usage, &conv_id_for_bg) {
+                            if let Ok(ev) = sse_ev.to_sse_event() {
+                                // 客户端已断时发送失败无关紧要：无论如何都要退出。
+                                let _ = sink.send(ev).await;
+                            }
+                        }
+                    }
+                    break;
+                }
 
                 Some(event) => {
                     if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg)
@@ -657,6 +735,8 @@ pub(crate) async fn spawn_run(
 mod tests {
     use std::time::Duration;
 
+    use peco_core::agent::TurnOutcome;
+
     use super::*;
 
     #[test]
@@ -693,6 +773,84 @@ mod tests {
         let mut acc = String::new();
         backfill_assistant_text(&mut acc, false, None);
         assert!(acc.is_empty());
+    }
+
+    /// 一轮收尾非 headless 时必须紧跟一条 `done`，用量取自本轮 `TurnComplete`。
+    ///
+    /// 端到端跑不了：事件循环体在 `spawn_run` 的 `tokio::spawn` 里，装配它要真实
+    /// DB、已打开的空间与带 provider 的 Agent（会真的调模型），crate 内单测构造
+    /// 不出来。断言因此落在收尾序列与用量记忆这两段真实生产代码上。
+    ///
+    /// 变异方法：结束帧漏发 → 序列只剩 `looper_state`；用量取 `Usage::default()`
+    /// 而非 `TurnComplete` 的值 → 用量断言变红。
+    #[test]
+    fn idle_exit_emits_done_carrying_the_turn_usage() {
+        let turn_usage = Usage {
+            input_tokens: 120,
+            output_tokens: 34,
+            total_tokens: 154,
+        };
+        let mut last_usage = Usage::default();
+        remember_turn_usage(
+            &mut last_usage,
+            &LooperEvent::TurnComplete {
+                turn_index: 2,
+                outcome: TurnOutcome::Success {
+                    text: "好了".to_string(),
+                },
+                usage: turn_usage.clone(),
+            },
+        );
+        assert_eq!(last_usage, turn_usage, "TurnComplete 的用量必须被记住");
+
+        let events = turn_end_events(
+            LooperEvent::StateChange {
+                from: LooperState::PausedDuringTools,
+                to: LooperState::Idle,
+            },
+            last_usage,
+            "conv-1",
+        );
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(ChatSseEvent::LooperState {
+                    paused: false,
+                    conversation_id,
+                }) if conversation_id == "conv-1"
+            ),
+            "迁出暂停态的状态事件在前，实际 {events:?}"
+        );
+        let Some(ChatSseEvent::Done {
+            usage,
+            conversation_id,
+        }) = events.get(1)
+        else {
+            panic!("`done` 必须紧跟状态事件，且是最后一条，实际 {events:?}");
+        };
+        assert_eq!(events.len(), 2, "收尾只有这两条，实际 {events:?}");
+        assert_eq!(usage.input_tokens, turn_usage.input_tokens);
+        assert_eq!(usage.output_tokens, turn_usage.output_tokens);
+        assert_eq!(conversation_id, "conv-1");
+    }
+
+    /// 未跨暂停态的 Idle 没有状态事件可发，但 `done` 照发 —— 否则最常见的
+    /// 「一轮跑完正常退出」反而收不到结束帧。
+    #[test]
+    fn idle_exit_without_pause_transition_still_emits_done() {
+        let events = turn_end_events(
+            LooperEvent::StateChange {
+                from: LooperState::PreparingRequest,
+                to: LooperState::Idle,
+            },
+            Usage::default(),
+            "conv-1",
+        );
+        assert!(
+            matches!(events.as_slice(), [ChatSseEvent::Done { .. }]),
+            "实际 {events:?}"
+        );
     }
 
     /// 看门狗必须明显长于台账的认领超时：反过来的话，一条还在正常跑的长回答会

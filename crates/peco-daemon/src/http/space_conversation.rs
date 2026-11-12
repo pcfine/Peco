@@ -1,7 +1,8 @@
 //! 空间单会话的生命周期：`/conversation/ensure` 惰性创建，`/conversation/clear` 清空消息。
 //!
-//! 前端点击空间时才 ensure：dispatch 与唤醒会顺带打开空间，但那些路径不该
-//! 在用户没进聊天页时留下会话行。
+//! 前端点击空间时会 ensure 一次；而唤醒投递的目标正是这条会话，所以它也会在
+//! 用户还没进聊天页时被 `wake::deliver` 幂等地建出来 —— 消息必须落在他打开空间
+//! 后看到的那段历史里，另开会话等于把唤醒藏进一个没人打开的会话。
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, State};

@@ -245,8 +245,8 @@ async fn non_peco_origins_never_enter_the_wake_queue() {
         env.task_and_wake_state(&target_ws_id, &own.to_string())
             .await
             .1,
-        "pending",
-        "Peco 自己派出去的任务要进队列"
+        "awaiting",
+        "Peco 自己派出去的任务要进队列（注册那一刻只是登记，终态才入队）"
     );
     assert_eq!(
         env.wake_skip_reason(&target_ws_id, &own.to_string()).await,
@@ -267,6 +267,13 @@ async fn non_peco_origins_never_enter_the_wake_queue() {
         Some("not_peco_origin"),
         "另一个空间的来源要标成 not_peco_origin"
     );
+    // 判据本身不产生队列项：入队发生在终态。两条都跑到终态，队列里才该只剩
+    // `own` 那一行 —— 只看注册期的 wake_state 断不出「投递侧看不到别的行」。
+    for task in [&own, &foreign] {
+        dispatches::finish(&env.pool, &task.to_string(), "completed", None)
+            .await
+            .unwrap();
+    }
     let pending = dispatches::list_pending(&env.pool, wake::MAX_BATCH, wake::RETRY_BACKOFF)
         .await
         .unwrap();

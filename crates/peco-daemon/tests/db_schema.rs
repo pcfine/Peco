@@ -441,6 +441,24 @@ async fn index_exists(pool: &sqlx::SqlitePool, name: &str) -> bool {
         > 0
 }
 
+async fn table_exists(pool: &sqlx::SqlitePool, name: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+        > 0
+}
+
+async fn row_count(pool: &sqlx::SqlitePool, table: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM \"{table}\""))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 /// daemon 启动对旧库跑一遍 019/020：列改名不丢行，历史 `skipped` 行留空原因，
 /// 旧名索引换成新名索引（`RENAME COLUMN` 只改定义不改名字）。
 #[tokio::test]
@@ -645,4 +663,225 @@ async fn migration_022_adds_the_prompt_digest_column_and_is_reentrant() {
     // 再跑一次：列门控命中，形状不变（ALTER 本身不可重入）。
     peco_daemon::db::run_migrations(&pool).await.unwrap();
     assert_eq!(column_names(&pool).await, columns);
+}
+
+/// 造一张 026 之前的 `d_dispatches`：唤醒态五档、没有 `dispatch_id`。
+///
+/// 行覆盖「已投递」「已跳过（带原因）」「还在等终态」三种唤醒态 —— 重建表的搬行
+/// 语句要么把它们原样搬过去，要么就会在这三条断言上显形。
+async fn pre_026_dispatch_ledger(pool: &sqlx::SqlitePool) {
+    for statement in [
+        "CREATE TABLE d_dispatches (\
+           id TEXT PRIMARY KEY, task_id TEXT NOT NULL, target_ws_id TEXT NOT NULL, \
+           target_work_dir TEXT NOT NULL, target_team_id TEXT NOT NULL, \
+           origin_ws_id TEXT NOT NULL, agent_name TEXT NOT NULL, origin_kind TEXT NOT NULL, \
+           task_state TEXT NOT NULL, wake_state TEXT NOT NULL DEFAULT 'pending' \
+             CHECK (wake_state IN ('pending','delivering','delivered','skipped','failed')), \
+           wake_skip_reason TEXT, wake_attempts INTEGER NOT NULL DEFAULT 0, \
+           wake_claimed_at TEXT, delivered_at TEXT, result_digest TEXT, prompt_digest TEXT, \
+           created_at TEXT NOT NULL DEFAULT (datetime('now')), terminal_at TEXT, \
+           UNIQUE (target_ws_id, task_id))",
+        "CREATE INDEX idx_dispatches_wake ON d_dispatches(wake_state, wake_claimed_at)",
+        "CREATE INDEX idx_dispatches_task_state ON d_dispatches(target_ws_id, task_state)",
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+           target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state, \
+           delivered_at, result_digest) \
+         VALUES ('d1', 't1', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+           'run_machine_task', 'completed', 'delivered', datetime('now'), '重构完成')",
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+           target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state, \
+           wake_skip_reason) \
+         VALUES ('d2', 't2', 'ws_a', '/tmp/a', 'research', 'ws_own', '@master', \
+           'run_machine_task', 'working', 'skipped', 'not_peco_origin')",
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+           target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state) \
+         VALUES ('d3', 't3', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+           'run_machine_task', 'working', 'pending')",
+    ] {
+        sqlx::raw_sql(statement).execute(pool).await.unwrap();
+    }
+}
+
+/// 旧库（026 之前）升级：已有行、唤醒态与跳过原因原样保留，`dispatch_id` 为
+/// NULL，重建出的表收 `awaiting`。
+///
+/// 变异：搬行时漏列 / 搬错列 ⇒ 行的三列断言红；新建表照抄旧 CHECK ⇒ 写
+/// `awaiting` 那步报 constraint failed；门控写成「总是执行」⇒ 第二次
+/// `run_migrations` 把刚写进去的 `delivered` 行搬丢，最后的形状断言红。
+#[tokio::test]
+async fn migration_026_rebuilds_the_ledger_and_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/pre026.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    pre_026_dispatch_ledger(&pool).await;
+    assert!(
+        !column_names(&pool)
+            .await
+            .contains(&"dispatch_id".to_string()),
+        "夹具需要一份缺 dispatch_id 的库"
+    );
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    let columns = column_names(&pool).await;
+    assert!(
+        columns.contains(&"dispatch_id".to_string()),
+        "026 必须给旧库补出 dispatch_id：{columns:?}"
+    );
+
+    let rows = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
+        "SELECT id, task_state, wake_state, wake_skip_reason, dispatch_id \
+         FROM d_dispatches ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "d1".to_string(),
+                "completed".to_string(),
+                "delivered".to_string(),
+                None,
+                None
+            ),
+            (
+                "d2".to_string(),
+                "working".to_string(),
+                "skipped".to_string(),
+                Some("not_peco_origin".to_string()),
+                None
+            ),
+            (
+                "d3".to_string(),
+                "working".to_string(),
+                "pending".to_string(),
+                None,
+                None
+            ),
+        ],
+        "搬行不得改值，dispatch_id 无旧值可搬一律 NULL"
+    );
+    let delivered_at: Option<String> =
+        sqlx::query_scalar("SELECT delivered_at FROM d_dispatches WHERE id = 'd1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(delivered_at.is_some(), "搬行不得丢送达时间戳");
+
+    // 新 CHECK 收 awaiting：迁移后旧库也该能写这一态。
+    sqlx::query("UPDATE d_dispatches SET wake_state = 'awaiting' WHERE id = 'd3'")
+        .execute(&pool)
+        .await
+        .expect("026 之后 wake_state 必须收 awaiting");
+
+    // 重建出的表必须仍带 `UNIQUE (target_ws_id, task_id)`：台账的幂等写入靠
+    // `ON CONFLICT(target_ws_id, task_id) DO NOTHING` 吃掉重复行，约束一丢，
+    // 这条 INSERT 自己就会报 no matching constraint（或落下第二行）。
+    let duplicate = sqlx::query(
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, target_team_id, \
+         origin_ws_id, agent_name, origin_kind, task_state) \
+         VALUES ('d4', 't1', 'ws_a', '/tmp/a', 'research', 'ws_peco', '@master', \
+         'run_machine_task', 'completed') \
+         ON CONFLICT(target_ws_id, task_id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("026 重建后的表必须满足 ON CONFLICT(target_ws_id, task_id)");
+    assert_eq!(
+        duplicate.rows_affected(),
+        0,
+        "同一 (target_ws_id, task_id) 的重复行必须被 DO NOTHING 吃掉"
+    );
+
+    assert!(index_exists(&pool, "idx_dispatches_wake").await);
+    assert!(index_exists(&pool, "idx_dispatches_task_state").await);
+
+    // 再跑一次：门控命中，形状与数据都不变。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_eq!(column_names(&pool).await, columns);
+    let still_awaiting: String =
+        sqlx::query_scalar("SELECT wake_state FROM d_dispatches WHERE id = 'd3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_awaiting, "awaiting", "重跑迁移不得重建表");
+}
+
+/// 把库复现成「026 崩在删旧表与改名之间」的现场：残表装着唯一一份台账，正式表没了。
+///
+/// 直接跑 026 文件里逐条语句、跑到 `DROP TABLE d_dispatches` 就停 —— 崩点与生产
+/// 逐条执行的顺序同源，夹具不会随 SQL 改动而漂移。
+async fn crash_026_between_drop_and_rename(pool: &sqlx::SqlitePool) {
+    let sql = include_str!("../src/db/migrations/026_dispatch_awaiting_wake.sql");
+    for statement in sql.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty()
+            || statement
+                .lines()
+                .all(|line| line.trim().is_empty() || line.trim().starts_with("--"))
+        {
+            continue;
+        }
+        sqlx::raw_sql(statement).execute(pool).await.unwrap();
+        if statement.starts_with("DROP TABLE d_dispatches") {
+            return;
+        }
+    }
+    panic!("026 的 SQL 里必须有一条 DROP TABLE d_dispatches");
+}
+
+/// 崩在「删旧表」与「改名」之间：重启后残表必须升格回正式表，而不是被
+/// `schema.sql` 先建出的空壳和 026 的门控一起埋掉。
+///
+/// 变异：删掉 `run_versioned_migrations` 里的 `recover_interrupted_026` ⇒ 门控
+/// 看到空壳表的 `dispatch_id` 就跳过 026，行数断言读到 0 行、`d_dispatches_new`
+/// 也还在，三条断言同时变红。
+#[tokio::test]
+async fn migration_026_promotes_the_leftover_table_when_the_rename_was_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/crash026.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    pre_026_dispatch_ledger(&pool).await;
+    crash_026_between_drop_and_rename(&pool).await;
+    assert!(
+        !table_exists(&pool, "d_dispatches").await,
+        "崩点之后正式表不该还在"
+    );
+    assert_eq!(
+        row_count(&pool, "d_dispatches_new").await,
+        3,
+        "夹具要让残表装着唯一一份台账"
+    );
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    assert_eq!(
+        row_count(&pool, "d_dispatches").await,
+        3,
+        "残表里的行必须被提升为正式表的内容"
+    );
+    assert!(
+        !table_exists(&pool, "d_dispatches_new").await,
+        "升格之后残表名不该还在"
+    );
+    assert!(
+        column_names(&pool)
+            .await
+            .contains(&"dispatch_id".to_string()),
+        "升格来的表已是 026 的新形状"
+    );
+    assert!(index_exists(&pool, "idx_dispatches_wake").await);
+    assert!(index_exists(&pool, "idx_dispatches_task_state").await);
+
+    // 升格来的表收 `awaiting`：形状与 026 建出来的表一致。
+    sqlx::query("UPDATE d_dispatches SET wake_state = 'awaiting' WHERE id = 'd3'")
+        .execute(&pool)
+        .await
+        .expect("026 的 CHECK 必须随残表一起被提升");
+
+    // 门控这次仍要收敛到「不再动表」：重跑一遍不多不少。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_eq!(row_count(&pool, "d_dispatches").await, 3);
 }

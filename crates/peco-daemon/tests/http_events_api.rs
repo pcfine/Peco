@@ -143,9 +143,16 @@ async fn a_ledger_event_reaches_an_open_connection() {
     assert_eq!(payload["task_state"], json!("working"));
     assert_eq!(
         payload["wake_state"],
-        json!("pending"),
-        "发起方是 Peco 空间，这一行要进唤醒队列"
+        json!("awaiting"),
+        "发起方是 Peco 空间，这一行要进唤醒队列 —— 但任务是注册那一刻，还没到终态"
     );
+    assert_eq!(
+        payload["kind"],
+        json!("registered"),
+        "载荷要带上是哪一刻，前端据此区分事件种类"
+    );
+    assert_eq!(payload["dispatch_id"], json!("disp-1"));
+    assert_eq!(payload["conversation_id"], json!(null));
     assert_eq!(payload["wake_skip_reason"], json!(null));
     assert_eq!(payload["origin_kind"], json!("dispatch_to_workspace"));
     assert!(payload["created_at"].is_string());
@@ -158,6 +165,51 @@ async fn a_ledger_event_reaches_an_open_connection() {
     // 断开后再发一条：没有订阅者时广播 `send` 失败，属正常路径，不得 panic。
     sink.on_registered(&obs, &snapshot(task, TaskState::Working))
         .await;
+    drop(router);
+}
+
+/// 唤醒轮结束的事件不查台账：它的 `task_id` 是空串，台账里没有对应行 ——
+/// 照旧查台账的实现在这里连一条事件都发不出来。
+///
+/// 变异：`stream` 里去掉 `conversation_id.is_some()` 那条分支 ⇒ 本用例超时变红。
+#[tokio::test]
+async fn a_wake_turn_event_is_built_from_the_event_itself() {
+    let env = new_env(&[]).await;
+    let router = env.router();
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/events")
+        .body(Body::empty())
+        .unwrap();
+    let response = tower::ServiceExt::oneshot(router.clone(), request)
+        .await
+        .expect("路由不会失败");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // `oneshot` 已经把 handler 跑到返回响应，订阅在那一刻就发生了；广播带缓冲，
+    // 读线程晚一步起来也不会漏。
+    let body = response.into_body();
+    let reader = tokio::spawn(async move { read_until(body, "wake_turn_done").await });
+    env.tasks.notify_wake_turn("ws_peco", "conv-1");
+
+    let wire = timeout(Duration::from_secs(30), reader)
+        .await
+        .expect("读线程不得挂死")
+        .expect("读线程不得 panic");
+    let data = wire
+        .lines()
+        .find(|line| line.starts_with("data: "))
+        .expect("必须有 data 行")
+        .trim_start_matches("data: ");
+    let payload: serde_json::Value = serde_json::from_str(data).expect("data 必须是 JSON");
+
+    assert_eq!(payload["kind"], json!("wake_turn_done"));
+    assert_eq!(payload["conversation_id"], json!("conv-1"));
+    assert_eq!(payload["ws_id"], json!("ws_peco"));
+    assert_eq!(payload["task_id"], json!(""), "唤醒轮没有台账行");
+    assert_eq!(payload["task_state"], json!(""), "任务态字段留空串");
+    assert_eq!(payload["wake_state"], json!(""));
+    assert_eq!(payload["terminal_at"], json!(null));
     drop(router);
 }
 

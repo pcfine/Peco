@@ -38,6 +38,9 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 /// 任务态与唤醒态是两套独立状态：一条任务可以已经 `completed`，而唤醒仍是
 /// `pending`（还没叫醒 Peco）。`wake_skip_reason` 只在 `wake_state='skipped'`
 /// 时给值，让「为什么没叫醒」不再需要翻库或看日志。
+///
+/// 唤醒态六档：`awaiting` 表示任务刚注册、还没到终态，此刻没有可投的内容，
+/// 终态落库时才转 `pending`；`delivering` 是投递方已认领、正在送。
 #[derive(Debug, Serialize)]
 pub struct TaskView {
     pub id: String,
@@ -56,6 +59,8 @@ pub struct TaskView {
     pub result_digest: Option<String>,
     /// 派发入参里那段任务描述的前 512 字；旧行是 `null`（当时没有记录）。
     pub prompt_digest: Option<String>,
+    /// 派发回执里的 dispatch_id；旧行是 `null`（当时没有记录）。
+    pub dispatch_id: Option<String>,
 }
 
 impl From<DispatchRow> for TaskView {
@@ -76,6 +81,7 @@ impl From<DispatchRow> for TaskView {
             terminal_at: row.terminal_at,
             result_digest: row.result_digest,
             prompt_digest: row.prompt_digest,
+            dispatch_id: row.dispatch_id,
         }
     }
 }

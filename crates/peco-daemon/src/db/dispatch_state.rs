@@ -3,9 +3,11 @@
 //! 放在 `db` 下自成一叶：`db` 是被唤醒侧依赖的一层，反向依赖会让台账 DAO 必须
 //! 知道唤醒策略。字符串与 DB 的 CHECK 约束一一对应，改动只在这一处落笔。
 
-/// 唤醒投递的五态；与 `d_dispatches.wake_state` 的 CHECK 同集合。
+/// 唤醒投递的六态；与 `d_dispatches.wake_state` 的 CHECK 同集合。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeState {
+    /// 任务还没到终态：此刻没有可投的内容，终态时转 `Pending`。
+    Awaiting,
     Pending,
     Delivering,
     /// 已交给运行器，不代表这一轮已经处理完。
@@ -15,7 +17,8 @@ pub enum WakeState {
 }
 
 impl WakeState {
-    pub const ALL: [WakeState; 5] = [
+    pub const ALL: [WakeState; 6] = [
+        WakeState::Awaiting,
         WakeState::Pending,
         WakeState::Delivering,
         WakeState::Delivered,
@@ -25,6 +28,7 @@ impl WakeState {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            WakeState::Awaiting => "awaiting",
             WakeState::Pending => "pending",
             WakeState::Delivering => "delivering",
             WakeState::Delivered => "delivered",
@@ -46,7 +50,8 @@ pub enum WakeSkipReason {
     NotPecoOrigin,
     /// 观察者还没拿到 Peco 身份（装配异常），宁可不叫醒。
     PecoIdentityMissing,
-    /// 运行期观察失联，结果再也查不到。
+    /// 历史行里的运行期失联成因。失联的行改为进待投递队列（Peco 要收到一条
+    /// orphan 文案），故新写入不再产生该值。
     Orphaned,
     /// 目标空间被关闭，唤醒只会拿到「任务不存在」。
     SpaceClosed,

@@ -236,7 +236,7 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
                     CHECK (origin_kind IN ('run_machine_task','dispatch_to_workspace')),
     task_state      TEXT NOT NULL,
     wake_state      TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (wake_state IN ('pending','delivering','delivered','skipped','failed')),
+                    CHECK (wake_state IN ('awaiting','pending','delivering','delivered','skipped','failed')),
     -- 仅 wake_state='skipped' 时非空；历史行留 NULL（成因不可考）
     wake_skip_reason TEXT
                     CHECK (wake_skip_reason IS NULL OR wake_skip_reason IN (
@@ -249,6 +249,8 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
     result_digest   TEXT,
     -- 派发工具入参 prompt 的前 512 字；旧行留 NULL（未记录）
     prompt_digest   TEXT,
+    -- 派发回执里的 dispatch_id；旧行留 NULL（当时没有记录）
+    dispatch_id     TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     terminal_at     TEXT,
     UNIQUE (target_ws_id, task_id)

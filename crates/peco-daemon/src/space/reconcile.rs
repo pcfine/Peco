@@ -128,8 +128,8 @@ async fn reconcile_row(state: &AppState, row: &DispatchRow) -> Outcome {
 }
 
 async fn orphan(state: &AppState, row: &DispatchRow, reason: &str) -> Outcome {
-    // 重启对账的孤儿行保留 `wake_state`：它还没被通知过，正是要告诉 Peco
-    // 「你派出去的那条断了」的那一类（运行期失联才该停掉唤醒）。
+    // 重启对账的孤儿行保留 `wake_state`，`awaiting` 的那一批转成 `pending`：它们
+    // 从没被通知过，正是要告诉 Peco「你派出去的那条断了」的那一类。
     match dispatches::orphan_by_task_on_restart(&state.pool, &row.task_id).await {
         Ok(_) => {
             warn!(

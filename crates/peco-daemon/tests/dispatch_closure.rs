@@ -612,6 +612,7 @@ async fn insert_row(
             wake_state: WakeState::Pending,
             wake_skip_reason: None,
             prompt_digest: None,
+            dispatch_id: None,
         },
     )
     .await

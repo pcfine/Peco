@@ -9,19 +9,25 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::http::{Method, Request};
 use chrono::Utc;
+use futures::StreamExt;
 use peco_core::agent::hooks::{DispatchObservation, DispatchOrigin, TaskObservationSink};
 use peco_core::machine::{OutputView, Progress, TaskId, TaskSnapshot, TaskSource, TaskState};
 use peco_daemon::chat::ChatActiveRuns;
 use peco_daemon::db::dispatches;
 use peco_daemon::space::peco::PecoIdentity;
 use peco_daemon::space::tasks::TaskObserver;
+use peco_daemon::state::AppState;
 use peco_daemon::wake::deliver::PecoDelivery;
 use peco_daemon::wake::pump::WakePump;
 use peco_daemon::wake::{RETRY_BACKOFF, TICK};
 use serde_json::{Value, json};
 use support::upstream::{FakeUpstream, Reply, has_tool_result};
 use support::{TestEnv, fixture, install_team, new_env};
+use tokio::time::timeout;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 /// 唤醒轮的等待上限。
@@ -29,6 +35,9 @@ use uuid::Uuid;
 /// 必须小于 [`TICK`]：否则「通知没发出去」会被定时 tick 悄悄兜住，用例在
 /// 接线断掉时照样绿。
 const WAKE_DEADLINE: Duration = Duration::from_secs(4);
+
+/// 一轮 SSE 对话的等待上限：够一次假上游往返，卡住就说明流根本没打算收尾。
+const STREAM_DEADLINE: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // 夹具
@@ -136,6 +145,14 @@ fn completed_snapshot(task_id: TaskId) -> TaskSnapshot {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         last_seq: 0,
+    }
+}
+
+/// 注册那一刻的快照：任务刚提交，还没有终态也没有摘要。
+fn working_snapshot(task_id: TaskId) -> TaskSnapshot {
+    TaskSnapshot {
+        state: TaskState::Working,
+        ..completed_snapshot(task_id)
     }
 }
 
@@ -309,6 +326,53 @@ async fn w1_a_finished_task_wakes_peco_and_runs_a_real_turn() {
 }
 
 // ============================================================================
+// A1：注册不唤醒，终态才唤醒
+// ============================================================================
+
+/// 注册那一刻只登记 `awaiting`，一条消息都不该投出去；终态落库后才入队，投出
+/// 去的那条要带终态摘要。
+///
+/// 变异：`space/tasks.rs::on_registered` 写回 `pending` ⇒ 注册后的第一次 tick
+/// 就把一条 `state=working` 的唤醒投出去（`message_count` 由 0 变 1），第二条
+/// 断言红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registering_alone_never_wakes_and_the_terminal_state_does() {
+    let env = new_env(&[]).await;
+    let upstream = FakeUpstream::start(text_reply("收到，我去核对这条任务")).await;
+    let ws_id = open_peco_space(&env, &upstream).await;
+    let peco = peco_identity(&env, &ws_id).await;
+    let (pump, _chat_runs) = wired_pump(&env, peco.clone());
+    let tasks = wired_observer(&env, &pump, &peco);
+
+    let task_id = TaskId(Uuid::new_v4());
+    let mut obs = observation(task_id, &ws_id);
+    // 注册要落台账，观察的目标目录必须是真实空间目录。
+    obs.target_dir = env.work_dir_of(&ws_id).await;
+    tasks.on_registered(&obs, &working_snapshot(task_id)).await;
+
+    assert_eq!(
+        ledger_row(&env, &task_id.to_string()).await.wake_state,
+        "awaiting",
+        "注册时没有可投的内容"
+    );
+    pump.tick().await;
+    assert_eq!(message_count(&env).await, 0, "注册不得投出任何唤醒");
+    assert!(upstream.exchanges().is_empty(), "注册时连模型都不该被问到");
+
+    tasks.on_terminal(&obs, &completed_snapshot(task_id)).await;
+    pump.tick().await;
+
+    let user = wait_for_message(&env, "user").await;
+    assert!(user.starts_with("[peco-wake]"), "{user}");
+    assert!(
+        user.contains(&task_id.to_string()),
+        "唤醒要带完整 task_id，Peco 才能回台账复核：{user}"
+    );
+    let row = wait_for_delivered(&env, &task_id.to_string()).await;
+    assert!(row.delivered_at.is_some(), "送达必须留时间戳：{row:?}");
+}
+
+// ============================================================================
 // W14：无客户端的一轮忽略 Pause，且不写会话标题
 // ============================================================================
 
@@ -370,8 +434,8 @@ async fn w14_a_headless_run_ignores_pause_and_still_finishes() {
         .await
         .unwrap();
     assert_eq!(
-        title, "后台任务",
-        "唤醒轮没有用户，不得把标题改写成 [peco-wake] 开头"
+        title, "空间对话",
+        "唤醒轮没有用户，不得把标题改写成 [peco-wake] 开头 —— 它落在空间会话里，标题是那条会话本来就有的"
     );
 }
 
@@ -384,6 +448,45 @@ async fn wake_conversation_id(env: &TestEnv, ws_id: &str) -> String {
     .fetch_one(&env.pool)
     .await
     .unwrap()
+}
+
+// ============================================================================
+// 送达信号：唤醒轮结束 → 广播 `wake_turn_done`
+// ============================================================================
+
+/// 唤醒轮是 headless 写入，前端不看事件流就永远不知道有这条消息；一轮结束时必须
+/// 广播一条带 `conversation_id` 的事件，前端据此失效消息缓存。
+///
+/// 变异：去掉 `chat/run.rs` 里的 Drop 守卫（或在循环末尾才调用）⇒ 事件不来，
+/// 本用例在等待处超时变红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_wake_turn_broadcasts_a_wake_turn_done_event() {
+    let env = new_env(&[]).await;
+    let upstream = FakeUpstream::start(text_reply("收到")).await;
+    let ws_id = open_peco_space(&env, &upstream).await;
+    let peco = peco_identity(&env, &ws_id).await;
+    let (pump, _chat_runs) = wired_pump(&env, peco);
+
+    // 先订阅再投递：广播没有历史，晚一步就漏掉这条事件。
+    let mut events = env.tasks.subscribe();
+    env.peco_pending_row(1, "t-signal", &ws_id).await;
+    pump.tick().await;
+
+    let event = loop {
+        let received = timeout(WAKE_DEADLINE, events.recv())
+            .await
+            .expect("唤醒轮结束后必须有事件");
+        let event = received.expect("广播通道不得关闭");
+        // 台账事件也会走同一个通道：这里只认唤醒轮结束那一条。
+        if event.kind == "wake_turn_done" {
+            break event;
+        }
+    };
+
+    let conv_id = wake_conversation_id(&env, &ws_id).await;
+    assert_eq!(event.conversation_id.as_deref(), Some(conv_id.as_str()));
+    assert_eq!(event.target_ws_id.as_deref(), Some(ws_id.as_str()));
+    assert_eq!(event.task_id, "", "唤醒轮没有台账行");
 }
 
 // ============================================================================
@@ -463,12 +566,19 @@ async fn busy_sessions_leave_the_row_pending_without_an_attempt() {
     let peco = peco_identity(&env, &ws_id).await;
     let (pump, chat_runs) = wired_pump(&env, peco);
 
-    let created = env
-        .post_in(&ws_id, "/api/chat/@master/conversations", json!({}))
+    // 用户正在看的就是空间会话：唤醒的落点与他一模一样，故必须让路。
+    let ensured = env
+        .post(
+            &format!("/api/spaces/{ws_id}/conversation/ensure"),
+            json!({}),
+        )
         .await;
-    assert_eq!(created.status, 201, "建会话失败: {}", created.body);
-    let conv_id = created.body["id"].as_str().unwrap().to_string();
-    // 用户正开着这个会话：唤醒必须让路，而且要整轮让路（不认领）。
+    assert_eq!(ensured.status, 200, "建会话失败: {}", ensured.body);
+    let conv_id = ensured.body["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 而且要让整轮让路（不认领）。
     let (_control_rx, _guard) = chat_runs.register(&conv_id);
 
     env.peco_pending_row(1, "t-busy", &ws_id).await;
@@ -512,4 +622,140 @@ async fn startup_reclaim_returns_leftover_deliveries_to_pending() {
     assert_eq!(row.wake_state, "pending", "上个进程留下的认领要退回队列");
     assert_eq!(row.wake_claimed_at, None);
     assert_eq!(row.wake_attempts, 1, "回收不改尝试次数");
+}
+
+// ============================================================================
+// SSE 一轮正常收尾：流必须自己结束，会话必须随之释放
+// ============================================================================
+
+/// 与泵共用同一份 `chat_runs` 的 `AppState`。
+///
+/// `TestEnv::router()` 每次都新建一份注册表：SSE 侧注册的条目投递端就看不见，
+/// 「用户正看着这个会话」与「这一轮已经结束」两条判据都会失真。
+fn app_state_sharing_runs(env: &TestEnv, chat_runs: &Arc<ChatActiveRuns>) -> AppState {
+    AppState {
+        chat_runs: Arc::clone(chat_runs),
+        ..env.app_state()
+    }
+}
+
+/// 起一轮真实的 SSE 对话，返回事件名序列的读取端；流结束时它才结束。
+///
+/// 与 `dispatch_closure.rs::start_turn` 同一条路（真实路由 + 真读响应体），两点
+/// 不同：会话由调用方指定（唤醒的落点），且这里要留下事件名 —— 「流有没有正常
+/// 收尾」是本用例的判据，把响应体丢掉就看不见。
+async fn start_stream_turn(
+    env: &TestEnv,
+    chat_runs: &Arc<ChatActiveRuns>,
+    ws_id: &str,
+    conv_id: &str,
+    message: &str,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    let uri = format!("/api/chat/@master/conversations/{conv_id}/stream?message={message}");
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(&uri)
+        .header("X-Peco-Space", ws_id)
+        .body(Body::empty())
+        .expect("build the SSE request");
+    let response = peco_daemon::http::router(app_state_sharing_runs(env, chat_runs))
+        .oneshot(request)
+        .await
+        .expect("router 不会失败");
+    assert!(
+        response.status().is_success(),
+        "SSE 握手失败: {}",
+        response.status()
+    );
+
+    let mut body = response.into_body().into_data_stream();
+    tokio::spawn(async move {
+        let mut names = Vec::new();
+        let mut buffer = String::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.expect("SSE 帧必须可读");
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(end) = buffer.find('\n') {
+                let line: String = buffer.drain(..=end).collect();
+                if let Some(name) = line.trim_end().strip_prefix("event: ") {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    })
+}
+
+/// 一轮 SSE 对话跑完后，流必须自己结束、最后一条必须是 `done`、会话注册条目必须
+/// 释放，于是「连接开过但这一轮已经结束」时唤醒不再被挡。
+///
+/// 先前的单测直接调 `turn_end_events` / `remember_turn_usage`：事件循环退不退都
+/// 绿。变异方法：把 `chat/run.rs` 的 Idle 分支改回 `}) if sink.is_headless() => {`
+/// ⇒ 本轮既不发 `done` 也不断流，第一条断言在 [`STREAM_DEADLINE`] 处超时变红，
+/// 后三条也一并失去前提。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_sse_turn_ends_the_stream_and_releases_the_session() {
+    let env = new_env(&[]).await;
+    // 首轮压 200ms：给「这一轮确实在跑」一个确定的观察窗口，注册条目必已存在。
+    let upstream = FakeUpstream::start(|_: Value| async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Reply::Text("收到".to_string())
+    })
+    .await;
+    let ws_id = open_peco_space(&env, &upstream).await;
+    let peco = peco_identity(&env, &ws_id).await;
+    let (pump, chat_runs) = wired_pump(&env, peco);
+
+    // 唤醒的落点是 Peco 空间的 `scope='space'` 会话：这一轮必须跑在同一条会话上，
+    // 「连接开过、但这一轮已经结束」才可能挡住唤醒。
+    let ensured = env
+        .post(
+            &format!("/api/spaces/{ws_id}/conversation/ensure"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(ensured.status, 200, "建空间会话失败: {}", ensured.body);
+    let conv_id = ensured.body["conversation_id"]
+        .as_str()
+        .expect("必须返回会话 id")
+        .to_string();
+    let scope: String = sqlx::query_scalar("SELECT scope FROM conversations WHERE id = ?")
+        .bind(&conv_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(scope, "space", "唤醒只投进空间会话");
+
+    // 查询参数里不放空格：`message` 直接拼进 URI，空格会让 request 构造失败。
+    let drain = start_stream_turn(&env, &chat_runs, &ws_id, &conv_id, "check-the-ledger").await;
+    assert!(
+        chat_runs.is_active(&conv_id),
+        "这一轮必须真的跑起来了，否则本用例什么都没测到"
+    );
+
+    let events = timeout(STREAM_DEADLINE, drain)
+        .await
+        .expect("SSE 流必须在限时内结束：Idle 之后既不补 done 也不断流，前端会一直等下去")
+        .expect("事件读取不得 panic");
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("done"),
+        "流的最后一条事件必须是 done，实际 {events:?}"
+    );
+
+    // 守卫的 drop 与断流不必同一时刻，但不能永远不到：不释放条目，「忙」判据就
+    // 永远是「连接开过」，该会话此后的唤醒全被让路。
+    let deadline = Instant::now() + STREAM_DEADLINE;
+    while chat_runs.is_active(&conv_id) {
+        if Instant::now() >= deadline {
+            panic!("{STREAM_DEADLINE:?} 内注册条目必须释放，否则该会话的唤醒被永久堵死");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 连接已开过、这一轮已结束：此时投进来的唤醒必须照常送达。
+    env.peco_pending_row(1, "t-after-stream", &ws_id).await;
+    pump.tick().await;
+    let row = wait_for_delivered(&env, "t-after-stream").await;
+    assert!(row.delivered_at.is_some(), "送达必须留时间戳：{row:?}");
 }

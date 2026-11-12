@@ -283,7 +283,8 @@ async fn orphan_is_recorded_and_unknown_ids_are_404() {
         .await;
     assert_eq!(
         env.task_and_wake_state(&ws_id, &task.to_string()).await.1,
-        "pending"
+        "awaiting",
+        "注册时任务还没跑完：进队列但要等终态才投"
     );
     sink.on_orphaned(&obs, "target space closed").await;
 
@@ -297,13 +298,12 @@ async fn orphan_is_recorded_and_unknown_ids_are_404() {
         .await
         .unwrap();
     assert_eq!(task_state, "orphan");
-    assert_eq!(wake_state, "skipped", "orphan 不得留下待唤醒");
-    assert!(terminal_at.is_some(), "orphan 是终态");
     assert_eq!(
-        reason.as_deref(),
-        Some("orphaned"),
-        "运行期失联的跳过要给 orphaned"
+        wake_state, "pending",
+        "失联也要通知 Peco：这条通知只能由一次投递送出去"
     );
+    assert!(terminal_at.is_some(), "orphan 是终态");
+    assert_eq!(reason, None, "待投递的行不写跳过原因");
 
     let missing_task = env.get("/api/tasks/not-a-task").await;
     assert_eq!(missing_task.status, 404, "body={}", missing_task.body);
@@ -412,11 +412,127 @@ async fn a_task_observer_without_peco_identity_records_that_reason() {
         env.task_and_wake_state(&ws_id, &sighted.to_string())
             .await
             .1,
-        "pending"
+        "awaiting",
+        "注册那一刻只登记，终态才入队"
     );
     assert_eq!(
         env.wake_skip_reason(&ws_id, &sighted.to_string()).await,
         None,
         "进队列的行不写跳过原因"
+    );
+}
+
+/// 注册登记「等终态」，终态才入队 —— 这两步是同一条契约的两半，缺任一半都会
+/// 退回到 v10 之前的「注册即唤醒」。
+///
+/// 变异：`on_registered` 写回 `pending` ⇒ 第一条断言红；`finish` 不带上唤醒态 ⇒
+/// 第二条断言红（行永远停在 `awaiting`，`list_pending` 永远取不到它）。
+#[tokio::test]
+async fn registration_waits_for_the_terminal_state_before_queueing_the_wake() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("awaiting-space");
+    let ws_id = env.resolve(&work_dir, "research").await.unwrap();
+    let target_dir = env.work_dir_of(&ws_id).await;
+
+    let task = TaskId(Uuid::new_v4());
+    let mut obs = observation(target_dir, task);
+    obs.origin.ws_id = env.env.peco.ws_id.clone();
+    let sink: &dyn TaskObservationSink = env.tasks.as_ref();
+
+    sink.on_registered(&obs, &snapshot(task, TaskState::Working, None))
+        .await;
+    assert_eq!(
+        env.task_and_wake_state(&ws_id, &task.to_string()).await.1,
+        "awaiting",
+        "注册时没有可投的内容，只登记"
+    );
+    assert_eq!(
+        env.wake_skip_reason(&ws_id, &task.to_string()).await,
+        None,
+        "等终态不是跳过，不写原因"
+    );
+    let awaiting_rows =
+        peco_daemon::db::dispatches::list_pending(&env.pool, 10, peco_daemon::wake::RETRY_BACKOFF)
+            .await
+            .unwrap();
+    assert!(
+        awaiting_rows
+            .iter()
+            .all(|row| row.task_id != task.to_string()),
+        "awaiting 行不得进待投递队列"
+    );
+
+    sink.on_terminal(
+        &obs,
+        &snapshot(task, TaskState::Completed, Some("final answer")),
+    )
+    .await;
+    assert_eq!(
+        env.task_and_wake_state(&ws_id, &task.to_string()).await,
+        ("completed".to_string(), "pending".to_string()),
+        "终态落库的同一条 UPDATE 里入队"
+    );
+}
+
+/// `dispatch_id` 从观察一路落到台账与三个查询接口；列为 NULL 的旧行原样返回
+/// `null`（旧行当时没有记录派发回执）。
+///
+/// 变异：`NewDispatch` 不带这一列 / 各 SELECT 漏列 ⇒ `/api/tasks/{id}` 的断言红。
+#[tokio::test]
+async fn dispatch_id_roundtrips_and_legacy_rows_stay_null() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("dispatch-id-space");
+    let ws_id = env.resolve(&work_dir, "research").await.unwrap();
+    let target_dir = env.work_dir_of(&ws_id).await;
+    let sink: &dyn TaskObservationSink = env.tasks.as_ref();
+
+    let task = TaskId(Uuid::new_v4());
+    let obs = observation(target_dir, task);
+    assert_eq!(obs.dispatch_id.as_deref(), Some("disp-1"));
+    sink.on_registered(&obs, &snapshot(task, TaskState::Working, None))
+        .await;
+
+    for uri in [
+        format!("/api/tasks/{task}"),
+        format!("/api/tasks?target_ws_id={ws_id}"),
+        format!("/api/spaces/{ws_id}/tasks"),
+    ] {
+        let reply = env.get(&uri).await;
+        assert_eq!(reply.status, 200, "{uri} body={}", reply.body);
+        let item = match reply.body.as_array() {
+            Some(items) => {
+                assert_eq!(items.len(), 1, "{uri} body={}", reply.body);
+                items[0].clone()
+            }
+            None => reply.body.clone(),
+        };
+        assert_eq!(
+            item["dispatch_id"],
+            json!("disp-1"),
+            "{uri} 必须带 dispatch_id"
+        );
+    }
+
+    // 迁移前写入的旧行：列是 NULL，接口就是 null。
+    let legacy = TaskId(Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+         target_team_id, origin_ws_id, agent_name, origin_kind, task_state, wake_state) \
+         VALUES (?, ?, ?, '/tmp/work', 'research', 'peco', '@master', \
+         'dispatch_to_workspace', 'working', 'pending')",
+    )
+    .bind(format!("d_{legacy}"))
+    .bind(legacy.to_string())
+    .bind(&ws_id)
+    .execute(&env.pool)
+    .await
+    .unwrap();
+
+    let legacy_reply = env.get(&format!("/api/tasks/{legacy}")).await;
+    assert_eq!(legacy_reply.status, 200, "body={}", legacy_reply.body);
+    assert_eq!(
+        legacy_reply.body["dispatch_id"],
+        json!(null),
+        "旧行不得编造一个派发回执"
     );
 }
