@@ -119,9 +119,13 @@ export interface UpdateTeamRequest {
   icon: string;
 }
 
-/** 唤醒投递的五态；与任务生命周期是两套独立状态，一条任务可以已终态而唤醒仍待投递。 */
+/**
+ * 唤醒投递的状态；与任务生命周期是两套独立状态，一条任务可以已终态而唤醒仍待投递。
+ *
+ * `awaiting` 是「任务已注册、还没终态」，此时还没进唤醒队列。
+ */
 export type WakeState =
-  "pending" | "delivering" | "delivered" | "skipped" | "failed";
+  "awaiting" | "pending" | "delivering" | "delivered" | "skipped" | "failed";
 
 /** `wake_state='skipped'` 的成因；历史行没有记录，显示为「原因未记录」。 */
 export type WakeSkipReason =
@@ -150,10 +154,23 @@ export interface Task {
   result_digest: string | null;
   /** 派发入参里那段任务描述的前 512 字；旧行没有记录，是 `null`。 */
   prompt_digest?: string | null;
+  /** 派发回执里的 dispatch_id；旧行没有记录，是 `null`。 */
+  dispatch_id?: string | null;
 }
 
 /** `/api/events` 的 `task` 事件载荷：只是台账变更信号，行本身要重取。 */
 export interface TaskEvent {
+  /**
+   * 事件种类；缺省即台账行变更。
+   *
+   * `wake_turn_done` 是另一回事：一轮唤醒在服务端跑完，会话里多出了反馈消息，
+   * 需要按 `conversation_id` 重取会话历史。这种载荷只有 `ws_id` 与
+   * `conversation_id` 有意义，其余字段是空串或 null。
+   */
+  kind?: string;
+  /** 哪条会话的历史变了；只有 `wake_turn_done` 会给。 */
+  conversation_id?: string | null;
+  dispatch_id?: string | null;
   ws_id: string;
   task_id: string;
   task_state: string;

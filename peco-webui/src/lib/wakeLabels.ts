@@ -4,6 +4,7 @@
 import type { WakeState, WakeSkipReason } from "@/types/daemon";
 
 const WAKE_STATE_LABELS: Record<WakeState, string> = {
+  awaiting: "等待完成",
   pending: "待投递",
   delivering: "投递中",
   delivered: "已投递",

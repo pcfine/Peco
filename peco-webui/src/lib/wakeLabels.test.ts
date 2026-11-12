@@ -7,6 +7,7 @@ import {
 
 describe("唤醒态文案", () => {
   it.each([
+    ["awaiting", "等待完成"],
     ["pending", "待投递"],
     ["delivering", "投递中"],
     ["delivered", "已投递"],
@@ -18,6 +19,11 @@ describe("唤醒态文案", () => {
 
   it("delivered 只说已投递，不暗示任务处理完成", () => {
     expect(wakeStateLabel("delivered")).not.toMatch(/完成|处理|已读/);
+  });
+
+  it("awaiting 是还没终态的等待，不拼出成因", () => {
+    expect(wakeDescription("awaiting", null)).toBe("等待完成");
+    expect(wakeDescription("awaiting", "space_closed")).toBe("等待完成");
   });
 
   it("没见过的唤醒态给兜底文案并带上原值", () => {

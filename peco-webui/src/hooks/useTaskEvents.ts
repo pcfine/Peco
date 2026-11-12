@@ -15,7 +15,12 @@ export function useTaskEvents(): void {
 
   useEffect(() => {
     return openTaskStream(wsId, {
-      onTask: () => {
+      onTask: (event) => {
+        // 唤醒轮跑完只在服务端留下消息，界面这边没有别的信号能把它带进来：
+        // 不重取历史，停在对话页的用户就一直看不见那条反馈。
+        if (event.conversation_id) {
+          void queryClient.invalidateQueries({ queryKey: ["messages"] });
+        }
         void queryClient.invalidateQueries({ queryKey: ["tasks"] });
         void queryClient.invalidateQueries({ queryKey: ["spaces"] });
         void queryClient.invalidateQueries({ queryKey: ["space-overview"] });
