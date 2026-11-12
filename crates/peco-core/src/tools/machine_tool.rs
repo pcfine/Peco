@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use super::deps::AgentAccess;
 use super::{Content, StringError, ToolDyn, ToolError};
+use crate::agent::hooks::MAX_DIGEST_CHARS;
 use crate::artifacts::{
     ArtifactDecl, render_artifact_lines, strip_artifact_lines, with_artifact_lines,
 };
@@ -65,6 +66,21 @@ const ASYNC_LABEL: &str = "async";
 const CANCEL_NOTE: &str = "cancellation requested; poll action=status to confirm";
 /// 终态任务上 `cancel` 什么都没做：`accepted` 恒 `true`，只能靠 `note` 说清。
 const CANCEL_INERT_NOTE: &str = "task is already terminal; cancel has no effect";
+
+/// 快照来源标签：缺键即本进程的活任务，`ledger` 表示正文来自台账。
+pub(crate) const LABEL_SOURCE: &str = "source";
+/// 正文留存口径：`full` 是全文，`digest_only` 只剩台账摘要。
+pub(crate) const LABEL_OUTPUT_RETENTION: &str = "output_retention";
+/// 台账里的正文自己就被落库上限截断过：它的长度不是原文总长。
+pub(crate) const LABEL_OUTPUT_TRUNCATED: &str = "output_truncated";
+pub(crate) const SOURCE_LEDGER: &str = "ledger";
+pub(crate) const RETENTION_FULL: &str = "full";
+pub(crate) const RETENTION_DIGEST_ONLY: &str = "digest_only";
+/// 台账里既没有正文也没有摘要：什么都没留下来。
+pub(crate) const RETENTION_NONE: &str = "none";
+/// [`LABEL_OUTPUT_TRUNCATED`] 唯一的真值：写入侧与读取侧各拼一次会漂移。
+pub(crate) const TRUNCATED_LABEL: &str = "true";
+pub(crate) const SOURCE_LIVE: &str = "live";
 
 fn tool_error(message: String) -> ToolError {
     ToolError::ToolCallError(Box::new(StringError(message)))
@@ -533,6 +549,23 @@ fn render_status_with(snapshot: &TaskSnapshot, action: &str, timed_out: Option<b
     task.insert("deadline".to_string(), json!(snapshot.deadline));
     task.insert("created_at".to_string(), json!(snapshot.created_at));
     task.insert("updated_at".to_string(), json!(snapshot.updated_at));
+    // 按 id 复查才需要「这份正文从哪来、缺了多少」：`run` 的每条结果共用一份
+    // 紧预算，同一个形状在那边只是白占额度。
+    task.insert("source".to_string(), json!(report.source));
+    task.insert(
+        "output_retention".to_string(),
+        json!(report.output_retention),
+    );
+    task.insert("output_bytes".to_string(), json!(report.output_bytes()));
+    task.insert(
+        "output_total_bytes".to_string(),
+        json!(report.output_total_bytes),
+    );
+    task.insert(
+        "output_omitted_head_bytes".to_string(),
+        json!(report.output_omitted_head_bytes),
+    );
+    task.insert("note".to_string(), report.note());
     let mut rows = vec![Value::Object(task)];
 
     finish_report(
@@ -591,23 +624,93 @@ struct TaskReport {
     task_id: TaskId,
     kind: String,
     state: TaskState,
+    /// 正文来源：`live` 是本进程的 Hub，`ledger` 是重启后从台账里捞回来的。
+    source: String,
+    /// 正文留存口径，作为一等字段外发：调用方据它决定该不该去 `action=output` 取全文，
+    /// 而不是从 `note` 文案与会为 `null` 的正文长度反推。无从判定时为 `None`。
+    output_retention: Option<&'static str>,
     output: Option<String>,
     output_truncated: bool,
     output_lossy: bool,
+    /// 正文总字节数；拿到的不保证是原文的一份预览时为 `None`。
+    output_total_bytes: Option<u64>,
+    /// `preview` 丢掉的头部长；同上。
+    output_omitted_head_bytes: Option<u64>,
+    /// 手上这份正文的字符数（`digest_only` 时是摘要长度）；没有正文时为 `None`。
+    total_chars: Option<usize>,
+    /// 只剩台账摘要：这份正文不是原文，长度与缺口都不可知。
+    digest_only: bool,
+    /// 台账正文在落库时就被上限截断过：连它的长度都不是原文总长。
+    persisted_prefix: bool,
+    /// 台账里既无正文又无摘要：`output_truncated` / `output_lossy` 都不该为真。
+    retention_none: bool,
     error: Option<TaskError>,
     artifacts: Vec<ArtifactDecl>,
 }
 
 impl TaskReport {
     fn new(snapshot: &TaskSnapshot) -> Self {
-        let (output, output_truncated, output_lossy, body_decls) = snapshot_text(snapshot);
+        let (body, body_decls) = snapshot_text(snapshot);
+        let retention = snapshot.labels.get(LABEL_OUTPUT_RETENTION);
+        let digest_only = retention.map(String::as_str) == Some(RETENTION_DIGEST_ONLY);
+        let retention_none = retention.map(String::as_str) == Some(RETENTION_NONE);
+        let persisted_prefix = snapshot
+            .labels
+            .get(LABEL_OUTPUT_TRUNCATED)
+            .is_some_and(|flag| flag == TRUNCATED_LABEL);
+        // 摘要代人原文、或台账正文自己就被截断过：两种情况下长度都不是原文的，
+        // 报一个数只会让「缺了多少」看起来可算。
+        let lengths_unknown = digest_only || persisted_prefix;
+        // 原文全长的字符数：`action=output` 按字符分页，提示里的 N 必须同口径。
+        // 摘要代原文时 `text_output` 给的就是摘要，N 自然是摘要长。
+        let total_chars = text_output(snapshot).map(|text| text.chars().count());
+        let source = snapshot
+            .labels
+            .get(LABEL_SOURCE)
+            .cloned()
+            .unwrap_or_else(|| SOURCE_LIVE.to_string());
+        // 台账的留存口径是写入侧的事实，读取侧只照抄；认不出的值给 `null` 而不是
+        // 当成 `full`。活快照没有留存策略可查，只能按手上有没有正文分两档 ——
+        // `digest_only` 是台账独有的形态，在这里凭空造出来就是撒谎。
+        let output_retention = if source == SOURCE_LEDGER {
+            match retention.map(String::as_str) {
+                Some(RETENTION_FULL) => Some(RETENTION_FULL),
+                Some(RETENTION_DIGEST_ONLY) => Some(RETENTION_DIGEST_ONLY),
+                Some(RETENTION_NONE) => Some(RETENTION_NONE),
+                _ => None,
+            }
+        } else {
+            Some(if body.text.is_some() {
+                RETENTION_FULL
+            } else {
+                RETENTION_NONE
+            })
+        };
         Self {
             task_id: snapshot.id,
             kind: snapshot.kind.clone(),
             state: snapshot.state,
-            output,
-            output_truncated,
-            output_lossy,
+            source,
+            output_retention,
+            // 摘要冒充全文是这里最坏的错误：`digest_only` 时它必须同时可信地
+            // 声明「丢了字节」与「给的是摘要」。
+            output_truncated: body.truncated || lengths_unknown,
+            output_lossy: body.lossy || digest_only,
+            output_total_bytes: if lengths_unknown {
+                None
+            } else {
+                body.total_bytes
+            },
+            output_omitted_head_bytes: if lengths_unknown {
+                None
+            } else {
+                body.omitted_head_bytes
+            },
+            output: body.text,
+            total_chars,
+            digest_only,
+            persisted_prefix,
+            retention_none,
             error: snapshot
                 .outcome
                 .as_ref()
@@ -616,11 +719,60 @@ impl TaskReport {
         }
     }
 
+    /// 交给调用方的正文字节数（已被预览裁剪）：0 表示这段正文是空的。
+    fn output_bytes(&self) -> usize {
+        self.output.as_ref().map_or(0, String::len)
+    }
+
+    /// 摘要替不了原文、或预览只给了尾部时，必须由本字段说清缺口与取法，
+    /// 而不是让读者从长度里猜。
+    fn note(&self) -> Value {
+        match self.note_text() {
+            Some(text) => Value::String(text),
+            None => Value::Null,
+        }
+    }
+
+    fn note_text(&self) -> Option<String> {
+        // 没到终态就没有全文可取：这时指向 `action=output` 只会让调用方撞空。
+        if !self.state.is_terminal() {
+            return None;
+        }
+        if self.retention_none {
+            return Some("全文与摘要都未留存，这次任务的输出无法取回".to_string());
+        }
+        if self.digest_only {
+            let chars = self.total_chars.unwrap_or(MAX_DIGEST_CHARS);
+            return Some(format!(
+                "全文未留存（任务早于 v11）：完整正文共 {chars} 字符，这只是 {chars} 字摘要的长度，\
+                 原文长度不可考；用 action=output 读取这段摘要"
+            ));
+        }
+        if self.persisted_prefix {
+            return Some(
+                "台账正文在落库时已按上限截断，原文总长不可考；用 action=output 分页读取已留存部分（带 offset 续读）"
+                    .to_string(),
+            );
+        }
+        match (self.output_omitted_head_bytes, self.total_chars) {
+            (Some(omitted), Some(chars)) if omitted > 0 => Some(format!(
+                "完整正文共 {chars} 字符，这里只是尾部预览；用 action=output 读取（带 offset 续读后一页）"
+            )),
+            _ => None,
+        }
+    }
+
     /// `run` 与 `inspect status` 共用的字段集合；两者只在此基础上加减字段。
     fn core(&self) -> Map<String, Value> {
         let mut fields = Map::new();
         fields.insert("task_id".to_string(), json!(self.task_id.to_string()));
-        fields.insert("kind".to_string(), json!(self.kind));
+        // 台账不存 machine `kind`，空串是「不知道」：给 `null`，不给一个空名字。
+        let kind = if self.kind.is_empty() {
+            Value::Null
+        } else {
+            Value::String(self.kind.clone())
+        };
+        fields.insert("kind".to_string(), kind);
         fields.insert("state".to_string(), json!(self.state));
         fields.insert("terminal".to_string(), json!(self.state.is_terminal()));
         fields.insert("output".to_string(), json!(self.output));
@@ -1025,8 +1177,20 @@ fn prompt_echo(prompt: &str) -> String {
     head_within(prompt, MAX_PROMPT_ECHO_BYTES)
 }
 
-/// 返回 (文本, 「有字节没给你」, 「给你的字节里有不可解码的」)：两个布尔互相独立。
-fn preview(bytes: &[u8], hub_start_offset: u64) -> (String, bool, bool) {
+/// 一次有界预览：文本、缺了多少、能不能解码，以及找回缺失所需的两个数。
+///
+/// 「有字节没给你」与「给你的字节里有不可解码的」互相独立，故是两个布尔。
+struct Preview {
+    text: String,
+    truncated: bool,
+    lossy: bool,
+    /// 原文总字节数（Hub 窗口起点 + 窗口长度）。
+    total_bytes: u64,
+    /// 被丢掉的头部长。
+    omitted_head_bytes: u64,
+}
+
+fn preview(bytes: &[u8], hub_start_offset: u64) -> Preview {
     let dropped_head = bytes.len().saturating_sub(MAX_OUTPUT_PREVIEW_BYTES);
     let window = &bytes[dropped_head..];
     // 窗口起点可能切在多字节字符中间：最多前跳 3 个续字节（0b10xx_xxxx）。
@@ -1043,11 +1207,47 @@ fn preview(bytes: &[u8], hub_start_offset: u64) -> (String, bool, bool) {
             "task output preview contains invalid UTF-8; undecodable bytes replaced"
         );
     }
-    (
-        String::from_utf8_lossy(rest).into_owned(),
-        dropped_head > 0 || start > 0 || hub_start_offset > 0,
+    Preview {
+        text: String::from_utf8_lossy(rest).into_owned(),
+        truncated: dropped_head > 0 || start > 0 || hub_start_offset > 0,
         lossy,
-    )
+        total_bytes: hub_start_offset.saturating_add(bytes.len() as u64),
+        omitted_head_bytes: dropped_head as u64,
+    }
+}
+
+/// 呈现用正文与「缺了多少」的补偿量。
+struct OutputBody {
+    text: Option<String>,
+    truncated: bool,
+    lossy: bool,
+    /// 原文总字节数；无从得知时为 `None`。
+    total_bytes: Option<u64>,
+    /// 被丢掉的头部长；无从得知时为 `None`。
+    omitted_head_bytes: Option<u64>,
+}
+
+impl OutputBody {
+    fn from_preview(preview: Preview) -> Self {
+        Self {
+            text: non_empty(preview.text, preview.truncated || preview.lossy),
+            truncated: preview.truncated,
+            lossy: preview.lossy,
+            total_bytes: Some(preview.total_bytes),
+            omitted_head_bytes: Some(preview.omitted_head_bytes),
+        }
+    }
+
+    /// 没有正文可给：两个长度也一并是未知，而不是 0。
+    fn empty() -> Self {
+        Self {
+            text: None,
+            truncated: false,
+            lossy: false,
+            total_bytes: None,
+            omitted_head_bytes: None,
+        }
+    }
 }
 
 /// 空结果给 `null` 而不是空串：模型据此区分「没有正文」与「正文是空的」。
@@ -1059,33 +1259,36 @@ fn non_empty(text: String, incomplete: bool) -> Option<String> {
     }
 }
 
-/// 正文权威：成功终态看 `outcome.output`，其余（含非终态）看有界的有损尾窗。
+/// 正文权威：`outcome.output` 的文本载荷，否则看有界的有损尾窗。
 ///
 /// 同时返回正文里自带的声明：`outcome.output` 可能含子 agent 自己写的声明行，
 /// 不剥离就会漏进调用方上下文并诱导它照抄。
-fn snapshot_text(snapshot: &TaskSnapshot) -> (Option<String>, bool, bool, Vec<ArtifactDecl>) {
-    if snapshot.state == TaskState::Completed {
-        let Some(output) = snapshot.outcome.as_ref().and_then(|o| o.output.as_ref()) else {
-            return (None, false, false, Vec::new());
-        };
-        if output.tag != TEXT_OUTPUT_TAG {
-            return (None, false, false, Vec::new());
-        }
-        let Some(text) = output.payload.as_str() else {
-            return (None, false, false, Vec::new());
-        };
+fn snapshot_text(snapshot: &TaskSnapshot) -> (OutputBody, Vec<ArtifactDecl>) {
+    if let Some(text) = text_output(snapshot) {
         let (clean, decls) = strip_artifact_lines(text);
-        let (text, truncated, lossy) = preview(clean.as_bytes(), 0);
-        return (non_empty(text, truncated || lossy), truncated, lossy, decls);
+        return (
+            OutputBody::from_preview(preview(clean.as_bytes(), 0)),
+            decls,
+        );
+    }
+    // 跑完却没有文本载荷：这份任务没有正文可给，尾窗里的半截流不是结果。
+    if snapshot.state == TaskState::Completed {
+        return (OutputBody::empty(), Vec::new());
     }
 
-    let (text, truncated, lossy) = preview(&snapshot.output.tail, snapshot.output.start_offset);
     (
-        non_empty(text, truncated || lossy),
-        truncated,
-        lossy,
+        OutputBody::from_preview(preview(&snapshot.output.tail, snapshot.output.start_offset)),
         Vec::new(),
     )
+}
+
+/// 终态正文的文本载荷；非文本（结构化载荷）没有可展示的原文。
+pub(crate) fn text_output(snapshot: &TaskSnapshot) -> Option<&str> {
+    let output = snapshot.outcome.as_ref()?.output.as_ref()?;
+    if output.tag != TEXT_OUTPUT_TAG {
+        return None;
+    }
+    output.payload.as_str()
 }
 
 /// 快照是产物权威：正文里重复声明的 `path` 不再补一次，正文内部冲突时后写获胜
@@ -1930,8 +2133,16 @@ mod tests {
             kind: "agent:worker".to_string(),
             state: TaskState::Completed,
             output: Some("o".repeat(MAX_OUTPUT_PREVIEW_BYTES)),
+            source: "live".to_string(),
+            output_retention: Some(RETENTION_FULL),
             output_truncated: true,
             output_lossy: false,
+            output_total_bytes: Some(MAX_OUTPUT_PREVIEW_BYTES as u64),
+            output_omitted_head_bytes: Some(0),
+            total_chars: Some(MAX_OUTPUT_PREVIEW_BYTES),
+            digest_only: false,
+            persisted_prefix: false,
+            retention_none: false,
             error: None,
             artifacts: decls,
         }
@@ -2363,52 +2574,65 @@ mod tests {
 
     #[test]
     fn preview_keeps_the_tail_and_reports_lossiness_separately() {
-        let (text, truncated, lossy) = preview(&[0x80, b'a', b'b'], 0);
-        assert_eq!(text, "ab");
-        assert!(truncated, "skipped continuation bytes are missing content");
-        assert!(!lossy);
+        let body = preview(&[0x80, b'a', b'b'], 0);
+        assert_eq!(body.text, "ab");
+        assert!(
+            body.truncated,
+            "skipped continuation bytes are missing content"
+        );
+        assert!(!body.lossy);
 
-        let (text, _, lossy) = preview(&[0xFF, b'a'], 0);
-        assert_eq!(text, "\u{FFFD}a");
-        assert!(lossy, "a replaced byte means the upstream wrote garbage");
+        let body = preview(&[0xFF, b'a'], 0);
+        assert_eq!(body.text, "\u{FFFD}a");
+        assert!(
+            body.lossy,
+            "a replaced byte means the upstream wrote garbage"
+        );
 
         // 头尾必须可区分：头部标记被丢、尾部标记保留，否则「保头部」的实现也能过。
         let mut long = vec![b'h'; MAX_OUTPUT_PREVIEW_BYTES + 808];
         long[..8].copy_from_slice(b"HEAD-MAR");
         let tail_at = long.len() - 16;
         long[tail_at..].copy_from_slice(b"TAIL-MARK-UNIQUE");
-        let (text, truncated, lossy) = preview(&long, 0);
-        assert_eq!(text.len(), MAX_OUTPUT_PREVIEW_BYTES);
-        assert!(truncated);
-        assert!(!lossy);
+        let body = preview(&long, 0);
+        assert_eq!(body.text.len(), MAX_OUTPUT_PREVIEW_BYTES);
+        assert!(body.truncated);
+        assert!(!body.lossy);
         assert!(
-            text.contains("TAIL-MARK-UNIQUE"),
-            "the newest bytes must survive: {text:?}"
+            body.text.contains("TAIL-MARK-UNIQUE"),
+            "the newest bytes must survive: {:?}",
+            body.text
         );
         assert!(
-            !text.contains("HEAD-MAR"),
-            "the oldest bytes must be dropped: {text:?}"
+            !body.text.contains("HEAD-MAR"),
+            "the oldest bytes must be dropped: {:?}",
+            body.text
         );
         assert_eq!(
-            text.as_bytes(),
+            body.text.as_bytes(),
             &long[long.len() - MAX_OUTPUT_PREVIEW_BYTES..],
             "the preview must be exactly the tail window"
         );
+        // 补偿量必须对得上：原文总长是全长，缺的就是被丢掉的那 808 字节。
+        assert_eq!(body.total_bytes, long.len() as u64);
+        assert_eq!(body.omitted_head_bytes, 808);
 
         // 窗口起点切在多字节字符中间：只该丢掉那 3 个续字节，不得产出替换字符。
         let mut split = vec![0xF0, 0x9F, 0x98, 0x80];
         split.extend(std::iter::repeat_n(b'a', MAX_OUTPUT_PREVIEW_BYTES - 1));
-        let (text, truncated, lossy) = preview(&split, 0);
-        assert_eq!(text, "a".repeat(MAX_OUTPUT_PREVIEW_BYTES - 1));
-        assert!(truncated);
+        let body = preview(&split, 0);
+        assert_eq!(body.text, "a".repeat(MAX_OUTPUT_PREVIEW_BYTES - 1));
+        assert!(body.truncated);
         assert!(
-            !lossy,
+            !body.lossy,
             "a cut multi-byte char must be skipped, not replaced"
         );
 
-        // Hub 早已丢掉更早的字节：窗口本身完整也算「有内容没给你」。
-        let (_, truncated, _) = preview(b"abc", 10);
-        assert!(truncated);
+        // Hub 早已丢掉更早的字节：窗口本身完整也算「有内容没给你」，总长仍据偏移可算。
+        let body = preview(b"abc", 10);
+        assert!(body.truncated);
+        assert_eq!(body.total_bytes, 13);
+        assert_eq!(body.omitted_head_bytes, 0);
     }
 
     #[test]
@@ -2547,9 +2771,17 @@ mod tests {
             task_id: TaskId(Uuid::nil()),
             kind: "agent:worker".to_string(),
             state: TaskState::Completed,
+            source: "live".to_string(),
+            output_retention: Some(RETENTION_FULL),
             output: None,
             output_truncated: false,
             output_lossy: false,
+            output_total_bytes: None,
+            output_omitted_head_bytes: None,
+            total_chars: None,
+            digest_only: false,
+            persisted_prefix: false,
+            retention_none: false,
             error: None,
             artifacts: Vec::new(),
         };

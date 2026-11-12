@@ -226,6 +226,8 @@ impl TaskObservationSink for TaskObserver {
             &obs.task_id.to_string(),
             state,
             digest.as_deref(),
+            result_output(snapshot),
+            false,
         )
         .await
         {
@@ -266,14 +268,21 @@ impl TaskObservationSink for TaskObserver {
     }
 }
 
-/// 终态输出摘要：只取文本载荷并截断到 [`MAX_DIGEST_CHARS`]，非文本为 `None`。
+/// 终态正文：`d_dispatches.output` 的来源，非文本载荷为 `None`。
 ///
-/// 启动对账补 `finish` 时也用它：两处各截一次会让「同一任务在两条路径上落库的
-/// 摘要」长度不同。
-pub(crate) fn result_digest(snapshot: &TaskSnapshot) -> Option<String> {
+/// 启动对账补 `finish` 时也用它：正文只该有一份取法，两处各写一遍会让「同一任务
+/// 在两条路径上落库的正文」不一样。
+pub(crate) fn result_output(snapshot: &TaskSnapshot) -> Option<&str> {
     let output = snapshot.outcome.as_ref()?.output.as_ref()?;
     let serde_json::Value::String(text) = &output.payload else {
         return None;
     };
-    Some(text.chars().take(MAX_DIGEST_CHARS).collect())
+    Some(text)
+}
+
+/// 终态输出摘要：正文前缀，截断到 [`MAX_DIGEST_CHARS`]。
+///
+/// 摘要留在台账里是给唤醒消息与老行用的；它永远不是全文的替代品。
+pub(crate) fn result_digest(snapshot: &TaskSnapshot) -> Option<String> {
+    result_output(snapshot).map(|text| text.chars().take(MAX_DIGEST_CHARS).collect())
 }

@@ -27,14 +27,18 @@ pub fn compose(rows: &[DispatchRow]) -> String {
 /// `dir` 是跨空间复核的必填入参（`inspect_workspace_task{dir, task_id, action}`）：
 /// 只给 `target`（ws_id）时模型没有可填进 `dir` 的东西，只能凭摘要猜。`target`
 /// 留着是为了让模型认出「这条属于哪个空间」，两者不是同一个值。
+///
+/// `full` 说的是台账里有没有正文可取（`full=full` 不承诺未被截断）：`digest`
+/// 只表示摘要，读到 512 字就结束不等于结果只有那么多，模型据此决定要不要再取一次。
 pub fn item_line(row: &DispatchRow) -> String {
     format!(
-        "- task={} state={} target={} dir={} digest={}",
+        "- task={} state={} target={} dir={} digest={} full={}",
         row.task_id,
         row.task_state,
         row.target_ws_id,
         row.target_work_dir,
-        digest(row)
+        digest(row),
+        if row.has_output { "full" } else { "digest" }
     )
 }
 
@@ -70,6 +74,7 @@ mod tests {
             wake_state: "pending".to_string(),
             wake_skip_reason: None,
             result_digest: digest.map(str::to_string),
+            has_output: false,
             prompt_digest: None,
             dispatch_id: None,
             created_at: "2026-01-01 00:00:00".to_string(),
@@ -108,6 +113,27 @@ mod tests {
         assert!(!line.contains("别的内容"), "旧摘要不再成立：{line}");
     }
 
+    /// `full=` 只说台账里还有没有全文：有正文取 `full`，只剩摘要取 `digest`。
+    ///
+    /// 变异点：删掉 `full=` 这一项 ⇒ 断言红；恒返回 `full` ⇒ 摘要那一条红。
+    #[test]
+    fn the_item_says_whether_the_ledger_keeps_the_full_output() {
+        let mut stored = row("t-1", "completed", Some("摘要"));
+        stored.has_output = true;
+        assert!(
+            item_line(&stored).contains(" full=full"),
+            "台账有正文时必须报 full=full：{}",
+            item_line(&stored)
+        );
+
+        let digest_only = row("t-2", "completed", Some("摘要"));
+        assert!(
+            item_line(&digest_only).contains(" full=digest"),
+            "只剩摘要时必须报 full=digest：{}",
+            item_line(&digest_only)
+        );
+    }
+
     /// 截断按字符：600 个汉字取 500 个；按字节取会剩下 166 个半截字符。
     #[test]
     fn long_digests_are_truncated_by_chars() {
@@ -133,6 +159,9 @@ mod tests {
         let text = compose(&[row("t-1", "timed_out", None)]);
 
         assert!(text.contains("- task=t-1 state=timed_out"), "{text}");
-        assert!(text.ends_with("digest="), "空摘要留字段：{text}");
+        assert!(
+            text.ends_with("digest= full=digest"),
+            "空摘要仍要留字段，且不得声称有全文：{text}"
+        );
     }
 }

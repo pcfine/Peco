@@ -49,9 +49,10 @@ pub use tool_register::ToolRegister;
 pub use web_search::WebSearchTool;
 pub use workspace_info::ShowWorkspace;
 pub use workspace_tools::{
-    CreateWorkspace, DispatchReceipt, DispatchToWorkspace, InspectWorkspaceTask, OpenRequest,
-    OpenWorkspace, WorkspaceHandle, WorkspaceHub, WorkspaceInfo, WorkspaceOpenError,
-    WorkspaceOpener, WorkspaceToolError, install_workspace_hub, workspace_hub,
+    CreateWorkspace, DispatchReceipt, DispatchToWorkspace, InspectWorkspaceTask, LedgerOutput,
+    LedgerTask, OpenRequest, OpenWorkspace, TaskLedger, WorkspaceHandle, WorkspaceHub,
+    WorkspaceInfo, WorkspaceOpenError, WorkspaceOpener, WorkspaceToolError, install_workspace_hub,
+    workspace_hub,
 };
 
 use async_trait::async_trait;

@@ -5,6 +5,7 @@ pub mod close;
 pub mod compaction;
 pub mod fanout;
 pub mod index;
+pub mod ledger;
 pub mod manifest;
 pub mod memory_audit;
 pub mod open;

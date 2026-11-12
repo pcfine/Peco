@@ -25,6 +25,7 @@ use peco_daemon::db::dispatches::{self, NewDispatch, WakeSkipReason, WakeState};
 use peco_daemon::db::workspaces;
 use peco_daemon::error::DaemonError;
 use peco_daemon::space::SpaceEnv;
+use peco_daemon::space::ledger::SqliteTaskLedger;
 use peco_daemon::space::open::{self, DaemonOpener, ensure_open_indexed};
 use peco_daemon::space::registry::SpaceRegistry;
 use peco_daemon::space::tasks::TaskObserver;
@@ -110,7 +111,9 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
         WorkspaceHub::with_system_config(Arc::new(system_config))
             .with_opener(opener.clone() as Arc<dyn WorkspaceOpener>)
             // daemon 是单用户宿主：label 只作展示，不做隔离校验。
-            .with_label_enforcement(false),
+            .with_label_enforcement(false)
+            // 与 `main` 同装：重启后回退查台账的路径在测试里也走真的 SQLite。
+            .with_ledger(Arc::new(SqliteTaskLedger::new(pool.clone()))),
     );
     // 与 daemon 启动同序：先建 Hub，再把它注入 SpaceEnv（文件监听扇出要用）。
     env.attach_hub(&hub);

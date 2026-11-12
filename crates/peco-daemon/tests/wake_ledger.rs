@@ -270,7 +270,7 @@ async fn non_peco_origins_never_enter_the_wake_queue() {
     // 判据本身不产生队列项：入队发生在终态。两条都跑到终态，队列里才该只剩
     // `own` 那一行 —— 只看注册期的 wake_state 断不出「投递侧看不到别的行」。
     for task in [&own, &foreign] {
-        dispatches::finish(&env.pool, &task.to_string(), "completed", None)
+        dispatches::finish(&env.pool, &task.to_string(), "completed", None, None, false)
             .await
             .unwrap();
     }

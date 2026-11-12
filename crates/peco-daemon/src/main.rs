@@ -15,6 +15,7 @@ use peco_daemon::error::DaemonError;
 use peco_daemon::http;
 use peco_daemon::single_instance;
 use peco_daemon::space::SpaceEnv;
+use peco_daemon::space::ledger::SqliteTaskLedger;
 use peco_daemon::space::open::{self, DaemonOpener};
 use peco_daemon::space::peco;
 use peco_daemon::space::registry::SpaceRegistry;
@@ -88,7 +89,9 @@ async fn run() -> Result<(), DaemonError> {
     let hub = Arc::new(
         WorkspaceHub::new()
             .with_opener(opener as Arc<dyn WorkspaceOpener>)
-            .with_label_enforcement(false),
+            .with_label_enforcement(false)
+            // 重启后 Hub 里没有旧任务的槽：正文只能从台账取。
+            .with_ledger(Arc::new(SqliteTaskLedger::new(pool.clone()))),
     );
     // 反向注入：opener 在打开实例后要能把文件变更扇出到同团队的其它空间，
     // 而 Hub 需要 opener 才能构造 —— 二者只有一方能事后拿到对方。

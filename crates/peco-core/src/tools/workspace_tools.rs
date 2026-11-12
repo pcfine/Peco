@@ -11,7 +11,7 @@
 // `machine_runtime` 同一条纪律 —— 否则 Hub → WorkSpace → Agent → 工具 → Hub
 // 会闭合，实例永远无法释放。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -19,19 +19,25 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use model_provider::ToolDefinition;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tracing::debug;
+use serde_json::{Value, json};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::machine_tool::{build_task, render_cancel, render_task_await, render_task_status};
+use super::machine_tool::{
+    LABEL_OUTPUT_RETENTION, LABEL_OUTPUT_TRUNCATED, LABEL_SOURCE, RETENTION_DIGEST_ONLY,
+    RETENTION_FULL, RETENTION_NONE, SOURCE_LEDGER, SOURCE_LIVE, TRUNCATED_LABEL, build_task,
+    render_cancel, render_task_await, render_task_status, text_output,
+};
 use super::{Content, StringError, ToolDyn, ToolError};
 use crate::agent::{Agent, AgentError, MASTER_AGENT_NAME};
 use crate::config::{SystemConfig, system_config};
 use crate::machine::runtime::RuntimeError;
 use crate::machine::{
-    MachineError, MachineRuntime, ObsStream, TaskFilter, TaskId, TaskSnapshot, TaskState,
+    MachineError, MachineRuntime, ObsStream, OutputView, Progress, TaggedJson, TaskFilter, TaskId,
+    TaskOutcome, TaskSnapshot, TaskSource, TaskState,
 };
 use crate::workspace::manifest::{self, ManifestError, WorkspaceManifest};
 use crate::workspace::{WorkDir, WorkSpace};
@@ -42,6 +48,10 @@ const DISPATCH_ORIGIN: &str = "dispatch_to_workspace";
 const MAX_OUTPUT_CHARS: usize = 8 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const MAX_TIMEOUT_SECS: u64 = 3600;
+/// `action=output` 的一页默认长度（字符）：一次给太多会顶掉调用方的上下文。
+const DEFAULT_OUTPUT_LIMIT_CHARS: usize = 32_000;
+/// 单页上限：正文本身可达 100 万字符，一页全塞进来就不再是分页。
+const MAX_OUTPUT_LIMIT_CHARS: usize = 200_000;
 const MAX_DEADLINE_SECS: u64 = 86_400;
 const MAX_LABEL_CHARS: usize = 128;
 const MAX_NAME_CHARS: usize = 200;
@@ -90,6 +100,8 @@ pub enum WorkspaceToolError {
     Runtime(#[from] RuntimeError),
     #[error("task hub error: {0}")]
     Machine(#[from] MachineError),
+    #[error("task ledger query failed: {0}")]
+    Ledger(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("background open task failed: {0}")]
@@ -179,6 +191,55 @@ pub trait WorkspaceOpener: Send + Sync {
     async fn open(&self, req: OpenRequest) -> Result<Arc<dyn WorkspaceHandle>, WorkspaceOpenError>;
 }
 
+/// 台账里一条终态任务的可读副本。
+///
+/// 只在 `TaskHub` 不认识这个 id（上一个进程的任务）时才被读取：`output` 是落库
+/// 时的正文，`result_digest` 只在正文没留存时有值 —— 两者不可互相冒充。
+#[derive(Clone)]
+pub struct LedgerTask {
+    pub task_id: String,
+    pub state: String,
+    pub output: Option<String>,
+    /// `output` 自己就被落库上限截断过：它不是原文的完整副本。
+    pub output_truncated: bool,
+    pub result_digest: Option<String>,
+    pub terminal_at: Option<String>,
+    pub dispatch_id: Option<String>,
+}
+
+/// 台账里一条终态行的正文。分页只要正文与它的长度口径：其余列对它没有用处，
+/// 而正文本身可达 100 万字符。
+pub struct LedgerOutput {
+    pub state: String,
+    pub output: Option<String>,
+    pub output_truncated: bool,
+    pub result_digest: Option<String>,
+}
+
+/// 台账读端。`peco-core` 不感知 SQLite，实现由宿主注入（daemon 指向 `d_dispatches`）。
+///
+/// 手写 `Pin<Box<dyn Future>>` 而不是引入 `async-trait`：与本文件的 `ToolDyn::call`
+/// 保持同一种形状，少一个只在少数 trait 上生效的宏。
+pub trait TaskLedger: Send + Sync {
+    /// 只返回终态行：运行中的任务没有可交付的正文，回退会把「本进程没有句柄」
+    /// 谎报成「有」。
+    fn find_terminal<'a>(
+        &'a self,
+        work_dir: &Path,
+        task_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LedgerTask>, String>> + Send + 'a>>;
+
+    /// 按 task 取正文，`action=output` 的唯一来源。
+    ///
+    /// 与 [`Self::find_terminal`] 分开：呈现用的快照走预览，而分页要的是原样
+    /// 正文，不该先经过那条路径。
+    fn find_output<'a>(
+        &'a self,
+        work_dir: &Path,
+        task_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LedgerOutput>, String>> + Send + 'a>>;
+}
+
 /// 默认实现：读 `.workspace.json`、校验团队，再在阻塞线程池里 `WorkSpace::open`。
 struct RealOpener;
 
@@ -244,6 +305,8 @@ pub struct WorkspaceHub {
     /// `None` = 每次打开时从进程级 [`SystemConfig`] 读取（生产路径）。
     config: Option<Arc<SystemConfig>>,
     opener: Arc<dyn WorkspaceOpener>,
+    /// `None` = 只认本进程的 Hub；测试与无台账宿主保持零侵入。
+    ledger: Option<Arc<dyn TaskLedger>>,
     instances: RwLock<HashMap<PathBuf, Arc<dyn WorkspaceHandle>>>,
     /// 正在关闭的目录：`get` 返回 `None`，`ensure_open` 返回 `Busy`。
     /// 实例仍留在 `instances` 里，直到 `finish_close` 摘除并在锁外 drop。
@@ -268,6 +331,7 @@ impl WorkspaceHub {
         Self {
             config: None,
             opener: Arc::new(RealOpener),
+            ledger: None,
             instances: RwLock::new(HashMap::new()),
             closing: RwLock::new(HashSet::new()),
             open_locks: Mutex::new(HashMap::new()),
@@ -287,6 +351,17 @@ impl WorkspaceHub {
     pub fn with_opener(mut self, opener: Arc<dyn WorkspaceOpener>) -> Self {
         self.opener = opener;
         self
+    }
+
+    /// 注入台账读端：跨重启查终态任务的正文靠它，缺省时只认本进程的 Hub。
+    pub fn with_ledger(mut self, ledger: Arc<dyn TaskLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// 事后注入：Hub 已经进了 `Arc` 的宿主走这条（`with_ledger` 拿不到所有权）。
+    pub fn set_ledger(&mut self, ledger: Arc<dyn TaskLedger>) {
+        self.ledger = Some(ledger);
     }
 
     /// 关闭 `label` 一致性校验（默认开启）。
@@ -408,13 +483,145 @@ impl WorkspaceHub {
 
     /// 读取目标空间里的任务快照。不会自动打开空间：新建的 Hub 不认识旧 task_id，
     /// 自动打开只会把「没有」谎报成「有」。
+    ///
+    /// 本进程的 Hub 明确不认识这个 id 时，去台账找它的终态行：那是重启之后唯一
+    /// 还留着正文的地方。台账也查不到才报「不存在」。
     pub async fn task_snapshot(
         &self,
         dir: &Path,
         id: TaskId,
     ) -> Result<TaskSnapshot, WorkspaceToolError> {
         let hub = self.runtime_for(dir)?.hub()?;
-        Ok(hub.snapshot(&id).await?)
+        match hub.snapshot(&id).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(MachineError::NotFound { .. }) => match self.ledger_snapshot(dir, id).await? {
+                Some(snapshot) => Ok(snapshot),
+                None => Err(MachineError::NotFound { id }.into()),
+            },
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// 台账里这条任务的终态快照；台账读不到或没有终态行时 `None`。
+    async fn ledger_snapshot(
+        &self,
+        dir: &Path,
+        id: TaskId,
+    ) -> Result<Option<TaskSnapshot>, WorkspaceToolError> {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return Ok(None);
+        };
+        let row = ledger
+            .find_terminal(&canonical(dir), &id.to_string())
+            .await
+            .map_err(WorkspaceToolError::Ledger)?;
+        Ok(row.and_then(|row| snapshot_from_ledger(id, row)))
+    }
+
+    /// `action=output` 的取数：本进程的活任务优先，其次台账。
+    ///
+    /// 与 [`Self::task_snapshot`] 同一条回退纪律（在飞的行不得谎报成有），但给的
+    /// 是原样正文 —— 分页要的是原文，不是已经裁过的呈现预览。
+    async fn task_output(&self, dir: &Path, id: TaskId) -> Result<TaskOutput, WorkspaceToolError> {
+        let hub = self.runtime_for(dir)?.hub()?;
+        let snapshot = match hub.snapshot(&id).await {
+            Ok(snapshot) => snapshot,
+            Err(MachineError::NotFound { .. }) => return self.ledger_output(dir, id).await,
+            Err(err) => return Err(err.into()),
+        };
+        if !snapshot.state.is_terminal() {
+            return Ok(TaskOutput {
+                source: SOURCE_LIVE,
+                retention: None,
+                body: None,
+                digest: None,
+                note: Some(format!(
+                    "任务尚未终态（{}），没有可交付的正文；用 action=status 查看进度",
+                    snapshot.state.as_str()
+                )),
+            });
+        }
+        let body = text_output(&snapshot);
+        let note = match snapshot
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.output.as_ref())
+        {
+            Some(tagged) if body.is_none() => Some(format!(
+                "正文不是文本载荷（tag={}），无法按字符分页",
+                tagged.tag
+            )),
+            Some(_) => None,
+            None => Some("任务终态但没有正文载荷".to_string()),
+        };
+        Ok(TaskOutput {
+            source: SOURCE_LIVE,
+            retention: Some(if body.is_some() {
+                RETENTION_FULL
+            } else {
+                RETENTION_NONE
+            }),
+            body: body.map(str::to_string),
+            digest: None,
+            note,
+        })
+    }
+
+    /// 台账里这条终态行的正文；与 [`Self::ledger_snapshot`] 一样，没有终态行即不存在。
+    async fn ledger_output(
+        &self,
+        dir: &Path,
+        id: TaskId,
+    ) -> Result<TaskOutput, WorkspaceToolError> {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return Err(MachineError::NotFound { id }.into());
+        };
+        let row = ledger
+            .find_output(&canonical(dir), &id.to_string())
+            .await
+            .map_err(WorkspaceToolError::Ledger)?;
+        let Some(LedgerOutput {
+            state,
+            output,
+            output_truncated,
+            result_digest,
+        }) = row
+        else {
+            return Err(MachineError::NotFound { id }.into());
+        };
+        if ledger_terminal_state(id, &state).is_none() {
+            return Err(MachineError::NotFound { id }.into());
+        }
+        let (body, digest, note) = match (output, result_digest) {
+            (Some(output), _) => {
+                let note = output_truncated.then(|| {
+                    "台账正文在落库时已按上限截断，原文更长；这里读到的是已留存部分".to_string()
+                });
+                (Some(output), None, note)
+            }
+            (None, Some(digest)) => (
+                None,
+                Some(digest),
+                Some("全文未留存（任务早于 v11）：下面是摘要，原文长度不可考".to_string()),
+            ),
+            (None, None) => (
+                None,
+                None,
+                Some("台账里既没有正文也没有摘要，这次输出无法取回".to_string()),
+            ),
+        };
+        let retention = match (&body, &digest) {
+            (Some(_), _) => RETENTION_FULL,
+            (None, Some(_)) => RETENTION_DIGEST_ONLY,
+            (None, None) => RETENTION_NONE,
+        };
+        Ok(TaskOutput {
+            source: SOURCE_LEDGER,
+            retention: Some(retention),
+            body,
+            digest,
+            note,
+        })
     }
 
     /// 列出目标空间里当前可观察的任务快照。
@@ -437,6 +644,8 @@ impl WorkspaceHub {
     }
 
     /// 等待目标空间里的任务进入终态。超时只返回错误，不取消任务。
+    ///
+    /// 台账命中即视为终态（`find_terminal` 只取终态行），故不再等。
     pub async fn await_task(
         &self,
         dir: &Path,
@@ -444,7 +653,14 @@ impl WorkspaceHub {
         timeout: Option<Duration>,
     ) -> Result<TaskSnapshot, WorkspaceToolError> {
         let hub = self.runtime_for(dir)?.hub()?;
-        Ok(hub.await_terminal(&id, timeout).await?)
+        match hub.await_terminal(&id, timeout).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(MachineError::NotFound { .. }) => match self.ledger_snapshot(dir, id).await? {
+                Some(snapshot) => Ok(snapshot),
+                None => Err(MachineError::NotFound { id }.into()),
+            },
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// 请求取消目标空间里的任务（幂等，只记录请求）。
@@ -1104,10 +1320,176 @@ impl ToolDyn for DispatchToWorkspace {
 }
 
 // ============================================================================
+// 台账回退 — 换进程之后唯一能重建的副本
+// ============================================================================
+
+/// 台账行 → 快照。
+///
+/// `None` 表示这一行在快照模型里无法表示（状态串不认识，或它不是终态）：宁可
+/// 报「不存在」，也不编一个终态 —— 编出来的状态会被下游当成事实使用。
+fn snapshot_from_ledger(id: TaskId, row: LedgerTask) -> Option<TaskSnapshot> {
+    let state = ledger_terminal_state(id, &row.state)?;
+    // 台账只记终态时间，创建时间已不可考：用它比用「现在」更接近事实。
+    let at = row
+        .terminal_at
+        .as_deref()
+        .and_then(parse_ledger_time)
+        .unwrap_or_else(Utc::now);
+    let mut labels = BTreeMap::new();
+    labels.insert(LABEL_SOURCE.to_string(), SOURCE_LEDGER.to_string());
+    // 摘要只在确实存在时才是「只剩摘要」：两样都没有时说成摘要，
+    // 读取侧就会把空正文报成有损。
+    let retention = if row.output.is_some() {
+        RETENTION_FULL
+    } else if row.result_digest.is_some() {
+        RETENTION_DIGEST_ONLY
+    } else {
+        RETENTION_NONE
+    };
+    labels.insert(LABEL_OUTPUT_RETENTION.to_string(), retention.to_string());
+    if row.output_truncated {
+        // 落库上限截断过：手上这份不是原文的完整副本，长度也就不是总长。
+        labels.insert(
+            LABEL_OUTPUT_TRUNCATED.to_string(),
+            TRUNCATED_LABEL.to_string(),
+        );
+    }
+    Some(TaskSnapshot {
+        id,
+        // 台账不存 machine `kind`：它是 Hub 内部概念，编一个会被当成真的。
+        kind: String::new(),
+        state,
+        state_detail: None,
+        progress: Progress {
+            phase: None,
+            current: None,
+            total: None,
+        },
+        // 正文走 `outcome.output` 一条路：尾窗是 Hub 的观察缓冲，台账里没有。
+        output: OutputView {
+            tail: Vec::new(),
+            start_offset: 0,
+            end_offset: 0,
+        },
+        outcome: Some(TaskOutcome {
+            output: row.output.or(row.result_digest).map(|text| TaggedJson {
+                tag: "text".to_string(),
+                payload: Value::String(text),
+            }),
+            error: None,
+        }),
+        artifacts: Vec::new(),
+        deadline: None,
+        // 提交人不在台账里：这是系统从台账读回的副本，不冒充某个 principal。
+        source: TaskSource::System {
+            component: "task_ledger".to_string(),
+        },
+        labels,
+        scope: None,
+        created_at: at,
+        updated_at: at,
+        last_seq: 0,
+    })
+}
+
+/// 台账行的状态串 → 终态。
+///
+/// 认不出的串与「不是终态」都返回 `None`：`terminal_at` 非空只是写入侧的动作，
+/// 不能拿它反推状态机里的终态，否则一个写入侧的错误就会变成「有结果可读」。
+fn ledger_terminal_state(id: TaskId, raw: &str) -> Option<TaskState> {
+    let Some(state) = TaskState::parse(raw) else {
+        warn!(
+            task_id = %id,
+            state = %raw,
+            "ledger row has no matching task state; ignored"
+        );
+        return None;
+    };
+    if !state.is_terminal() {
+        warn!(
+            task_id = %id,
+            state = %raw,
+            "ledger row is not terminal; ignored"
+        );
+        return None;
+    }
+    Some(state)
+}
+
+/// 台账时间戳是 SQLite 的 `datetime('now')`：UTC，无时区后缀。
+fn parse_ledger_time(text: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+// ============================================================================
 // inspect_workspace_task
 // ============================================================================
 
-/// 跨空间任务的事后查询：`status` / `await` / `cancel`。
+/// `action=output` 的一次取数：原样正文，以及「取不到时为什么」。
+struct TaskOutput {
+    /// `live` 是本进程的 Hub，`ledger` 是台账。
+    source: &'static str,
+    /// 留存口径：与 `status` 同名同值，调用方不必从 `body` / `digest` 的有无反推。
+    /// 任务未终态时还谈不上留存，给 `None`。
+    retention: Option<&'static str>,
+    /// 原样正文；`None` 表示这条任务给不出可读正文（原因在 `note`）。
+    body: Option<String>,
+    /// 只剩摘要的行才有：台账摘要，不是正文。
+    digest: Option<String>,
+    note: Option<String>,
+}
+
+/// 一页正文 + 下一页的位置。
+///
+/// `offset` / `limit` 都按字符：切在字节上会把一个汉字劈成两半，取回来的正文
+/// 本身就坏了。
+fn render_task_output(
+    task_id: TaskId,
+    page: TaskOutput,
+    offset: usize,
+    limit: usize,
+) -> Result<String, WorkspaceToolError> {
+    let (body, next_offset, total_chars) = match page.body.as_deref() {
+        Some(text) => {
+            let total = text.chars().count();
+            if offset > total {
+                return Err(WorkspaceToolError::InvalidArgument(format!(
+                    "offset {offset} is past the end of the body ({total} chars)"
+                )));
+            }
+            let end = offset.saturating_add(limit).min(total);
+            let chunk: String = text.chars().skip(offset).take(end - offset).collect();
+            let next = if end < total { json!(end) } else { Value::Null };
+            (json!(chunk), next, json!(total))
+        }
+        // 没有正文可给时长度也只在摘要这一种情形下可知。
+        None => {
+            let total = page
+                .digest
+                .as_deref()
+                .map_or(Value::Null, |digest| json!(digest.chars().count()));
+            (Value::Null, Value::Null, total)
+        }
+    };
+    let report = json!({
+        "action": "output",
+        "task_id": task_id.to_string(),
+        "source": page.source,
+        "output_retention": page.retention,
+        "offset": offset,
+        "limit": limit,
+        "total_chars": total_chars,
+        "next_offset": next_offset,
+        "body": body,
+        "digest": page.digest,
+        "note": page.note,
+    });
+    Ok(serde_json::to_string_pretty(&report).expect("an output report is always serializable"))
+}
+
+/// 跨空间任务的事后查询：`status` / `await` / `cancel` / `output`。
 pub struct InspectWorkspaceTask {
     hub: Weak<WorkspaceHub>,
 }
@@ -1134,7 +1516,10 @@ impl ToolDyn for InspectWorkspaceTask {
                 (default 300) elapses; a wait timeout never cancels the task. action=cancel \
                 requests cancellation; it is idempotent and returns once the request is recorded, \
                 not when the task converged. Tasks submitted with wait=false are not canceled by \
-                the parent turn ending."
+                the parent turn ending. status and await only carry an 8 KB tail preview; \
+                action=output is the only way to read the stored body of a terminal task, paged by \
+                offset and limit in characters, and it says so when the ledger kept only a digest \
+                or the body was truncated at persistence."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1150,8 +1535,8 @@ impl ToolDyn for InspectWorkspaceTask {
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["status", "await", "cancel"],
-                        "description": "status: read the current state. await: wait for a terminal state or timeout. cancel: request cancellation."
+                        "enum": ["status", "await", "cancel", "output"],
+                        "description": "status: read the current state. await: wait for a terminal state or timeout. cancel: request cancellation. output: page the raw body of a terminal task."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -1159,6 +1544,19 @@ impl ToolDyn for InspectWorkspaceTask {
                         "maximum": MAX_TIMEOUT_SECS,
                         "default": DEFAULT_TIMEOUT_SECS,
                         "description": "Upper bound for action=await. Expiry is not a cancellation."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "action=output only: character offset of the first character to return."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_OUTPUT_LIMIT_CHARS,
+                        "default": DEFAULT_OUTPUT_LIMIT_CHARS,
+                        "description": "action=output only: characters per page. Raise it only when the remaining body is known to be short."
                     }
                 }
             }),
@@ -1177,14 +1575,31 @@ impl ToolDyn for InspectWorkspaceTask {
                 task_id: String,
                 action: String,
                 timeout_secs: Option<u64>,
+                offset: Option<usize>,
+                limit: Option<usize>,
             }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             let action = parsed.action.as_str();
-            if !matches!(action, "status" | "await" | "cancel") {
+            if !matches!(action, "status" | "await" | "cancel" | "output") {
                 return Err(ToolError::ToolCallError(Box::new(StringError(
-                    "action must be one of: status, await, cancel".to_string(),
+                    "action must be one of: status, await, cancel, output".to_string(),
                 ))));
+            }
+            // 静默忽略一个改错行为的入参，比报错更难查：分页参数只属于 output。
+            if action != "output" && (parsed.offset.is_some() || parsed.limit.is_some()) {
+                return Err(WorkspaceToolError::InvalidArgument(
+                    "offset and limit only apply to action=output".to_string(),
+                )
+                .into());
+            }
+            let offset = parsed.offset.unwrap_or(0);
+            let limit = parsed.limit.unwrap_or(DEFAULT_OUTPUT_LIMIT_CHARS);
+            if !(1..=MAX_OUTPUT_LIMIT_CHARS).contains(&limit) {
+                return Err(WorkspaceToolError::InvalidArgument(format!(
+                    "limit must be in 1..={MAX_OUTPUT_LIMIT_CHARS}, got {limit}"
+                ))
+                .into());
             }
             let id = Uuid::parse_str(&parsed.task_id).map(TaskId).map_err(|_| {
                 ToolError::ToolCallError(Box::new(StringError(format!(
@@ -1231,6 +1646,13 @@ impl ToolDyn for InspectWorkspaceTask {
                     };
                     Ok(Content::Text(render_task_await(&snapshot, timed_out)))
                 }
+                "output" => {
+                    let page = hub
+                        .task_output(&dir, id)
+                        .await
+                        .map_err(|err| task_error(&dir, id, err))?;
+                    Ok(Content::Text(render_task_output(id, page, offset, limit)?))
+                }
                 _ => {
                     // 请求前快照是 `already_terminal` 的唯一判据。
                     let before = hub
@@ -1273,6 +1695,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::agent::hooks::MAX_DIGEST_CHARS;
     use crate::agent::test_support::{
         GateTool, completed, scripted_agent, scripted_agent_with_tools, tool_call_response,
     };
@@ -2115,6 +2538,21 @@ mod tests {
         assert_eq!(status["found"], json!(true));
         assert_eq!(status["task"]["state"], json!("completed"));
         assert_eq!(status["task"]["output"], json!("done"));
+        assert_eq!(
+            status["task"]["source"],
+            json!("live"),
+            "本进程的活任务必须自报 live"
+        );
+        assert_eq!(
+            status["task"]["output_retention"],
+            json!("full"),
+            "活任务有正文就是 full：这里没有台账可查，恒置 none 会撒谎"
+        );
+        assert_eq!(
+            status["task"]["note"],
+            Value::Null,
+            "全文在手上时不该有缺失提示"
+        );
 
         let awaited = report_json(
             &inspect_text(
@@ -2241,7 +2679,804 @@ mod tests {
             .expect_err("unknown actions must be rejected");
         assert_eq!(
             err.to_string(),
-            "action must be one of: status, await, cancel"
+            "action must be one of: status, await, cancel, output"
+        );
+    }
+
+    // ── 台账回退：换进程之后正文只能从 d_dispatches 那一侧重建 ──────────────
+
+    /// 台账读端的替身，与 SQL 实现守同一条纪律：只回终态行。
+    #[derive(Default)]
+    struct FakeLedger {
+        rows: Mutex<Vec<(PathBuf, LedgerTask)>>,
+    }
+
+    impl FakeLedger {
+        fn insert(&self, dir: &Path, row: LedgerTask) {
+            self.rows.lock().unwrap().push((canonical(dir), row));
+        }
+
+        fn with_row(dir: &Path, row: LedgerTask) -> Arc<Self> {
+            let ledger = Arc::new(Self::default());
+            ledger.insert(dir, row);
+            ledger
+        }
+    }
+
+    impl TaskLedger for FakeLedger {
+        fn find_terminal<'a>(
+            &'a self,
+            work_dir: &Path,
+            task_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<LedgerTask>, String>> + Send + 'a>> {
+            let hit = self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(dir, row)| {
+                    dir == work_dir && row.task_id == task_id && row.terminal_at.is_some()
+                })
+                .map(|(_, row)| row.clone());
+            Box::pin(async move { Ok(hit) })
+        }
+
+        fn find_output<'a>(
+            &'a self,
+            work_dir: &Path,
+            task_id: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<LedgerOutput>, String>> + Send + 'a>>
+        {
+            let hit = self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(dir, row)| {
+                    dir == work_dir && row.task_id == task_id && row.terminal_at.is_some()
+                })
+                .map(|(_, row)| LedgerOutput {
+                    state: row.state.clone(),
+                    output: row.output.clone(),
+                    output_truncated: row.output_truncated,
+                    result_digest: row.result_digest.clone(),
+                });
+            Box::pin(async move { Ok(hit) })
+        }
+    }
+
+    fn ledger_row(
+        id: TaskId,
+        state: &str,
+        output: Option<&str>,
+        digest: Option<&str>,
+    ) -> LedgerTask {
+        LedgerTask {
+            task_id: id.to_string(),
+            state: state.to_string(),
+            output: output.map(str::to_string),
+            output_truncated: false,
+            result_digest: digest.map(str::to_string),
+            terminal_at: Some("2026-01-01 00:00:00".to_string()),
+            dispatch_id: Some("disp-1".to_string()),
+        }
+    }
+
+    /// 一个「重启过」的 Hub：空间刚打开，没有任何任务槽，台账里躺着终态行。
+    fn restarted_hub(dir: &Path, ledger: Arc<FakeLedger>) -> Arc<WorkspaceHub> {
+        let (agent, _provider) = scripted_agent(vec![]);
+        let hub = Arc::new(
+            WorkspaceHub::with_system_config(Arc::new(test_config()))
+                .with_ledger(ledger as Arc<dyn TaskLedger>),
+        );
+        hub.insert_for_test(dir, fake_handle("alice", agent, test_runtime()));
+        hub
+    }
+
+    /// 台账全文：正文与总长都完整，`status` 与 `await` 都走这条路。
+    ///
+    /// 变异点：删掉 `task_snapshot` / `await_task` 的台账回退 ⇒ 两条断言一起退化成
+    /// "not found in workspace"。
+    #[tokio::test]
+    async fn a_new_hub_serves_the_terminal_body_from_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        // 纯 ASCII：切点必然落在字符边界上，缺口量可以逐字节对上。
+        let body = format!("{}TAIL-MARK-UNIQUE", "x".repeat(12_000));
+        let digest: String = body.chars().take(MAX_DIGEST_CHARS).collect();
+        let ledger = FakeLedger::with_row(
+            dir.path(),
+            ledger_row(id, "completed", Some(&body), Some(&digest)),
+        );
+        let hub = restarted_hub(dir.path(), ledger);
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+        let args = |action: &str| {
+            json!({
+                "dir": dir.path().display().to_string(),
+                "task_id": id.to_string(),
+                "action": action
+            })
+        };
+
+        let status = report_json(&inspect_text(&tool, args("status")).await);
+        let task = &status["task"];
+        assert_eq!(task["state"], json!("completed"));
+        assert_eq!(task["source"], json!("ledger"), "必须自报来自台账");
+        assert_eq!(
+            task["output_retention"],
+            json!("full"),
+            "有正文就是 full，不能靠 note 文案让调用方猜"
+        );
+        assert_eq!(task["terminal"], json!(true));
+        let output = task["output"].as_str().expect("正文必须可读");
+        assert!(
+            output.ends_with("TAIL-MARK-UNIQUE"),
+            "尾部必须在：{output:?}"
+        );
+        assert!(
+            output.chars().count() > MAX_DIGEST_CHARS,
+            "给的是全文而不是 512 字摘要"
+        );
+        assert_eq!(task["output_total_bytes"], json!(body.len()));
+        assert_eq!(
+            task["output_omitted_head_bytes"],
+            json!(body.len() - output.len()),
+            "丢掉的头部长必须等于实测的缺口"
+        );
+        assert_eq!(task["output_bytes"], json!(output.len()));
+        let note = task["note"].as_str().expect("尾窗之外还有正文时必须给取法");
+        assert!(note.contains("action=output"), "{note}");
+        assert!(
+            note.contains(&body.chars().count().to_string()),
+            "提示里的 N 必须是全文的字符数：{note}"
+        );
+
+        let awaited = report_json(&inspect_text(&tool, args("await")).await);
+        assert_eq!(awaited["action"], json!("await"));
+        assert_eq!(awaited["timed_out"], json!(false), "台账命中即视为终态");
+        assert_eq!(awaited["task"]["source"], json!("ledger"));
+        assert_eq!(awaited["task"]["state"], json!("completed"));
+        assert_eq!(
+            awaited["task"]["output_retention"],
+            json!("full"),
+            "await 与 status 同口径"
+        );
+    }
+
+    /// 历史行（`output IS NULL`）只剩摘要：必须如实标注，不能用摘要冒充全文。
+    ///
+    /// 变异点：`digest_only` 不置 `output_truncated` / `note` ⇒ 断言红。
+    #[tokio::test]
+    async fn a_legacy_ledger_row_is_reported_as_a_digest_not_as_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let digest = "摘".repeat(MAX_DIGEST_CHARS);
+        let ledger =
+            FakeLedger::with_row(dir.path(), ledger_row(id, "completed", None, Some(&digest)));
+        let hub = restarted_hub(dir.path(), ledger);
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+
+        let labels = hub
+            .task_snapshot(dir.path(), id)
+            .await
+            .expect("台账命中")
+            .labels;
+        assert_eq!(labels.get("source").map(String::as_str), Some("ledger"));
+        assert_eq!(
+            labels.get("output_retention").map(String::as_str),
+            Some("digest_only")
+        );
+
+        let status = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": dir.path().display().to_string(),
+                    "task_id": id.to_string(),
+                    "action": "status"
+                }),
+            )
+            .await,
+        );
+        let task = &status["task"];
+        assert_eq!(task["output"], json!(digest));
+        assert_eq!(
+            task["output_retention"],
+            json!("digest_only"),
+            "摘要代原文必须自报 digest_only"
+        );
+        assert_eq!(task["output_truncated"], json!(true));
+        assert_eq!(
+            task["output_lossy"],
+            json!(true),
+            "摘要不是原文，正文本身就是有损的"
+        );
+        assert_eq!(
+            task["output_total_bytes"],
+            Value::Null,
+            "原文总长不可知，不能拿摘要长度顶替"
+        );
+        let note = task["note"].as_str().expect("摘要必须自带提示");
+        assert!(note.contains("全文未留存"), "{note}");
+        assert!(note.contains(&MAX_DIGEST_CHARS.to_string()), "{note}");
+    }
+
+    /// 认不出的留存口径给 `null`（键仍在），而不是猜一个值。
+    ///
+    /// 变异点：缺标签时默认 `full` / 干脆不插字段 ⇒ 断言红。
+    #[test]
+    fn a_ledger_snapshot_without_a_retention_label_reports_null() {
+        let id = TaskId(Uuid::new_v4());
+        let mut snapshot =
+            snapshot_from_ledger(id, ledger_row(id, "completed", Some("正文"), None))
+                .expect("终态行必须能重建快照");
+        snapshot.labels.remove(LABEL_OUTPUT_RETENTION);
+        snapshot.labels.remove(LABEL_OUTPUT_TRUNCATED);
+
+        let report = report_json(&render_task_status(&snapshot));
+        assert_eq!(
+            report["task"].get("output_retention"),
+            Some(&Value::Null),
+            "口径未知时必须给 null，且键不能消失"
+        );
+    }
+
+    /// 落库时被上限截断过的正文：长度不再是原文总长，必须报「不可知」。
+    ///
+    /// 变异点：`output_truncated` 不进 labels / 读取侧不看它 ⇒ 这里会报一个
+    /// 比原文小的总长度，读者据此以为任务只产出了这么多。
+    #[tokio::test]
+    async fn a_persist_truncated_body_reports_an_unknown_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let mut row = ledger_row(id, "completed", Some(&"x".repeat(20_000)), None);
+        row.output_truncated = true;
+        let hub = restarted_hub(dir.path(), FakeLedger::with_row(dir.path(), row));
+
+        let snapshot = hub.task_snapshot(dir.path(), id).await.expect("台账命中");
+        assert_eq!(
+            snapshot.labels.get("output_retention").map(String::as_str),
+            Some("full"),
+            "正文仍然在，只是被截断过"
+        );
+        assert_eq!(
+            snapshot.labels.get("output_truncated").map(String::as_str),
+            Some("true")
+        );
+
+        let report = report_json(&render_task_status(&snapshot));
+        let task = &report["task"];
+        assert_eq!(task["output_total_bytes"], Value::Null);
+        assert_eq!(task["output_omitted_head_bytes"], Value::Null);
+        assert_eq!(task["output_truncated"], json!(true));
+    }
+
+    /// 活任务的全文出口：按字符分页，`next_offset` 到位即 `null`。
+    ///
+    /// 变异点：分页退化成「一次返整段」⇒ 第一页的 `body` 与 `next_offset` 断言红；
+    /// 把 `offset` 当字节用 ⇒ 汉字被劈开、拼回来的正文与原文不等（CJK 正文那条）。
+    #[tokio::test]
+    async fn action_output_pages_the_live_body_by_characters() {
+        let (agent, _provider) = scripted_agent(vec![completed("重构完成")]);
+        let runtime = test_runtime();
+        let hub = Arc::new(WorkspaceHub::with_system_config(Arc::new(test_config())));
+        let dir = tempfile::tempdir().unwrap();
+        hub.insert_for_test(dir.path(), fake_handle("alice", agent, runtime.clone()));
+        let receipt = hub
+            .dispatch(dir.path(), "hi", true, None, Some(5), None)
+            .await
+            .expect("dispatch");
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+
+        let first = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": receipt.workspace,
+                    "task_id": receipt.task_id,
+                    "action": "output",
+                    "limit": 3
+                }),
+            )
+            .await,
+        );
+        assert_eq!(first["action"], json!("output"));
+        assert_eq!(first["source"], json!("live"));
+        assert_eq!(
+            first["output_retention"],
+            json!("full"),
+            "有正文可取就是 full"
+        );
+        assert_eq!(first["offset"], json!(0));
+        assert_eq!(first["limit"], json!(3));
+        assert_eq!(first["total_chars"], json!(4));
+        assert_eq!(first["body"], json!("重构完"), "按字符切，不按字节");
+        assert_eq!(first["next_offset"], json!(3));
+        assert_eq!(first["note"], Value::Null, "正文在手上时不该有缺失提示");
+
+        let second = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": receipt.workspace,
+                    "task_id": receipt.task_id,
+                    "action": "output",
+                    "offset": 3,
+                    "limit": 3
+                }),
+            )
+            .await,
+        );
+        assert_eq!(second["body"], json!("成"));
+        assert_eq!(
+            second["next_offset"],
+            Value::Null,
+            "没有更多时必须给 null，而不是总长"
+        );
+
+        // 越界不是「空页」：静默给空串会让调用方以为读完了。
+        let err = tool
+            .call(
+                json!({
+                    "dir": receipt.workspace,
+                    "task_id": receipt.task_id,
+                    "action": "output",
+                    "offset": 5
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("offset past the end must be rejected");
+        assert!(err.to_string().contains("past the end"), "{err}");
+    }
+
+    /// `action=output` 给的是原样正文：声明行照旧在，只有呈现用的预览才剥它。
+    ///
+    /// 变异点：正文改走 `snapshot_text`（预览那条路）⇒ 声明行从 body 里消失。
+    #[tokio::test]
+    async fn action_output_keeps_the_body_verbatim() {
+        let decl = format!(r#"@@PECO_ARTIFACT {{"path":"{}"}}"#, "/ws/output/a.jpg");
+        let body = format!("开头\n{decl}\n结尾");
+        let (agent, _provider) = scripted_agent(vec![completed(&body)]);
+        let runtime = test_runtime();
+        let hub = Arc::new(WorkspaceHub::with_system_config(Arc::new(test_config())));
+        let dir = tempfile::tempdir().unwrap();
+        hub.insert_for_test(dir.path(), fake_handle("alice", agent, runtime.clone()));
+        let receipt = hub
+            .dispatch(dir.path(), "hi", true, None, Some(5), None)
+            .await
+            .expect("dispatch");
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+
+        let status = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": receipt.workspace,
+                    "task_id": receipt.task_id,
+                    "action": "status"
+                }),
+            )
+            .await,
+        );
+        let preview = status["task"]["output"].as_str().expect("预览必须有正文");
+        assert!(
+            !preview.contains("@@PECO_ARTIFACT"),
+            "声明行不该进模型上下文：{preview:?}"
+        );
+
+        let page = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": receipt.workspace,
+                    "task_id": receipt.task_id,
+                    "action": "output"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(page["body"], json!(body), "分页给的必须是原样正文");
+        assert_eq!(page["total_chars"], json!(body.chars().count()));
+    }
+
+    /// 分页参数只属于 `output`：其它 action 传了必须报错，不能静默忽略。
+    #[tokio::test]
+    async fn action_output_rejects_paging_parameters_on_other_actions() {
+        let tool = InspectWorkspaceTask::new(Weak::new());
+        let err = tool
+            .call(
+                json!({
+                    "dir": "/tmp/anywhere",
+                    "task_id": Uuid::nil().to_string(),
+                    "action": "status",
+                    "offset": 10
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("offset on status must be rejected");
+        assert!(
+            err.to_string().contains("only apply to action=output"),
+            "{err}"
+        );
+
+        let err = tool
+            .call(
+                json!({
+                    "dir": "/tmp/anywhere",
+                    "task_id": Uuid::nil().to_string(),
+                    "action": "await",
+                    "limit": 10
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("limit on await must be rejected");
+        assert!(
+            err.to_string().contains("only apply to action=output"),
+            "{err}"
+        );
+
+        let err = tool
+            .call(
+                json!({
+                    "dir": "/tmp/anywhere",
+                    "task_id": Uuid::nil().to_string(),
+                    "action": "output",
+                    "limit": MAX_OUTPUT_LIMIT_CHARS + 1
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("limit above the cap must be rejected");
+        assert!(err.to_string().contains("limit must be in"), "{err}");
+    }
+
+    /// 在飞的任务没有可交付正文：`body=null` + 提示，而不是报错。
+    ///
+    /// 变异点：不判终态、直接按 `outcome.output` 取 ⇒ `body` 断言红；改成报错 ⇒
+    /// 调用方把「还没跑完」当成「取不到」。
+    #[tokio::test]
+    async fn action_output_on_a_running_task_reports_no_body() {
+        let (agent, entered, _release) = gated_master_agent();
+        let runtime = test_runtime();
+        let hub = Arc::new(WorkspaceHub::with_system_config(Arc::new(test_config())));
+        let dir = tempfile::tempdir().unwrap();
+        hub.insert_for_test(dir.path(), fake_handle("alice", agent, runtime.clone()));
+        let receipt = hub
+            .dispatch(dir.path(), "hi", false, None, None, None)
+            .await
+            .expect("dispatch");
+        entered.notified().await;
+
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+        let report = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": receipt.workspace,
+                    "task_id": receipt.task_id,
+                    "action": "output"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(report["source"], json!("live"));
+        assert_eq!(
+            report.get("output_retention"),
+            Some(&Value::Null),
+            "还没终态就谈不上留存：键必须在，值是 null"
+        );
+        assert_eq!(report["body"], Value::Null, "未完的任务没有正文可给");
+        assert_eq!(report["next_offset"], Value::Null);
+        assert_eq!(report["total_chars"], Value::Null);
+        let note = report["note"].as_str().expect("必须说清为什么没有正文");
+        assert!(note.contains("尚未终态"), "{note}");
+    }
+
+    /// 只剩摘要的行：`body` 必须是 `null`，摘要走 `digest`，长度注明不可考。
+    ///
+    /// 变异点：把摘要塞进 `body` ⇒ `body` 断言红；`total_chars` 填 0 / null ⇒
+    /// 长度断断言红（摘要长度是已知的，原文长度才是不可考的）。
+    #[tokio::test]
+    async fn action_output_refuses_to_invent_a_body_for_a_digest_only_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let digest = "摘".repeat(MAX_DIGEST_CHARS);
+        let hub = restarted_hub(
+            dir.path(),
+            FakeLedger::with_row(dir.path(), ledger_row(id, "completed", None, Some(&digest))),
+        );
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+
+        let report = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": dir.path().display().to_string(),
+                    "task_id": id.to_string(),
+                    "action": "output"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(report["source"], json!("ledger"));
+        assert_eq!(
+            report["output_retention"],
+            json!("digest_only"),
+            "摘要代原文必须自报 digest_only"
+        );
+        assert_eq!(report["body"], Value::Null, "摘要不是正文，不得塞进 body");
+        assert_eq!(report["digest"], json!(digest));
+        assert_eq!(report["total_chars"], json!(MAX_DIGEST_CHARS));
+        assert_eq!(report["next_offset"], Value::Null);
+        let note = report["note"].as_str().expect("必须说清这是摘要");
+        assert!(note.contains("原文长度不可考"), "{note}");
+    }
+
+    /// 台账正文分页：CJK 正文逐字符拼回来必须与原文逐字相等。
+    #[tokio::test]
+    async fn action_output_pages_the_ledger_body_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let body = format!(
+            "HEAD{}MID{}TAIL{}",
+            "中".repeat(7_000),
+            "文".repeat(7_000),
+            "尾".repeat(6_000)
+        );
+        let hub = restarted_hub(
+            dir.path(),
+            FakeLedger::with_row(dir.path(), ledger_row(id, "completed", Some(&body), None)),
+        );
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+        let total_chars = body.chars().count();
+
+        let mut offset = 0usize;
+        let mut assembled = String::new();
+        loop {
+            let page = report_json(
+                &inspect_text(
+                    &tool,
+                    json!({
+                        "dir": dir.path().display().to_string(),
+                        "task_id": id.to_string(),
+                        "action": "output",
+                        "offset": offset,
+                        "limit": 8_000
+                    }),
+                )
+                .await,
+            );
+            assert_eq!(page["source"], json!("ledger"));
+            assert_eq!(page["total_chars"], json!(total_chars));
+            assembled.push_str(page["body"].as_str().expect("body 必须是原文"));
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset as u64, "next_offset 必须前进：{next}");
+                    offset = next as usize;
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(assembled, body, "分页拼回来必须与原文逐字相等");
+        assert!(assembled.contains("HEAD"), "头段标记必须在");
+        assert!(assembled.contains("MID"), "中段标记必须在");
+        assert!(assembled.contains("TAIL"), "尾段标记必须在");
+    }
+
+    /// 既无正文又无摘要：不得报成有损或截断，只说「无法取回」。
+    ///
+    /// 变异点：缺摘要也标 `digest_only` ⇒
+    /// `output_truncated` / `output_lossy` 两条断言红。
+    #[tokio::test]
+    async fn a_ledger_row_without_body_or_digest_reports_nothing_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let hub = restarted_hub(
+            dir.path(),
+            FakeLedger::with_row(dir.path(), ledger_row(id, "completed", None, None)),
+        );
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+
+        let snapshot = hub.task_snapshot(dir.path(), id).await.expect("台账命中");
+        assert_eq!(
+            snapshot.labels.get("output_retention").map(String::as_str),
+            Some("none"),
+            "两样都没有就不是 digest_only"
+        );
+
+        let status = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": dir.path().display().to_string(),
+                    "task_id": id.to_string(),
+                    "action": "status"
+                }),
+            )
+            .await,
+        );
+        let task = &status["task"];
+        assert_eq!(task["output"], Value::Null);
+        assert_eq!(
+            task["output_truncated"],
+            json!(false),
+            "什么都没有留存，不能声称被截断"
+        );
+        assert_eq!(task["output_lossy"], json!(false));
+        assert_eq!(
+            task["output_retention"],
+            json!("none"),
+            "两样都没有是 none，不是 digest_only"
+        );
+        assert_eq!(task["kind"], Value::Null, "台账不存 kind：给 null");
+        let note = task["note"].as_str().expect("必须说清没有留存");
+        assert!(note.contains("无法取回"), "{note}");
+
+        let output = report_json(
+            &inspect_text(
+                &tool,
+                json!({
+                    "dir": dir.path().display().to_string(),
+                    "task_id": id.to_string(),
+                    "action": "output"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(output["body"], Value::Null);
+        assert_eq!(output["digest"], Value::Null);
+        assert_eq!(output["total_chars"], Value::Null);
+        assert_eq!(
+            output["output_retention"],
+            json!("none"),
+            "action=output 与 status 同口径"
+        );
+    }
+
+    /// `terminal_at` 非空但状态不是终态：库外不变式不能当判据。
+    ///
+    /// 变异点：删掉 `state.is_terminal()` 断言 ⇒ 这条从 NotFound 变成一个编出来的
+    /// 快照，`action=output` 也会给出正文。
+    #[tokio::test]
+    async fn a_terminal_timestamp_without_a_terminal_state_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let hub = restarted_hub(
+            dir.path(),
+            FakeLedger::with_row(dir.path(), ledger_row(id, "working", Some("正文"), None)),
+        );
+
+        let err = hub
+            .task_snapshot(dir.path(), id)
+            .await
+            .expect_err("非终态行不得变成快照");
+        assert!(
+            matches!(
+                err,
+                WorkspaceToolError::Machine(MachineError::NotFound { .. })
+            ),
+            "{err}"
+        );
+
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+        let err = tool
+            .call(
+                json!({
+                    "dir": dir.path().display().to_string(),
+                    "task_id": id.to_string(),
+                    "action": "output"
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("非终态行没有正文可取");
+        assert!(err.to_string().contains("not found in workspace"), "{err}");
+    }
+
+    /// 台账读不出来时如实报错，不伪装成「任务不存在」。
+    #[tokio::test]
+    async fn a_failing_ledger_surfaces_its_own_error() {
+        struct BrokenLedger;
+
+        impl TaskLedger for BrokenLedger {
+            fn find_terminal<'a>(
+                &'a self,
+                _work_dir: &Path,
+                _task_id: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<LedgerTask>, String>> + Send + 'a>>
+            {
+                Box::pin(async move { Err("database is locked".to_string()) })
+            }
+
+            fn find_output<'a>(
+                &'a self,
+                _work_dir: &Path,
+                _task_id: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<LedgerOutput>, String>> + Send + 'a>>
+            {
+                Box::pin(async move { Err("database is locked".to_string()) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _provider) = scripted_agent(vec![]);
+        let hub = WorkspaceHub::with_system_config(Arc::new(test_config()))
+            .with_ledger(Arc::new(BrokenLedger));
+        hub.insert_for_test(dir.path(), fake_handle("alice", agent, test_runtime()));
+
+        let err = hub
+            .task_snapshot(dir.path(), TaskId(Uuid::new_v4()))
+            .await
+            .expect_err("台账故障必须显形");
+        assert_eq!(
+            err.to_string(),
+            "task ledger query failed: database is locked",
+            "{err}"
+        );
+    }
+
+    /// 台账里还有在飞的行时不得回退：本进程没有句柄，就不是「有」。
+    ///
+    /// 变异点：回退改判 `terminal_at` ⇒ 这条从 NotFound 变成一个编出来的快照。
+    #[tokio::test]
+    async fn a_running_ledger_row_is_not_served_as_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let mut row = ledger_row(id, "working", Some("半截正文"), None);
+        row.terminal_at = None;
+        let hub = restarted_hub(dir.path(), FakeLedger::with_row(dir.path(), row));
+        let tool = InspectWorkspaceTask::new(Arc::downgrade(&hub));
+
+        let err = hub
+            .task_snapshot(dir.path(), id)
+            .await
+            .expect_err("在飞的行不得回退");
+        assert!(
+            matches!(
+                err,
+                WorkspaceToolError::Machine(MachineError::NotFound { .. })
+            ),
+            "{err}"
+        );
+
+        let err = tool
+            .call(
+                json!({
+                    "dir": dir.path().display().to_string(),
+                    "task_id": id.to_string(),
+                    "action": "status"
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("在飞的行仍要报不存在");
+        assert!(err.to_string().contains("not found in workspace"), "{err}");
+    }
+
+    /// 状态串认不出来时不编一个终态。
+    #[tokio::test]
+    async fn an_unrepresentable_ledger_state_is_not_invented() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = TaskId(Uuid::new_v4());
+        let hub = restarted_hub(
+            dir.path(),
+            FakeLedger::with_row(dir.path(), ledger_row(id, "orphan", Some("正文"), None)),
+        );
+
+        let err = hub
+            .task_snapshot(dir.path(), id)
+            .await
+            .expect_err("未知状态不得变成快照");
+        assert!(
+            matches!(
+                err,
+                WorkspaceToolError::Machine(MachineError::NotFound { .. })
+            ),
+            "{err}"
         );
     }
 
@@ -2255,7 +3490,19 @@ mod tests {
         );
         assert_eq!(
             definition.parameters["properties"]["action"]["enum"],
-            json!(["status", "await", "cancel"])
+            json!(["status", "await", "cancel", "output"])
+        );
+        assert_eq!(
+            definition.parameters["properties"]["limit"]["default"],
+            json!(DEFAULT_OUTPUT_LIMIT_CHARS)
+        );
+        assert_eq!(
+            definition.parameters["properties"]["limit"]["maximum"],
+            json!(MAX_OUTPUT_LIMIT_CHARS)
+        );
+        assert_eq!(
+            definition.parameters["properties"]["offset"]["default"],
+            json!(0)
         );
         assert_eq!(
             definition.parameters["properties"]["timeout_secs"]["maximum"],

@@ -9,6 +9,14 @@ use sqlx::{QueryBuilder, SqlitePool};
 
 pub use crate::db::dispatch_state::{WakeSkipReason, WakeState};
 
+/// [`DispatchRow`] 的列清单：四处查询共用一份，加列时不会漏掉某条路径。
+///
+/// `output` 只取「有没有」，正文由 [`crate::space::ledger`] 按 id 单查。
+const ROW_COLUMNS: &str = "id, task_id, target_ws_id, target_work_dir, target_team_id, \
+     origin_ws_id, agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
+     result_digest, prompt_digest, dispatch_id, created_at, terminal_at, \
+     (output IS NOT NULL) AS has_output";
+
 /// `d_dispatches` 的完整行；HTTP 任务视图直接投影这组列。
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct DispatchRow {
@@ -25,6 +33,8 @@ pub struct DispatchRow {
     /// 仅 `wake_state='skipped'` 时非空；历史行为 `None`（成因不可考）。
     pub wake_skip_reason: Option<String>,
     pub result_digest: Option<String>,
+    /// 终态正文是否留存；正文本身按需单查，列表接口不拖上最多 100 万字符的 `output`。
+    pub has_output: bool,
     /// 派发入参里那段任务描述的前 512 字；旧行是 `None`（当时没有记录）。
     pub prompt_digest: Option<String>,
     /// 派发回执里的 dispatch_id；旧行是 `None`（当时没有记录）。
@@ -254,16 +264,14 @@ pub async fn get_by_task_id(
     pool: &SqlitePool,
     task_id: &str,
 ) -> Result<Option<DispatchRow>, sqlx::Error> {
-    sqlx::query_as::<_, DispatchRow>(
-        "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-         agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
-         FROM d_dispatches WHERE task_id = ? \
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(task_id)
-    .fetch_optional(pool)
-    .await
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM d_dispatches WHERE task_id = ? \
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    sqlx::query_as::<_, DispatchRow>(&sql)
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// 启动对账要逐行点查的台账：只有非终态行需要判断「任务是否还活着」。
@@ -272,10 +280,8 @@ pub async fn get_by_task_id(
 /// 重启时不算」这类漂移无从收敛。
 pub async fn list_active(pool: &SqlitePool) -> Result<Vec<DispatchRow>, sqlx::Error> {
     let sql = format!(
-        "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-         agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
-         FROM d_dispatches WHERE task_state IN ({}) ORDER BY created_at DESC, id DESC",
+        "SELECT {ROW_COLUMNS} FROM d_dispatches WHERE task_state IN ({}) \
+         ORDER BY created_at DESC, id DESC",
         placeholders(TASK_ACTIVE_STATES)
     );
     let mut query = sqlx::query_as::<_, DispatchRow>(&sql);
@@ -290,12 +296,7 @@ pub async fn list(
     pool: &SqlitePool,
     filter: DispatchFilter<'_>,
 ) -> Result<Vec<DispatchRow>, sqlx::Error> {
-    let mut builder = QueryBuilder::new(
-        "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-         agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
-         FROM d_dispatches",
-    );
+    let mut builder = QueryBuilder::new(format!("SELECT {ROW_COLUMNS} FROM d_dispatches"));
     let mut has_where = false;
     if let Some(value) = filter.target_ws_id {
         push_filter_eq(&mut builder, &mut has_where, "target_ws_id", value);
@@ -373,20 +374,46 @@ pub async fn finish(
     task_id: &str,
     state: &str,
     result_digest: Option<&str>,
+    output: Option<&str>,
+    output_truncated: bool,
 ) -> Result<u64, sqlx::Error> {
+    let (output, output_truncated) = bounded_output(output, output_truncated);
     let sql = format!(
         "UPDATE d_dispatches SET task_state = ?, terminal_at = datetime('now'), \
-         result_digest = COALESCE(?, result_digest), {} \
+         result_digest = COALESCE(?, result_digest), output = COALESCE(?, output), \
+         output_truncated = MAX(output_truncated, ?), {} \
          WHERE task_id = ? AND task_state <> 'orphan'",
         queue_awaiting_assignment(),
     );
     let result = sqlx::query(&sql)
         .bind(state)
         .bind(result_digest)
+        .bind(output)
+        .bind(output_truncated)
         .bind(task_id)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+/// 落库正文上限（字符）：台账要留得下全文，但不能再无界增长。
+///
+/// 按字符而不是字节：切在字节上会把一个汉字劈成两半，取回来的正文本身就坏了。
+pub const MAX_PERSISTED_OUTPUT_CHARS: usize = 1_000_000;
+
+/// 落库前的裁剪：返回要写的正文与「这份正文是否已被截断」。
+///
+/// 超限时保留头部并置标志 —— 读者据此知道长度不是原文总长，而不是以为任务
+/// 只产出了这么多。`already_truncated` 是调用方自己的约定：上游交来的正文若
+/// 已是一段前缀，标志必须留下来，不能被这次「没再截断」洗掉。
+fn bounded_output(output: Option<&str>, already_truncated: bool) -> (Option<String>, bool) {
+    let Some(text) = output else {
+        return (None, already_truncated);
+    };
+    match text.char_indices().nth(MAX_PERSISTED_OUTPUT_CHARS) {
+        Some((cut, _)) => (Some(text[..cut].to_string()), true),
+        None => (Some(text.to_string()), already_truncated),
+    }
 }
 
 /// 单行 orphan 化：任务已不可观察（空间关闭、Hub 消失、重订阅耗尽）。
@@ -472,10 +499,8 @@ pub async fn list_pending(
     backoff: RetryBackoff,
 ) -> Result<Vec<DispatchRow>, sqlx::Error> {
     let sql = format!(
-        "SELECT id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-         agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-         result_digest, prompt_digest, dispatch_id, created_at, terminal_at \
-         FROM d_dispatches WHERE wake_state = '{pending}' AND {} ORDER BY created_at, id LIMIT ?",
+        "SELECT {ROW_COLUMNS} FROM d_dispatches WHERE wake_state = '{pending}' AND {} \
+         ORDER BY created_at, id LIMIT ?",
         backoff_predicate(backoff),
         pending = WakeState::Pending.as_str(),
     );
@@ -746,12 +771,21 @@ mod tests {
         seed_skipped(&pool, "d_skipped", WakeSkipReason::NotPecoOrigin).await;
 
         assert_eq!(
-            finish(&pool, "d_live", "completed", Some("12 个测试通过"))
-                .await
-                .unwrap(),
+            finish(
+                &pool,
+                "d_live",
+                "completed",
+                Some("12 个测试通过"),
+                Some("全文正文，长度远超 512 字的摘要"),
+                false
+            )
+            .await
+            .unwrap(),
             1
         );
-        finish(&pool, "d_skipped", "completed", None).await.unwrap();
+        finish(&pool, "d_skipped", "completed", None, None, false)
+            .await
+            .unwrap();
 
         assert_eq!(
             ledger_of(&pool, "d_live").await,
@@ -776,6 +810,90 @@ mod tests {
             ),
             "已跳过的行不因终态被叫醒"
         );
+    }
+
+    /// 正文超上限时保留头部并置标志：字数不再是原文总长，读者必须看得到这一点。
+    ///
+    /// 变异点：`bounded_output` 不截断 ⇒ 字数断言红；截断但不置标志 ⇒
+    /// `output_truncated` 断言红。
+    #[tokio::test]
+    async fn an_over_long_body_is_truncated_at_the_persistence_cap() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_big", "working", WakeState::Awaiting, None).await;
+        let body = "正".repeat(MAX_PERSISTED_OUTPUT_CHARS + 10);
+
+        assert_eq!(
+            finish(&pool, "d_big", "completed", None, Some(&body), false)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let (output, truncated) = sqlx::query_as::<_, (String, i64)>(
+            "SELECT output, output_truncated FROM d_dispatches WHERE id = 'd_big'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            output.chars().count(),
+            MAX_PERSISTED_OUTPUT_CHARS,
+            "按字符截断，保留头部"
+        );
+        assert!(
+            body.starts_with(&output),
+            "留下的必须是原文前缀，不能是重新拼的内容"
+        );
+        assert_eq!(truncated, 1, "超上限必须留下截断标志");
+    }
+
+    /// 上限本身不算截断：恰好 1_000_000 字符原样落库、标志为 0；多一个字符才截。
+    ///
+    /// 变异点：边界写成 `>=` 或 `nth(MAX - 1)` ⇒ 「恰好到上限」那条的正文与标志都红。
+    #[tokio::test]
+    async fn the_persistence_cap_is_inclusive_of_its_last_character() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_exact", "working", WakeState::Awaiting, None).await;
+        seed_row(&pool, "d_over", "working", WakeState::Awaiting, None).await;
+        let exact = "正".repeat(MAX_PERSISTED_OUTPUT_CHARS);
+
+        assert_eq!(
+            finish(&pool, "d_exact", "completed", None, Some(&exact), false)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            finish(
+                &pool,
+                "d_over",
+                "completed",
+                None,
+                Some(&format!("{exact}多")),
+                false
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        let (output, truncated) = sqlx::query_as::<_, (String, i64)>(
+            "SELECT output, output_truncated FROM d_dispatches WHERE id = 'd_exact'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(output, exact, "恰好到上限必须原样落库");
+        assert_eq!(truncated, 0, "没超过上限，不得置截断标志");
+
+        let (output, truncated) = sqlx::query_as::<_, (String, i64)>(
+            "SELECT output, output_truncated FROM d_dispatches WHERE id = 'd_over'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(output, exact, "多一个字符也只留到上限为止");
+        assert_eq!(truncated, 1, "截断过就必须留标志");
     }
 
     /// `awaiting` 不进待投递队列：任务还没终态，此刻投出去只能报一个中间态，而

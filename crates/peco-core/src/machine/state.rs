@@ -36,6 +36,26 @@ impl TaskState {
         }
     }
 
+    /// [`Self::as_str`] 的逆运算：台账与接口里的状态串要能回到具体状态。
+    ///
+    /// 不认识的串返回 `None` 而不猜一个：调用方据此决定「这条记录无法表示」，
+    /// 编一个状态只会把未知当成已知。两处映射必须一起改。
+    pub fn parse(value: &str) -> Option<Self> {
+        let state = match value {
+            "submitted" => Self::Submitted,
+            "working" => Self::Working,
+            "input_required" => Self::InputRequired,
+            "auth_required" => Self::AuthRequired,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "canceled" => Self::Canceled,
+            "timed_out" => Self::TimedOut,
+            "rejected" => Self::Rejected,
+            _ => return None,
+        };
+        Some(state)
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -214,6 +234,28 @@ mod tests {
                 "serde name drifted from as_str: state={state:?}"
             );
         }
+    }
+
+    /// `as_str` 与 `parse` 互为逆运算：九种状态逐条往返，认不出的串必须给 `None`。
+    ///
+    /// 变异点：`parse` 漏掉任一分支 ⇒ 该状态的往返断言红；`parse` 对未知串猜一个
+    /// 状态 ⇒ 末尾三条断言红。
+    #[test]
+    fn parse_round_trips_every_wire_name() {
+        for state in ALL_STATES {
+            assert_eq!(
+                TaskState::parse(state.as_str()),
+                Some(state),
+                "wire name is not reversible: state={state:?}"
+            );
+        }
+        assert_eq!(TaskState::parse("orphan"), None);
+        assert_eq!(TaskState::parse(""), None);
+        assert_eq!(
+            TaskState::parse("Completed"),
+            None,
+            "状态串是小写 snake_case，大小写不是同一个值"
+        );
     }
 
     #[test]

@@ -251,6 +251,10 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
     prompt_digest   TEXT,
     -- 派发回执里的 dispatch_id；旧行留 NULL（当时没有记录）
     dispatch_id     TEXT,
+    -- 终态正文；旧行留 NULL（未留存），读取侧不得用摘要冒充全文
+    output          TEXT,
+    -- 1 = output 在落库时被上限截断，长度不再是原文总长
+    output_truncated INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     terminal_at     TEXT,
     UNIQUE (target_ws_id, task_id)

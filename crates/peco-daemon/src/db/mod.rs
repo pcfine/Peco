@@ -687,6 +687,50 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         );
     }
 
+    // ── Migration 027: d_dispatches.output ────────────────────────────────
+    // 门控查列：ALTER ADD COLUMN 不可重复执行（重跑报 duplicate column name）。
+    let has_dispatch_output = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('d_dispatches') WHERE name = 'output'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_dispatch_output {
+        run_migration(
+            pool,
+            "027",
+            include_str!("migrations/027_dispatch_output.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 027 completed");
+    } else {
+        tracing::debug!("Migration 027 skipped: d_dispatches.output already exists");
+    }
+
+    // ── Migration 028: d_dispatches.output_truncated ──────────────────────
+    // 与 027 各持一条单语句、各查自己那一列：崩溃落在两者之间时，下一次启动
+    // 只会补上缺的那一条。两列挤在一个文件里时，027 的门控会把 028 一起跳过，
+    // 缺列的库上 `finish` 与台账查询双双报 no such column，唤醒便再也发不出去。
+    let has_dispatch_output_truncated = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('d_dispatches') WHERE name = 'output_truncated'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_dispatch_output_truncated {
+        run_migration(
+            pool,
+            "028",
+            include_str!("migrations/028_dispatch_output_truncated.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 028 completed");
+    } else {
+        tracing::debug!("Migration 028 skipped: d_dispatches.output_truncated already exists");
+    }
+
     Ok(())
 }
 

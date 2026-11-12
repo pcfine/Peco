@@ -383,6 +383,14 @@ fn schema_sql_declares_task_state_and_wake_skip_reason() {
         "d_dispatches 建表语句必须带 prompt_digest 列（新库不靠迁移补）"
     );
     assert!(
+        schema.contains("    output          TEXT"),
+        "d_dispatches 建表语句必须带 output 列（新库不靠迁移补）"
+    );
+    assert!(
+        schema.contains("    output_truncated INTEGER NOT NULL DEFAULT 0"),
+        "d_dispatches 建表语句必须带 output_truncated 列"
+    );
+    assert!(
         !before_migrations.contains("idx_dispatches_state"),
         "迁移前段落不得建旧索引：旧库此时还没有 task_state 列"
     );
@@ -807,6 +815,124 @@ async fn migration_026_rebuilds_the_ledger_and_keeps_every_row() {
             .await
             .unwrap();
     assert_eq!(still_awaiting, "awaiting", "重跑迁移不得重建表");
+}
+
+/// 027/028 给旧库补出正文两列，历史行留 `NULL` / `0`：不能替它们编一段正文。
+///
+/// 变异点：把历史行的 `output_truncated` 默认成 1 或写空串 ⇒ 两条断言红；门控
+/// 写成「总是执行」⇒ 第二次 `run_migrations` 撞 duplicate column name。
+#[tokio::test]
+async fn migration_027_adds_the_body_columns_without_touching_historical_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/pre027.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    // 026 之前的库同样缺 027 的两列，且 026 会先把它重建成新形状。
+    pre_026_dispatch_ledger(&pool).await;
+    assert!(
+        !column_names(&pool).await.contains(&"output".to_string()),
+        "夹具需要一份没有 output 的库"
+    );
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    let columns = column_names(&pool).await;
+    assert!(
+        columns.contains(&"output".to_string()),
+        "027 必须补出 output：{columns:?}"
+    );
+    assert!(
+        columns.contains(&"output_truncated".to_string()),
+        "028 必须补出 output_truncated：{columns:?}"
+    );
+    let rows = sqlx::query_as::<_, (String, Option<String>, i64)>(
+        "SELECT id, output, output_truncated FROM d_dispatches ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("d1".to_string(), None, 0),
+            ("d2".to_string(), None, 0),
+            ("d3".to_string(), None, 0),
+        ],
+        "历史行没有正文可搬：留 NULL，且不得声称被截断"
+    );
+
+    // 再跑一次：列门控命中，形状不变（ALTER 本身不可重入）。
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+    assert_eq!(column_names(&pool).await, columns);
+}
+
+/// 崩在 027 与 028 两条 ALTER 之间：下一次启动必须只补缺的那一列。
+///
+/// 这一格之前是「唤醒永久失效」的根：门控只看 `output` 就把 028 一起跳过，
+/// `output_truncated` 永远缺失，`finish` 与台账查询双双报 no such column ——
+/// `awaiting → pending` 再也写不出去。
+///
+/// 变异点：028 的门控改成查 `output` ⇒ 「两列都在」断言红（缺
+/// `output_truncated`），后面的 `finish` 直接报 no such column。
+#[tokio::test]
+async fn migration_028_heals_a_db_left_between_the_two_alter_statements() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}/half027.db?mode=rwc", dir.path().display());
+    let pool = peco_daemon::db::connect(&url).await.unwrap();
+    pre_026_dispatch_ledger(&pool).await;
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    // 复现崩点：027 的 ALTER 已生效，028 的还没跑。列在场时删掉它（全新库由
+    // schema.sql 一次建全）；不在场就说明门控已经把 028 跳过了，现场已经成立。
+    if column_names(&pool)
+        .await
+        .contains(&"output_truncated".to_string())
+    {
+        sqlx::raw_sql("ALTER TABLE d_dispatches DROP COLUMN output_truncated")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let half = column_names(&pool).await;
+    assert!(half.contains(&"output".to_string()), "夹具需要 027 已生效");
+    assert!(
+        !half.contains(&"output_truncated".to_string()),
+        "夹具需要 028 未执行：{half:?}"
+    );
+
+    peco_daemon::db::run_migrations(&pool).await.unwrap();
+
+    let columns = column_names(&pool).await;
+    assert!(
+        columns.contains(&"output".to_string()),
+        "自愈后 output 必须在：{columns:?}"
+    );
+    assert!(
+        columns.contains(&"output_truncated".to_string()),
+        "自愈后 output_truncated 必须在：{columns:?}"
+    );
+
+    // 两列都在，写入侧才跑得动：缺列时这条 UPDATE 报 no such column。
+    let affected = peco_daemon::db::dispatches::finish(
+        &pool,
+        "t3",
+        "completed",
+        Some("摘要"),
+        Some("正文"),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(affected, 1, "半迁移库上 finish 必须可执行");
+
+    // 读端同理：正文与截断标志都按列名读。
+    let ledger = peco_daemon::space::ledger::SqliteTaskLedger::new(pool.clone());
+    let row =
+        peco_core::tools::TaskLedger::find_terminal(&ledger, std::path::Path::new("/tmp/a"), "t3")
+            .await
+            .unwrap()
+            .expect("台账读必须可执行");
+    assert_eq!(row.output.as_deref(), Some("正文"));
+    assert!(!row.output_truncated, "落库时没截断");
 }
 
 /// 把库复现成「026 崩在删旧表与改名之间」的现场：残表装着唯一一份台账，正式表没了。

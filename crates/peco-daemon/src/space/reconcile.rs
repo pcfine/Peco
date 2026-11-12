@@ -17,7 +17,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::db::dispatches::{self, DispatchRow};
-use crate::space::tasks::result_digest;
+use crate::space::tasks::{result_digest, result_output};
 use crate::state::AppState;
 
 /// `run_machine_task` 的工具名：重建观察时把它当作「刚返回的结果」，让
@@ -102,6 +102,8 @@ async fn reconcile_row(state: &AppState, row: &DispatchRow) -> Outcome {
                 &row.task_id,
                 snapshot.state.as_str(),
                 digest.as_deref(),
+                result_output(&snapshot),
+                false,
             )
             .await
             {
