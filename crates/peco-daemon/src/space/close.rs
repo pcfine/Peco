@@ -17,6 +17,10 @@ use crate::db::workspaces;
 use crate::error::DaemonError;
 use crate::space::SpaceEnv;
 use crate::space::open::map_tool_error;
+use crate::space::report::{self, ReportBody};
+
+/// force 关闭时写进失联说明的原因：这是人主动做的决定，不是设备/网络故障。
+const FORCE_CLOSE_REASON: &str = "空间被强制关闭";
 
 /// 关闭/删除的结果。
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +127,9 @@ async fn pass_gate(
             inflight_foreign: inflight.foreign,
         });
     }
+    // 先取在飞行再改状态：`mark_orphan` 之后这批行就离开 `TASK_ACTIVE_STATES`，
+    // 再也读不回来了。
+    let doomed = dispatches::list_active_by_target(&env.pool, ws_id).await?;
     let orphaned = dispatches::mark_orphan(&env.pool, ws_id).await?;
     tracing::warn!(
         ws_id,
@@ -131,6 +138,23 @@ async fn pass_gate(
         foreign = inflight.foreign,
         "inflight ledger rows marked orphan"
     );
+    // 这些行已不在在飞状态，重启对账永不重扫它们 —— 空间目录里的失联说明是它们
+    // 唯一可能留下的交付物。台账没被改写就不写（报告会与台账打架）；写盘失败由
+    // `write_for_row` 自己 warn，空间目录可能已被清理，属预期。
+    if orphaned > 0 {
+        for row in &doomed {
+            report::write_for_row(
+                &env.pool,
+                row,
+                ReportBody::Orphan {
+                    reason: FORCE_CLOSE_REASON,
+                    // 失联时刻不可考：报告按落盘时间估计并自行标注。
+                    terminal_at: None,
+                },
+            )
+            .await;
+        }
+    }
     Ok((inflight, orphaned))
 }
 

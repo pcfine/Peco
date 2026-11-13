@@ -17,7 +17,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::db::dispatches::{self, DispatchRow};
-use crate::space::tasks::{result_digest, result_output};
+use crate::space::report;
+use crate::space::tasks::{result_digest, result_error, result_output, terminal_at};
 use crate::state::AppState;
 
 /// `run_machine_task` 的工具名：重建观察时把它当作「刚返回的结果」，让
@@ -97,7 +98,7 @@ async fn reconcile_row(state: &AppState, row: &DispatchRow) -> Outcome {
     match hub.snapshot(&task_id).await {
         Ok(snapshot) if snapshot.state.is_terminal() => {
             let digest = result_digest(&snapshot);
-            match dispatches::finish(
+            let finished = dispatches::finish(
                 &state.pool,
                 &row.task_id,
                 snapshot.state.as_str(),
@@ -105,9 +106,32 @@ async fn reconcile_row(state: &AppState, row: &DispatchRow) -> Outcome {
                 result_output(&snapshot),
                 false,
             )
-            .await
-            {
-                Ok(_) => Outcome::Finished,
+            .await;
+            match finished {
+                Ok(changed) => {
+                    // 这条路径完全绕过 sink，报告必须在这里另写一次，否则重启期间
+                    // 补终态的任务在空间目录里永远没有交付物。
+                    if changed > 0 {
+                        let finished_at = terminal_at(&snapshot);
+                        report::write_for_row(
+                            &state.pool,
+                            row,
+                            report::ReportBody::Terminal {
+                                state: snapshot.state.as_str(),
+                                terminal_at: Some(&finished_at),
+                                // 正文、摘要与截断标志都由报告回读台账取得：快照里的
+                                // 这份可能比台账旧，行里那份摘要也可能已被 `finish`
+                                // 换掉。这里的值只是读不到行时的兜底。
+                                output: result_output(&snapshot),
+                                digest: digest.as_deref(),
+                                output_truncated: false,
+                                error: result_error(&snapshot),
+                            },
+                        )
+                        .await;
+                    }
+                    Outcome::Finished
+                }
                 Err(e) => {
                     warn!(task_id = %row.task_id, error = %e, "ledger finish failed");
                     Outcome::Left
@@ -133,13 +157,26 @@ async fn orphan(state: &AppState, row: &DispatchRow, reason: &str) -> Outcome {
     // 重启对账的孤儿行保留 `wake_state`，`awaiting` 的那一批转成 `pending`：它们
     // 从没被通知过，正是要告诉 Peco「你派出去的那条断了」的那一类。
     match dispatches::orphan_by_task_on_restart(&state.pool, &row.task_id).await {
-        Ok(_) => {
+        Ok(changed) => {
             warn!(
                 task_id = %row.task_id,
                 target_ws_id = %row.target_ws_id,
                 reason,
                 "dispatch ledger row marked orphan on startup"
             );
+            // 与运行期失联同理：重启对账也得在目标空间留下失联说明，否则那些任务
+            // 在文件页签里从未存在过。
+            if changed > 0 {
+                report::write_for_row(
+                    &state.pool,
+                    row,
+                    report::ReportBody::Orphan {
+                        reason,
+                        terminal_at: None,
+                    },
+                )
+                .await;
+            }
             Outcome::Orphaned
         }
         Err(e) => {

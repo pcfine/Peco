@@ -15,12 +15,13 @@ use peco_core::machine::{ObsEvent, TaskSnapshot, UpdateBody};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::db::dispatch_state::{WakeSkipReason, WakeState};
 use crate::db::dispatches::{self, NewDispatch};
 use crate::db::workspaces;
 use crate::space::peco::PecoIdentity;
+use crate::space::report;
 use crate::wake;
 use crate::wake::pump::WakePump;
 
@@ -231,7 +232,7 @@ impl TaskObservationSink for TaskObserver {
         )
         .await
         {
-            Ok(_) => {
+            Ok(changed) => {
                 self.emit(TaskEvent {
                     kind: "terminal",
                     task_id: obs.task_id.to_string(),
@@ -243,6 +244,32 @@ impl TaskObservationSink for TaskObserver {
                 // 无条件叫醒：这一行该不该投、能不能投，由判据与 `claim` 的条件
                 // 更新决定；在这里先猜一遍等于多出第二份判据。重放是幂等的。
                 self.wake.notify_one();
+                // 为 0 说明这行早已终态或从未落库：前者结果已随空间消失，此刻补一份
+                // completed 的报告只会与台账打架。
+                if changed > 0 {
+                    let finished_at = terminal_at(snapshot);
+                    report::write_for_observation(
+                        &self.pool,
+                        obs,
+                        report::ReportBody::Terminal {
+                            state,
+                            terminal_at: Some(&finished_at),
+                            // 正文与摘要在报告里回读台账取得（`finish` 的 COALESCE
+                            // 可能保住了上一份正文）；这里的快照只是读不到行时的兜底。
+                            output: result_output(snapshot),
+                            digest: digest.as_deref(),
+                            output_truncated: false,
+                            error: result_error(snapshot),
+                        },
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        task_id = %obs.task_id,
+                        state,
+                        "dispatch ledger row is already terminal or missing; no report written"
+                    );
+                }
             }
             Err(e) => warn!(task_id = %obs.task_id, error = %e, "dispatch ledger finish failed"),
         }
@@ -250,7 +277,7 @@ impl TaskObservationSink for TaskObserver {
 
     async fn on_orphaned(&self, obs: &DispatchObservation, reason: &str) {
         match dispatches::orphan_by_task(&self.pool, &obs.task_id.to_string()).await {
-            Ok(_) => {
+            Ok(changed) => {
                 warn!(task_id = %obs.task_id, reason, "dispatch observation orphaned");
                 self.emit(TaskEvent {
                     kind: "orphaned",
@@ -260,6 +287,21 @@ impl TaskObservationSink for TaskObserver {
                     dispatch_id: obs.dispatch_id.clone(),
                     conversation_id: None,
                 });
+                // 失联说明是这份任务的唯一交付物：没有它，空间目录里连「任务来过」
+                // 都看不到。`orphan_by_task` 带状态谓词，故 `changed > 0` 就是「本次
+                // 真的发生了迁移」；为 0 时报告已有内容，覆盖它等于抹掉终态结果。
+                if changed > 0 {
+                    report::write_for_observation(
+                        &self.pool,
+                        obs,
+                        report::ReportBody::Orphan {
+                            reason,
+                            // 失联时刻不可考，报告按落盘时间估计并自行标注。
+                            terminal_at: None,
+                        },
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 warn!(task_id = %obs.task_id, error = %e, "dispatch ledger orphan update failed")
@@ -278,6 +320,24 @@ pub(crate) fn result_output(snapshot: &TaskSnapshot) -> Option<&str> {
         return None;
     };
     Some(text)
+}
+
+/// 终态出错原因：报告「错误」段的唯一来源。
+pub(crate) fn result_error(snapshot: &TaskSnapshot) -> Option<&str> {
+    snapshot
+        .outcome
+        .as_ref()?
+        .error
+        .as_ref()
+        .map(|e| e.message.as_str())
+}
+
+/// 终态时刻。快照的 `updated_at` 就是最后一次状态变更的时刻：任务终态之后不再变，
+/// 故两条补写路径给出的时间是同一个。
+pub(crate) fn terminal_at(snapshot: &TaskSnapshot) -> String {
+    snapshot
+        .updated_at
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// 终态输出摘要：正文前缀，截断到 [`MAX_DIGEST_CHARS`]。

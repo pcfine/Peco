@@ -274,6 +274,62 @@ pub async fn get_by_task_id(
         .await
 }
 
+/// 报告要用到的那些台账事实。
+///
+/// 不复用 [`DispatchRow`]：后者故意只取「有没有正文」，列表接口不该拖上最多
+/// 100 万字符的 `output`。报告是唯一确实需要全文的读者，所以它单查一列。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReportSource {
+    /// 台账留存的正文；旧行与「任务没产出」都是 `None`。
+    pub output: Option<String>,
+    /// 台账正文本身是否已被上限截断：报告只是它的副本，这个标志必须继承。
+    pub output_truncated: bool,
+    pub result_digest: Option<String>,
+    pub created_at: String,
+    pub prompt_digest: Option<String>,
+}
+
+/// 终态之后回读台账，报告的全部正文与身份事实只从这一行取。
+///
+/// 不能沿用调用方手里的快照：`finish` 用 `COALESCE(?, output)` 保留旧正文，重复
+/// 终态时第二次快照可能已经没有 `output`，据快照写就会把台账里还在的全文抹成
+/// 「无输出」—— 交付副本于是和唯一事实源互相矛盾。`created_at` 与
+/// `prompt_digest` 同理：运行期的观察根本拿不到它们。
+///
+/// 一次只查一个任务：正文可能上百万字符，只有终态落库成功的那一次调用需要它。
+pub async fn find_report_source(
+    pool: &SqlitePool,
+    task_id: &str,
+) -> Result<Option<ReportSource>, sqlx::Error> {
+    sqlx::query_as::<_, ReportSource>(
+        "SELECT output, output_truncated, result_digest, created_at, prompt_digest \
+         FROM d_dispatches WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// 某个目标空间的在飞台账行。
+///
+/// force 关闭要在 orphan 化之后逐行补一份失联说明，所以这里返回行本身而不是
+/// 计数；状态清单与 [`mark_orphan`] 同源，读到的就是要被改写的那批行。
+pub async fn list_active_by_target(
+    pool: &SqlitePool,
+    target_ws_id: &str,
+) -> Result<Vec<DispatchRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM d_dispatches WHERE target_ws_id = ? AND task_state IN ({}) \
+         ORDER BY created_at DESC, id DESC",
+        placeholders(TASK_ACTIVE_STATES)
+    );
+    let mut query = sqlx::query_as::<_, DispatchRow>(&sql).bind(target_ws_id);
+    for state in TASK_ACTIVE_STATES {
+        query = query.bind(*state);
+    }
+    query.fetch_all(pool).await
+}
+
 /// 启动对账要逐行点查的台账：只有非终态行需要判断「任务是否还活着」。
 ///
 /// 与 [`mark_orphan`] 共用同一份状态清单 —— 两处各写一份会让「关闭时算在飞、
@@ -401,19 +457,42 @@ pub async fn finish(
 /// 按字符而不是字节：切在字节上会把一个汉字劈成两半，取回来的正文本身就坏了。
 pub const MAX_PERSISTED_OUTPUT_CHARS: usize = 1_000_000;
 
-/// 落库前的裁剪：返回要写的正文与「这份正文是否已被截断」。
+/// 正文裁剪的唯一实现：返回要用的正文与「这份正文是否已被截断」。
 ///
-/// 超限时保留头部并置标志 —— 读者据此知道长度不是原文总长，而不是以为任务
-/// 只产出了这么多。`already_truncated` 是调用方自己的约定：上游交来的正文若
-/// 已是一段前缀，标志必须留下来，不能被这次「没再截断」洗掉。
+/// 台账落库与报告正文都走这一处 —— 两边各写一份「按字符砍到上限」，哪天口径
+/// 变了就会有一边悄悄多留或少留几个字，报告里那句「台账只保留了前 N 字符」
+/// 也随之变成假话。
+pub fn clamp_chars(text: &str) -> (&str, bool) {
+    match text.char_indices().nth(MAX_PERSISTED_OUTPUT_CHARS) {
+        Some((cut, _)) => (&text[..cut], true),
+        None => (text, false),
+    }
+}
+
+/// 落库前的裁剪。
+///
+/// `already_truncated` 是调用方自己的约定：上游交来的正文若已是一段前缀，标志
+/// 必须留下来，不能被这次「没再截断」洗掉。
 fn bounded_output(output: Option<&str>, already_truncated: bool) -> (Option<String>, bool) {
     let Some(text) = output else {
         return (None, already_truncated);
     };
-    match text.char_indices().nth(MAX_PERSISTED_OUTPUT_CHARS) {
-        Some((cut, _)) => (Some(text[..cut].to_string()), true),
-        None => (Some(text.to_string()), already_truncated),
-    }
+    let (shown, clamped) = clamp_chars(text);
+    (Some(shown.to_string()), clamped || already_truncated)
+}
+
+/// 「还没到终态」的谓词：只命中真正会迁移的行，故 `rows_affected() > 0` 才等于
+/// 「本次发生了状态迁移」，调用方可以据此决定要不要覆盖交付副本。
+///
+/// 没有它，`UPDATE ... WHERE task_id = ?` 对终态行同样返回 1（SQLite 把同一组值
+/// 写回去也算改动），一条迟到的失联通知就会把带全文的报告改写成「无结果可回捞」。
+/// 状态清单取常量而不是字面量：新增终态时这里必须跟着走。
+fn not_terminal_predicate() -> String {
+    format!(
+        "task_state NOT IN ({}, '{orphan}')",
+        placeholders(TASK_TERMINAL_STATES),
+        orphan = TASK_ORPHAN_STATE,
+    )
 }
 
 /// 单行 orphan 化：任务已不可观察（空间关闭、Hub 消失、重订阅耗尽）。
@@ -426,11 +505,16 @@ fn bounded_output(output: Option<&str>, already_truncated: bool) -> (Option<Stri
 pub async fn orphan_by_task(pool: &SqlitePool, task_id: &str) -> Result<u64, sqlx::Error> {
     let sql = format!(
         "UPDATE d_dispatches SET task_state = '{orphan}', terminal_at = datetime('now'), {} \
-         WHERE task_id = ?",
+         WHERE task_id = ? AND {}",
         queue_awaiting_assignment(),
+        not_terminal_predicate(),
         orphan = TASK_ORPHAN_STATE,
     );
-    let result = sqlx::query(&sql).bind(task_id).execute(pool).await?;
+    let mut query = sqlx::query(&sql).bind(task_id);
+    for state in TASK_TERMINAL_STATES {
+        query = query.bind(*state);
+    }
+    let result = query.execute(pool).await?;
     Ok(result.rows_affected())
 }
 
@@ -682,11 +766,17 @@ pub async fn orphan_by_task_on_restart(
     task_id: &str,
 ) -> Result<u64, sqlx::Error> {
     let sql = format!(
-        "UPDATE d_dispatches SET task_state = 'orphan', terminal_at = datetime('now'), {} \
-         WHERE task_id = ?",
+        "UPDATE d_dispatches SET task_state = '{orphan}', terminal_at = datetime('now'), {} \
+         WHERE task_id = ? AND {}",
         queue_awaiting_assignment(),
+        not_terminal_predicate(),
+        orphan = TASK_ORPHAN_STATE,
     );
-    let result = sqlx::query(&sql).bind(task_id).execute(pool).await?;
+    let mut query = sqlx::query(&sql).bind(task_id);
+    for state in TASK_TERMINAL_STATES {
+        query = query.bind(*state);
+    }
+    let result = query.execute(pool).await?;
     Ok(result.rows_affected())
 }
 
@@ -1299,6 +1389,21 @@ mod tests {
         assert!(rejected.is_err(), "CHECK 必须拒绝清单外的原因");
     }
 
+    /// 截断口径只有一份：正好等于上限不算截断，多一个字符才算。边界错一个字，
+    /// 报告里那句「台账只保留了前 N 字符」就与事实不符。
+    #[test]
+    fn clamping_keeps_the_limit_itself_and_flags_only_what_it_drops() {
+        let exact = "正".repeat(MAX_PERSISTED_OUTPUT_CHARS);
+
+        assert_eq!(clamp_chars(&exact), (exact.as_str(), false));
+
+        let over = format!("{exact}多");
+        let (shown, truncated) = clamp_chars(&over);
+        assert_eq!(shown.chars().count(), MAX_PERSISTED_OUTPUT_CHARS);
+        assert!(truncated, "多出来的那一个字必须被标成截断");
+        assert!(!shown.contains('多'));
+    }
+
     /// 六态的字符串都得能落库：CHECK 与 [`WakeState::ALL`] 各写一份清单，任一边
     /// 漏一个值，写入就会在运行期报 constraint failed。
     #[tokio::test]
@@ -1374,11 +1479,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_orphaning_queues_the_rows_that_were_still_waiting() {
         let (pool, _dir) = test_pool().await;
-        seed_wake_row(&pool, "d_awaiting", "t_awaiting").await;
-        set_wake_state(&pool, "d_awaiting", WakeState::Awaiting).await;
+        seed_row(&pool, "d_awaiting", "working", WakeState::Awaiting, None).await;
         seed_skipped(&pool, "d_skipped", WakeSkipReason::NotPecoOrigin).await;
 
-        orphan_by_task(&pool, "t_awaiting").await.unwrap();
+        orphan_by_task(&pool, "d_awaiting").await.unwrap();
         orphan_by_task(&pool, "d_skipped").await.unwrap();
 
         assert_eq!(
@@ -1618,13 +1722,67 @@ mod tests {
         assert_eq!(ledger_of(&pool, "d_claim").await.2, None, "claim 要清原因");
     }
 
+    /// 已经离开在飞状态的行不再被失联通知改写 —— 两条 orphan 语句都必须带状态
+    /// 谓词，`rows_affected() > 0` 才真的等于「本次发生了迁移」。
+    ///
+    /// 否则 `WHERE task_id = ?` 对终态行同样返回 1，一条迟到的失联会把带全文的
+    /// 报告改写成「无结果可回捞」，而台账里的正文还在。
+    #[tokio::test]
+    async fn orphaning_never_rewrites_a_row_that_left_the_active_states() {
+        let (pool, _dir) = test_pool().await;
+        seed_row(&pool, "d_done", "completed", WakeState::Delivered, None).await;
+        seed_row(
+            &pool,
+            "d_orphan",
+            TASK_ORPHAN_STATE,
+            WakeState::Skipped,
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE d_dispatches SET output = 'FULL-BODY', result_digest = 'digest' \
+             WHERE id = 'd_done'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for task_id in ["d_done", "d_orphan"] {
+            assert_eq!(
+                orphan_by_task(&pool, task_id).await.unwrap(),
+                0,
+                "{task_id} 已不在飞，运行期失联不得算作一次迁移"
+            );
+            assert_eq!(
+                orphan_by_task_on_restart(&pool, task_id).await.unwrap(),
+                0,
+                "{task_id} 已不在飞，重启对账同样不得算作一次迁移"
+            );
+        }
+
+        let (state, terminal_at, output): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT task_state, terminal_at, output FROM d_dispatches WHERE id = 'd_done'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "completed", "终态不得被改写");
+        assert_eq!(terminal_at, None, "不得给一条早已终态的行补失联时刻");
+        assert_eq!(
+            output.as_deref(),
+            Some("FULL-BODY"),
+            "正文是唯一事实源，谁都不许动"
+        );
+    }
+
     /// 重启对账不清原因：它保留 `wake_state='pending'`，而 reason 只属于 skipped。
     #[tokio::test]
     async fn restart_orphaning_leaves_the_reason_alone() {
         let (pool, _dir) = test_pool().await;
-        seed_wake_row(&pool, "d_restart", "t_restart").await;
+        seed_row(&pool, "d_restart", "working", WakeState::Pending, None).await;
 
-        orphan_by_task_on_restart(&pool, "t_restart").await.unwrap();
+        orphan_by_task_on_restart(&pool, "d_restart").await.unwrap();
 
         assert_eq!(
             ledger_of(&pool, "d_restart").await,

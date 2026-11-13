@@ -12,6 +12,7 @@ pub mod open;
 pub mod peco;
 pub mod reconcile;
 pub mod registry;
+pub mod report;
 pub mod tasks;
 
 use std::path::PathBuf;
