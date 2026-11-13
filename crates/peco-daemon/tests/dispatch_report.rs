@@ -1,5 +1,5 @@
-//! 派发任务的报告落盘：任务在哪个空间跑，那个空间的 `output/dispatch/` 里就该有
-//! 一份 markdown。
+//! 派发任务的报告落盘：任务在哪个空间跑，那个空间 work 根下的 `dispatch/` 里就该
+//! 有一份 markdown。
 //!
 //! 终态有两条独立路径（运行期的 sink、重启对账），两条都要留下文件 —— 只测一条
 //! 等于把重启期间补终态的任务交给空白目录。
@@ -102,7 +102,7 @@ async fn open_space(env: &TestEnv, name: &str) -> (String, PathBuf) {
 }
 
 fn report_dir(target_dir: &Path) -> PathBuf {
-    target_dir.join("output").join("dispatch")
+    target_dir.join("dispatch")
 }
 
 /// 空间目录下的报告文件，按名字排序；目录不存在时是空（「一个都没写」）。
@@ -316,7 +316,7 @@ fn unavailable(err: peco_core::machine::SinkError) -> MachineError {
 
 /// 正常终态：文件落在目标空间、正文是全文、身份从目标目录反查得到。
 ///
-/// 变异点：`path_of` 不进 `output/dispatch/` ⇒ 落点断言红；正文改用摘要 ⇒
+/// 变异点：`path_of` 不进 `dispatch/` ⇒ 落点断言红；正文改用摘要 ⇒
 /// 尾段标记与字数断言红。
 #[tokio::test]
 async fn the_terminal_report_lands_in_the_target_space() {
@@ -531,13 +531,12 @@ async fn the_report_path_comes_from_the_ledger_not_the_observation() {
     assert!(text.contains("SECOND-BODY"), "{text}");
 }
 
-/// 报告写不出去（这里让 `output/dispatch` 是个同名文件）只许 warn：台账、唤醒
+/// 报告写不出去（这里让 `dispatch` 是个同名文件）只许 warn：台账、唤醒
 /// 队列与事件广播照旧。磁盘满了不能把派发链路一起拖垮。
 #[tokio::test]
 async fn a_report_that_cannot_be_written_leaves_the_ledger_and_the_wake_queue_alone() {
     let env = new_env(&["research"]).await;
     let (_ws_id, target_dir) = open_space(&env, "report-unwritable").await;
-    std::fs::create_dir_all(target_dir.join("output")).expect("建出 output 目录");
     std::fs::write(report_dir(&target_dir), "not a directory").expect("用同名文件占住落点");
 
     let task = TaskId(Uuid::new_v4());

@@ -1,4 +1,4 @@
-//! 派发任务的交付副本：终态报告落进目标空间的 work 目录。
+//! 派发任务的交付副本：终态报告落进目标空间 work 目录下的一层 `dispatch/`。
 //!
 //! `d_dispatches` 仍是唤醒与对账的唯一事实源；本模块写的是给人看的副本 ——
 //! 任务派到哪个空间跑，那个空间的「文件」页签里就该有一份结果，人脱离 Peco
@@ -29,9 +29,12 @@ use crate::db::dispatches::{
 };
 use crate::db::workspaces;
 
-/// 报告目录，相对目标空间 work 目录。`output/` 是空间产物约定目录，前端文件
-/// 页签浏览的就是这里。
-const REPORT_SUBDIR: &str = "output/dispatch";
+/// 报告目录，相对目标空间 work 目录，只有一层。
+///
+/// 文件页签的根就是这个 work 目录，一层意味着从空间根点一次就到。不放进
+/// `output/`：那是 skill 产物与 `$PECO_OUT_DIR` 的落点，报告不是产物，混在一起
+/// 会让人在两处找结果。
+const REPORT_SUBDIR: &str = "dispatch";
 /// 文件名里任务描述的长度上限：够看清是什么任务，又不至于把目录撑乱。
 const SLUG_MAX_CHARS: usize = 24;
 /// 标题取任务描述第一行的长度上限。
@@ -206,9 +209,9 @@ fn task_id_prefix(task_id: &str) -> Result<String, ReportError> {
 
 /// 运行期断言（不是 `debug_assert`）：release 构建下这条边界同样必须成立。
 ///
-/// 判据是「恰好一层普通文件名，且就在 `<target_dir>/output/dispatch` 下」：
+/// 判据是「恰好一层普通文件名，且就在 `<target_dir>/dispatch` 下」：
 /// `starts_with(target_dir)` 恒真，`file_name()` 只看最后一段，两者都证明不了
-/// 扁平 —— `<target>/output/dispatch/a/../../x.md` 既在目录里、最后一段也干净。
+/// 扁平 —— `<target>/dispatch/a/../../x.md` 既在目录里、最后一段也干净。
 fn guard(path: &Path, target_dir: &Path) -> Result<(), ReportError> {
     let rel = path
         .strip_prefix(target_dir.join(REPORT_SUBDIR))
@@ -757,24 +760,28 @@ mod tests {
 
     // ---- path_of ----------------------------------------------------------
 
+    /// 「最多点一层」：相对 work 根恰好两段（`dispatch` + 文件名）。文件页签的
+    /// 根就是 work 目录，多一层就得多点一次目录。
     #[test]
-    fn report_paths_land_in_the_output_dispatch_directory() {
+    fn report_paths_land_one_level_below_the_work_dir() {
         let meta = meta("/tmp/spaces/research/work", Some("修复登录"));
         let path = path_of(&meta).unwrap();
 
+        let rel: Vec<String> = path
+            .strip_prefix(&meta.target_dir)
+            .unwrap_or_else(|_| panic!("报告必须留在目标空间目录里：{}", path.display()))
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
-            path.parent().unwrap(),
-            Path::new("/tmp/spaces/research/work/output/dispatch")
-        );
-        assert!(
-            path.starts_with(&meta.target_dir),
-            "报告必须留在目标空间目录里：{}",
-            path.display()
+            rel,
+            ["dispatch".to_string(), "修复登录__aabbccdd.md".to_string()],
+            "相对 work 根恰好两段：一层目录 + 文件名"
         );
         assert_eq!(
-            path.file_name().unwrap().to_string_lossy(),
-            "修复登录__aabbccdd.md",
-            "文件名只由任务描述与 task_id 决定"
+            path_of(&meta).unwrap(),
+            path,
+            "同一份 meta 两次算出同一路径：运行期与对账各写一次，路径漂了就有两份文件"
         );
     }
 
@@ -800,15 +807,15 @@ mod tests {
         }
     }
 
-    /// 落点必须是「`output/dispatch` 下恰好一层普通文件」：`starts_with` 恒真、
+    /// 落点必须是「`dispatch` 下恰好一层普通文件」：`starts_with` 恒真、
     /// `file_name()` 只看最后一段，两者都拦不住 `a/../../x.md` 这种写法。
     #[test]
     fn the_guard_only_accepts_a_flat_file_under_the_report_directory() {
         let target = Path::new("/tmp/spaces/research/work");
 
         for ok in [
-            "/tmp/spaces/research/work/output/dispatch/任务__aabbccdd.md",
-            "/tmp/spaces/research/work/output/dispatch/task.md",
+            "/tmp/spaces/research/work/dispatch/任务__aabbccdd.md",
+            "/tmp/spaces/research/work/dispatch/task.md",
         ] {
             assert!(guard(Path::new(ok), target).is_ok(), "{ok} 应当合法");
         }
@@ -816,11 +823,11 @@ mod tests {
             // 报告目录之外
             "/tmp/spaces/research/work/task.md",
             // 深一层
-            "/tmp/spaces/research/work/output/dispatch/sub/task.md",
+            "/tmp/spaces/research/work/dispatch/sub/task.md",
             // 用 `..` 回到目录内，最后一段依然干净
-            "/tmp/spaces/research/work/output/dispatch/a/../../task.md",
+            "/tmp/spaces/research/work/dispatch/a/../../task.md",
             // 完全是另一个目录
-            "/tmp/elsewhere/output/dispatch/task.md",
+            "/tmp/elsewhere/dispatch/task.md",
         ] {
             assert!(
                 matches!(
