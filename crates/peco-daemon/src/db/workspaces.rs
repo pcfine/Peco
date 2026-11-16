@@ -211,6 +211,12 @@ pub async fn rescan(pool: &SqlitePool, home: &Path) -> Result<RescanReport, Daem
         report.teams += 1;
     }
 
+    // 团队被删掉、空间目录还留在盘上时，`workspaces.team_id` 的外键会让这一行
+    // 插不进去 —— 那是坏数据，不是坏库，一次陈旧目录不该把整个 daemon 拦在启动
+    // 之外。缺团队的目录跳过并留痕，人工决定是补团队还是删目录。
+    let known_teams: std::collections::HashSet<String> =
+        teams::list_ids(pool).await?.into_iter().collect();
+
     for dir in subdirs(&home.join("spaces")) {
         let work_dir = dir.join("work");
         let value = match manifest::read(&work_dir) {
@@ -243,6 +249,14 @@ pub async fn rescan(pool: &SqlitePool, home: &Path) -> Result<RescanReport, Daem
                 continue;
             }
         };
+        if !known_teams.contains(&team_id) {
+            tracing::warn!(
+                space_dir = %dir.display(),
+                team_id = %team_id,
+                "space points at a team that no longer exists; leaving it unindexed"
+            );
+            continue;
+        }
         let ws_id = manifest::ws_id_of(&value);
         let work_dir = work_dir.to_string_lossy().into_owned();
         insert_if_absent(
@@ -301,4 +315,69 @@ pub async fn list_by_team(
     .bind(team_id)
     .fetch_all(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peco_core::workspace::manifest::WorkspaceManifest;
+
+    async fn test_pool() -> (SqlitePool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}/test.db?mode=rwc", dir.path().display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::run_migrations(&pool).await.unwrap();
+        (pool, dir)
+    }
+
+    fn manifest_for(home: &Path, team_id: &str, session: &str) -> WorkspaceManifest {
+        WorkspaceManifest {
+            format: "peco-workspace".into(),
+            schema: 1,
+            name: session.into(),
+            description: String::new(),
+            team: home
+                .join("teams")
+                .join(team_id)
+                .to_string_lossy()
+                .into_owned(),
+            session_id: session.into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// 落在盘上的空间指向一个已经删掉的团队：跳过并留痕，不让外键错误中断普查。
+    ///
+    /// 这条判据的价值在启动链路上 —— `rescan` 的错误会让 `main` 直接退出，
+    /// 一个陈旧目录就等于 daemon 起不来。
+    #[tokio::test]
+    async fn rescan_skips_space_whose_team_is_gone() {
+        let (pool, home) = test_pool().await;
+        let home = home.path();
+        std::fs::create_dir_all(home.join("teams/ops")).unwrap();
+        teams::upsert(
+            &pool,
+            &NewTeam {
+                id: "ops",
+                display_name: "ops",
+                template_version: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let live = home.join("spaces/live/work");
+        std::fs::create_dir_all(&live).unwrap();
+        manifest::write(&live, &manifest_for(home, "ops", "live")).unwrap();
+
+        let stale = home.join("spaces/stale/work");
+        std::fs::create_dir_all(&stale).unwrap();
+        manifest::write(&stale, &manifest_for(home, "gone", "stale")).unwrap();
+
+        let report = rescan(&pool, home).await.unwrap();
+        assert_eq!(report.spaces, 1, "只有团队还在的那个空间被索引");
+        let rows = list(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "ws_live");
+    }
 }
