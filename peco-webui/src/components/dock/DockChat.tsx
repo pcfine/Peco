@@ -5,6 +5,8 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChatView, type ChatMessage } from "@/components/chat/ChatView";
 import {
+  cancelConversationTurn,
+  conversationLiveStreamUrl,
   conversationStreamUrl,
   getMessages,
   uploadConversationImage,
@@ -21,13 +23,15 @@ interface DockChatProps {
 
 export function DockChat({ agentId, convId, wsId }: DockChatProps) {
   const setChat = useConnectionStore((state) => state.setChat);
-  const { data: history } = useQuery({
+  const historyQuery = useQuery({
     queryKey: ["messages", agentId, convId],
     queryFn: () => getMessages(agentId, convId, { limit: 100, wsId }),
     // 重挂载时重取：dock 关掉再开，本轮新消息只在服务端。
     staleTime: 0,
     refetchOnMount: "always",
   });
+
+  const history = historyQuery.data;
 
   const initialMessages = useMemo<ChatMessage[]>(
     () =>
@@ -54,6 +58,13 @@ export function DockChat({ agentId, convId, wsId }: DockChatProps) {
         conversationStreamUrl(agentId, convId, message, { imageIds, wsId })
       }
       initialMessages={initialMessages}
+      // ── 在途轮的重订阅：dock 关掉再开等于「回到对话」，接上在途轮而不是重发 ──
+      historySettled={historyQuery.isFetched}
+      liveStreamUrl={() => conversationLiveStreamUrl(agentId, convId, { wsId })}
+      // 「停止」改走服务端取消（200 = 命令已投递，等 done 收尾）
+      cancelTurn={() => cancelConversationTurn(agentId, convId, { wsId })}
+      onAttachSettled={() => void historyQuery.refetch()}
+      onTurnSettled={() => void historyQuery.refetch()}
       welcomeMessage="让 Peco 开始一件事。它会派发到某个空间，或直接回答。"
       suggestions={["现在有哪些任务在跑？", "团队的能力边界是什么？"]}
       className="h-full"

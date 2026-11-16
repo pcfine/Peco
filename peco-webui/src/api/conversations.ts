@@ -1,5 +1,6 @@
 import { api, spaceScope } from "@/lib/api";
 import type {
+  CancelTurnOutcome,
   Conversation,
   Message,
   SessionSnapshotResponse,
@@ -174,6 +175,53 @@ export async function listConversationArtifacts(
     spaceScope(wsId),
   );
   return res.data;
+}
+
+/**
+ * 重新订阅该会话的在途轮：`GET .../stream/live`。
+ *
+ * 200 → SSE（首帧 `turn_snapshot`，随后与 `/stream` 同构）；**204 = 该会话没有
+ * 在途轮**（历史即权威，客户端什么都不做）。一轮的执行归 daemon，连接只是它的
+ * 出口之一 —— 切走再回来靠这条 URL 接上，而不是重发。
+ *
+ * 与 `conversationStreamUrl` 一样走 `fetch` 直连：SSE 要逐块读 body，且 fetch
+ * 不带 axios 拦截器加的空间头，故 `?ws=` 必须显式补上。
+ */
+export function conversationLiveStreamUrl(
+  agentId: string,
+  convId: string,
+  options: { wsId?: string } = {},
+): string {
+  const ws = options.wsId ? `?ws=${encodeURIComponent(options.wsId)}` : "";
+  return `/api${chatBase(agentId)}/${encodeURIComponent(convId)}/stream/live${ws}`;
+}
+
+/**
+ * 取消该会话的在途轮：`POST .../cancel`。
+ *
+ * 200 只表示**命令已投递** —— 收尾发生在步进边界，可能晚于响应，所以调用方要
+ * 保持连接等 `done`。409 `no_running_task` 表示轮已结束，映射成
+ * `"no_running_task"` 交给界面「只 refetch」；其余错误照常抛（交给 toast）。
+ */
+export async function cancelConversationTurn(
+  agentId: string,
+  convId: string,
+  options: { wsId?: string } = {},
+): Promise<CancelTurnOutcome> {
+  const { wsId } = options;
+  try {
+    await api.post<SuccessResponse>(
+      `${chatBase(agentId)}/${convId}/cancel`,
+      {},
+      { params: wsId ? { ws: wsId } : {}, ...spaceScope(wsId) },
+    );
+    return "accepted";
+  } catch (err) {
+    if ((err as { code?: string } | null)?.code === "no_running_task") {
+      return "no_running_task";
+    }
+    throw err;
+  }
 }
 
 /**

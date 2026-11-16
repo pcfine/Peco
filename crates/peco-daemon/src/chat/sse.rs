@@ -186,6 +186,14 @@ pub enum ChatSseEvent {
         text: String,
         conversation_id: String,
     },
+
+    /// 订阅建立时的首帧：这一轮**此刻**的样子。
+    ///
+    /// 只在 `/stream` 与 `/stream/live` 握手时发一次。客户端据此**替换**本地在途
+    /// 气泡（而不是追加），并记下 `seq` 作为水位 —— 之后 `id <= seq` 的帧一律丢弃，
+    /// 「快照与增量之间不重不漏」因此由 `seq` 单独裁决。
+    #[serde(rename = "turn_snapshot")]
+    TurnSnapshot(super::feed::TurnSnapshot),
 }
 
 /// Token 用量数据（精简版，供前端展示）。
@@ -206,7 +214,10 @@ impl From<Usage> for UsageData {
 
 impl ChatSseEvent {
     /// 转换为 axum SSE Event。
-    pub fn to_sse_event(&self) -> Result<Event, serde_json::Error> {
+    ///
+    /// `seq` 是 feed 分配的帧序号，写进 SSE `id:` 字段 —— 重连时客户端据它判断
+    /// 「首帧快照已经覆盖到哪一帧」。这是 `id` 的唯一拼接点，调用方不要自己拼。
+    pub fn to_sse_event(&self, seq: u64) -> Result<Event, serde_json::Error> {
         let data = serde_json::to_string(self)?;
         let event_name = match self {
             ChatSseEvent::TextDelta { .. } => "text_delta",
@@ -223,8 +234,12 @@ impl ChatSseEvent {
             ChatSseEvent::TruncationRetry { .. } => "truncation_retry",
             ChatSseEvent::LooperState { .. } => "looper_state",
             ChatSseEvent::UserSteer { .. } => "user_steer",
+            ChatSseEvent::TurnSnapshot(_) => "turn_snapshot",
         };
-        Ok(Event::default().event(event_name).data(data))
+        Ok(Event::default()
+            .event(event_name)
+            .id(seq.to_string())
+            .data(data))
     }
 }
 
@@ -679,7 +694,7 @@ mod tests {
     async fn sse_wire(event: ChatSseEvent) -> String {
         use axum::response::IntoResponse;
 
-        let event = event.to_sse_event().expect("SSE 事件序列化失败");
+        let event = event.to_sse_event(1).expect("SSE 事件序列化失败");
         let body = axum::response::Sse::new(futures::stream::once(async move {
             Ok::<_, std::convert::Infallible>(event)
         }))

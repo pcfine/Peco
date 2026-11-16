@@ -519,6 +519,29 @@ pub async fn call_in_space(
     HttpReply { status, body }
 }
 
+/// 发起一次请求并返回**未消费**的响应体。
+///
+/// 断连用例要能「读 N 帧后丢弃响应体」：[`call_in_space`] 会把整个响应体读完，
+/// 造不出「连接中途消失」。语义与 [`call_in_space`] 的唯一差别就是最后不读体。
+pub async fn stream_in_space(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    ws_id: Option<&str>,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(ws_id) = ws_id {
+        builder = builder.header("X-Peco-Space", ws_id);
+    }
+    router
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .expect("router 不会失败")
+}
+
 impl TestEnv {
     pub async fn get(&self, uri: &str) -> HttpReply {
         call(&self.router(), Method::GET, uri, None).await

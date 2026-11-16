@@ -128,6 +128,9 @@ vi.mock("@/api/conversations", () => ({
   getMessages: (...args: unknown[]) => mocks.getMessages(...args),
   conversationStreamUrl: (agentId: string, convId: string, _message: string) =>
     `/api/chat/${agentId}/conversations/${convId}/stream`,
+  conversationLiveStreamUrl: (agentId: string, convId: string) =>
+    `/api/chat/${agentId}/conversations/${convId}/stream/live`,
+  cancelConversationTurn: async () => "accepted" as const,
   uploadConversationImage: async () => ({ id: "img", url: "/img" }),
 }));
 
@@ -276,7 +279,13 @@ function stubChatStream() {
   });
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => new Response(body, { status: 200 })),
+    vi.fn(async (url: string) =>
+      // 壳挂载即订阅在途轮：本文件只关心「发出去的那条流」，订阅一律回「没有
+      // 在途轮」，免得两条读取者抢同一条 body。
+      String(url).includes("/stream/live")
+        ? new Response(null, { status: 204 })
+        : new Response(body, { status: 200 }),
+    ),
   );
   return {
     /** 关流 = 这一轮收尾：ChatView 的读循环走完 finally，把 streaming 置回 false。 */
@@ -318,6 +327,11 @@ beforeEach(() => {
     });
   });
   mocks.getMessages.mockResolvedValue([]);
+  // 默认没有在途轮（订阅端点 204）；需要「这一轮在跑」的用例再换成 stubChatStream。
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response(null, { status: 204 })),
+  );
   useOpenSpacesStore.setState({
     openIds: ["ws_a"],
     activeWsId: "ws_a",

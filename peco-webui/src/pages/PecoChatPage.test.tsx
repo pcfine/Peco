@@ -112,6 +112,9 @@ vi.mock("@/api/conversations", () => ({
   getMessages: async (): Promise<Message[]> => [],
   conversationStreamUrl: (agentId: string, convId: string) =>
     `/api/chat/${agentId}/conversations/${convId}/stream`,
+  conversationLiveStreamUrl: (agentId: string, convId: string) =>
+    `/api/chat/${agentId}/conversations/${convId}/stream/live`,
+  cancelConversationTurn: async () => "accepted" as const,
   uploadConversationImage: async () => ({ id: "img", url: "/img" }),
 }));
 

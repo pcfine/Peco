@@ -1,10 +1,12 @@
 // 单个空间的聊天壳：一条 ensure 出来的 @master 会话 + 一轮一条 GET 流。
 //
-// 它按 wsId 常驻在页面里，非当前空间只加 `hidden` 而不卸载：ChatView 卸载会
-// abort 在途 fetch（服务端随之结束该轮），切空间绝不能走那条路。
+// 它按 wsId 常驻在页面里，非当前空间只加 `hidden` 而不卸载：历史查询与本地消息
+// 不必每次切回都重建。
 //
-// 已知限制：离开承载它的路由（`/spaces/:wsId`、`/peco` 或状态页）就会卸载本壳，
-// 在途的流随之中断 —— 应用内跨空间切换不受影响。
+// 为什么卸载/隐藏都不可怕：一轮的执行归 daemon，SSE 连接只是它的出口之一。断开
+// 出口既不停住那一轮（它照常跑到轮末并落库），也不丢已产出的内容 —— 重新可见或
+// 重新挂载时 `liveStreamUrl` 接上 `/stream/live`，首帧快照把在途内容补齐，`done`
+// 之后再取一次历史以库里为准。所以「切走再回来」靠重订阅收敛，不靠重发。
 
 import { useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -13,6 +15,8 @@ import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SpaceConflictHint } from "@/components/spaces/SpaceConflictHint";
 import {
+  cancelConversationTurn,
+  conversationLiveStreamUrl,
   conversationStreamUrl,
   getMessages,
   uploadConversationImage,
@@ -116,6 +120,20 @@ function SpaceConversationChat({
             })
           }
           initialMessages={initialMessages}
+          // ── 在途轮的重订阅（切走再回来靠它收敛，不靠重发）──
+          // 历史已落定才订阅：帧序规则要求历史请求先于订阅请求发出。
+          historySettled={history.isFetched}
+          liveStreamUrl={() =>
+            conversationLiveStreamUrl(SPACE_MASTER_AGENT, convId, { wsId })
+          }
+          // 「停止」改走服务端取消：detach 之后掐本地连接停不住那一轮。
+          cancelTurn={() =>
+            cancelConversationTurn(SPACE_MASTER_AGENT, convId, { wsId })
+          }
+          // 快照落定补一次历史（user 行可能晚于历史快照落库）；
+          // `done` 之后同样取一次：以落库结果替换本地气泡。
+          onAttachSettled={() => void history.refetch()}
+          onTurnSettled={() => void history.refetch()}
           // 一轮的起止进壳级 store：文件面板靠它在回复落地后立刻重取，
           // 不必等下一次轮询（dock 头部的对话状态也读同一份）。
           onStreamingChange={(streaming) => {
@@ -147,7 +165,8 @@ export function SpaceChatShell({
   const conversation = useSpaceConversation(wsId);
   const convId = conversation.data?.conversation_id ?? null;
 
-  // 壳卸载时这一轮随之中断，活动位必须复位，否则清除按钮会一直不可用。
+  // 壳卸载后没人再上报活动位：必须复位，否则清除按钮会一直不可用。
+  // （卸载本身不会中断服务端那一轮 —— 见文件头的说明。）
   useEffect(() => {
     return () => useSpaceActivityStore.getState().setStreaming(wsId, false);
   }, [wsId]);

@@ -7,6 +7,7 @@
 
 pub(crate) mod active;
 pub(crate) mod conversation;
+pub(crate) mod feed;
 pub(crate) mod handler;
 pub(crate) mod images;
 pub(crate) mod run;
@@ -53,6 +54,15 @@ pub fn router() -> Router<AppState> {
         .route(
             "/{agent_id}/conversations/{id}/stream",
             get(handler::stream_chat),
+        )
+        // 只订阅在途轮（不新开一轮）：204 = 没有在途轮，历史即权威。
+        .route(
+            "/{agent_id}/conversations/{id}/stream/live",
+            get(handler::subscribe_chat),
+        )
+        .route(
+            "/{agent_id}/conversations/{id}/cancel",
+            post(handler::cancel_chat),
         )
         .route(
             "/{agent_id}/conversations/{id}/pause",

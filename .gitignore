@@ -12,3 +12,7 @@ dist/
 docs/
 reports/
 helix/
+
+# Peco 空间标记与派发产物（本地运行态，不入库）
+/.workspace.json
+/dispatch/

@@ -2,17 +2,21 @@
 // ChatActiveRuns — 活跃 chat 运行的控制注册表
 // ============================================================================
 //
-// chat 链路的 looper 由 SSE 请求任务独占持有（见 `handler::stream_chat`），
-// 请求之外无从触达；暂停/恢复必须在**另一条 HTTP 请求**里对在途 looper 施加
-// 控制，故这里给出「会话 → 控制通道」的注册表：
+// 一轮 chat 的 looper 由 run 任务独占持有（见 `chat::run`），请求之外无从触达；
+// 暂停 / 恢复 / 取消必须在**另一条 HTTP 请求**里对在途 looper 施加控制，故这里
+// 给出「会话 → 控制通道」的注册表：
 //
-//   POST .../pause  ─┐
-//                    ├─→ ChatActiveRuns ──mpsc──→ SSE 任务 ──→ LooperHandle::pause()/resume()
-//   POST .../resume ─┘
+//   POST .../pause   ─┐
+//   POST .../resume  ─┼─→ ChatActiveRuns ──mpsc──→ run 任务 ──→ LooperHandle::pause()/resume()/cancel()
+//   POST .../cancel  ─┘
 //
-// 条目与 SSE 任务同寿命：任务结束由 [`ChatRunGuard`] 移除。同一会话的重复
-// stream 请求**顶替**旧条目 —— 顶替即丢弃旧发送端，旧任务看到控制通道关闭
-// 便退出，避免出现「旧连接仍握着暂停开关」的错配。
+// 条目与 run 任务同寿命（任务结束由 [`ChatRunGuard`] 移除），条目里同时挂着这一轮
+// 的 [`TurnFeed`]：两者必须同寿命，否则会出现「feed 还在、控制没了」或反之。
+//
+// 断连不是事件 —— 连接只是这一轮的一个出口，不是它的所有权。所以 HTTP 入口与
+// 唤醒入口都用 [`ChatActiveRuns::try_register`]：有在途轮就是忙（409），不再有
+// 「新连接顺手挤掉旧连接」的顶替语义。[`ChatActiveRuns::register`] 保留顶替形态，
+// 供注册表自身的守卫与 token 保护被单测直接驱动。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,20 +24,26 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-/// 控制命令 —— SSE 任务转译为 `LooperHandle::pause()` / `resume()`。
+use super::feed::{LiveFrames, TurnFeed};
+
+/// 控制命令 —— run 任务转译为 `LooperHandle::pause()` / `resume()` / `cancel()`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatControl {
     Pause,
     Resume,
+    /// 会话级取消：收尾在 looper 的步进边界，可能晚于 HTTP 响应。
+    Cancel,
 }
 
 /// 控制通道容量。命令在 SSE 任务的 `select!` 上即时消费，容量只作背压缓冲。
 const CONTROL_CHANNEL_CAPACITY: usize = 8;
 
 struct Entry {
-    /// 注册代次标识 —— 顶替后旧守卫不得误删新条目。
+    /// 注册代次标识 —— 同会话两代条目并存时，旧守卫不得误删新条目。
     token: u64,
     tx: mpsc::Sender<ChatControl>,
+    /// 这一轮的帧扇出。与条目同寿命：条目在就说明这一轮在跑（或刚刚跑完、行已落库）。
+    feed: Arc<TurnFeed>,
 }
 
 type Registry = Arc<Mutex<HashMap<String, Entry>>>;
@@ -45,6 +55,8 @@ type Registry = Arc<Mutex<HashMap<String, Entry>>>;
 pub(crate) struct RunRegistration {
     pub(crate) control_rx: mpsc::Receiver<ChatControl>,
     pub(crate) guard: ChatRunGuard,
+    /// 这一轮的出口；由注册表创建，故条目与运行侧拿到的是同一个 `Arc`。
+    pub(crate) feed: Arc<TurnFeed>,
 }
 
 /// 会话级控制注册表（每会话至多一个在途 run）。
@@ -67,10 +79,12 @@ impl ChatActiveRuns {
         }
     }
 
-    /// 注册一个会话的运行，返回控制接收端与清理守卫。
+    /// 顶替形态的注册：返回控制接收端与清理守卫。
     ///
     /// 同一 `conversation_id` 重复注册会顶替旧条目：旧发送端随旧 `Entry` 一起
-    /// 丢弃，旧任务据此从 `control_rx` 收到 `None` 并退出。
+    /// 丢弃，旧任务据此从 `control_rx` 收到 `None` 并退出。两条产品入口都不走
+    /// 它（见文件头），这里保留的是注册表自身的原语 —— [`ChatRunGuard`] 的
+    /// token 校验只有在两代条目可能并存时才有意义。
     pub fn register(&self, conversation_id: &str) -> (mpsc::Receiver<ChatControl>, ChatRunGuard) {
         let reg = self.insert_locked(&mut self.inner.lock().unwrap(), conversation_id);
         (reg.control_rx, reg.guard)
@@ -90,12 +104,12 @@ impl ChatActiveRuns {
 
     /// 会话是否有在途运行：条目存在且控制发送端未关闭。
     ///
-    /// 语义是「这一轮真的在跑」，不是「还有人连着」：一轮一条流，`chat::run`
-    /// 的事件循环在 looper 回到 Idle 时退出、守卫随之 drop，页面开着而本轮已结束
-    /// 的会话在这里就不算忙了。
+    /// 语义是「这一轮真的在跑，与连接无关」：run 任务把一轮跑完才 drop 守卫，
+    /// 客户端断连不影响它。页面开着而本轮已结束的会话在这里不算忙 —— 唤醒队列
+    /// 因此不会为一条已经关掉的连接永久让路。
     ///
-    /// 表里有条目不等于跑着：被顶替的旧条目要到旧守卫 drop 才移除，而旧任务
-    /// 收到通道关闭早已退出。据此判「忙」会把已死的运行当成在跑的。
+    /// 表里有条目不等于跑着：条目要到守卫 drop 才移除，而任务可能早已退出。
+    /// 据此判「忙」会把已死的运行当成在跑的。
     pub fn is_active(&self, conversation_id: &str) -> bool {
         let map = self.inner.lock().unwrap();
         map.get(conversation_id)
@@ -110,7 +124,15 @@ impl ChatActiveRuns {
     ) -> RunRegistration {
         let (tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        map.insert(conversation_id.to_string(), Entry { token, tx });
+        let feed = Arc::new(TurnFeed::new(conversation_id.to_string()));
+        map.insert(
+            conversation_id.to_string(),
+            Entry {
+                token,
+                tx,
+                feed: Arc::clone(&feed),
+            },
+        );
         RunRegistration {
             control_rx,
             guard: ChatRunGuard {
@@ -118,6 +140,7 @@ impl ChatActiveRuns {
                 conversation_id: conversation_id.to_string(),
                 token,
             },
+            feed,
         }
     }
 
@@ -131,6 +154,24 @@ impl ChatActiveRuns {
         self.send(conversation_id, ChatControl::Resume)
     }
 
+    /// 请求取消这一轮；语义同 [`Self::pause`]（返回 `false` 表示无在途轮）。
+    pub fn cancel(&self, conversation_id: &str) -> bool {
+        self.send(conversation_id, ChatControl::Cancel)
+    }
+
+    /// 加入该会话在途轮的帧流；无在途轮、或这一轮已进入终态时返回 `None`
+    /// （调用方据此回 204：历史已是权威）。
+    ///
+    /// 先克隆 `Arc` 再放注册表锁：`attach` 的原子性由 feed 内部那把锁保证，
+    /// 没必要持着外层的锁去拿里层的。
+    pub(crate) fn attach(&self, conversation_id: &str) -> Option<LiveFrames> {
+        let feed = {
+            let map = self.inner.lock().unwrap();
+            Arc::clone(&map.get(conversation_id)?.feed)
+        };
+        feed.attach()
+    }
+
     fn send(&self, conversation_id: &str, cmd: ChatControl) -> bool {
         let map = self.inner.lock().unwrap();
         map.get(conversation_id)
@@ -138,10 +179,10 @@ impl ChatActiveRuns {
     }
 }
 
-/// 注册表条目的生命周期守卫 —— 随 SSE 任务 drop 时移除。
+/// 注册表条目的生命周期守卫 —— 随 run 任务 drop 时移除。
 ///
-/// 只在条目**仍属于本次注册**（token 相同）时移除：被新 stream 顶替后，旧守卫
-/// 不得删掉新条目，否则新连接会失去暂停控制。
+/// 只在条目**仍属于本次注册**（token 相同）时移除：同会话两代条目可能短暂并存
+/// （顶替形态的注册），旧守卫不得删掉新条目，否则新的运行会失去控制端。
 pub struct ChatRunGuard {
     inner: Registry,
     conversation_id: String,

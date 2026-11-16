@@ -11,7 +11,7 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use crate::chat::active::ChatActiveRuns;
-use crate::chat::run::{Registration, RunDeps, RunError, RunSink, spawn_run};
+use crate::chat::run::{RunAudience, RunDeps, RunError, spawn_run};
 use crate::db::conversations::{self, ConversationRow};
 use crate::space::SpaceEnv;
 use crate::space::peco::PecoIdentity;
@@ -131,8 +131,8 @@ impl DeliverySink for PecoDelivery {
         };
 
         // 注册由 `spawn_run` 在校验之后做：查空闲与注册之间用户可能刚好打开这个
-        // 会话，`TryNew` 输掉的一方拿到 `Busy`，行回滚成待投递而不是记一次失败。
-        // 顺带保证「空间没打开」这类装配失败也不会顶掉用户正在看的那一轮。
+        // 会话，输掉的一方拿到 `Busy`，行回滚成待投递而不是记一次失败。顺带保证
+        // 「空间没打开」这类装配失败也不会动用户正在看的那一轮。
         let deps = RunDeps {
             pool: &self.pool,
             env: &env,
@@ -145,12 +145,12 @@ impl DeliverySink for PecoDelivery {
             &conv,
             text.clone(),
             Content::Text(text),
-            RunSink::Headless,
-            Registration::TryNew,
+            RunAudience::Headless,
         )
         .await
         {
-            Ok(()) => Delivery::Delivered,
+            // 无人看帧：这一轮的订阅端直接丢弃（正文与用量已由 feed 与落库覆盖）。
+            Ok(_) => Delivery::Delivered,
             Err(e) => delivery_of(e),
         }
     }

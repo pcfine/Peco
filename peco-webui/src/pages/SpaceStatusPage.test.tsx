@@ -25,6 +25,9 @@ vi.mock("@/api/conversations", () => ({
   deleteConversation: async () => ({ success: true }),
   uploadConversationImage: async () => ({ id: "i", url: "/i" }),
   conversationStreamUrl: () => "/api/chat/@master/conversations/c/stream",
+  conversationLiveStreamUrl: (agentId: string, convId: string) =>
+    `/api/chat/${agentId}/conversations/${convId}/stream/live`,
+  cancelConversationTurn: async () => "accepted" as const,
 }));
 
 vi.mock("@/api/spaces", () => ({

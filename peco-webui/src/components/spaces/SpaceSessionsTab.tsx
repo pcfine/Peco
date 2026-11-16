@@ -10,6 +10,8 @@ import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Button } from "@/components/ui/button";
 import {
+  cancelConversationTurn,
+  conversationLiveStreamUrl,
   conversationStreamUrl,
   createConversation,
   deleteConversation,
@@ -199,6 +201,15 @@ export function SpaceSessionsTab({
               })
             }
             initialMessages={initialMessages}
+            // ── 在途轮的重订阅：切回这个会话靠它接上，而不是重发 ──
+            historySettled={history.isFetched}
+            liveStreamUrl={() =>
+              conversationLiveStreamUrl(AGENT, active, { wsId })
+            }
+            // 「停止」改走服务端取消：200 = 命令已投递，守着连接等 done
+            cancelTurn={() => cancelConversationTurn(AGENT, active, { wsId })}
+            onAttachSettled={() => void history.refetch()}
+            onTurnSettled={() => void history.refetch()}
             welcomeMessage="这个空间已经就绪。把要它做的事写下来。"
             className="h-full p-3"
           />

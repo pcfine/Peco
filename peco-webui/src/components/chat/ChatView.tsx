@@ -15,10 +15,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type {
+  CancelTurnOutcome,
   ChatSseEvent,
   ErrorData,
   MessageData,
   TurnData,
+  TurnSnapshotData,
   UsageData,
 } from "@/types/chat";
 import {
@@ -33,7 +35,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { toast } from "sonner";
-import { parseSSELines, toChatSseEvent } from "@/api/stream";
+import { frameSeq, parseSSELines, toChatSseEvent } from "@/api/stream";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { TokenUsageRing } from "@/components/chat/TokenUsageRing";
 import { ToolCallCard } from "@/components/chat/ToolCallCard";
@@ -50,6 +52,7 @@ import { BrandMark } from "@/components/common/BrandMark";
 import { DEFAULT_CONTEXT_WINDOW } from "@/lib/constants";
 import { settlePendingToolCalls, type ToolCallView } from "@/lib/toolCall";
 import { formatDuration, formatMessageTime } from "@/lib/time";
+import { MAX_RETRIES, retryDelay } from "@/lib/sseState";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -101,6 +104,20 @@ function uploadErrorMessage(err: unknown, name: string): string {
   return data?.details || data?.error || `附件上传失败：${name}`;
 }
 
+/**
+ * 从错误响应体里取 `code`（`{code, error, details}`，取不到返回 null）。
+ *
+ * 分流按 code 走、不解析文案：`conversation_busy` 与其它 409 的处理方式不同。
+ */
+function errorCodeOf(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown };
+    return typeof parsed.code === "string" ? parsed.code : null;
+  } catch {
+    return null;
+  }
+}
+
 /** 上传进度回调：0–100（服务端未给出总长度时不回调）。 */
 export type UploadProgress = (percent: number) => void;
 
@@ -142,6 +159,14 @@ export interface ChatAttachment {
   name: string;
   url?: string;
 }
+
+/**
+ * 点「停止」后等 `done` 的硬兜底时长。
+ *
+ * 取消命令 200 只表示已投递，收尾在步进边界；10s 还没等到 `done` 说明连接已经死
+ * 了，才退化成断开本地连接（服务端那一轮仍在跑，并会自己落库）。
+ */
+export const CANCEL_ABORT_MS = 10_000;
 
 /** 一轮的终态：正常完成 / 失败 / 用户取消。 */
 export type TurnStatus = "success" | "failed" | "cancelled";
@@ -280,6 +305,39 @@ export interface ChatViewProps {
   loadingEarlier?: boolean;
   /** 流式开关变化回调：dock 头部据此显示「对话流」的连接状态。 */
   onStreamingChange?: (streaming: boolean) => void;
+  /**
+   * [可选] 重新订阅在途轮的流地址（`GET .../stream/live`；服务端无在途轮回 204）。
+   *
+   * 一轮的执行归 daemon，连接只是它的出口之一：切走再回来不是重发，而是接上。
+   * 不传即不启用 attach —— 既有用法（external 模式、纯本地流）行为不变。
+   */
+  liveStreamUrl?: () => string;
+  /**
+   * [可选] 历史请求是否已落定（壳里的 `history.isFetched`）。
+   *
+   * attach 的启动条件之一：历史请求必须先于订阅请求发出，否则快照补进来的内容
+   * 与历史快照谁先落地就变成运气。缺省 false（不 attach）。
+   */
+  historySettled?: boolean;
+  /**
+   * [可选] 请求服务端取消在途轮（`POST .../cancel`）。
+   *
+   * 提供时「停止」不再掐本地连接 —— detach 之后掐连接不会停住服务端那一轮。
+   * 返回 `"no_running_task"` 表示轮已结束（409），只补历史、不打「已取消」标。
+   */
+  cancelTurn?: () => Promise<CancelTurnOutcome>;
+  /**
+   * [可选] 首帧 `turn_snapshot` 落定后回调一次。
+   *
+   * 用于补取历史：user 行可能晚于历史快照落库（帧序规则第 2 条）。
+   */
+  onAttachSettled?: () => void;
+  /**
+   * [可选] 一轮真正结束（收到 `done`）后回调 —— 壳在此 `void history.refetch()`。
+   *
+   * 时机见 `settleTurn`。
+   */
+  onTurnSettled?: () => void;
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
@@ -316,6 +374,11 @@ export function ChatView({
   hasMore = false,
   loadingEarlier = false,
   onStreamingChange,
+  liveStreamUrl,
+  historySettled,
+  cancelTurn,
+  onAttachSettled,
+  onTurnSettled,
 }: ChatViewProps) {
   const isExternalMode = mode === "external";
   if (isExternalMode && import.meta.env.DEV) {
@@ -326,6 +389,11 @@ export function ChatView({
     if (externalIsStreaming === undefined)
       console.warn("ChatView mode=external: externalIsStreaming is required");
   }
+  if (liveStreamUrl && historySettled === undefined && import.meta.env.DEV) {
+    // 静默不 attach 是最难查的一类问题：attach 依赖「历史已落定」这个外部事实，
+    // 漏传就表现为「回来以后什么都没接上」。
+    console.warn("ChatView liveStreamUrl: historySettled is required");
+  }
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -333,6 +401,14 @@ export function ChatView({
   const [paused, setPaused] = useState(false);
   /** 已点暂停、服务端尚未挂起（流式在途）时的暂态提示 */
   const [pausePending, setPausePending] = useState(false);
+  /** 已投递取消命令、服务端尚未收尾：气泡标 `aria-busy`，「停止」按钮禁用 */
+  const [cancelling, setCancelling] = useState(false);
+  /** attach 的重连次数用尽：不再静默重试，摆一个可点的重试入口 */
+  const [attachFailed, setAttachFailed] = useState(false);
+  /** attach 的重跑开关（重试按钮 / 重新可见都靠它推一拍） */
+  const [attachEpoch, setAttachEpoch] = useState(0);
+  /** 收尾计数器：`done` 之后每次 +1，effect 里再回调 onTurnSettled（见 settleTurn） */
+  const [settleSeq, setSettleSeq] = useState(0);
   const [usage, setUsage] = useState<UsageData | null>(null);
   /** 已上传待发送的附件（图片 + 文档） */
   const [pendingAttachments, setPendingAttachments] = useState<
@@ -343,6 +419,14 @@ export function ChatView({
   const uploadSeqRef = useRef(0);
   const uploading = uploads.length > 0;
   const abortRef = useRef<AbortController | null>(null);
+  /** attach（订阅在途轮）的连接：与「本地发出去的那条流」生命周期不同，单独持有 */
+  const attachAbortRef = useRef<AbortController | null>(null);
+  /** 取消命令的 10s 兜底定时器 */
+  const cancelTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  /** 本轮收到过 `error{cancelled:true}` —— 服务端权威判据，`done` 时据此打标 */
+  const cancelledRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const unreadCountRef = useRef(0);
@@ -362,8 +446,6 @@ export function ChatView({
   const uploadingRef = useRef(uploading);
   uploadingRef.current = uploading;
 
-  // StrictMode-safe unmount timer: setTimeout in cleanup is cleared on remount,
-  // so abort only fires for genuine unmounts, not StrictMode double-invocation.
   const unmountTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -375,6 +457,19 @@ export function ChatView({
   onUnreadRef.current = onUnread;
   const onInitialQuerySentRef = useRef(onInitialQuerySent);
   onInitialQuerySentRef.current = onInitialQuerySent;
+
+  // attach / 取消相关回调同样走 ref：壳里传的是内联箭头，每渲染都是新引用，
+  // 直接进 effect 依赖会让订阅随每次渲染重建。
+  const liveStreamUrlRef = useRef(liveStreamUrl);
+  liveStreamUrlRef.current = liveStreamUrl;
+  const cancelTurnRef = useRef(cancelTurn);
+  cancelTurnRef.current = cancelTurn;
+  const onAttachSettledRef = useRef(onAttachSettled);
+  onAttachSettledRef.current = onAttachSettled;
+  const onTurnSettledRef = useRef(onTurnSettled);
+  onTurnSettledRef.current = onTurnSettled;
+  const cancellingRef = useRef(cancelling);
+  cancellingRef.current = cancelling;
 
   // External-mode refs — stable across renders for use in callbacks / effects.
   const onExternalSendRef = useRef(onExternalSend);
@@ -392,78 +487,146 @@ export function ChatView({
   // `usage` state; external mode reads from the parent-provided prop.
   const effectiveUsage = isExternalMode ? externalUsage : usage;
 
+  /**
+   * 一轮收尾：**先**关流式态，下一次提交再回调 `onTurnSettled`。
+   *
+   * 顺序是验收项而非实现细节 —— 壳里 refetch 回来的 `initialMessages` 依赖既有
+   * 同步效应（要求 `streamingRef.current === false`）才能替换本地在途气泡；把
+   * 「关流式」排在「让 refetch 落地」之后，用户看到的就是一行永远不被替换的脏气泡。
+   * 用计数器 + effect 而不是直接调回调，是为了让这次提交先把「已不再是流式」渲染
+   * 出去（流式开关的观察者也按同一提交的顺序收到 false）。
+   */
+  const settleTurn = useCallback(() => {
+    setMessages((prev) => {
+      const settled = settlePendingToolCalls(prev);
+      // 「已取消」只在服务端说了算（`error{cancelled:true}`）时才打标，
+      // 且延到 `done` 这一拍 —— 提前打会把还在收尾的轮说成已经停下。
+      return cancelledRef.current
+        ? markTurnResult(settled, "cancelled")
+        : settled;
+    });
+    setStreaming(false);
+    setPaused(false);
+    setCancelling(false);
+    if (cancelTimerRef.current) {
+      clearTimeout(cancelTimerRef.current);
+      cancelTimerRef.current = undefined;
+    }
+    setSettleSeq((n) => n + 1);
+  }, []);
+
   // ── Core send logic — stable identity (empty deps, reads everything from refs) ─
 
-  const sendMessage = useCallback(async (text: string) => {
-    const attachments = pendingAttachmentsRef.current;
-    if ((!text.trim() && attachments.length === 0) || streamingRef.current)
-      return;
+  const sendMessage = useCallback(
+    async (text: string) => {
+      const attachments = pendingAttachmentsRef.current;
+      if ((!text.trim() && attachments.length === 0) || streamingRef.current)
+        return;
 
-    // 上传中的附件不允许随消息发送（upload 完成前禁用发送即可达，这里兜底跳过）
-    const fileIds = attachments.map((att) => att.id);
+      // 上传中的附件不允许随消息发送（upload 完成前禁用发送即可达，这里兜底跳过）
+      const fileIds = attachments.map((att) => att.id);
 
-    const sentAt = Date.now();
-    const userMsg: ChatMessage = {
-      role: "user",
-      content: text,
-      turnIndex: 0,
-      timestampMs: sentAt,
-      images: attachments
-        .filter((att) => att.kind === "image" && att.url)
-        .map((att) => att.url as string),
-      attachments: attachments
-        .filter((att) => att.kind === "document")
-        .map((att) => ({ name: att.name })),
-    };
-    setMessages((prev) => [...prev, userMsg]);
-    setStreaming(true);
-    setPaused(false);
-    setPendingAttachments([]);
+      const sentAt = Date.now();
+      const userMsg: ChatMessage = {
+        role: "user",
+        content: text,
+        turnIndex: 0,
+        timestampMs: sentAt,
+        images: attachments
+          .filter((att) => att.kind === "image" && att.url)
+          .map((att) => att.url as string),
+        attachments: attachments
+          .filter((att) => att.kind === "document")
+          .map((att) => ({ name: att.name })),
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setStreaming(true);
+      setPaused(false);
+      setCancelling(false);
+      cancelledRef.current = false;
+      setPendingAttachments([]);
 
-    const assistantMsg: ChatMessage = {
-      role: "assistant",
-      content: "",
-      turnIndex: 0,
-      timestampMs: sentAt,
-    };
-    setMessages((prev) => [...prev, assistantMsg]);
+      const assistantMsg: ChatMessage = {
+        role: "assistant",
+        content: "",
+        turnIndex: 0,
+        timestampMs: sentAt,
+      };
+      setMessages((prev) => [...prev, assistantMsg]);
 
-    const controller = new AbortController();
-    abortRef.current = controller;
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-    try {
-      const url = streamUrlRef.current(text, fileIds);
-      const response = await fetch(url, { signal: controller.signal });
-      if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(errText || `HTTP ${response.status}`);
-      }
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let pendingEvent = "";
+      try {
+        const url = streamUrlRef.current(text, fileIds);
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) {
+          const errText = await response.text().catch(() => "");
+          if (
+            response.status === 409 &&
+            errorCodeOf(errText) === "conversation_busy"
+          ) {
+            // 这一轮还在跑（别的标签页 / 上一轮没收尾）：重发不是解法，先把刚
+            // 乐观插进去的两条气泡撤掉，输入原样还给用户 —— 让他先停止或等它收尾。
+            setMessages((prev) =>
+              prev.filter((m) => m !== userMsg && m !== assistantMsg),
+            );
+            setInput(text);
+            setPendingAttachments(attachments);
+            toast.error("这一轮还在跑，先停止再发");
+            return;
+          }
+          throw new Error(errText || `HTTP ${response.status}`);
+        }
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let pendingEvent = "";
+        let pendingId = "";
+        /** 帧序水位：首帧 `turn_snapshot` 覆盖到的最后一帧；`id <= 水位` 的帧丢弃 */
+        let watermark = -1;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        const {
-          events,
-          remaining,
-          pendingEvent: next,
-        } = parseSSELines(chunk, buffer, pendingEvent);
-        buffer = remaining;
-        pendingEvent = next;
+          const chunk = decoder.decode(value, { stream: true });
+          const parsedChunk = parseSSELines(
+            chunk,
+            buffer,
+            pendingEvent,
+            pendingId,
+          );
+          buffer = parsedChunk.remaining;
+          pendingEvent = parsedChunk.pendingEvent;
+          pendingId = parsedChunk.pendingId;
 
-        for (const parsed of events) {
-          const event = toChatSseEvent(parsed);
-          if (event) {
+          for (const parsed of parsedChunk.events) {
+            const event = toChatSseEvent(parsed);
+            if (!event) continue;
+
+            if (event.event === "turn_snapshot") {
+              // 先记水位再应用（帧序规则第 2 条）：快照之后的重叠帧一律丢弃
+              watermark = event.data.seq;
+              setUsage(event.data.usage);
+            } else {
+              const seq = frameSeq(parsed.id);
+              if (seq !== null && seq <= watermark) continue;
+            }
+
             if (event.event === "usage") {
               setUsage({
                 input_tokens: event.data.input_tokens,
                 output_tokens: event.data.output_tokens,
               });
+            }
+            if (event.event === "error" && isCancelledError(event.data)) {
+              cancelledRef.current = true;
+            }
+            if (event.event === "done") {
+              // `done` 是唯一的「流结束」信号：关流式态 → 下一拍 refetch 以库里为准
+              settleTurn();
+              continue;
             }
             handleSSEEvent(event, setMessages, setStreaming, setPaused, () => {
               if (!visibleRef.current && onUnreadRef.current) {
@@ -482,16 +645,20 @@ export function ChatView({
             });
           }
         }
+      } catch (err: unknown) {
+        if (err instanceof Error && err.name === "AbortError") return;
+        toast.error("连接中断");
+      } finally {
+        // 兜底：若这一轮没等到 `done`（连接断在半路），流式态仍要关掉 —— 服务端
+        // 那一轮有没有跑完由下一次 attach（204/快照）交代，本地只负责不再假装在生成。
+        setStreaming(false);
+        setPaused(false);
+        setCancelling(false);
+        abortRef.current = null;
       }
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === "AbortError") return;
-      toast.error("连接中断");
-    } finally {
-      setStreaming(false);
-      setPaused(false);
-      abortRef.current = null;
-    }
-  }, []);
+    },
+    [settleTurn],
+  );
 
   // ── Sync messages when initialMessages changes (pool keep-alive) ─────────
 
@@ -633,6 +800,8 @@ export function ChatView({
       unmountTimerRef.current = undefined;
     }
     return () => {
+      // 取消的 10s 兜底定时器不能活过组件：到点再 setState 已无处安放。
+      if (cancelTimerRef.current) clearTimeout(cancelTimerRef.current);
       // In external mode the SSE lifecycle is managed by the store —
       // do NOT abort on unmount so streaming continues in the background.
       if (isExternalMode) return;
@@ -642,17 +811,198 @@ export function ChatView({
     };
   }, [isExternalMode]);
 
+  // ── 重新订阅在途轮（attach）────────────────────────────────────────────
+  //
+  // 一轮的执行归 daemon，SSE 连接只是它的出口之一，所以「切走再回来」不是重发
+  // 而是重新订阅：无在途轮 → 204（历史即权威，什么都不做）；有在途轮 → 首帧
+  // `turn_snapshot` 把已产出的内容原样交回，我们按 `seq` 记水位、按 `id` 丢弃重叠
+  // 帧后继续跟增量。断开只是关掉出口，服务端那一轮不受影响。
+  const canAttachTurn =
+    !isExternalMode && liveStreamUrl !== undefined && historySettled === true;
+
+  useEffect(() => {
+    // 不可见时不握连接：切回可见时本 effect 会重跑，届时重新订阅并补齐
+    if (!canAttachTurn || !visible) return;
+    // 本地正在发的那条流本身就是出口，不要再叠一条订阅
+    if (abortRef.current) return;
+    const buildUrl = liveStreamUrlRef.current;
+    if (!buildUrl) return;
+
+    // 地址只解析一次：重试要重走的是**同一条订阅**，不是重新拼一串参数。
+    // 拼不出来（接线漏了）就别开订阅，更不要拿它当连接失败去重试。
+    let url: string;
+    try {
+      url = buildUrl();
+    } catch (err) {
+      if (import.meta.env.DEV) {
+        console.warn("ChatView liveStreamUrl: 取流地址失败，跳过订阅", err);
+      }
+      return;
+    }
+
+    const controller = new AbortController();
+    attachAbortRef.current = controller;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    /** 退避重连（复用 sseState 的 1s→…→15s，MAX_RETRIES 次） */
+    const retry = (attempt: number) => {
+      if (disposed) return;
+      if (attempt >= MAX_RETRIES) {
+        setAttachFailed(true);
+        return;
+      }
+      timer = setTimeout(
+        () => {
+          void run(attempt + 1);
+        },
+        retryDelay(attempt + 1),
+      );
+    };
+
+    const run = async (attempt: number): Promise<void> => {
+      let watermark = -1;
+      let sawDone = false;
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (disposed) return;
+        if (response.status === 204) {
+          // 无在途轮：历史即权威。顺手把可能残留的流式态收干净（隐藏期间这一轮
+          // 跑完时我们不在，没人替我们关它）。
+          setStreaming(false);
+          setCancelling(false);
+          setAttachFailed(false);
+          return;
+        }
+        if (!response.ok || !response.body) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let pendingEvent = "";
+        let pendingId = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          const parsedChunk = parseSSELines(
+            chunk,
+            buffer,
+            pendingEvent,
+            pendingId,
+          );
+          buffer = parsedChunk.remaining;
+          pendingEvent = parsedChunk.pendingEvent;
+          pendingId = parsedChunk.pendingId;
+
+          for (const parsed of parsedChunk.events) {
+            const event = toChatSseEvent(parsed);
+            if (!event) continue;
+
+            if (event.event === "turn_snapshot") {
+              // 规则 2：先记水位，再**替换**在途气泡（替换即气泡级去重）；
+              // 服务端因 Lagged 补发新快照时也走这里，按同一口径重置。
+              watermark = event.data.seq;
+              setMessages((prev) => applyTurnSnapshot(prev, event.data));
+              setUsage(event.data.usage);
+              setStreaming(true);
+              setPaused(event.data.phase === "paused");
+              setCancelling(event.data.phase === "cancelling");
+              // 规则 2 末句：快照落定后补取一次历史，补齐可能晚于历史快照
+              // 落库的 user 行（窗口 W4）
+              onAttachSettledRef.current?.();
+              continue;
+            }
+
+            // 规则 3：`id <= 水位` 的帧已被快照覆盖，丢弃
+            const seq = frameSeq(parsed.id);
+            if (seq !== null && seq <= watermark) continue;
+
+            if (event.event === "error" && isCancelledError(event.data)) {
+              cancelledRef.current = true;
+            }
+            if (event.event === "done") {
+              sawDone = true;
+              settleTurn();
+              continue;
+            }
+            handleSSEEvent(event, setMessages, setStreaming, setPaused);
+          }
+        }
+
+        // 规则 7：没有 `done` 而流结束 = 连接失败，不得自行判定轮已结束
+        if (!sawDone) retry(attempt);
+      } catch {
+        if (disposed || controller.signal.aborted) return;
+        retry(attempt);
+      }
+    };
+
+    setAttachFailed(false);
+    void run(0);
+
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      // 只是关掉出口：服务端那一轮由 daemon 持有，回来时重新订阅即可
+      controller.abort();
+      if (attachAbortRef.current === controller) attachAbortRef.current = null;
+    };
+  }, [canAttachTurn, visible, attachEpoch, settleTurn]);
+
   // ── Handlers ────────────────────────────────────────────────────────────
 
+  /**
+   * 停止 = 请服务端取消这一轮，而不是掐掉自己的连接。
+   *
+   * detach 之后连接不再是所有权：掐它停不住服务端那一轮，用户看到的只是「按了
+   * 没反应」。200 只表示命令已投递（收尾在步进边界），所以守着连接等
+   * `error{cancelled:true}` + `done`；10s 还没等到才退化为本地 abort —— 硬兜底，
+   * 只在连接已经死掉时触发，服务端那一轮仍会自己跑完并落库。
+   */
   const handleStop = () => {
     if (onExternalStopRef.current) {
       onExternalStopRef.current();
-    } else {
+      return;
+    }
+    const requestCancel = cancelTurnRef.current;
+    if (!requestCancel) {
+      // 没有取消能力（旧后端 / 未接线）：保持旧行为 —— 断流 + 本地打标
       abortRef.current?.abort();
       // 连接已断，收不到服务端终态事件
       setMessages((prev) => markTurnResult(prev, "cancelled"));
       setStreaming(false);
+      return;
     }
+    if (cancellingRef.current) return;
+    setCancelling(true);
+    void requestCancel().then(
+      (outcome) => {
+        if (outcome === "no_running_task") {
+          // 轮已经结束：历史即权威，补一次历史就够了，不打「已取消」标
+          setCancelling(false);
+          setSettleSeq((n) => n + 1);
+          return;
+        }
+        // 命令已投递：连接保持打开，等 error{cancelled:true} + done 收尾
+        cancelTimerRef.current = setTimeout(() => {
+          cancelTimerRef.current = undefined;
+          abortRef.current?.abort();
+          attachAbortRef.current?.abort();
+          setStreaming(false);
+          setCancelling(false);
+          setSettleSeq((n) => n + 1);
+        }, CANCEL_ABORT_MS);
+      },
+      () => {
+        setCancelling(false);
+        toast.error("取消失败，请重试");
+      },
+    );
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -788,6 +1138,14 @@ export function ChatView({
   useEffect(() => {
     onStreamingChangeRef.current?.(isStreaming);
   }, [isStreaming]);
+
+  // 一轮收尾的回调必须落在「流式已关」之后的那次提交里 —— 本 effect 因此**排在上
+  // 面那个之后**（同一提交内 effect 按声明顺序执行）。
+  useEffect(() => {
+    if (settleSeq === 0) return;
+    onTurnSettledRef.current?.();
+  }, [settleSeq]);
+
   // external 模式的 SSE 由 store 管理，本地循环收不到 `looper_state`，
   // 故以父组件传入的 externalPaused 为权威；internal 模式仍认本地事件。
   const effectivePaused = isExternalMode ? externalPaused : paused;
@@ -832,6 +1190,8 @@ export function ChatView({
         ref={scrollContainerRef}
         onScroll={handleScroll}
         data-slot="message-scroller"
+        // 取消已投递、收尾尚未发生：在途气泡仍在被服务端改写
+        aria-busy={cancelling ? "true" : undefined}
         className="flex-1 overflow-y-auto space-y-4 pr-2"
       >
         {onLoadEarlier && hasMore && (
@@ -858,6 +1218,27 @@ export function ChatView({
         ))}
         <div ref={messagesEndRef} />
       </div>
+
+      {/* 订阅在途轮的重试入口：重连次数用尽后停在这里，不后台空转 */}
+      {attachFailed && (
+        <div
+          data-slot="attach-retry"
+          role="status"
+          className="mt-2 flex items-center justify-between gap-2 rounded-md border border-warn/40 bg-warn/10 px-3 py-1.5 text-caption text-ink-muted"
+        >
+          <span>没能接上这一轮，连接已断开。</span>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              setAttachFailed(false);
+              setAttachEpoch((n) => n + 1);
+            }}
+          >
+            重试
+          </Button>
+        </div>
+      )}
 
       {/* Input */}
       <div className="pt-4 mt-4">
@@ -1060,14 +1441,23 @@ export function ChatView({
                 </Tooltip>
               )}
               {isStreaming && (
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  aria-label="停止"
-                  onClick={handleStop}
-                >
-                  <Square className="h-4 w-4" />
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      aria-label={cancelling ? "正在取消" : "停止"}
+                      aria-busy={cancelling ? "true" : undefined}
+                      disabled={cancelling}
+                      onClick={handleStop}
+                    >
+                      <Square className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {cancelling ? "正在取消，等这一轮收尾…" : "停止"}
+                  </TooltipContent>
+                </Tooltip>
               )}
               {/* external 模式在途也保留发送入口（消息排队）；internal 模式
                   流式中仍只给停止，避免新 SSE 顶替在途 run。 */}
@@ -1422,6 +1812,85 @@ function lastHostIndex(messages: ChatMessage[]): number {
 }
 
 /**
+ * 在途气泡的下标：本轮 SSE 造出来的 assistant 宿主。
+ *
+ * 与 `lastHostIndex` 的区别是「不带 id」—— 历史消息（快照/分页）恒有 id，实时
+ * 消息恒无（见 `ChatMessage.id` 的注释）。attach 时若拿历史里的回答当宿主，快照
+ * 就会把上一轮的回答覆盖成本轮内容。
+ */
+function lastLiveHostIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (
+      m.role === "assistant" &&
+      m.id === undefined &&
+      !m.isNotice &&
+      !m.isError
+    )
+      return i;
+  }
+  return -1;
+}
+
+/**
+ * 首帧 `turn_snapshot` → 在途气泡（帧序规则第 2 条：**替换**而非追加）。
+ *
+ * 快照是在途内容的显示权威（DB 只在 `done` 之后接手）：正文/推理/工具卡一律以
+ * 它为准，本轮已产出的子 Agent 卡按快照重建。没有在途气泡时新建一个 —— 这是
+ * 「切走再回来」与「刷新后接上」的共同入口。
+ */
+export function applyTurnSnapshot(
+  messages: ChatMessage[],
+  snapshot: TurnSnapshotData,
+): ChatMessage[] {
+  // 子 Agent 卡整体由快照重建：本地那些无 id 的同轮卡片一并作废
+  const base = messages.filter(
+    (m) => m.role !== "agent-call" || m.id !== undefined,
+  );
+  const toolCalls: ToolCallView[] | undefined = snapshot.tool_calls.length
+    ? snapshot.tool_calls.map((tc) => ({
+        id: tc.id,
+        name: tc.name,
+        arguments: tc.arguments,
+        result: tc.result,
+        status: tc.status === "done" ? ("done" as const) : ("pending" as const),
+      }))
+    : undefined;
+  const reasoning = snapshot.reasoning === "" ? undefined : snapshot.reasoning;
+  const agents: ChatMessage[] = snapshot.agent_calls.map((call) => ({
+    role: "agent-call" as const,
+    content: call.status === "done" ? call.result || "(完成)" : "",
+    turnIndex: 0,
+    agentName: call.agent_name,
+    // 快照不带子 Agent 的任务描述（阶段一按 id/name/status 重建卡片即可）
+    agentTask: "",
+    callId: call.call_id,
+  }));
+
+  const host = lastLiveHostIndex(base);
+  if (host < 0) {
+    return [
+      ...base,
+      {
+        role: "assistant" as const,
+        content: snapshot.text,
+        turnIndex: 0,
+        reasoning,
+        toolCalls,
+        timestampMs: Date.now(),
+      },
+      ...agents,
+    ];
+  }
+  return [
+    ...base.slice(0, host),
+    { ...base[host], content: snapshot.text, reasoning, toolCalls },
+    ...agents,
+    ...base.slice(host + 1),
+  ];
+}
+
+/**
  * Apply a single SSE event to a messages array (pure — no side effects).
  * `now` 仅在终态事件上用于计算本轮耗时。
  */
@@ -1532,6 +2001,9 @@ export function reduceStreamEvent(
       return markTurnResult(settlePendingToolCalls(messages), "success", now);
     case "done":
       return settlePendingToolCalls(messages);
+    case "turn_snapshot":
+      // 在途轮快照：水位与流式态由读循环负责，这里只管气泡内容（替换口径）
+      return applyTurnSnapshot(messages, event.data);
     case "usage":
     case "looper_state":
     // steering 的气泡切分由 store 负责（需要同时消费「已排队」状态）；

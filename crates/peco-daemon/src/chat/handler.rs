@@ -14,12 +14,12 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::sse::{KeepAlive, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use futures::stream::Stream;
 use model_provider::{Content, ContentPart};
 use peco_core::session::SessionPersister;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::api_error::ApiError;
@@ -32,7 +32,8 @@ use crate::session_store::SqliteSessionPersister;
 use crate::state::AppState;
 
 use super::conversation::auto_archive_oldest_if_needed;
-use super::run::{Registration, RunDeps, RunError, RunSink, spawn_run};
+use super::feed::{self, LiveFrames};
+use super::run::{RunAudience, RunDeps, RunError, spawn_run};
 use super::sse::UsageData;
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
@@ -327,22 +328,40 @@ impl From<RunError> for ApiError {
         match err {
             RunError::Space(e) => ApiError::from(e),
             RunError::Agent(message) => ApiError::Internal(message),
-            // HTTP 入口是顶替语义，走不到这一支；留着是为了「有在途运行」这条
-            // 语义在两条入口上有一致的状态码。
-            RunError::Busy => ApiError::Conflict("the conversation is already running".into()),
+            // 这一轮还在跑（与有没有人连着无关）：不再静默顶替 —— 顶替会让另一个
+            // 标签页正在看的一轮被无声截断，且两条 run 争同一会话的 session 快照。
+            // 前端按 `code` 分支提示「先停止再发」，不解析文案。
+            RunError::Busy => ApiError::coded(
+                StatusCode::CONFLICT,
+                "conversation_busy",
+                "the conversation is already running",
+            ),
         }
     }
 }
 
+/// 把一订阅端包成 SSE 响应。keep-alive 保留：一轮可以长时间没有帧（模型在读长
+/// 上下文），连接不能因此被中间设备判死。
+fn sse_response(frames: LiveFrames) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(feed::frame_stream(frames)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
 /// `GET /api/chat/{agentId}/conversations/{id}/stream?message=`
 ///
-/// SSE 流式对话。
+/// 发一轮并跟随它的帧流。首帧是 `turn_snapshot`，末帧是 `done`。
+///
+/// **连接不是这一轮的所有权**：断连只丢掉这条出口，轮照旧跑完并落库；客户端回来
+/// 用 `GET .../stream/live` 接上，不必重发。有在途轮时返回 409 `conversation_busy`。
 pub async fn stream_chat(
     LocalUser { ws_id }: LocalUser,
     State(state): State<AppState>,
     Path((_agent_name, conv_id)): Path<(String, String)>,
     Query(params): Query<StreamQuery>,
-) -> Result<Sse<impl Stream<Item = Result<axum::response::sse::Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let message = params.message.trim().to_string();
     if message.is_empty() {
         return Err(ApiError::BadRequest("message is required".into()));
@@ -375,13 +394,10 @@ pub async fn stream_chat(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("conversation '{conv_id}' not found")))?;
 
-    // ── 2. 建立事件出口并跑起来 ────────────────────────────────────────
-    let (sse_tx, sse_rx) = mpsc::channel::<Result<axum::response::sse::Event, Infallible>>(256);
-
-    // 注册交给 `spawn_run`，位置在空间/agent/会话校验之后：同会话重复访问是顶替
-    // 语义（页面重载要靠它挤掉旧连接），但一个注定 409 的请求不该把在途的 run
-    // 挤掉。
-    spawn_run(
+    // ── 2. 跑起来并跟上它的帧流 ────────────────────────────────────────
+    // 注册交给 `spawn_run`，位置在空间/agent/会话校验之后：一个注定 409/500 的
+    // 请求不该把该会话在途的 run 挤掉。
+    let frames = spawn_run(
         RunDeps {
             pool: &state.pool,
             env: &state.env,
@@ -392,17 +408,54 @@ pub async fn stream_chat(
         &conv,
         message,
         message_content,
-        RunSink::Sse(sse_tx),
-        Registration::Replace,
+        RunAudience::Live,
     )
     .await?;
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(sse_rx);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    Ok(sse_response(frames).into_response())
+}
+
+/// `GET /api/chat/{agentId}/conversations/{id}/stream/live`
+///
+/// 只订阅、不新开一轮：客户端回来接上在途轮。
+///
+/// `204 No Content` 表示该会话没有未结束的在途轮 —— 此时**历史即权威**（落库严格
+/// 早于终态帧），客户端直接用 `GET .../messages` 的结果替换本地气泡即可。返回 200
+/// 时首帧是 `turn_snapshot`，其后与 `/stream` 同构。
+pub async fn subscribe_chat(
+    LocalUser { ws_id }: LocalUser,
+    State(state): State<AppState>,
+    Path((_agent_name, conv_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    require_owned_conversation(&state, &ws_id, &conv_id).await?;
+
+    match state.chat_runs.attach(&conv_id) {
+        Some(frames) => Ok(sse_response(frames).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+/// `POST /api/chat/{agentId}/conversations/{id}/cancel`
+///
+/// 取消该会话在途的一轮。`200` 只表示**命令已投递**：收尾发生在 looper 的步进
+/// 边界（流式=单 chunk、工具=≤200ms 轮询、batch=整段生成），可能晚于响应。实际
+/// 收尾经帧流下发（`error{cancelled:true}` 之后跟 `done`），这一轮已产出的正文
+/// 照旧落库。
+pub async fn cancel_chat(
+    LocalUser { ws_id }: LocalUser,
+    State(state): State<AppState>,
+    Path((_agent_name, conv_id)): Path<(String, String)>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    require_owned_conversation(&state, &ws_id, &conv_id).await?;
+    if state.chat_runs.cancel(&conv_id) {
+        Ok(Json(SuccessResponse { success: true }))
+    } else {
+        Err(ApiError::coded(
+            StatusCode::CONFLICT,
+            "no_running_task",
+            format!("no running task for conversation '{conv_id}'"),
+        ))
+    }
 }
 
 // ── 暂停 / 恢复 ──────────────────────────────────────────────────────────────

@@ -95,6 +95,9 @@ vi.mock("@/api/conversations", () => ({
   createConversation: async () => ({ id: "conv-dock" }),
   conversationStreamUrl: () =>
     "/api/chat/@master/conversations/conv-dock/stream",
+  conversationLiveStreamUrl: (agentId: string, convId: string) =>
+    `/api/chat/${agentId}/conversations/${convId}/stream/live`,
+  cancelConversationTurn: async () => "accepted" as const,
   uploadConversationImage: async () => ({ id: "img", url: "/img" }),
 }));
 
@@ -179,6 +182,15 @@ function expectTopBarIndicator(text: string) {
 
 beforeEach(() => {
   localStorage.clear();
+  // dock 的对话壳挂载即订阅在途轮：本文件不测 attach，统一回「没有在途轮」。
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response(null, { status: 204 })),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe("壳与路由", () => {

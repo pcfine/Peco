@@ -41,6 +41,7 @@ export type ChatSseEvent =
   | { event: "truncation_retry"; data: TruncationRetryData }
   | { event: "looper_state"; data: LooperStateData }
   | { event: "user_steer"; data: UserSteerData }
+  | { event: "turn_snapshot"; data: TurnSnapshotData }
   | { event: "error"; data: ErrorData };
 
 export interface TextDeltaData {
@@ -114,6 +115,54 @@ export interface ErrorData {
   cancelled?: boolean;
   conversation_id: string;
 }
+
+/**
+ * 在途轮的订阅快照 —— `/stream` 与 `/stream/live` 的首帧。
+ *
+ * 服务端在建立订阅时把「这一轮到目前为止的样子」整体给出：内存 feed 是
+ * 在途内容的**显示权威**（DB 只在 `done` 之后接手，见 `seq`/`done` 两条规则）。
+ * 客户端以它**替换**本地在途气泡，之后按 `seq` 水位丢弃重叠帧。
+ */
+export interface TurnSnapshotData {
+  conversation_id: string;
+  /** 本快照已覆盖到的最后一帧序号；客户端丢弃 `id <= seq` 的后续帧。 */
+  seq: number;
+  /** 服务端权威状态。`cancelling` = 已收到 cancel、尚未收尾。 */
+  phase: TurnPhase;
+  /** 本轮**已产出**的 assistant 正文（无则空串）。 */
+  text: string;
+  /** 已产出的推理文本（无则空串）。 */
+  reasoning: string;
+  tool_calls: TurnSnapshotToolCall[];
+  agent_calls: TurnSnapshotAgentCall[];
+  /** 最近一次模型调用的用量；无则 0/0。 */
+  usage: UsageData;
+}
+
+/** 在途轮的权威状态：`cancelling` 已投递取消命令但收尾尚未发生。 */
+export type TurnPhase = "running" | "paused" | "cancelling";
+
+export interface TurnSnapshotToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+  status: "running" | "done";
+  result?: string;
+}
+
+export interface TurnSnapshotAgentCall {
+  call_id: string;
+  agent_id: string;
+  agent_name: string;
+  status: "running" | "done";
+  result?: string;
+}
+
+/**
+ * `POST .../cancel` 的结果：`accepted` = 命令已投递（收尾在步进边界，可能晚于
+ * 响应），`no_running_task` = 轮已结束（409，历史即权威）。
+ */
+export type CancelTurnOutcome = "accepted" | "no_running_task";
 
 /** 上下文滚动压缩完成 — 更早的对话轮次已被结构化摘要替换 */
 export interface ContextCompactedData {

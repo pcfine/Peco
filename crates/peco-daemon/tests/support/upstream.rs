@@ -31,11 +31,28 @@ pub enum Reply {
         name: String,
         arguments: Value,
     },
+    /// 正文 + 工具调用同帧返回：用来构造「这一轮已经产出一段、还要继续跑」的
+    /// 中间态（纯文本回复是这一轮的最后一步，构造不出半程）。
+    TextAndToolCall {
+        text: String,
+        id: String,
+        name: String,
+        arguments: Value,
+    },
 }
 
 impl Reply {
     pub fn tool_call(name: &str, arguments: Value) -> Self {
         Self::ToolCall {
+            id: format!("call_{name}"),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    pub fn text_and_tool_call(text: &str, name: &str, arguments: Value) -> Self {
+        Self::TextAndToolCall {
+            text: text.to_string(),
             id: format!("call_{name}"),
             name: name.to_string(),
             arguments,
@@ -155,6 +172,23 @@ fn reply_body(reply: Reply) -> Value {
             "message": {
                 "role": "assistant",
                 "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments.to_string()},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }),
+        Reply::TextAndToolCall {
+            text,
+            id,
+            name,
+            arguments,
+        } => json!({
+            "message": {
+                "role": "assistant",
+                "content": text,
                 "tool_calls": [{
                     "id": id,
                     "type": "function",
