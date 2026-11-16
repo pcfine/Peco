@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::LOCAL_USER_ID;
 use crate::api_error::ApiError;
-use crate::auth::LocalUser;
+use crate::auth::ResourceScope;
 use crate::db::agents::{self, AgentRow, CreateAgentParams, UpdateAgentParams};
 use crate::space::{fanout, index};
 use crate::state::AppState;
@@ -261,11 +261,11 @@ fn merge_agent_profile(
 /// 行来自 DB 索引，`tools` / `model` 等细节现读 agent.md：索引里没有这些字段，
 /// 而列表页需要它们。
 pub async fn list(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentListItem>>, ApiError> {
-    let ws = state.spaces.workspace(&ws_id).await?;
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
 
     // 索引可能落后于磁盘（模板安装、手工拷贝、外部编辑器新建）：列表是能发现
     // 这些 agent 的唯一入口，先补行再查，否则它们永远不出现在列表里。
@@ -279,7 +279,7 @@ pub async fn list(
         // 直接不返回：详情页要读 agent.md，交出去只会换一个 500。
         if !ws.agent_manager().md_path(&r.name).is_file() {
             tracing::debug!(
-                ws_id = %ws_id,
+                team = %team_id,
                 agent = %r.name,
                 "agent.md is gone; hiding the stale index row"
             );
@@ -304,7 +304,7 @@ pub async fn list(
             created_at: r.created_at.clone(),
         });
     }
-    info!(ws_id = %ws_id, count = items.len(), "Agents listed");
+    info!(team = %team_id, count = items.len(), "Agents listed");
     Ok(Json(items))
 }
 
@@ -387,7 +387,7 @@ fn deletable_error(name: &str, error: WorkspaceError) -> ApiError {
 /// }
 /// ```
 pub async fn create(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Json(req): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentDetail>), ApiError> {
@@ -398,7 +398,7 @@ pub async fn create(
     }
 
     // 同名冲突只在同一团队内成立：另一团队的同名 agent 是另一份资源。
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     if agents::find_id_by_name_and_team(&state.pool, name, &team_id)
         .await?
         .is_some()
@@ -412,7 +412,7 @@ pub async fn create(
     let assemble_params = assemble_params_from_request(&req);
     let content = agent_config::assemble_agent_md(&assemble_params);
 
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
     ensure_writable_name(&ws, name)?;
     let agent_id = Uuid::new_v4().to_string();
 
@@ -433,7 +433,7 @@ pub async fn create(
     }
 
     info!(
-        ws_id = %ws_id,
+        team = %team_id,
         agent_id = %agent_id,
         agent_name = %name,
         "Agent created"
@@ -493,7 +493,7 @@ pub async fn create(
 
     // 同 team 的其它已打开空间有自己的 AgentManager：新名字只进了发起方的
     // Tier-1，不扇出它们看不到这个 agent。
-    fanout::refresh_space_team(&state, &ws_id).await;
+    fanout::refresh_team_agents(&state, &team_id).await;
 
     Ok((StatusCode::CREATED, Json(detail)))
 }
@@ -502,18 +502,18 @@ pub async fn create(
 ///
 /// 返回 Agent 完整详情（数据来自 agent.md 文件）。
 pub async fn get(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<AgentDetail>, ApiError> {
+    let team_id = scope.team_id.clone();
     // ── 从 DB 获取 name（限定本团队：别的团队的 id 在这里就是不存在）─────
-    let team_id = state.spaces.team_id(&ws_id).await?;
     let db_row = agents::find_index_by_id_and_team(&state.pool, &agent_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("agent '{agent_id}' not found")))?;
 
     // ── 从 agent.md 读取完整配置 ─────────────────────────────────────────
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
     let md_path = ws.agent_manager().md_path(&db_row.name);
     let content = std::fs::read_to_string(&md_path).map_err(|e| {
         ApiError::Internal(format!(
@@ -530,7 +530,7 @@ pub async fn get(
         profile.llm.as_ref().and_then(|l| l.provider.as_deref()),
     );
     let detail = agent_detail_from_profile(&agent_id, &db_row, &profile, &body, supports_images);
-    info!(ws_id = %ws_id, agent_id = %agent_id, name = %db_row.name, "Agent fetched");
+    info!(team = %team_id, agent_id = %agent_id, name = %db_row.name, "Agent fetched");
     Ok(Json(detail))
 }
 
@@ -538,13 +538,13 @@ pub async fn get(
 ///
 /// 更新 Agent 的部分字段。核心流程：读 agent.md → 深度合并 → 写回 → 更新 DB 索引。
 pub async fn update(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
     Json(req): Json<UpdateAgentRequest>,
 ) -> Result<Json<AgentDetail>, ApiError> {
+    let team_id = scope.team_id.clone();
     // ── 确认 Agent 存在（限定本团队：跨团队的 id 不是可改对象）─────────────
-    let team_id = state.spaces.team_id(&ws_id).await?;
     let existing = agents::find_index_by_id_and_team(&state.pool, &agent_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("agent '{agent_id}' not found")))?;
@@ -567,7 +567,7 @@ pub async fn update(
     }
 
     // ── 读取现有 agent.md ─────────────────────────────────────────────────
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
     if new_name != existing.name {
         // 改名 = 写新目录 + 删旧目录；旧名不可删时改名同样不成立，
         // 否则会留下「新名有文件、旧名还挂着总管」的两份身份。
@@ -621,7 +621,7 @@ pub async fn update(
     }
 
     info!(
-        ws_id = %ws_id,
+        team = %team_id,
         agent_id = %agent_id,
         old_name = %existing.name,
         new_name = %new_name,
@@ -673,7 +673,7 @@ pub async fn update(
 
     // 改名会同时动两个名字（新名、旧名），扇出按「磁盘名 ∪ 库内名」整体失效，
     // 不需要在这里传名字。
-    fanout::refresh_space_team(&state, &ws_id).await;
+    fanout::refresh_team_agents(&state, &team_id).await;
 
     Ok(Json(detail))
 }
@@ -682,19 +682,19 @@ pub async fn update(
 ///
 /// 删除 Agent 及其配置文件和 DB 索引。
 pub async fn delete(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
+    let team_id = scope.team_id.clone();
     // ── 确认 Agent 存在（限定本团队：跨团队的 id 不是可删对象）─────────────
-    let team_id = state.spaces.team_id(&ws_id).await?;
     let existing = agents::find_index_by_id_and_team(&state.pool, &agent_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("agent '{agent_id}' not found")))?;
 
     // ── 删除前置：先问 core 这个名字能不能删 ──────────────────────────────
     // 顺序不能反：先删 DB 行再被 core 拒绝，会留下「行没了、文件还在」的半完成态。
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
     if let Err(e) = ws.agent_manager().ensure_deletable(&existing.name) {
         return Err(deletable_error(&existing.name, e));
     }
@@ -712,10 +712,10 @@ pub async fn delete(
 
     // 扇出在文件已删除之后：失效集合里包含「rescan 之前」的 Tier-1 名字，
     // 所以刚被删掉的这个 agent 也能从其它空间的缓存里清掉。
-    fanout::refresh_space_team(&state, &ws_id).await;
+    fanout::refresh_team_agents(&state, &team_id).await;
 
     info!(
-        ws_id = %ws_id,
+        team = %team_id,
         agent_id = %agent_id,
         agent_name = %existing.name,
         "Agent deleted"

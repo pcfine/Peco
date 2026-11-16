@@ -1,14 +1,13 @@
 // MCP Config Handler
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use serde::Serialize;
 
 use peco_core::tools::McpAccess;
 
 use crate::api_error::ApiError;
-use crate::auth::LocalUser;
-use crate::state::AppState;
+use crate::auth::ResourceScope;
 
 #[derive(Debug, Serialize)]
 pub struct SuccessResponse {
@@ -17,12 +16,8 @@ pub struct SuccessResponse {
     pub message: Option<String>,
 }
 
-pub async fn get_config(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let ws = state.spaces.workspace(&ws_id).await?;
-    let path = ws.root().join("mcpconfig.json");
+pub async fn get_config(scope: ResourceScope) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = scope.workspace()?.root().join("mcpconfig.json");
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| ApiError::Internal(format!("failed to read mcp_config.json: {e}")))?;
@@ -35,11 +30,10 @@ pub async fn get_config(
 }
 
 pub async fn update_config(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
 
     // 1. 解析前端发来的 JSON 是否符合 McpConfig 格式
     let new_config: peco_core::mcp::McpConfig = serde_json::from_value(body)
@@ -58,6 +52,7 @@ pub async fn update_config(
         .map_err(|e| ApiError::Internal(format!("Failed to save MCP config: {e}")))?;
 
     tracing::info!(
+        team = %scope.team_id,
         servers = server_count,
         "MCP config updated via replace_mcp_config"
     );
@@ -69,11 +64,10 @@ pub async fn update_config(
 }
 
 pub async fn test_connection(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Path(name): Path<String>,
 ) -> Result<Json<peco_core::mcp::McpTestResult>, ApiError> {
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
 
     let config = ws.get_mcp_server_config(&name).ok_or_else(|| {
         ApiError::NotFound(format!("MCP server '{name}' not found in configuration"))

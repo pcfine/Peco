@@ -178,6 +178,10 @@ pub async fn delete(
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
+    // 摘掉本进程里为这个团队建过的 console。它只覆盖「删除时已经在缓存里」的
+    // 那棵树：与在途的 console 构建没有互斥，构建完成后由 `team_workspace`
+    // 的团队存在性复核兜住，不会把已删团队的目录重新缓存下来。
+    state.spaces.drop_console(&team_id);
     tracing::info!(
         team_id = %team_id,
         deleted_spaces,

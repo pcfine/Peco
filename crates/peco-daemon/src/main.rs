@@ -118,7 +118,7 @@ async fn run() -> Result<(), DaemonError> {
     restore_opened_spaces(&env, &hub).await;
 
     // 资源模块经这一个适配层取实例：Hub 仍是唯一真源，注册表只做 ws_id → 目录。
-    let spaces = Arc::new(SpaceRegistry::new(hub.clone(), pool.clone()));
+    let spaces = Arc::new(SpaceRegistry::new(hub.clone(), env.clone()));
     let state = AppState {
         pool,
         hub,

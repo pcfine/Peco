@@ -135,6 +135,38 @@ async fn indexed_but_closed_space_is_409_space_not_open() {
     assert_eq!(reply.code(), "space_not_open", "body={}", reply.body);
 }
 
+/// 空间已索引但未打开 ⇒ 建库在**写库之前**被拒：不留没有 KB 目录的幽灵索引行。
+///
+/// 变异方法：把 `scope.workspace()?` 挪到 `knowledge_bases::insert(...)` 之后 →
+/// 请求仍是 409，但库里多出一条索引行、磁盘上没有 KB 目录，列表从此永久出现
+/// 计数全 0 的 KB，同名再建被 409 挡住。
+#[tokio::test]
+async fn creating_a_kb_in_a_closed_space_leaves_no_index_row() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+
+    let closed = env
+        .post(&format!("/api/spaces/{ws_id}/close"), json!({}))
+        .await;
+    assert_eq!(closed.status, 200, "body={}", closed.body);
+
+    let reply = env
+        .post_in(&ws_id, "/api/knowledge", json!({"name": "kb-one"}))
+        .await;
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+    assert_eq!(reply.code(), "space_not_open", "body={}", reply.body);
+
+    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM knowledge_bases")
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "失败路径不得留下索引行");
+    assert!(
+        !env.home.join("teams/research/knowledge/kb-one").exists(),
+        "没有实例就不该建出 KB 目录"
+    );
+}
+
 /// `@master` 与裸写的 `master` 都不能被新建 ⇒ 400 `reserved_agent`，且不留任何痕迹。
 ///
 /// 变异方法：删掉 `create` 里的 `ensure_writable_name` 调用 → 变成 201，

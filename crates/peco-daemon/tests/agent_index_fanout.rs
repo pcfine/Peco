@@ -300,7 +300,7 @@ async fn file_watch_pushes_external_edits_into_the_open_space() {
 
 /// 写接口（`POST/PATCH/DELETE /api/agents`）也必须扇出到同团队的其它空间。
 ///
-/// 变异方法：删掉 handler 里对应的 `fanout::refresh_space_team` 调用 ——
+/// 变异方法：删掉 handler 里对应的 `fanout::refresh_team_agents` 调用 ——
 /// 另一个空间的 Tier-1 永远停在旧名字集合、Tier-2 继续交出已删除的实例，
 /// 三个阶段（新建可见 / 改名可见 / 删除后加载失败）逐条变红。
 #[tokio::test]

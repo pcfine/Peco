@@ -121,8 +121,9 @@ pub fn router(state: AppState) -> Router {
         // 台账事件流：看板靠它把「任务变状态」推进 UI，不轮询。
         .route("/api/events", get(events::stream))
         // 资源模块与 chat 沿用 peco-server 的路径：前端与既有 API 文档不需要改。
-        // 每个 handler 都要求 `LocalUser`，空间选择器（X-Peco-Space / ?ws=）
-        // 因此对这几条子树是强制项。
+        // chat 与 artifacts 要求 `LocalUser`，空间选择器（X-Peco-Space / ?ws=）
+        // 因此对这两条子树是强制项；四个资源模块认 `ResourceScope`，空间与团队
+        // 选择器都没有才 400。
         .nest("/api/agents", agent::router())
         .nest("/api/skills", skill::router())
         .nest("/api/mcp", mcp_config::router())

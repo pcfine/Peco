@@ -10,11 +10,12 @@ use knowledge_base::manager::config::{
     BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
 };
 use peco_core::knowledge::hash_manifest::is_supported_extension_with;
+use peco_core::workspace::WorkSpace;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api_error::ApiError;
-use crate::auth::LocalUser;
+use crate::auth::ResourceScope;
 use crate::db::{documents, knowledge_bases};
 use crate::state::AppState;
 use tracing::{error, info, warn};
@@ -234,15 +235,12 @@ fn is_allowed_mime(mime: &str) -> bool {
     ) || mime.starts_with("text/")
 }
 
-/// KB 细节（后端 / 嵌入模型 / 计数）只在实例打开时可得。
+/// KB 细节（后端 / 嵌入模型 / 计数）只在实例的管理器里可得。
 ///
-/// 列表与详情在实例缺席时降级为「只有索引行」而不是整体 409：名字与描述够用了，
-/// 计数按 0 报比让列表页打不开更有用。
-async fn kb_infos(state: &AppState, ws_id: &str) -> Vec<knowledge_base::KbInfo> {
-    match state.spaces.workspace(ws_id).await {
-        Ok(ws) => ws.knowledge_manager().list_kbs().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+/// 读取失败降级为「只有索引行」而不是整体报错：名字与描述够用了，计数按 0 报
+/// 比让列表页打不开更有用。
+async fn kb_infos(ws: &WorkSpace) -> Vec<knowledge_base::KbInfo> {
+    ws.knowledge_manager().list_kbs().await.unwrap_or_default()
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -251,13 +249,16 @@ async fn kb_infos(state: &AppState, ws_id: &str) -> Vec<knowledge_base::KbInfo> 
 ///
 /// 列出知识库：索引行来自 DB，KB 细节来自实例（实例缺失时按 0 计数）。
 pub async fn list_knowledge_bases(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<KnowledgeBaseResponse>>, ApiError> {
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     let rows = knowledge_bases::list_by_team(&state.pool, &team_id).await?;
 
-    let infos = kb_infos(&state, &ws_id).await;
+    let infos = match scope.opened() {
+        Some(ws) => kb_infos(&ws).await,
+        None => Vec::new(),
+    };
 
     let mut responses = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -281,7 +282,7 @@ pub async fn list_knowledge_bases(
         });
     }
 
-    info!(ws_id = %ws_id, count = responses.len(), "Knowledge bases listed");
+    info!(team = %team_id, count = responses.len(), "Knowledge bases listed");
     Ok(Json(responses))
 }
 
@@ -289,17 +290,17 @@ pub async fn list_knowledge_bases(
 ///
 /// 创建新知识库。
 pub async fn create_knowledge_base(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Json(req): Json<CreateKbRequest>,
 ) -> Result<(StatusCode, Json<KnowledgeBaseResponse>), ApiError> {
+    let team_id = scope.team_id.clone();
     let name = req.name.trim().to_string();
     if let Err(msg) = knowledge_base::validate_kb_name(&name) {
         return Err(ApiError::BadRequest(msg));
     }
 
     // 同名冲突只在同一团队内成立：另一团队的同名 KB 是另一份资源。
-    let team_id = state.spaces.team_id(&ws_id).await?;
     if let Some(existing) =
         knowledge_bases::find_by_name_and_team(&state.pool, &name, &team_id).await?
     {
@@ -316,7 +317,8 @@ pub async fn create_knowledge_base(
     let embedding_model = parse_embedding_model(req.embedding_model.as_deref());
     let chunking = parse_chunk_strategy(req.chunk_strategy);
 
-    let ws = state.spaces.workspace(&ws_id).await?;
+    // 实例先取：空间未打开时在这里就失败，库里不会留下一条没有 KB 目录的索引行。
+    let ws = scope.workspace()?;
 
     // 写入 SQLite
     knowledge_bases::insert(
@@ -357,7 +359,7 @@ pub async fn create_knowledge_base(
     };
 
     info!(
-        ws_id = %ws_id,
+        team = %team_id,
         kb_id = %response.id,
         name = %response.name,
         "Knowledge base created"
@@ -370,23 +372,26 @@ pub async fn create_knowledge_base(
 ///
 /// 获取单个知识库详情。
 pub async fn get_knowledge_base(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(kb_id): Path<String>,
 ) -> Result<Json<KnowledgeBaseResponse>, ApiError> {
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     let row = knowledge_bases::find_by_id_and_team(&state.pool, &kb_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
-    let infos = kb_infos(&state, &ws_id).await;
+    let infos = match scope.opened() {
+        Some(ws) => kb_infos(&ws).await,
+        None => Vec::new(),
+    };
     let info = infos.iter().find(|i| i.name == row.name);
     let (backend, embedding_model) = kb_labels(info);
     let (doc_count, chunk_count) = info
         .map(|i| (i.document_count, i.chunk_count))
         .unwrap_or((0, 0));
 
-    info!(ws_id = %ws_id, kb_id = %kb_id, name = %row.name, "Knowledge base fetched");
+    info!(team = %team_id, kb_id = %kb_id, name = %row.name, "Knowledge base fetched");
     Ok(Json(KnowledgeBaseResponse {
         id: row.id,
         name: row.name,
@@ -406,11 +411,11 @@ pub async fn get_knowledge_base(
 ///
 /// KB 后端的向量/图谱数据不在此清理。
 pub async fn delete_knowledge_base(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(kb_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     let row = knowledge_bases::find_by_id_and_team(&state.pool, &kb_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
@@ -428,10 +433,11 @@ pub async fn delete_knowledge_base(
     knowledge_bases::delete(&state.pool, &kb_id, &team_id).await?;
 
     // 3. 通过 KnowledgeBaseManager 删除知识库目录（含 kb_config.json 与其下数据文件）
-    if let Ok(ws) = state.spaces.workspace(&ws_id).await
+    if let Some(ws) = scope.opened()
         && let Err(e) = ws.knowledge_manager().delete_kb(&kb_name).await
     {
         warn!(
+            team = %team_id,
             kb_name = %kb_name,
             error = %e,
             "KnowledgeBaseManager failed to delete KB data (may already be removed)"
@@ -439,7 +445,7 @@ pub async fn delete_knowledge_base(
     }
 
     info!(
-        ws_id = %ws_id,
+        team = %team_id,
         kb_id = %kb_id,
         kb_name = %kb_name,
         "Knowledge base deleted"
@@ -452,13 +458,13 @@ pub async fn delete_knowledge_base(
 ///
 /// 列出知识库中的文档，支持分页和按状态过滤。
 pub async fn list_documents(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(kb_id): Path<String>,
     Query(params): Query<DocumentListQuery>,
 ) -> Result<Json<Vec<DocumentResponse>>, ApiError> {
     // 验证 KB 归属（限定本团队：其余团队的 KB 在本题里就是不存在）
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     knowledge_bases::find_by_id_and_team(&state.pool, &kb_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
@@ -486,7 +492,7 @@ pub async fn list_documents(
         })
         .collect();
 
-    info!(ws_id = %ws_id, kb_id = %kb_id, count = responses.len(), "Documents listed");
+    info!(team = %team_id, kb_id = %kb_id, count = responses.len(), "Documents listed");
     Ok(Json(responses))
 }
 
@@ -494,19 +500,19 @@ pub async fn list_documents(
 ///
 /// 上传文件到知识库。文件保存后异步触发解析管道。
 pub async fn upload_document(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(kb_id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<DocumentResponse>), ApiError> {
     // 验证 KB 归属
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     let kb_row = knowledge_bases::find_by_id_and_team(&state.pool, &kb_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
     let kb_name = kb_row.name.clone();
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
     let kb_name_for_bg = kb_name.clone();
     let kb_id_for_bg = kb_id.clone();
     let db_for_bg = state.pool.clone();
@@ -639,16 +645,16 @@ pub async fn upload_document(
 ///
 /// 手动触发知识库同步。
 pub async fn sync_knowledge_base(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path(kb_id): Path<String>,
 ) -> Result<Json<SyncResponse>, ApiError> {
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     let row = knowledge_bases::find_by_id_and_team(&state.pool, &kb_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
 
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let ws = scope.workspace()?;
     let km = ws.knowledge_manager();
     let report = km
         .sync_kb(&row.name)
@@ -662,7 +668,7 @@ pub async fn sync_knowledge_base(
     // 更新 KB 时间戳
     let _ = knowledge_bases::touch(&state.pool, &kb_id).await;
 
-    info!(ws_id = %ws_id, kb_id = %kb_id, name = %row.name, added = report.added, updated = report.updated, "Knowledge base synced");
+    info!(team = %team_id, kb_id = %kb_id, name = %row.name, added = report.added, updated = report.updated, "Knowledge base synced");
     Ok(Json(SyncResponse {
         kb_name: report.kb_name,
         added: report.added,
@@ -678,12 +684,12 @@ pub async fn sync_knowledge_base(
 ///
 /// 删除单个文档（SQLite 记录 + 磁盘文件）。
 pub async fn delete_document(
-    LocalUser { ws_id }: LocalUser,
+    scope: ResourceScope,
     State(state): State<AppState>,
     Path((kb_id, doc_id)): Path<(String, String)>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
     // 验证 KB 归属（限定本团队：其余团队的 KB 在本题里就是不存在）
-    let team_id = state.spaces.team_id(&ws_id).await?;
+    let team_id = scope.team_id.clone();
     knowledge_bases::find_by_id_and_team(&state.pool, &kb_id, &team_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("knowledge base '{kb_id}' not found")))?;
@@ -709,7 +715,7 @@ pub async fn delete_document(
     documents::delete(&state.pool, &doc_id).await?;
 
     info!(
-        ws_id = %ws_id,
+        team = %team_id,
         kb_id = %kb_id,
         doc_id = %doc_id,
         filename = %doc.filename,
@@ -796,7 +802,7 @@ mod tests {
     /// REST 建库路径默认走 HelixDB 后端。
     ///
     /// 只覆盖纯逻辑：handler 本身依赖 `AppState`（SQLite 池 + 迁移 +
-    /// 已打开实例）与 `LocalUser`，本文件没有现成的测试夹具，搭一套
+    /// 已打开实例）与 `ResourceScope`，本文件没有现成的测试夹具，搭一套
     /// 的成本远高于被测决策本身。`build_kb_config` 是 `create_knowledge_base`
     /// 中唯一决定后端的表达式，覆盖它即覆盖该决策。
     #[test]

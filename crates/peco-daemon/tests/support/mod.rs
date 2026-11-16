@@ -236,10 +236,10 @@ impl TestEnv {
         AppState {
             pool: self.pool.clone(),
             hub: self.hub.clone(),
-            env,
+            env: env.clone(),
             config: self.config.clone(),
             tasks: self.tasks.clone(),
-            spaces: Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone())),
+            spaces: Arc::new(SpaceRegistry::new(self.hub.clone(), env)),
             chat_runs: Arc::new(peco_daemon::chat::ChatActiveRuns::new()),
             wake: self.wake.clone(),
         }
@@ -426,7 +426,7 @@ impl TestEnv {
 
     /// 资源模块用的 `ws_id → 实例` 适配层；与 `AppState` 里那份同源同库。
     pub fn spaces(&self) -> Arc<SpaceRegistry> {
-        Arc::new(SpaceRegistry::new(self.hub.clone(), self.pool.clone()))
+        Arc::new(SpaceRegistry::new(self.hub.clone(), self.env.clone()))
     }
 
     /// `d_dispatches` 一行的 `(task_state, wake_state)`：两套状态域各自断言。

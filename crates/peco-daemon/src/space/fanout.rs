@@ -29,21 +29,6 @@ pub async fn refresh_team_agents(state: &AppState, team_id: &str) -> usize {
     refresh_open_spaces(&state.hub, &state.pool, team_id).await
 }
 
-/// 写接口手里只有 `ws_id`：先查库拿到团队，再按团队扇出。
-pub async fn refresh_space_team(state: &AppState, ws_id: &str) -> usize {
-    match workspaces::by_id(&state.pool, ws_id).await {
-        Ok(Some(row)) => refresh_team_agents(state, &row.team_id).await,
-        Ok(None) => {
-            warn!(ws_id, "space row missing; skipping agent cache fanout");
-            0
-        }
-        Err(e) => {
-            warn!(ws_id, error = %e, "cannot read space row; skipping agent cache fanout");
-            0
-        }
-    }
-}
-
 /// 不依赖 `AppState` 的扇出实现：文件监听只持连接池与 `Weak<WorkspaceHub>`，
 /// 拿不到（也不该持有）整个 `AppState`。
 pub(crate) async fn refresh_open_spaces(

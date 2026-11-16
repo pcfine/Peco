@@ -1,8 +1,8 @@
 //! Agent 管理：路由与处理函数。
 //!
-//! Agent 是「按空间（实为团队能力根）」的资源：配置文件在
-//! `agents/<name>/agent.md`，DB 只有轻量索引；索引的 `user_id` 恒为
-//! [`crate::LOCAL_USER_ID`]，空间归属只体现在本模块要求 `LocalUser`。
+//! Agent 是「按团队能力根」的资源：配置文件在 `agents/<name>/agent.md`，DB 只有
+//! 轻量索引；索引的 `user_id` 恒为 [`crate::LOCAL_USER_ID`]，团队归属由
+//! [`crate::auth::ResourceScope`] 给出。
 
 mod handler;
 

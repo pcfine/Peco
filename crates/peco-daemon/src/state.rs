@@ -29,7 +29,7 @@ pub struct AppState {
     pub config: Arc<DaemonConfig>,
     /// 跨空间任务台账 sink + 广播（HTTP 查询与未来 SSE 共用）。
     pub tasks: Arc<TaskObserver>,
-    /// 资源模块（agent / skill / knowledge / mcp）把 `ws_id` 变成实例的唯一入口。
+    /// 资源模块（agent / skill / knowledge / mcp）把团队变成实例的唯一入口。
     pub spaces: Arc<SpaceRegistry>,
     /// 会话级 chat 控制注册表：暂停/恢复必须从**另一条请求**触达在途 looper，
     /// 而 looper 由 SSE 请求任务独占持有，故只能在这里留一个会话 → 控制通道的表。

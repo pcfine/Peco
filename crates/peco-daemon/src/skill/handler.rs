@@ -3,12 +3,11 @@
 use std::io::Read;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use serde::{Deserialize, Serialize};
 
 use crate::api_error::ApiError;
-use crate::auth::LocalUser;
-use crate::state::AppState;
+use crate::auth::ResourceScope;
 use peco_core::skills::{SkillError, SkillResourceFile, validate_name};
 use tracing::info;
 
@@ -42,11 +41,9 @@ pub struct SuccessResponse {
     pub message: Option<String>,
 }
 
-pub async fn list(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
-) -> Result<Json<Vec<SkillInfo>>, ApiError> {
-    let ws = state.spaces.workspace(&ws_id).await?;
+pub async fn list(scope: ResourceScope) -> Result<Json<Vec<SkillInfo>>, ApiError> {
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
     let metas = ws.skill_registry().all_meta();
     let skills: Vec<SkillInfo> = metas
         .into_iter()
@@ -55,43 +52,43 @@ pub async fn list(
             description: m.description,
         })
         .collect();
-    info!(ws_id = %ws_id, count = skills.len(), "Skills listed");
+    info!(team = %team_id, count = skills.len(), "Skills listed");
     Ok(Json(skills))
 }
 
 pub async fn get(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_skill_name(&name)?;
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
     let skill_md = ws.skills_dir().join(&name).join("SKILL.md");
     if !skill_md.exists() {
         return Err(ApiError::NotFound(format!("skill '{name}' not found")));
     }
     let content = std::fs::read_to_string(&skill_md)
         .map_err(|e| ApiError::Internal(format!("failed to read SKILL.md: {e}")))?;
-    info!(ws_id = %ws_id, name = %name, "Skill fetched");
+    info!(team = %team_id, name = %name, "Skill fetched");
     Ok(Json(
         serde_json::json!({ "name": name, "content": content }),
     ))
 }
 
 pub async fn upsert(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Path(name): Path<String>,
     Json(req): Json<UpsertSkillRequest>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
     // 统一走 SkillRegister：名称/内容校验 + 原子写入 + 缓存刷新，
     // 与 Agent 工具路径（save_skill）共用同一套规则。
     ws.skill_registry()
         .save_skill_bundle(&name, &req.content, &req.files)
         .map_err(skill_error_to_api)?;
 
-    info!(ws_id = %ws_id, name = %name, files = req.files.len(), "Skill created/updated");
+    info!(team = %team_id, name = %name, files = req.files.len(), "Skill created/updated");
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' saved")),
@@ -99,12 +96,12 @@ pub async fn upsert(
 }
 
 pub async fn delete_skill(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Path(name): Path<String>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
     check_skill_name(&name)?;
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
     let skill_dir = ws.skills_dir().join(&name);
     if skill_dir.exists() {
         std::fs::remove_dir_all(&skill_dir)
@@ -114,7 +111,7 @@ pub async fn delete_skill(
     // 从 SkillRegister 缓存中移除
     ws.remove_skill(&name);
 
-    info!(ws_id = %ws_id, name = %name, "Skill deleted");
+    info!(team = %team_id, name = %name, "Skill deleted");
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' deleted")),
@@ -122,12 +119,12 @@ pub async fn delete_skill(
 }
 
 pub async fn export_skill(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Path(name): Path<String>,
 ) -> Result<Vec<u8>, ApiError> {
     check_skill_name(&name)?;
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
     let skill_dir = ws.skills_dir().join(&name);
     if !skill_dir.exists() {
         return Err(ApiError::NotFound(format!("skill '{name}' not found")));
@@ -135,13 +132,12 @@ pub async fn export_skill(
     // Simple: return SKILL.md content as download
     let content = std::fs::read_to_string(skill_dir.join("SKILL.md"))
         .map_err(|e| ApiError::Internal(format!("failed to read SKILL.md: {e}")))?;
-    info!(ws_id = %ws_id, name = %name, "Skill exported");
+    info!(team = %team_id, name = %name, "Skill exported");
     Ok(content.into_bytes())
 }
 
 pub async fn import_skill(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Json(req): Json<ImportSkillRequest>,
 ) -> Result<Json<SuccessResponse>, ApiError> {
     let name = req.name.trim();
@@ -152,14 +148,15 @@ pub async fn import_skill(
         return Err(ApiError::BadRequest("skill content is required".into()));
     }
 
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
 
     // 与 PUT /skills/{name} 同一路径：校验 → 原子写 → 刷缓存。
     ws.skill_registry()
         .save_skill_bundle(name, &req.content, &req.files)
         .map_err(skill_error_to_api)?;
 
-    info!(ws_id = %ws_id, name = %name, files = req.files.len(), "Skill imported");
+    info!(team = %team_id, name = %name, files = req.files.len(), "Skill imported");
     Ok(Json(SuccessResponse {
         success: true,
         message: Some(format!("Skill '{name}' imported")),
@@ -248,13 +245,13 @@ pub struct FileQuery {
 
 /// `GET /api/skills/{name}/files` — 目录清单；带 `?path=` 时返回该文件内容。
 pub async fn files(
-    LocalUser { ws_id }: LocalUser,
-    State(state): State<AppState>,
+    scope: ResourceScope,
     Path(name): Path<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<SkillFilesResponse>, ApiError> {
     check_skill_name(&name)?;
-    let ws = state.spaces.workspace(&ws_id).await?;
+    let team_id = scope.team_id.clone();
+    let ws = scope.workspace()?;
     let skill_dir = ws.skills_dir().join(&name);
     if !skill_dir.join("SKILL.md").is_file() {
         return Err(ApiError::NotFound(format!("skill '{name}' not found")));
@@ -265,7 +262,7 @@ pub async fn files(
             let mut files = Vec::new();
             walk_dir(&skill_dir, "", 0, &mut files);
             files.sort_by(|a, b| a.path.cmp(&b.path));
-            info!(ws_id = %ws_id, name = %name, count = files.len(), "Skill files listed");
+            info!(team = %team_id, name = %name, count = files.len(), "Skill files listed");
             Ok(Json(SkillFilesResponse::List { files }))
         }
         Some(rel) => {
@@ -305,7 +302,7 @@ pub async fn files(
                     .map_err(|_| ApiError::UnsupportedMedia(format!("'{rel}' is not UTF-8")))?
             };
 
-            info!(ws_id = %ws_id, name = %name, path = %rel, "Skill file read");
+            info!(team = %team_id, name = %name, path = %rel, "Skill file read");
             Ok(Json(SkillFilesResponse::Content(SkillFileContent {
                 path: rel.to_string(),
                 size,
