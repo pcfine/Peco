@@ -59,7 +59,7 @@ export function DockChat({ agentId, convId, wsId }: DockChatProps) {
     <ChatView
       key={convId}
       mode="internal"
-      headerTitle="Peco"
+      hideHeader
       supportsImages
       uploadImage={(file, onProgress) =>
         uploadConversationImage(agentId, convId, file, { onProgress, wsId })

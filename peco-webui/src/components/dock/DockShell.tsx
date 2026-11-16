@@ -91,14 +91,12 @@ export function DockShell() {
   if (onPecoSurface) return null;
 
   const content = (
-    <div className="min-h-0 flex-1 overflow-hidden">
+    <div className="min-h-0 flex-1 overflow-hidden px-4 pt-3 pb-3">
       {error ? (
         // 失败不是死路：这条查询不在重挂载时重试，只能就地给一枚重试。
-        <div className="p-3">
-          <ErrorBanner message={errorText(error)} onRetry={retry} />
-        </div>
+        <ErrorBanner message={errorText(error)} onRetry={retry} />
       ) : !convId || !wsId ? (
-        <p className="p-3 text-sm text-ink-muted">正在准备对话…</p>
+        <p className="text-sm text-ink-muted">正在准备对话…</p>
       ) : tab === "chat" ? (
         <DockChat agentId={agentId} convId={convId} wsId={wsId} />
       ) : (
@@ -135,7 +133,7 @@ export function DockShell() {
           "left 300ms cubic-bezier(0, 0, 0.2, 1), translate 120ms cubic-bezier(0, 0, 0.2, 1)",
       }}
     >
-      <div className="flex h-11 shrink-0 items-center gap-1 border-b border-line px-2">
+      <div className="flex h-11 shrink-0 items-center gap-1 border-b border-line px-4">
         <button
           type="button"
           onClick={() => setTab("chat")}
@@ -183,7 +181,7 @@ export function DockShell() {
           type="button"
           onClick={() => setOpen(false)}
           aria-label="关闭 Peco 对话"
-          className="grid h-6 w-6 shrink-0 place-items-center rounded-sm text-ink-faint hover:bg-line hover:text-ink"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-sm text-ink-faint hover:bg-line hover:text-ink"
         >
           <X aria-hidden="true" className="h-4 w-4" />
         </button>

@@ -24,18 +24,13 @@ export function DockArtifacts({
 
   if (error) {
     return (
-      <div className="p-3">
-        <ErrorBanner
-          message={errorText(error)}
-          onRetry={() => void refetch()}
-        />
-      </div>
+      <ErrorBanner message={errorText(error)} onRetry={() => void refetch()} />
     );
   }
 
   if (isPending) {
     return (
-      <div className="space-y-px p-3">
+      <div className="space-y-px">
         {[0, 1, 2].map((row) => (
           <Skeleton key={row} className="h-9 w-full" />
         ))}
@@ -45,7 +40,7 @@ export function DockArtifacts({
 
   if (!data || data.length === 0) {
     return (
-      <p className="max-w-narrow p-3 text-sm text-ink-muted">
+      <p className="max-w-narrow text-sm text-ink-muted">
         任务完成后，产物会出现在这里。
       </p>
     );
@@ -54,7 +49,7 @@ export function DockArtifacts({
   return (
     <ul className="divide-y divide-line">
       {data.map((item) => (
-        <li key={item.id} className="flex h-9 items-center gap-2 px-3">
+        <li key={item.id} className="flex h-9 items-center gap-2">
           <span className="shrink-0 font-mono text-2xs uppercase text-ink-faint">
             {item.kind}
           </span>

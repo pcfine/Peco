@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
     conversation_id: "conv-space",
     created: false,
   })),
+  artifacts: vi.fn(async (): Promise<unknown[]> => []),
 }));
 
 vi.mock("@/api/peco", () => ({
@@ -44,7 +45,7 @@ vi.mock("@/api/conversations", () => ({
   conversationLiveStreamUrl: () => "/stream/live",
   cancelConversationTurn: async () => "accepted",
   uploadConversationImage: async () => ({ id: "img", url: "/img" }),
-  listConversationArtifacts: async () => ({ items: [], total: 0 }),
+  listConversationArtifacts: mocks.artifacts,
 }));
 
 function renderDock(path: string) {
@@ -73,6 +74,8 @@ beforeEach(() => {
     conversation_id: "conv-space",
     created: false,
   }));
+  mocks.artifacts.mockReset();
+  mocks.artifacts.mockImplementation(async () => []);
   useDockStore.setState({ open: true, tab: "chat" });
   useSpaceActivityStore.setState({ running: {} });
   useUiStore.setState({ railOpen: true });
@@ -154,6 +157,80 @@ describe("抽屉的错误态", () => {
 
     // 查询带 retryOnMount: false，重新挂载不会重取，出路只有这枚按钮。
     await waitFor(() => expect(mocks.ensure).toHaveBeenCalledTimes(2));
+    unmount();
+  });
+});
+
+describe("抽屉的布局", () => {
+  const chatReady = (panel: HTMLElement) =>
+    waitFor(() =>
+      expect(
+        panel.querySelector("[data-slot='message-scroller']"),
+      ).not.toBeNull(),
+    );
+
+  it("聊天面板不自带标题行：tab 行已经是这块面板的头", async () => {
+    const { container, unmount } = renderDock("/spaces");
+    const panel = dockPanel(container) as HTMLElement;
+    await chatReady(panel);
+
+    // 再给 ChatView 传一条 headerTitle 就会把同一块 chrome 叠两遍。
+    const titles = [...panel.querySelectorAll("h2")].map((h) => h.textContent);
+    expect(titles).not.toContain("Peco");
+    unmount();
+  });
+
+  it("gutter 只有 content 容器这一处来源", async () => {
+    const { container, unmount } = renderDock("/spaces");
+    const panel = dockPanel(container) as HTMLElement;
+    await chatReady(panel);
+
+    // 面板是「tab 行 + content」两段；gutter 若回落到各分支自带的外边距，
+    // 这个唯一的容器就不会带上它。
+    const content = panel.lastElementChild as HTMLElement;
+    expect(
+      content.querySelector("[data-slot='message-scroller']"),
+    ).not.toBeNull();
+    expect(content).toHaveClass("px-4", "pt-3", "pb-3");
+    unmount();
+  });
+
+  it("tab 行左内边距与内容同轴，关闭按钮与 tab pill 同高", async () => {
+    const { container, unmount } = renderDock("/spaces");
+    const panel = dockPanel(container) as HTMLElement;
+    await chatReady(panel);
+
+    expect(panel.firstElementChild).toHaveClass("px-4");
+    // 24px 是命中区域下限，28px 才与 tab pill 等高。
+    expect(screen.getByRole("button", { name: "关闭 Peco 对话" })).toHaveClass(
+      "h-7",
+      "w-7",
+    );
+    unmount();
+  });
+
+  it("产物行不再自带横内边距：16px 内容边距上不再叠 12px", async () => {
+    mocks.artifacts.mockResolvedValue([
+      {
+        id: "art-1",
+        conversation_id: "conv-space",
+        kind: "document",
+        mime: "text/markdown",
+        title: "报告.md",
+        size_bytes: 1024,
+        url: "/api/artifacts/art-1/content",
+        download_url: "/api/artifacts/art-1/download",
+        created_at: "2026-01-01 00:00:00",
+        available: true,
+      },
+    ]);
+    const { unmount } = renderDock("/spaces");
+    fireEvent.click(screen.getByRole("button", { name: "产物" }));
+
+    const link = await screen.findByRole("link", { name: "报告.md" });
+    const row = link.closest("li") as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row.className).not.toContain("px-3");
     unmount();
   });
 });
