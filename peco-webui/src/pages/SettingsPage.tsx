@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { PageFrame } from "@/components/layout/PageFrame";
+import { BrandSection } from "@/components/settings/BrandSection";
 import { ProviderSection } from "@/components/settings/ProviderSection";
 import {
   Select,
@@ -90,6 +91,8 @@ export function SettingsPage() {
   return (
     <PageFrame title="设置" contentWidth="mid">
       <div className="space-y-6">
+        <BrandSection />
+
         <section className="space-y-2">
           <div className="flex h-8 items-center gap-2 border-b border-line">
             <h2 className="text-xs font-semibold text-ink-muted">团队</h2>

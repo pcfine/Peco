@@ -16,9 +16,10 @@ import {
   UserCog,
   Users,
 } from "lucide-react";
-import { BrandMark } from "@/components/common/BrandMark";
+import { BrandImage } from "@/components/common/BrandImage";
 import { OpenSpaceRow } from "@/components/layout/OpenSpaceRow";
 import { useActivateSpace } from "@/hooks/useOpenSpaces";
+import { useBrand } from "@/queries/brand";
 import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
 import { useRecentResults } from "@/queries/tasks";
@@ -68,6 +69,7 @@ export function Rail({
   const navigate = useNavigate();
   const { pathname } = useLocation();
 
+  const { data: brand } = useBrand();
   const { data: peco } = usePeco();
   const { data: spaces } = useSpaces();
   const { data: teams } = useTeams();
@@ -123,6 +125,7 @@ export function Rail({
     rowNodes[Math.min(Math.max(next, 0), rowNodes.length - 1)]?.focus();
   };
 
+  const brandImage = brand?.image ?? "";
   const onPecoSurface = isPecoSurface(pathname, peco?.ws_id);
 
   // 边框只跟当前路由：在哪个栏目/空间，哪一行才高亮。
@@ -158,7 +161,7 @@ export function Rail({
       <div className="flex h-11 shrink-0 items-center justify-center border-b border-line">
         {/* 会话本体的页面没有抽屉，品牌行退回成标记。 */}
         {onPecoSurface ? (
-          <BrandMark size={24} />
+          <BrandImage image={brandImage} collapsed={collapsed} />
         ) : (
           // 品牌行是抽屉开关；工作空间名由下方 Peco 行承担。
           <button
@@ -169,13 +172,15 @@ export function Rail({
             aria-expanded={dockOpen}
             aria-controls="peco-dock"
             className={cn(
-              "grid size-8 place-items-center rounded-lg border transition-colors",
+              "grid place-items-center rounded-lg border transition-colors",
+              // 有品牌图时按钮让位给那 176×32 的槽位；没图仍是一枚 32px 标记。
+              brandImage !== "" && !collapsed ? "h-8 w-44" : "size-8",
               dockOpen
                 ? "border-brand/40 bg-brand/10"
                 : "border-transparent hover:bg-line/50",
             )}
           >
-            <BrandMark size={24} />
+            <BrandImage image={brandImage} collapsed={collapsed} />
           </button>
         )}
       </div>

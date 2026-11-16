@@ -3,6 +3,7 @@
 //! 这一层不碰 marker、不碰实例表状态机 —— 那些判断都在 `space` 与
 //! `WorkspaceHub` 里，HTTP 只负责路由、请求体与错误体形状。
 
+pub mod brand;
 pub mod events;
 pub mod peco;
 pub mod space;
@@ -115,6 +116,8 @@ pub fn router(state: AppState) -> Router {
             post(provider::test_connection),
         )
         .route("/api/peco", get(peco::detail))
+        // 左栏品牌图：全局一张，不分空间也不分团队。
+        .route("/api/brand", get(brand::get).put(brand::update))
         // 台账事件流：看板靠它把「任务变状态」推进 UI，不轮询。
         .route("/api/events", get(events::stream))
         // 资源模块与 chat 沿用 peco-server 的路径：前端与既有 API 文档不需要改。

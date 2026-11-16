@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Rail } from "@/components/layout/Rail";
@@ -7,6 +7,9 @@ import { useDockStore } from "@/stores/dockStore";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useSpaceStore } from "@/stores/spaceStore";
 import type { Space } from "@/types/daemon";
+
+/** 左栏取到的品牌图；默认未设置，用例里按需改写。 */
+let brandImage = "";
 
 const ensureSpaceConversation = vi.fn(async (_wsId: string) => ({
   conversation_id: "c",
@@ -64,6 +67,10 @@ vi.mock("@/api/teams", () => ({
   deleteTeam: vi.fn(),
 }));
 vi.mock("@/api/tasks", () => ({ listTasks: async () => [] }));
+vi.mock("@/api/brand", () => ({
+  getBrand: async () => ({ image: brandImage }),
+  setBrand: async (image: string) => ({ image }),
+}));
 
 function PathProbe() {
   const { pathname, search } = useLocation();
@@ -91,6 +98,7 @@ function renderRail(collapsed = false, path = "/peco") {
 
 beforeEach(() => {
   localStorage.clear();
+  brandImage = "";
   ensureSpaceConversation.mockClear();
   closeSpace.mockClear();
   useSpaceStore.setState({ currentWsId: "ws_peco" });
@@ -120,6 +128,68 @@ describe("左栏品牌行", () => {
     fireEvent.click(trigger);
     expect(useDockStore.getState().open).toBe(false);
     expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("有品牌图时按钮里就是图片，开关语义不变", async () => {
+    brandImage = "/uploads/brand/x.png";
+    renderRail(false, "/spaces/ws_a");
+
+    const trigger = await screen.findByRole("button", { name: "Peco 对话" });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger).toHaveAttribute("aria-controls", "peco-dock");
+    // 品牌图是异步取回来的：等它换掉默认标记。
+    await waitFor(() =>
+      expect(trigger.querySelector("img")).toHaveAttribute(
+        "src",
+        "/uploads/brand/x.png",
+      ),
+    );
+    // 展开槽位 176×32：按钮让宽，折叠态仍是 32px 方块。
+    expect(trigger.className).toContain("w-44");
+    expect(trigger.className).toContain("h-8");
+
+    fireEvent.click(trigger);
+    expect(useDockStore.getState().open).toBe(true);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("折叠态品牌图只露左半：内层按 2 倍宽度压缩", async () => {
+    brandImage = "/uploads/brand/x.png";
+    renderRail(true, "/spaces/ws_a");
+
+    const trigger = await screen.findByRole("button", { name: "Peco 对话" });
+    const img = await waitFor(() => {
+      const found = trigger.querySelector<HTMLImageElement>(
+        'img[src="/uploads/brand/x.png"]',
+      );
+      expect(found).not.toBeNull();
+      return found as HTMLImageElement;
+    });
+    expect(img.className).toContain("w-[200%]");
+    expect(img.className).toContain("object-fill");
+    // 折叠槽位不因品牌图变宽：还是那枚 32px 的方块按钮。
+    expect(trigger.className).toContain("size-8");
+  });
+
+  it("Peco 页的静态标记也换成品牌图", async () => {
+    brandImage = "/uploads/brand/x.png";
+    renderRail(false, "/peco");
+
+    await screen.findByRole("button", { name: "Peco" });
+    await waitFor(() =>
+      expect(
+        document.querySelector('img[src="/uploads/brand/x.png"]'),
+      ).not.toBeNull(),
+    );
+    expect(screen.queryByRole("button", { name: "Peco 对话" })).toBeNull();
+  });
+
+  it("未设置品牌图时仍是默认标记", async () => {
+    renderRail(false, "/spaces/ws_a");
+
+    const trigger = await screen.findByRole("button", { name: "Peco 对话" });
+    expect(trigger.className).toContain("size-8");
+    expect(trigger.querySelector("img")).toHaveAttribute("src", "/favicon.svg");
   });
 
   it("在 Peco 页品牌行只是标记：没有开关按钮", async () => {

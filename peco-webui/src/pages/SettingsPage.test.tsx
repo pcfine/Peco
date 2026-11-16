@@ -108,6 +108,7 @@ beforeEach(() => {
   teams = [team("research", "研发"), team("peco", "Peco", true)];
   get.mockReset().mockImplementation(async (url: string) => {
     if (url === "/teams") return { data: teams };
+    if (url === "/brand") return { data: { image: "" } };
     if (url === "/spaces") return { data: [space("ws_r", "research")] };
     if (url === "/teams/research/providers")
       return { data: [provider("qwen")] };
@@ -120,6 +121,19 @@ beforeEach(() => {
 });
 
 describe("设置页", () => {
+  it("品牌区排在团队之前，并注明对所有空间与团队生效", async () => {
+    renderPage();
+
+    const brandHeading = await screen.findByRole("heading", { name: "品牌" });
+    const teamHeading = await screen.findByRole("heading", { name: "团队" });
+    expect(
+      brandHeading.compareDocumentPosition(teamHeading) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText("对所有空间与团队生效")).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith("/brand", undefined);
+  });
+
   it("Peco 置顶并自报身份：兜底层先摆出来", () => {
     const ordered = orderTeams(teams);
 
@@ -143,6 +157,8 @@ describe("设置页", () => {
   it("选中 Peco 时副标题说明它是继承层，拉的是 Peco 自己的 provider", async () => {
     get.mockImplementation(async (url: string) => {
       if (url === "/teams") return { data: teams };
+      if (url === "/brand") return { data: { image: "" } };
+      if (url === "/brand") return { data: { image: "" } };
       if (url === "/spaces") return { data: [space("ws_p", "peco")] };
       if (url === "/teams/peco/providers")
         return { data: [provider("deepseek")] };
@@ -164,6 +180,8 @@ describe("设置页", () => {
   it("Peco 没有任何带密钥的自有条目时摆一条提示", async () => {
     get.mockImplementation(async (url: string) => {
       if (url === "/teams") return { data: teams };
+      if (url === "/brand") return { data: { image: "" } };
+      if (url === "/brand") return { data: { image: "" } };
       if (url === "/spaces") return { data: [space("ws_r", "research")] };
       if (url === "/teams/research/providers")
         return { data: [provider("qwen")] };
@@ -206,6 +224,8 @@ describe("设置页", () => {
     teams = [team("research", "研发")];
     get.mockImplementation(async (url: string) => {
       if (url === "/teams") return { data: teams };
+      if (url === "/brand") return { data: { image: "" } };
+      if (url === "/brand") return { data: { image: "" } };
       if (url === "/spaces") return { data: [space("ws_r", "research")] };
       if (url === "/teams/research/providers")
         return { data: [provider("qwen")] };
