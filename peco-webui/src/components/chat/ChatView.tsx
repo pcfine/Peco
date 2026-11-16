@@ -45,6 +45,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { CHEVRON, FOLD_ROW } from "@/components/chat/foldRow";
+import { CHAT_MEASURE } from "@/components/chat/measure";
 import { MESSAGE_TIME_CLASS } from "@/components/chat/messageTime";
 import { UserBubble } from "@/components/chat/UserBubble";
 import { WakeNotice, isWakeNotice } from "@/components/chat/WakeNotice";
@@ -1175,7 +1176,7 @@ export function ChatView({
 
   return (
     <div
-      className={`mx-auto flex min-h-0 w-full max-w-chat flex-col ${className || "h-full"}`}
+      className={`${CHAT_MEASURE} flex min-h-0 flex-col ${className || "h-full"}`}
     >
       {/* Header */}
       {!hideHeader && (

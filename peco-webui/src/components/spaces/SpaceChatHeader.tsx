@@ -1,13 +1,14 @@
 // 对话列头部：状态点 + 工作名称 + 团队 + 图标组，一行 48px。
 //
 // 两个折叠入口贴着头的两端：「收起对话」在最左，「展开右栏」在最右。
-// 两道边槽同宽，中间内容行仍是 `mx-auto max-w-chat` —— 一边收放时按钮不挪位，
+// 两道边槽同宽，中间内容行与正文共用 CHAT_MEASURE —— 一边收放时按钮不挪位，
 // 标题、消息与 composer 也继续落在同一条竖线上。名称可能很长而团队名很短，
 // 所以截断落在 h1 上、团队名整体让位；图标组不随名称长短漂移。
 
 import type { ReactNode, Ref } from "react";
 import { CircleChevronLeft, Eraser } from "lucide-react";
 import { Link } from "react-router-dom";
+import { CHAT_MEASURE } from "@/components/chat/measure";
 import { SpaceHeaderIconButton } from "@/components/spaces/SpaceHeaderIconButton";
 import {
   SpaceStatusMark,
@@ -70,7 +71,7 @@ export function SpaceChatHeader({
           onClick={onCollapseChat}
         />
       </div>
-      <div className="mx-auto flex w-full max-w-chat min-w-0 items-center gap-2">
+      <div className={`${CHAT_MEASURE} flex min-w-0 items-center gap-2`}>
         <SpaceStatusMark group={spaceGroupOf(space)} />
         <h1
           className="min-w-0 truncate text-xl font-semibold text-ink"

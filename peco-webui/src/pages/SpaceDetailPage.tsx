@@ -167,8 +167,9 @@ export function SpaceDetailPage() {
       <div
         data-testid="space-chat-column"
         data-collapsed={panel.chatCollapsed ? "true" : "false"}
+        // 列自己就是宽度容器：对话内容按它的宽度分档，不看视口。
         className={cn(
-          "min-w-0 flex-1 basis-0 flex-col",
+          "@container/chat min-w-0 flex-1 basis-0 flex-col",
           panel.chatCollapsed ? "hidden" : "flex",
         )}
       >

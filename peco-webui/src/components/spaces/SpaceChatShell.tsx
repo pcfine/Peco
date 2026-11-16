@@ -11,6 +11,7 @@
 import { useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChatView, type ChatMessage } from "@/components/chat/ChatView";
+import { CHAT_MEASURE } from "@/components/chat/measure";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SpaceConflictHint } from "@/components/spaces/SpaceConflictHint";
@@ -92,7 +93,7 @@ function SpaceConversationChat({
   return (
     <>
       {history.error && (
-        <div className="mx-auto w-full max-w-chat shrink-0 px-3 pt-3">
+        <div className={`${CHAT_MEASURE} shrink-0 px-3 pt-3`}>
           <ErrorBanner
             message={errorText(history.error)}
             onRetry={() => void history.refetch()}
@@ -182,7 +183,7 @@ export function SpaceChatShell({
       )}
     >
       {conversation.error ? (
-        <div className="mx-auto w-full max-w-chat p-3">
+        <div className={`${CHAT_MEASURE} p-3`}>
           <ErrorBanner
             message={errorText(conversation.error)}
             onRetry={() => void conversation.refetch()}

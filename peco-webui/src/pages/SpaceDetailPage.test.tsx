@@ -17,6 +17,7 @@ import {
 } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CHAT_MEASURE } from "@/components/chat/measure";
 import { SpaceDetailPage } from "@/pages/SpaceDetailPage";
 import { useSpacePanelState } from "@/components/spaces/useSpacePanelState";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
@@ -874,11 +875,11 @@ describe("空间聊天页", () => {
     expect(screen.getByRole("button", { name: "展开右栏" })).toHaveFocus();
   });
 
-  it("左头内容行与聊天正文同轴：mx-auto + max-w-chat，两侧内距同为 px-4", async () => {
+  it("左头内容行与聊天正文同轴：共用 CHAT_MEASURE，两侧内距同为 px-4", async () => {
     renderDetail();
     const shell = await screen.findByTestId("space-chat-shell");
 
-    // 双开时两块均分，x 轴不由 max-w-chat 封顶：头部与正文差 4px 就是两条竖线。
+    // 双开时两块均分，x 轴不由宽度档封顶：头部与正文差 4px 就是两条竖线。
     const header = document.querySelector("header") as HTMLElement;
     expect(header.className).toContain("px-4");
     expect(
@@ -887,19 +888,23 @@ describe("空间聊天页", () => {
     // 三条：左边界槽、居中内容行、右边界槽。内容行以列中心为轴。
     expect(header.children).toHaveLength(3);
     const row = header.querySelector(".max-w-chat") as HTMLElement;
-    expect(row.className).toContain("mx-auto");
-    expect(row.className).toContain("max-w-chat");
+    // 拿共享常量比、不拿字面量比：两边各自的宽度档一旦走偏，这个断言就该红。
+    expect(row.className).toContain(CHAT_MEASURE);
     // h1 在这一行里：标题与消息落在同一条竖线上。
     expect(
       within(row).getByRole("heading", { level: 1, name: "空间 A" }),
     ).toBeInTheDocument();
 
-    // 正文那一列用同一对上限类：jsdom 量不了布局，量的是同轴的前提。
+    // 正文那一列用同一份上限：jsdom 量不了布局，量的是同轴的前提。
     const chatView = shell.querySelector<HTMLElement>(
       '[data-slot="message-scroller"]',
     )?.parentElement as HTMLElement;
-    expect(chatView.className).toContain("mx-auto");
-    expect(chatView.className).toContain("max-w-chat");
+    expect(chatView.className).toContain(CHAT_MEASURE);
+
+    // 分档的前提：聊天列自己得是具名容器，否则具名查询命不中、三档全都落回默认。
+    expect(
+      screen.getByTestId("space-chat-column").className.split(/\s+/),
+    ).toContain("@container/chat");
   });
 
   describe("清除对话", () => {
