@@ -1,7 +1,7 @@
-// 左栏品牌图片：展开态整图，折叠态只取左半并横向压缩。
+// 左栏品牌图片：展开态整图，折叠态只取中间 1/2 并横向压缩。
 //
 // 折叠槽位只有 32px 宽，而品牌图是按 176×32 设计的；等比缩进去会变成一条细横条，
-// 所以内层按 2 倍宽度渲染再裁掉右半 —— 看得见的恰好是原图左 1/2。
+// 所以内层按 2 倍宽度渲染、水平居中，左右各裁掉 1/4 —— 看得见的恰好是原图中间 1/2。
 
 import { useEffect, useState } from "react";
 import { BrandMark } from "@/components/common/BrandMark";
@@ -40,7 +40,7 @@ export function BrandImage({
           aria-hidden="true"
           draggable={false}
           onError={() => setBroken(true)}
-          className="absolute top-0 left-0 h-full w-[200%] max-w-none object-fill"
+          className="absolute top-0 left-1/2 h-full w-[200%] max-w-none -translate-x-1/2 object-fill"
         />
       </span>
     );

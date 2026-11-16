@@ -15,20 +15,23 @@ describe("BrandImage", () => {
     const { container } = render(<BrandImage image={IMAGE} collapsed />);
     const img = firstImage(container);
     const box = img.parentElement as HTMLElement;
+    const classes = img.className.split(/\s+/);
 
     expect(box.className).toContain("overflow-hidden");
     expect(box.style.width).toBe("32px");
     expect(box.style.height).toBe("32px");
 
     expect(img.getAttribute("src")).toBe(IMAGE);
-    // 2 倍宽度 + 靠左对齐 = 可见区域正好是原图左半。
-    expect(img.className).toContain("w-[200%]");
-    expect(img.className).toContain("object-fill");
-    expect(img.className).toContain("absolute");
-    expect(img.className).toContain("top-0");
-    expect(img.className).toContain("left-0");
+    // 2 倍宽度 + 水平居中 = 左右各被裁掉 1/4，可见区域是原图中间 1/2。
+    expect(classes).toContain("w-[200%]");
+    expect(classes).toContain("object-fill");
+    expect(classes).toContain("absolute");
+    expect(classes).toContain("top-0");
+    expect(classes).toContain("left-1/2");
+    expect(classes).toContain("-translate-x-1/2");
+    expect(classes).not.toContain("left-0");
     // preflight 的 max-width:100% 会把 200% 压回去，必须显式放开。
-    expect(img.className).toContain("max-w-none");
+    expect(classes).toContain("max-w-none");
   });
 
   it("展开态：整图装进 176×32，等比缩放到框内", () => {
