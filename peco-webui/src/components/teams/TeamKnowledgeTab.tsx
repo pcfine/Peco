@@ -9,7 +9,7 @@ import { NewKnowledgeDialog } from "@/components/teams/NewKnowledgeDialog";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useKnowledgeBases } from "@/queries/teamDetail";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import type { KnowledgeBase, TeamDetail } from "@/types/daemon";
 
 function KnowledgeCard({ kb }: { kb: KnowledgeBase }) {
@@ -32,13 +32,13 @@ function KnowledgeCard({ kb }: { kb: KnowledgeBase }) {
 }
 
 export function TeamKnowledgeTab({
-  wsId,
+  scope,
   detail,
 }: {
-  wsId: string;
+  scope: ResourceScope;
   detail: TeamDetail;
 }) {
-  const bases = useKnowledgeBases(wsId);
+  const bases = useKnowledgeBases(scope);
   const [creating, setCreating] = useState(false);
 
   if (bases.error) {
@@ -90,7 +90,7 @@ export function TeamKnowledgeTab({
         </CardGrid>
       )}
       <NewKnowledgeDialog
-        wsId={wsId}
+        scope={scope}
         open={creating}
         onOpenChange={setCreating}
       />

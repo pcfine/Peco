@@ -18,7 +18,7 @@ import {
   draftFromDetail,
   toggleValue,
 } from "@/lib/agentDraft";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import { TOOLS } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 import {
@@ -100,8 +100,8 @@ function CapabilityGroup({
 }
 
 interface AgentEditorProps {
-  wsId: string;
-  /** provider 配置按团队取；`wsId` 只是能力根的请求头。 */
+  scope: ResourceScope;
+  /** provider 配置按团队取；资源请求认的是 `scope`。 */
   teamId: string;
   agentId: string;
   isMaster: boolean;
@@ -110,26 +110,31 @@ interface AgentEditorProps {
 }
 
 export function AgentEditor({
-  wsId,
+  scope,
   teamId,
   agentId,
   isMaster,
   onRequestDelete,
 }: AgentEditorProps) {
   const queryClient = useQueryClient();
-  const detail = useAgentDetail(wsId, agentId);
-  const skills = useTeamSkills(wsId);
-  const mcp = useMcpConfig(wsId);
-  const knowledge = useKnowledgeBases(wsId);
+  const detail = useAgentDetail(scope, agentId);
+  const skills = useTeamSkills(scope);
+  const mcp = useMcpConfig(scope);
+  const knowledge = useKnowledgeBases(scope);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
 
   const save = useMutation({
-    mutationFn: (body: UpdateAgentRequest) => updateAgent(wsId, agentId, body),
+    mutationFn: (body: UpdateAgentRequest) => updateAgent(scope, agentId, body),
     onSuccess: (updated) => {
       setDraft(null);
-      queryClient.setQueryData(["agent", wsId, agentId], updated);
+      queryClient.setQueryData(
+        ["agent", scope.teamId, scope.wsId, agentId],
+        updated,
+      );
       // 「列表里的名字 / 团队里的 agent 数」都变了，扇出刷新一次。
-      void queryClient.invalidateQueries({ queryKey: ["agents", wsId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["agents", scope.teamId, scope.wsId],
+      });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       toast.success("已保存");
     },

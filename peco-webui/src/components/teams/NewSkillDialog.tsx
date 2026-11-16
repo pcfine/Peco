@@ -16,7 +16,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { saveSkill } from "@/api/skills";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 
 /** 与后端 `validate_name` 同一套规则：先在这里挡住，省一次 400 往返。 */
 const VALID_SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -39,22 +39,27 @@ description: 什么时候该用这个技能
 `;
 
 interface NewSkillFormProps {
-  wsId: string;
+  scope: ResourceScope;
   onCancel: () => void;
   onCreated: (name: string) => void;
 }
 
-function NewSkillForm({ wsId, onCancel, onCreated }: NewSkillFormProps) {
+function NewSkillForm({ scope, onCancel, onCreated }: NewSkillFormProps) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [content, setContent] = useState("");
 
   const create = useMutation({
-    mutationFn: () => saveSkill(wsId, name, content),
+    mutationFn: () => saveSkill(scope, name, content),
     onSuccess: () => {
       // 先塞预览再选它：列表要等一次重新拉取，预览不用等。
-      queryClient.setQueryData(["skill", wsId, name], { name, content });
-      void queryClient.invalidateQueries({ queryKey: ["skills", wsId] });
+      queryClient.setQueryData(["skill", scope.teamId, scope.wsId, name], {
+        name,
+        content,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["skills", scope.teamId, scope.wsId],
+      });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       toast.success(`已新建 skill「${name}」`);
       onCreated(name);
@@ -132,14 +137,14 @@ function NewSkillForm({ wsId, onCancel, onCreated }: NewSkillFormProps) {
 }
 
 interface NewSkillDialogProps {
-  wsId: string;
+  scope: ResourceScope;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (name: string) => void;
 }
 
 export function NewSkillDialog({
-  wsId,
+  scope,
   open,
   onOpenChange,
   onCreated,
@@ -154,7 +159,7 @@ export function NewSkillDialog({
           </DialogDescription>
         </DialogHeader>
         <NewSkillForm
-          wsId={wsId}
+          scope={scope}
           onCancel={() => onOpenChange(false)}
           onCreated={(name) => {
             // 先关再选：关掉即卸载表单，下次打开是干净的一份。

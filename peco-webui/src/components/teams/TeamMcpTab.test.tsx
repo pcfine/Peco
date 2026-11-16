@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { ApiError } from "@/lib/api";
+import { ApiError, type ResourceScope } from "@/lib/api";
 import { TeamMcpTab } from "@/components/teams/TeamMcpTab";
 
 // 只替换 axios 实例：PUT 的 body 与试连的 URL 都在这里看得见，接口层照原样跑。
@@ -25,16 +25,18 @@ vi.mock("@/lib/api", async (importOriginal) => {
 });
 
 const SCOPE = { headers: { "X-Peco-Space": "ws_a" } };
+/** 借道已打开空间：能力根与 `X-Peco-Space` 指向同一个团队。 */
+const TEAM_SCOPE: ResourceScope = { teamId: "t1", wsId: "ws_a" };
 
 let servers: Record<string, unknown>;
 
-function renderTab() {
+function renderTab(scope: ResourceScope = TEAM_SCOPE) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <TeamMcpTab wsId="ws_a" />
+      <TeamMcpTab scope={scope} />
     </QueryClientProvider>,
   );
 }
@@ -60,6 +62,28 @@ beforeEach(() => {
 });
 
 describe("团队 MCP tab 装配", () => {
+  it("没有已打开空间时按团队寻址：列表与试连都发 X-Peco-Team", async () => {
+    const TEAM = { headers: { "X-Peco-Team": "t1" } };
+    post.mockResolvedValue({
+      data: {
+        success: true,
+        server: "filesystem",
+        transport: "stdio",
+        tool_count: 1,
+        tools: ["read_file"],
+        message: "connected",
+        duration_ms: 5,
+      },
+    });
+    renderTab({ teamId: "t1", wsId: null });
+
+    fireEvent.click((await testButtons())[0]);
+
+    expect(await screen.findByText("连接成功 · 1 个工具 · 5ms")).toBeTruthy();
+    expect(get).toHaveBeenCalledWith("/mcp", TEAM);
+    expect(post).toHaveBeenCalledWith("/mcp/filesystem/test", undefined, TEAM);
+  });
+
   it("试连成功显示工具数与耗时", async () => {
     post.mockResolvedValue({
       data: {

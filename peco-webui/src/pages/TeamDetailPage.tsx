@@ -1,14 +1,13 @@
 // `/teams/:teamId` —— 团队页，与 Peco 聊天页左头的 `·peco` 共用 `TeamConfigPanel`。
 //
-// 这里补团队页自己的两件事：从空间列表里挑一个已打开空间作 `X-Peco-Space`，
-// 以及出错时回团队列表的路。
+// 这里补团队页自己的两件事：从空间列表里挑一个已打开空间借道（没有也能用 ——
+// 资源 tab 会按团队寻址），以及出错时回团队列表的路。
 //
 // Peco 是后端保留团队，特例化两层：能力根固定挂在 Peco 空间上、记忆直接浏览
 // Peco 空间自己的记忆；「绑定空间」整栏用 hideSpaces 收掉 —— 连带它内容区的
 // 「新建空间」入口。
 
 import { useParams } from "react-router-dom";
-import { PecoClosedNotice } from "@/components/spaces/PecoClosedNotice";
 import { TeamConfigPanel } from "@/components/teams/TeamConfigPanel";
 import { usePeco } from "@/queries/peco";
 import { useSpaces } from "@/queries/spaces";
@@ -46,11 +45,6 @@ export function TeamDetailPage() {
         // 空间没打开时也传：记忆面板自己会摆「打开空间」的入口，
         // 比团队维度的「尚未接入」占位更靠近用户想做的那件事。
         memoryWsId={isPeco ? (peco.data?.ws_id ?? null) : null}
-        noSpaceNotice={
-          isPeco && pecoSpace && pecoSpace.status !== "open" ? (
-            <PecoClosedNotice space={pecoSpace} />
-          ) : undefined
-        }
       />
     </div>
   );

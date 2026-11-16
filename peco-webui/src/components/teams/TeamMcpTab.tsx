@@ -10,7 +10,7 @@ import { NewMcpDialog } from "@/components/teams/NewMcpDialog";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { testMcpServer } from "@/api/mcp";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useMcpConfig } from "@/queries/teamDetail";
 import type { McpTestResult } from "@/types/daemon";
@@ -146,12 +146,12 @@ function ServerCard({
   );
 }
 
-export function TeamMcpTab({ wsId }: { wsId: string }) {
-  const config = useMcpConfig(wsId);
+export function TeamMcpTab({ scope }: { scope: ResourceScope }) {
+  const config = useMcpConfig(scope);
   const [adding, setAdding] = useState(false);
 
   const test = useMutation({
-    mutationFn: (name: string) => testMcpServer(wsId, name),
+    mutationFn: (name: string) => testMcpServer(scope, name),
   });
 
   if (config.error) {
@@ -208,7 +208,7 @@ export function TeamMcpTab({ wsId }: { wsId: string }) {
         </CardGrid>
       )}
       <NewMcpDialog
-        wsId={wsId}
+        scope={scope}
         config={mcpConfig}
         open={adding}
         onOpenChange={setAdding}

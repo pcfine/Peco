@@ -23,17 +23,17 @@ import {
   createRequestFromDraft,
 } from "@/lib/agentDraft";
 import { agentDisplayName } from "@/lib/agentName";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 
 interface NewAgentFormProps {
-  wsId: string;
+  scope: ResourceScope;
   teamId: string;
   onCancel: () => void;
   onCreated: (agentId: string) => void;
 }
 
 function NewAgentForm({
-  wsId,
+  scope,
   teamId,
   onCancel,
   onCreated,
@@ -42,11 +42,16 @@ function NewAgentForm({
   const [draft, setDraft] = useState<NewAgentDraft>(EMPTY_NEW_AGENT);
 
   const create = useMutation({
-    mutationFn: () => createAgent(wsId, createRequestFromDraft(draft)),
+    mutationFn: () => createAgent(scope, createRequestFromDraft(draft)),
     onSuccess: (agent) => {
       // 先塞详情再选它：列表要等一次重新拉取，编辑器不用等。
-      queryClient.setQueryData(["agent", wsId, agent.id], agent);
-      void queryClient.invalidateQueries({ queryKey: ["agents", wsId] });
+      queryClient.setQueryData(
+        ["agent", scope.teamId, scope.wsId, agent.id],
+        agent,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: ["agents", scope.teamId, scope.wsId],
+      });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       toast.success(
         `已新建 agent「${agentDisplayName(agent.description, agent.name)}」`,
@@ -137,7 +142,7 @@ function NewAgentForm({
 }
 
 interface NewAgentDialogProps {
-  wsId: string;
+  scope: ResourceScope;
   teamId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -145,7 +150,7 @@ interface NewAgentDialogProps {
 }
 
 export function NewAgentDialog({
-  wsId,
+  scope,
   teamId,
   open,
   onOpenChange,
@@ -159,7 +164,7 @@ export function NewAgentDialog({
           <DialogDescription>只有 id 必填，其余可留空。</DialogDescription>
         </DialogHeader>
         <NewAgentForm
-          wsId={wsId}
+          scope={scope}
           teamId={teamId}
           onCancel={() => onOpenChange(false)}
           onCreated={(agentId) => {

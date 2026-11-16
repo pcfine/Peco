@@ -1,5 +1,5 @@
 // agents tab：卡片列表 → 点卡进同一个位置的编辑器。列表是装配入口 —— 新建、改、删。
-// 只在团队有已打开空间时可用：请求头 `X-Peco-Space` 决定读哪个团队的能力根。
+// 读写的是团队能力根：`scope` 决定请求认哪个团队，没有空间的团队照样能用。
 
 import { useState, type CSSProperties } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -26,7 +26,7 @@ import {
   agentDisplayName,
   firstGrapheme,
 } from "@/lib/agentName";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import { seedHue } from "@/lib/identicon";
 import { useTeamAgents } from "@/queries/teamDetail";
 import type { AgentListItem } from "@/types/daemon";
@@ -145,8 +145,8 @@ function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
 }
 
 interface TeamAgentsTabProps {
-  /** `X-Peco-Space`：哪个已打开空间的能力根。 */
-  wsId: string;
+  /** 能力根的落点：有已打开空间时借道空间，否则按团队寻址。 */
+  scope: ResourceScope;
   /** provider 配置按团队取，取这个名字下的 providers.toml。 */
   teamId: string;
   /** 团队没有 `@master` 时派发不了任务，列表顶部要把这句话说出来。 */
@@ -154,22 +154,26 @@ interface TeamAgentsTabProps {
 }
 
 export function TeamAgentsTab({
-  wsId,
+  scope,
   teamId,
   noMaster = false,
 }: TeamAgentsTabProps) {
   const queryClient = useQueryClient();
-  const agents = useTeamAgents(wsId);
+  const agents = useTeamAgents(scope);
   const [selected, setSelected] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<DeleteTarget | null>(null);
 
   // 删掉一个 agent 也会改团队里的计数：列表与团队详情都要重取。
   const remove = useMutation({
-    mutationFn: (target: DeleteTarget) => deleteAgent(wsId, target.id),
+    mutationFn: (target: DeleteTarget) => deleteAgent(scope, target.id),
     onSuccess: (_res, target) => {
-      queryClient.removeQueries({ queryKey: ["agent", wsId, target.id] });
-      void queryClient.invalidateQueries({ queryKey: ["agents", wsId] });
+      queryClient.removeQueries({
+        queryKey: ["agent", scope.teamId, scope.wsId, target.id],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["agents", scope.teamId, scope.wsId],
+      });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       setPendingDelete(null);
       // 删掉的正是编辑器里那个：回到列表，不留一个指向空 agent 的表单。
@@ -274,7 +278,7 @@ export function TeamAgentsTab({
         <AgentEditor
           // 换 agent 就重挂：上一个的草稿不留到下一个身上。
           key={selected}
-          wsId={wsId}
+          scope={scope}
           teamId={teamId}
           agentId={selected}
           isMaster={active?.is_master ?? false}
@@ -326,7 +330,7 @@ export function TeamAgentsTab({
       )}
 
       <NewAgentDialog
-        wsId={wsId}
+        scope={scope}
         teamId={teamId}
         open={creating}
         onOpenChange={setCreating}

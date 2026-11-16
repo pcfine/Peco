@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TeamKnowledgeTab } from "@/components/teams/TeamKnowledgeTab";
+import type { ResourceScope } from "@/lib/api";
 import type { KnowledgeBase, TeamDetail } from "@/types/daemon";
 
 // 只替换 axios 实例：POST 的 body 与空间头都在这里看得见，接口层照原样跑。
@@ -23,6 +24,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
 });
 
 const SCOPE = { headers: { "X-Peco-Space": "ws_a" } };
+/** 借道已打开空间：能力根与 `X-Peco-Space` 指向同一个团队。 */
+const TEAM_SCOPE: ResourceScope = { teamId: "t1", wsId: "ws_a" };
 
 const DETAIL = {
   id: "team_a",
@@ -54,13 +57,13 @@ function kb(name: string): KnowledgeBase {
   };
 }
 
-function renderTab() {
+function renderTab(scope: ResourceScope = TEAM_SCOPE) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <TeamKnowledgeTab wsId="ws_a" detail={DETAIL} />
+      <TeamKnowledgeTab scope={scope} detail={DETAIL} />
     </QueryClientProvider>,
   );
 }
@@ -80,6 +83,25 @@ beforeEach(() => {
 });
 
 describe("团队知识库 tab 新建", () => {
+  it("没有已打开空间时按团队寻址：列表与建库都发 X-Peco-Team", async () => {
+    const TEAM = { headers: { "X-Peco-Team": "t1" } };
+    renderTab({ teamId: "t1", wsId: null });
+
+    expect(await screen.findByText("这里什么也没有")).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith("/knowledge", TEAM);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "＋ 新建知识库" }),
+    );
+    fireEvent.change(screen.getByLabelText("名称（必填）"), {
+      target: { value: "handbook" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    expect(post.mock.calls[0][2]).toEqual(TEAM);
+  });
+
   it("空态下也有新建入口，创建后卡片随即摆出来", async () => {
     renderTab();
 

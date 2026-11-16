@@ -2,8 +2,8 @@
 //
 // 从老 webui 的 SkillEditPage 移植：docs 按文件各自持有缓冲、三视图
 // （分栏/源码/预览）、窄屏目录 Sheet、按文件记忆滚动与选区、脏标记与 ⌘S。
-// 差异只在入口与主题：这里嵌在团队配置页的 skills tab 里，请求要带
-// `X-Peco-Space`，保存后回写 React Query 缓存。
+// 差异只在入口与主题：这里嵌在团队配置页的 skills tab 里，请求按 `scope`
+// 认团队能力根，保存后回写 React Query 缓存。
 
 import {
   useCallback,
@@ -31,7 +31,7 @@ import {
   readSkillFile,
   saveSkill,
 } from "@/api/skills";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import { languageOf } from "@/lib/codeLanguage";
 import { formatBytes } from "@/lib/format";
 import type { SkillFile } from "@/types/skill";
@@ -69,14 +69,21 @@ function PreviewError() {
 }
 
 interface SkillEditorProps {
-  wsId: string;
+  scope: ResourceScope;
   name: string;
   /** 返回卡片列表；有未保存改动时调用方由本组件先确认。 */
   onBack: () => void;
 }
 
-export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
+export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
   const queryClient = useQueryClient();
+  // 调用方每次渲染都可能给出新的 scope 对象；effects 只该在「哪个团队 / 哪个
+  // 空间」变化时重跑，否则一次 setState 就会重取一遍 SKILL.md。
+  const { teamId, wsId } = scope;
+  const requestScope = useMemo<ResourceScope>(
+    () => ({ teamId, wsId }),
+    [teamId, wsId],
+  );
   const [skill, setSkill] = useState<{ name: string; content: string } | null>(
     null,
   );
@@ -133,7 +140,7 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     perFile.current = {};
     restored.current = null;
 
-    getSkillMd(wsId, name)
+    getSkillMd(requestScope, name)
       .then((detail) => {
         if (cancelled) return;
         setSkill(detail);
@@ -156,13 +163,13 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     return () => {
       cancelled = true;
     };
-  }, [wsId, name, loadKey]);
+  }, [requestScope, name, loadKey]);
 
   useEffect(() => {
     let cancelled = false;
     setFilesLoading(true);
     setFilesError(false);
-    listSkillFiles(wsId, name)
+    listSkillFiles(requestScope, name)
       .then((data) => {
         if (!cancelled) setFiles(data.files);
       })
@@ -175,7 +182,7 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     return () => {
       cancelled = true;
     };
-  }, [wsId, name, filesReloadKey]);
+  }, [requestScope, name, filesReloadKey]);
 
   // 资源文件按需加载：只有真正打开时才请求，避免一次拉 19 个文件。
   // SKILL.md 由 getSkillMd 装载，不能走这里，否则会与首屏请求竞争覆盖缓冲。
@@ -184,7 +191,7 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     let cancelled = false;
     setFileLoading(true);
     setFileFailed(false);
-    readSkillFile(wsId, name, activePath)
+    readSkillFile(requestScope, name, activePath)
       .then((data) => {
         if (cancelled) return;
         setDocs((prev) => ({
@@ -205,7 +212,7 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     return () => {
       cancelled = true;
     };
-  }, [wsId, name, activePath, activeDoc, fileReloadKey]);
+  }, [requestScope, name, activePath, activeDoc, fileReloadKey]);
 
   // 容器宽决定默认视图与「分栏」是否可用；视口宽不可靠（侧栏展开/收起差 176px）。
   useLayoutEffect(() => {
@@ -322,14 +329,16 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     setSaveError(null);
     try {
       if (isSkillMd) {
-        await saveSkill(wsId, name, activeDoc.content);
+        await saveSkill(requestScope, name, activeDoc.content);
         // 描述住在 frontmatter 里：正文一改可能连描述一起改，列表也要重取。
-        void queryClient.invalidateQueries({ queryKey: ["skills", wsId] });
+        void queryClient.invalidateQueries({
+          queryKey: ["skills", teamId, wsId],
+        });
       } else {
         // 带 SKILL.md 的磁盘版本：后端每次 upsert 都要校验 frontmatter，
         // 传 saved 而非草稿，避免存脚本时顺手提交未确认的 SKILL.md 改动。
         if (!skillDoc) throw new Error("SKILL.md 尚未加载");
-        await saveSkill(wsId, name, skillDoc.saved, [
+        await saveSkill(requestScope, name, skillDoc.saved, [
           { path: activePath, content: activeDoc.content },
         ]);
       }
@@ -352,6 +361,8 @@ export function SkillEditor({ wsId, name, onBack }: SkillEditorProps) {
     name,
     queryClient,
     skillDoc,
+    requestScope,
+    teamId,
     wsId,
   ]);
 

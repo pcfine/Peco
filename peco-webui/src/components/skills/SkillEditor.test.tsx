@@ -11,6 +11,7 @@ import {
   readSkillFile,
   saveSkill,
 } from "@/api/skills";
+import { type ResourceScope } from "@/lib/api";
 import type { SkillFile } from "@/types/skill";
 
 vi.mock("@/api/skills", () => ({
@@ -28,6 +29,8 @@ const GET_SKILL = vi.mocked(getSkillMd);
 const LIST_FILES = vi.mocked(listSkillFiles);
 const READ_FILE = vi.mocked(readSkillFile);
 const SAVE = vi.mocked(saveSkill);
+/** 借道已打开空间：能力根与 `X-Peco-Space` 指向同一个团队。 */
+const SCOPE: ResourceScope = { teamId: "t1", wsId: "ws_a" };
 
 const FILES: SkillFile[] = [
   {
@@ -71,7 +74,7 @@ function renderEditor() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <SkillEditor wsId="ws_a" name="demo" onBack={backHandler()} />
+      <SkillEditor scope={SCOPE} name="demo" onBack={backHandler()} />
     </QueryClientProvider>,
   );
 }
@@ -271,7 +274,7 @@ describe("SkillEditor", () => {
     });
     await waitFor(() => expect(SAVE).toHaveBeenCalledTimes(1));
 
-    expect(SAVE).toHaveBeenCalledWith("ws_a", "demo", "原始内容 + 新增");
+    expect(SAVE).toHaveBeenCalledWith(SCOPE, "demo", "原始内容 + 新增");
     // 多文件编辑下保存不应跳走，否则会打断其它缓冲。
     expect(onBackMock).not.toHaveBeenCalled();
     await waitFor(() =>
@@ -330,7 +333,7 @@ describe("SkillEditor", () => {
     await openFile("references/notes.md");
     await waitFor(() => expect(READ_FILE).toHaveBeenCalled());
     expect(READ_FILE).toHaveBeenCalledWith(
-      "ws_a",
+      SCOPE,
       "demo",
       "references/notes.md",
     );
@@ -394,7 +397,7 @@ describe("SkillEditor", () => {
     });
     await waitFor(() => expect(SAVE).toHaveBeenCalledTimes(1));
 
-    expect(SAVE).toHaveBeenCalledWith("ws_a", "demo", "原始内容", [
+    expect(SAVE).toHaveBeenCalledWith(SCOPE, "demo", "原始内容", [
       { path: "scripts/run.py", content: "print('hi')  # edited" },
     ]);
   });

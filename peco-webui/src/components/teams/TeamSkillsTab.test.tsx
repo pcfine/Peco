@@ -7,7 +7,7 @@ import {
   within,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { ApiError } from "@/lib/api";
+import { ApiError, type ResourceScope } from "@/lib/api";
 import { TeamSkillsTab } from "@/components/teams/TeamSkillsTab";
 import type { AgentDetail, AgentListItem, SkillInfo } from "@/types/daemon";
 
@@ -31,6 +31,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
 });
 
 const SCOPE = { headers: { "X-Peco-Space": "ws_a" } };
+/** 借道已打开空间：能力根与 `X-Peco-Space` 指向同一个团队。 */
+const TEAM_SCOPE: ResourceScope = { teamId: "t1", wsId: "ws_a" };
 
 const REVIEW_MD =
   "---\nname: review\ndescription: 代码审查\n---\n\nreview 的正文\n";
@@ -92,13 +94,13 @@ async function openEditor(name = "review") {
   await screen.findByRole("button", { name: "保存修改" });
 }
 
-function renderTab() {
+function renderTab(scope: ResourceScope = TEAM_SCOPE) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <TeamSkillsTab wsId="ws_a" />
+      <TeamSkillsTab scope={scope} />
     </QueryClientProvider>,
   );
 }
@@ -162,6 +164,37 @@ beforeEach(() => {
 });
 
 describe("团队 skills tab 装配", () => {
+  it("没有已打开空间时按团队寻址：列表与写删都发 X-Peco-Team", async () => {
+    const TEAM = { headers: { "X-Peco-Team": "t1" } };
+    renderTab({ teamId: "t1", wsId: null });
+
+    expect(
+      await screen.findByRole("button", { name: /^review/ }),
+    ).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith("/skills", TEAM);
+    // 删除确认要列「删掉会让谁缺能力」，agent 列表也得按同一个团队取。
+    expect(get).toHaveBeenCalledWith("/agents", TEAM);
+
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("SKILL.md 内容"), {
+      target: {
+        value: "---\nname: review\ndescription: 代码审查\n---\n\n新正文\n",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存修改" }));
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put.mock.calls[0][2]).toEqual(TEAM);
+
+    fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
+    fireEvent.click(await screen.findByRole("button", { name: "删除 review" }));
+    const confirm = await screen.findByRole("button", { name: "确认删除" });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(del).toHaveBeenCalledWith("/skills/review", TEAM),
+    );
+  });
+
   it("新建调 PUT /skills/{name}，body 带 content 与空 files", async () => {
     const created = "---\nname: code-review\ndescription: 审\n---\n\n正文\n";
     renderTab();

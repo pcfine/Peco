@@ -23,7 +23,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { getAgent } from "@/api/agents";
 import { deleteSkill } from "@/api/skills";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import { useTeamAgents, useTeamSkills } from "@/queries/teamDetail";
 import type { AgentDetail, SkillInfo } from "@/types/daemon";
 
@@ -74,10 +74,10 @@ function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
   );
 }
 
-export function TeamSkillsTab({ wsId }: { wsId: string }) {
+export function TeamSkillsTab({ scope }: { scope: ResourceScope }) {
   const queryClient = useQueryClient();
-  const skills = useTeamSkills(wsId);
-  const agents = useTeamAgents(wsId);
+  const skills = useTeamSkills(scope);
+  const agents = useTeamAgents(scope);
   const [selected, setSelected] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   /** 正在二次确认删除的技能名。 */
@@ -100,10 +100,11 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
       for (const agent of agents.data) {
         const cached = queryClient.getQueryData<AgentDetail>([
           "agent",
-          wsId,
+          scope.teamId,
+          scope.wsId,
           agent.id,
         ]);
-        const detail = cached ?? (await getAgent(wsId, agent.id));
+        const detail = cached ?? (await getAgent(scope, agent.id));
         if (detail.skills.includes(skill)) names.push(detail.name);
       }
       return names;
@@ -111,9 +112,11 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
   });
 
   const remove = useMutation({
-    mutationFn: (name: string) => deleteSkill(wsId, name),
+    mutationFn: (name: string) => deleteSkill(scope, name),
     onSuccess: (_res, name) => {
-      void queryClient.invalidateQueries({ queryKey: ["skills", wsId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["skills", scope.teamId, scope.wsId],
+      });
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       setPendingDelete(null);
       setSelected((current) => (current === name ? null : current));
@@ -158,7 +161,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
   const dialog = (
     <>
       <NewSkillDialog
-        wsId={wsId}
+        scope={scope}
         open={creating}
         onOpenChange={setCreating}
         onCreated={setSelected}
@@ -229,7 +232,7 @@ export function TeamSkillsTab({ wsId }: { wsId: string }) {
   if (selected !== null) {
     return (
       <div className="h-full min-h-0">
-        <SkillEditor wsId={wsId} name={selected} onBack={backToList} />
+        <SkillEditor scope={scope} name={selected} onBack={backToList} />
       </div>
     );
   }

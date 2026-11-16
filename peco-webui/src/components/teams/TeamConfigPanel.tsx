@@ -3,7 +3,7 @@
 // `/teams/peco` 也走这一份 —— Peco 是保留团队，差别只在「没有绑定空间可看」，
 // 由调用方用 hideSpaces 表达。
 
-import { Fragment, type ComponentType, type ReactNode } from "react";
+import { Fragment, type ComponentType } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   BookOpen,
@@ -14,7 +14,6 @@ import {
   Plug,
   Puzzle,
 } from "lucide-react";
-import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { SpaceMemoryTab } from "@/components/spaces/SpaceMemoryTab";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -26,7 +25,7 @@ import { TeamMemoryTab } from "@/components/teams/TeamMemoryTab";
 import { TeamSkillsTab } from "@/components/teams/TeamSkillsTab";
 import { TeamSpacesTab } from "@/components/teams/TeamSpacesTab";
 import { useTeam } from "@/queries/teamDetail";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type TeamTab = "agents" | "skills" | "mcp" | "knowledge" | "spaces" | "memory";
@@ -49,7 +48,7 @@ const TAB_ICONS: Record<TeamTab, ComponentType<{ className?: string }>> = {
   memory: BrainCircuit,
 };
 
-/** 需要「该团队已打开的空间」作请求头的那几个 tab：能力根都在空间里。 */
+/** 读写团队能力根的四个 tab。 */
 const RESOURCE_TABS: readonly TeamTab[] = [
   "agents",
   "skills",
@@ -78,12 +77,14 @@ function parseTab(raw: string | null, tabs: readonly TeamTab[]): TeamTab {
 
 interface TeamConfigPanelProps {
   teamId: string;
-  /** 资源 tab 的 `X-Peco-Space`：哪个已打开空间的能力根。空表示没有可用空间。 */
+  /**
+   * 该团队可借道的已打开空间；`null` 表示没有，资源 tab 直接按团队寻址。
+   *
+   * 能力根是团队级的，没有空间不影响读写，`wsId` 只决定用哪种选择器。
+   */
   wsId: string | null;
   /** 藏掉「绑定空间」与整个「工作」分组：Peco 是保留团队，不能再建/绑空间。 */
   hideSpaces?: boolean;
-  /** 没有可用空间时资源 tab 的占位；缺省是那句「先打开一个绑定空间」。 */
-  noSpaceNotice?: ReactNode;
   /** `/teams/:teamId` 出错时要一条回团队列表的路。 */
   showBackToList?: boolean;
   /**
@@ -99,7 +100,6 @@ export function TeamConfigPanel({
   teamId,
   wsId,
   hideSpaces = false,
-  noSpaceNotice,
   showBackToList = false,
   memoryWsId = null,
 }: TeamConfigPanelProps) {
@@ -158,6 +158,7 @@ export function TeamConfigPanel({
   }
 
   const detail = team.data;
+  const scope: ResourceScope = { teamId: detail.id, wsId };
 
   return (
     <div className="@container/team flex h-full min-h-0">
@@ -254,26 +255,17 @@ export function TeamConfigPanel({
             tab === "skills" ? "overflow-hidden" : "overflow-y-auto",
           )}
         >
-          {RESOURCE_TABS.includes(tab) &&
-            (wsId ? null : (
-              <div className="p-3">
-                {noSpaceNotice ?? (
-                  <EmptyState title="这个团队还没有已打开的空间。先打开一个绑定空间，才能读写它的能力根。" />
-                )}
-              </div>
-            ))}
-
-          {tab === "agents" && wsId && (
+          {tab === "agents" && (
             <TeamAgentsTab
-              wsId={wsId}
+              scope={scope}
               teamId={detail.id}
               noMaster={!detail.has_master}
             />
           )}
-          {tab === "skills" && wsId && <TeamSkillsTab wsId={wsId} />}
-          {tab === "mcp" && wsId && <TeamMcpTab wsId={wsId} />}
-          {tab === "knowledge" && wsId && (
-            <TeamKnowledgeTab wsId={wsId} detail={detail} />
+          {tab === "skills" && <TeamSkillsTab scope={scope} />}
+          {tab === "mcp" && <TeamMcpTab scope={scope} />}
+          {tab === "knowledge" && (
+            <TeamKnowledgeTab scope={scope} detail={detail} />
           )}
           {tab === "spaces" && (
             <TeamSpacesTab teamId={detail.id} spaces={detail.spaces} />

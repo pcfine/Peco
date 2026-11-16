@@ -25,7 +25,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { updateMcpConfig, type McpConfig } from "@/api/mcp";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 
 type Transport = "stdio" | "sse" | "streamable_http";
 
@@ -117,13 +117,13 @@ function toServerConfig(form: FormState): Record<string, unknown> {
 }
 
 interface NewMcpFormProps {
-  wsId: string;
+  scope: ResourceScope;
   config: McpConfig;
   onCancel: () => void;
   onCreated: () => void;
 }
 
-function NewMcpForm({ wsId, config, onCancel, onCreated }: NewMcpFormProps) {
+function NewMcpForm({ scope, config, onCancel, onCreated }: NewMcpFormProps) {
   const queryClient = useQueryClient();
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
 
@@ -144,12 +144,14 @@ function NewMcpForm({ wsId, config, onCancel, onCreated }: NewMcpFormProps) {
 
   const create = useMutation({
     mutationFn: (server: Record<string, unknown>) =>
-      updateMcpConfig(wsId, {
+      updateMcpConfig(scope, {
         ...config,
         mcpServers: { ...config.mcpServers, [name]: server },
       }),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["mcp", wsId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["mcp", scope.teamId, scope.wsId],
+      });
       // agent 编辑器的 MCP 候选也读这份配置，扇出刷新一次。
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       toast.success(`已添加 MCP server「${name}」`);
@@ -368,14 +370,14 @@ function NewMcpForm({ wsId, config, onCancel, onCreated }: NewMcpFormProps) {
 }
 
 interface NewMcpDialogProps {
-  wsId: string;
+  scope: ResourceScope;
   config: McpConfig;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
 export function NewMcpDialog({
-  wsId,
+  scope,
   config,
   open,
   onOpenChange,
@@ -391,7 +393,7 @@ export function NewMcpDialog({
         </DialogHeader>
         {/* 表单状态放在 DialogContent 里：关掉即卸载，下次打开是干净的一份。 */}
         <NewMcpForm
-          wsId={wsId}
+          scope={scope}
           config={config}
           onCancel={() => onOpenChange(false)}
           onCreated={() => onOpenChange(false)}

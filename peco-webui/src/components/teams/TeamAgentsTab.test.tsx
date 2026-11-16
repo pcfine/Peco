@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TeamAgentsTab } from "@/components/teams/TeamAgentsTab";
-import { ApiError } from "@/lib/api";
+import { ApiError, type ResourceScope } from "@/lib/api";
 import type {
   AgentDetail,
   AgentListItem,
@@ -130,13 +130,16 @@ function listItem(detail: AgentDetail, isMaster: boolean): AgentListItem {
 let details: Map<string, AgentDetail>;
 let rows: AgentListItem[];
 
-function renderTab(props: { noMaster?: boolean } = {}) {
+/** 借道已打开空间：能力根与 `X-Peco-Space` 指向同一个团队。 */
+const SCOPE: ResourceScope = { teamId: "t1", wsId: "ws_a" };
+
+function renderTab(props: { noMaster?: boolean } = {}, scope = SCOPE) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <TeamAgentsTab wsId="ws_a" teamId="t1" {...props} />
+      <TeamAgentsTab scope={scope} teamId="t1" {...props} />
     </QueryClientProvider>,
   );
 }
@@ -198,6 +201,20 @@ beforeEach(() => {
 });
 
 describe("团队 agents tab 装配", () => {
+  it("团队没有已打开空间时照常列出能力根里的 agents", async () => {
+    renderTab({}, { teamId: "machine", wsId: null });
+
+    expect(
+      await screen.findByRole("button", { name: /@master/ }),
+    ).toBeInTheDocument();
+    expect(listAgents).toHaveBeenCalledWith({ teamId: "machine", wsId: null });
+    // 有没有空间只影响请求头，不影响渲染：列表与新建入口都照常在。
+    expect(screen.queryByText("这个团队还没有 agent。")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "＋ 新建 agent" }),
+    ).toBeInTheDocument();
+  });
+
   it("填 id 提交后调用 POST，新 agent 直接进编辑器并出现在列表里", async () => {
     renderTab();
     fireEvent.click(
@@ -215,7 +232,7 @@ describe("团队 agents tab 装配", () => {
     fireEvent.click(dialog.getByRole("button", { name: "创建" }));
 
     await waitFor(() => expect(createAgent).toHaveBeenCalledTimes(1));
-    expect(createAgent).toHaveBeenCalledWith("ws_a", {
+    expect(createAgent).toHaveBeenCalledWith(SCOPE, {
       name: "reviewer",
       description: "审查员 — 看代码",
     });
@@ -239,8 +256,8 @@ describe("团队 agents tab 装配", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
-    const [wsId, agentId, body] = updateAgent.mock.calls[0];
-    expect(wsId).toBe("ws_a");
+    const [scope, agentId, body] = updateAgent.mock.calls[0];
+    expect(scope).toEqual(SCOPE);
     expect(agentId).toBe("a_helper");
     expect(body).toEqual({ description: "改了描述" });
     expect(body).not.toHaveProperty("system_prompt");
@@ -364,7 +381,7 @@ describe("团队 agents tab 装配", () => {
     fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
 
     await waitFor(() =>
-      expect(deleteAgent).toHaveBeenCalledWith("ws_a", "a_helper"),
+      expect(deleteAgent).toHaveBeenCalledWith(SCOPE, "a_helper"),
     );
   });
 

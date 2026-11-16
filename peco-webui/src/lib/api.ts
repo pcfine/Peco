@@ -50,7 +50,11 @@ export const api = axios.create({
 api.interceptors.request.use((config) => {
   const wsId = useSpaceStore.getState().currentWsId;
   // 请求已自带头时不覆盖：dock 固定落在 Peco 空间，与「当前空间」无关。
-  if (wsId && !config.headers["X-Peco-Space"]) {
+  // 团队头也算自带头 —— 补一个空间头会让资源请求落到当前空间所属的团队。
+  const scoped = Boolean(
+    config.headers["X-Peco-Space"] || config.headers["X-Peco-Team"],
+  );
+  if (wsId && !scoped) {
     config.headers["X-Peco-Space"] = wsId;
   }
   return config;
@@ -59,6 +63,26 @@ api.interceptors.request.use((config) => {
 /** 显式指定请求空间；不传就由拦截器按「当前空间」决定。 */
 export function spaceScope(wsId?: string | null) {
   return wsId ? { headers: { "X-Peco-Space": wsId } } : undefined;
+}
+
+/**
+ * 资源请求的落点：团队能力根。
+ *
+ * `wsId` 只表示「该团队有一个已打开的空间可借道」；能力根本身是团队级的，
+ * 没有空间照样能读写，所以缺省走团队选择器。
+ */
+export interface ResourceScope {
+  teamId: string;
+  wsId: string | null;
+}
+
+/** 资源模块的请求头：有已打开空间时用空间寻址，否则直接按团队寻址。 */
+export function resourceScope(scope: ResourceScope) {
+  return {
+    headers: scope.wsId
+      ? { "X-Peco-Space": scope.wsId }
+      : { "X-Peco-Team": scope.teamId },
+  };
 }
 
 api.interceptors.response.use(

@@ -1,4 +1,4 @@
-import { api, spaceScope } from "@/lib/api";
+import { api, resourceScope, type ResourceScope } from "@/lib/api";
 import type { SuccessResponse } from "@/types/common";
 import type { McpTestResult } from "@/types/daemon";
 
@@ -7,8 +7,8 @@ export interface McpConfig {
   mcpServers: Record<string, unknown>;
 }
 
-export async function getMcpConfig(wsId: string): Promise<McpConfig> {
-  const res = await api.get<McpConfig>("/mcp", spaceScope(wsId));
+export async function getMcpConfig(scope: ResourceScope): Promise<McpConfig> {
+  const res = await api.get<McpConfig>("/mcp", resourceScope(scope));
   // 服务端缺文件时回 `{mcpServers:{}}`；顶层其它键原样留着 —— PUT 是整份替换，
   // 在这里丢掉就等于保存时把它们删了。
   return { ...res.data, mcpServers: res.data?.mcpServers ?? {} };
@@ -20,22 +20,26 @@ export async function getMcpConfig(wsId: string): Promise<McpConfig> {
  * 失败时 400 的原文原样展示给用户。
  */
 export async function updateMcpConfig(
-  wsId: string,
+  scope: ResourceScope,
   config: unknown,
 ): Promise<SuccessResponse> {
-  const res = await api.put<SuccessResponse>("/mcp", config, spaceScope(wsId));
+  const res = await api.put<SuccessResponse>(
+    "/mcp",
+    config,
+    resourceScope(scope),
+  );
   return res.data;
 }
 
 /** 真连一次：会起子进程 / 打网络请求，所以只在用户点「试连」时调用。 */
 export async function testMcpServer(
-  wsId: string,
+  scope: ResourceScope,
   name: string,
 ): Promise<McpTestResult> {
   const res = await api.post<McpTestResult>(
     `/mcp/${encodeURIComponent(name)}/test`,
     undefined,
-    spaceScope(wsId),
+    resourceScope(scope),
   );
   return res.data;
 }

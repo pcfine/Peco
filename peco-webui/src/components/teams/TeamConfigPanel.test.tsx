@@ -27,10 +27,22 @@ vi.mock("@/queries/teamDetail", () => ({
   }),
 }));
 
-// 六个资源面板各有自己的网络逻辑，面板布局与它们无关。
+// 六个资源面板各有自己的网络逻辑，面板布局与它们无关；agents 面板额外把
+// 收到的 scope 摆出来 —— 「没有空间也照常渲染、按团队寻址」只能在这一层看见。
 vi.mock("@/components/teams/TeamAgentsTab", () => ({
-  TeamAgentsTab: ({ noMaster }: { noMaster?: boolean }) => (
-    <div data-testid="agents-panel" data-no-master={String(noMaster)} />
+  TeamAgentsTab: ({
+    noMaster,
+    scope,
+  }: {
+    noMaster?: boolean;
+    scope: { teamId: string; wsId: string | null };
+  }) => (
+    <div
+      data-testid="agents-panel"
+      data-no-master={String(noMaster)}
+      data-team={scope.teamId}
+      data-ws={String(scope.wsId)}
+    />
   ),
 }));
 vi.mock("@/components/teams/TeamSkillsTab", () => ({
@@ -186,6 +198,24 @@ describe("TeamConfigPanel 分类导航", () => {
     // 直开没有上一页时兜底到团队列表。
     fireEvent.click(back);
     expect(screen.getByTestId("path")).toHaveTextContent("/teams");
+  });
+
+  it("没有已打开空间时资源 tab 照常渲染，不再出「先打开一个绑定空间」", () => {
+    renderPanel({ wsId: null });
+
+    const panel = screen.getByTestId("agents-panel");
+    expect(panel).toBeInTheDocument();
+    expect(panel.getAttribute("data-ws")).toBe("null");
+    expect(screen.queryByText(/先打开一个绑定空间/)).toBeNull();
+    expect(screen.queryByText(/还没有已打开的空间/)).toBeNull();
+  });
+
+  it("把团队与可借道的空间一起交给 agents 面板", () => {
+    renderPanel({ wsId: "ws_9" });
+
+    const panel = screen.getByTestId("agents-panel");
+    expect(panel.getAttribute("data-team")).toBe("x");
+    expect(panel.getAttribute("data-ws")).toBe("ws_9");
   });
 
   it("缺 @master 时把 noMaster 交给 agents 面板", () => {

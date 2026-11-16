@@ -16,7 +16,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { createKnowledgeBase } from "@/api/knowledge";
-import { errorText } from "@/lib/api";
+import { errorText, type ResourceScope } from "@/lib/api";
 
 /** 与后端一致：字母/数字开头结尾，中间只允许字母、数字、`.`、`_`、`-`。 */
 const VALID_KB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
@@ -31,13 +31,13 @@ function kbNameError(name: string): string | null {
 }
 
 interface NewKnowledgeFormProps {
-  wsId: string;
+  scope: ResourceScope;
   onCancel: () => void;
   onCreated: () => void;
 }
 
 function NewKnowledgeForm({
-  wsId,
+  scope,
   onCancel,
   onCreated,
 }: NewKnowledgeFormProps) {
@@ -47,9 +47,11 @@ function NewKnowledgeForm({
 
   const create = useMutation({
     mutationFn: () =>
-      createKnowledgeBase(wsId, { name: name.trim(), description }),
+      createKnowledgeBase(scope, { name: name.trim(), description }),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["knowledge", wsId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["knowledge", scope.teamId, scope.wsId],
+      });
       // 团队详情里也摊着知识库目录，扇出刷新一次。
       void queryClient.invalidateQueries({ queryKey: ["team"] });
       toast.success(`已新建知识库「${name.trim()}」`);
@@ -124,13 +126,13 @@ function NewKnowledgeForm({
 }
 
 interface NewKnowledgeDialogProps {
-  wsId: string;
+  scope: ResourceScope;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
 
 export function NewKnowledgeDialog({
-  wsId,
+  scope,
   open,
   onOpenChange,
 }: NewKnowledgeDialogProps) {
@@ -145,7 +147,7 @@ export function NewKnowledgeDialog({
         </DialogHeader>
         {/* 表单状态放在 DialogContent 里：关掉即卸载，下次打开是干净的一份。 */}
         <NewKnowledgeForm
-          wsId={wsId}
+          scope={scope}
           onCancel={() => onOpenChange(false)}
           onCreated={() => onOpenChange(false)}
         />
