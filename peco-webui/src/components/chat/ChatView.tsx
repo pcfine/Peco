@@ -428,7 +428,6 @@ export function ChatView({
   );
   /** 本轮收到过 `error{cancelled:true}` —— 服务端权威判据，`done` 时据此打标 */
   const cancelledRef = useRef(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const unreadCountRef = useRef(0);
   const unreadDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -1193,31 +1192,33 @@ export function ChatView({
         data-slot="message-scroller"
         // 取消已投递、收尾尚未发生：在途气泡仍在被服务端改写
         aria-busy={cancelling ? "true" : undefined}
-        className="flex-1 overflow-y-auto space-y-4 pr-2"
+        className="flex flex-1 flex-col overflow-y-auto pr-2"
       >
-        {onLoadEarlier && hasMore && (
-          <div className="flex justify-center">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={onLoadEarlier}
-              disabled={loadingEarlier || (externalIsStreaming ?? streaming)}
-            >
-              {loadingEarlier ? "加载中…" : "加载更早的对话"}
-            </Button>
-          </div>
-        )}
-        {displayMessages.length === 0 && welcomeMessage && (
-          <WelcomeHero
-            message={welcomeMessage}
-            suggestions={suggestions}
-            onSuggestion={submitText}
-          />
-        )}
-        {displayMessages.map((msg, i) => (
-          <ChatBubble key={msg.id ?? i} message={msg} />
-        ))}
-        <div ref={messagesEndRef} />
+        {/* my-auto 而非 justify-center：flex 列溢出时自动外边距归零，首条仍能滚到顶 */}
+        <div data-slot="message-list" className="my-auto w-full space-y-4">
+          {onLoadEarlier && hasMore && (
+            <div className="flex justify-center">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onLoadEarlier}
+                disabled={loadingEarlier || (externalIsStreaming ?? streaming)}
+              >
+                {loadingEarlier ? "加载中…" : "加载更早的对话"}
+              </Button>
+            </div>
+          )}
+          {displayMessages.length === 0 && welcomeMessage && (
+            <WelcomeHero
+              message={welcomeMessage}
+              suggestions={suggestions}
+              onSuggestion={submitText}
+            />
+          )}
+          {displayMessages.map((msg, i) => (
+            <ChatBubble key={msg.id ?? i} message={msg} />
+          ))}
+        </div>
       </div>
 
       {/* 订阅在途轮的重试入口：重连次数用尽后停在这里，不后台空转 */}

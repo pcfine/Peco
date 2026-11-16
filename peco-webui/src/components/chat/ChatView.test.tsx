@@ -58,3 +58,66 @@ describe("对话里的唤醒消息", () => {
     ).toHaveLength(1);
   });
 });
+
+describe("消息区垂直锚定", () => {
+  function scrollerOf(container: HTMLElement): HTMLElement {
+    const scroller = container.querySelector<HTMLElement>(
+      "[data-slot='message-scroller']",
+    );
+    expect(scroller).not.toBeNull();
+    return scroller as HTMLElement;
+  }
+
+  function hasClass(el: Element, name: string): boolean {
+    return el.className.split(/\s+/).includes(name);
+  }
+
+  it("滚动容器内只有一层带 my-auto 的 message-list，间距随内容包下移", () => {
+    const { container } = renderMessages([
+      { role: "user", content: "在吗", turnIndex: 0 },
+    ]);
+    const scroller = scrollerOf(container);
+
+    // 居中层必须是滚动容器的唯一子元素：多一层就会各自算一次自动外边距
+    expect(scroller.children).toHaveLength(1);
+    const list = scroller.querySelector("[data-slot='message-list']");
+    expect(list).not.toBeNull();
+    expect(hasClass(list as Element, "my-auto")).toBe(true);
+    expect(hasClass(list as Element, "space-y-4")).toBe(true);
+
+    // 居中靠 flex 列 + margin-block:auto；滚动容器自身不再带间距
+    expect(hasClass(scroller, "flex")).toBe(true);
+    expect(hasClass(scroller, "flex-col")).toBe(true);
+    expect(hasClass(scroller, "space-y-4")).toBe(false);
+    expect(hasClass(scroller, "justify-center")).toBe(false);
+  });
+
+  it("user 与 assistant 气泡全部是 message-list 的后代", () => {
+    const { container } = renderMessages([
+      { role: "user", content: "第一问", turnIndex: 0 },
+      { role: "assistant", content: "第一答", turnIndex: 0 },
+      { role: "user", content: "第二问", turnIndex: 1 },
+      { role: "assistant", content: "第二答", turnIndex: 1 },
+    ]);
+    const scroller = scrollerOf(container);
+    const list = scroller.querySelector<HTMLElement>(
+      "[data-slot='message-list']",
+    ) as HTMLElement;
+    expect(list).not.toBeNull();
+
+    const bubbles = [
+      ...scroller.querySelectorAll("[data-slot='user-bubble']"),
+      ...scroller.querySelectorAll("[data-slot='assistant-result']"),
+    ];
+    // 两种角色各自都在场，否则「全是后代」可能只是因为另一种根本没渲染
+    expect(scroller.querySelectorAll("[data-slot='user-bubble']")).toHaveLength(
+      2,
+    );
+    expect(
+      scroller.querySelectorAll("[data-slot='assistant-result']"),
+    ).toHaveLength(2);
+    for (const bubble of bubbles) {
+      expect(list.contains(bubble)).toBe(true);
+    }
+  });
+});
