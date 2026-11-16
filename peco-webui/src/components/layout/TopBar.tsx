@@ -8,6 +8,7 @@ import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { usePecoTodayTasks } from "@/queries/tasks";
 import { TASK_RUNNING_STATES } from "@/lib/taskStates";
 import { usePeco } from "@/queries/peco";
+import { isPecoSurface } from "@/lib/pecoSurface";
 import { useDockStore } from "@/stores/dockStore";
 
 const PAGE_TITLES: Record<string, string> = {
@@ -34,6 +35,8 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
   // <900 时 rail 离屏，抽屉开关只能落在这里；900–1099 走左栏那枚图标。
   const railOffscreen = !useMediaQuery("(min-width: 900px)");
   const { data: peco } = usePeco();
+  // 抽屉不在 Peco 会话本体所在的页面上存在，开关也就没有落点。
+  const onPecoSurface = isPecoSurface(pathname, peco?.ws_id);
   const { data: tasks } = usePecoTodayTasks(peco?.ws_id ?? null);
   const dockOpen = useDockStore((state) => state.open);
   const toggleDock = useDockStore((state) => state.toggle);
@@ -61,7 +64,7 @@ export function TopBar({ onOpenNav }: { onOpenNav: () => void }) {
         {titleOf(pathname)}
       </p>
 
-      {railOffscreen && (
+      {railOffscreen && !onPecoSurface && (
         <div className="ml-auto flex items-center gap-1">
           <button
             type="button"

@@ -1,5 +1,4 @@
-// Peco dock 的开关、tab 与「每个空间用哪个对话」。
-// 对话 id 必须按空间分开存：切空间后再回来要接上原对话，而不是新开一条。
+// Peco dock 的开关与 tab。
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
@@ -9,12 +8,9 @@ export type DockTab = "chat" | "artifacts";
 interface DockState {
   open: boolean;
   tab: DockTab;
-  /** ws_id → conversation id。 */
-  conversationByWs: Record<string, string>;
   setOpen: (open: boolean) => void;
   toggle: () => void;
   setTab: (tab: DockTab) => void;
-  setConversation: (wsId: string, convId: string) => void;
 }
 
 export const useDockStore = create<DockState>()(
@@ -23,22 +19,13 @@ export const useDockStore = create<DockState>()(
       // 抽屉是覆盖层：默认打开会盖住刚进来的页面。
       open: false,
       tab: "chat",
-      conversationByWs: {},
       setOpen: (open) => set({ open }),
       toggle: () => set({ open: !get().open }),
       setTab: (tab) => set({ tab }),
-      setConversation: (wsId, convId) =>
-        set((state) => ({
-          conversationByWs: { ...state.conversationByWs, [wsId]: convId },
-        })),
     }),
     {
       name: "peco-webui:dock",
-      partialize: (state) => ({
-        open: state.open,
-        tab: state.tab,
-        conversationByWs: state.conversationByWs,
-      }),
+      partialize: (state) => ({ open: state.open, tab: state.tab }),
     },
   ),
 );

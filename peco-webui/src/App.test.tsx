@@ -25,6 +25,14 @@ vi.mock("@/api/peco", () => ({
   }),
 }));
 
+const mocks = vi.hoisted(() => ({
+  getMessages: vi.fn(async () => []),
+  ensure: vi.fn(async (_wsId: string) => ({
+    conversation_id: "conv-space",
+    created: false,
+  })),
+}));
+
 const pecoSpace = {
   ws_id: "ws_peco",
   work_dir: "/tmp/peco",
@@ -49,10 +57,7 @@ vi.mock("@/api/spaces", () => ({
   cancelSpaceTask: async () => ({ cancelled: true }),
   spaceArtifacts: async () => ({ items: [], total: 0 }),
   spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
-  ensureSpaceConversation: async () => ({
-    conversation_id: "conv-space",
-    created: false,
-  }),
+  ensureSpaceConversation: mocks.ensure,
   closeSpace: async () => ({ stopped: true }),
   createSpace: async () => ({ ws_id: "ws_new" }),
   deleteSpace: async () => ({ purged: true }),
@@ -90,11 +95,9 @@ vi.mock("@/api/tasks", () => ({
 }));
 
 vi.mock("@/api/conversations", () => ({
-  listConversations: async () => [{ id: "conv-dock", title: "Peco" }],
-  getMessages: async () => [],
-  createConversation: async () => ({ id: "conv-dock" }),
-  conversationStreamUrl: () =>
-    "/api/chat/@master/conversations/conv-dock/stream",
+  getMessages: mocks.getMessages,
+  conversationStreamUrl: (agentId: string, convId: string) =>
+    `/api/chat/${agentId}/conversations/${convId}/stream`,
   conversationLiveStreamUrl: (agentId: string, convId: string) =>
     `/api/chat/${agentId}/conversations/${convId}/stream/live`,
   cancelConversationTurn: async () => "accepted" as const,
@@ -182,6 +185,8 @@ function expectTopBarIndicator(text: string) {
 
 beforeEach(() => {
   localStorage.clear();
+  mocks.getMessages.mockClear();
+  mocks.ensure.mockClear();
   // dock 的对话壳挂载即订阅在途轮：本文件不测 attach，统一回「没有在途轮」。
   vi.stubGlobal(
     "fetch",
@@ -380,14 +385,23 @@ describe("白屏与 rail 宽度", () => {
 
   it("dock 打开时对话首屏不白屏：ChatView 的 Tooltip 在根部 provider 里", async () => {
     const restore = useWideViewport();
-    useDockStore.setState({ open: true, conversationByWs: {} });
-    const view = renderAt("/");
+    useDockStore.setState({ open: true });
+    // `#peco-dock` 只在非 Peco 页存在：`/` 会重定向到 `/peco`。
+    const view = renderAt("/spaces");
     try {
       // 缺 TooltipProvider 时 Radix 渲染期抛错、整棵树被卸载，消息区不会出现。
       await waitFor(() =>
         expect(
           document.querySelector("[data-slot='message-scroller']"),
         ).not.toBeNull(),
+      );
+      // 抽屉接的是空间会话（ensure 出来的那条），不再自己建一条。
+      await waitFor(() =>
+        expect(mocks.getMessages).toHaveBeenCalledWith(
+          "@master",
+          "conv-space",
+          expect.objectContaining({ wsId: "ws_peco" }),
+        ),
       );
     } finally {
       // Tooltip 内部有延迟计时器：挂着等它到点会以 act() 警告收尾。
@@ -403,13 +417,53 @@ describe("Peco 抽屉", () => {
     setViewport(1024);
   });
 
+  it("在 /peco 时不渲染：没有 #peco-dock，开关也归 false", async () => {
+    const restore = useWideViewport();
+    try {
+      setViewport(1440);
+      useUiStore.setState({ railOpen: true });
+      useDockStore.setState({ open: true });
+      const view = renderAt("/peco");
+      // Peco 页自己就是这条会话的入口：抽屉连壳都不该留。这里不断言 ensure 的
+      // 次数 —— 页面壳自己也会调它，抽屉侧的「不建会话」由 DockShell.test.tsx 管。
+      await waitFor(() => expect(useDockStore.getState().open).toBe(false));
+      expect(view.container.querySelector("#peco-dock")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Peco 对话" })).toBeNull();
+      view.unmount();
+    } finally {
+      useDockStore.setState({ open: false });
+      useUiStore.setState({ railOpen: true });
+      restore();
+    }
+  });
+
+  it("在 Peco 空间页不渲染：那一页的主体就是同一条会话", async () => {
+    const restore = useWideViewport();
+    try {
+      setViewport(1440);
+      useUiStore.setState({ railOpen: true });
+      useDockStore.setState({ open: true });
+      const view = renderAt("/spaces/ws_peco");
+      // 等页面自己的聊天壳落地，再看抽屉有没有跟着铺第二份历史。
+      expect(await screen.findByTestId("space-chat-shell")).toBeInTheDocument();
+      await waitFor(() => expect(useDockStore.getState().open).toBe(false));
+      expect(view.container.querySelector("#peco-dock")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Peco 对话" })).toBeNull();
+      view.unmount();
+    } finally {
+      useDockStore.setState({ open: false });
+      useUiStore.setState({ railOpen: true });
+      restore();
+    }
+  });
+
   it("关着：面板常驻但内容不渲染、键盘与点击都进不去，旧的两个 id 不存在", async () => {
     const restore = useWideViewport();
     try {
       setViewport(1440);
       useUiStore.setState({ railOpen: true });
-      useDockStore.setState({ open: false, conversationByWs: {} });
-      const view = renderAt("/");
+      useDockStore.setState({ open: false });
+      const view = renderAt("/spaces");
       const panel = await waitFor(() => {
         const node = view.container.querySelector("#peco-dock");
         expect(node).not.toBeNull();
@@ -426,7 +480,7 @@ describe("Peco 抽屉", () => {
       expect(view.container.querySelector("#peco-dock-sheet")).toBeNull();
       view.unmount();
     } finally {
-      useDockStore.setState({ open: false, conversationByWs: {} });
+      useDockStore.setState({ open: false });
       useUiStore.setState({ railOpen: true });
       restore();
     }
@@ -437,8 +491,8 @@ describe("Peco 抽屉", () => {
     try {
       setViewport(1440);
       useUiStore.setState({ railOpen: true });
-      useDockStore.setState({ open: false, conversationByWs: {} });
-      const view = renderAt("/");
+      useDockStore.setState({ open: false });
+      const view = renderAt("/spaces");
       const panel = await waitFor(() => {
         const node = view.container.querySelector("#peco-dock");
         expect(node).not.toBeNull();
@@ -451,6 +505,8 @@ describe("Peco 抽屉", () => {
 
       await waitFor(() => expect(useDockStore.getState().open).toBe(true));
       expect(trigger).toHaveAttribute("aria-expanded", "true");
+      // 抽屉的会话就是 Peco 空间那一条，不自己另建。
+      await waitFor(() => expect(mocks.ensure).toHaveBeenCalledWith("ws_peco"));
       expect(panel).toHaveClass("translate-x-0");
       expect(panel).not.toHaveAttribute("inert");
       // 几何：抽屉起点 = rail 宽，宽度上限 400（1440 时 92vw 用不上）。
@@ -473,7 +529,7 @@ describe("Peco 抽屉", () => {
       expect(panel).toHaveAttribute("inert");
       view.unmount();
     } finally {
-      useDockStore.setState({ open: false, conversationByWs: {} });
+      useDockStore.setState({ open: false });
       useUiStore.setState({ railOpen: true });
       restore();
     }
@@ -484,8 +540,8 @@ describe("Peco 抽屉", () => {
     try {
       setViewport(1440);
       useUiStore.setState({ railOpen: true });
-      useDockStore.setState({ open: true, conversationByWs: {} });
-      const view = renderAt("/");
+      useDockStore.setState({ open: true });
+      const view = renderAt("/spaces");
       const before = await waitFor(() => {
         const node = view.container
           .querySelector("#peco-dock")
@@ -504,7 +560,7 @@ describe("Peco 抽屉", () => {
       ).toBe(before);
       view.unmount();
     } finally {
-      useDockStore.setState({ open: false, conversationByWs: {} });
+      useDockStore.setState({ open: false });
       useUiStore.setState({ railOpen: true });
       restore();
     }

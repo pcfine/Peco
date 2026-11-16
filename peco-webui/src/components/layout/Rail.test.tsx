@@ -104,7 +104,8 @@ beforeEach(() => {
 
 describe("左栏品牌行", () => {
   it("品牌按钮只 toggle 抽屉，不导航", async () => {
-    renderRail(false, "/peco");
+    // 抽屉只在非 Peco 页存在，开关也只在那里有。
+    renderRail(false, "/spaces/ws_a");
 
     const trigger = await screen.findByRole("button", { name: "Peco 对话" });
     expect(trigger).toHaveAttribute("aria-expanded", "false");
@@ -114,11 +115,28 @@ describe("左栏品牌行", () => {
     expect(useDockStore.getState().open).toBe(true);
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     // 开关不是导航入口：点了还停在原页。
-    expect(screen.getByTestId("path")).toHaveTextContent(/^\/peco$/);
+    expect(screen.getByTestId("path")).toHaveTextContent(/^\/spaces\/ws_a$/);
 
     fireEvent.click(trigger);
     expect(useDockStore.getState().open).toBe(false);
     expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("在 Peco 页品牌行只是标记：没有开关按钮", async () => {
+    renderRail(false, "/peco");
+
+    // 等 Peco 行出现（它依赖身份查询）再断言「没有开关」。
+    await screen.findByRole("button", { name: "Peco" });
+    expect(screen.queryByRole("button", { name: "Peco 对话" })).toBeNull();
+    expect(document.querySelector('[aria-controls="peco-dock"]')).toBeNull();
+  });
+
+  it("Peco 空间页同样没有开关：那一页自己就是会话本体", async () => {
+    renderRail(false, "/spaces/ws_peco");
+
+    await screen.findByRole("button", { name: "Peco" });
+    expect(screen.queryByRole("button", { name: "Peco 对话" })).toBeNull();
+    expect(document.querySelector('[aria-controls="peco-dock"]')).toBeNull();
   });
 });
 

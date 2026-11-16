@@ -27,6 +27,7 @@ import { useDockStore } from "@/stores/dockStore";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useThemeStore } from "@/stores/themeStore";
 import { useUiStore } from "@/stores/uiStore";
+import { isPecoSurface } from "@/lib/pecoSurface";
 import { isToday } from "@/lib/relative";
 import { cn } from "@/lib/utils";
 import type { Space } from "@/types/daemon";
@@ -122,9 +123,12 @@ export function Rail({
     rowNodes[Math.min(Math.max(next, 0), rowNodes.length - 1)]?.focus();
   };
 
+  const onPecoSurface = isPecoSurface(pathname, peco?.ws_id);
+
   // 边框只跟当前路由：在哪个栏目/空间，哪一行才高亮。
-  const routeWsId =
-    pathname === "/peco" ? (peco?.ws_id ?? null) : spaceIdInPath(pathname);
+  const routeWsId = onPecoSurface
+    ? (peco?.ws_id ?? null)
+    : spaceIdInPath(pathname);
   const onSpacesPage = pathname === "/spaces" || pathname === "/spaces/new";
   const onTeamsPage = pathname === "/teams" || pathname.startsWith("/teams/");
   const onResultsPage = pathname === "/results";
@@ -152,23 +156,28 @@ export function Rail({
       )}
     >
       <div className="flex h-11 shrink-0 items-center justify-center border-b border-line">
-        {/* 品牌行是抽屉开关；工作空间名由下方 Peco 行承担。 */}
-        <button
-          type="button"
-          onClick={toggleDock}
-          aria-label="Peco 对话"
-          title="Peco 对话"
-          aria-expanded={dockOpen}
-          aria-controls="peco-dock"
-          className={cn(
-            "grid size-8 place-items-center rounded-lg border transition-colors",
-            dockOpen
-              ? "border-brand/40 bg-brand/10"
-              : "border-transparent hover:bg-line/50",
-          )}
-        >
+        {/* 会话本体的页面没有抽屉，品牌行退回成标记。 */}
+        {onPecoSurface ? (
           <BrandMark size={24} />
-        </button>
+        ) : (
+          // 品牌行是抽屉开关；工作空间名由下方 Peco 行承担。
+          <button
+            type="button"
+            onClick={toggleDock}
+            aria-label="Peco 对话"
+            title="Peco 对话"
+            aria-expanded={dockOpen}
+            aria-controls="peco-dock"
+            className={cn(
+              "grid size-8 place-items-center rounded-lg border transition-colors",
+              dockOpen
+                ? "border-brand/40 bg-brand/10"
+                : "border-transparent hover:bg-line/50",
+            )}
+          >
+            <BrandMark size={24} />
+          </button>
+        )}
       </div>
 
       <div

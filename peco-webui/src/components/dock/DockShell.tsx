@@ -2,21 +2,33 @@
 // 页面开着抽屉仍然可读。开关是左栏那枚品牌按钮（<900 时是顶栏的图标）。
 //
 // 内容只在首次打开后挂载，之后不再卸载：开合频繁，卸载会丢滚动位置与在途那一轮。
+//
+// 路由已经显示 Peco 会话本体时不挂抽屉（`/peco` 与 Peco 空间详情页）：
+// 那一页自己就是这条会话的入口，再开一层只是把同一份历史铺两遍。
 
 import { useEffect, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { X } from "lucide-react";
 import { ConnectionStatus } from "@/components/common/ConnectionStatus";
+import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { DockArtifacts } from "@/components/dock/DockArtifacts";
 import { DockChat } from "@/components/dock/DockChat";
 import { useDockConversation } from "@/hooks/useDockConversation";
 import { useViewportWidth } from "@/hooks/useViewportWidth";
+import { usePeco } from "@/queries/peco";
+import { errorText } from "@/lib/api";
+import { isPecoSurface } from "@/lib/pecoSurface";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDockStore } from "@/stores/dockStore";
+import { useSpaceStreaming } from "@/stores/spaceActivityStore";
 import { railWidth, useUiStore } from "@/stores/uiStore";
 import { DOCK_DRAWER_WIDTH } from "@/components/layout/shellMetrics";
 import { cn } from "@/lib/utils";
 
 export function DockShell() {
+  const { pathname } = useLocation();
+  const { data: peco } = usePeco();
+  const onPecoSurface = isPecoSurface(pathname, peco?.ws_id);
   const viewport = useViewportWidth();
   const railOpen = useUiStore((state) => state.railOpen);
   const open = useDockStore((state) => state.open);
@@ -26,9 +38,11 @@ export function DockShell() {
   // 从没打开过就不该白建一条对话与 SSE。
   const [everOpened, setEverOpened] = useState(open);
   const live = open || everOpened;
-  const { agentId, wsId, convId, error } = useDockConversation(live);
+  const { agentId, wsId, convId, error, retry } = useDockConversation(
+    live && !onPecoSurface,
+  );
+  const chatStreaming = useSpaceStreaming(wsId);
   const eventsState = useConnectionStore((state) => state.events);
-  const chatState = useConnectionStore((state) => state.chat);
   const retryEvents = useConnectionStore((state) => state.retryEvents);
   const panelRef = useRef<HTMLElement>(null);
   const returnFocusTo = useRef<HTMLElement | null>(null);
@@ -36,6 +50,11 @@ export function DockShell() {
   useEffect(() => {
     if (open) setEverOpened(true);
   }, [open]);
+
+  // 带着「开着」的存档进来时收起它：这一页没有抽屉，否则离开时它会在别处冒出来。
+  useEffect(() => {
+    if (onPecoSurface) setOpen(false);
+  }, [onPecoSurface, setOpen]);
 
   // 打开时焦点进面板；关掉时还回触发它的按钮。`inert` 会把焦点挤到 body，
   // 所以 body 也算「焦点还在抽屉里」；用户自己挪到别处的不抢。
@@ -69,12 +88,15 @@ export function DockShell() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [open, setOpen]);
 
+  if (onPecoSurface) return null;
+
   const content = (
     <div className="min-h-0 flex-1 overflow-hidden">
       {error ? (
-        <p className="max-w-narrow p-3 text-sm text-ink-muted">
-          Peco 空间还没打开，无法开始对话。
-        </p>
+        // 失败不是死路：这条查询不在重挂载时重试，只能就地给一枚重试。
+        <div className="p-3">
+          <ErrorBanner message={errorText(error)} onRetry={retry} />
+        </div>
       ) : !convId || !wsId ? (
         <p className="p-3 text-sm text-ink-muted">正在准备对话…</p>
       ) : tab === "chat" ? (
@@ -143,7 +165,10 @@ export function DockShell() {
         {/* 两条流分开标：事件断了不代表正在生成的这一轮断了。 */}
         <span className="ml-auto flex items-center gap-2">
           <ConnectionStatus state={eventsState} label="事件" />
-          <ConnectionStatus state={chatState} label="对话" />
+          <ConnectionStatus
+            state={chatStreaming ? { kind: "running" } : { kind: "idle" }}
+            label="对话"
+          />
         </span>
         {eventsState.kind === "failed" && (
           <button

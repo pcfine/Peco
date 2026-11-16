@@ -31,6 +31,9 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSpaceActivityStore } from "@/stores/spaceActivityStore";
 import type { Message } from "@/types/chat";
 
+/** 页面壳（含隐藏的那些）在这条会话上的身份：同一会话有多个观察者，各记一笔。 */
+const OWNER = "space-shell";
+
 /** 台账历史还原成展示层消息：一轮一条 GET 流不区分 turn，故 turnIndex 恒 0。 */
 function toChatMessages(history: Message[]): ChatMessage[] {
   return history.map((message) => ({
@@ -140,7 +143,9 @@ function SpaceConversationChat({
           onStreamingChange={(streaming) => {
             setChat(streaming ? { kind: "running" } : { kind: "idle" });
             // 连接态只有一份，活动按 wsId 记录；隐藏的壳同样上报，供清除对话的禁用态读取。
-            useSpaceActivityStore.getState().setStreaming(wsId, streaming);
+            useSpaceActivityStore
+              .getState()
+              .setStreaming(wsId, OWNER, streaming);
           }}
           composerNotice={<SpaceConflictHint inflight={inflight} />}
           welcomeMessage={welcomeMessage}
@@ -169,7 +174,8 @@ export function SpaceChatShell({
   // 壳卸载后没人再上报活动位：必须复位，否则清除按钮会一直不可用。
   // （卸载本身不会中断服务端那一轮 —— 见文件头的说明。）
   useEffect(() => {
-    return () => useSpaceActivityStore.getState().setStreaming(wsId, false);
+    return () =>
+      useSpaceActivityStore.getState().setStreaming(wsId, OWNER, false);
   }, [wsId]);
 
   return (

@@ -1,7 +1,7 @@
 // dock 的对话 tab：ChatView internal 模式，一轮一条 GET 流，
 // 端点是 daemon 的 `/api/chat/@master/conversations/{id}/stream`。
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ChatView, type ChatMessage } from "@/components/chat/ChatView";
 import {
@@ -12,7 +12,10 @@ import {
   uploadConversationImage,
 } from "@/api/conversations";
 import { parseServerTimestamp } from "@/lib/format";
-import { useConnectionStore } from "@/stores/connectionStore";
+import { useSpaceActivityStore } from "@/stores/spaceActivityStore";
+
+/** 抽屉在这条会话上的身份：与页面壳各记一笔，互不覆盖。 */
+const OWNER = "dock";
 
 interface DockChatProps {
   agentId: string;
@@ -22,7 +25,14 @@ interface DockChatProps {
 }
 
 export function DockChat({ agentId, convId, wsId }: DockChatProps) {
-  const setChat = useConnectionStore((state) => state.setChat);
+  const setStreaming = useSpaceActivityStore((state) => state.setStreaming);
+  // 切到「产物」tab 会把聊天卸掉，之后没有任何回调会再上报：不复位的话头部
+  // 会一直停在「生成中」。卸载只是断开出入口，服务端那一轮照常跑完并落库。
+  useEffect(
+    () => () =>
+      useSpaceActivityStore.getState().setStreaming(wsId, OWNER, false),
+    [wsId],
+  );
   const historyQuery = useQuery({
     queryKey: ["messages", agentId, convId],
     queryFn: () => getMessages(agentId, convId, { limit: 100, wsId }),
@@ -69,9 +79,7 @@ export function DockChat({ agentId, convId, wsId }: DockChatProps) {
       suggestions={["现在有哪些任务在跑？", "团队的能力边界是什么？"]}
       className="h-full"
       // 一轮一条 fetch 流：没有常驻连接可重连，只有「生成中 / 空闲」两态。
-      onStreamingChange={(streaming) =>
-        setChat(streaming ? { kind: "running" } : { kind: "idle" })
-      }
+      onStreamingChange={(streaming) => setStreaming(wsId, OWNER, streaming)}
     />
   );
 }
