@@ -12,6 +12,7 @@ pub mod space_conversation;
 pub mod space_files;
 pub mod space_memory;
 pub mod space_overview;
+pub mod static_files;
 pub mod tasks;
 pub mod team;
 pub mod upload;
@@ -38,7 +39,7 @@ use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
     let uploads_dir = state.config.peco_home.join("uploads");
-    Router::new()
+    let router = Router::new()
         .route("/api/spaces", get(space::list).post(space::create))
         .route(
             "/api/spaces/{ws_id}",
@@ -131,7 +132,18 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/knowledge", knowledge::router())
         .nest("/api/chat", chat::router())
         .nest("/api/artifacts", artifact::router())
-        .nest_service("/uploads", ServeDir::new(uploads_dir))
+        .nest_service("/uploads", ServeDir::new(uploads_dir));
+
+    // 前端产物是最后一道兜底：`/api` 与 `/uploads` 的未命中仍由各自的 404 语义
+    // 决定，静态层缺席时行为与没有这一层时完全一致。
+    let router = match static_files::service_from_env() {
+        Some(spa) => router.fallback_service(spa),
+        None => router,
+    };
+
+    // 两层跨领域中间件必须罩住 fallback：先挂 fallback 再 `.layer()`，静态响应
+    // 才和 API 响应带同样的 CORS 头，日志里也不会只出现接口请求。
+    router
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
