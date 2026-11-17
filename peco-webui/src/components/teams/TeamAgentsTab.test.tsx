@@ -209,7 +209,7 @@ describe("团队 agents tab 装配", () => {
     ).toBeInTheDocument();
     expect(listAgents).toHaveBeenCalledWith({ teamId: "machine", wsId: null });
     // 有没有空间只影响请求头，不影响渲染：列表与新建入口都照常在。
-    expect(screen.queryByText("这个团队还没有 agent。")).toBeNull();
+    expect(screen.queryByText("这个团队还没有 agent")).toBeNull();
     expect(
       screen.getByRole("button", { name: "＋ 新建 agent" }),
     ).toBeInTheDocument();
@@ -507,9 +507,7 @@ describe("团队 agents tab 装配", () => {
     rows = [];
     renderTab();
 
-    expect(
-      await screen.findByText("这个团队还没有 agent。"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("这个团队还没有 agent")).toBeInTheDocument();
     expect(
       screen.getAllByRole("button", { name: "＋ 新建 agent" }).length,
     ).toBeGreaterThan(0);

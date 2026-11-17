@@ -87,7 +87,7 @@ describe("团队知识库 tab 新建", () => {
     const TEAM = { headers: { "X-Peco-Team": "t1" } };
     renderTab({ teamId: "t1", wsId: null });
 
-    expect(await screen.findByText("这里什么也没有")).toBeInTheDocument();
+    expect(await screen.findByText("这个团队还没有知识库")).toBeInTheDocument();
     expect(get).toHaveBeenCalledWith("/knowledge", TEAM);
 
     fireEvent.click(
@@ -105,7 +105,7 @@ describe("团队知识库 tab 新建", () => {
   it("空态下也有新建入口，创建后卡片随即摆出来", async () => {
     renderTab();
 
-    expect(await screen.findByText("这里什么也没有")).toBeInTheDocument();
+    expect(await screen.findByText("这个团队还没有知识库")).toBeInTheDocument();
 
     fireEvent.click(
       await screen.findByRole("button", { name: "＋ 新建知识库" }),

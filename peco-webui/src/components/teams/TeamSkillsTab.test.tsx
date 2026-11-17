@@ -339,7 +339,7 @@ describe("团队 skills tab 装配", () => {
     expect(
       screen.getByRole("button", { name: "＋ 新建技能" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("这里什么也没有")).toBeInTheDocument();
+    expect(screen.getByText("这个团队还没有 Skill")).toBeInTheDocument();
   });
 
   it("取消删除不发请求", async () => {

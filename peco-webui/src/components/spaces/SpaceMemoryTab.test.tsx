@@ -155,7 +155,7 @@ describe("空间记忆面板", () => {
 
   it("类别过滤把 category 传给后端，按钮的 aria-pressed 跟着走", async () => {
     renderTab();
-    await screen.findByText("本空间还没有记忆。");
+    await screen.findByText("本空间还没有记忆");
 
     fireEvent.click(screen.getByRole("button", { name: "偏好" }));
 
@@ -197,13 +197,13 @@ describe("空间记忆面板", () => {
 
   it("空态写明本空间没有记忆；筛选后换成无匹配并给清除入口", async () => {
     renderTab();
-    expect(await screen.findByText("本空间还没有记忆。")).toBeInTheDocument();
+    expect(await screen.findByText("本空间还没有记忆")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "事项" }));
-    expect(await screen.findByText("没有匹配的记忆。")).toBeInTheDocument();
+    expect(await screen.findByText("没有匹配的记忆")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "清除筛选" }));
-    expect(await screen.findByText("本空间还没有记忆。")).toBeInTheDocument();
+    expect(await screen.findByText("本空间还没有记忆")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "全部" })).toHaveAttribute(
       "aria-pressed",
       "true",
@@ -231,7 +231,7 @@ describe("空间记忆面板", () => {
       await screen.findByRole("button", { name: "打开空间" }),
     ).toBeInTheDocument();
     expect(screen.getByText(/空间还没打开/)).toBeInTheDocument();
-    expect(screen.queryByText("本空间还没有记忆。")).toBeNull();
+    expect(screen.queryByText("本空间还没有记忆")).toBeNull();
     // 没实例就没有记忆可读：一个必然 409 的请求不该发出去。
     expect(mocks.list).not.toHaveBeenCalled();
   });
@@ -245,7 +245,7 @@ describe("空间记忆面板", () => {
     expect(
       await screen.findByRole("button", { name: "打开空间" }),
     ).toBeInTheDocument();
-    expect(screen.queryByText("本空间还没有记忆。")).toBeNull();
+    expect(screen.queryByText("本空间还没有记忆")).toBeNull();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
   });
 
@@ -258,7 +258,7 @@ describe("空间记忆面板", () => {
     ).toBeInTheDocument();
     await settle();
     expect(mocks.list).not.toHaveBeenCalled();
-    expect(screen.queryByText("本空间还没有记忆。")).toBeNull();
+    expect(screen.queryByText("本空间还没有记忆")).toBeNull();
   });
 
   it("翻转成已打开后清单自己接上，说明退场", async () => {

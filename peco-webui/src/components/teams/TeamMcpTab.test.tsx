@@ -323,7 +323,9 @@ describe("团队 MCP tab 装配", () => {
     servers = {};
     renderTab();
 
-    expect(await screen.findByText("这里什么也没有")).toBeInTheDocument();
+    expect(
+      await screen.findByText("这个团队还没有 MCP 服务器"),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/可以直接粘一份/)).toBeNull();
     expect(screen.getByRole("button", { name: "＋ 添加MCP" })).toBeEnabled();
   });

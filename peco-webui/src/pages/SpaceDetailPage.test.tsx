@@ -718,7 +718,7 @@ describe("空间聊天页", () => {
       "data-mode",
       "memory",
     );
-    expect(await screen.findByText("本空间还没有记忆。")).toBeInTheDocument();
+    expect(await screen.findByText("本空间还没有记忆")).toBeInTheDocument();
   });
 
   it("存档说聊天收起时，右栏按独占恢复", async () => {
