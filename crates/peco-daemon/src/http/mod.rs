@@ -147,11 +147,44 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
         .await
 }
 
+/// 监听 SIGINT 与 SIGTERM，任一个都落到同一条优雅退出路径。
+///
+/// `systemctl stop` 发的是 SIGTERM：只等 SIGINT 的话它会被默认处置直接终止，
+/// 在飞轮次断、sqlite 不 close、`daemon.pid` 残留（清理只在 Drop 里做一次）。
+/// 信号注册失败时只留 journal 证据并保持 pending —— 装不上信号处理器不该让
+/// 服务起不来，该让运维在日志里看见。
 async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("shutdown signal received; draining"),
-        Err(e) => tracing::error!(error = %e, "cannot listen for shutdown signal"),
-    }
+    let interrupt = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGINT");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let signal = tokio::select! {
+        _ = interrupt => "int",
+        _ = terminate => "term",
+    };
+    tracing::info!(signal, "shutdown signal received; draining");
 }
 
 /// 错误响应体 `{code, message}` 的唯一形状定义。

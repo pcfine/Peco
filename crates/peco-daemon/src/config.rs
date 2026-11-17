@@ -13,6 +13,20 @@ use crate::error::DaemonError;
 /// `$PECO_HOME/daemon.toml`。
 pub const CONFIG_FILE: &str = "daemon.toml";
 
+/// daemon 数据根在 `$HOME` 下的目录名。
+///
+/// 这是 daemon 数据根的唯一定义：部署脚本按行从这行常量解析目录名，解析到零处
+/// 或两处都直接失败，不在别处再写一份字面量。
+///
+/// `~/.peco` 归 peco-server 所有，daemon 不得复用它 —— 两个进程写同一份
+/// `peco.db` 会把数据搅在一起。改动这里的值之前，先确认部署脚本最后那道
+/// 「`work_dir` 前缀必须等于数据根」的校验点仍然成立。
+///
+/// peco-core 里还有两处 `.peco` 字面量（知识库配置与会话文件持久化的默认路径），
+/// 全仓零调用；不要为了「统一」去改它们 —— core 不该认识 daemon 的目录名，
+/// 改这两处只有耦合，没有运行时收益。
+pub const HOME_DIR_NAME: &str = ".peco-daemon";
+
 /// 与既有服务（9227 / 6969 / 6970 / 9233）错开的默认监听地址。
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:6971";
 
@@ -198,12 +212,66 @@ fn default_home() -> Result<PathBuf, DaemonError> {
     let base = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| DaemonError::Config("HOME is unset and PECO_HOME is not given".into()))?;
-    Ok(base.join(".peco"))
+    Ok(base.join(HOME_DIR_NAME))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PECO_HOME` 是进程级环境变量，改它的测试必须彼此串行，否则结果取决于
+    /// 测试执行顺序。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PecoHomeEnv(Option<std::ffi::OsString>);
+
+    impl PecoHomeEnv {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("PECO_HOME");
+            unsafe { std::env::set_var("PECO_HOME", path) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for PecoHomeEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(raw) => unsafe { std::env::set_var("PECO_HOME", raw) },
+                None => unsafe { std::env::remove_var("PECO_HOME") },
+            }
+        }
+    }
+
+    #[test]
+    fn default_home_uses_the_home_dir_name_constant() {
+        assert_eq!(HOME_DIR_NAME, ".peco-daemon");
+        let home = default_home().unwrap();
+        assert!(
+            home.ends_with(HOME_DIR_NAME),
+            "默认 home 应以常量结尾：{}",
+            home.display()
+        );
+    }
+
+    /// `PECO_HOME` 仍压过 `$HOME/<HOME_DIR_NAME>`：临时实例与隔离实例全靠它。
+    #[test]
+    fn peco_home_env_wins_over_the_default_home() {
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let probe = std::fs::canonicalize(dir.path()).unwrap();
+
+        let config = {
+            let _env = PecoHomeEnv::set(&probe);
+            DaemonConfig::load().unwrap()
+        };
+
+        assert_eq!(config.peco_home, probe);
+        assert!(
+            !config.peco_home.ends_with(HOME_DIR_NAME),
+            "被覆盖时不该再落到默认 home：{}",
+            config.peco_home.display()
+        );
+    }
 
     #[test]
     fn defaults_apply_when_config_file_is_absent() {
