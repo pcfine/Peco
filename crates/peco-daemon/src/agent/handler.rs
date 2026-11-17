@@ -48,6 +48,9 @@ pub struct CreateAgentRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 服务端网页搜索开关（由 provider 执行，区别于 tools 里的本地 web_search）
+    #[serde(default)]
+    pub web_search: Option<bool>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
     #[serde(default)]
@@ -69,6 +72,8 @@ pub struct UpdateAgentRequest {
     pub max_tokens: Option<Option<u32>>,
     pub stream: Option<Option<bool>>,
     pub reasoning_effort: Option<Option<String>>,
+    /// None=不更新、Some(None)=清空、Some(Some(v))=设为 v
+    pub web_search: Option<Option<bool>>,
     pub max_iterations: Option<usize>,
     pub knowledge_bases: Option<Vec<String>>,
 }
@@ -109,9 +114,12 @@ pub struct AgentDetail {
     pub max_tokens: Option<u32>,          // agent.md llm.max_tokens
     pub stream: Option<bool>,             // agent.md llm.stream
     pub reasoning_effort: Option<String>, // agent.md llm.reasoning_effort
+    pub web_search: Option<bool>,         // agent.md llm.web_search
     pub max_iterations: usize,            // agent.md max_iterations
     /// 用户消息图片输入能力（provider 类型 + api 分派，未实例化）
     pub supports_images: bool,
+    /// 服务端网页搜索能力（同上口径）；false 时 web_search 开关不生效
+    pub supports_server_web_search: bool,
     pub created_at: String, // DB
     pub updated_at: String, // DB
 }
@@ -131,6 +139,7 @@ fn agent_detail_from_profile(
     profile: &AgentProfile,
     body: &str,
     supports_images: bool,
+    supports_server_web_search: bool,
 ) -> AgentDetail {
     let llm = profile.llm.as_ref();
     AgentDetail {
@@ -149,8 +158,10 @@ fn agent_detail_from_profile(
         max_tokens: llm.and_then(|l| l.max_tokens),
         stream: llm.and_then(|l| l.stream),
         reasoning_effort: llm.and_then(|l| l.reasoning_effort.clone()),
+        web_search: llm.and_then(|l| l.web_search),
         max_iterations: profile.max_iterations,
         supports_images,
+        supports_server_web_search,
         created_at: db_row.created_at.clone(),
         updated_at: db_row.updated_at.clone(),
     }
@@ -172,7 +183,7 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
         max_tokens: req.max_tokens,
         stream: req.stream,
         reasoning_effort: req.reasoning_effort.clone(),
-        web_search: None,
+        web_search: req.web_search,
         tools: req.tools.clone(),
         mcp_servers: req.mcp_servers.clone(),
         skills: req.skills.clone(),
@@ -225,8 +236,7 @@ fn merge_agent_profile(
             &req.reasoning_effort,
             old_llm.and_then(|l| l.reasoning_effort.clone()),
         ),
-        // 请求体未暴露该字段：编辑时保留旧值，避免静默丢失
-        web_search: old_llm.and_then(|l| l.web_search),
+        web_search: merge_opt(&req.web_search, old_llm.and_then(|l| l.web_search)),
         tools: req
             .tools
             .clone()
@@ -461,6 +471,14 @@ pub async fn create(
             Some(assemble_params.provider.as_str())
         },
     );
+    let supports_server_web_search = peco_core::agent::supports_server_web_search_for(
+        &ws.config(),
+        if assemble_params.provider.is_empty() {
+            None
+        } else {
+            Some(assemble_params.provider.as_str())
+        },
+    );
     let detail = AgentDetail {
         id: agent_id,
         name: name.to_string(),
@@ -485,8 +503,10 @@ pub async fn create(
         max_tokens: assemble_params.max_tokens,
         stream: assemble_params.stream,
         reasoning_effort: assemble_params.reasoning_effort,
+        web_search: assemble_params.web_search,
         max_iterations: assemble_params.max_iterations,
         supports_images,
+        supports_server_web_search,
         created_at: db_row.created_at,
         updated_at: db_row.updated_at,
     };
@@ -529,7 +549,18 @@ pub async fn get(
         &ws.config(),
         profile.llm.as_ref().and_then(|l| l.provider.as_deref()),
     );
-    let detail = agent_detail_from_profile(&agent_id, &db_row, &profile, &body, supports_images);
+    let supports_server_web_search = peco_core::agent::supports_server_web_search_for(
+        &ws.config(),
+        profile.llm.as_ref().and_then(|l| l.provider.as_deref()),
+    );
+    let detail = agent_detail_from_profile(
+        &agent_id,
+        &db_row,
+        &profile,
+        &body,
+        supports_images,
+        supports_server_web_search,
+    );
     info!(team = %team_id, agent_id = %agent_id, name = %db_row.name, "Agent fetched");
     Ok(Json(detail))
 }
@@ -641,6 +672,14 @@ pub async fn update(
             Some(merged.provider.as_str())
         },
     );
+    let supports_server_web_search = peco_core::agent::supports_server_web_search_for(
+        &ws.config(),
+        if merged.provider.is_empty() {
+            None
+        } else {
+            Some(merged.provider.as_str())
+        },
+    );
     let detail = AgentDetail {
         id: agent_id,
         name: merged.name,
@@ -665,8 +704,10 @@ pub async fn update(
         max_tokens: merged.max_tokens,
         stream: merged.stream,
         reasoning_effort: merged.reasoning_effort,
+        web_search: merged.web_search,
         max_iterations: merged.max_iterations,
         supports_images,
+        supports_server_web_search,
         created_at: updated_row.created_at,
         updated_at: updated_row.updated_at,
     };
@@ -758,9 +799,140 @@ body
             max_tokens: None,
             stream: None,
             reasoning_effort: None,
+            web_search: None,
             max_iterations: None,
             knowledge_bases: None,
         }
+    }
+
+    /// 带 `web_search: true` 的 agent.md（手写 true 是「开关打开但不一定生效」的源头）。
+    const WEB_SEARCH_ON_MD: &str = r#"---
+agent:
+  name: "searcher"
+  description: "d"
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  web_search: true
+---
+
+body
+"#;
+    const WEB_SEARCH_OFF_MD: &str = r#"---
+agent:
+  name: "searcher"
+  description: "d"
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  web_search: false
+---
+
+body
+"#;
+
+    /// 合并结果 → 写盘 → 重新解析，和真实保存路径一致：只断言 `merged` 会漏掉
+    /// 「assemble 没写出该字段」这类缺陷。
+    fn reparse(merged: &AssembleAgentMdParams) -> AgentProfile {
+        let md = agent_config::assemble_agent_md(merged);
+        agent_config::parse_agent_md(&md).unwrap().0
+    }
+
+    /// 不传 `web_search` → 旧值保留（编辑不要静默关掉已开的能力）。
+    #[test]
+    fn update_keeps_web_search_when_field_omitted() {
+        let (old_profile, old_body) = agent_config::parse_agent_md(WEB_SEARCH_ON_MD).unwrap();
+        let req = empty_update_request();
+
+        let merged = merge_agent_profile(&old_profile, &old_body, &req);
+        assert_eq!(merged.web_search, Some(true));
+        assert_eq!(reparse(&merged).llm.unwrap().web_search, Some(true));
+    }
+
+    /// `merge_opt` 的 `Some(None)` 分支 → 该字段被清空。
+    ///
+    /// HTTP 层走不到这个分支：serde 对 `Option<Option<bool>>` 无法区分「缺字段」与
+    /// `null`，两者都落到 `None`＝不更新。真正关掉开关的是 UI 显式发的 `false`。
+    #[test]
+    fn merge_opt_clears_web_search_on_some_none() {
+        let (old_profile, old_body) = agent_config::parse_agent_md(WEB_SEARCH_ON_MD).unwrap();
+        let mut req = empty_update_request();
+        req.web_search = Some(None);
+
+        let merged = merge_agent_profile(&old_profile, &old_body, &req);
+        assert_eq!(merged.web_search, None);
+        assert_eq!(reparse(&merged).llm.unwrap().web_search, None);
+    }
+
+    /// 传 `true` → 写入（旧文件没有该字段时也要能打开）。
+    #[test]
+    fn update_writes_web_search_on_true() {
+        let (old_profile, old_body) = agent_config::parse_agent_md(WEB_SEARCH_OFF_MD).unwrap();
+        let mut req = empty_update_request();
+        req.web_search = Some(Some(true));
+
+        let merged = merge_agent_profile(&old_profile, &old_body, &req);
+        assert_eq!(merged.web_search, Some(true));
+        assert_eq!(reparse(&merged).llm.unwrap().web_search, Some(true));
+
+        // 反向：显式 false 覆盖旧 true，不能被 merge_opt 当成「未指定」
+        let (on_profile, on_body) = agent_config::parse_agent_md(WEB_SEARCH_ON_MD).unwrap();
+        let mut req = empty_update_request();
+        req.web_search = Some(Some(false));
+        let merged = merge_agent_profile(&on_profile, &on_body, &req);
+        assert_eq!(merged.web_search, Some(false));
+        assert_eq!(reparse(&merged).llm.unwrap().web_search, Some(false));
+    }
+
+    /// 创建请求里的 `web_search` 必须落到 assemble 参数上，否则新 agent 的开关存不下。
+    #[test]
+    fn create_request_passes_web_search_through() {
+        let req = CreateAgentRequest {
+            name: "searcher".into(),
+            description: String::new(),
+            system_prompt: String::new(),
+            model: None,
+            provider: None,
+            tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            reasoning_effort: None,
+            web_search: Some(true),
+            max_iterations: None,
+            knowledge_bases: None,
+        };
+
+        let params = assemble_params_from_request(&req);
+        assert_eq!(params.web_search, Some(true));
+        assert_eq!(reparse(&params).llm.unwrap().web_search, Some(true));
+    }
+
+    /// 详情响应两个字段都要照 agent.md 原样回给前端：开关值 + 该 provider 能不能用。
+    #[test]
+    fn detail_reports_web_search_and_support() {
+        let row = AgentRow {
+            id: "a1".into(),
+            user_id: LOCAL_USER_ID.to_string(),
+            team_id: "t1".into(),
+            name: "searcher".into(),
+            description: "d".into(),
+            status: "idle".into(),
+            created_at: "created".into(),
+            updated_at: "updated".into(),
+        };
+        let (profile, body) = agent_config::parse_agent_md(WEB_SEARCH_ON_MD).unwrap();
+
+        let supported = agent_detail_from_profile("a1", &row, &profile, &body, true, true);
+        assert_eq!(supported.web_search, Some(true));
+        assert!(supported.supports_server_web_search);
+        assert!(supported.supports_images);
+
+        let unsupported = agent_detail_from_profile("a1", &row, &profile, &body, true, false);
+        assert_eq!(unsupported.web_search, Some(true));
+        assert!(!unsupported.supports_server_web_search);
     }
 
     /// 回归（本缺陷根因）：UI 保存（PATCH）必须保留 `template_version`，否则下次重启被模板覆盖。
