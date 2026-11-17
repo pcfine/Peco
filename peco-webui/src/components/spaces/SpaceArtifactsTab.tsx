@@ -110,7 +110,7 @@ export function SpaceArtifactsTab({
   if (artifacts.length === 0) {
     return (
       <div className="p-3">
-        <EmptyState title="任务完成后，产物会出现在这里。" />
+        <EmptyState title="任务完成后，产物会出现在这里" />
       </div>
     );
   }

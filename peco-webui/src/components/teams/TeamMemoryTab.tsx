@@ -6,7 +6,7 @@ import { EmptyState } from "@/components/common/EmptyState";
 export function TeamMemoryTab() {
   return (
     <div className="p-3">
-      <EmptyState title="记忆接口尚未接入。团队的记忆内容与召回记录都要等 daemon 提供读写接口后才能在这里展示。" />
+      <EmptyState title="记忆接口尚未接入，团队的记忆内容与召回记录都要等 daemon 提供读写接口后才能在这里展示" />
     </div>
   );
 }

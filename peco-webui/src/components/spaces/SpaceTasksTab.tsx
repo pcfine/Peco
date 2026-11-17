@@ -63,7 +63,7 @@ export function SpaceTasksTab({
   if (tasks.length === 0) {
     return (
       <div className="p-3">
-        <EmptyState title="这个空间还没有任务。Peco 派发到这里后会出现在台账里。" />
+        <EmptyState title="这个空间还没有任务，Peco 派发到这里后会出现在台账里" />
       </div>
     );
   }

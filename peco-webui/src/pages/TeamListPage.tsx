@@ -6,7 +6,6 @@ import { Camera, Loader2, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { PixelIdenticon } from "@/components/common/PixelIdenticon";
 import { PageFrame } from "@/components/layout/PageFrame";
@@ -204,18 +203,6 @@ export function TeamListPage() {
               <Skeleton key={card} className="h-[115px] w-full rounded-xl" />
             ))}
           </div>
-        )}
-
-        {teams && teams.length === 0 && (
-          <EmptyState
-            title="还没有可管理的团队。"
-            action={
-              <Button size="sm" onClick={() => setNewOpen(true)}>
-                <Plus className="size-4" />
-                新建团队
-              </Button>
-            }
-          />
         )}
 
         <ul className={GRID}>

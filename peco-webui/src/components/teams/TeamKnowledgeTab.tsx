@@ -67,7 +67,7 @@ export function TeamKnowledgeTab({
   const emptyText =
     detail.knowledge_bases.length > 0
       ? `这个团队还没有知识库（团队目录里有 ${detail.knowledge_bases.map((kb) => kb.name).join("、")}，索引还没同步）`
-      : "这里什么也没有";
+      : "这个团队还没有知识库";
 
   return (
     <div className="p-3">

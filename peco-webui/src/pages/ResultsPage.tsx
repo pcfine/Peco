@@ -120,10 +120,10 @@ export function ResultsPage() {
         )}
 
         {tasks.data && tasks.data.length === 0 && (
-          <EmptyState title="台账里没有记录。派发过的任务会在完成后写入。" />
+          <EmptyState title="台账里没有记录，派发过的任务会在完成后写入" />
         )}
         {tasks.data && tasks.data.length > 0 && rows.length === 0 && (
-          <EmptyState title="没有符合当前筛选的记录。" />
+          <EmptyState title="没有符合当前筛选的记录" />
         )}
 
         {rows.length > 0 && (

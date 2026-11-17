@@ -189,7 +189,7 @@ export function TeamMcpTab({ scope }: { scope: ResourceScope }) {
         </span>
       </div>
       {servers.length === 0 ? (
-        <EmptyState title="这里什么也没有" />
+        <EmptyState title="这个团队还没有 MCP 服务器" />
       ) : (
         <CardGrid>
           {servers.map(([name, value]) => (

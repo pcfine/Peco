@@ -192,7 +192,7 @@ export function SpaceFilesTab({
           )}
           {dirData && dirData.entries.length === 0 && (
             <div className="p-3">
-              <EmptyState title="这个目录是空的。" />
+              <EmptyState title="这个目录是空的" />
             </div>
           )}
           <ul>
@@ -258,7 +258,7 @@ export function SpaceFilesTab({
       >
         {openPath === null ? (
           <div className="p-3">
-            <EmptyState title="选一个文件查看内容。" />
+            <EmptyState title="还没有选中文件，选一个查看内容" />
           </div>
         ) : (
           <>

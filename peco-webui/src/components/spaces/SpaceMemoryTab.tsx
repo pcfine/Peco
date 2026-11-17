@@ -206,7 +206,7 @@ export function SpaceMemoryTab({
         {readable && list.data && items.length === 0 && (
           <div className="p-3">
             <EmptyState
-              title={filtered ? "没有匹配的记忆。" : "本空间还没有记忆。"}
+              title={filtered ? "没有匹配的记忆" : "本空间还没有记忆"}
               action={
                 filtered ? (
                   <Button variant="ghost" size="xs" onClick={clearFilters}>
@@ -328,7 +328,7 @@ function SpaceClosedNotice({ space }: { space: Space }) {
   return (
     <div className="p-3">
       <EmptyState
-        title="空间还没打开。记忆只在空间运行时才读得到。"
+        title="空间还没打开，记忆只在空间运行时才读得到"
         action={<OpenSpaceButton space={space} />}
       />
     </div>

@@ -170,7 +170,7 @@ export function SpaceSessionsTab({
         {!active ? (
           <div className="p-3">
             <EmptyState
-              title="这个空间还没有会话。"
+              title="这个空间还没有会话"
               action={
                 <Button
                   size="sm"

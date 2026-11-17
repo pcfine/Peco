@@ -113,7 +113,7 @@ export function SettingsPage() {
           {teams.isPending && <Skeleton className="h-8 w-56" />}
 
           {teams.data && rows.length === 0 && (
-            <EmptyState title="还没有团队，provider 配置没有落点。" />
+            <EmptyState title="还没有团队，provider 配置没有落点" />
           )}
 
           {active && (

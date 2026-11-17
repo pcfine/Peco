@@ -21,7 +21,7 @@ export function PanelTeams() {
     >
       {teams && teams.length === 0 ? (
         <EmptyState
-          title="只有一个 Peco 内置团队。"
+          title="只有一个 Peco 内置团队"
           action={
             <Button asChild variant="ghost" size="sm">
               <Link to="/teams">查看团队</Link>

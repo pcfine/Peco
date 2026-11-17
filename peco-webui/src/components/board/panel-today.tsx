@@ -136,7 +136,7 @@ export function PanelToday({ pecoWsId }: { pecoWsId: string | null }) {
     >
       {total === 0 ? (
         <EmptyState
-          title="今日没有任务。Peco 派发的任务会出现在这里。"
+          title="今日没有任务，Peco 派发的任务会出现在这里"
           action={
             <button
               type="button"

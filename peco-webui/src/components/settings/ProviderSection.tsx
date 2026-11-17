@@ -448,7 +448,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
       )}
 
       {!loading && !loadError && providers.length === 0 && (
-        <EmptyState title="这个团队还没有配置 provider，对话会走系统层默认值。" />
+        <EmptyState title="这个团队还没有配置 provider，对话会走系统层默认值" />
       )}
 
       <ul>

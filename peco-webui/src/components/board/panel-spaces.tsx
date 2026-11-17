@@ -46,7 +46,7 @@ export function PanelSpaces() {
     >
       {spaces && spaces.length === 0 ? (
         <EmptyState
-          title="还没有工作空间。空间 = 一个目录 + 一个团队。"
+          title="还没有工作空间，空间 = 一个目录 + 一个团队"
           action={
             <Button asChild size="sm">
               <Link to="/spaces">新建空间</Link>

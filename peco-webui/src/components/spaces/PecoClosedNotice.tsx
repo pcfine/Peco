@@ -18,7 +18,7 @@ export function PecoClosedNotice({ space }: { space: Space }) {
   return (
     <div className="p-3">
       <EmptyState
-        title="Peco 空间还没打开。打开后才能和 Peco 对话、读写它的能力根。"
+        title="Peco 空间还没打开，打开后才能和 Peco 对话、读写它的能力根"
         action={
           <Button size="sm" className="h-7" disabled={opening} onClick={open}>
             打开 Peco 空间

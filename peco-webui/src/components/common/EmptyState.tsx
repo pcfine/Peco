@@ -1,10 +1,9 @@
-// 空态统一形：一句事实 + 一个动作。左对齐、不居中，也不给插画位。
+// 空态统一形：一句事实 + 一个可选动作。文案不带句末句号。左对齐、不居中，也不给插画位。
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 interface EmptyStateProps {
-  /** 事实本身，例如「还没有工作空间。」 */
   title: string;
   action?: ReactNode;
   className?: string;

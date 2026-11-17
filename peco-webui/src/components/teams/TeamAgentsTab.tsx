@@ -307,7 +307,7 @@ export function TeamAgentsTab({
       )}
       {rows.length === 0 ? (
         <EmptyState
-          title="这个团队还没有 agent。"
+          title="这个团队还没有 agent"
           action={
             <Button size="sm" onClick={() => setCreating(true)}>
               ＋ 新建 agent

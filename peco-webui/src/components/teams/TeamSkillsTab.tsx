@@ -249,7 +249,7 @@ export function TeamSkillsTab({ scope }: { scope: ResourceScope }) {
         </span>
       </div>
       {rows.length === 0 ? (
-        <EmptyState title="这里什么也没有" />
+        <EmptyState title="这个团队还没有 Skill" />
       ) : (
         <CardGrid>
           {rows.map((skill) => (

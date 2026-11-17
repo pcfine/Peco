@@ -2,7 +2,6 @@
 // 组头 sticky 但不做表头 —— 列义明显，4 行表头会吃掉密度。
 
 import { Link } from "react-router-dom";
-import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import {
   SPACE_GROUP_LABELS,
@@ -124,17 +123,6 @@ export function SpaceListPage() {
               <Skeleton key={row} className="h-10 w-full" />
             ))}
           </div>
-        )}
-
-        {spaces && spaces.length === 0 && (
-          <EmptyState
-            title="还没有工作空间。空间 = 一个目录 + 一个团队。"
-            action={
-              <Button asChild size="sm">
-                <Link to="/spaces/new">新建空间</Link>
-              </Button>
-            }
-          />
         )}
 
         {groups.map(({ group, rows }) =>
