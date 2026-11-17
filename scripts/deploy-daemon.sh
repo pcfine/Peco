@@ -26,6 +26,11 @@
 #   PECO_DAEMON_ALLOW_PUBLIC 1 = 允许非 loopback 监听（默认拒绝，需要时自己承担风险）
 #   PECO_DAEMON_CONFIRM_PURGE 1 = 允许 uninstall --purge-data
 #
+# 调用者的代理环境（HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY，大小写两种）
+# 会像 PATH 一样被照抄进 unit：systemd --user 的环境是干净的，而本机出网往往要
+# 走登录 shell 里才有的本地代理；缺了它 daemon 只会得到
+# 「error sending request for url (.../v1/messages)」——没有状态码，也没有原因。
+#
 # install 重跑时以已装 unit 里的 Environment 行为基线：当前 shell 没显式给对应
 # 变量就沿用基线值；数据根真的变了必须显式 --allow-home-change，否则拒绝。
 # ============================================================================
@@ -277,6 +282,7 @@ resolve_paths() {
   fi
 
   PATH_SNAPSHOT="$(snapshot_path)"
+  PROXY_ENV_SNAPSHOT="$(snapshot_proxy_env)"
 }
 
 # unit 里某个 Environment= 的值。systemd 语义是后写的覆盖先写的，故取最后一行。
@@ -302,6 +308,7 @@ print_vars() {
   printf '  Logs:          %s\n' "${LOG_DIR:-journal}"
   printf '  Log level:     %s\n' "${LOG_LEVEL:-<binary default>}"
   printf '  PATH items:    %s\n' "$(tr ':' '\n' <<<"$PATH_SNAPSHOT" | wc -l)"
+  printf '  Proxy vars:    %s\n' "$(grep -c '^Environment=' <<<"${PROXY_ENV_SNAPSHOT:-}" || true)"
   printf '  Skip build:    %s\n' "$SKIP_BUILD"
 }
 
@@ -326,6 +333,37 @@ snapshot_path() {
   unset IFS
   [[ -n "$out" ]] || die "PATH is empty"
   printf '%s' "$out"
+}
+
+# ── 代理环境快照 ───────────────────────────────────────────────────────────
+# 与 PATH 同一性质：值只在调用者的 shell 里，systemd --user 的 unit 环境没有。
+# 用白名单而不是整个 env —— `Environment=` 会把值原样落进 unit 文件，
+# 无关的凭据与路径不该被顺手复制进去。
+PROXY_ENV_KEYS=(
+  HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+  http_proxy https_proxy all_proxy no_proxy
+)
+
+# 每行一条 `Environment="KEY=VALUE"`。调用者没给该变量时沿用已装 unit 的基线，
+# 与 PATH 一致：重跑 install 不带代理变量，不该把已装好的代理抹掉。
+snapshot_proxy_env() {
+  local key value out=""
+  for key in "${PROXY_ENV_KEYS[@]}"; do
+    value="$(printenv "$key" 2>/dev/null || true)"
+    [[ -n "$value" ]] || value="$(unit_env_value "$key")"
+    [[ -n "$value" ]] || continue
+    case "$value" in
+      *'"'*|*'\\'*|*$'\n'*) die "$key would break the unit file syntax: $value" ;;
+    esac
+    out+="Environment=\"$key=$value\""$'\n'
+  done
+  printf '%s' "$out"
+}
+
+# unit 里现有的代理行（原样、按出现顺序），用于 refresh-env 的「无变化」判定。
+proxy_lines_of_unit() {
+  grep -E '^Environment="(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy)=' \
+    "$UNIT" 2>/dev/null || true
 }
 
 # ── 端口 ──────────────────────────────────────────────────────────────────
@@ -461,6 +499,10 @@ render_unit() {
   printf 'TimeoutStopSec=30\n'
   printf 'KillSignal=SIGTERM\n'
   printf 'Environment="PATH=%s"\n' "$PATH_SNAPSHOT"
+  # 命令替换会剥掉末尾换行，末行必须自己补一个，否则会和下一条 Environment 粘连。
+  if [[ -n "$PROXY_ENV_SNAPSHOT" ]]; then
+    printf '%s\n' "$PROXY_ENV_SNAPSHOT"
+  fi
   if [[ "$WEBUI_DIST_DISABLED" != "1" ]]; then
     printf 'Environment="PECO_WEBUI_DIST=%s"\n' "$WEBUI_DIST"
   fi
@@ -835,14 +877,16 @@ cmd_refresh_env() {
   resolve_paths 0 1
   [[ -f "$UNIT" ]] || die "unit not installed: $UNIT (run install first)"
 
-  local lines current escaped
+  local lines current current_proxy
   lines="$(grep -c '^Environment="PATH=' "$UNIT" || true)"
   if [[ "$lines" != "1" ]]; then
     die "expected exactly one Environment=\"PATH=\" line in $UNIT, found ${lines:-0} (rerun install)"
   fi
   current="$(sed -nE 's/^Environment="PATH=(.*)"$/\1/p' "$UNIT")"
-  if [[ "$current" == "$PATH_SNAPSHOT" ]]; then
-    log_info "no change: PATH snapshot already in $UNIT"
+  # 代理行与 PATH 同源（都来自调用者环境，不是 install 的配置决定），一并重取。
+  current_proxy="$(proxy_lines_of_unit)"
+  if [[ "$current" == "$PATH_SNAPSHOT" && "$current_proxy" == "${PROXY_ENV_SNAPSHOT%$'\n'}" ]]; then
+    log_info "no change: PATH and proxy snapshot already in $UNIT"
     exit 0
   fi
 
@@ -850,11 +894,24 @@ cmd_refresh_env() {
   cp "$UNIT" "$backup"
   log_info "previous unit backed up: $backup"
 
-  escaped="$(printf '%s' "$PATH_SNAPSHOT" | sed -e 's/[\\&|]/\\&/g')"
-  sed -E "s|^Environment=\"PATH=.*\"\$|Environment=\"PATH=${escaped}\"|" "$UNIT" >"$UNIT.new"
+  # 用 awk 而不是 sed 替换：插入多行块时 sed 要么转义地狱，要么依赖 `r` 的文件名。
+  # 值都经 ENVIRON 传入，`-v` 会把反斜杠当转义序列处理。
+  NEW_PATH="$PATH_SNAPSHOT" NEW_PROXY="$PROXY_ENV_SNAPSHOT" awk '
+    BEGIN {
+      path = ENVIRON["NEW_PATH"]
+      proxy = ENVIRON["NEW_PROXY"]
+    }
+    /^Environment="(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy)=/ { next }
+    /^Environment="PATH=/ {
+      print "Environment=\"PATH=" path "\""
+      if (proxy != "") printf "%s\n", proxy
+      next
+    }
+    { print }
+  ' "$UNIT" >"$UNIT.new"
   install -m 0644 "$UNIT.new" "$UNIT"
   rm -f "$UNIT.new"
-  log_info "PATH line refreshed in $UNIT"
+  log_info "PATH and proxy lines refreshed in $UNIT"
 
   systemctl --user daemon-reload
   systemctl --user restart "$SERVICE"

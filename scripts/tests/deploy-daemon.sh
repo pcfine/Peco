@@ -512,10 +512,55 @@ write_ss() {
 }
 
 # ── 运行 ──────────────────────────────────────────────────────────────────
+
+# B7：代理环境与 PATH 同源：install 照抄、refresh-env 刷新、缺值时保留基线。
+#
+# 这条用例钉的是真故障：本机出网要走登录 shell 里的本地代理，systemd --user 的
+# 环境是干净的，unit 少了这几行，daemon 的模型请求只会得到
+# 「error sending request for url (.../v1/messages)」——既没有状态码也没有原因。
+proxy_env_is_propagated_and_refreshable() {
+  local dist="$SANDBOX/dist"
+  dist_fixture "$dist"
+  local out rc unit_text
+
+  out="$(run_script PECO_WEBUI_DIST="$dist" \
+    HTTPS_PROXY=http://127.0.0.1:7890 NO_PROXY="localhost,127.0.0.1" -- install 2>&1)"
+  rc=$?
+  check_eq 0 "$rc" "带代理变量的 install 应成功：$out"
+  unit_text="$(cat "$UNIT")"
+  check_contains 'Environment="HTTPS_PROXY=http://127.0.0.1:7890"' "$unit_text" \
+    "install 应把 HTTPS_PROXY 写进 unit"
+  check_contains 'Environment="NO_PROXY=localhost,127.0.0.1"' "$unit_text" \
+    "install 应把 NO_PROXY 写进 unit"
+
+  # 只改一个变量：它必须被刷新，而没给的 NO_PROXY 必须保留基线（不是被抹掉）。
+  out="$(run_script HTTPS_PROXY=http://127.0.0.1:7891 -- refresh-env 2>&1)"
+  rc=$?
+  check_eq 0 "$rc" "refresh-env 应成功：$out"
+  unit_text="$(cat "$UNIT")"
+  check_contains 'Environment="HTTPS_PROXY=http://127.0.0.1:7891"' "$unit_text" \
+    "refresh-env 应换掉 HTTPS_PROXY 的值"
+  check_not_contains "7890" "$unit_text" "旧代理值不得残留"
+  check_contains 'Environment="NO_PROXY=localhost,127.0.0.1"' "$unit_text" \
+    "调用者没给 NO_PROXY 时应沿用已装 unit 的基线"
+  check_eq "1" "$(grep -c '^Environment="HTTPS_PROXY=' <<<"$unit_text")" \
+    "HTTPS_PROXY 只能有一行（重复行会在 systemd 里叠成两份环境）"
+
+  # 裸跑 refresh-env（干净环境、没有任何代理变量）：基线仍在，不该被清空。
+  out="$(run_script PATH="$SHIM_DIR:/usr/bin:/bin:/opt/probe/bin" -- refresh-env 2>&1)"
+  rc=$?
+  check_eq 0 "$rc" "裸跑 refresh-env 应成功：$out"
+  unit_text="$(cat "$UNIT")"
+  check_contains 'Environment="HTTPS_PROXY=http://127.0.0.1:7891"' "$unit_text" \
+    "没有代理变量时不得抹掉已装好的代理"
+  check_contains "/opt/probe/bin" "$unit_text" "PATH 仍应被刷新"
+}
+
 ALL_TESTS=(
   purge_data_refuses_dangerous_paths
   purge_data_interlocks_with_a_live_daemon
   refresh_env_replaces_only_the_path_line
+  proxy_env_is_propagated_and_refreshable
   install_keeps_the_installed_data_root
   fresh_clone_install_bootstraps_the_dist
   bind_addr_occupancy_and_public_guard
