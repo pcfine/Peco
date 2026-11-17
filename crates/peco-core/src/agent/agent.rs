@@ -122,7 +122,7 @@ impl Agent {
         mcp_manager: Arc<McpManager>,
         skill_registry: Option<Arc<SkillRegister>>,
     ) -> Self {
-        Agent {
+        let agent = Agent {
             md_path,
             profile,
             preamble,
@@ -131,7 +131,9 @@ impl Agent {
             tool_executor,
             mcp_manager,
             skill_registry,
-        }
+        };
+        agent.warn_if_server_web_search_inactive();
+        agent
     }
 
     /// 从 `agent.md` 文件创建 Agent（新签名：显式依赖注入，同步）。
@@ -227,7 +229,7 @@ impl Agent {
             "MCP manager created (connections lazy)"
         );
 
-        Ok(Agent {
+        let agent = Agent {
             md_path: path.to_path_buf(),
             profile,
             preamble,
@@ -236,7 +238,26 @@ impl Agent {
             tool_executor,
             mcp_manager,
             skill_registry,
-        })
+        };
+        agent.warn_if_server_web_search_inactive();
+        Ok(agent)
+    }
+
+    /// 服务端网页搜索开关开着、但当前适配器不实现它时提示一次。
+    ///
+    /// 注入点（[`Self::build_generate_request`]）对不满足条件的组合静默跳过，
+    /// agent.md 写了 `web_search: true` 却没有搜索行为时，这条日志是唯一线索。
+    /// 判定放在构造期而非请求期：一次组装一条，不随每轮模型调用刷屏。
+    fn warn_if_server_web_search_inactive(&self) {
+        if self.model_config.web_search == Some(true) && !self.model.supports_server_web_search() {
+            tracing::warn!(
+                agent = %self.profile.agent.name,
+                provider = %self.model.name(),
+                model = ?self.model_config.model_name,
+                "web_search is enabled in agent.md but this provider has no server-side web search; \
+                 the switch takes no effect"
+            );
+        }
     }
 
     /// 返回内部 [`ModelProvider`] 的引用。
@@ -516,6 +537,25 @@ pub fn supports_image_input_for(user_config: &UserConfig, provider_name: Option<
     }
 }
 
+/// 解析 provider（未实例化）的服务端网页搜索能力。
+///
+/// 与 [`build_provider_with_user`] 的适配器分派同源：只有 deepseek 的
+/// anthropic 兼容适配器实现了服务端 `web_search`，其余适配器拿不到这个工具，
+/// 开关开了也不生效。
+pub fn supports_server_web_search_for(
+    user_config: &UserConfig,
+    provider_name: Option<&str>,
+) -> bool {
+    let provider_name = provider_name.unwrap_or_else(|| user_config.default_provider_name());
+    match user_config.provider_entry(Some(provider_name)) {
+        Some(entry) => {
+            entry.provider_type == "deepseek"
+                && api_mode_of(entry).is_some_and(|a| a.eq_ignore_ascii_case("anthropic"))
+        }
+        None => false,
+    }
+}
+
 /// 从 ModelConfig 构建 ModelProvider（使用 UserConfig 替代 GlobalHandler）。
 pub fn build_provider_with_user(
     model_config: &ModelConfig,
@@ -662,7 +702,9 @@ mod tests {
     use super::*;
     use crate::config::{McpConfig, ProviderEntry, ProvidersConfig};
     use crate::session::{AnnotatedMessage, MessageId, MessageSource};
-    use model_provider::{Content, ContentPart, InputItem, Role};
+    use model_provider::{
+        Content, ContentPart, FinishReason, InputItem, ProviderError, ResponseStatus, Role,
+    };
     use std::collections::HashMap;
 
     /// 只处理文本的过滤器：纯文本消息被替换为占位符（模拟脱敏逻辑），
@@ -841,6 +883,238 @@ mod tests {
     fn test_supports_image_input_falls_back_to_default_provider() {
         let config = user_config("qwen", entry_of("qwen", Some("chat")));
         assert!(supports_image_input_for(&config, None));
+    }
+
+    // ── 服务端网页搜索能力判定 ────────────────────────────────────────────
+
+    #[test]
+    fn test_supports_server_web_search_deepseek_anthropic_only() {
+        // 只有 deepseek 的 anthropic 适配器实现服务端 web_search；api 值大小写不敏感。
+        for api in [Some("anthropic"), Some("Anthropic"), Some("ANTHROPIC")] {
+            let config = user_config("deepseek", entry_of("deepseek", api));
+            assert!(
+                supports_server_web_search_for(&config, Some("deepseek")),
+                "deepseek api={api:?} 应支持服务端网页搜索"
+            );
+        }
+        // responses / chat / 缺省分支不是 anthropic 适配器
+        for api in [None, Some("responses"), Some("chat")] {
+            let config = user_config("deepseek", entry_of("deepseek", api));
+            assert!(
+                !supports_server_web_search_for(&config, Some("deepseek")),
+                "deepseek api={api:?} 不应支持服务端网页搜索"
+            );
+        }
+    }
+
+    #[test]
+    fn test_supports_server_web_search_other_and_unknown_provider() {
+        let openai = user_config("openai", entry_of("openai", Some("chat")));
+        assert!(!supports_server_web_search_for(&openai, Some("openai")));
+
+        let qwen = user_config("qwen", entry_of("qwen", Some("chat")));
+        assert!(!supports_server_web_search_for(&qwen, Some("qwen")));
+
+        // provider 名在配置中不存在 → 不支持
+        assert!(!supports_server_web_search_for(&qwen, Some("nope")));
+
+        // 未指定 provider 名时回落到默认 provider
+        let deepseek = user_config("deepseek", entry_of("deepseek", Some("anthropic")));
+        assert!(supports_server_web_search_for(&deepseek, None));
+    }
+
+    /// UI 的预判与 dispatch 真正构造出的适配器能力必须同源一致。
+    ///
+    /// 只断言 [`supports_server_web_search_for`] 自身会漏掉「新增适配器支持服务端
+    /// 搜索、却忘了改预判」：UI 显示「不支持」，而开关其实生效。
+    #[test]
+    fn test_supports_server_web_search_matches_built_adapter() {
+        let cases: [(&str, Option<&str>); 5] = [
+            ("deepseek", Some("anthropic")),
+            ("deepseek", None),
+            ("deepseek", Some("chat")),
+            ("deepseek", Some("responses")),
+            ("openai", None),
+        ];
+
+        for (provider_type, api) in cases {
+            let config = user_config(provider_type, entry_of(provider_type, api));
+            let built = build_provider_with_user(&model_config(provider_type), &config)
+                .unwrap_or_else(|e| panic!("{provider_type} api={api:?} 应能构造适配器: {e}"));
+            assert_eq!(
+                supports_server_web_search_for(&config, Some(provider_type)),
+                built.supports_server_web_search(),
+                "{provider_type} api={api:?}：预判与适配器实际能力不一致"
+            );
+        }
+
+        // provider 名不在配置里：预判不支持，`build_provider_with_user` 直接报配置错误，
+        // 拿不到适配器，这条组合没有可比对象，只断言两侧都不支持。
+        let config = user_config("deepseek", entry_of("deepseek", Some("anthropic")));
+        assert!(!supports_server_web_search_for(&config, Some("nope")));
+        assert!(
+            build_provider_with_user(&model_config("nope"), &config).is_err(),
+            "未知 provider 名不应构造出适配器"
+        );
+    }
+
+    // ── 「开关开着但不生效」的告警 ────────────────────────────────────────
+
+    /// 告警正文里可定位的一句：条数断言只认它，不看日志前缀。
+    const WEB_SEARCH_WARN: &str = "the switch takes no effect";
+
+    /// 服务端网页搜索能力的桩适配器：只用来观察构造期告警，不发请求。
+    struct WebSearchStub {
+        supports: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for WebSearchStub {
+        fn name(&self) -> &str {
+            "stub-anthropic"
+        }
+
+        fn supports_server_web_search(&self) -> bool {
+            self.supports
+        }
+
+        async fn generate_full(
+            &self,
+            _request: &GenerateRequest,
+        ) -> Result<GenerateResult, ProviderError> {
+            Ok(GenerateResult {
+                id: "r-stub".into(),
+                output: Vec::new(),
+                usage: Usage::default(),
+                status: ResponseStatus::Completed,
+                finish_reason: Some(FinishReason::Stop),
+                error: None,
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: &GenerateRequest,
+        ) -> Result<GenerateStream, ProviderError> {
+            Err(ProviderError::Request("stream unused in stub".into()))
+        }
+    }
+
+    fn agent_with_web_search(web_search: Option<bool>, adapter_supports: bool) -> Arc<Agent> {
+        let profile: AgentProfile = serde_yaml::from_str(
+            "agent:\n  name: search-agent\n  description: d\nllm:\n  provider: stub\n  model: stub-model\n",
+        )
+        .unwrap();
+        let executor: Arc<dyn ToolExecutor> =
+            Arc::new(crate::tools::DefaultToolsExecutor::new(Vec::new()));
+        let mut builder = ModelConfigBuilder::new().model_name("stub-model");
+        if let Some(enabled) = web_search {
+            builder = builder.web_search(enabled);
+        }
+        Arc::new(Agent::from_parts(
+            std::path::PathBuf::from("/tmp/agent.md"),
+            profile,
+            "sys".to_string(),
+            Arc::new(WebSearchStub {
+                supports: adapter_supports,
+            }),
+            builder.build(),
+            Arc::clone(&executor),
+            Arc::new(McpManager::empty(executor)),
+            None,
+        ))
+    }
+
+    /// 采集日志的 writer：`warn!` 条数断言靠它，不用真实 stderr。
+    ///
+    /// 必须跑在 `#[tokio::test]` 默认的单线程运行时上：默认 subscriber 是线程
+    /// 局部的，多线程会把异步段里的日志写到别的线程，断言恒红。
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let writer = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (writer, guard)
+    }
+
+    /// 开关开着但适配器不支持：构造期一条告警，含 agent / provider / model 三项，
+    /// 且后续模型调用不再追加。
+    ///
+    /// 变异点：把这个判定搬回 `build_generate_request` ⇒ 条数变 2；不判能力一律
+    /// 告警 ⇒ 第二条用例变红；告警里任一字段写死 ⇒ 对应断言变红。
+    #[tokio::test]
+    async fn test_web_search_warns_once_when_adapter_lacks_it() {
+        let (logs, _guard) = capture_logs();
+        let agent = agent_with_web_search(Some(true), false);
+
+        let after_build = logs.text();
+        assert_eq!(
+            after_build.matches(WEB_SEARCH_WARN).count(),
+            1,
+            "{after_build}"
+        );
+        assert!(after_build.contains("search-agent"), "{after_build}");
+        assert!(after_build.contains("stub-anthropic"), "{after_build}");
+        assert!(after_build.contains("stub-model"), "{after_build}");
+
+        agent
+            .generate_full(Vec::new(), |_| {})
+            .await
+            .expect("stub provider completes");
+        agent
+            .generate_full(Vec::new(), |_| {})
+            .await
+            .expect("stub provider completes");
+
+        let text = logs.text();
+        assert_eq!(text.matches(WEB_SEARCH_WARN).count(), 1, "{text}");
+    }
+
+    /// 开关没开、或适配器本来就支持时，一条告警都不该有。
+    #[tokio::test]
+    async fn test_web_search_silent_when_off_or_supported() {
+        let (logs, _guard) = capture_logs();
+        let _off = agent_with_web_search(None, false);
+        let supported = agent_with_web_search(Some(true), true);
+        supported
+            .generate_full(Vec::new(), |_| {})
+            .await
+            .expect("stub provider completes");
+
+        let text = logs.text();
+        assert!(!text.contains(WEB_SEARCH_WARN), "{text}");
     }
 
     #[test]

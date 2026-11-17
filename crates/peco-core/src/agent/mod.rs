@@ -19,7 +19,10 @@ mod stream;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use agent::{Agent, MessageFilter, build_provider_with_user, supports_image_input_for};
+pub use agent::{
+    Agent, MessageFilter, build_provider_with_user, supports_image_input_for,
+    supports_server_web_search_for,
+};
 pub use agent_config::{
     AgentIdentity, AgentProfile, AssembleAgentMdParams, LlmConfig, ModelConfig, ModelConfigBuilder,
     assemble_agent_md, parse_agent_md, resolve_api_key, split_frontmatter,
