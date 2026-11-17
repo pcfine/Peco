@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SpaceListPage } from "@/pages/SpaceListPage";
@@ -7,9 +7,10 @@ import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { useSpaceStore } from "@/stores/spaceStore";
 import type { Space } from "@/types/daemon";
 
-const ensureSpaceConversation = vi.fn(
-  async (_wsId: string) => ({ conversation_id: "conv_a", created: true }),
-);
+const ensureSpaceConversation = vi.fn(async (_wsId: string) => ({
+  conversation_id: "conv_a",
+  created: true,
+}));
 
 const spaceA: Space = {
   ws_id: "ws_a",
@@ -27,6 +28,15 @@ const spaceA: Space = {
   marker: null,
 };
 
+/** 同一组里的一行空闲、一行在跑：状态位必须把这两行分开。 */
+const spaceB: Space = {
+  ...spaceA,
+  ws_id: "ws_b",
+  work_dir: "/tmp/spaces/b/work",
+  label: "空间 B",
+  inflight_dispatch: 2,
+};
+
 vi.mock("@/api/peco", () => ({
   getPeco: async () => ({
     ws_id: "ws_peco",
@@ -38,7 +48,7 @@ vi.mock("@/api/peco", () => ({
 }));
 
 vi.mock("@/api/spaces", () => ({
-  listSpaces: async () => [spaceA],
+  listSpaces: async () => [spaceA, spaceB],
   ensureSpaceConversation: (wsId: string) => ensureSpaceConversation(wsId),
 }));
 
@@ -93,6 +103,22 @@ describe("工作室列表", () => {
     expect(
       await screen.findByRole("link", { name: "空间 A 状态" }),
     ).toHaveAttribute("href", "/spaces/ws_a/status");
+  });
+
+  it("在跑的行状态位是「在运行 · N 个任务在飞」，空闲的行没有", async () => {
+    renderList();
+
+    const busyRow = await screen.findByRole("button", {
+      name: "进入空间 空间 B",
+    });
+    expect(
+      within(busyRow).getByLabelText("在运行 · 2 个任务在飞"),
+    ).toHaveTextContent("◉");
+
+    // 空闲的已打开空间不摆任何在跑标记：`●` 留给「最近打开」那一行。
+    const idleRow = screen.getByRole("button", { name: "进入空间 空间 A" });
+    expect(within(idleRow).queryByLabelText(/在运行/)).toBeNull();
+    expect(within(idleRow).queryByText("◉")).toBeNull();
   });
 
   it("保留新建空间入口", async () => {

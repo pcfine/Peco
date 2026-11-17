@@ -342,7 +342,7 @@ describe("左栏打开集", () => {
     expect(otherRow).not.toContainElement(screen.getByLabelText("最近打开"));
   });
 
-  it("最近打开的行有在飞任务时，照常给数量徽标", async () => {
+  it("最近打开的行有在飞任务时：状态换成在运行，数量进按钮名字", async () => {
     useOpenSpacesStore.setState({
       openIds: ["ws_c"],
       activeWsId: "ws_c",
@@ -350,9 +350,43 @@ describe("左栏打开集", () => {
     });
     renderRail();
 
-    await screen.findByRole("button", { name: "空间 C（团队 research）" });
-    expect(screen.getByLabelText("最近打开")).toBeInTheDocument();
-    expect(screen.getByLabelText("2 个任务在飞")).toHaveTextContent("2");
+    // 展开态的数字徽章会被按钮自己的 aria-label 盖掉，数字因此也写进名字里。
+    const row = await screen.findByRole("button", {
+      name: "空间 C（团队 research） · 2 个任务在飞",
+    });
+    // `●` 只说「最近打开」，在跑由 `◉` 承担：两个意思挤进一个符号就分不清了。
+    expect(screen.getByLabelText("在运行 · 2 个任务在飞")).toHaveTextContent(
+      "◉",
+    );
+    expect(screen.queryByLabelText("最近打开")).toBeNull();
+    // 徽章本身照旧摆着数量，只是不再自带 aria-label。
+    expect(row).toHaveTextContent("2");
+    expect(screen.queryByLabelText("2 个任务在飞")).toBeNull();
+  });
+
+  it("收起态没有徽章位置：在飞数进名字与 title，空闲行不带", async () => {
+    useOpenSpacesStore.setState({
+      openIds: ["ws_a", "ws_c"],
+      activeWsId: "ws_c",
+      seeded: true,
+    });
+    renderRail(true);
+
+    const busy = await screen.findByRole("button", {
+      name: "空间 C（团队 research） · 2 个任务在飞",
+    });
+    expect(busy).toHaveAttribute(
+      "title",
+      "空间 C（团队 research） · 2 个任务在飞",
+    );
+    // 收起态不摆数字徽章：整行只剩首字与那枚 brand 小圆点。
+    expect(screen.queryByLabelText("2 个任务在飞")).toBeNull();
+
+    const idle = screen.getByRole("button", {
+      name: "空间 A（团队 research）",
+    });
+    expect(idle).toHaveAttribute("title", "空间 A");
+    expect(idle).not.toHaveTextContent("任务在飞");
   });
 
   it("边框只跟当前路由：在团队页时空间行不高亮，团队入口高亮", async () => {

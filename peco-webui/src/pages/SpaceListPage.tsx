@@ -52,7 +52,11 @@ function SpaceRow({
         className="flex h-full min-w-0 flex-1 flex-col justify-center gap-0.5 rounded-sm text-left hover:bg-line/30 @min-[900px]/work:flex-row @min-[900px]/work:items-center @min-[900px]/work:gap-2"
       >
         <span className="flex min-w-0 items-center gap-2">
-          <SpaceStatusMark group={spaceGroupOf(space)} recent={active} />
+          <SpaceStatusMark
+            group={spaceGroupOf(space)}
+            recent={active}
+            inflight={inflight}
+          />
           <span className="min-w-0 truncate text-sm text-ink">{name}</span>
           {active && (
             <span className="shrink-0 rounded-sm bg-line/60 px-1 text-caption font-medium text-ink-faint">

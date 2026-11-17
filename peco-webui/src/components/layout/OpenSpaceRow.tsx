@@ -32,24 +32,36 @@ export function OpenSpaceRow({
 }: OpenSpaceRowProps) {
   const name = spaceLabel(space);
   const inflight = space.inflight_dispatch + space.inflight_foreign;
+  // 收起态没有位置摆数量徽章，展开态的徽章又被按钮自己的 aria-label 盖掉：
+  // 两种形态都得把在飞数写进按钮的名字，读屏才拿得到。
+  const busy = collapsed && inflight > 0;
+  const label = `${name}（团队 ${space.team_id}）${
+    inflight > 0 ? ` · ${inflight} 个任务在飞` : ""
+  }`;
 
   return (
     // 圆角矩形落在行容器上：主点击区与「×」同属一行，框只画一次。
     // `group` 是给「×」用的：删除只在指针进入这一行（或键盘焦点落进来）时出现。
     <div
       className={cn(
-        "group mx-2 flex items-center rounded-lg border transition-colors",
+        "group relative mx-2 flex items-center rounded-lg border transition-colors",
         active
           ? "border-brand/40 bg-brand/10"
           : "border-transparent hover:bg-line/50",
       )}
     >
+      {busy && (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-brand"
+        />
+      )}
       <button
         type="button"
         onClick={onSelect}
         aria-current={active ? "true" : undefined}
-        aria-label={`${name}（团队 ${space.team_id}）`}
-        title={name}
+        aria-label={label}
+        title={inflight > 0 ? label : name}
         data-ws-id={space.ws_id}
         data-space-row=""
         className={cn(
@@ -63,14 +75,17 @@ export function OpenSpaceRow({
             {spaceInitial(space)}
           </span>
         ) : (
-          <SpaceStatusMark group={spaceGroupOf(space)} recent={recent} />
+          <SpaceStatusMark
+            group={spaceGroupOf(space)}
+            recent={recent}
+            inflight={inflight}
+          />
         )}
         {!collapsed && (
           <>
             <span className="min-w-0 truncate text-body">{name}</span>
             {inflight > 0 && (
               <span
-                aria-label={`${inflight} 个任务在飞`}
                 title={`${inflight} 个任务在飞`}
                 className="ml-auto inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-brand/15 px-1 tabular-nums text-2xs font-semibold text-primary-ink"
               >

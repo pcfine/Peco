@@ -29,15 +29,34 @@ const MARKS: Record<
 
 /**
  * 已打开（running）只在最近打开的那一行点蓝点；其余留同宽空槽，文字不挪位。
+ *
+ * 有任务在飞时换成 `◉` 并压过 `recent`：`●` 说的是「最近/当前」，不兼任「在跑」，
+ * 两者挤进同一个符号就没人分得清这一行是在忙还是刚点过。
  */
 export function SpaceStatusMark({
   group,
   recent = false,
+  inflight = 0,
 }: {
   group: SpaceGroup;
   recent?: boolean;
+  /** 在飞任务数（含外来）；0 不显示。 */
+  inflight?: number;
 }) {
   if (group === "running") {
+    if (inflight > 0) {
+      const label = `在运行 · ${inflight} 个任务在飞`;
+      return (
+        <span
+          role="img"
+          aria-label={label}
+          title={label}
+          className="w-4 shrink-0 text-center text-xs text-brand"
+        >
+          ◉
+        </span>
+      );
+    }
     return (
       <span className="grid w-4 shrink-0 place-items-center">
         {recent && (
