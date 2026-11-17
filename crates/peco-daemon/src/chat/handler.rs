@@ -328,6 +328,14 @@ impl From<RunError> for ApiError {
         match err {
             RunError::Space(e) => ApiError::from(e),
             RunError::Agent(message) => ApiError::Internal(message),
+            // 配置不可用不是「稍后重试就好」（不是 503），也不是请求写错了（不是
+            // 4xx）：状态码留在服务端侧，前端按 `code` 分流。文案是中文可操作句
+            // + core 原文，只拼 provider 名与变量名，不拼任何配置值。
+            RunError::Provider(failure, detail) => ApiError::coded(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                failure.code(),
+                failure.user_message(&detail),
+            ),
             // 这一轮还在跑（与有没有人连着无关）：不再静默顶替 —— 顶替会让另一个
             // 标签页正在看的一轮被无声截断，且两条 run 争同一会话的 session 快照。
             // 前端按 `code` 分支提示「先停止再发」，不解析文案。
@@ -681,4 +689,52 @@ fn conversation_turns_markdown(
         }
     }
     md
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::ProviderFailure;
+
+    /// 装配期的 provider 失败落到 HTTP：稳定 code + 中文可操作句 + core 原文。
+    ///
+    /// 状态码留在服务端侧（500）是设计选择：这不是请求写错了（不是 4xx），也不是
+    /// 「稍后重试就好」（不是 503），前端按 `code` 分流。
+    #[test]
+    fn provider_failure_maps_to_a_coded_error() {
+        let error: ApiError = RunError::Provider(
+            ProviderFailure::KeyUnresolved {
+                provider: "gw".to_string(),
+                var: "PECO_TEST_MISSING".to_string(),
+            },
+            "failed to load agent '@master': env var missing".to_string(),
+        )
+        .into();
+
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code(), "provider_key_unresolved");
+        let message = error.message();
+        assert!(
+            message.starts_with("provider 'gw' 的密钥引用了环境变量 PECO_TEST_MISSING"),
+            "中文可操作句要在最前面：{message}"
+        );
+        assert!(
+            message.contains('\n'),
+            "中文句与 core 原文分两行：{message}"
+        );
+        assert!(
+            message.contains("failed to load agent '@master'"),
+            "core 原文必须原样保留，便于排查：{message}"
+        );
+
+        let unconfigured: ApiError =
+            RunError::Provider(ProviderFailure::NoProviders, "detail".into()).into();
+        assert_eq!(unconfigured.code(), "provider_unconfigured");
+        assert_eq!(unconfigured.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // agent 装载失败但配置健康：仍是通用 internal，code 不变。
+        let plain: ApiError = RunError::Agent("boom".into()).into();
+        assert_eq!(plain.code(), "internal");
+        assert_eq!(plain.message(), "boom");
+    }
 }

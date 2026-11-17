@@ -28,7 +28,7 @@ use crate::error::DaemonError;
 use crate::file_watcher::FileWatcher;
 use crate::memory::cleanup;
 use crate::memory::config::MemoryConfig;
-use crate::provider::{layer_roots, layers_for};
+use crate::provider::layer_roots_for;
 use crate::space::SpaceEnv;
 use crate::space::index;
 use crate::space::manifest;
@@ -124,7 +124,7 @@ impl DaemonOpener {
             let root = env.team_root(&team);
             // provider 继承链与 provider 模块共用一处推导：打开的空间与
             // `GET .../providers` 必须看到同一份生效配置。
-            let provider_layers = layer_roots(&layers_for(env, &team));
+            let provider_layers = layer_roots_for(env, &team);
             let kb_scope = team.clone();
             let open_dir = work_dir.clone();
             let opened = tokio::task::spawn_blocking(move || {

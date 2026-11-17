@@ -94,7 +94,9 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
     let pool = db::connect(&config.db_url()).await.unwrap();
     db::run_migrations(&pool).await.unwrap();
 
-    let system_config = SystemConfig::load();
+    // 与 `main` 同源：基座恒为空 providers，系统层是 `$PECO_HOME/providers.toml`
+    // 这一最低优先文件层。读 core 的默认位置会让用例随开发机的配置漂移。
+    let system_config = peco_daemon::config::base_system_config();
     let peco = Arc::new(peco_daemon::space::peco::resolve(&config.peco_home));
     let wake = Arc::new(WakePump::new(pool.clone(), peco.clone()));
     let tasks = Arc::new(TaskObserver::new(pool.clone(), wake.clone()));
@@ -206,7 +208,7 @@ impl TestEnv {
         &self,
         peco: Arc<peco_daemon::space::peco::PecoIdentity>,
     ) -> AppState {
-        self.with_env(self.env_with_system_config(SystemConfig::load(), peco))
+        self.with_env(self.env_with_system_config(peco_daemon::config::base_system_config(), peco))
     }
 
     /// 换一份系统配置重建 `AppState`：系统层的 provider 兜底只在这一层可见，

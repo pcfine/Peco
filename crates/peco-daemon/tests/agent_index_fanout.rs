@@ -8,15 +8,18 @@ use support::new_env;
 
 /// 最小可用 `providers.toml`：构造 Agent 需要一条能解析的 provider 条目。
 /// 指向不可达地址即可 —— 这些测试只加载配置，不发请求。
+///
+/// 名字必须是 `deepseek`：`POST /api/agents` 未指定 provider 时写死这个名字
+/// （`agent/handler.rs`），而系统层基座已改成空 —— 夹具要自带一条能解析的。
 const PROVIDERS_TOML: &str = r#"
-default_provider = "test"
+default_provider = "deepseek"
 
-[providers.test]
+[providers.deepseek]
 type = "deepseek"
 api_key = "sk-test-local"
 base_url = "http://127.0.0.1:9"
 
-[providers.test.default]
+[providers.deepseek.default]
 model = "test-model"
 "#;
 

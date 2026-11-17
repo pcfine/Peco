@@ -184,6 +184,7 @@ fn delivery_of(error: RunError) -> Delivery {
         RunError::Busy => Delivery::Busy,
         RunError::Space(e) => Delivery::Failed(format!("target space is unusable: {e}")),
         RunError::Agent(message) => Delivery::Failed(message),
+        RunError::Provider(_, message) => Delivery::Failed(message),
     }
 }
 

@@ -1,4 +1,5 @@
-//! 团队级 provider 配置：`teams/<team_id>/providers.toml` 的读写与呈现。
+//! provider 配置：系统层 `$PECO_HOME/providers.toml` 与团队层
+//! `teams/<team_id>/providers.toml` 的读写与呈现。
 //!
 //! 写入是**字段级部分更新**：请求里 `None` 的字段保留已存值，只有显式给出的
 //! 值才覆盖（空串表示清空）。两个原因：`api_key` 永不回读，前端编辑时手里没有
@@ -8,11 +9,16 @@
 //! 生效并集，每项标注它由哪一层定义（[`ProviderSource`]）——只列本团队文件会
 //! 让继承来的条目看不见，像是没生效。`is_default` 与 `has_api_key` 按合并结果
 //! 判定：「能跑」和「本层文件里写了 key」是两件事。
+//!
+//! 系统层在本 crate 里是**文件层**，不是 `SystemConfig` 基座：基座恒为空
+//! （见 `config::base_system_config`），系统层与其它层一样经 `reload_providers()`
+//! 从磁盘重读，删除才能生效。读 `SystemConfig.providers` 找不到系统层条目。
 
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use peco_core::agent::resolve_api_key;
 use peco_core::config::{
     LlmApiParams, PROVIDER_TYPES, ProviderEntry, ProvidersConfig, SystemConfig, UserConfig,
 };
@@ -25,10 +31,11 @@ use crate::space::peco::PECO_TEAM_ID;
 
 mod handler;
 
-pub use handler::{delete, get, list, list_types, test_connection, test_draft, upsert};
-
-/// 团队能力根下的 provider 配置文件。
-pub const PROVIDERS_FILE: &str = "providers.toml";
+pub use crate::config::PROVIDERS_FILE;
+pub use handler::{
+    delete, delete_system, get, list, list_system, list_types, test_connection,
+    test_connection_system, test_draft, test_draft_system, types_system, upsert, upsert_system,
+};
 
 /// provider 在列表/详情中的呈现。
 ///
@@ -44,22 +51,87 @@ pub struct ProviderInfo {
     /// API 风格：`"responses"` | `"chat"`；`None` = 用该类型的默认风格。
     pub api: Option<String>,
     /// 是否已配置 API Key（不回读明文）。
+    ///
+    /// 语义是「能解析出非空值」，不是「文件里写了字符串」：`${VAR}` 指向未设置
+    /// 或空值的变量时这里是 `false`，否则页面会说「已配置」而对话必然失败。
     pub has_api_key: bool,
+    /// `api_key` 的可解析状态；前端据此区分「没配 / 明文 / 变量已设 / 变量未设」。
+    pub api_key_status: ApiKeyStatus,
+    /// `api_key` 引用的环境变量名（只有变量名，永远没有值）。
+    pub api_key_env: Option<String>,
     /// 是否为当前默认 provider（agent.md 未指定 provider 时走它）。
     pub is_default: bool,
     /// 该条目由哪一层定义 —— 只有 `"team"` 能在本团队文件里编辑/删除。
     pub source: ProviderSource,
 }
 
+/// `api_key` 的可解析状态。
+///
+/// 判定的是「能不能拿到可用的密钥」，不是「文件里写了什么」：`${VAR}` 指向未设置
+/// 或空值的变量时对话必然失败，页面却会显示「已配置」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyStatus {
+    /// 没写，或写了空串。
+    Missing,
+    /// 明文凭据。
+    Literal,
+    /// `${VAR}` 且变量已设置、解析结果非空。
+    EnvResolved,
+    /// `${VAR}` 但变量未设置，或解析出来是空串。
+    EnvUnresolved,
+}
+
+impl ApiKeyStatus {
+    /// 凭据此刻是否可用 —— `has_api_key` 与默认 provider 的可用性判定都用它。
+    pub fn is_resolvable(self) -> bool {
+        matches!(self, Self::Literal | Self::EnvResolved)
+    }
+}
+
+/// 原始 `api_key` 字符串 → 可解析状态。
+///
+/// 两步判定，缺一不可：`resolve_api_key` 能解析 **且** 结果非空。只做第一步会把
+/// `${EMPTY_VAR}`（变量存在但为空串）判成已配置 —— `resolve_api_key` 只查
+/// 「变量在不在」，空串照样是 `Ok("")`。
+///
+/// `${VAR}` 的语法判定以 core 的 `resolve_api_key` 为仲裁者，不在本文件复制一份
+/// 前缀/后缀规则；明文只在本函数的局部变量里存在，不进任何结构体或日志。
+pub fn api_key_status(raw: Option<&str>) -> ApiKeyStatus {
+    let Some(raw) = raw.filter(|k| !k.trim().is_empty()) else {
+        return ApiKeyStatus::Missing;
+    };
+    match resolve_api_key(raw) {
+        Ok(plain) if plain.is_empty() => ApiKeyStatus::EnvUnresolved,
+        Ok(_) => {
+            if api_key_env(Some(raw)).is_some() {
+                ApiKeyStatus::EnvResolved
+            } else {
+                ApiKeyStatus::Literal
+            }
+        }
+        Err(_) => ApiKeyStatus::EnvUnresolved,
+    }
+}
+
+/// `api_key` 引用的环境变量名（展示用）。
+///
+/// 只返回变量名，永不返回变量值。只有 `${...}` 形式才有值，且空名视为没有：
+/// `${}` 指不到任何变量，把它当名字显示只会误导。
+pub fn api_key_env(raw: Option<&str>) -> Option<String> {
+    let inner = raw?.trim().strip_prefix("${")?.strip_suffix('}')?;
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 /// provider 条目的定义层，也是列表里的 `source` 取值。
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderSource {
     /// 团队自己的 `providers.toml`。
     Team,
     /// 保留团队 Peco 的 `providers.toml`（团队全局默认）。
     Peco,
-    /// 系统层 `~/.config/peco/providers.toml`。
+    /// daemon 系统层：`$PECO_HOME/providers.toml`（最低优先层，所有团队共用）。
     System,
 }
 
@@ -74,10 +146,13 @@ impl ProviderSource {
     }
 
     /// 继承条目不可删时，告诉用户「这条是从哪继承来的」。
+    ///
+    /// 系统层的措辞与设置页那个「系统（本机）」伪条目同名：同一个概念在两个
+    /// 地方用两个词，用户会以为是两份配置。
     fn origin_label(self) -> &'static str {
         match self {
             Self::Peco => "Peco",
-            Self::System => "系统配置",
+            Self::System => "系统（本机）",
             Self::Team => "本团队",
         }
     }
@@ -92,17 +167,19 @@ pub struct ProviderLayer {
 
 /// 一个团队的 provider 层级（低 → 高）。
 ///
-/// Peco 自己只有两层：系统 + 自己，不自我继承 —— 否则 `teams/peco` 会被
+/// 系统层是一切团队的兜底层。Peco 自己不自我继承 —— 否则 `teams/peco` 会被
 /// 当成两层读同一份文件。
 pub fn layers_for(env: &SpaceEnv, team_id: &str) -> Vec<ProviderLayer> {
+    let system = system_layer(env);
     let team = ProviderLayer {
         root: env.team_root(team_id),
         source: ProviderSource::Team,
     };
     if team_id == PECO_TEAM_ID {
-        return vec![team];
+        return vec![system, team];
     }
     vec![
+        system,
         ProviderLayer {
             root: env.team_root(PECO_TEAM_ID),
             source: ProviderSource::Peco,
@@ -111,9 +188,56 @@ pub fn layers_for(env: &SpaceEnv, team_id: &str) -> Vec<ProviderLayer> {
     ]
 }
 
+/// 系统层（最低优先层）：所有团队共用的兜底层。
+pub fn system_layer(env: &SpaceEnv) -> ProviderLayer {
+    ProviderLayer {
+        root: env.system_providers_root().to_path_buf(),
+        source: ProviderSource::System,
+    }
+}
+
 /// 交给 [`UserConfig::load_layered`] 的路径序列（低 → 高）。
 pub fn layer_roots(layers: &[ProviderLayer]) -> Vec<PathBuf> {
     layers.iter().map(|layer| layer.root.clone()).collect()
+}
+
+/// [`layers_for`] + [`layer_roots`] 的合成，给「手里只有 `env` 和 `team_id`」的
+/// 调用点用（打开空间、console、对话期诊断）。
+///
+/// 三处各拼一遍会让生效配置与诊断看不同的层：漏了系统层时，配置明明生效，
+/// 诊断却说「一条 provider 都没有」。
+pub fn layer_roots_for(env: &SpaceEnv, team_id: &str) -> Vec<PathBuf> {
+    layer_roots(&layers_for(env, team_id))
+}
+
+/// 一层文件被写入后，哪些已打开实例必须重读配置。
+///
+/// 系统层与 Peco 层都是公共兜底（所有团队都继承），只能整表刷；团队层只影响
+/// 自己。「刷哪些实例」因此是写入作用域的属性，由调用方显式给出，不再靠
+/// 「team_id 等于 Peco 就刷全部」这条隐式规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadScope {
+    All,
+    Team(String),
+}
+
+impl ReloadScope {
+    /// 团队层写入的作用域：Peco 层同时也是其它团队的兜底，必须升级为 `All`。
+    pub fn for_team(team_id: &str) -> Self {
+        if team_id == PECO_TEAM_ID {
+            Self::All
+        } else {
+            Self::Team(team_id.to_string())
+        }
+    }
+
+    /// 该作用域是否覆盖这个团队。
+    pub fn covers(&self, team_id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Team(id) => id == team_id,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +403,7 @@ pub fn provider_info(
     effective: &UserConfig,
     source: ProviderSource,
 ) -> ProviderInfo {
+    let status = api_key_status(entry.api_key.as_deref());
     ProviderInfo {
         name: name.to_string(),
         provider_type: entry.provider_type.clone(),
@@ -286,6 +411,8 @@ pub fn provider_info(
         default_model: entry.default.as_ref().map(|d| d.model.clone()),
         api: entry.api.clone(),
         has_api_key: has_effective_api_key(effective, name),
+        api_key_status: status,
+        api_key_env: api_key_env(entry.api_key.as_deref()),
         is_default: name == effective.default_provider_name(),
         source,
     }
@@ -301,16 +428,135 @@ pub fn sort_for_display(infos: &mut [ProviderInfo]) {
     });
 }
 
-/// 合并后的生效配置里该 provider 是否带凭据。
+/// 合并后的生效配置里该 provider 的凭据此刻能不能用。
 ///
-/// 用户文件与系统配置做深递归合并时 `api_key` 由系统层兜底，所以「能跑」与
+/// 用户文件与系统配置做深递归合并时 `api_key` 由低层兜底，所以「能跑」与
 /// 「用户文件里写了 key」是两回事；按原始文件判定会把实际可用的 provider 报成
-/// 未配置。
+/// 未配置。反过来只看 `api_key.is_some()` 会把 `${VAR}` 未设置的那一条报成已配置。
 fn has_effective_api_key(effective: &UserConfig, name: &str) -> bool {
-    effective
-        .provider_entry(Some(name))
-        .and_then(|e| e.api_key.as_ref())
-        .is_some()
+    api_key_status(
+        effective
+            .provider_entry(Some(name))
+            .and_then(|e| e.api_key.as_deref()),
+    )
+    .is_resolvable()
+}
+
+/// 对话装配期「配置不可用」的唯一分类。
+///
+/// 分类来自配置本身，不来自解析 core 的英文报错：core 的文案会演进，而配置
+/// 判定是稳定的。core 的原文只作为证据附在 [`Self::user_message`] 后面。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderFailure {
+    /// 合并结果里一条 provider 都没有。
+    NoProviders,
+    /// 某层文件声明了 `default_provider`，但合并结果里没有这个名字。
+    DanglingDefault { name: String },
+    /// 有条目，但没有任何一层声明 `default_provider`。
+    NoDefault { count: usize },
+    /// 默认 provider 的密钥引用了解析不出来的环境变量。
+    KeyUnresolved { provider: String, var: String },
+}
+
+impl ProviderFailure {
+    /// 与前端约定的稳定 code（前端按它分流，不按状态码）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoProviders | Self::NoDefault { .. } => "provider_unconfigured",
+            Self::DanglingDefault { .. } => "provider_dangling_default",
+            Self::KeyUnresolved { .. } => "provider_key_unresolved",
+        }
+    }
+
+    /// 给用户看的中文可操作句 + core 原文。
+    ///
+    /// 只拼 provider 名与环境变量名，**不拼任何配置值**：这段文案会经
+    /// `ApiError::into_response` 原样进 journal。
+    pub fn user_message(&self, detail: &str) -> String {
+        format!("{}\n{detail}", self.actionable())
+    }
+
+    fn actionable(&self) -> String {
+        match self {
+            Self::NoProviders => {
+                "还没有任何可用的 provider 配置：请到「设置 → 系统（本机）」填一条 API Key（其它团队都会继承它）".to_string()
+            }
+            Self::NoDefault { count } => format!(
+                "共有 {count} 个 provider，但没有任何一层指定默认：请在某一条上勾选「设为默认」"
+            ),
+            Self::DanglingDefault { name } => format!(
+                "某一层指定的默认 provider '{name}' 已不存在（多半是被系统层删掉了）：请重新指定默认"
+            ),
+            Self::KeyUnresolved { provider, var } => format!(
+                "provider '{provider}' 的密钥引用了环境变量 {var}，但 daemon 进程里没有这个变量（或它的值为空）：请给 daemon 进程设上该变量，或在这一条上直接填写明文密钥"
+            ),
+        }
+    }
+}
+
+/// 配置此刻能不能跑；`None` = 没发现配置层面的问题。
+///
+/// 判定顺序互斥，且 `DanglingDefault` 必须在 `NoDefault` 之前：悬空时合并默认已
+/// 回落空，`NoDefault` 也会命中，而「你写的那个默认名已经不存在」更接近真相。
+///
+/// 只看默认/整体层面，不看具体 agent.md 的 `llm.provider`：那要把 agent profile
+/// 的解析前移到 daemon，与 core 的加载职责重叠。agent 指定了非默认 provider 且
+/// 它的密钥不可解析时本函数返回 `None`，前端落到「服务端拒绝了这次请求 + 原文」。
+pub fn diagnose(user_config: &UserConfig, layers: &[PathBuf]) -> Option<ProviderFailure> {
+    let providers = &user_config.providers.providers;
+    if providers.is_empty() {
+        return Some(ProviderFailure::NoProviders);
+    }
+    if let Some(name) = dangling_default(providers, layers) {
+        return Some(ProviderFailure::DanglingDefault { name });
+    }
+    let default = user_config.default_provider_name();
+    let Some(entry) = providers.get(default) else {
+        // 默认位为空是常态（没有任何一层声明它）；非空却指不到条目在 core 的
+        // 合并里不会出现（悬空会被回落），归到同一档也不至于指错方向。
+        return Some(ProviderFailure::NoDefault {
+            count: providers.len(),
+        });
+    };
+    if api_key_status(entry.api_key.as_deref()) == ApiKeyStatus::EnvUnresolved {
+        return Some(ProviderFailure::KeyUnresolved {
+            provider: default.to_string(),
+            var: api_key_env(entry.api_key.as_deref()).unwrap_or_default(),
+        });
+    }
+    None
+}
+
+/// 逐层读**原始文档**找悬空的默认声明。
+///
+/// 必须读原始 TOML，不能读合并结果：core 的合并会把「指不到条目的默认」静默
+/// 回落成低层的默认，信息在合并后已经不存在。判定口径与 core 的 `has_default`
+/// 一致，唯一差异是这里把**空串**排除在「声明」之外（空串表示本层没声明），
+/// 单测锁死这一档。
+fn dangling_default(
+    providers: &HashMap<String, ProviderEntry>,
+    layers: &[PathBuf],
+) -> Option<String> {
+    for layer in layers {
+        let path = layer.join(PROVIDERS_FILE);
+        // 读不到 / 解析不了的文件不在这里报：列表与打开空间各有自己的错误面。
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(document) = toml::from_str::<toml::Value>(&raw) else {
+            continue;
+        };
+        let Some(name) = document
+            .get("default_provider")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        if !name.is_empty() && !providers.contains_key(name) {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// 请求里显式给出的 provider 名，省略时回退为 `fallback`（调用方传目录里的规范
@@ -552,6 +798,8 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use std::collections::HashMap;
+
+    use crate::test_env::{ENV_LOCK, EnvVar};
 
     fn req(name: Option<&str>, provider_type: &str) -> UpsertProviderRequest {
         UpsertProviderRequest {
@@ -948,6 +1196,278 @@ mod tests {
             .find(|i| i.provider_type == "deepseek")
             .expect("deepseek 必须在目录里");
         assert_eq!(ds.default_base_url, "https://api.deepseek.com");
+    }
+
+    /// 一条只写了类型与密钥的条目。
+    fn keyed(provider_type: &str, key: Option<&str>) -> ProviderEntry {
+        ProviderEntry {
+            provider_type: provider_type.to_string(),
+            api_key: key.map(str::to_string),
+            base_url: None,
+            api: None,
+            default: None,
+        }
+    }
+
+    /// 合并结果：`providers` + 默认位。
+    fn merged(default: &str, entries: &[(&str, ProviderEntry)]) -> UserConfig {
+        let mut providers = HashMap::new();
+        for (name, entry) in entries {
+            providers.insert((*name).to_string(), entry.clone());
+        }
+        UserConfig {
+            providers: ProvidersConfig {
+                default_provider: default.to_string(),
+                providers,
+                web_search: None,
+            },
+            mcp: peco_core::config::McpConfig::empty(),
+        }
+    }
+
+    /// 写一层 `providers.toml` 并返回层根（`diagnose` 只看层里的原始文档）。
+    fn layer(dir: &Path, team: &str, body: &str) -> PathBuf {
+        let root = dir.join(team);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(PROVIDERS_FILE), body).unwrap();
+        root
+    }
+
+    /// `${VAR}` 必须「能解析」**且**「解析结果非空」才算已配置。
+    ///
+    /// 只做第一步会把 `${EMPTY}`（变量存在但为空串）判成已配置 —— 页面因此说
+    /// 「已配置」，而 `resolve_api_key` 拿到空密钥后对话必然失败。
+    #[test]
+    fn env_reference_needs_a_set_and_non_empty_variable() {
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        assert_eq!(
+            api_key_status(Some("${PECO_TEST_MISSING}")),
+            ApiKeyStatus::EnvUnresolved,
+            "变量未设置"
+        );
+        assert_eq!(
+            api_key_env(Some("${PECO_TEST_MISSING}")).as_deref(),
+            Some("PECO_TEST_MISSING")
+        );
+
+        let _empty = EnvVar::set("PECO_TEST_EMPTY", "");
+        assert_eq!(
+            api_key_status(Some("${PECO_TEST_EMPTY}")),
+            ApiKeyStatus::EnvUnresolved,
+            "变量存在但为空串"
+        );
+
+        let _set = EnvVar::set("PECO_TEST_SET", "sk-resolved");
+        assert_eq!(
+            api_key_status(Some("${PECO_TEST_SET}")),
+            ApiKeyStatus::EnvResolved
+        );
+
+        let config = merged(
+            "gw",
+            &[
+                ("gw", keyed("openai", Some("${PECO_TEST_MISSING}"))),
+                ("ok", keyed("openai", Some("${PECO_TEST_SET}"))),
+            ],
+        );
+        let unresolved = provider_info(
+            "gw",
+            &config.providers.providers["gw"],
+            &config,
+            ProviderSource::System,
+        );
+        assert!(!unresolved.has_api_key);
+        assert_eq!(unresolved.api_key_status, ApiKeyStatus::EnvUnresolved);
+        assert_eq!(unresolved.api_key_env.as_deref(), Some("PECO_TEST_MISSING"));
+
+        let resolved = provider_info(
+            "ok",
+            &config.providers.providers["ok"],
+            &config,
+            ProviderSource::System,
+        );
+        assert!(resolved.has_api_key);
+        assert_eq!(resolved.api_key_status, ApiKeyStatus::EnvResolved);
+    }
+
+    /// 明文可用；空串与「没写」都是未配置。
+    #[test]
+    fn literal_and_missing_keys_are_told_apart() {
+        assert_eq!(api_key_status(Some("sk-abc")), ApiKeyStatus::Literal);
+        assert_eq!(api_key_status(Some("")), ApiKeyStatus::Missing);
+        assert_eq!(api_key_status(Some("   ")), ApiKeyStatus::Missing);
+        assert_eq!(api_key_status(None), ApiKeyStatus::Missing);
+        assert!(ApiKeyStatus::Literal.is_resolvable());
+        assert!(!ApiKeyStatus::Missing.is_resolvable());
+        assert!(!ApiKeyStatus::EnvUnresolved.is_resolvable());
+
+        assert_eq!(api_key_env(Some("sk-abc")), None, "明文没有变量名");
+        assert_eq!(api_key_env(Some("${}")), None, "空变量名指不到任何变量");
+        assert_eq!(api_key_env(None), None);
+
+        let config = merged("gw", &[("gw", keyed("openai", Some("sk-abc")))]);
+        let info = provider_info(
+            "gw",
+            &config.providers.providers["gw"],
+            &config,
+            ProviderSource::System,
+        );
+        assert!(info.has_api_key);
+        assert_eq!(info.api_key_env, None);
+    }
+
+    /// 密钥明文不得进入任何结构体或文案：`ApiError` 会把 `details` 原样写进
+    /// journal，这里漏一次就是把凭据落进日志。
+    #[test]
+    fn api_key_plaintext_never_leaves_the_judgement() {
+        let _serial = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _secret = EnvVar::set("PECO_TEST_SECRET", "s3cr3t-value");
+
+        let config = merged(
+            "gw",
+            &[("gw", keyed("openai", Some("${PECO_TEST_SECRET}")))],
+        );
+        let info = provider_info(
+            "gw",
+            &config.providers.providers["gw"],
+            &config,
+            ProviderSource::System,
+        );
+        assert!(info.has_api_key, "明文解析得出来");
+        assert_eq!(info.api_key_env.as_deref(), Some("PECO_TEST_SECRET"));
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("s3cr3t-value"), "{json}");
+        let debug = format!("{info:?}");
+        assert!(!debug.contains("s3cr3t-value"), "{debug}");
+
+        let failure = ProviderFailure::KeyUnresolved {
+            provider: "gw".to_string(),
+            var: "PECO_TEST_SECRET".to_string(),
+        };
+        assert!(
+            !failure.user_message("core detail").contains("s3cr3t-value"),
+            "文案里只许出现 provider 名与变量名"
+        );
+    }
+
+    /// `diagnose` 的四档互斥，且悬空默认优先于「没声明默认」。
+    #[test]
+    fn diagnose_classifies_the_four_config_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        assert_eq!(
+            diagnose(&merged("", &[]), &[]),
+            Some(ProviderFailure::NoProviders)
+        );
+
+        // 条目在、默认位为空：没有任何一层声明过它。
+        let no_default = merged(
+            "",
+            &[("gw", keyed("openai", None)), ("qwen", keyed("qwen", None))],
+        );
+        assert_eq!(
+            diagnose(&no_default, &[]),
+            Some(ProviderFailure::NoDefault { count: 2 })
+        );
+
+        // 层文件写了默认名，但合并结果里没有这个条目 ⇒ 悬空，不是「没声明」。
+        let dangling_layer = layer(
+            path,
+            "team-gw",
+            "default_provider = \"gw\"\n\n[providers.qwen]\ntype = \"qwen\"\n",
+        );
+        let only_qwen = merged("", &[("qwen", keyed("qwen", None))]);
+        assert_eq!(
+            diagnose(&only_qwen, std::slice::from_ref(&dangling_layer)),
+            Some(ProviderFailure::DanglingDefault {
+                name: "gw".to_string()
+            }),
+            "悬空默认比「没声明默认」更接近真相"
+        );
+
+        // 空串不算声明：口径与 core 的 `has_default` 的唯一差异。
+        let empty_default_layer = layer(
+            path,
+            "team-empty",
+            "default_provider = \"\"\n\n[providers.qwen]\ntype = \"qwen\"\n",
+        );
+        assert_eq!(
+            diagnose(&only_qwen, std::slice::from_ref(&empty_default_layer)),
+            Some(ProviderFailure::NoDefault { count: 1 })
+        );
+
+        // 默认 provider 的密钥解析不出来。
+        let unresolved = merged(
+            "gw",
+            &[("gw", keyed("openai", Some("${PECO_TEST_MISSING}")))],
+        );
+        assert_eq!(
+            diagnose(&unresolved, &[]),
+            Some(ProviderFailure::KeyUnresolved {
+                provider: "gw".to_string(),
+                var: "PECO_TEST_MISSING".to_string(),
+            })
+        );
+
+        // 每一档都有自己的 code，前端按它分流。
+        assert_eq!(ProviderFailure::NoProviders.code(), "provider_unconfigured");
+        assert_eq!(
+            ProviderFailure::NoDefault { count: 1 }.code(),
+            "provider_unconfigured"
+        );
+        assert_eq!(
+            ProviderFailure::DanglingDefault {
+                name: "gw".to_string()
+            }
+            .code(),
+            "provider_dangling_default"
+        );
+        assert_eq!(
+            ProviderFailure::KeyUnresolved {
+                provider: "gw".to_string(),
+                var: "V".to_string()
+            }
+            .code(),
+            "provider_key_unresolved"
+        );
+    }
+
+    /// 配置本身健康时 `diagnose` 不报 —— 包括 agent.md 指向未知 provider 的情形。
+    ///
+    /// 诊断只看默认/整体层面：agent profile 里的 `llm.provider` 不在 daemon 的
+    /// 视野里，为此把 agent 解析前移会与 core 的加载职责重叠（已知局限）。
+    #[test]
+    fn diagnose_is_silent_on_a_healthy_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy_layer = layer(
+            dir.path(),
+            "team",
+            "default_provider = \"gw\"\n\n[providers.gw]\ntype = \"openai\"\napi_key = \"sk\"\n",
+        );
+        let config = merged("gw", &[("gw", keyed("openai", Some("sk")))]);
+
+        assert_eq!(
+            diagnose(&config, std::slice::from_ref(&healthy_layer)),
+            None
+        );
+
+        // 文件名损坏的层（读不出来）不应让诊断凭空报错：那条错误属于列表/打开期。
+        let broken = layer(dir.path(), "team-broken", "[providers.gw\ntype = 1\n");
+        assert_eq!(
+            diagnose(&config, std::slice::from_ref(&broken)),
+            None,
+            "解析不了的层由列表与打开期各报各的，诊断不重复报"
+        );
+
+        // 默认密钥是明文，也不需要环境变量。
+        assert!(config.providers.providers.contains_key("gw"));
+        assert_eq!(
+            api_key_status(config.providers.providers["gw"].api_key.as_deref()),
+            ApiKeyStatus::Literal
+        );
     }
 
     /// 保存成功文案把重载结论拼在同一条 message 里。

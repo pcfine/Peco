@@ -21,7 +21,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde::Serialize;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
@@ -95,6 +95,21 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/upload",
             post(upload::upload_image).layer(DefaultBodyLimit::max(upload::MAX_UPLOAD_BODY_BYTES)),
+        )
+        // 系统层 provider 配置：不带 team，与团队路由并存（同领域函数，两个入口）。
+        // `/types` 与 `/test` 是静态段，优先于 `{name}`（axum 0.8 的路由优先级，
+        // 与既有 `/teams/{id}/providers/test` 同一模式）。没有 by-name GET：
+        // 零调用方，团队路由那条保留不变。
+        .route(
+            "/api/providers",
+            get(provider::list_system).put(provider::upsert_system),
+        )
+        .route("/api/providers/types", get(provider::types_system))
+        .route("/api/providers/test", post(provider::test_draft_system))
+        .route("/api/providers/{name}", delete(provider::delete_system))
+        .route(
+            "/api/providers/{name}/test",
+            post(provider::test_connection_system),
         )
         // 团队级 provider 配置：providers.toml 属于团队能力根，不在某个空间里。
         .route(

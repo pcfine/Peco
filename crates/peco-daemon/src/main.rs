@@ -3,13 +3,12 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use peco_core::config::SystemConfig;
 use peco_core::tools::{WorkspaceHub, WorkspaceOpener, install_workspace_hub};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use peco_daemon::chat::ChatActiveRuns;
-use peco_daemon::config::DaemonConfig;
+use peco_daemon::config::{self, DaemonConfig};
 use peco_daemon::db;
 use peco_daemon::error::DaemonError;
 use peco_daemon::http;
@@ -52,9 +51,29 @@ async fn run() -> Result<(), DaemonError> {
     // 守卫持有到进程退出：pid 文件的存活期就是 daemon 的存活期。
     let _instance = single_instance::check_single_instance(&config.peco_home)?;
 
-    let system_config = Arc::new(SystemConfig::load());
+    // 基座为空：系统层是 `$PECO_HOME/providers.toml` 这一最低优先文件层，留一份
+    // 启动快照当基座会让删掉的条目被快照复活。MCP 仍由 core 加载。
+    let system_config = Arc::new(config::base_system_config());
     // 进程级配置只注入一次：工作空间工具经 `peco_core::config::system_config()` 读取。
     peco_core::config::install_system_config(system_config.clone());
+
+    // 系统层文件的位置只出现在日志里（前端一句路径都不出现）。损坏它会让所有
+    // 团队的空间都打不开，而打开期的错误不带路径 —— 这条 ERROR 是唯一的定位入口。
+    // 只报不改：daemon 不替用户动既有文件。
+    let system_providers = config.system_providers_root().join(config::PROVIDERS_FILE);
+    info!(
+        path = %system_providers.display(),
+        exists = system_providers.exists(),
+        "system providers file"
+    );
+    if let Err(e) = config::check_system_providers_file(&system_providers) {
+        error!(
+            path = %system_providers.display(),
+            error = %e,
+            "system providers file is broken; team spaces may fail to open"
+        );
+    }
+
     // Peco 身份在装配 Hub 之前解析一次：台账分组计数与 HTTP 视图必须看同一份。
     let peco = Arc::new(peco::resolve(&config.peco_home));
     info!(

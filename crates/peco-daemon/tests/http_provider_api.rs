@@ -1068,11 +1068,13 @@ async fn deleting_an_inherited_provider_is_400() {
     .await;
     assert_eq!(system.status, 400, "body={}", system.body);
     assert_eq!(system.code(), "inherited_provider");
+    // 系统层的措辞与设置页「系统（本机）」伪条目同名：同一个概念两个词会让用户
+    // 以为是两份配置（本断言随 origin_label 的措辞变更而变更，code 与状态不变）。
     assert!(
         system.body["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("系统配置"),
+            .contains("系统（本机）"),
         "body={}",
         system.body
     );

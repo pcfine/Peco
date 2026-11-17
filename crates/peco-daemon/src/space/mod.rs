@@ -15,7 +15,7 @@ pub mod registry;
 pub mod report;
 pub mod tasks;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
 use model_provider::ModelProvider;
@@ -50,6 +50,11 @@ use crate::space::tasks::TaskObserver;
 /// 表；本结构体不承担缓存职责。
 pub struct SpaceEnv {
     pub home: PathBuf,
+    /// 系统层 provider 文件所在的目录（`config::PROVIDERS_FILE` 拼在它后面）。
+    ///
+    /// 启动时从 [`DaemonConfig`] 捕获一次：`PECO_PROVIDERS_CONFIG` 改了要重启
+    /// 才生效，不在运行期重读 —— 那会造出第二个环境边界。
+    providers_root: PathBuf,
     pub pool: SqlitePool,
     pub system_config: SystemConfig,
     /// Peco 默认空间的身份；台账分组计数与 HTTP 视图共用这一份。
@@ -76,6 +81,7 @@ impl SpaceEnv {
         tasks.attach_peco(peco.clone());
         Self {
             home: config.peco_home.clone(),
+            providers_root: config.system_providers_root().to_path_buf(),
             pool,
             system_config,
             peco,
@@ -212,6 +218,11 @@ impl SpaceEnv {
     /// 已打开实例表；未注入时为 `None`。
     pub fn hub(&self) -> Option<Arc<WorkspaceHub>> {
         self.hub.get().and_then(Weak::upgrade)
+    }
+
+    /// 系统层 provider 文件的目录（最低优先层）。
+    pub fn system_providers_root(&self) -> &Path {
+        &self.providers_root
     }
 
     pub fn team_root(&self, team_id: &str) -> PathBuf {

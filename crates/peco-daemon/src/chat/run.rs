@@ -29,6 +29,7 @@ use crate::LOCAL_USER_ID;
 use crate::db::conversations::ConversationRow;
 use crate::db::{agents, conversations, messages};
 use crate::error::DaemonError;
+use crate::provider::{self, ProviderFailure};
 use crate::session_store::{SqliteSessionPersister, hydrate_inflight_turn};
 use crate::space::SpaceEnv;
 use crate::space::registry::SpaceRegistry;
@@ -159,6 +160,8 @@ pub(crate) enum RunError {
     Space(DaemonError),
     /// 会话记着的 agent 已不在。
     Agent(String),
+    /// agent 装不上，且原因是 provider 配置不可用（`diagnose` 给出的分类 + core 原文）。
+    Provider(ProviderFailure, String),
     /// 该会话已有在途运行（这一轮在跑，与有没有人连着无关）。
     Busy,
 }
@@ -237,11 +240,21 @@ pub(crate) async fn spawn_run(
         .workspace(ws_id)
         .await
         .map_err(RunError::Space)?;
+    // team_id 先取：agent 加载失败时要靠它重算层列表，才能判断失败是不是
+    // 「provider 配置不可用」这一类。
+    let team_id = deps.spaces.team_id(ws_id).await.map_err(RunError::Space)?;
     let agent = ws
         .agent_manager()
         .load_cached(&conv.agent_name)
-        .map_err(|e| RunError::Agent(format!("failed to load agent '{}': {e}", conv.agent_name)))?;
-    let team_id = deps.spaces.team_id(ws_id).await.map_err(RunError::Space)?;
+        .map_err(|e| {
+            let detail = format!("failed to load agent '{}': {e}", conv.agent_name);
+            // 先判配置、再保留 core 的原文当证据：分类来自配置判定，不来自解析
+            // core 的英文报错（那些文案会演进）。
+            match provider::diagnose(&ws.config(), &deps.spaces.provider_layer_roots(&team_id)) {
+                Some(failure) => RunError::Provider(failure, detail),
+                None => RunError::Agent(detail),
+            }
+        })?;
 
     // ── 2. 加载或创建 Session ────────────────────────────────────────────
     let persister = SqliteSessionPersister::new(deps.pool.clone());

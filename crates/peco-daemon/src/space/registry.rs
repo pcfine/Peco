@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db::{teams, workspaces};
 use crate::error::DaemonError;
-use crate::provider::{layer_roots, layers_for};
+use crate::provider::{ReloadScope, layer_roots_for};
 use crate::space::SpaceEnv;
 use crate::team;
 
@@ -33,6 +33,13 @@ fn team_not_found(team_id: &str) -> DaemonError {
     DaemonError::TeamNotFound {
         team_id: team_id.to_string(),
     }
+}
+
+/// 一次 console 重载的结论：刷了几个、哪些失败。
+#[derive(Debug, Default)]
+pub struct ConsoleReload {
+    pub reloaded: usize,
+    pub failures: Vec<String>,
 }
 
 pub struct SpaceRegistry {
@@ -133,6 +140,46 @@ impl SpaceRegistry {
         self.consoles().remove(team_id);
     }
 
+    /// 该团队的 provider 层根（低 → 高），与打开空间时用的是同一处推导。
+    ///
+    /// core 的 `WorkSpace` 不暴露自己的 `provider_layers`，而对话期诊断需要它 ——
+    /// 另写一份推导会让诊断和生效配置看不同的层。
+    pub fn provider_layer_roots(&self, team_id: &str) -> Vec<PathBuf> {
+        layer_roots_for(self.env.as_ref(), team_id)
+    }
+
+    /// 让该作用域下的 console 重读 provider 配置。
+    ///
+    /// console 不在 Hub 里（它没有空间身份），`reload_open_spaces` 遍历的已打开
+    /// 空间列表看不到它：只有 console、没有空间的团队过去永远看不到配置改动。
+    /// 单个实例失败只收集不中断 —— 一个团队重载失败不该让其它团队停在旧配置上。
+    pub fn reload_console_providers(&self, scope: &ReloadScope) -> ConsoleReload {
+        // 先摘出目标再逐个重载：重载要读盘，不能持着表锁。
+        let targets: Vec<(String, Arc<WorkSpace>)> = self
+            .consoles()
+            .iter()
+            .filter(|(team_id, _)| scope.covers(team_id))
+            .map(|(team_id, ws)| (team_id.clone(), Arc::clone(ws)))
+            .collect();
+
+        let mut outcome = ConsoleReload::default();
+        for (team_id, ws) in targets {
+            match ws.reload_providers() {
+                Ok(invalidated) => {
+                    outcome.reloaded += 1;
+                    tracing::info!(team = %team_id, invalidated, "provider config reloaded");
+                }
+                Err(e) => {
+                    tracing::warn!(team = %team_id, error = %e, "provider reload failed");
+                    outcome
+                        .failures
+                        .push(format!("team console {team_id}: {e}"));
+                }
+            }
+        }
+        outcome
+    }
+
     /// 团队 id 的路径归属：能力根必须落在 `$PECO_HOME/teams` 之下。
     ///
     /// `X-Peco-Team` 是请求方给的任意字符串，`..`、`foo/..` 或指向 teams 之外
@@ -189,7 +236,7 @@ impl SpaceRegistry {
         let root = self.env.team_root(team_id);
         let system_config = self.env.system_config.clone();
         // provider 继承链与空间打开共用一处推导：团队页看到的与打开的空间一致。
-        let provider_layers = layer_roots(&layers_for(self.env.as_ref(), team_id));
+        let provider_layers = self.provider_layer_roots(team_id);
         let work_dir = WorkDir::new(
             self.env
                 .home

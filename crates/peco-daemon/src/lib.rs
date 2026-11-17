@@ -34,3 +34,37 @@ pub mod wake;
 /// `user_id` 列会让两套语义在同一个列名上混住，反之把 `local` 传给
 /// `WorkSpace::open` 会让不同 team 的同名 KB 撞进同一命名空间。
 pub const LOCAL_USER_ID: &str = "local";
+
+/// 测试专用：进程级环境变量的作用域守卫。
+///
+/// 环境变量是进程状态：读它的用例必须彼此串行（共用 [`ENV_LOCK`]），否则结果
+/// 取决于执行顺序。守卫负责还原成进入前的样子，包括「原本未设置」。
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::Mutex;
+
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct EnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVar {
+        pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(raw) => unsafe { std::env::set_var(self.key, raw) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+}
