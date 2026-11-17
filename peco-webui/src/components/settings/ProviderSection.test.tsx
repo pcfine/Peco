@@ -20,7 +20,13 @@ import {
   validateForm,
   type FormState,
 } from "@/components/settings/ProviderSection";
-import type { ProviderInfo, ProviderTypeInfo } from "@/api/providers";
+import {
+  providersQueryKey,
+  scopeKey,
+  type ProviderInfo,
+  type ProviderScope,
+  type ProviderTypeInfo,
+} from "@/api/providers";
 
 // 只替换 axios 实例：URL、请求体与「哪些字段被略过」都在这一层看得见。
 const get = vi.fn();
@@ -118,17 +124,45 @@ const SYSTEM: ProviderInfo = {
   source: "system",
 };
 
+/** 引用了未设置的变量：看着配好了，其实一跑对话就失败。 */
+const UNRESOLVED: ProviderInfo = {
+  name: "deepseek-env",
+  provider_type: "deepseek",
+  base_url: null,
+  default_model: "deepseek-v4-flash",
+  api: null,
+  has_api_key: false,
+  api_key_status: "env_unresolved",
+  api_key_env: "DEEPSEEK_API_KEY",
+  is_default: false,
+  source: "system",
+};
+
+/** 系统层自己写下的条目：在系统范围下可改可删。 */
+const SYSTEM_OWN: ProviderInfo = {
+  name: "gw",
+  provider_type: "openai",
+  base_url: null,
+  default_model: "gpt-5",
+  api: null,
+  has_api_key: true,
+  is_default: true,
+  source: "system",
+};
+
 const TEAM = "t1";
+const TEAM_SCOPE: ProviderScope = { kind: "team", teamId: TEAM };
+const SYSTEM_SCOPE: ProviderScope = { kind: "system" };
 
 let providers: ProviderInfo[];
 
-function renderSection() {
+function renderSection(scope: ProviderScope = TEAM_SCOPE) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <ProviderSection teamId={TEAM} />
+      <ProviderSection scope={scope} />
     </QueryClientProvider>,
   );
 }
@@ -165,6 +199,8 @@ beforeEach(() => {
   get.mockReset().mockImplementation(async (url: string) => {
     if (url === `/teams/${TEAM}/providers`) return { data: providers };
     if (url === `/teams/${TEAM}/providers/types`) return { data: TYPES };
+    if (url === "/providers") return { data: providers };
+    if (url === "/providers/types") return { data: TYPES };
     throw new Error(`unexpected GET ${url}`);
   });
   put
@@ -492,7 +528,7 @@ describe("ProviderSection", () => {
     renderSection();
 
     expect(await screen.findByText("继承自 Peco")).toBeInTheDocument();
-    expect(screen.getByText("系统")).toBeInTheDocument();
+    expect(screen.getByText("继承自 系统（本机）")).toBeInTheDocument();
 
     const pecoRow = await rowOf("qwen");
     expect(within(pecoRow).getByRole("button", { name: "覆盖" })).toBeEnabled();
@@ -574,5 +610,142 @@ describe("ProviderSection", () => {
     });
 
     expect(within(dialog).getByText(/已存在同名 Provider/)).toBeInTheDocument();
+  });
+});
+
+describe("配置范围", () => {
+  it("系统范围的请求打到不带团队的 /providers，查询键不与团队 id 撞", async () => {
+    providers = [SYSTEM_OWN];
+    renderSection(SYSTEM_SCOPE);
+
+    expect(await screen.findByText("gw")).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith("/providers", undefined);
+    expect(get).toHaveBeenCalledWith("/providers/types", undefined);
+
+    // `system` 是合法团队 id：系统层必须用另一个键，否则两份缓存互相覆盖
+    expect(scopeKey(SYSTEM_SCOPE)).toBe("__system__");
+    expect(scopeKey({ kind: "team", teamId: "system" })).toBe("system");
+    expect(providersQueryKey(SYSTEM_SCOPE)).toEqual([
+      "providers",
+      "__system__",
+    ]);
+    expect(providersQueryKey({ kind: "team", teamId: "system" })).toEqual([
+      "providers",
+      "system",
+    ]);
+  });
+
+  it("系统范围只有 system 条目可写，其它层一律只能覆盖", async () => {
+    providers = [SYSTEM_OWN, INHERITED];
+    renderSection(SYSTEM_SCOPE);
+
+    const ownRow = await rowOf("gw");
+    expect(
+      within(ownRow).getByRole("button", { name: "编辑 gw" }),
+    ).toBeInTheDocument();
+    expect(within(ownRow).queryByRole("button", { name: "覆盖" })).toBeNull();
+
+    const inheritedRow = await rowOf("qwen");
+    expect(
+      within(inheritedRow).getByRole("button", { name: "覆盖" }),
+    ).toBeInTheDocument();
+    expect(
+      within(inheritedRow).queryByRole("button", { name: /^编辑/ }),
+    ).toBeNull();
+    expect(
+      within(inheritedRow).queryByRole("button", { name: /^删除/ }),
+    ).toBeNull();
+  });
+
+  it("团队范围反过来：team 条目可写，system 条目只读", async () => {
+    providers = [EXISTING, SYSTEM_OWN];
+    renderSection();
+
+    const ownRow = await rowOf("deepseek");
+    expect(
+      within(ownRow).getByRole("button", { name: "删除 deepseek" }),
+    ).toBeInTheDocument();
+
+    const systemRow = await rowOf("gw");
+    expect(
+      within(systemRow).getByRole("button", { name: "覆盖" }),
+    ).toBeInTheDocument();
+    expect(
+      within(systemRow).queryByRole("button", { name: /^编辑/ }),
+    ).toBeNull();
+  });
+
+  it("变量没设的条目点名变量并给出下一步，而不是笼统说「未配置密钥」", async () => {
+    providers = [UNRESOLVED];
+    renderSection(SYSTEM_SCOPE);
+
+    expect(await screen.findByTestId("key-status")).toHaveTextContent(
+      "密钥引用的 DEEPSEEK_API_KEY 未设置",
+    );
+    expect(screen.queryByText("未配置密钥")).toBeNull();
+    expect(
+      screen.getByText(/给 daemon 的环境变量 DEEPSEEK_API_KEY 赋一个非空值/),
+    ).toBeInTheDocument();
+  });
+
+  it("系统范围的重名校验不为空：本层占用的名字才提示，继承来的不算", async () => {
+    providers = [{ ...SYSTEM_OWN, name: "deepseek" }, SYSTEM_OWN, INHERITED];
+    renderSection(SYSTEM_SCOPE);
+    const dialog = await openCreate();
+
+    // 本层已有的 deepseek 被避让掉（现状会给出「deepseek」并静默覆盖）
+    expect(within(dialog).getByLabelText("名称")).toHaveValue("deepseek-2");
+
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "gw" },
+    });
+    expect(within(dialog).getByText(/已存在同名 Provider/)).toBeInTheDocument();
+
+    // Peco 层的 qwen 不是本层占用：正是「覆盖」想要的入口
+    fireEvent.change(within(dialog).getByLabelText("名称"), {
+      target: { value: "qwen" },
+    });
+    expect(within(dialog).queryByText(/已存在同名 Provider/)).toBeNull();
+  });
+
+  it("保存后失效的是 providers 前缀，连带别的范围一起刷", async () => {
+    const invalidation = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    renderSection(SYSTEM_SCOPE);
+    const dialog = await openCreate();
+
+    fireEvent.change(within(dialog).getByLabelText("API Key"), {
+      target: { value: "sk-test" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(invalidation).toHaveBeenCalledWith({ queryKey: ["providers"] }),
+    );
+    expect(put.mock.calls[0][0]).toBe("/providers");
+    invalidation.mockRestore();
+  });
+
+  it("系统范围的文案不提团队文件：覆盖与删除都说「所有团队都受影响」", async () => {
+    providers = [SYSTEM_OWN, INHERITED];
+    renderSection(SYSTEM_SCOPE);
+
+    const inheritedRow = await rowOf("qwen");
+    fireEvent.click(within(inheritedRow).getByRole("button", { name: "覆盖" }));
+    const overrideDialog = await screen.findByRole("dialog");
+    expect(
+      within(overrideDialog).getByText(/会写进系统层，所有团队都受影响/),
+    ).toBeInTheDocument();
+    expect(
+      within(overrideDialog).queryByText(/本团队的 providers.toml/),
+    ).toBeNull();
+    fireEvent.click(
+      within(overrideDialog).getByRole("button", { name: "取消" }),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "删除 gw" }));
+    const deleteDialog = await screen.findByRole("dialog");
+    expect(
+      within(deleteDialog).getByText(/所有团队都受影响/),
+    ).toBeInTheDocument();
   });
 });

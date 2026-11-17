@@ -4,9 +4,10 @@
 // 粘一个 API Key。地址与模型仍可手改（自建兼容端点），但不会让人对着空输入框
 // 手打默认值。
 //
-// 列表是生效并集：`team` 是本团队文件里的条目，`peco` / `system` 是继承来的。
-// 继承条目改不了也删不掉 —— 上层文件不在本团队手里，删除只会得到 400；唯一能做的
-// 是在本团队写下同名条目把它覆盖掉。
+// 同一个组件服务两个配置范围：团队层与系统层（`scope`）。列表是生效并集：`team`
+// 是当前团队文件里的条目，`peco` / `system` 是继承来的。能改的只有当前范围自己
+// 写下的那几条 —— 继承条目在上层文件里，删除只会得到 400，唯一能做的是在本层写
+// 下同名条目把它覆盖掉。
 
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -34,16 +35,21 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import {
-  deleteProvider,
-  listProviderTypes,
-  listProviders,
+  apiKeyStatus,
+  deleteProviderFor,
+  listProviderTypesFor,
+  listProvidersFor,
   providerSource,
-  testProviderConnection,
-  testProviderDraft,
-  upsertProvider,
+  providerTypesQueryKey,
+  providersQueryKey,
+  testProviderConnectionFor,
+  testProviderDraftFor,
+  upsertProviderFor,
 } from "@/api/providers";
 import type {
+  ApiKeyStatus,
   ProviderInfo,
+  ProviderScope,
   ProviderTypeInfo,
   TestDraftRequest,
   TestResponse,
@@ -231,16 +237,45 @@ export function validateForm(form: FormState, isNew: boolean): string | null {
 
 // ── 组件 ─────────────────────────────────────────────────────────────────
 
-export function ProviderSection({ teamId }: { teamId: string }) {
+/** 密钥状态的展示文案：不能解析时必须点名是哪个变量没设。 */
+function keyStatusLabel(provider: ProviderInfo, status: ApiKeyStatus): string {
+  if (status === "env_unresolved") {
+    return `密钥引用的 ${provider.api_key_env ?? "环境变量"} 未设置`;
+  }
+  return status === "missing" ? "未配置密钥" : "已配置密钥";
+}
+
+/** 变量没设时的可操作指向：两条路都不需要用户去找文件。 */
+function envHint(env: string | null | undefined): string {
+  const name = env ?? "环境变量";
+  return `给 daemon 的环境变量 ${name} 赋一个非空值后重启 daemon；或在本层改填字面量密钥（同名条目即覆盖）。`;
+}
+
+/**
+ * 这一条是不是当前范围自己能改的。
+ *
+ * 「可写」与「已占用的名字」必须是同一个谓词：系统范围下沿用「team 层才算自己
+ * 写的」，本层重名校验会恒空 —— 保存就变成静默覆盖。
+ */
+export function writable(
+  provider: ProviderInfo,
+  scope: ProviderScope,
+): boolean {
+  return (
+    providerSource(provider) === (scope.kind === "system" ? "system" : "team")
+  );
+}
+
+export function ProviderSection({ scope }: { scope: ProviderScope }) {
   const queryClient = useQueryClient();
   const providersQuery = useQuery({
-    queryKey: ["providers", teamId],
-    queryFn: () => listProviders(teamId),
+    queryKey: providersQueryKey(scope),
+    queryFn: () => listProvidersFor(scope),
   });
-  // 目录是一份编译期常量，按团队维度缓存，别为它反复打网络。
+  // 目录是一份编译期常量，按 scope 维度缓存，别为它反复打网络。
   const typesQuery = useQuery({
-    queryKey: ["provider-types", teamId],
-    queryFn: () => listProviderTypes(teamId),
+    queryKey: providerTypesQueryKey(scope),
+    queryFn: () => listProviderTypesFor(scope),
     staleTime: 5 * 60_000,
   });
 
@@ -270,11 +305,13 @@ export function ProviderSection({ teamId }: { teamId: string }) {
     message: string;
   } | null>(null);
 
+  // 前缀失效：系统层改动会改掉所有团队的生效并集，只失效当前 scope 会让别的
+  // 团队页留着旧值。
   const refreshProviders = () =>
-    queryClient.invalidateQueries({ queryKey: ["providers", teamId] });
+    queryClient.invalidateQueries({ queryKey: ["providers"] });
 
   const save = useMutation({
-    mutationFn: (body: UpsertProviderRequest) => upsertProvider(teamId, body),
+    mutationFn: (body: UpsertProviderRequest) => upsertProviderFor(scope, body),
     onSuccess: (res) => {
       void refreshProviders();
       setDialogOpen(false);
@@ -283,7 +320,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
   });
 
   const remove = useMutation({
-    mutationFn: (name: string) => deleteProvider(teamId, name),
+    mutationFn: (name: string) => deleteProviderFor(scope, name),
     onSuccess: (res) => {
       void refreshProviders();
       setDeleteTarget(null);
@@ -292,7 +329,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
   });
 
   const testSaved = useMutation({
-    mutationFn: (name: string) => testProviderConnection(teamId, name),
+    mutationFn: (name: string) => testProviderConnectionFor(scope, name),
     onSuccess: (res, name) =>
       setTested({ name, ok: res.success, message: res.message }),
     onError: (error, name) =>
@@ -301,7 +338,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
 
   const testDraftMutation = useMutation({
     mutationFn: (input: { signature: string; body: TestDraftRequest }) =>
-      testProviderDraft(teamId, input.body),
+      testProviderDraftFor(scope, input.body),
     onSuccess: (result, input) =>
       setDraftTest({ signature: input.signature, result }),
     onError: (error, input) =>
@@ -319,9 +356,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
   const update = (patch: Partial<FormState>) =>
     setForm((prev) => ({ ...prev, ...patch }));
 
-  // 只有本团队写的名字算占用：继承条目正是「覆盖」的目标，算进去就没有可用的覆盖名了。
+  // 只有本范围写的名字算占用：继承条目正是「覆盖」的目标，算进去就没有可用的覆盖名了。
   const ownNames = providers
-    .filter((provider) => providerSource(provider) === "team")
+    .filter((provider) => writable(provider, scope))
     .map((provider) => provider.name);
   const nameLocked = editing !== null || overrideTarget !== null;
 
@@ -407,6 +444,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
       ? "填入默认模型后可试连"
       : null;
   const nameTaken = !nameLocked && ownNames.includes(form.name.trim());
+  // 密钥解析不出来的条目当默认 = 每一轮对话都失败，先修密钥再说
+  const defaultBlocked =
+    editing !== null && apiKeyStatus(editing) === "env_unresolved";
 
   return (
     <section className="space-y-3">
@@ -416,7 +456,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
           {providers.length}
         </span>
         <span className="min-w-0 truncate text-caption font-medium text-ink-faint">
-          providers.toml · 名称即 agent.md 里 llm.provider 引用的 key
+          {scope.kind === "system"
+            ? "所有团队未配置的 provider 都在这里兜底；这一层不属于任何团队"
+            : "providers.toml · 名称即 agent.md 里 llm.provider 引用的 key"}
         </span>
         <Button
           size="sm"
@@ -448,7 +490,13 @@ export function ProviderSection({ teamId }: { teamId: string }) {
       )}
 
       {!loading && !loadError && providers.length === 0 && (
-        <EmptyState title="这个团队还没有配置 provider，对话会走系统层默认值" />
+        <EmptyState
+          title={
+            scope.kind === "system"
+              ? "系统层还没有配置 provider：没配 provider 的团队会在对话时报错"
+              : "这个团队还没有配置 provider，对话会走系统层默认值"
+          }
+        />
       )}
 
       <ul>
@@ -458,7 +506,8 @@ export function ProviderSection({ teamId }: { teamId: string }) {
           const testing =
             testSaved.isPending && testSaved.variables === provider.name;
           const source = providerSource(provider);
-          const inherited = source !== "team";
+          const inherited = !writable(provider, scope);
+          const keyStatus = apiKeyStatus(provider);
           return (
             <li key={provider.name} className="border-b border-line">
               <div className="flex flex-col justify-center gap-0.5 px-3 py-1 @min-[760px]/work:h-10 @min-[760px]/work:flex-row @min-[760px]/work:items-center @min-[760px]/work:gap-2 @min-[760px]/work:py-0">
@@ -468,7 +517,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                   </span>
                   {inherited && (
                     <span className="shrink-0 rounded-sm bg-line/60 px-1 text-caption font-medium text-ink-faint">
-                      {source === "peco" ? "继承自 Peco" : "系统"}
+                      {source === "peco"
+                        ? "继承自 Peco"
+                        : "继承自 系统（本机）"}
                     </span>
                   )}
                   {provider.is_default && (
@@ -477,12 +528,15 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                     </span>
                   )}
                   <span
+                    data-testid="key-status"
                     className={cn(
                       "shrink-0 text-caption font-medium",
-                      provider.has_api_key ? "text-ink-faint" : "text-danger",
+                      keyStatus === "env_unresolved" || keyStatus === "missing"
+                        ? "text-danger"
+                        : "text-ink-faint",
                     )}
                   >
-                    {provider.has_api_key ? "已配置密钥" : "未配置密钥"}
+                    {keyStatusLabel(provider, keyStatus)}
                   </span>
                 </div>
                 <span className="truncate text-caption font-medium text-ink-muted @min-[760px]/work:w-24 @min-[760px]/work:shrink-0">
@@ -500,7 +554,7 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                 </span>
                 <div className="flex shrink-0 items-center gap-1">
                   {inherited ? (
-                    // 覆盖 = 在本团队文件里写下同名条目；上层文件不在本团队手里，改不到。
+                    // 覆盖 = 在本层文件里写下同名条目；上层文件不在这里，改不到。
                     <Button
                       variant="ghost"
                       size="sm"
@@ -547,6 +601,11 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                   )}
                 </div>
               </div>
+              {keyStatus === "env_unresolved" && (
+                <p className="border-t border-line px-3 py-1 text-caption font-medium text-danger">
+                  {envHint(provider.api_key_env)}
+                </p>
+              )}
               {outcome && (
                 <p
                   className={cn(
@@ -582,7 +641,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
               {editing
                 ? "留空的字段保持已存值；密钥不回读，只能覆盖不能查看。"
                 : overrideTarget
-                  ? "同名条目会写进本团队的 providers.toml，从此这一层说了算；未填的字段继续继承上一层。"
+                  ? scope.kind === "system"
+                    ? "同名条目会写进系统层，所有团队都受影响；它是继承链的最底层，没有上一层可继承。"
+                    : "同名条目会写进本团队的 providers.toml，从此这一层说了算；未填的字段继续继承上一层。"
                   : "类型选好后地址与模型已按默认值填好，填入 API Key 即可。"}
             </DialogDescription>
           </DialogHeader>
@@ -751,7 +812,11 @@ export function ProviderSection({ teamId }: { teamId: string }) {
                 id="provider-default"
                 checked={form.setDefault}
                 onCheckedChange={(checked) => update({ setDefault: checked })}
-                disabled={editing?.is_default === true || save.isPending}
+                disabled={
+                  editing?.is_default === true ||
+                  save.isPending ||
+                  defaultBlocked
+                }
               />
               <label htmlFor="provider-default" className="text-xs text-ink">
                 设为默认 provider
@@ -759,7 +824,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
               <span className="text-caption font-medium text-ink-faint">
                 {editing?.is_default
                   ? "它已经是默认 provider"
-                  : "agent.md 未指定 provider 的 agent 走它"}
+                  : defaultBlocked
+                    ? "它的密钥解析不出来，先修好密钥再设为默认"
+                    : "agent.md 未指定 provider 的 agent 走它"}
               </span>
             </div>
 
@@ -840,8 +907,9 @@ export function ProviderSection({ teamId }: { teamId: string }) {
           <DialogHeader>
             <DialogTitle>删除 Provider「{deleteTarget?.name}」？</DialogTitle>
             <DialogDescription>
-              providers.toml 里的这条配置会被删掉，不可恢复；引用它的 agent.md
-              会退回默认 provider。
+              {scope.kind === "system"
+                ? "系统层里的这条配置会被删掉，不可恢复；所有团队都受影响；若删的是默认条目，默认会自动改成剩余里字典序最小的一条。"
+                : "providers.toml 里的这条配置会被删掉，不可恢复；引用它的 agent.md 会退回默认 provider。"}
             </DialogDescription>
           </DialogHeader>
           {remove.error !== null && (

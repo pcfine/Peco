@@ -36,6 +36,14 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { frameSeq, parseSSELines, toChatSseEvent } from "@/api/stream";
+import {
+  REJECTED_TITLE,
+  chatFailureToast,
+  fromError,
+  fromResponse,
+  userFacingDetail,
+  type ChatFailure,
+} from "@/lib/chatErrors";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { TokenUsageRing } from "@/components/chat/TokenUsageRing";
 import { ToolCallCard } from "@/components/chat/ToolCallCard";
@@ -103,20 +111,6 @@ function uploadErrorMessage(err: unknown, name: string): string {
     err as { response?: { data?: { details?: string; error?: string } } }
   )?.response?.data;
   return data?.details || data?.error || `附件上传失败：${name}`;
-}
-
-/**
- * 从错误响应体里取 `code`（`{code, error, details}`，取不到返回 null）。
- *
- * 分流按 code 走、不解析文案：`conversation_busy` 与其它 409 的处理方式不同。
- */
-function errorCodeOf(body: string): string | null {
-  try {
-    const parsed = JSON.parse(body) as { code?: unknown };
-    return typeof parsed.code === "string" ? parsed.code : null;
-  } catch {
-    return null;
-  }
 }
 
 /** 上传进度回调：0–100（服务端未给出总长度时不回调）。 */
@@ -557,26 +551,46 @@ export function ChatView({
       const controller = new AbortController();
       abortRef.current = controller;
 
+      /**
+       * 撤掉刚乐观插进去的两条气泡，输入与附件原样还给用户。
+       *
+       * 只在「服务端那一轮根本没跑起来」时调用：帧一旦进来，撤气泡会让人以为
+       * 消息没发出去，而它其实已经跑了。
+       */
+      const restoreOptimistic = () => {
+        setMessages((prev) =>
+          prev.filter((m) => m !== userMsg && m !== assistantMsg),
+        );
+        setInput(text);
+        setPendingAttachments(attachments);
+      };
+
+      const reportFailure = (failure: ChatFailure) => {
+        const line = chatFailureToast(failure);
+        if (!line) return;
+        if (line.description) {
+          toast.error(line.title, { description: line.description });
+        } else {
+          toast.error(line.title);
+        }
+      };
+
+      /** `fetch` 是否已 resolve：false 才可能确实是「连不上」。 */
+      let responded = false;
+      /** 本轮已应用的帧数：0 = 服务端那轮没跑起来，回滚才是对的。 */
+      let framesApplied = 0;
+
       try {
         const url = streamUrlRef.current(text, fileIds);
         const response = await fetch(url, { signal: controller.signal });
+        responded = true;
         if (!response.ok) {
           const errText = await response.text().catch(() => "");
-          if (
-            response.status === 409 &&
-            errorCodeOf(errText) === "conversation_busy"
-          ) {
-            // 这一轮还在跑（别的标签页 / 上一轮没收尾）：重发不是解法，先把刚
-            // 乐观插进去的两条气泡撤掉，输入原样还给用户 —— 让他先停止或等它收尾。
-            setMessages((prev) =>
-              prev.filter((m) => m !== userMsg && m !== assistantMsg),
-            );
-            setInput(text);
-            setPendingAttachments(attachments);
-            toast.error("这一轮还在跑，先停止再发");
-            return;
-          }
-          throw new Error(errText || `HTTP ${response.status}`);
+          // 观测点即分类点：回了响应就一定不是「连不上」，别再落进 catch。
+          const failure = fromResponse(response.status, errText);
+          restoreOptimistic();
+          reportFailure(failure);
+          return;
         }
         const reader = response.body!.getReader();
         const decoder = new TextDecoder();
@@ -609,9 +623,12 @@ export function ChatView({
               // 先记水位再应用（帧序规则第 2 条）：快照之后的重叠帧一律丢弃
               watermark = event.data.seq;
               setUsage(event.data.usage);
+              // 快照早于下面的水位过滤，单独计一帧
+              framesApplied += 1;
             } else {
               const seq = frameSeq(parsed.id);
               if (seq !== null && seq <= watermark) continue;
+              framesApplied += 1;
             }
 
             if (event.event === "usage") {
@@ -646,8 +663,23 @@ export function ChatView({
           }
         }
       } catch (err: unknown) {
-        if (err instanceof Error && err.name === "AbortError") return;
-        toast.error("连接中断");
+        const failure = fromError(err, responded);
+        // 用户自己按的停止：界面上的这一轮由停止流程收尾，不提示也不回滚
+        if (failure.kind === "aborted") return;
+        // 帧已进来 ⇒ 服务端那一轮可能已经跑了，撤气泡会让人以为没发出去
+        if (failure.kind === "stream" && framesApplied > 0) {
+          reportFailure(failure);
+          return;
+        }
+        restoreOptimistic();
+        if (failure.kind === "stream") {
+          // 有响应却一帧未出：服务端那轮没跑起来，与「拒绝」同档
+          const detail = userFacingDetail(failure.detail);
+          if (detail) toast.error(REJECTED_TITLE, { description: detail });
+          else toast.error(REJECTED_TITLE);
+          return;
+        }
+        reportFailure(failure);
       } finally {
         // 兜底：若这一轮没等到 `done`（连接断在半路），流式态仍要关掉 —— 服务端
         // 那一轮有没有跑完由下一次 attach（204/快照）交代，本地只负责不再假装在生成。

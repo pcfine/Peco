@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   SettingsPage,
@@ -68,6 +68,8 @@ const TYPES = [
 ];
 
 let teams: Team[];
+/** 系统层的条目：只在这个 scope 被选中时请求。 */
+let systemProviders: unknown[];
 
 function provider(
   name: string,
@@ -86,9 +88,9 @@ function provider(
   };
 }
 
-/** 打开团队下拉：Radix Select 用键盘开，jsdom 里的指针事件它不认。 */
-async function openTeamSelect() {
-  const trigger = await screen.findByRole("combobox", { name: "团队" });
+/** 打开配置范围下拉：Radix Select 用键盘开，jsdom 里的指针事件它不认。 */
+async function openScopeSelect() {
+  const trigger = await screen.findByRole("combobox", { name: "配置范围" });
   fireEvent.keyDown(trigger, { key: "Enter" });
   return screen.findAllByRole("option");
 }
@@ -106,6 +108,7 @@ function renderPage() {
 
 beforeEach(() => {
   teams = [team("research", "研发"), team("peco", "Peco", true)];
+  systemProviders = [];
   get.mockReset().mockImplementation(async (url: string) => {
     if (url === "/teams") return { data: teams };
     if (url === "/brand") return { data: { image: "" } };
@@ -114,6 +117,8 @@ beforeEach(() => {
       return { data: [provider("qwen")] };
     if (url === "/teams/peco/providers")
       return { data: [provider("deepseek")] };
+    // 系统层：不带团队的那组路由
+    if (url === "/providers") return { data: systemProviders };
     if (url.endsWith("/providers/types")) return { data: TYPES };
     throw new Error(`unexpected GET ${url}`);
   });
@@ -121,13 +126,15 @@ beforeEach(() => {
 });
 
 describe("设置页", () => {
-  it("品牌区排在团队之前，并注明对所有空间与团队生效", async () => {
+  it("品牌区排在配置范围之前，并注明对所有空间与团队生效", async () => {
     renderPage();
 
     const brandHeading = await screen.findByRole("heading", { name: "品牌" });
-    const teamHeading = await screen.findByRole("heading", { name: "团队" });
+    const scopeHeading = await screen.findByRole("heading", {
+      name: "配置范围",
+    });
     expect(
-      brandHeading.compareDocumentPosition(teamHeading) &
+      brandHeading.compareDocumentPosition(scopeHeading) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(screen.getByText("对所有空间与团队生效")).toBeInTheDocument();
@@ -143,11 +150,13 @@ describe("设置页", () => {
     expect(teams.map((row) => row.team_id)).toEqual(["research", "peco"]);
   });
 
-  it("团队下拉来自 include=peco 的那份清单，Peco 排在第一个", async () => {
+  it("配置范围下拉来自 include=peco 的那份清单，系统层伪条目置顶", async () => {
     renderPage();
-    const options = await openTeamSelect();
+    const options = await openScopeSelect();
 
+    // 继承链自上而下：系统层在最前，Peco 是团队层的兜底
     expect(options.map((option) => option.textContent)).toEqual([
+      "系统（本机）",
       "Peco（默认兜底）",
       "研发",
     ]);
@@ -171,13 +180,13 @@ describe("设置页", () => {
     expect(
       await screen.findByText("其它团队未配置的 provider 从这里继承"),
     ).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "团队" })).toHaveTextContent(
-      "Peco（默认兜底）",
-    );
+    expect(
+      screen.getByRole("combobox", { name: "配置范围" }),
+    ).toHaveTextContent("Peco（默认兜底）");
     expect(get).toHaveBeenCalledWith("/teams/peco/providers", undefined);
   });
 
-  it("Peco 没有任何带密钥的自有条目时摆一条提示", async () => {
+  it("Peco 视图里链上一条可用密钥都没有时摆一条提示", async () => {
     get.mockImplementation(async (url: string) => {
       if (url === "/teams") return { data: teams };
       if (url === "/brand") return { data: { image: "" } };
@@ -193,20 +202,22 @@ describe("设置页", () => {
     renderPage();
 
     expect(
-      await screen.findByText(/Peco 还没有配置自己的 provider 密钥/),
+      await screen.findByText(/Peco 和系统层都没有一条能用的 provider 密钥/),
     ).toBeInTheDocument();
   });
 
-  it("提示只看 Peco 的自有条目：没拉到、或自有条目已带密钥都不提示", () => {
+  it("提示看的是整条链：任一层有可解析的密钥就算配好了", () => {
     expect(pecoNeedsSetup(undefined)).toBe(false);
 
     expect(pecoNeedsSetup([provider("deepseek")])).toBe(false);
 
-    // 自己的条目没密钥，或压根没有自有条目（列表里只剩继承来的）。
+    // 一条能用的都没有（没密钥 / 空列表）才提示
     expect(pecoNeedsSetup([provider("deepseek", "team", false)])).toBe(true);
     expect(pecoNeedsSetup([])).toBe(true);
-    expect(pecoNeedsSetup([provider("qwen", "peco")])).toBe(true);
-    expect(pecoNeedsSetup([provider("openai", "system")])).toBe(true);
+
+    // 链的终点已迁到系统层：Peco 自己没有、系统层有，也够用
+    expect(pecoNeedsSetup([provider("qwen", "peco")])).toBe(false);
+    expect(pecoNeedsSetup([provider("openai", "system")])).toBe(false);
   });
 
   it("默认选当前空间所属团队，拉的是它的 provider 配置", async () => {
@@ -214,28 +225,73 @@ describe("设置页", () => {
 
     expect(await screen.findByText("qwen")).toBeInTheDocument();
     expect(screen.queryByText("deepseek")).toBeNull();
-    expect(screen.getByRole("combobox", { name: "团队" })).toHaveTextContent(
-      "研发",
-    );
+    expect(
+      screen.getByRole("combobox", { name: "配置范围" }),
+    ).toHaveTextContent("研发");
     expect(get).toHaveBeenCalledWith("/teams/research/providers", undefined);
   });
 
-  it("只有一个团队时不摆选择器，直接显示团队名", async () => {
+  it("只有一个团队时仍然能选到系统（本机）", async () => {
     teams = [team("research", "研发")];
     get.mockImplementation(async (url: string) => {
       if (url === "/teams") return { data: teams };
       if (url === "/brand") return { data: { image: "" } };
-      if (url === "/brand") return { data: { image: "" } };
       if (url === "/spaces") return { data: [space("ws_r", "research")] };
       if (url === "/teams/research/providers")
         return { data: [provider("qwen")] };
+      if (url === "/providers") return { data: [] };
       if (url.endsWith("/providers/types")) return { data: TYPES };
       throw new Error(`unexpected GET ${url}`);
     });
     renderPage();
 
     expect(await screen.findByText("qwen")).toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: "团队" })).toBeNull();
-    expect(screen.getByText("研发")).toBeInTheDocument();
+    // 新装环境只有 Peco 一个团队：单团队不渲染下拉，系统层就点不到了
+    const options = await openScopeSelect();
+    expect(options.map((option) => option.textContent)).toContain(
+      "系统（本机）",
+    );
+  });
+
+  it("选中系统（本机）后保持选中，请求打到不带团队的 /api/providers", async () => {
+    systemProviders = [provider("openai", "system")];
+    renderPage();
+    const options = await openScopeSelect();
+
+    fireEvent.click(options[0]);
+
+    await waitFor(() =>
+      expect(get).toHaveBeenCalledWith("/providers", undefined),
+    );
+    // 选中值不被「回落到某个团队」改掉
+    expect(
+      screen.getByRole("combobox", { name: "配置范围" }),
+    ).toHaveTextContent("系统（本机）");
+    // 列表也换成了系统层那份：团队层的 qwen 不在这一屏
+    expect(await screen.findByText("openai")).toBeInTheDocument();
+    expect(screen.queryByText("qwen")).toBeNull();
+  });
+
+  it("零团队时仍渲染系统范围，并说明团队建好后自动继承", async () => {
+    teams = [];
+    get.mockImplementation(async (url: string) => {
+      if (url === "/teams") return { data: teams };
+      if (url === "/brand") return { data: { image: "" } };
+      if (url === "/spaces") return { data: [] };
+      if (url === "/providers") return { data: [] };
+      if (url.endsWith("/providers/types")) return { data: TYPES };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    renderPage();
+
+    expect(
+      await screen.findByText(/还没有团队；先在这里配系统 provider/),
+    ).toBeInTheDocument();
+    expect(get).toHaveBeenCalledWith("/providers", undefined);
+    expect(
+      screen.getByText(
+        "所有团队未配置的 provider 都在这里兜底；这一层不属于任何团队",
+      ),
+    ).toBeInTheDocument();
   });
 });
