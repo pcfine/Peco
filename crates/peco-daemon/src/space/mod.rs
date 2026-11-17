@@ -127,22 +127,11 @@ impl SpaceEnv {
             .hooks
             .push(self.dispatch_hook(ws_id.to_string(), team_id.to_string(), work_dir));
         if self.peco.is_peco_space(ws_id) {
-            // 动态清单靠 Hub 判「已关闭」：没有实例表时列出来的目标可能早已销毁，
-            // 与其给一份不可信的清单，不如让这一轮没有清单。
-            match self.hub() {
-                Some(hub) => {
-                    config.dynamic_context = Some(Arc::new(SpaceCatalogContext::new(
-                        self.pool.clone(),
-                        hub,
-                        self.peco.clone(),
-                        self.home.clone(),
-                    )));
-                }
-                None => tracing::warn!(
-                    ws_id = %ws_id,
-                    "space hub not attached; peco space gets no dynamic catalog"
-                ),
-            }
+            config.dynamic_context = Some(Arc::new(SpaceCatalogContext::new(
+                self.pool.clone(),
+                self.peco.clone(),
+                self.home.clone(),
+            )));
         }
         config
     }

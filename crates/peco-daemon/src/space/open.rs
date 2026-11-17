@@ -355,8 +355,9 @@ fn start_file_watcher(env: &SpaceEnv, team: &str, ws: &Arc<WorkSpace>) -> Option
 
 /// 按 `ws_id` 打开已索引的空间；先做 daemon 侧的「目录消失」判定，再委托 Hub。
 ///
-/// 这是启动恢复与测试的入口：Hub 的 `ensure_open` 要求目录存在，而 daemon
-/// 需要把「打开过、目录又没了」归类为 `work_dir_missing` 并写 `closed_at`。
+/// 这是 `POST /api/spaces/{ws_id}/open` 与测试的入口：Hub 的 `ensure_open`
+/// 要求目录存在，而 daemon 需要把「打开过、目录又没了」归类为
+/// `work_dir_missing` 并写 `closed_at`。
 pub async fn ensure_open_indexed(
     env: &SpaceEnv,
     hub: &Arc<WorkspaceHub>,

@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
             get(space::detail).patch(space::update).delete(space::purge),
         )
         .route("/api/spaces/{ws_id}/close", post(space::close))
+        .route("/api/spaces/{ws_id}/open", post(space::open))
         .route("/api/spaces/{ws_id}/tasks", get(tasks::list_for_space))
         // 实时观察只读该空间的 TaskHub 内存：未打开时 409，不拿空列表冒充。
         // `live` 是静态段，与 `{task_id}` 子树不重叠（前者两段，后者三段）。

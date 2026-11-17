@@ -1,7 +1,7 @@
 //! 注入 Peco 空间 system prompt 的工作空间与团队清单。
 //!
 //! 派发按目录寻址，Peco 必须知道每个空间的可派发目录、所属团队与在飞任务数；
-//! 这些值每轮都可能变（空间开关、任务进出），所以走 `dynamic_context` 而不是
+//! 这些值每轮都可能变（空间被关闭、任务进出），所以走 `dynamic_context` 而不是
 //! 会话级恒定的 `environment`。
 
 use std::path::PathBuf;
@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use peco_core::agent::DynamicContext;
-use peco_core::tools::WorkspaceHub;
 use sqlx::SqlitePool;
 use tracing::warn;
 
@@ -23,36 +22,23 @@ const MAX_CATALOG_CHARS: usize = 1200;
 
 pub struct SpaceCatalogContext {
     pool: SqlitePool,
-    hub: Arc<WorkspaceHub>,
     peco: Arc<PecoIdentity>,
     home: PathBuf,
 }
 
 impl SpaceCatalogContext {
-    pub fn new(
-        pool: SqlitePool,
-        hub: Arc<WorkspaceHub>,
-        peco: Arc<PecoIdentity>,
-        home: PathBuf,
-    ) -> Self {
-        Self {
-            pool,
-            hub,
-            peco,
-            home,
-        }
+    pub fn new(pool: SqlitePool, peco: Arc<PecoIdentity>, home: PathBuf) -> Self {
+        Self { pool, peco, home }
     }
 
-    /// 采集 + 落格式；任何 DB/Hub 失败都上抛给 [`DynamicContext::query`] 降级。
+    /// 采集 + 落格式；任何 DB 失败都上抛给 [`DynamicContext::query`] 降级。
     async fn catalog(&self) -> Result<Catalog, DaemonError> {
         let mut spaces = Vec::new();
         for row in workspaces::list(&self.pool).await? {
-            // 已关闭的空间实例已销毁，列出来等于给一个必然失败的派发目标。
+            // 只排除用户显式关过的目标：替他撤销一次关闭，比漏一个目标更糟。
+            // 「当前没打开」不是排除理由 —— 派发自己会 `ensure_open` 再投递，
+            // 而重启后除 Peco 外都在未打开，按它过滤等于让 Peco 认不出任何目标。
             if row.closed_at.is_some() {
-                continue;
-            }
-            let dir = PathBuf::from(&row.work_dir);
-            if !self.hub.is_open(&dir) {
                 continue;
             }
             let inflight = dispatches::inflight_counts(&self.pool, &row.id, &self.peco.ws_id)

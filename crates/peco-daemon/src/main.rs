@@ -1,4 +1,4 @@
-//! daemon 入口：配置 → 单用户 DB 与迁移 → 单实例检查 → 索引普查 → 恢复已打开的空间 → HTTP。
+//! daemon 入口：配置 → 单用户 DB 与迁移 → 单实例检查 → 索引普查 → HTTP。
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use peco_daemon::http;
 use peco_daemon::single_instance;
 use peco_daemon::space::SpaceEnv;
 use peco_daemon::space::ledger::SqliteTaskLedger;
-use peco_daemon::space::open::{self, DaemonOpener};
+use peco_daemon::space::open::DaemonOpener;
 use peco_daemon::space::peco;
 use peco_daemon::space::registry::SpaceRegistry;
 use peco_daemon::space::tasks::TaskObserver;
@@ -104,7 +104,7 @@ async fn run() -> Result<(), DaemonError> {
         });
     }
 
-    // Peco 的团队与默认空间是 Peco 会话的宿主：先幂等装好，再普查与恢复 ——
+    // Peco 的团队与默认空间是 Peco 会话的宿主：先幂等装好，再普查 ——
     // 普查在引导之前跑会白扫一次刚建出来的目录。
     peco_daemon::space::bootstrap::bootstrap_peco(&env).await;
 
@@ -115,7 +115,9 @@ async fn run() -> Result<(), DaemonError> {
         "workspace index rescanned"
     );
 
-    restore_opened_spaces(&env, &hub).await;
+    // 启动不预开用户空间：空间在被进入时打开（`POST /api/spaces/{ws_id}/open`
+    // 由前端在进入时调用）。Peco 主空间是例外，它由 `bootstrap_peco` 打开 ——
+    // 会话宿主与唤醒落点必须从第一个请求起就在。
 
     // 资源模块经这一个适配层取实例：Hub 仍是唯一真源，注册表只做 ws_id → 目录。
     let spaces = Arc::new(SpaceRegistry::new(hub.clone(), env.clone()));
@@ -159,26 +161,4 @@ async fn run() -> Result<(), DaemonError> {
     http::serve(state).await?;
     info!("http server stopped; daemon exit");
     Ok(())
-}
-
-/// 重启后复活上次打开过的空间；单个失败只 warn —— 一个坏空间不该拦住整个 daemon。
-async fn restore_opened_spaces(env: &SpaceEnv, hub: &Arc<WorkspaceHub>) {
-    let rows = match db::workspaces::list(&env.pool).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!(error = %e, "cannot list spaces; skipping restore");
-            return;
-        }
-    };
-    for row in rows.iter().filter(|row| row.last_opened_at.is_some()) {
-        match open::ensure_open_indexed(env, hub, &row.id).await {
-            Ok(_) => info!(ws_id = %row.id, "space restored"),
-            Err(e) => warn!(
-                ws_id = %row.id,
-                code = e.code(),
-                error = %e,
-                "space restore failed; leaving it closed"
-            ),
-        }
-    }
 }

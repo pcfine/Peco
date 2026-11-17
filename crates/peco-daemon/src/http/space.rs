@@ -1,4 +1,4 @@
-//! `/api/spaces` —— 空间列表、创建、详情、运行属性修改、关闭与删除。
+//! `/api/spaces` —— 空间列表、创建、详情、运行属性修改、打开与关闭、删除。
 //!
 //! 每个 handler 只做三件事：取参数、调领域函数、拼响应；门槛与决策表都在
 //! `space::close` 与 `space::open` 里，这里重复一遍就会有两份定义。
@@ -237,6 +237,26 @@ pub async fn update(
     }
 
     let row = by_id(&state, &row.id).await?;
+    Ok(Json(space_view(&state, row).await?))
+}
+
+/// 打开一个已索引的空间；不重建实例，已经打开就原样返回。
+///
+/// 打开动作会改 `closed_at` 与 `last_opened_at`，所以视图基于打开之后重读的那一行，
+/// 不是打开之前取到的快照。
+pub async fn open(
+    State(state): State<AppState>,
+    UrlPath(ws_id): UrlPath<String>,
+) -> Result<Json<SpaceView>, DaemonError> {
+    // 未知 id 在 opener 之前就拒掉：路径错的请求不该走一遍目录判定。
+    let row = by_id(&state, &ws_id).await?;
+    // 实例活着就已经是「打开」，目录在不在只影响下一次打开：这里放行，
+    // 否则删掉一个正在跑的目录会把活着的实例报成 409。
+    if state.hub.is_open(Path::new(&row.work_dir)) {
+        return Ok(Json(space_view(&state, row).await?));
+    }
+    open::ensure_open_indexed(&state.env, &state.hub, &ws_id).await?;
+    let row = by_id(&state, &ws_id).await?;
     Ok(Json(space_view(&state, row).await?))
 }
 

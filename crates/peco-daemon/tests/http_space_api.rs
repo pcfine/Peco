@@ -668,3 +668,177 @@ async fn rebinding_a_space_to_the_reserved_peco_team_is_400() {
         "被拒的改绑不得改 marker"
     );
 }
+
+/// 列表里按 `ws_id` 挑一行：清单接口的断言不该依赖行序。
+fn row_in(list: &serde_json::Value, ws_id: &str) -> serde_json::Value {
+    list.as_array()
+        .unwrap_or_else(|| panic!("空间清单必须是数组: {list}"))
+        .iter()
+        .find(|row| row["ws_id"] == json!(ws_id))
+        .unwrap_or_else(|| panic!("清单里必须有 {ws_id}: {list}"))
+        .clone()
+}
+
+/// 关闭之后显式打开：`POST /open` 回 200，视图是**打开之后**的那一行。
+///
+/// 变异：handler 复用打开之前取到的 row 拼视图 → `closed_at` 仍是旧值，断言变红。
+#[tokio::test]
+async fn open_endpoint_reopens_a_closed_space() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("reopen");
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+        )
+        .await;
+    let ws_id = ws_id_of(&created);
+
+    let closed = env
+        .post(
+            &format!("/api/spaces/{ws_id}/close"),
+            json!({"force": true}),
+        )
+        .await;
+    assert_eq!(closed.status, 200, "body={}", closed.body);
+    assert_eq!(
+        env.get(&format!("/api/spaces/{ws_id}")).await.body["status"],
+        json!("closed")
+    );
+
+    let reopened = env
+        .post(&format!("/api/spaces/{ws_id}/open"), json!({}))
+        .await;
+    assert_eq!(reopened.status, 200, "body={}", reopened.body);
+    assert_eq!(reopened.body["ws_id"], json!(ws_id));
+    assert_eq!(reopened.body["status"], json!("open"));
+    assert_eq!(
+        reopened.body["closed_at"],
+        json!(null),
+        "重开必须清掉关闭时刻: {}",
+        reopened.body
+    );
+    assert!(
+        reopened.body["last_opened_at"].as_str().is_some(),
+        "打开必须写入 last_opened_at: {}",
+        reopened.body
+    );
+
+    let listed = row_in(&env.get("/api/spaces").await.body, &ws_id);
+    assert_eq!(listed["status"], json!("open"));
+    assert_eq!(listed["closed_at"], json!(null));
+    assert!(listed["last_opened_at"].as_str().is_some());
+}
+
+/// 幂等：已经打开的空间再开一次仍是 200，状态不变。
+#[tokio::test]
+async fn open_endpoint_is_idempotent() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("twice");
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+        )
+        .await;
+    let ws_id = ws_id_of(&created);
+
+    for attempt in 1..=2 {
+        let reply = env
+            .post(&format!("/api/spaces/{ws_id}/open"), json!({}))
+            .await;
+        assert_eq!(reply.status, 200, "第 {attempt} 次打开: {}", reply.body);
+        assert_eq!(reply.body["status"], json!("open"));
+        assert_eq!(reply.body["closed_at"], json!(null));
+    }
+    assert_eq!(
+        env.get(&format!("/api/spaces/{ws_id}")).await.body["status"],
+        json!("open")
+    );
+}
+
+/// 未知 id 是 `space_not_found`，与关闭、详情同一个口径。
+#[tokio::test]
+async fn open_unknown_space_is_404() {
+    let env = new_env(&["research"]).await;
+
+    let reply = env.post("/api/spaces/ws_nope/open", json!({})).await;
+
+    assert_eq!(reply.status, 404, "body={}", reply.body);
+    assert_eq!(reply.code(), "space_not_found");
+}
+
+/// 目录消失 ⇒ `work_dir_missing`，并把这一行记成「已关闭」—— 列表的三组靠它分开。
+///
+/// 前件是「打开过、实例又不在、目录也没了」：实例还活着时 `/open` 直接回视图，
+/// 那条路径由 `open_of_a_live_space_survives_a_deleted_work_dir` 钉住。
+#[tokio::test]
+async fn open_reports_missing_work_dir_and_marks_closed() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("gone");
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+        )
+        .await;
+    let ws_id = ws_id_of(&created);
+
+    // 前件成立才算「打开过、目录又没了」：last_opened_at 有值、closed_at 还是空，
+    // 实例则已经不在表里 —— 重启之后每一行都是这个样子。
+    let before = env.get(&format!("/api/spaces/{ws_id}")).await;
+    assert!(before.body["last_opened_at"].as_str().is_some());
+    assert_eq!(before.body["closed_at"], json!(null));
+    env.hub.forget(&work_dir);
+    assert!(!env.is_open(&ws_id).await, "前件：实例不在表里");
+
+    std::fs::remove_dir_all(&work_dir).unwrap();
+
+    let reply = env
+        .post(&format!("/api/spaces/{ws_id}/open"), json!({}))
+        .await;
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+    assert_eq!(reply.code(), "work_dir_missing");
+
+    let after = env.get(&format!("/api/spaces/{ws_id}")).await;
+    assert!(
+        after.body["closed_at"].as_str().is_some(),
+        "打不开的空间要落进「已关闭」: {}",
+        after.body
+    );
+}
+
+/// 实例已经活着时目录被删：`/open` 仍是 200 —— 在跑的实例不该被一次目录检查报成打不开。
+///
+/// 变异：去掉 handler 里 `hub.is_open` 的短路 → 落进 `ensure_open_indexed` 的目录判定，
+/// 这条请求变成 409 `work_dir_missing`。
+#[tokio::test]
+async fn open_of_a_live_space_survives_a_deleted_work_dir() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("live");
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+        )
+        .await;
+    let ws_id = ws_id_of(&created);
+    assert!(env.is_open(&ws_id).await, "夹具前提：创建即打开");
+
+    std::fs::remove_dir_all(&work_dir).unwrap();
+
+    let reply = env
+        .post(&format!("/api/spaces/{ws_id}/open"), json!({}))
+        .await;
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["status"], json!("open"));
+    assert_eq!(
+        reply.body["closed_at"],
+        json!(null),
+        "活着的实例不该被记成「已关闭」: {}",
+        reply.body
+    );
+
+    let detail = env.get(&format!("/api/spaces/{ws_id}")).await;
+    assert_eq!(detail.body["status"], json!("open"));
+}

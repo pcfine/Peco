@@ -1,7 +1,7 @@
 //! Peco 空间的动态上下文：清单格式、截断、注入范围与失败降级。
 //!
-//! 清单会进 Peco 的 system prompt 并当作派发目标的来源：列出一个打不开的空间
-//! 就是给出一条必然失败的任务，因此「列谁、不列谁」是行为契约而非展示细节。
+//! 清单会进 Peco 的 system prompt 并当作派发目标的来源：漏掉一个可派发的空间，
+//! Peco 就无从定位用户嘴里的那个目标，因此「列谁、不列谁」是行为契约而非展示细节。
 
 mod support;
 
@@ -14,12 +14,7 @@ use serde_json::json;
 use support::{TestEnv, new_env};
 
 fn catalog(env: &TestEnv) -> SpaceCatalogContext {
-    SpaceCatalogContext::new(
-        env.pool.clone(),
-        env.hub.clone(),
-        env.env.peco.clone(),
-        env.home.clone(),
-    )
+    SpaceCatalogContext::new(env.pool.clone(), env.env.peco.clone(), env.home.clone())
 }
 
 async fn install_teams(env: &TestEnv, teams: &[&str]) {
@@ -30,13 +25,15 @@ async fn install_teams(env: &TestEnv, teams: &[&str]) {
     }
 }
 
-/// 已关闭空间与「只有索引、从未打开」的空间都不能出现：前者实例已销毁，后者
-/// 派发必然失败。两个条件各有独立可观察的反例（`gone` / `indexed` / `stale`）。
+/// 清单排除的是「用户显式关过」，不是「当前没打开」：前者是他拒绝过的目标，
+/// 后者派发会在投递前自己 `ensure_open`，藏起来只会让 Peco 认不出重启后那一片
+/// 未打开的空间。三个反例各钉一个条件（`gone` / `stale` 靠 `closed_at` 排除，
+/// `indexed` 证明 `is_open` 不再参与）。
 ///
-/// 变异方法：去掉 `closed_at.is_some()` 过滤 → `stale` 行出现；
-/// 去掉 `hub.is_open()` 过滤 → `indexed` 行出现。
+/// 变异方法：去掉 `closed_at.is_some()` 过滤 → `gone` / `stale` 行出现；
+/// 把 `hub.is_open()` 过滤加回去 → `indexed` 行消失。
 #[tokio::test]
-async fn the_catalog_lists_only_dispatchable_spaces_and_installed_teams() {
+async fn the_catalog_lists_unclosed_spaces_and_installed_teams() {
     let env = new_env(&[]).await;
     bootstrap_peco(&env.env).await;
     install_teams(&env, &["research"]).await;
@@ -57,8 +54,13 @@ async fn the_catalog_lists_only_dispatchable_spaces_and_installed_teams() {
         .await
         .expect("补索引行不该失败");
 
+    assert!(
+        !env.is_open(&indexed).await,
+        "夹具前提：这一行只有索引，实例表里没有它"
+    );
+
     // 索引与实例表可以分叉：这里直接把 closed_at 写上，实例仍活着。
-    // 清单要求两个条件同时满足，否则会向 Peco 报一个「已关闭但还在跑」的空间。
+    // 清单只认 closed_at —— 否则会向 Peco 报一个「已关闭但还在跑」的空间。
     let stale = env.open_space("stale", "research").await;
     workspaces::set_closed_at(&env.pool, &stale).await.unwrap();
     assert!(
@@ -80,11 +82,11 @@ async fn the_catalog_lists_only_dispatchable_spaces_and_installed_teams() {
     );
     assert!(
         !text.contains(&format!("ws_id={gone}")),
-        "已关闭的空间不该出现: {text}"
+        "用户显式关闭的空间不该出现: {text}"
     );
     assert!(
-        !text.contains(&format!("ws_id={indexed}")),
-        "只有索引没有实例的空间不该出现: {text}"
+        text.contains(&format!("ws_id={indexed}")),
+        "只有索引、从未打开的空间必须出现：派发会懒打开: {text}"
     );
     assert!(
         !text.contains(&format!("ws_id={stale}")),
@@ -102,7 +104,7 @@ async fn the_catalog_lists_only_dispatchable_spaces_and_installed_teams() {
     );
     assert!(
         text.contains(&format!(
-            "共 2 个空间；当前空间 dir={} ws_id=ws_peco",
+            "共 3 个空间；当前空间 dir={} ws_id=ws_peco",
             env.work_dir("peco").display()
         )),
         "{text}"
@@ -192,12 +194,7 @@ async fn a_broken_database_yields_no_catalog_instead_of_an_error() {
 
     // 独立连接池：关掉它不影响夹具自己的池，失败原因单一。
     let doomed = db::connect(&env.config.db_url()).await.unwrap();
-    let context = SpaceCatalogContext::new(
-        doomed.clone(),
-        env.hub.clone(),
-        env.env.peco.clone(),
-        env.home.clone(),
-    );
+    let context = SpaceCatalogContext::new(doomed.clone(), env.env.peco.clone(), env.home.clone());
     doomed.close().await;
 
     assert!(
