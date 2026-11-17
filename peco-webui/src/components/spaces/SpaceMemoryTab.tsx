@@ -75,7 +75,18 @@ function ListSkeleton() {
   );
 }
 
-export function SpaceMemoryTab({ wsId }: { wsId: string }) {
+export function SpaceMemoryTab({
+  wsId,
+  open = true,
+}: {
+  wsId: string;
+  /**
+   * 空间是否已经打开。未打开时清单接口一律 409：请求挡在发出之前，而不是
+   * 读回错误再翻译。与下面按空间状态兜底的那一路是两个判据 —— 页面手上那一
+   * 份是刚读到的，`useSpace` 那份可能还是 15s 前的快照。
+   */
+  open?: boolean;
+}) {
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -89,7 +100,7 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
   const list = useSpaceMemoryDocuments(
     wsId,
     { query, category },
-    { enabled: spaceOpen },
+    { enabled: open && spaceOpen },
   );
 
   // 换了条件就收起详情：展开的行可能已经不在新列表里，正文会和列表讲两件事。
@@ -108,6 +119,14 @@ export function SpaceMemoryTab({ wsId }: { wsId: string }) {
     setSearch("");
     setCategory(null);
   };
+
+  if (!open) {
+    return (
+      <div className="p-3">
+        <p className="text-sm text-ink-muted">空间未打开，暂时看不到记忆。</p>
+      </div>
+    );
+  }
 
   const listFailed = spaceOpen && list.error !== null;
   // 状态是 15s 前的快照，清单请求才是当下：两者冲突时以后者为准。

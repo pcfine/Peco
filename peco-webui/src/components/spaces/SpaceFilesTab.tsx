@@ -74,22 +74,28 @@ function Breadcrumb({
 export function SpaceFilesTab({
   wsId,
   active = true,
+  open = true,
 }: {
   wsId: string;
   /** 面板是否真的在看：隐藏或切到别的模式时停轮询。 */
   active?: boolean;
+  /**
+   * 空间是否已经打开。未打开时目录接口一律 409，请求发出去只会把原文案钉在
+   * 面板上 —— 闸门在这里，不在错误处理里。
+   */
+  open?: boolean;
 }) {
   const [dir, setDir] = useState("");
   const [openPath, setOpenPath] = useState<string | null>(null);
 
   const pollMs = active ? SPACE_FILES_POLL_MS : false;
   const listing = useSpaceFiles(wsId, dir, {
-    enabled: openPath === null,
+    enabled: open && openPath === null,
     refetchInterval: pollMs,
   });
   // 预览也跟着轮：文件可能在编辑器里被改过，用户重新点开前该看到新内容。
   const preview = useSpaceFiles(wsId, openPath ?? "", {
-    enabled: openPath !== null,
+    enabled: open && openPath !== null,
     refetchInterval: pollMs,
   });
 
@@ -145,6 +151,14 @@ export function SpaceFilesTab({
       timers.clear();
     };
   }, []);
+
+  if (!open) {
+    return (
+      <div className="p-3">
+        <p className="text-sm text-ink-muted">空间未打开，暂时看不到文件。</p>
+      </div>
+    );
+  }
 
   const openDir = (next: string) => {
     setOpenPath(null);

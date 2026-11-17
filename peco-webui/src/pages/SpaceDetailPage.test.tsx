@@ -23,37 +23,103 @@ import { useSpacePanelState } from "@/components/spaces/useSpacePanelState";
 import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import { toast } from "sonner";
 import { ApiError } from "@/lib/api";
-import type { LiveTaskView, Space, Task } from "@/types/daemon";
+import type {
+  LiveTaskView,
+  Space,
+  SpaceFilesResponse,
+  Task,
+} from "@/types/daemon";
 import type { Message } from "@/types/chat";
 
 // 聊天页的装配面：两块并排、双向折叠、右栏模式与持久化、冲突提示。
 // 取数全换成固定值 —— 真接口由 daemon 的集成测试覆盖。
 
-const mocks = vi.hoisted(() => ({
-  ensure: vi.fn(async (wsId: string) => ({
-    conversation_id: `conv_${wsId}`,
-    created: false,
-  })),
-  tasks: vi.fn(async (_wsId: string): Promise<Task[]> => []),
-  /** 默认走「空间未打开」这条路：提示与角标于是回落到台账，与真实漂移一致。 */
-  live: vi.fn(async (_wsId: string): Promise<LiveTaskView[]> => {
-    throw new ApiError("空间还没打开", {
-      status: 409,
-      code: "space_not_open",
-    });
-  }),
-  getMessages: vi.fn(async (..._args: unknown[]): Promise<Message[]> => []),
-  clearSpaceConversation: vi.fn(async (..._args: unknown[]) => ({
-    success: true,
-  })),
-}));
+const mocks = vi.hoisted(() => {
+  /** 服务端那一份空间表：由 `@/api/spaces` 的 mock 在装配时填进来。 */
+  let spaces: Record<string, Space> = {};
 
-/** 「打开」走的是幂等的 POST /api/spaces：目录与团队原样提交。 */
-const createSpace = vi.fn(
-  async (_body: { work_dir: string; team_id: string }) => ({
-    ws_id: "ws_closed",
-  }),
-);
+  /** 一份完整形态的空间视图：`POST /open` 与 `GET /spaces/{id}` 回的都是它。 */
+  const spaceView = (wsId: string, overrides: Partial<Space> = {}): Space => ({
+    ws_id: wsId,
+    work_dir: `/tmp/spaces/${wsId}/work`,
+    team_id: "research",
+    label: null,
+    exit_policy: "inherit",
+    effective_exit_policy: "keep",
+    status: "closed",
+    closed_at: null,
+    last_opened_at: null,
+    reserved: false,
+    inflight_dispatch: 0,
+    inflight_foreign: 0,
+    marker: null,
+    ...overrides,
+  });
+  /** 已经打开过的空间：`openSpace` 成功后 `getSpace` 要照服务端的样子回报。 */
+  const opened = new Set<string>();
+  const openImpl = async (wsId: string): Promise<Space> => {
+    opened.add(wsId);
+    return spaceView(wsId, {
+      status: "open",
+      last_opened_at: "2026-11-05 12:00:00",
+    });
+  };
+  /**
+   * 详情每次都是新对象，与服务端一致。
+   *
+   * 但「换对象」不等于「effect 会重跑」：react-query 的结构共享在内容全等时
+   * 留住旧引用。想让重取真的驱动一次重跑，用例得改内容（`inflight_*`、
+   * `closed_at`…），这也正是轮询在真实世界里唯一会做的事。
+   */
+  const getSpaceImpl = async (wsId: string): Promise<Space> => {
+    const space = spaces[wsId] ?? spaces.ws_a;
+    return opened.has(wsId)
+      ? {
+          ...space,
+          status: "open" as const,
+          closed_at: null,
+          last_opened_at: "2026-11-05 12:00:00",
+        }
+      : { ...space };
+  };
+  return {
+    spaceView,
+    opened,
+    openImpl,
+    setSpaces: (table: Record<string, Space>) => {
+      spaces = table;
+    },
+    getSpaceImpl,
+    getSpace: vi.fn(getSpaceImpl),
+    openSpace: vi.fn(openImpl),
+    ensure: vi.fn(async (wsId: string) => ({
+      conversation_id: `conv_${wsId}`,
+      created: false,
+    })),
+    tasks: vi.fn(async (_wsId: string): Promise<Task[]> => []),
+    /** 默认走「空间未打开」这条路：提示与角标于是回落到台账，与真实漂移一致。 */
+    live: vi.fn(async (_wsId: string): Promise<LiveTaskView[]> => {
+      throw new ApiError("空间还没打开", {
+        status: 409,
+        code: "space_not_open",
+      });
+    }),
+    files: vi.fn(
+      async (
+        _wsId: string,
+        _options: { path?: string },
+      ): Promise<SpaceFilesResponse> => ({
+        path: "",
+        entries: [],
+        truncated: false,
+      }),
+    ),
+    getMessages: vi.fn(async (..._args: unknown[]): Promise<Message[]> => []),
+    clearSpaceConversation: vi.fn(async (..._args: unknown[]) => ({
+      success: true,
+    })),
+  };
+});
 
 vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn() },
@@ -91,6 +157,7 @@ vi.mock("@/api/spaces", () => {
       inflight_foreign: 0,
       marker: null,
     },
+    // 用户显式关掉过：`closed_at` 有值。
     ws_closed: {
       ws_id: "ws_closed",
       work_dir: "/tmp/spaces/ws_closed/work",
@@ -106,18 +173,35 @@ vi.mock("@/api/spaces", () => {
       inflight_foreign: 0,
       marker: null,
     },
+    // 只是没打开（从未打开过）：`closed_at` 为空，三组里的第三组。
+    ws_dormant: {
+      ws_id: "ws_dormant",
+      work_dir: "/tmp/spaces/ws_dormant/work",
+      team_id: "research",
+      label: "空间 D",
+      exit_policy: "inherit",
+      effective_exit_policy: "keep",
+      status: "closed",
+      closed_at: null,
+      last_opened_at: null,
+      reserved: false,
+      inflight_dispatch: 0,
+      inflight_foreign: 0,
+      marker: null,
+    },
   };
+  mocks.setSpaces(spaces);
   return {
-    getSpace: async (wsId: string) => spaces[wsId] ?? spaces.ws_a,
+    getSpace: (wsId: string) => mocks.getSpace(wsId),
     ensureSpaceConversation: (wsId: string) => mocks.ensure(wsId),
     clearSpaceConversation: (wsId: string, agentName?: string) =>
       mocks.clearSpaceConversation(wsId, agentName),
-    createSpace: (body: { work_dir: string; team_id: string }) =>
-      createSpace(body),
+    openSpace: (wsId: string) => mocks.openSpace(wsId),
     spaceTasks: (wsId: string) => mocks.tasks(wsId),
     spaceLiveTasks: (wsId: string) => mocks.live(wsId),
     cancelSpaceTask: async () => ({ cancelled: true }),
-    spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
+    spaceFiles: (wsId: string, options: { path?: string }) =>
+      mocks.files(wsId, options),
     // 右栏的「记忆」模式在挂载时就会取清单；这里给空列表，本文件测的是面板装配。
     spaceMemoryDocuments: async () => ({ total: 0, items: [] }),
     spaceArtifacts: async () => ({ items: [], total: 0 }),
@@ -194,7 +278,7 @@ function renderDetail(
     defaultOptions: { queries: { retry: false } },
   });
   prime?.(client);
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[path]}>
@@ -209,6 +293,9 @@ function renderDetail(
       </TooltipProvider>
     </QueryClientProvider>,
   );
+  // 用例要能主动重取：轮询换回来的新对象是「不自动重试」「不再自动开」的
+  // 触发条件，不强制重取一次就证明不了那两道闸。
+  return { ...result, client };
 }
 
 /** 壳的分档读 `window.innerWidth`（`useViewportWidth`）：挂载前改，挂载后补一次 resize。 */
@@ -314,7 +401,13 @@ beforeEach(() => {
   mocks.clearSpaceConversation.mockClear();
   mocks.clearSpaceConversation.mockResolvedValue({ success: true });
   vi.mocked(toast.error).mockClear();
-  createSpace.mockClear();
+  vi.mocked(toast.success).mockClear();
+  mocks.opened.clear();
+  // reset 而不是 clear：某个用例塞的「失败一次」不能留给下一个用例。
+  mocks.openSpace.mockReset();
+  mocks.openSpace.mockImplementation(mocks.openImpl);
+  mocks.getSpace.mockReset();
+  mocks.getSpace.mockImplementation(mocks.getSpaceImpl);
   mocks.ensure.mockImplementation(async (wsId: string) => ({
     conversation_id: `conv_${wsId}`,
     created: false,
@@ -328,6 +421,8 @@ beforeEach(() => {
     });
   });
   mocks.getMessages.mockResolvedValue([]);
+  mocks.files.mockReset();
+  mocks.files.mockResolvedValue({ path: "", entries: [], truncated: false });
   // 默认没有在途轮（订阅端点 204）；需要「这一轮在跑」的用例再换成 stubChatStream。
   vi.stubGlobal(
     "fetch",
@@ -709,23 +804,181 @@ describe("空间聊天页", () => {
     expect(screen.queryByText("空间 ws_a 没有可用会话")).toBeNull();
   });
 
-  it("空间未打开时先说清楚，并就地给出打开入口", async () => {
+  it("进入未打开的空间就自动打开，成功后提示整条退场", async () => {
+    renderDetail("/spaces/ws_dormant");
+
+    // 自动打开只发一次，开的就是路径里那个空间。
+    await waitFor(() =>
+      expect(mocks.openSpace).toHaveBeenCalledWith("ws_dormant"),
+    );
+    expect(mocks.openSpace).toHaveBeenCalledTimes(1);
+
+    // 成功之后两条提示都不该留：既不是「还没打开」，也不是「已关闭」。
+    await waitFor(() =>
+      expect(screen.queryByText("空间还没打开。")).toBeNull(),
+    );
+    expect(screen.queryByText("空间已关闭，消息发不出去。")).toBeNull();
+    expect(screen.queryByRole("button", { name: "重新打开" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "打开" })).toBeNull();
+    expect(screen.queryByText("正在打开空间…")).toBeNull();
+    expect(mocks.openSpace).toHaveBeenCalledTimes(1);
+
+    // 自动打开不弹 toast：用户只是进了这个空间，没有「完成了一件事」。
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("进入未打开空间：文件面板等到打开完成才发请求，不留 409 原文案", async () => {
+    // 与真实 daemon 一致：空间没有实例时目录接口回 409，文案里带着 workspace。
+    mocks.files.mockImplementation(async (wsId: string) => {
+      if (!mocks.opened.has(wsId)) {
+        throw new ApiError(`workspace '${wsId}' is indexed but not open`, {
+          status: 409,
+          code: "space_not_open",
+        });
+      }
+      return {
+        path: "",
+        entries: [
+          {
+            name: "a.txt",
+            kind: "file" as const,
+            size_bytes: 10,
+            modified_at: "2026-11-05T10:00:00Z",
+          },
+        ],
+        truncated: false,
+      };
+    });
+
+    // 打开请求握在用例手里：只有这样才停得住「还没打开」的那一段。
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mocks.openSpace.mockImplementation(async (wsId: string) => {
+      await gate;
+      return mocks.openImpl(wsId);
+    });
+
+    renderDetail("/spaces/ws_dormant");
+
+    expect(await screen.findByTestId("space-panel")).toHaveAttribute(
+      "data-mode",
+      "files",
+    );
+    // 自动打开还没回来：这段时间一次目录请求都不该发，原文案也就无处落脚。
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    // 用户看到的那一行原文案，正是这一条要挡掉的东西。
+    expect(screen.queryByText(/is indexed but not open/)).toBeNull();
+    expect(mocks.files).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(
+      screen.getByText("空间未打开，暂时看不到文件。"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      release();
+    });
+
+    // 打开完成后不需要任何用户动作：同一块面板自己读到了目录。
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    expect(mocks.files).toHaveBeenCalledWith("ws_dormant", { path: "" });
+    expect(screen.queryByText("空间未打开，暂时看不到文件。")).toBeNull();
+    expect(screen.queryByText(/is indexed but not open/)).toBeNull();
+  });
+
+  it("打开失败不自动重试：强制重取详情也还是那一次", async () => {
+    mocks.openSpace.mockRejectedValueOnce(
+      new ApiError("目录不见了", { status: 409, code: "work_dir_missing" }),
+    );
+    const { client } = renderDetail("/spaces/ws_dormant");
+
+    expect(await screen.findByText("目录不见了")).toBeInTheDocument();
+    expect(mocks.openSpace).toHaveBeenCalledTimes(1);
+
+    // 轮询换回来的内容也变了（这里多了一个在飞任务）：内容变化只是重渲染，
+    // 不是「再开一次」的信号。
+    mocks.getSpace.mockImplementationOnce(async (wsId: string) =>
+      mocks.spaceView(wsId, { inflight_dispatch: 1 }),
+    );
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["space", "ws_dormant"] });
+    });
+    expect(mocks.openSpace).toHaveBeenCalledTimes(1);
+
+    // 重发是用户的动作。
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(mocks.openSpace).toHaveBeenCalledTimes(2));
+    expect(mocks.openSpace).toHaveBeenLastCalledWith("ws_dormant");
+    await waitFor(() => expect(screen.queryByText("目录不见了")).toBeNull());
+  });
+
+  it("显式关闭的空间挂载时不自动打开，路由往返也不开", async () => {
+    const first = renderDetail("/spaces/ws_closed");
+
+    expect(
+      await screen.findByText("空间已关闭，消息发不出去。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重新打开" }),
+    ).toBeInTheDocument();
+
+    // 留出 effect 与重取的余量：一次都不该发。
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(mocks.openSpace).not.toHaveBeenCalled();
+
+    // 离开再回来（路由元素卸载 → ref 归零 → 重挂载）：判据落在 `closed_at` 上
+    // 而不是内存里，所以往返一次也不会把它重开。
+    first.unmount();
+    renderDetail("/spaces/ws_closed");
+    expect(
+      await screen.findByText("空间已关闭，消息发不出去。"),
+    ).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(mocks.openSpace).not.toHaveBeenCalled();
+  });
+
+  it("「重新打开」是用户动作：点一次发一次，成功后再无关闭提示", async () => {
     renderDetail("/spaces/ws_closed");
 
-    expect(await screen.findByText(/空间还没打开/)).toBeInTheDocument();
-    const shells = screen.getAllByTestId("space-chat-shell");
-    expect(shells.map((shell) => shell.getAttribute("data-ws-id"))).toContain(
-      "ws_closed",
-    );
+    const reopen = await screen.findByRole("button", { name: "重新打开" });
+    expect(mocks.openSpace).not.toHaveBeenCalled();
 
-    // 页头没有「打开」了：入口只能在这条提示旁边。
-    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    fireEvent.click(reopen);
+
+    await waitFor(() => expect(mocks.openSpace).toHaveBeenCalledTimes(1));
+    expect(mocks.openSpace).toHaveBeenLastCalledWith("ws_closed");
     await waitFor(() =>
-      expect(createSpace).toHaveBeenCalledWith({
-        work_dir: "/tmp/spaces/ws_closed/work",
-        team_id: "research",
-      }),
+      expect(screen.queryByText("空间已关闭，消息发不出去。")).toBeNull(),
     );
+  });
+
+  it("打开成功但实例又没了：只说「还没打开」，不再自动开", async () => {
+    // 服务端这次没有留下实例（两次请求之间重启）：成功回执之后重取回来仍是
+    // 「未打开」。这一份既不该说成「已关闭」，也不该换来第二次自动打开。
+    mocks.openSpace.mockImplementationOnce(async (wsId: string) =>
+      mocks.spaceView(wsId, { status: "open" }),
+    );
+    renderDetail("/spaces/ws_dormant");
+
+    await waitFor(() => expect(mocks.openSpace).toHaveBeenCalledTimes(1));
+
+    expect(await screen.findByText("空间还没打开。")).toBeInTheDocument();
+    expect(screen.queryByText("空间已关闭，消息发不出去。")).toBeNull();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(mocks.openSpace).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "打开" }));
+    await waitFor(() => expect(mocks.openSpace).toHaveBeenCalledTimes(2));
   });
 
   it("有任务在飞时 composer 上方给非阻塞提示，输入框仍可用", async () => {

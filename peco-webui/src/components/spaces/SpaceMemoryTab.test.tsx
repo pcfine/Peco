@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SpaceMemoryTab } from "@/components/spaces/SpaceMemoryTab";
 import { ApiError } from "@/lib/api";
@@ -68,15 +74,31 @@ function page(items: MemoryDocumentSummary[], total = items.length) {
   return { total, items };
 }
 
-function renderTab() {
+interface MemoryTabProps {
+  open?: boolean;
+}
+
+function renderTab(props: MemoryTabProps = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return render(
+  const element = (next: MemoryTabProps) => (
     <QueryClientProvider client={client}>
-      <SpaceMemoryTab wsId="ws_a" />
-    </QueryClientProvider>,
+      <SpaceMemoryTab wsId="ws_a" open={next.open ?? true} />
+    </QueryClientProvider>
   );
+  const view = render(element(props));
+  return {
+    ...view,
+    rerender: (next: MemoryTabProps) => view.rerender(element(next)),
+  };
+}
+
+/** 放掉一轮宏任务：让「本该不发的请求」有机会暴露自己。 */
+async function settle(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 }
 
 beforeEach(() => {
@@ -225,6 +247,35 @@ describe("空间记忆面板", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("本空间还没有记忆。")).toBeNull();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+  });
+
+  it("open=false：一个清单请求都不发，只摆中性说明", async () => {
+    // 详情里的状态说「开着」也不放行：15s 前的快照说不了当下有没有实例。
+    renderTab({ open: false });
+
+    expect(
+      await screen.findByText("空间未打开，暂时看不到记忆。"),
+    ).toBeInTheDocument();
+    await settle();
+    expect(mocks.list).not.toHaveBeenCalled();
+    expect(screen.queryByText("本空间还没有记忆。")).toBeNull();
+  });
+
+  it("翻转成已打开后清单自己接上，说明退场", async () => {
+    mocks.list.mockResolvedValue(page([summary()]));
+    const { rerender } = renderTab({ open: false });
+
+    expect(
+      await screen.findByText("空间未打开，暂时看不到记忆。"),
+    ).toBeInTheDocument();
+    await settle();
+    expect(mocks.list).not.toHaveBeenCalled();
+
+    rerender({ open: true });
+
+    expect(await screen.findByText("回复偏好")).toBeInTheDocument();
+    expect(screen.queryByText("空间未打开，暂时看不到记忆。")).toBeNull();
+    expect(mocks.list).toHaveBeenCalledTimes(1);
   });
 
   it("点列表项按 docId 取全文并渲染正文、来源，再点收起", async () => {

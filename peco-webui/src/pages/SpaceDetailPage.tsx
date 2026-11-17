@@ -14,6 +14,7 @@
 // 隐藏空间的流随组件卸载中断。
 
 import { useEffect, useMemo, useRef } from "react";
+import { Loader2 } from "lucide-react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Button } from "@/components/ui/button";
@@ -30,8 +31,9 @@ import {
 } from "@/components/spaces/useSpacePanelState";
 import { useConversationClear } from "@/components/spaces/useConversationClear";
 import {
+  type SpaceOpenNoticePhase,
   useCloseSpace,
-  useOpenSpace,
+  useOpenSpaceOnEnter,
 } from "@/components/spaces/useSpaceLifecycle";
 import { WORK_INLINE_MIN, workWidthOf } from "@/components/layout/shellMetrics";
 import { useViewportWidth } from "@/hooks/useViewportWidth";
@@ -41,26 +43,64 @@ import { useSpaceStreaming } from "@/stores/spaceActivityStore";
 import { useUiStore } from "@/stores/uiStore";
 import { errorText } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { Space } from "@/types/daemon";
 
 /**
- * 对话列里唯一能启动空间的地方：左头只是一行标题，没有动作位。
- * 少了这一处，「空间还没打开」就只剩一句死胡同式的说明。
+ * 未打开的空间进来就自动开：「空间没实例」时每一轮对话都会 409，先把空间打通。
+ *
+ * 自动打开只是省一次点击，不是取消手动兜底：自动尝试按 `ws_id` 只发生一次，
+ * 用户随后在同一页里关掉空间就不会再有第二次，此时这行说明与「重新打开」
+ * 是唯一的路。打开中只报一句进度，不占错误色 —— 这是正常过程，不是故障；
+ * 失败则把判断交回用户：重试是显式动作，不由轮询代劳。
+ *
+ * 「还没打开」与「已关闭」分开说：前者是等待，后者是用户的决定，把两者写成
+ * 一句话会让刚点过「关闭」的人以为它自己又开了。
  */
-function SpaceClosedBanner({ space }: { space: Space }) {
-  const { open, opening } = useOpenSpace(
-    space.ws_id,
-    space.work_dir,
-    space.team_id,
-  );
+function SpaceOpenNotice({
+  phase,
+  error,
+  onRetry,
+}: {
+  phase: SpaceOpenNoticePhase;
+  error: unknown;
+  onRetry: () => void;
+}) {
+  if (phase === "opening") {
+    return (
+      <p
+        role="status"
+        data-slot="space-opening-notice"
+        className="flex shrink-0 items-center gap-1.5 py-3 text-caption font-medium text-ink-muted"
+      >
+        <Loader2
+          aria-hidden="true"
+          className="size-3 shrink-0 motion-safe:animate-spin"
+        />
+        <span className="min-w-0">正在打开空间…</span>
+      </p>
+    );
+  }
 
-  return (
-    <div className="flex shrink-0 items-start gap-2 py-3">
-      <div className="min-w-0 flex-1">
-        <ErrorBanner message="空间还没打开，消息发不出去。" />
+  if (phase === "failed") {
+    return (
+      <div className="flex shrink-0 items-start gap-2 py-3">
+        <div className="min-w-0 flex-1">
+          <ErrorBanner message={errorText(error)} />
+        </div>
+        <Button size="sm" className="h-7" onClick={onRetry}>
+          重试
+        </Button>
       </div>
-      <Button size="sm" className="h-7" disabled={opening} onClick={open}>
-        打开
+    );
+  }
+
+  const closed = phase === "closed";
+  return (
+    <div className="flex shrink-0 items-center gap-2 py-3">
+      <p className="min-w-0 flex-1 text-caption font-medium text-ink-muted">
+        {closed ? "空间已关闭，消息发不出去。" : "空间还没打开。"}
+      </p>
+      <Button size="sm" className="h-7" onClick={onRetry}>
+        {closed ? "重新打开" : "打开"}
       </Button>
     </div>
   );
@@ -70,6 +110,7 @@ export function SpaceDetailPage() {
   const { wsId = "" } = useParams();
   const space = useSpace(wsId);
   const close = useCloseSpace(wsId);
+  const autoOpen = useOpenSpaceOnEnter(space.data);
   const openIds = useOpenSpacesStore((state) => state.openIds);
   const viewport = useViewportWidth();
   const railOpen = useUiStore((state) => state.railOpen);
@@ -185,9 +226,13 @@ export function SpaceDetailPage() {
         />
         <div className="flex min-h-0 flex-1 flex-col px-4 pb-3">
           {/* 未打开的空间没有实例：历史还能看，但每一轮都会 409。
-              先说明白，别让用户在 composer 里撞一次错误才发现。 */}
-          {space.data.status === "closed" && (
-            <SpaceClosedBanner space={space.data} />
+              所以进来就自动打开，把「打开」这一步从用户手里拿走。 */}
+          {autoOpen.phase !== "open" && (
+            <SpaceOpenNotice
+              phase={autoOpen.phase}
+              error={autoOpen.error}
+              onRetry={autoOpen.retry}
+            />
           )}
           {/* 折叠只改这块的显隐：壳按 wsId 常驻，收起对话不会掐断在途的一轮。 */}
           {shellIds.map((id) => (
@@ -222,7 +267,11 @@ export function SpaceDetailPage() {
           />
           {/* 收起对话后右栏接手整行：内容跟着吃满可用宽度，不再按 880 居中留白。 */}
           <div className="@container/panel min-h-0 flex-1">
-            <SpaceSidePanel wsId={wsId} mode={panel.mode} />
+            <SpaceSidePanel
+              wsId={wsId}
+              mode={panel.mode}
+              open={space.data.status === "open"}
+            />
           </div>
         </aside>
       )}

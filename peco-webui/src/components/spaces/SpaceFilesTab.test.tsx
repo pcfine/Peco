@@ -55,22 +55,37 @@ async function flush(): Promise<void> {
   });
 }
 
-function renderTab(props: { active?: boolean } = {}) {
+interface FilesTabProps {
+  active?: boolean;
+  open?: boolean;
+}
+
+function renderTab(props: FilesTabProps = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  const element = (active: boolean) => (
+  const element = (next: FilesTabProps) => (
     <QueryClientProvider client={client}>
-      <SpaceFilesTab wsId="ws_a" active={active} />
+      <SpaceFilesTab
+        wsId="ws_a"
+        active={next.active ?? true}
+        open={next.open ?? true}
+      />
     </QueryClientProvider>
   );
-  const view = render(element(props.active ?? true));
+  const view = render(element(props));
   return {
     client,
     container: view.container,
-    rerender: (next: { active?: boolean }) =>
-      view.rerender(element(next.active ?? true)),
+    rerender: (next: FilesTabProps) => view.rerender(element(next)),
   };
+}
+
+/** 放掉一轮宏任务：真定时器下让「本该不发的请求」有机会暴露自己。 */
+async function settle(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
 }
 
 describe("SpaceFilesTab 自动刷新", () => {
@@ -185,6 +200,42 @@ describe("SpaceFilesTab 自动刷新", () => {
       await vi.advanceTimersByTimeAsync(SPACE_FILES_POLL_MS + 500);
     });
     expect(mocks.files).toHaveBeenCalledTimes(beforeInterval + 1);
+  });
+});
+
+describe("SpaceFilesTab 的空间闸门", () => {
+  beforeEach(() => {
+    mocks.files.mockReset();
+  });
+
+  it("空间未打开：一个目录请求都不发，只摆中性说明", async () => {
+    renderTab({ open: false });
+
+    expect(
+      await screen.findByText("空间未打开，暂时看不到文件。"),
+    ).toBeInTheDocument();
+    await settle();
+    // 未打开时后端的目录接口就是 409：请求发出去只会把原文案留在面板上。
+    expect(mocks.files).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+  });
+
+  it("翻转成已打开后自己接上：请求发出、列表出现、说明退场", async () => {
+    mocks.files.mockResolvedValue(listing([entry({ name: "a.txt" })]));
+    const { rerender } = renderTab({ open: false });
+
+    expect(
+      await screen.findByText("空间未打开，暂时看不到文件。"),
+    ).toBeInTheDocument();
+    await settle();
+    expect(mocks.files).not.toHaveBeenCalled();
+
+    // 不靠轮询也不靠手动重试：自动打开完成后这个组件就该自己读目录。
+    rerender({ open: true });
+
+    expect(await screen.findByText("a.txt")).toBeInTheDocument();
+    expect(screen.queryByText("空间未打开，暂时看不到文件。")).toBeNull();
+    expect(mocks.files).toHaveBeenCalledTimes(1);
   });
 });
 

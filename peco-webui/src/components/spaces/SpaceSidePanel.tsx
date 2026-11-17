@@ -56,6 +56,8 @@ interface SpaceSidePanelProps {
   variant?: SpacePanelVariant;
   /** 这一栏是否真的在用户眼前（隐藏的栏仍挂载，但不轮询）。 */
   active?: boolean;
+  /** 空间是否已经打开。未打开时文件与记忆没有实例可读，面板只给一行说明。 */
+  open?: boolean;
 }
 
 export function SpaceSidePanel({
@@ -63,6 +65,7 @@ export function SpaceSidePanel({
   mode,
   variant = "space",
   active = true,
+  open = true,
 }: SpaceSidePanelProps) {
   // 挂在这里而不是每个聊天壳里：一台页面只有一个右栏，一轮结束只失效一次。
   useFilesRefreshOnChatIdle();
@@ -70,14 +73,16 @@ export function SpaceSidePanel({
   return (
     <div className="h-full min-h-0">
       {mode === "overview" && <SpaceOverviewTab />}
-      {mode === "files" && <SpaceFilesTab wsId={wsId} active={active} />}
+      {mode === "files" && (
+        <SpaceFilesTab wsId={wsId} active={active} open={open} />
+      )}
       {mode === "tasks" &&
         (variant === "peco" ? (
           <PecoDispatchTasks wsId={wsId} />
         ) : (
           <SpaceLiveTasksTab wsId={wsId} />
         ))}
-      {mode === "memory" && <SpaceMemoryTab wsId={wsId} />}
+      {mode === "memory" && <SpaceMemoryTab wsId={wsId} open={open} />}
     </div>
   );
 }

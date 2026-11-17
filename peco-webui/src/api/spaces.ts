@@ -175,6 +175,16 @@ export async function spaceFiles(
   return res.data;
 }
 
+/**
+ * 按 id 打开一个已索引的空间；已打开就原样返回。
+ *
+ * 路径里已经带 `ws_id`，请求体与 `X-Peco-Space` 都不需要 —— 要开的就是它自己。
+ */
+export async function openSpace(wsId: string): Promise<Space> {
+  const res = await api.post<Space>(`/spaces/${encodeURIComponent(wsId)}/open`);
+  return res.data;
+}
+
 /** 关闭空间；`force` 越过在飞门槛（409 `inflight_tasks` 之后的第二条路）。 */
 export async function closeSpace(
   wsId: string,

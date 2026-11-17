@@ -59,6 +59,8 @@ vi.mock("@/api/spaces", () => ({
   spaceFiles: async () => ({ path: "", entries: [], truncated: false }),
   ensureSpaceConversation: mocks.ensure,
   closeSpace: async () => ({ stopped: true }),
+  // 冒烟用的空间本来就是 open：自动打开不会发这一枪，但入口得在。
+  openSpace: async () => pecoSpace,
   createSpace: async () => ({ ws_id: "ws_new" }),
   deleteSpace: async () => ({ purged: true }),
 }));
