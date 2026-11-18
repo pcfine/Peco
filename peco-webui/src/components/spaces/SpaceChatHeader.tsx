@@ -19,10 +19,13 @@ import type { Space } from "@/types/daemon";
 
 interface SpaceChatHeaderProps {
   /**
-   * 只要这五项：Peco 页在空间清单到手前用 Peco 身份顶上，也得能画出这一行
+   * 只要这几项：Peco 页在空间清单到手前用 Peco 身份顶上，也得能画出这一行
    * —— 唯一的 h1 与三个动作都长在这里。
    */
-  space: Pick<Space, "label" | "work_dir" | "team_id" | "status" | "closed_at">;
+  space: Pick<
+    Space,
+    "name" | "label" | "work_dir" | "team_id" | "status" | "closed_at"
+  >;
   /** 右栏收起时这里接一个「展开右栏」：两块互相是对方的回来路径。 */
   panelCollapsed: boolean;
   onExpandPanel: () => void;

@@ -90,7 +90,7 @@ function spaceUnavailableNotice(
 
 type HeaderSpace = Pick<
   Space,
-  "label" | "work_dir" | "team_id" | "status" | "closed_at"
+  "name" | "label" | "work_dir" | "team_id" | "status" | "closed_at"
 >;
 
 /**
@@ -101,6 +101,8 @@ type HeaderSpace = Pick<
 function headerSpaceOf(peco: PecoIdentity, space: Space | null) {
   if (space) return space;
   return {
+    // 兜底身份没有 marker，人读名缺席，标题由 label 顶上。
+    name: null,
     label: "Peco",
     work_dir: peco.work_dir,
     team_id: peco.team_id,

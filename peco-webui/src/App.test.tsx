@@ -38,6 +38,7 @@ const pecoSpace = {
   work_dir: "/tmp/peco",
   team_id: "peco",
   label: "Peco",
+  name: null,
   exit_policy: "inherit",
   effective_exit_policy: "inherit",
   status: "open" as const,

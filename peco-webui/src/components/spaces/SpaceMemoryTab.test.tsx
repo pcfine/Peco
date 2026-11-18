@@ -43,6 +43,7 @@ function space(overrides: Partial<Space> = {}): Space {
     work_dir: "/tmp/spaces/ws_a/work",
     team_id: "research",
     label: "空间 A",
+    name: null,
     exit_policy: "inherit",
     effective_exit_policy: "keep",
     status: "open",

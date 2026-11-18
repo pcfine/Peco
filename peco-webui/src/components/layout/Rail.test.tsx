@@ -24,6 +24,7 @@ function space(overrides: Partial<Space> & { ws_id: string }): Space {
     work_dir: `/tmp/${overrides.ws_id}/work`,
     team_id: "research",
     label: null,
+    name: null,
     exit_policy: "inherit",
     effective_exit_policy: "inherit",
     status: "open",

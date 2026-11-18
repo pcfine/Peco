@@ -1,12 +1,18 @@
 import type { Space } from "@/types/daemon";
 
+type SpaceNames = Pick<Space, "name" | "label" | "work_dir">;
+
 /**
- * 空间显示名：优先 `label`，缺省退回目录末段。
+ * 空间显示名：`name`（marker 的人读名）→ `label`（库里的逻辑名）→ 目录末段。
  *
- * 目录才是空间的身份（同名 label 可以有多个），所以缺 label 时也不显示 ws_id。
+ * 不显示 ws_id：同名 `label` 可以有多个，目录才是身份。空串与纯空白视同缺失
+ *（后端会过滤，缺字段的响应与 mock 不会）。
  */
-export function spaceLabel(space: Pick<Space, "label" | "work_dir">): string {
-  if (space.label) return space.label;
+export function spaceLabel(space: SpaceNames): string {
+  const name = space.name?.trim();
+  if (name) return name;
+  const label = space.label?.trim();
+  if (label) return label;
   const parts = space.work_dir.split("/").filter(Boolean);
   return parts[parts.length - 1] ?? space.work_dir;
 }
@@ -16,6 +22,6 @@ export function spaceLabel(space: Pick<Space, "label" | "work_dir">): string {
  *
  * 用码点而不是下标切：emoji 之类是代理对，按 UTF-16 切会留下半个字。
  */
-export function spaceInitial(space: Pick<Space, "label" | "work_dir">): string {
+export function spaceInitial(space: SpaceNames): string {
   return Array.from(spaceLabel(space).trim())[0] ?? "·";
 }

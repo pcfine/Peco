@@ -4,6 +4,8 @@ export interface MarkerInfo {
   team: string;
   user_id: string;
   session_id: string;
+  /** 人读名（新建空间时填的「显示名称」）。 */
+  name: string;
 }
 
 /** `GET /api/spaces` 的一行。 */
@@ -11,7 +13,10 @@ export interface Space {
   ws_id: string;
   work_dir: string;
   team_id: string;
+  /** 库里的逻辑名；缺省为 null。显示优先级见 `spaceLabel`。 */
   label: string | null;
+  /** marker 里的人读名；marker 缺失或损坏时为 null。显示优先级见 `spaceLabel`。 */
+  name: string | null;
   exit_policy: string;
   effective_exit_policy: string;
   /** `open` = 实例在 Hub 里；`closed` = 本次未打开。 */
@@ -46,6 +51,8 @@ export interface SpaceOpened {
 export interface CreateSpaceRequest {
   work_dir: string;
   team_id: string;
+  /** 「显示名称」：写进 marker 的 `name`，不是 `label`。 */
+  name?: string;
   label?: string;
 }
 

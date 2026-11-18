@@ -41,7 +41,8 @@ export function NewSpaceForm({
   const teams = useTeams();
 
   const [workDir, setWorkDir] = useState("");
-  const [label, setLabel] = useState("");
+  // 「显示名称」写 marker 的 `name`；`label` 属于台账，表单不填（见 spaceLabel）。
+  const [name, setName] = useState("");
   const [mode, setMode] = useState<TeamMode>({
     kind: "existing",
     teamId: initialTeamId,
@@ -82,7 +83,7 @@ export function NewSpaceForm({
       return createSpace({
         work_dir: workDir.trim(),
         team_id: teamId,
-        label: label.trim() || undefined,
+        name: name.trim() || undefined,
       });
     },
     onSuccess: (opened) => {
@@ -124,8 +125,8 @@ export function NewSpaceForm({
           <Label htmlFor="space-name">显示名称</Label>
           <Input
             id="space-name"
-            value={label}
-            onChange={(event) => setLabel(event.target.value)}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
             placeholder="例如 客户合同审阅"
           />
         </div>

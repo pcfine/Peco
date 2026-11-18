@@ -44,6 +44,7 @@ function space(wsId: string, teamId: string): Space {
     work_dir: `/tmp/${wsId}`,
     team_id: teamId,
     label: null,
+    name: null,
     exit_policy: "inherit",
     effective_exit_policy: "inherit",
     status: "open",

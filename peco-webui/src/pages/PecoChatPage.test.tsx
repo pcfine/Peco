@@ -40,6 +40,7 @@ const pecoSpace = (): Space => ({
   work_dir: "/tmp/peco/work",
   team_id: "peco",
   label: mocks.spaceLabel.value,
+  name: null,
   exit_policy: "inherit",
   effective_exit_policy: "keep",
   status: mocks.spaceStatus.value,
