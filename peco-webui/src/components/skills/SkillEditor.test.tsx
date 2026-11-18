@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { SkillEditor } from "@/components/skills/SkillEditor";
+import { previewBounds, SkillEditor } from "@/components/skills/SkillEditor";
 import {
   getSkillMd,
   listSkillFiles,
@@ -79,6 +79,20 @@ function renderEditor() {
   );
 }
 
+/**
+ * 让外层容器与分栏行量出不同宽度：真实页面上常驻文件栏只占外层、不在分栏行里。
+ * `this` 指向被测量的元素，所以只能用普通函数。
+ */
+function mockWidths(container: number, splitRow: number) {
+  vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockImplementation(
+    function (this: HTMLElement) {
+      const width =
+        this.getAttribute("data-testid") === "split-row" ? splitRow : container;
+      return { width, height: 800 } as DOMRect;
+    },
+  );
+}
+
 function pane(name: "source" | "preview"): HTMLElement {
   const el = document.querySelector<HTMLElement>(`[data-pane="${name}"]`);
   if (!el) throw new Error(`pane not found: ${name}`);
@@ -139,6 +153,33 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("previewBounds", () => {
+  it("1920 页面分栏行 1296：上限 870、默认仍是 560", () => {
+    expect(previewBounds(1296)).toEqual({
+      min: 320,
+      max: 870,
+      defaultWidth: 560,
+    });
+  });
+
+  it("分栏行 1000：上限 574、默认 450", () => {
+    expect(previewBounds(1000)).toEqual({
+      min: 320,
+      max: 574,
+      defaultWidth: 450,
+    });
+  });
+
+  it("极窄分栏行的上限不低于下限", () => {
+    // 700 - 420 - 6 = 274 已经低于下限；上限必须兜到 320，否则 aria 的下限大于上限。
+    expect(previewBounds(700)).toEqual({
+      min: 320,
+      max: 320,
+      defaultWidth: 320,
+    });
+  });
 });
 
 describe("SkillEditor", () => {
@@ -595,20 +636,186 @@ describe("SkillEditor", () => {
     });
   });
 
-  it("独占预览时铺满剩余宽度，分栏时维持固定宽", async () => {
+  it("分栏按容器宽给预览定宽，独占预览铺满剩余宽度", async () => {
     renderEditor();
     await screen.findByTestId("action-bar");
 
-    // jsdom 没有真实布局，只能断言类名契约
-    expect(pane("preview").className).toContain("clamp(380px,45%,560px)");
+    // 1200 容器：round(1200 * 0.45) = 540，仍落在默认区间的 380..560 内
+    expect(pane("preview").style.width).toBe("540px");
+    expect(pane("preview").className).toContain("shrink-0");
 
     await act(async () => buttonByTestId("mode-preview").click());
 
-    expect(pane("preview").className).not.toContain("clamp(380px,45%,560px)");
+    expect(pane("preview").style.width).toBe("");
     expect(pane("preview").className).toContain("flex-1");
     expect(pane("preview").firstElementChild?.className).toContain(
       "max-w-[760px]",
     );
+  });
+
+  describe("分栏分隔线", () => {
+    /** 上限 = 容器 1200 - 源码下限 420 - 分隔线热区 6。 */
+    const MAX_WIDTH = 1200 - 420 - 6;
+
+    function separator(): HTMLElement {
+      const el = document.querySelector<HTMLElement>('[role="separator"]');
+      if (!el) throw new Error("separator not found");
+      return el;
+    }
+
+    async function press(key: string) {
+      await act(async () => {
+        separator().dispatchEvent(
+          new KeyboardEvent("keydown", { key, bubbles: true }),
+        );
+      });
+    }
+
+    /** jsdom 没有 PointerEvent，用同一组 window 监听器接 MouseEvent。 */
+    function pointer(type: string, clientX: number) {
+      return new MouseEvent(type, {
+        clientX,
+        bubbles: true,
+        cancelable: true,
+      });
+    }
+
+    it("暴露 separator 语义与当前宽度", async () => {
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      const handle = separator();
+      expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+      expect(handle.tabIndex).toBe(0);
+      expect(handle.getAttribute("aria-label")).toBe("调整源码与预览宽度");
+      expect(handle.getAttribute("aria-valuenow")).toBe("540");
+      expect(handle.getAttribute("aria-valuemin")).toBe("320");
+      expect(handle.getAttribute("aria-valuemax")).toBe(String(MAX_WIDTH));
+      expect(handle.getAttribute("aria-valuetext")).toBe("预览栏 540px");
+    });
+
+    it("上下限量的是分栏行，不是含常驻文件栏的外层容器", async () => {
+      // 1920 页面实测：外层 1536，文件栏吃掉 240，分栏行只有 1296。
+      mockWidths(1536, 1296);
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      const bounds = previewBounds(1296);
+      expect(separator().getAttribute("aria-valuemax")).toBe(
+        String(bounds.max),
+      );
+      expect(separator().getAttribute("aria-valuemax")).not.toBe(
+        String(previewBounds(1536).max),
+      );
+      // 拖到最右时预览停在 870，源码栏仍留够 420。
+      expect(pane("preview").style.width).toBe(`${bounds.defaultWidth}px`);
+      expect(bounds.defaultWidth).toBe(560);
+    });
+
+    it("分栏是否可用仍看外层容器宽，窄分栏行不放宽预览上限", async () => {
+      // 分栏行被文件栏压到 700 时上限只剩 320，但「分栏」本身仍可用（容器 ≥860）。
+      mockWidths(1200, 700);
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      expect(buttonByTestId("mode-split").disabled).toBe(false);
+      expect(pane("preview").hidden).toBe(false);
+      expect(separator().getAttribute("aria-valuemax")).toBe("320");
+      expect(pane("preview").style.width).toBe("320px");
+    });
+
+    it("热区用伪元素向两侧扩到 30px，布局占位与视觉线不变", async () => {
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      const handle = separator();
+      // jsdom 不算伪元素样式与命中测试，这里只能锁类名契约；实际命中范围在浏览器
+      // 里用 elementFromPoint 量。w-1.5 = 6px 占位，伪元素各 12px 是热区。
+      expect(handle.className).toContain("w-1.5");
+      expect(handle.className).toContain("after:absolute");
+      expect(handle.className).toContain("after:inset-y-0");
+      expect(handle.className).toContain("after:-left-3");
+      expect(handle.className).toContain("after:-right-3");
+      expect(handle.className).toContain("after:content-['']");
+    });
+
+    it("键盘焦点走全站统一 outline，只额外染线", async () => {
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      const handle = separator();
+      expect(handle.className).not.toContain("focus-visible:outline-none");
+      expect(handle.firstElementChild?.className).toContain(
+        "group-focus-visible:bg-primary",
+      );
+    });
+
+    it("键盘 ←/→ 一次 16px，越界停在上下限，Home/End 跳到两端", async () => {
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      await press("ArrowLeft");
+      expect(pane("preview").style.width).toBe("556px");
+      await press("ArrowRight");
+      expect(pane("preview").style.width).toBe("540px");
+
+      for (let i = 0; i < 20; i += 1) await press("ArrowRight");
+      expect(pane("preview").style.width).toBe("320px");
+      expect(separator().getAttribute("aria-valuenow")).toBe("320");
+
+      await press("End");
+      expect(pane("preview").style.width).toBe(`${MAX_WIDTH}px`);
+      await press("Home");
+      expect(pane("preview").style.width).toBe("320px");
+    });
+
+    it("双击复位到默认宽度", async () => {
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      await press("End");
+      expect(pane("preview").style.width).toBe(`${MAX_WIDTH}px`);
+
+      await act(async () => {
+        separator().dispatchEvent(
+          new MouseEvent("dblclick", { bubbles: true }),
+        );
+      });
+      expect(pane("preview").style.width).toBe("540px");
+    });
+
+    it("拖拽跟随指针，松手后停止跟随", async () => {
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      await act(async () => {
+        separator().dispatchEvent(pointer("pointerdown", 900));
+      });
+      // 拖动时指针扫过正文不该顺手选中文字
+      expect(document.body.style.userSelect).toBe("none");
+
+      // 指针左移 40px → 预览加宽 40px
+      await act(async () => {
+        window.dispatchEvent(pointer("pointermove", 860));
+      });
+      expect(pane("preview").style.width).toBe("580px");
+
+      // 一路拖到容器最左也只给到上限，不会把源码栏挤没
+      await act(async () => {
+        window.dispatchEvent(pointer("pointermove", 0));
+      });
+      expect(pane("preview").style.width).toBe(`${MAX_WIDTH}px`);
+
+      await act(async () => {
+        window.dispatchEvent(pointer("pointerup", 0));
+      });
+      expect(document.body.style.userSelect).toBe("");
+
+      await act(async () => {
+        window.dispatchEvent(pointer("pointermove", 300));
+      });
+      expect(pane("preview").style.width).toBe(`${MAX_WIDTH}px`);
+    });
   });
 
   it("干净状态点返回直接回列表，不弹确认", async () => {

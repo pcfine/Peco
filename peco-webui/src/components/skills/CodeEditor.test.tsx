@@ -2,9 +2,9 @@
 // 更要与输入逐字节一致，差一个字符整篇就会错位。
 
 import { createRef } from "react";
-import { describe, expect, it } from "vitest";
-import { render } from "@testing-library/react";
-import { CodeEditor } from "@/components/skills/CodeEditor";
+import { describe, expect, it, vi } from "vitest";
+import { createEvent, fireEvent, render } from "@testing-library/react";
+import { CodeEditor, scrollbarInsets } from "@/components/skills/CodeEditor";
 
 const WITH_FRONTMATTER = [
   "---",
@@ -98,5 +98,144 @@ describe("CodeEditor 高亮层", () => {
 
     expect(code.innerHTML).not.toContain("hljs-");
     expect(code.textContent).toBe(`${value}\n`);
+  });
+});
+
+describe("scrollbarInsets", () => {
+  it("按 border box 与 client box 的差算出滑条占位", () => {
+    expect(
+      scrollbarInsets({
+        offsetWidth: 570,
+        clientWidth: 560,
+        offsetHeight: 820,
+        clientHeight: 810,
+      }),
+    ).toEqual({ w: 10, h: 10 });
+  });
+
+  it("没有滑条时不收边", () => {
+    expect(
+      scrollbarInsets({
+        offsetWidth: 570,
+        clientWidth: 570,
+        offsetHeight: 820,
+        clientHeight: 820,
+      }),
+    ).toEqual({ w: 0, h: 0 });
+  });
+
+  it("布局未就绪读到负值也不返回负的裁剪量", () => {
+    expect(
+      scrollbarInsets({
+        offsetWidth: 570,
+        clientWidth: 580,
+        offsetHeight: 820,
+        clientHeight: 840,
+      }),
+    ).toEqual({ w: 0, h: 0 });
+  });
+});
+
+describe("CodeEditor 裁剪层", () => {
+  it("高亮层被裁到 textarea 的 client box 内，位移仍只发生在 pre 上", () => {
+    const textareaRef = createRef<HTMLTextAreaElement>();
+    const { container } = render(
+      <CodeEditor
+        value={"# 很长的一行 ".repeat(40)}
+        onChange={() => {}}
+        language="markdown"
+        ariaLabel="内容"
+        textareaRef={textareaRef}
+      />,
+    );
+
+    const pres = container.querySelectorAll<HTMLElement>("pre");
+    expect(pres).toHaveLength(1);
+    const pre = pres[0];
+    const clip = pre.parentElement;
+    if (!clip) throw new Error("clip layer not found");
+
+    expect(clip.className).toContain("overflow-hidden");
+    expect(clip.className).toContain("pointer-events-none");
+    // 裁剪量绑在右/下两边：jsdom 没有布局，量到的滑条宽度是 0
+    expect(clip.style.right).toBe("0px");
+    expect(clip.style.bottom).toBe("0px");
+    // 内边距必须留在 pre 上：挪到裁剪层就会让高亮与 textarea 的文字错位
+    expect(pre.className).toContain("px-5");
+    expect(pre.className).toContain("py-4");
+    expect(clip.className).not.toContain("px-5");
+    // 跟随滚动的 transform 只写 pre，裁剪框不能跟着移动
+    expect(pre.style.transform).toContain("translate");
+    expect(clip.style.transform).toBe("");
+  });
+});
+
+function renderForKeys() {
+  const textareaRef = createRef<HTMLTextAreaElement>();
+  const onChange = vi.fn();
+  const { container } = render(
+    <CodeEditor
+      value="abc"
+      onChange={onChange}
+      language="markdown"
+      ariaLabel="内容"
+      textareaRef={textareaRef}
+    />,
+  );
+  const textarea = container.querySelector("textarea");
+  if (!textarea) throw new Error("textarea not found");
+  return { textarea, onChange };
+}
+
+/** jsdom 里 Tab 不会真的搬动焦点，只能靠 onChange 与 defaultPrevented 判断谁接住了这个键。 */
+function press(el: HTMLElement, key: string) {
+  const event = createEvent.keyDown(el, { key });
+  fireEvent(el, event);
+  return event;
+}
+
+describe("CodeEditor 的 Tab 出口", () => {
+  it("Tab 默认用来插入缩进并拦下事件", () => {
+    const { textarea, onChange } = renderForKeys();
+
+    const event = press(textarea, "Tab");
+
+    expect(onChange).toHaveBeenCalledWith("  abc");
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("Escape 之后的 Tab 放给浏览器，不插入也不拦截", () => {
+    const { textarea, onChange } = renderForKeys();
+
+    const escape = press(textarea, "Escape");
+    expect(escape.defaultPrevented).toBe(false);
+    expect(onChange).not.toHaveBeenCalled();
+
+    const tab = press(textarea, "Tab");
+    expect(onChange).not.toHaveBeenCalled();
+    expect(tab.defaultPrevented).toBe(false);
+  });
+
+  it("出口只用一次：放行之后的下一个 Tab 又回到缩进", () => {
+    const { textarea, onChange } = renderForKeys();
+    press(textarea, "Escape");
+    press(textarea, "Tab");
+
+    const again = press(textarea, "Tab");
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledWith("  abc");
+    expect(again.defaultPrevented).toBe(true);
+  });
+
+  it("blur 清掉放行状态，重新聚焦后 Tab 仍是缩进", () => {
+    const { textarea, onChange } = renderForKeys();
+    press(textarea, "Escape");
+    fireEvent.blur(textarea);
+
+    const tab = press(textarea, "Tab");
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(tab.defaultPrevented).toBe(true);
   });
 });

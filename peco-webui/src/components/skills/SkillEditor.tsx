@@ -26,6 +26,7 @@ import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { CodeEditor } from "@/components/skills/CodeEditor";
 import { SkillFilePanel } from "@/components/skills/SkillFilePanel";
 import { SkillFileTree } from "@/components/skills/SkillFileTree";
+import { SplitHandle } from "@/components/skills/SplitHandle";
 import {
   getSkillMd,
   listSkillFiles,
@@ -47,12 +48,44 @@ const SPLIT_MIN_WIDTH = 860;
 /** 常驻文件栏阈值：加 241px 栏后源码内容仍 ≥700 的最小容器宽。 */
 const RAIL_MIN_WIDTH = 1280;
 const PREVIEW_DEBOUNCE_MS = 250;
+/** 分栏可拖拽后预览栏的收窄下限：再窄 Markdown 的代码块与表格就压成一列字。 */
+const PREVIEW_MIN_WIDTH = 320;
+/** 源码栏下限：低于 420 宽只剩 60 余字符，拖窄了不如切回单栏。 */
+const SOURCE_MIN_WIDTH = 420;
+/** 分隔线的布局占位（1px 视觉线撑在 6px 里）；算预览上限时要扣掉它。 */
+const HANDLE_WIDTH = 6;
 
 const VIEW_OPTIONS: { mode: ViewMode; label: string; testId: string }[] = [
   { mode: "split", label: "分栏", testId: "mode-split" },
   { mode: "source", label: "源码", testId: "mode-source" },
   { mode: "preview", label: "预览", testId: "mode-preview" },
 ];
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * 分栏几何：入参是分栏行（源码 + 热区 + 预览）的宽度，不是外层容器宽——常驻文件
+ * 栏不在分栏行里，拿容器宽算上限会让预览把源码栏压到 SOURCE_MIN_WIDTH 以下。
+ *
+ * 默认宽度沿用分隔线可拖之前的观感——约占分栏行 45%，窄屏收到 380、宽屏封顶
+ * 560（1200 下即 540），最后夹进 [min, max]，极窄时分栏行也不给出越界的默认值。
+ */
+export function previewBounds(layoutWidth: number): {
+  min: number;
+  max: number;
+  defaultWidth: number;
+} {
+  const min = PREVIEW_MIN_WIDTH;
+  const max = Math.max(min, layoutWidth - SOURCE_MIN_WIDTH - HANDLE_WIDTH);
+  const defaultWidth = clamp(
+    clamp(Math.round(layoutWidth * 0.45), 380, 560),
+    min,
+    max,
+  );
+  return { min, max, defaultWidth };
+}
 
 /** 单个文件的编辑缓冲；`saved` 保留磁盘值，用于脏标记与保存后回写。 */
 interface Doc {
@@ -116,6 +149,10 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
   const [mode, setMode] = useState<ViewMode | null>(null);
   const [previewContent, setPreviewContent] = useState("");
   const [containerWidth, setContainerWidth] = useState(0);
+  /** 分栏行本身的宽度；首帧未量到时为 0，由调用处退回容器宽。 */
+  const [splitWidth, setSplitWidth] = useState(0);
+  /** 用户拖到的预览宽度；null 表示还没拖过，跟随容器默认值。 */
+  const [previewWidth, setPreviewWidth] = useState<number | null>(null);
   const [files, setFiles] = useState<SkillFile[]>([]);
   const [filesLoading, setFilesLoading] = useState(true);
   const [filesError, setFilesError] = useState(false);
@@ -127,6 +164,7 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
   const [fileReloadKey, setFileReloadKey] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const splitObserverRef = useRef<ResizeObserver | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const savedScroll = useRef({ source: 0, preview: 0 });
@@ -234,7 +272,7 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
     };
   }, [requestScope, name, activePath, activeDoc, fileReloadKey]);
 
-  // 容器宽决定默认视图与「分栏」是否可用；视口宽不可靠（侧栏展开/收起差 176px）。
+  // 容器宽决定「分栏」是否可用；视口宽不可靠（侧栏展开/收起差 176px）。
   useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -245,6 +283,22 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+
+  // 分栏行要等 SKILL.md 到位才挂载，effect 首次运行拿不到节点，所以测量挂在 ref
+  // 回调上：挂载即量、换技能重挂即重量，文件栏出现或窗口缩放都跟着 ResizeObserver 变。
+  const measureSplitRow = useCallback((el: HTMLDivElement | null) => {
+    splitObserverRef.current?.disconnect();
+    splitObserverRef.current = null;
+    if (!el) return;
+    setSplitWidth(el.getBoundingClientRect().width);
+    const observer = new ResizeObserver((entries) => {
+      setSplitWidth(entries[0].contentRect.width);
+    });
+    observer.observe(el);
+    splitObserverRef.current = observer;
+  }, []);
+
+  useEffect(() => () => splitObserverRef.current?.disconnect(), []);
 
   // 预览只跟随 SKILL.md；编辑脚本时不需要渲染 Markdown。
   useEffect(() => {
@@ -269,6 +323,21 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
       : (mode ?? (splitAvailable ? "split" : "source"));
   // 代码文件没有 Markdown 预览，源码独占。
   const effectiveMode: ViewMode = isSkillMd ? activeMode : "source";
+
+  // 没有分栏行（单栏、加载中）时才退回外层宽，避免首帧先按 320 渲染再跳到默认值。
+  const layoutWidth = splitWidth || containerWidth;
+  const {
+    min: previewMin,
+    max: previewMax,
+    defaultWidth: previewDefault,
+  } = previewBounds(layoutWidth);
+  // 记的是绝对宽度，但每次渲染都按当前分栏行重新 clamp：文件栏出现或窗口变窄时
+  // 预览自己收回来，不会把源码栏挤出可视区。
+  const effectivePreviewWidth = clamp(
+    previewWidth ?? previewDefault,
+    previewMin,
+    previewMax,
+  );
 
   const writableOf = (path: string): boolean => {
     if (path === SKILL_MD) return true;
@@ -597,7 +666,11 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
                 </span>
               </div>
 
-              <div className="flex min-h-0 flex-1">
+              <div
+                ref={measureSplitRow}
+                data-testid="split-row"
+                className="flex min-h-0 flex-1"
+              >
                 <div
                   data-pane="source"
                   hidden={effectiveMode === "preview"}
@@ -659,17 +732,26 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
                 </div>
 
                 {isSkillMd && effectiveMode === "split" && (
-                  <div className="w-px shrink-0 bg-line" />
+                  <SplitHandle
+                    width={effectivePreviewWidth}
+                    min={previewMin}
+                    max={previewMax}
+                    defaultWidth={previewDefault}
+                    onChange={setPreviewWidth}
+                  />
                 )}
 
                 {isSkillMd && (
                   <div
                     data-pane="preview"
                     hidden={effectiveMode === "source"}
-                    className={`overflow-y-auto bg-rail/40 px-5 py-4 [scrollbar-gutter:stable] ${
+                    style={
                       effectiveMode === "split"
-                        ? "w-[clamp(380px,45%,560px)] shrink-0"
-                        : "min-w-0 flex-1"
+                        ? { width: effectivePreviewWidth }
+                        : undefined
+                    }
+                    className={`overflow-y-auto bg-rail/40 px-5 py-4 [scrollbar-gutter:stable] ${
+                      effectiveMode === "split" ? "shrink-0" : "min-w-0 flex-1"
                     }`}
                   >
                     <div
