@@ -514,6 +514,103 @@ describe("SkillEditor", () => {
     expect(pane("preview").textContent).toContain("新增片段");
   });
 
+  describe("预览里的 frontmatter", () => {
+    /** 与真实 SKILL.md 同形：属性段在前，正文另起。 */
+    const WITH_FRONTMATTER = [
+      "---",
+      "name: db-migration",
+      "description: SQLite 迁移与数据完整性",
+      'allowed-tools: ["shell"]',
+      "---",
+      "",
+      "# SQLite 迁移铁律",
+      "",
+      "先备份再迁移。",
+      "",
+    ].join("\n");
+
+    it("frontmatter 不再被渲染成分隔线与含 name: 的二级标题", async () => {
+      GET_SKILL.mockResolvedValue({
+        name: "demo",
+        content: WITH_FRONTMATTER,
+      });
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      const preview = pane("preview");
+      expect(preview.querySelector("hr")).toBeNull();
+      const titles = Array.from(preview.querySelectorAll("h2"));
+      expect(titles.some((el) => el.textContent?.includes("name:"))).toBe(
+        false,
+      );
+    });
+
+    it("元信息块原样展示属性，正文照常渲染", async () => {
+      GET_SKILL.mockResolvedValue({
+        name: "demo",
+        content: WITH_FRONTMATTER,
+      });
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      const block = document.querySelector<HTMLElement>(
+        '[data-testid="frontmatter-block"]',
+      );
+      expect(block).not.toBeNull();
+      expect(pane("preview").contains(block!)).toBe(true);
+      expect(block?.textContent).toContain("name:");
+      expect(block?.textContent).toContain("allowed-tools:");
+
+      expect(pane("preview").querySelector("h1")?.textContent).toContain(
+        "迁移铁律",
+      );
+    });
+
+    it("正文自带的 --- 仍渲染成人分隔线", async () => {
+      GET_SKILL.mockResolvedValue({
+        name: "demo",
+        content: "# 标题\n\n第一段\n\n---\n\n第二段\n",
+      });
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      expect(pane("preview").querySelector("hr")).not.toBeNull();
+      expect(
+        document.querySelector('[data-testid="frontmatter-block"]'),
+      ).toBeNull();
+    });
+
+    it("只有元信息、没有正文时不显示空态", async () => {
+      GET_SKILL.mockResolvedValue({
+        name: "demo",
+        content: "---\nname: x\n---\n",
+      });
+      renderEditor();
+      await screen.findByTestId("action-bar");
+
+      expect(
+        document.querySelector('[data-testid="frontmatter-block"]'),
+      ).not.toBeNull();
+      expect(document.body.textContent).not.toContain("还没有内容");
+    });
+  });
+
+  it("独占预览时铺满剩余宽度，分栏时维持固定宽", async () => {
+    renderEditor();
+    await screen.findByTestId("action-bar");
+
+    // jsdom 没有真实布局，只能断言类名契约
+    expect(pane("preview").className).toContain("clamp(380px,45%,560px)");
+
+    await act(async () => buttonByTestId("mode-preview").click());
+
+    expect(pane("preview").className).not.toContain("clamp(380px,45%,560px)");
+    expect(pane("preview").className).toContain("flex-1");
+    expect(pane("preview").firstElementChild?.className).toContain(
+      "max-w-[760px]",
+    );
+  });
+
   it("干净状态点返回直接回列表，不弹确认", async () => {
     renderEditor();
     await screen.findByTestId("action-bar");

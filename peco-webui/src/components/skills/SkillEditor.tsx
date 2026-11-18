@@ -14,12 +14,13 @@ import {
   useState,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, ArrowLeft, FolderTree, Lock } from "lucide-react";
+import { AlertCircle, FileCode2, FolderTree, Lock } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { BackButton } from "@/components/common/BackButton";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { CodeEditor } from "@/components/skills/CodeEditor";
@@ -33,6 +34,7 @@ import {
 } from "@/api/skills";
 import { errorText, type ResourceScope } from "@/lib/api";
 import { languageOf } from "@/lib/codeLanguage";
+import { splitFrontmatter } from "@/lib/frontmatter";
 import { formatBytes } from "@/lib/format";
 import type { SkillFile } from "@/types/skill";
 
@@ -57,6 +59,24 @@ interface Doc {
   content: string;
   saved: string;
   truncated: boolean;
+}
+
+/** frontmatter 是元信息不是正文：单独展示，别让 Markdown 把它渲染成标题。 */
+function FrontmatterBlock({ content }: { content: string }) {
+  return (
+    <div
+      data-testid="frontmatter-block"
+      className="mb-4 rounded-md border border-line bg-rail/50"
+    >
+      <div className="flex items-center gap-1.5 border-b border-line px-3 py-1.5 text-[11px] text-ink-faint">
+        <FileCode2 className="size-3.5 shrink-0" aria-hidden="true" />
+        元信息（frontmatter）
+      </div>
+      <pre className="max-h-40 min-w-0 overflow-auto px-3 py-2 font-mono text-[11px] leading-4 whitespace-pre-wrap break-words text-ink-muted">
+        {content}
+      </pre>
+    </div>
+  );
 }
 
 function PreviewError() {
@@ -416,6 +436,8 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
     [activePath, isSkillMd],
   );
 
+  const { frontmatter, body } = splitFrontmatter(previewContent);
+
   const docMeta = `${activePath} · ${lineCount} 行 · ${formatBytes(byteLength)}`;
   const title = skill?.name ?? name;
 
@@ -455,15 +477,7 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
             data-testid="action-bar"
             className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-2"
           >
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="返回列表"
-              title="返回列表"
-              onClick={handleBack}
-            >
-              <ArrowLeft />
-            </Button>
+            <BackButton label="返回列表" onClick={handleBack} />
             <span className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
               {title}
             </span>
@@ -652,23 +666,38 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
                   <div
                     data-pane="preview"
                     hidden={effectiveMode === "source"}
-                    className="w-[clamp(380px,45%,560px)] shrink-0 overflow-y-auto bg-rail/40 px-5 py-4 [scrollbar-gutter:stable]"
+                    className={`overflow-y-auto bg-rail/40 px-5 py-4 [scrollbar-gutter:stable] ${
+                      effectiveMode === "split"
+                        ? "w-[clamp(380px,45%,560px)] shrink-0"
+                        : "min-w-0 flex-1"
+                    }`}
                   >
-                    <div className="mx-auto flex min-h-full w-full max-w-[560px] flex-col">
-                      {previewContent.trim() ? (
-                        <ErrorBoundary
-                          key={previewContent}
-                          fallback={<PreviewError />}
-                        >
-                          <MarkdownRenderer content={previewContent} />
-                        </ErrorBoundary>
-                      ) : (
+                    <div
+                      className={`mx-auto flex min-h-full w-full flex-col ${
+                        effectiveMode === "split"
+                          ? "max-w-[560px]"
+                          : "max-w-[760px]"
+                      }`}
+                    >
+                      {previewContent.trim() === "" ? (
                         <div className="my-auto max-w-[320px] self-center text-center text-sm text-ink-muted">
                           <p>还没有内容</p>
                           <p className="mt-1">
                             在左侧写 Markdown，这里会同步显示
                           </p>
                         </div>
+                      ) : (
+                        <ErrorBoundary
+                          key={previewContent}
+                          fallback={<PreviewError />}
+                        >
+                          {frontmatter !== null && (
+                            <FrontmatterBlock content={frontmatter} />
+                          )}
+                          {body.trim() !== "" && (
+                            <MarkdownRenderer content={body} />
+                          )}
+                        </ErrorBoundary>
                       )}
                     </div>
                   </div>

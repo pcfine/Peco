@@ -1,5 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, type RefObject } from "react";
 import hljs from "highlight.js/lib/common";
+import { splitFrontmatter } from "@/lib/frontmatter";
 
 /** 超过这个长度不做高亮，避免长文件每次击键阻塞主线程。 */
 const MAX_HIGHLIGHT_CHARS = 120_000;
@@ -24,6 +25,25 @@ function highlight(code: string, language: string): string {
   } catch {
     return escapeHtml(code);
   }
+}
+
+/**
+ * Markdown 的 frontmatter 不是 Markdown：highlight.js 会把闭合 `---` 当成
+ * setext 下划线，把整段属性吞进一个 section 标题。按 YAML 单独高亮再拼回去，
+ * 高亮层是 textarea 的透明叠层，拼接不能增减任何字符。
+ *
+ * CRLF 要先并成 LF：YAML 高亮会把行尾的 `\r` 收进 meta span，HTML 折行时它
+ * 与 span 外的 `\n` 被拆成两个换行，高亮层就比 textarea 多一行、整篇错位。
+ */
+function highlightMarkdown(code: string): string {
+  // 分段后每段都小于阈值，长度闸门必须先按整篇判。
+  if (code.length > MAX_HIGHLIGHT_CHARS) return escapeHtml(code);
+  const { frontmatter, body } = splitFrontmatter(code);
+  if (frontmatter === null) return highlight(code, "markdown");
+  return (
+    highlight(frontmatter.replaceAll("\r\n", "\n"), "yaml") +
+    highlight(body.replaceAll("\r\n", "\n"), "markdown")
+  );
 }
 
 interface CodeEditorProps {
@@ -52,7 +72,13 @@ export function CodeEditor({
 }: CodeEditorProps) {
   const preRef = useRef<HTMLPreElement>(null);
 
-  const html = useMemo(() => highlight(value, language), [value, language]);
+  const html = useMemo(
+    () =>
+      language === "markdown"
+        ? highlightMarkdown(value)
+        : highlight(value, language),
+    [value, language],
+  );
 
   const syncScroll = () => {
     const textarea = textareaRef.current;
