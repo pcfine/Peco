@@ -33,6 +33,9 @@ pub struct MarkerInfo {
     pub team: String,
     pub user_id: String,
     pub session_id: String,
+    /// 人读名称；刻意不落 `workspaces` 列 —— 名字的事实来源是 marker，DB 只是
+    /// 可重建的索引，抄一份进来就多出「改名后信谁」的第二份定义。
+    pub name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +63,8 @@ pub struct SpaceView {
     /// 门槛口径的两个计数，与 close 返回的 409 同一来源。
     pub inflight_dispatch: i64,
     pub inflight_foreign: i64,
+    /// 与下面的 `marker` 出自同一次读盘；marker 缺失或损坏时为 `null`。
+    pub name: Option<String>,
     pub marker: Option<MarkerInfo>,
 }
 
@@ -77,6 +82,8 @@ pub struct CreateRequest {
     pub work_dir: String,
     pub team_id: String,
     pub label: Option<String>,
+    /// 人读名称，写进 marker；空白视同未传，由打开路径兜底。
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -167,6 +174,23 @@ pub async fn create(
         work_dir: key.clone(),
         reason: e.to_string(),
     })?;
+
+    // 名称只落 marker：须在 `create_dir_all` 之后（独占写要先在目录里建临时文件）、
+    // `ensure_open` 之前（打开路径见已有 marker 就不再补写兜底名）；已有记录读回
+    // 原值，不会因此改名。
+    if let Some(name) = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        manifest::ensure_for(
+            &work_dir,
+            &ws_id,
+            &state.env.team_root(&request.team_id),
+            name,
+        )?;
+    }
     let handle = state
         .hub
         .ensure_open(&work_dir, None)
@@ -305,6 +329,8 @@ async fn space_view(state: &AppState, row: WorkspaceRow) -> Result<SpaceView, Da
     let reserved = state.env.peco.is_peco_space(&row.id);
     let inflight = dispatches::inflight_counts(&state.pool, &row.id, &state.env.peco.ws_id).await?;
     let effective_exit_policy = resolve_exit_policy(&row.exit_policy, state.config.exit_policy);
+    // 坏 marker 只降级这一行（列表不整体失败）；只读一次，`name` 与 `marker` 同源。
+    let marker = marker_info(Path::new(&row.work_dir));
     Ok(SpaceView {
         ws_id: row.id,
         work_dir: row.work_dir.clone(),
@@ -318,8 +344,8 @@ async fn space_view(state: &AppState, row: WorkspaceRow) -> Result<SpaceView, Da
         reserved,
         inflight_dispatch: inflight.dispatch,
         inflight_foreign: inflight.foreign,
-        // 坏 marker 不该让整个列表 409：列表只降级掉这一项，详情里也照此处理。
-        marker: marker_info(Path::new(&row.work_dir)),
+        name: marker.as_ref().map(|found| found.name.clone()),
+        marker,
     })
 }
 
@@ -329,6 +355,7 @@ fn marker_info(work_dir: &Path) -> Option<MarkerInfo> {
             team: manifest::team_id_of(&found).unwrap_or_default(),
             user_id: crate::LOCAL_USER_ID.to_string(),
             session_id: found.session_id,
+            name: found.name,
         }),
         Ok(None) => None,
         Err(e) => {

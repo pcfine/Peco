@@ -168,7 +168,13 @@ impl DaemonOpener {
         // 已有记录保持原字节（打开动作不改写创建时间/会话）；缺失时按 DB 行补写，
         // 会话 id 取自 ws_id，保证之后可重建同一个身份。
         if marker.is_none() {
-            let name = row.label.clone().unwrap_or_else(|| row.team_id.clone());
+            // 名称取目录末段：`label` 会被 PATCH 改掉，不能拿来命名；取不到末段
+            // （如 work_dir 是根目录）才退 team_id。
+            let name = work_dir
+                .file_name()
+                .and_then(|segment| segment.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| row.team_id.clone());
             manifest::ensure_for(&work_dir, &row.id, &env.team_root(&team), &name)?;
         }
 

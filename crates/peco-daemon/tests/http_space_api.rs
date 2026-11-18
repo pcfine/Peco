@@ -194,7 +194,12 @@ async fn an_existing_manifest_keeps_its_identity_and_bytes() {
     let reply = env
         .post(
             "/api/spaces",
-            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+            // 请求里的 name 与记录不同：再 POST 一次不得改名。
+            json!({
+                "work_dir": work_dir.to_string_lossy(),
+                "team_id": "research",
+                "name": "overwritten",
+            }),
         )
         .await;
 
@@ -209,6 +214,175 @@ async fn an_existing_manifest_keeps_its_identity_and_bytes() {
         std::fs::read(work_dir.join(MANIFEST_FILE)).unwrap(),
         bytes_before,
         "打开不得改写现有记录"
+    );
+    assert_eq!(
+        read_marker(&work_dir)["name"],
+        json!("kept"),
+        "既有记录的名称不得被请求里的 name 覆盖"
+    );
+}
+
+/// `name` 落进 marker，由列表与详情原样返回，且不顶替 `label`。
+///
+/// 变异：`SpaceView` 的 `name` 恒为 `null` → 列表、详情断言变红。
+#[tokio::test]
+async fn create_persists_name_into_the_marker_and_serves_it_back() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("named");
+
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({
+                "work_dir": work_dir.to_string_lossy(),
+                "team_id": "research",
+                "label": "展示名",
+                "name": "alpha",
+            }),
+        )
+        .await;
+    assert_eq!(created.status, 201, "body={}", created.body);
+    let ws_id = ws_id_of(&created);
+
+    assert_eq!(
+        read_marker(&work_dir)["name"],
+        json!("alpha"),
+        "name 必须落进 marker"
+    );
+
+    let listed = row_in(&env.get("/api/spaces").await.body, &ws_id);
+    assert_eq!(listed["name"], json!("alpha"), "列表返回 name");
+    assert_eq!(
+        listed["label"],
+        json!("展示名"),
+        "label 仍是 label，未被 name 顶替"
+    );
+    assert_eq!(
+        listed["marker"]["name"],
+        json!("alpha"),
+        "name 与 marker 快照出自同一次读盘"
+    );
+
+    let detail = env.get(&format!("/api/spaces/{ws_id}")).await;
+    assert_eq!(detail.body["name"], json!("alpha"), "详情返回 name");
+    assert_eq!(detail.body["label"], json!("展示名"));
+}
+
+/// 不传 `name` 时兜底取 work_dir 末段，且不写进 `label`。
+///
+/// 变异：兜底改用 `label`/`team_id` → 记录里会是 `research`，断言变红。
+#[tokio::test]
+async fn a_nameless_create_falls_back_to_the_work_dir_last_segment() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("unnamed");
+
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({"work_dir": work_dir.to_string_lossy(), "team_id": "research"}),
+        )
+        .await;
+    assert_eq!(created.status, 201, "body={}", created.body);
+    let ws_id = ws_id_of(&created);
+
+    let expected = work_dir
+        .file_name()
+        .and_then(|segment| segment.to_str())
+        .expect("夹具的 work_dir 必有末段");
+    assert_eq!(
+        read_marker(&work_dir)["name"],
+        json!(expected),
+        "兜底名是 work_dir 末段"
+    );
+    assert_ne!(
+        read_marker(&work_dir)["name"],
+        json!("research"),
+        "兜底不得退成 team_id"
+    );
+
+    // 名称只进 marker：`label` 仍是 `resolve_ws_id` 写的 team_id。
+    let label: Option<String> = sqlx::query_scalar("SELECT label FROM workspaces WHERE id = ?")
+        .bind(&ws_id)
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(label.as_deref(), Some("research"), "name 不得写进 label");
+}
+
+/// 只有空白的 `name` 视同未传：不写空串，兜底与不传时一致。
+///
+/// 变异：去掉 `create` 里的 `trim`/`is_empty` 过滤 → 记录里是 `""`，断言变红。
+#[tokio::test]
+async fn a_blank_name_is_treated_as_absent() {
+    let env = new_env(&["research"]).await;
+    let work_dir = env.work_dir("blank");
+
+    let created = env
+        .post(
+            "/api/spaces",
+            json!({
+                "work_dir": work_dir.to_string_lossy(),
+                "team_id": "research",
+                "name": "   ",
+            }),
+        )
+        .await;
+    assert_eq!(created.status, 201, "body={}", created.body);
+
+    let recorded = read_marker(&work_dir)["name"].clone();
+    assert_ne!(recorded, json!(""), "空白不得写进 marker");
+    assert_eq!(
+        recorded,
+        json!(work_dir.file_name().unwrap().to_str().unwrap()),
+        "空白视同未传，走同一个兜底"
+    );
+}
+
+/// marker 坏掉只降级这一行：列表仍 `200`，该行 `name`/`marker` 为 `null`，
+/// 其它空间照常返回（记录被删与记录损坏两种前件同测）。
+///
+/// 变异：`marker_info` 把读盘错误冒泡出去 → 列表不是 200；`name` 直接从
+/// `marker` 取字段 → 空 marker 处 panic。
+#[tokio::test]
+async fn a_broken_marker_nulls_only_its_own_name() {
+    let env = new_env(&["research"]).await;
+    let mut created = Vec::new();
+    for name in ["hale", "tomb", "rot"] {
+        let work_dir = env.work_dir(name);
+        let reply = env
+            .post(
+                "/api/spaces",
+                json!({
+                    "work_dir": work_dir.to_string_lossy(),
+                    "team_id": "research",
+                    "name": name,
+                }),
+            )
+            .await;
+        assert_eq!(reply.status, 201, "body={}", reply.body);
+        created.push((ws_id_of(&reply), work_dir));
+    }
+    let (hale_id, _) = created[0].clone();
+    let (tomb_id, tomb_dir) = created[1].clone();
+    let (rot_id, rot_dir) = created[2].clone();
+
+    std::fs::remove_file(tomb_dir.join(MANIFEST_FILE)).unwrap();
+    std::fs::write(rot_dir.join(MANIFEST_FILE), "{ not json").unwrap();
+
+    let list = env.get("/api/spaces").await;
+    assert_eq!(list.status, 200, "坏记录不得让列表整体失败: {}", list.body);
+
+    for ws_id in [&tomb_id, &rot_id] {
+        let row = row_in(&list.body, ws_id);
+        assert_eq!(row["name"], json!(null), "无 marker 时 name 为 null: {row}");
+        assert_eq!(row["marker"], json!(null), "marker 整体为 null: {row}");
+    }
+    // 同一次请求里的健康空间没有被连带降级。
+    let hale = row_in(&list.body, &hale_id);
+    assert_eq!(hale["name"], json!("hale"));
+    assert!(
+        hale["marker"]["session_id"].as_str().is_some(),
+        "健康空间的 marker 仍完整: {hale}"
     );
 }
 
