@@ -9,15 +9,14 @@ import {
   BookOpen,
   Bot,
   BrainCircuit,
-  ChevronLeft,
   FolderOpen,
   Plug,
   Puzzle,
 } from "lucide-react";
+import { BackButton } from "@/components/common/BackButton";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { SpaceMemoryTab } from "@/components/spaces/SpaceMemoryTab";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Button } from "@/components/ui/button";
 import { TeamAgentsTab } from "@/components/teams/TeamAgentsTab";
 import { TeamKnowledgeTab } from "@/components/teams/TeamKnowledgeTab";
 import { TeamMcpTab } from "@/components/teams/TeamMcpTab";
@@ -167,17 +166,7 @@ export function TeamConfigPanel({
           {/* 三栏等宽栅格：左右各留 28px，名称在中间那栏居中，返回键随
               `items-center` 垂直居中。 */}
           <div className="grid w-full grid-cols-[28px_1fr_28px] items-center @max-[560px]/team:flex @max-[560px]/team:justify-center">
-            {/* 颜色与下方导航一致（ink-muted）。 */}
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="text-ink-muted"
-              aria-label="返回上一页"
-              title="返回上一页"
-              onClick={goBack}
-            >
-              <ChevronLeft className="size-5" />
-            </Button>
+            <BackButton label="返回上一页" onClick={goBack} />
             {/* 窄档只剩图标栏：标题视觉隐藏但留在无障碍树里，一页仍有一个 h1。
                 团队 id 不上屏 —— 路由地址里已经带着它。 */}
             <h1

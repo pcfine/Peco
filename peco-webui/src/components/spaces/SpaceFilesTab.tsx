@@ -2,6 +2,7 @@
 // 这里只回答「这个目录里有什么」和「刚有哪些变了」。
 
 import { useEffect, useRef, useState } from "react";
+import { ChevronLeft } from "lucide-react";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -266,9 +267,10 @@ export function SpaceFilesTab({
               <button
                 type="button"
                 onClick={() => setOpenPath(null)}
-                className="shrink-0 text-caption font-medium text-ink-muted hover:text-ink @min-[640px]/panel:hidden"
+                className="inline-flex shrink-0 items-center gap-1 text-caption font-medium text-ink-muted hover:text-ink @min-[640px]/panel:hidden"
               >
-                ← 返回目录
+                <ChevronLeft className="size-3.5" aria-hidden="true" />
+                返回目录
               </button>
               <span className="min-w-0 flex-1 truncate font-mono text-2xs text-ink-muted">
                 {openPath}

@@ -263,3 +263,40 @@ describe("SpaceFilesTab 的分栏档", () => {
     expect(root.innerHTML).not.toContain("/work");
   });
 });
+
+describe("SpaceFilesTab 返回目录", () => {
+  beforeEach(() => {
+    mocks.files.mockReset();
+  });
+
+  it("打开文件后的返回是一枚 < 形 chevron，不是字面箭头", async () => {
+    mocks.files.mockImplementation(async (_wsId, options) =>
+      options.path === "a.txt"
+        ? {
+            path: "a.txt",
+            kind: "file" as const,
+            size_bytes: 10,
+            text: "hello",
+            truncated: false,
+            binary: false,
+          }
+        : listing([entry({ name: "a.txt" })]),
+    );
+    renderTab();
+
+    fireEvent.click(await screen.findByText("a.txt"));
+    const back = await screen.findByRole("button", { name: "返回目录" });
+
+    const svg = back.querySelector("svg");
+    expect(svg).not.toBeNull();
+    expect(svg?.getAttribute("class") ?? "").toContain("lucide-chevron-left");
+    // 装饰性图标：名字由按钮文本承担，读屏不会念两遍。
+    expect(svg?.getAttribute("aria-hidden")).toBe("true");
+    // 字面「←」不再参与拼装 —— 全项目的返回图标只有这一种形式。
+    expect(back.textContent).not.toContain("←");
+    expect(back.textContent?.trim()).toBe("返回目录");
+
+    fireEvent.click(back);
+    expect(screen.queryByRole("button", { name: "返回目录" })).toBeNull();
+  });
+});
