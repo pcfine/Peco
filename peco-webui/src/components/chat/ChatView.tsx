@@ -217,6 +217,22 @@ export interface QueuedChatMessage {
   text: string;
 }
 
+/**
+ * 一轮非取消的失败：气泡留在本地，等历史回来时按锚点插回去。
+ *
+ * 库里没有它的位置（服务端只在有正文时落库），所以锚点只能取「本轮是第几个
+ * user」—— 这是失败气泡与历史消息之间唯一稳定的关系。
+ */
+export interface RetainedFailure {
+  /** 失败轮的 user 在历史基准里的序号（0 起） */
+  anchorUserIndex: number;
+  /** `reduceStreamEvent` 生成的那条 isError 气泡，原样复用 */
+  message: ChatMessage;
+}
+
+/** 保留上限：只涨不跌的登记表，就是一条只涨不跌的内存。 */
+export const MAX_RETAINED_FAILURES = 20;
+
 export interface ChatViewProps {
   /** 生成 SSE 流式 URL 的函数，接收用户输入消息与附件引用 id，返回完整 URL */
   streamUrl: (message: string, fileIds: string[]) => string;
@@ -422,6 +438,18 @@ export function ChatView({
   );
   /** 本轮收到过 `error{cancelled:true}` —— 服务端权威判据，`done` 时据此打标 */
   const cancelledRef = useRef(false);
+  /**
+   * 仍在本地保留的未落库失败。失败轮在库里只有 user 行，历史一回来就会把错误
+   * 气泡一起抹掉；这里记着「它属于第几个 user」，等历史落地时插回原位。
+   */
+  const retainedFailuresRef = useRef<RetainedFailure[]>([]);
+  /**
+   * 本地消息列表里的 user 条数：本轮 user 的锚点是它 − 1。
+   *
+   * 不拿渲染后的 `messages` 现算 —— 一轮的头几帧可能早于乐观气泡的渲染就到了，
+   * 那样算出来的锚点会落到上一轮。
+   */
+  const userCountRef = useRef(countUserMessages(initialMessages));
   const fileInputRef = useRef<HTMLInputElement>(null);
   const unreadCountRef = useRef(0);
   const unreadDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -439,6 +467,10 @@ export function ChatView({
   pendingAttachmentsRef.current = pendingAttachments;
   const uploadingRef = useRef(uploading);
   uploadingRef.current = uploading;
+  // 登记保留气泡时要算本轮耗时（起点是本轮 user 的时间戳），而读流循环拿不到
+  // 最新 state —— 只能读上一次提交的列表。
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
 
   const unmountTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
@@ -509,6 +541,14 @@ export function ChatView({
     setSettleSeq((n) => n + 1);
   }, []);
 
+  /** 登记一条未落库的失败：气泡本体沿用 `reduceStreamEvent` 的那一份。 */
+  const retainFailure = useCallback((data: ErrorData) => {
+    retainedFailuresRef.current = retainFailureIn(retainedFailuresRef.current, {
+      anchorUserIndex: userCountRef.current - 1,
+      message: errorBubble(data, messagesRef.current, Date.now()),
+    });
+  }, []);
+
   // ── Core send logic — stable identity (empty deps, reads everything from refs) ─
 
   const sendMessage = useCallback(
@@ -534,6 +574,7 @@ export function ChatView({
           .map((att) => ({ name: att.name })),
       };
       setMessages((prev) => [...prev, userMsg]);
+      userCountRef.current += 1;
       setStreaming(true);
       setPaused(false);
       setCancelling(false);
@@ -561,6 +602,8 @@ export function ChatView({
         setMessages((prev) =>
           prev.filter((m) => m !== userMsg && m !== assistantMsg),
         );
+        // 乐观插入的那条 user 撤了，锚点跟着退回去，否则下一轮会算错位置
+        userCountRef.current -= 1;
         setInput(text);
         setPendingAttachments(attachments);
       };
@@ -637,8 +680,13 @@ export function ChatView({
                 output_tokens: event.data.output_tokens,
               });
             }
-            if (event.event === "error" && isCancelledError(event.data)) {
-              cancelledRef.current = true;
+            if (event.event === "error") {
+              if (isCancelledError(event.data)) {
+                cancelledRef.current = true;
+              } else {
+                // 这一轮多半不会落库：先把气泡留一份，历史回来时按锚点插回
+                retainFailure(event.data);
+              }
             }
             if (event.event === "done") {
               // `done` 是唯一的「流结束」信号：关流式态 → 下一拍 refetch 以库里为准
@@ -689,7 +737,7 @@ export function ChatView({
         abortRef.current = null;
       }
     },
-    [settleTurn],
+    [settleTurn, retainFailure],
   );
 
   // ── Sync messages when initialMessages changes (pool keep-alive) ─────────
@@ -708,7 +756,14 @@ export function ChatView({
       !streamingRef.current
     ) {
       prevInitialMessagesRef.current = initialMessages;
-      setMessages(initialMessages);
+      const merged = mergeRetainedFailures(
+        initialMessages,
+        retainedFailuresRef.current,
+      );
+      // 回写剪枝后的登记表：真实回复已落库的那些失败不该拖到下一次 refetch
+      retainedFailuresRef.current = merged.retained;
+      userCountRef.current = countUserMessages(initialMessages);
+      setMessages(merged.messages);
     }
   }, [initialMessages, isExternalMode]);
 
@@ -954,8 +1009,13 @@ export function ChatView({
             const seq = frameSeq(parsed.id);
             if (seq !== null && seq <= watermark) continue;
 
-            if (event.event === "error" && isCancelledError(event.data)) {
-              cancelledRef.current = true;
+            if (event.event === "error") {
+              if (isCancelledError(event.data)) {
+                cancelledRef.current = true;
+              } else {
+                // 水位已拦掉重叠帧：同一帧不会登记第二次
+                retainFailure(event.data);
+              }
             }
             if (event.event === "done") {
               sawDone = true;
@@ -984,7 +1044,7 @@ export function ChatView({
       controller.abort();
       if (attachAbortRef.current === controller) attachAbortRef.current = null;
     };
-  }, [canAttachTurn, visible, attachEpoch, settleTurn]);
+  }, [canAttachTurn, visible, attachEpoch, settleTurn, retainFailure]);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -1818,6 +1878,30 @@ function turnResultAt(
   };
 }
 
+/**
+ * `error` 帧的气泡本体。
+ *
+ * 未落库的失败要跨一次 refetch 留着，所以构造口径必须只有一处 —— 读流时现成
+ * 生成一份、保留时再造一份，两边就会长成两种样子。
+ */
+function errorBubble(
+  data: ErrorData,
+  messages: ChatMessage[],
+  now: number,
+): ChatMessage {
+  return {
+    role: "assistant",
+    content: data.message,
+    turnIndex: 0,
+    isError: true,
+    turnResult: turnResultAt(
+      messages,
+      isCancelledError(data) ? "cancelled" : "failed",
+      now,
+    ),
+  };
+}
+
 /** 给本轮最后一条 assistant 宿主挂上终态。 */
 export function markTurnResult(
   messages: ChatMessage[],
@@ -1922,6 +2006,84 @@ export function applyTurnSnapshot(
     ...agents,
     ...base.slice(host + 1),
   ];
+}
+
+/** 列表里 user 消息的条数 —— 也就是下一个 user 的锚点。 */
+function countUserMessages(messages: ChatMessage[]): number {
+  let count = 0;
+  for (const m of messages) {
+    if (m.role === "user") count += 1;
+  }
+  return count;
+}
+
+/** 登记一条失败；超出上限丢最旧的（新的失败比旧的一直更有信息量）。 */
+export function retainFailureIn(
+  retained: RetainedFailure[],
+  entry: RetainedFailure,
+): RetainedFailure[] {
+  return [...retained, entry].slice(-MAX_RETAINED_FAILURES);
+}
+
+/**
+ * 把未落库的失败气泡合进历史基准（纯函数）。
+ *
+ * 失败轮在库里只剩 user 行，直接拿历史整表覆盖会把错误抹掉（用户只看到红框闪
+ * 一下）。合并而不是追加：每次都从基准重建，多次 refetch 不会叠出第二条同样的
+ * 气泡。这一轮已经有 assistant 落库时丢弃登记 —— 真实回复才是最终结论，错误只是
+ * 失败尝试的回声。
+ */
+export function mergeRetainedFailures(
+  base: ChatMessage[],
+  retained: RetainedFailure[],
+): { messages: ChatMessage[]; retained: RetainedFailure[] } {
+  if (retained.length === 0) return { messages: base, retained };
+
+  const userIndices: number[] = [];
+  base.forEach((m, i) => {
+    if (m.role === "user") userIndices.push(i);
+  });
+
+  /** 插入位置（基准下标，插在该下标之前）→ 该位置要插入的气泡 */
+  const insertions = new Map<number, ChatMessage[]>();
+  const kept: RetainedFailure[] = [];
+
+  for (const item of retained) {
+    const blockStart = userIndices[item.anchorUserIndex];
+    // 一轮块的末尾 = 下一个 user 之前；没有下一个 user 就是列表末尾
+    const blockEnd =
+      blockStart === undefined
+        ? base.length
+        : (userIndices[item.anchorUserIndex + 1] ?? base.length);
+    if (blockStart !== undefined) {
+      let replied = false;
+      for (let i = blockStart + 1; i < blockEnd; i += 1) {
+        if (base[i].role === "assistant") {
+          replied = true;
+          break;
+        }
+      }
+      if (replied) continue;
+    }
+    // 锚点越界 = 基准还没含这一轮（历史尚未追上）：错误仍要说出来，先追加到
+    // 末尾；下一次 refetch 若追上，锚点会重新把它归位。
+    kept.push(item);
+    const at = insertions.get(blockEnd) ?? [];
+    at.push(item.message);
+    insertions.set(blockEnd, at);
+  }
+
+  if (kept.length === 0) return { messages: base, retained: kept };
+
+  const messages: ChatMessage[] = [];
+  base.forEach((m, i) => {
+    const at = insertions.get(i);
+    if (at) messages.push(...at);
+    messages.push(m);
+  });
+  const tail = insertions.get(base.length);
+  if (tail) messages.push(...tail);
+  return { messages, retained: kept };
 }
 
 /**
@@ -2086,17 +2248,7 @@ export function reduceStreamEvent(
       // 失败轮以警示气泡展示；取消还原为「取消」态
       return settlePendingToolCalls([
         ...messages,
-        {
-          role: "assistant" as const,
-          content: event.data.message,
-          turnIndex: 0,
-          isError: true,
-          turnResult: turnResultAt(
-            messages,
-            isCancelledError(event.data) ? "cancelled" : "failed",
-            now,
-          ),
-        },
+        errorBubble(event.data, messages, now),
       ]);
   }
 }
