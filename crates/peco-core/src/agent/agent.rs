@@ -2,6 +2,7 @@
 // Agent — 从 agent.md 配置文件组装完整的 Agent 实例
 // ============================================================================
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::agent::agent_config::{
@@ -12,7 +13,7 @@ use model_provider::{
     DeepSeek, DeepSeekAnthropicAdapter, DeepSeekResponsesAdapter, GenerateRequest, GenerateResult,
     GenerateStream, InputItem, ModelProvider, OpenAI, OpenAiResponsesAdapter,
     QwenChatCompletionsAdapter, QwenResponsesAdapter, ReasoningConfig, ReasoningEffort,
-    SERVER_TOOL_WEB_SEARCH, ToolChoice, ToolDefinition, Usage,
+    SERVER_TOOL_WEB_SEARCH, SERVER_WEB_SEARCH_WIRE_NAME, ToolChoice, ToolDefinition, Usage,
 };
 
 use serde::{Deserialize, Serialize};
@@ -336,16 +337,12 @@ impl Agent {
         &self,
         input: Vec<Arc<InputItem>>,
         instructions: Option<String>,
-        mut tools: Vec<ToolDefinition>,
+        tools: Vec<ToolDefinition>,
         customize: impl FnOnce(&mut GenerateRequest),
     ) -> GenerateRequest {
-        if self.model_config.web_search == Some(true) && self.model.supports_server_web_search() {
-            tools.push(ToolDefinition {
-                name: SERVER_TOOL_WEB_SEARCH.to_string(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
-            });
-        }
+        let server_web_search =
+            self.model_config.web_search == Some(true) && self.model.supports_server_web_search();
+        let tools = merge_server_web_search(tools, server_web_search);
         let mut request = GenerateRequest {
             model: self.model_config.model_name.clone().unwrap_or_default(),
             instructions,
@@ -404,6 +401,48 @@ impl Agent {
         let request = self.build_generate_request(input, instructions, tools, customize);
         Ok(self.model.generate_full(&request).await?)
     }
+}
+
+/// 把服务端 web 搜索标记并入工具列表，并按 [`ToolDefinition::name`] 去重（保留首次出现）。
+///
+/// 标记启用时先移除同名的客户端 web 搜索工具：服务端搜索接管该名字后，客户端那条
+/// 既无法被端点接受（同名工具会被整条拒掉）、也不再是调用方想要的检索路径。
+fn merge_server_web_search(
+    mut tools: Vec<ToolDefinition>,
+    server_marker_enabled: bool,
+) -> Vec<ToolDefinition> {
+    if server_marker_enabled {
+        tools.retain(|tool| {
+            if tool.name != SERVER_WEB_SEARCH_WIRE_NAME {
+                return true;
+            }
+            tracing::warn!(
+                tool = %tool.name,
+                reason = "server_web_search",
+                "client tool superseded by server-side web search"
+            );
+            false
+        });
+        tools.push(ToolDefinition {
+            name: SERVER_TOOL_WEB_SEARCH.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+    }
+
+    let mut seen = HashSet::new();
+    tools.retain(|tool| {
+        if seen.insert(tool.name.clone()) {
+            return true;
+        }
+        tracing::warn!(
+            tool = %tool.name,
+            reason = "duplicate_name",
+            "dropping duplicate tool definition"
+        );
+        false
+    });
+    tools
 }
 
 /// 生成「一次性覆盖输出预算」的请求定制闭包：`Some(b)` 时覆写
@@ -1409,6 +1448,135 @@ mod tests {
                 .all(|t| t.name != SERVER_TOOL_WEB_SEARCH),
             "不支持的 provider 不得注入标记"
         );
+    }
+
+    // ── 工具名去重 ────────────────────────────────────────────────────────
+
+    /// 去重告警里可定位的一句：条数断言只认它，不看日志前缀。
+    const DROP_DUP_WARN: &str = "dropping duplicate tool definition";
+    const SUPERSEDED_WARN: &str = "client tool superseded by server-side web search";
+
+    /// 客户端工具名与适配器声明服务端搜索时用的名字是同一个。
+    const CLIENT_WEB_SEARCH: &str = "web_search";
+
+    fn tool_def(name: &str, description: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// 服务端标记接管名字后，同名客户端工具必须让位：两者都进请求就会被端点
+    /// 以 “Tool names must be unique” 整条拒掉。断言按报文名比，不看中立层命名。
+    #[test]
+    fn test_client_web_search_superseded_by_server_marker() {
+        let agent = web_search_agent(
+            Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()),
+            Some(true),
+        );
+        let request = agent.build_generate_request(
+            vec![],
+            None,
+            vec![
+                tool_def("shell", "d"),
+                tool_def(CLIENT_WEB_SEARCH, "client"),
+            ],
+            |_| {},
+        );
+
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["shell", SERVER_TOOL_WEB_SEARCH],
+            "客户端 web_search 应被服务端搜索取代，shell 保留"
+        );
+
+        let marker = request.tools.last().expect("标记位于末尾");
+        assert_eq!(marker.name, SERVER_TOOL_WEB_SEARCH);
+        assert_eq!(marker.description, "");
+        assert_eq!(marker.parameters, serde_json::json!({"type": "object"}));
+    }
+
+    /// 开关关着、或适配器没有服务端搜索时客户端工具仍是唯一可用的检索路径，
+    /// 不得被去重顺手删掉。
+    fn assert_client_web_search_kept(agent: &Agent, case: &str) {
+        let request = agent.build_generate_request(
+            vec![],
+            None,
+            vec![
+                tool_def("shell", "d"),
+                tool_def(CLIENT_WEB_SEARCH, "client"),
+            ],
+            |_| {},
+        );
+        let client = request
+            .tools
+            .iter()
+            .find(|t| t.name == CLIENT_WEB_SEARCH)
+            .unwrap_or_else(|| panic!("{case}: 客户端 web_search 被误删"));
+        assert_eq!(client.description, "client", "{case}");
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|t| t.name != SERVER_TOOL_WEB_SEARCH),
+            "{case}: 不该注入标记"
+        );
+    }
+
+    #[test]
+    fn test_client_web_search_kept_when_switch_off() {
+        for flag in [None, Some(false)] {
+            let agent =
+                web_search_agent(Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()), flag);
+            assert_client_web_search_kept(&agent, &format!("flag={flag:?}"));
+        }
+    }
+
+    #[test]
+    fn test_client_web_search_kept_when_provider_lacks_server_search() {
+        let agent = web_search_agent(
+            Arc::new(DeepSeekResponsesAdapter::new("sk").unwrap()),
+            Some(true),
+        );
+        assert_client_web_search_kept(&agent, "responses 适配器");
+    }
+
+    #[test]
+    fn test_duplicate_tool_names_keep_first() {
+        let agent = web_search_agent(Arc::new(DeepSeekAnthropicAdapter::new("sk").unwrap()), None);
+        let request = agent.build_generate_request(
+            vec![],
+            None,
+            vec![tool_def("shell", "a"), tool_def("shell", "b")],
+            |_| {},
+        );
+
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["shell"], "重名只保留首次出现");
+        assert_eq!(request.tools[0].description, "a", "保留的是首次出现的那条");
+    }
+
+    /// 丢弃要留痕：线上只能靠这两条 warn 知道工具有没有少、为什么少。
+    #[test]
+    fn test_merge_server_web_search_warns_per_dropped_tool() {
+        let (logs, _guard) = capture_logs();
+        let tools = merge_server_web_search(
+            vec![
+                tool_def("shell", "a"),
+                tool_def("shell", "b"),
+                tool_def(CLIENT_WEB_SEARCH, "client"),
+            ],
+            true,
+        );
+
+        assert_eq!(tools.len(), 2, "只剩一个 shell 与服务端标记");
+        let text = logs.text();
+        assert_eq!(text.matches(DROP_DUP_WARN).count(), 1, "{text}");
+        assert_eq!(text.matches(SUPERSEDED_WARN).count(), 1, "{text}");
+        assert!(text.contains("tool=shell"), "{text}");
+        assert!(text.contains("tool=web_search"), "{text}");
     }
 
     // ── agent.md web_search 配置透传 ───────────────────────────────────────

@@ -21,7 +21,8 @@ use crate::logging;
 use crate::providers::chat_common::strip_tool_output_images;
 use crate::response::{
     BlockType, Content, ContentBlock, FinishReason, GenerateRequest, GenerateResult, InputItem,
-    ResponseError, ResponseStatus, Role, SERVER_TOOL_WEB_SEARCH, StreamChunk,
+    ResponseError, ResponseStatus, Role, SERVER_TOOL_WEB_SEARCH, SERVER_WEB_SEARCH_WIRE_NAME,
+    StreamChunk,
 };
 use crate::streaming::sse::{SseEvent, StreamingEventSource};
 use crate::{GenerateStream, ModelProvider, ProviderError, Usage};
@@ -444,7 +445,7 @@ fn build_request_body(
             if t.name == SERVER_TOOL_WEB_SEARCH {
                 serde_json::json!({
                     "type": "web_search_20250305",
-                    "name": "web_search",
+                    "name": SERVER_WEB_SEARCH_WIRE_NAME,
                     "max_uses": WEB_SEARCH_MAX_USES,
                 })
             } else {

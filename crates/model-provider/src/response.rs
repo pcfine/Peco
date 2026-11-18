@@ -71,6 +71,12 @@ pub fn text_of_blocks(blocks: &[ContentBlock]) -> String {
 /// 引擎在请求工具列表中追加以此命名的 `ToolDefinition`，表示启用服务端 web 搜索。
 pub const SERVER_TOOL_WEB_SEARCH: &str = "__server_tool_web_search__";
 
+/// 服务端 web 搜索声明在请求报文里占用的工具名。
+///
+/// 引擎据它判断客户端工具是否与之撞名（端点对同名工具整条拒收）；适配器据它拼
+/// `name` 字段。必须只有这一处字面量。
+pub const SERVER_WEB_SEARCH_WIRE_NAME: &str = "web_search";
+
 // ============================================================================
 // Content — 消息 / 工具输出内容（string | parts[]）
 // ============================================================================
