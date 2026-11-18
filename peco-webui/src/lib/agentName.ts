@@ -1,25 +1,21 @@
 // Agent 的中文展示名从 description 推导，不单独存字段：save_agent 创建的 agent
 // 只写 agent.md，给它补一列显示名会让两种创建路径分叉。
 //
-// 约定：description 的「名称 — 说明」形式取破折号前的名称；没有分隔符时取前
-// 3 个字符；结果最多 8 个字符，避免卡片标题被一整句话撑开。
+// 约定：description 写成「名称 — 说明」，标题取分隔符前的名称。只在开头这么短的
+// 窗口里找分隔符：名称写多长由各人习惯决定，「说明里随手一个连字符」不该把标题
+// 换成前半句废话，超出窗口就整条回退到 agent id。
 
 const SEPARATORS = ["-", "—", "–"];
-const MAX_NAME_CHARS = 8;
-const HEAD_CHARS = 3;
+const TITLE_CHARS = 12;
 
-function takeChars(text: string, limit: number): string {
-  const chars = Array.from(text);
-  if (chars.length <= limit) return text.trimEnd();
-
-  let cut = chars.slice(0, limit).join("");
-  // 截断点落在单词中间时回退到前一个空白，避免「记忆管理 Age」这种半截词。
-  const next = chars[limit];
-  if (next && !/\s/.test(next) && !/\s/.test(cut.at(-1) ?? "")) {
-    const boundary = cut.search(/\s\S*$/);
-    if (boundary > 0) cut = cut.slice(0, boundary);
+/** 最早出现的分隔符下标，没有则 -1。数据里 ASCII 连字符与全角破折号混用。 */
+function firstSeparatorIndex(text: string): number {
+  let cut = -1;
+  for (const separator of SEPARATORS) {
+    const index = text.indexOf(separator);
+    if (index >= 0 && (cut < 0 || index < cut)) cut = index;
   }
-  return cut.trimEnd();
+  return cut;
 }
 
 /** 卡片/编辑器标题用的展示名；推导不出时回退到 agent id。 */
@@ -30,20 +26,21 @@ export function agentDisplayName(
   const text = description.trim();
   if (!text) return fallback;
 
-  let cut = -1;
-  for (const separator of SEPARATORS) {
-    const index = text.indexOf(separator);
-    if (index >= 0 && (cut < 0 || index < cut)) cut = index;
-  }
+  // 按码点开窗：slice 切 UTF-16 会留下半个 emoji。
+  const window = Array.from(text).slice(0, TITLE_CHARS).join("");
+  const cut = firstSeparatorIndex(window);
+  // 分隔符落在开头说明前面没名称，这条只能回退到 id。
+  return cut > 0 ? window.slice(0, cut).trim() : fallback;
+}
 
-  if (cut > 0) {
-    const name = takeChars(text.slice(0, cut), MAX_NAME_CHARS);
-    if (name) return name;
-  }
-
-  // 无分隔符，或分隔符前为空：去掉开头的分隔符/空白后取前几个字。
-  const head = text.replace(/^[-—–\s]+/, "");
-  return takeChars(head, HEAD_CHARS) || fallback;
+/**
+ * 整条 description 里的角色名。标题窗口装不下名称时，卡片副行靠它把名称留住：
+ * 标题此时是 id，副行再写一遍 id 就等于什么都没说。
+ */
+export function agentRoleName(description: string): string {
+  const text = description.trim();
+  const cut = firstSeparatorIndex(text);
+  return cut > 0 ? text.slice(0, cut).trim() : "";
 }
 
 /** 卡片副文本：去掉「名称 —」前缀后的说明；无分隔符时原样返回。 */
@@ -51,11 +48,7 @@ export function agentDescriptionDetail(description: string): string {
   const text = description.trim();
   if (!text) return "";
 
-  let cut = -1;
-  for (const separator of SEPARATORS) {
-    const index = text.indexOf(separator);
-    if (index >= 0 && (cut < 0 || index < cut)) cut = index;
-  }
+  const cut = firstSeparatorIndex(text);
   return cut >= 0 ? text.slice(cut + 1).trim() : text;
 }
 

@@ -353,19 +353,71 @@ describe("团队 agents tab 装配", () => {
     expect(screen.queryByRole("button", { name: /^删除/ })).toBeNull();
   });
 
-  it("master 徽标是底色 chip 不描边，整张卡就是可点的那一层", async () => {
+  it("标题用得上名称时，副行摆等宽的 id 且只摆一次", async () => {
     renderTab();
-    const card = await screen.findByRole("button", { name: /@master/ });
+    const card = await screen.findByRole("button", { name: /^团队总管/ });
 
-    // 名字与徽标都写着 @master：取带 chip 底色的那一个。
-    const badge = within(card)
-      .getAllByText("@master")
-      .find((node) => node.className.includes("bg-line/60"));
-    expect(badge).toBeDefined();
-    expect(badge?.className).not.toMatch(/\bborder(-|\b)/);
+    expect(within(card).getByText("团队总管")).toBeInTheDocument();
+    const idRow = within(card).getByText("@master");
+    expect(idRow).toHaveClass("font-mono");
+    expect(idRow).toHaveClass("text-ink-faint");
+    expect(within(card).getAllByText("@master")).toHaveLength(1);
 
     // 整张卡就是一个按钮：点卡上任何一处都是「打开这个 agent」。
     expect(card.tagName).toBe("BUTTON");
+  });
+
+  it("标题回退成 id 时，副行改摆角色名且不带等宽", async () => {
+    rows = [
+      listItem(
+        agentDetail({
+          id: "a_dba",
+          name: "dba",
+          description: "Peco 数据与迁移专员 — 负责 SQLite schema",
+        }),
+        false,
+      ),
+    ];
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^dba/ });
+    // 12 字窗口里没有分隔符：标题就是 id，副行不再把 id 重复一遍。
+    expect(within(card).getAllByText("dba")).toHaveLength(1);
+
+    const roleRow = within(card).getByText("Peco 数据与迁移专员");
+    expect(roleRow).toHaveClass("text-ink-faint");
+    expect(roleRow.className).not.toContain("font-mono");
+    expect(within(card).getByText("负责 SQLite schema")).toBeInTheDocument();
+  });
+
+  it("没有说明时描述行留占位，四行里不会塌掉一行", async () => {
+    rows = [
+      listItem(
+        agentDetail({ id: "a_quiet", name: "quiet", description: "安静 —" }),
+        false,
+      ),
+    ];
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^安静/ });
+    const descRow = Array.from(card.querySelectorAll("p")).find((row) =>
+      row.className.includes("text-caption"),
+    );
+    expect(descRow?.textContent).toBe("\u00a0");
+  });
+
+  it("计数行单行不折行，卡体撑满栅格给的高度", async () => {
+    renderTab();
+    const card = await screen.findByRole("button", { name: /^助手/ });
+
+    expect(card.className).toContain("h-full");
+
+    const counts = within(card).getByText("tools: 3").parentElement;
+    expect(counts?.className).toContain("overflow-hidden");
+    expect(counts?.className).not.toContain("flex-wrap");
+    for (const label of ["tools: 3", "mcp: 1", "skill: 1"]) {
+      expect(within(card).getByText(label)).toHaveClass("whitespace-nowrap");
+    }
   });
 
   it("普通 agent 的卡内删除要过二次确认，且不会顺带打开编辑器", async () => {

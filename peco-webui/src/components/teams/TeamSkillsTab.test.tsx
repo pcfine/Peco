@@ -94,6 +94,27 @@ async function openEditor(name = "review") {
   await screen.findByRole("button", { name: "保存修改" });
 }
 
+/**
+ * 源码编辑层是 textarea 上的透明高亮底片，同一段正文在 DOM 里出现两次；
+ * 断言「预览里看得见」必须限定到预览面板，否则会撞上高亮层那份。
+ */
+function previewPane(): HTMLElement {
+  const el = document.querySelector<HTMLElement>('[data-pane="preview"]');
+  if (!el) throw new Error("preview pane not found");
+  return el;
+}
+
+async function findByPreviewText(text: string): Promise<HTMLElement> {
+  // 预览面板要等技能详情到位才挂载，先等它出现再查文本。
+  await waitFor(() => previewPane());
+  return within(previewPane()).findByText(text);
+}
+
+function queryPreviewText(text: string): HTMLElement | null {
+  const pane = document.querySelector<HTMLElement>('[data-pane="preview"]');
+  return pane ? within(pane).queryByText(text) : null;
+}
+
 function renderTab(scope: ResourceScope = TEAM_SCOPE) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -215,7 +236,7 @@ describe("团队 skills tab 装配", () => {
     expect(put.mock.calls[0][2]).toEqual(SCOPE);
 
     // 建完即选中：预览直接是刚写进去的那份。
-    expect(await screen.findByText("正文")).toBeInTheDocument();
+    expect(await findByPreviewText("正文")).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
@@ -320,8 +341,8 @@ describe("团队 skills tab 装配", () => {
     );
 
     fireEvent.click(await screen.findByRole("button", { name: /^review/ }));
-    expect(await screen.findByText("review 的正文")).toBeInTheDocument();
-    expect(screen.queryByText("translate 的正文")).toBeNull();
+    expect(await findByPreviewText("review 的正文")).toBeInTheDocument();
+    expect(queryPreviewText("translate 的正文")).toBeNull();
   });
 
   it("删掉最后一个技能后只剩新建入口与空态文案", async () => {
@@ -359,11 +380,19 @@ describe("团队 skills tab 装配", () => {
     const card = await screen.findByRole("button", { name: /^review/ });
     expect(screen.getByText("Skill")).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
-    // 卡上只留名字，描述不再铺出来。
-    expect(within(card).queryByText("代码审查")).toBeNull();
+    // 描述摆进卡里：列表上就要能分辨两个技能是干什么的。
+    expect(within(card).getByText("代码审查")).toBeInTheDocument();
     expect(screen.queryByLabelText("SKILL.md 内容")).toBeNull();
     expect(screen.queryByRole("button", { name: "保存修改" })).toBeNull();
     expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
+  });
+
+  it("描述为空的技能卡上摆「无描述」，不留空白", async () => {
+    rows = [{ name: "bare", description: "" }];
+    renderTab();
+
+    const card = await screen.findByRole("button", { name: /^bare/ });
+    expect(within(card).getByText("无描述")).toBeInTheDocument();
   });
 
   it("点卡片进编辑器，点「返回列表」回到卡片栅格", async () => {
@@ -373,14 +402,14 @@ describe("团队 skills tab 装配", () => {
     expect(
       await screen.findByRole("button", { name: "返回列表" }),
     ).toBeInTheDocument();
-    expect(await screen.findByText("translate 的正文")).toBeInTheDocument();
+    expect(await findByPreviewText("translate 的正文")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "返回列表" }));
 
     expect(
       await screen.findByRole("button", { name: /^translate/ }),
     ).toBeInTheDocument();
-    expect(screen.queryByText("translate 的正文")).toBeNull();
+    expect(queryPreviewText("translate 的正文")).toBeNull();
     expect(screen.queryByRole("button", { name: "返回列表" })).toBeNull();
   });
 
@@ -389,14 +418,14 @@ describe("团队 skills tab 装配", () => {
     await openEditor();
 
     // 首屏不闪空：进编辑态的第一帧就是磁盘上的正文。
-    expect(screen.getByText("review 的正文")).toBeInTheDocument();
+    expect(queryPreviewText("review 的正文")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("SKILL.md 内容"), {
       target: { value: "---\nname: review\n---\n\n改过的正文\n" },
     });
 
-    expect(await screen.findByText("改过的正文")).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByText("review 的正文")).toBeNull());
+    expect(await findByPreviewText("改过的正文")).toBeInTheDocument();
+    await waitFor(() => expect(queryPreviewText("review 的正文")).toBeNull());
     // 预览是草稿的投影，没发请求。
     expect(put).not.toHaveBeenCalled();
   });

@@ -224,6 +224,26 @@ describe("团队 MCP tab 装配", () => {
     expect(screen.queryByText("undefined")).toBeNull();
   });
 
+  it("配置里写了 description 就摆出来，没写的卡不占那一行", async () => {
+    servers = {
+      filesystem: {
+        command: "npx",
+        args: ["-y", "@mcp/filesystem"],
+        description: "文件读写",
+      },
+      docs: { url: "https://example.com/sse" },
+      blank: { url: "http://x/y", description: "   " },
+    };
+    renderTab();
+
+    expect(await screen.findByText("文件读写")).toBeInTheDocument();
+    expect(screen.getAllByText("文件读写")).toHaveLength(1);
+    // 没写、只写空白的配置都不摆那一行，也不用「无描述」占位。
+    expect(screen.getByText("docs")).toBeInTheDocument();
+    expect(screen.getByText("blank")).toBeInTheDocument();
+    expect(screen.queryByText("无描述")).toBeNull();
+  });
+
   it("「添加MCP」弹表单，提交后只加这一项并保留其余 server", async () => {
     renderTab();
 

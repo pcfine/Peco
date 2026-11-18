@@ -39,6 +39,7 @@ interface ServerSummary {
   endpoint: string | null;
   timeoutSecs: number | null;
   maxRetries: number | null;
+  description: string | null;
 }
 
 /**
@@ -65,6 +66,11 @@ function summarize(value: unknown): ServerSummary {
       typeof record.timeoutSecs === "number" ? record.timeoutSecs : null,
     maxRetries:
       typeof record.maxRetries === "number" ? record.maxRetries : null,
+    // 配置里没有这个字段，是手写 JSON 里额外带的；空串当没有，免得摆出一行空白。
+    description:
+      typeof record.description === "string" && record.description.trim() !== ""
+        ? record.description.trim()
+        : null,
   };
 }
 
@@ -90,6 +96,8 @@ function ServerCard({
 
   return (
     <EntityCard
+      // 与 skills 卡同一节奏：只有两行内容时，132px 的默认高度会留出 58px 空白。
+      className="h-full min-h-[90px]"
       actions={
         // 试连一次要真起进程 / 打网络：并发的第二个没有意义。
         <Button variant="ghost" size="xs" disabled={disabled} onClick={onTest}>
@@ -108,7 +116,7 @@ function ServerCard({
         />
         {/* 状态不能只靠颜色：读屏靠这句。 */}
         <span className="sr-only">{summary.enabled ? "已启用" : "已停用"}</span>
-        <span className="min-w-0 truncate font-mono text-sm text-ink">
+        <span className="min-w-0 truncate font-mono text-lg font-semibold text-ink">
           {name}
         </span>
         {summary.transport && (
@@ -117,6 +125,11 @@ function ServerCard({
           </span>
         )}
       </div>
+      {summary.description !== null && (
+        <p className="line-clamp-2 text-caption text-ink-muted">
+          {summary.description}
+        </p>
+      )}
       <div className="mt-auto flex min-w-0 items-baseline gap-1 font-mono text-caption text-ink-faint">
         {summary.endpoint && (
           <span className="min-w-0 truncate">{summary.endpoint}</span>

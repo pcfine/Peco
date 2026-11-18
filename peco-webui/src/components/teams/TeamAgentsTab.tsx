@@ -3,8 +3,9 @@
 
 import { useState, type CSSProperties } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { BackButton } from "@/components/common/BackButton";
 import { CardGrid, EntityCard } from "@/components/common/CardGrid";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
@@ -24,6 +25,7 @@ import { deleteAgent } from "@/api/agents";
 import {
   agentDescriptionDetail,
   agentDisplayName,
+  agentRoleName,
   firstGrapheme,
 } from "@/lib/agentName";
 import { errorText, type ResourceScope } from "@/lib/api";
@@ -81,14 +83,16 @@ function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
   const toolCount = agent.tools?.length ?? 0;
   const mcpCount = agent.mcp_servers?.length ?? 0;
   const skillCount = agent.skills?.length ?? 0;
-  // id 只出现一次：普通 agent 用副行，master 用徽标（标题已是 @master 时两者都不画）。
-  const showId = !agent.is_master && label !== agent.name;
-  const showMasterBadge = agent.is_master && label !== agent.name;
+  // 标题回退成 id 说明名称没落在窗口里，副行改放角色名；两条分支都为的是同一个
+  // 字符串不在卡上出现两次。
+  const fallsBackToId = label === agent.name;
+  const roleName = agentRoleName(agent.description);
+  const secondary = fallsBackToId ? roleName : agent.name;
 
   return (
     <EntityCard
       onClick={onOpen}
-      className="min-h-[104px]"
+      className="h-full min-h-[104px]"
       actions={
         agent.is_master ? null : (
           <Button
@@ -105,35 +109,29 @@ function AgentCard({ agent, onOpen, onDelete }: AgentCardProps) {
     >
       <div className="flex min-w-0 flex-1 items-stretch gap-3">
         <AgentMonogram agent={agent} />
+        {/* 四行都只占一行高：同组卡等高靠这里，行内换行会把卡撑成不同高度。 */}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="space-y-0.5">
-            {/* 右上角留给操作按钮，名字行不铺到那里。 */}
-            <div className="flex min-w-0 items-baseline gap-1.5 pr-6">
-              <span className="truncate text-base font-semibold text-ink">
-                {label}
-              </span>
-              {showMasterBadge && (
-                <span className="shrink-0 rounded-sm bg-line/60 px-1 text-2xs font-medium text-ink-faint">
-                  @master
-                </span>
-              )}
-            </div>
-            {showId && (
-              <p
-                className="truncate font-mono text-2xs text-ink-faint"
-                title={agent.name}
-              >
-                {agent.name}
-              </p>
-            )}
-            {detail && detail !== label && (
-              <p className="mt-1 line-clamp-2 text-caption text-ink-muted">
-                {detail}
-              </p>
-            )}
+          {/* 右上角留给操作按钮，名字行不铺到那里。 */}
+          <div className="flex min-w-0 items-center pr-6">
+            <span className="truncate text-base font-semibold text-ink">
+              {label}
+            </span>
           </div>
+          <p
+            className={
+              fallsBackToId
+                ? "mt-0.5 truncate text-2xs text-ink-faint"
+                : "mt-0.5 truncate font-mono text-2xs text-ink-faint"
+            }
+            title={secondary || undefined}
+          >
+            {secondary || "\u00a0"}
+          </p>
+          <p className="mt-1 truncate text-caption text-ink-muted">
+            {detail || "\u00a0"}
+          </p>
           {/* 计数压到卡底：短描述时也不留一截空白。 */}
-          <p className="mt-auto flex flex-wrap items-center gap-x-3 gap-y-0.5 pt-2 font-mono text-2xs text-ink-faint">
+          <p className="mt-auto flex items-center gap-x-3 overflow-hidden pt-2 font-mono text-2xs text-ink-faint">
             <span className="whitespace-nowrap">tools: {toolCount}</span>
             <span className="whitespace-nowrap">mcp: {mcpCount}</span>
             <span className="whitespace-nowrap">skill: {skillCount}</span>
@@ -259,16 +257,7 @@ export function TeamAgentsTab({
             返回键与标题都靠 items-center 落在同一条中线上。 */}
         <div className="flex h-11 shrink-0 items-center border-b border-line px-3">
           <div className="grid w-full grid-cols-[28px_1fr_28px] items-center">
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="text-ink-muted"
-              aria-label="返回列表"
-              title="返回列表"
-              onClick={() => setSelected(null)}
-            >
-              <ChevronLeft className="size-5" />
-            </Button>
+            <BackButton label="返回列表" onClick={() => setSelected(null)} />
             <h1 className="min-w-0 truncate text-center text-sm font-semibold text-ink">
               {activeLabel}
             </h1>

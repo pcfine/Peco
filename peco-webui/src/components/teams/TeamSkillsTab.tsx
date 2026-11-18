@@ -37,7 +37,7 @@ function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
   return (
     <EntityCard
       onClick={onOpen}
-      className="min-h-[72px]"
+      className="h-full min-h-[90px]"
       actions={
         <Button
           variant="ghost"
@@ -57,17 +57,21 @@ function SkillCard({ skill, onOpen, onDelete }: SkillCardProps) {
       <div className="flex min-w-0 items-start gap-2">
         <span
           aria-hidden
-          className="flex size-10 shrink-0 items-center justify-center rounded-md bg-line/40"
+          className="flex size-8 shrink-0 items-center justify-center self-start rounded-md bg-line/40"
         >
           <Puzzle className="size-4 text-ink-muted" />
         </span>
         <div className="min-w-0 flex-1">
           {/* 右上角留给删除按钮，名字行不铺到那里。 */}
           <div className="flex min-w-0 items-center pr-6">
-            <span className="truncate font-mono text-sm text-ink">
+            <span className="truncate font-mono text-lg font-semibold text-ink">
               {skill.name}
             </span>
           </div>
+          {/* 描述固定占两行的高度：只有一行描述的卡与两行的卡才能等高。 */}
+          <p className="mt-1 line-clamp-2 min-h-[36px] text-caption text-ink-muted">
+            {skill.description || "无描述"}
+          </p>
         </div>
       </div>
     </EntityCard>
