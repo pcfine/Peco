@@ -3,6 +3,7 @@
 pub mod bootstrap;
 pub mod close;
 pub mod compaction;
+pub mod compaction_hooks;
 pub mod fanout;
 pub mod index;
 pub mod ledger;
@@ -21,13 +22,14 @@ use std::sync::{Arc, OnceLock, Weak};
 use model_provider::ModelProvider;
 use peco_core::agent::hooks::{DispatchOrigin, DispatchWatchHook, TaskObservationSink};
 use peco_core::agent::{
-    CompactionPolicy, DynamicContext, LooperConfig, ModelSummarizer, TurnSummarizer,
+    DynamicContext, LooperConfig, ModelSummarizer, PecoContextFilter, TurnSummarizer,
 };
 use peco_core::config::SystemConfig;
 use peco_core::knowledge::KnowledgeManager;
 use peco_core::tools::WorkspaceHub;
 use sqlx::SqlitePool;
 
+use crate::LOCAL_USER_ID;
 use crate::config::DaemonConfig;
 use crate::db::workspaces::{self, WorkspaceRow};
 use crate::dynamic::SpaceCatalogContext;
@@ -37,6 +39,7 @@ use crate::memory::compose::ComposedDynamicContext;
 use crate::memory::config::MemoryConfig;
 use crate::memory::hook::MemoryExtractionHook;
 use crate::memory::recall::MemoryRecallContext;
+use crate::space::compaction_hooks::{CompactionMetricsHook, ContextShadowHook};
 use crate::space::peco::PecoIdentity;
 use crate::space::tasks::TaskObserver;
 
@@ -142,8 +145,8 @@ impl SpaceEnv {
         config
     }
 
-    /// 为一次聊天 run 组装配置：在 [`Self::looper_config`] 之上挂压缩、轮末
-    /// 收尾报告与记忆读写。
+    /// 为一次聊天 run 组装配置：在 [`Self::looper_config`] 之上挂上下文窗口、
+    /// 压缩、轮末收尾报告与记忆读写。
     ///
     /// 这些只给聊天 run：聊天会话跨轮累积，不折叠就会一路顶到上下文窗口；记忆
     /// 抽取与召回也只对「同一个空间里持续对话的 @master」有意义。machine 任务
@@ -151,6 +154,8 @@ impl SpaceEnv {
     ///
     /// `km` 必须是本轮空间自己的知识管理器：记忆库按团队隔离（`kb_scope`），
     /// 用别的团队的实例会把记忆写进别人的库。
+    ///
+    /// `conversation_id` 只用于把压缩日志与边界观测挂到本轮会话上。
     pub fn chat_looper_config(
         &self,
         ws_id: &str,
@@ -158,9 +163,35 @@ impl SpaceEnv {
         work_dir: PathBuf,
         provider: Arc<dyn ModelProvider>,
         km: Arc<KnowledgeManager>,
+        conversation_id: &str,
     ) -> LooperConfig {
         let mut config = self.looper_config(ws_id, team_id, work_dir);
-        let limits = compaction::limits();
+        // 钳制必须每次装配都跑：它决定下方 policy 与 filter 的入参，缓存一次会让
+        // 「改 env 后重启」与「运行期生效」两套口径并存。
+        let mut limits = compaction::limits();
+        let violations = limits.validate();
+        if !violations.is_empty() && compaction::claim_config_log() {
+            for v in violations {
+                if v.is_error {
+                    tracing::error!(
+                        invariant = v.invariant,
+                        detail = %v.detail,
+                        "Compaction config invariant violated; clamped"
+                    );
+                } else {
+                    tracing::warn!(
+                        invariant = v.invariant,
+                        detail = %v.detail,
+                        "Compaction config invariant at risk"
+                    );
+                }
+            }
+        }
+        // 历史窗口是会话语义：没有它，压缩负责把历史折叠掉，而模型仍会收到全部
+        // 未折叠轮 —— 折叠阈值之下的增长没有任何裁剪点。
+        config.message_filter = Some(Arc::new(PecoContextFilter::new(
+            limits.history_token_budget,
+        )));
         // 摘要器与收尾报告器共用同一个实例：两者都是「读一遍既有内容、产出短文本」
         // 的元任务，复用同一个 provider 与模型即可，另建一份只会多一份配置漂移。
         let summarizer: Arc<dyn TurnSummarizer> = Arc::new(ModelSummarizer::new(
@@ -168,10 +199,22 @@ impl SpaceEnv {
             limits.summarizer_model.clone(),
         ));
         config.epilogue = Some(Arc::clone(&summarizer));
-        config.compaction = Some(Arc::new(CompactionPolicy::new(
-            limits.trigger_tokens,
-            limits.keep_recent_tokens,
-            summarizer,
+        config.compaction = Some(Arc::new(limits.to_policy(summarizer)));
+
+        // 折叠写日志、每个边界写观测行 —— 两张表口径不同，都要挂。观测钩子的
+        // gate 与削减同源：只评估（shadow）时也落行，否则观测数据永远为零。
+        config.hooks.push(Arc::new(CompactionMetricsHook::new(
+            self.pool.clone(),
+            LOCAL_USER_ID,
+            conversation_id,
+        )));
+        config.hooks.push(Arc::new(ContextShadowHook::new(
+            self.pool.clone(),
+            LOCAL_USER_ID,
+            conversation_id,
+            limits.history_token_budget,
+            limits.strip.shadow || limits.strip.enforce,
+            limits.strip.tool_output_max_chars,
         )));
 
         let memory = MemoryConfig::from_env();

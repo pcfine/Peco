@@ -48,6 +48,15 @@ async fn run() -> Result<(), DaemonError> {
     let pool = db::connect(&config.db_url()).await?;
     db::run_migrations(&pool).await?;
 
+    // 边界观测表按保留期回收一次：清理失败只 warn，过期行留到下个进程周期。
+    peco_daemon::space::compaction_hooks::purge_expired_shadow(
+        &pool,
+        peco_daemon::space::compaction::limits()
+            .strip
+            .retention_days,
+    )
+    .await;
+
     // 守卫持有到进程退出：pid 文件的存活期就是 daemon 的存活期。
     let _instance = single_instance::check_single_instance(&config.peco_home)?;
 

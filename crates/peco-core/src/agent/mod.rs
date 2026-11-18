@@ -13,6 +13,7 @@ pub mod compaction;
 pub(crate) mod context;
 pub(crate) mod dynamic_context;
 pub(crate) mod error;
+pub mod filter;
 pub mod hooks;
 pub(crate) mod simple_looper;
 mod stream;
@@ -44,6 +45,7 @@ pub use context::{
 };
 pub use dynamic_context::DynamicContext;
 pub use error::AgentError;
+pub use filter::{PecoContextFilter, select_history_turns};
 pub use hooks::{
     DispatchObservation, DispatchOrigin, DispatchWatchHook, HookAction, LooperHook,
     TaskObservationSink, TokenBudgetHook, ToolAllowlistHook, ToolHookAction,

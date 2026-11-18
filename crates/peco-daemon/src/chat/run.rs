@@ -334,6 +334,8 @@ pub(crate) async fn spawn_run(
         Arc::clone(agent.provider()),
         // 记忆写进本轮空间自己的库：同一个团队的空间共用一套 KB，标签才分得开。
         Arc::clone(ws.knowledge_manager()),
+        // 压缩日志与边界观测按会话归档，指标才能只读本会话的时间线。
+        &conv_id,
     );
 
     let db_for_bg = deps.pool.clone();
