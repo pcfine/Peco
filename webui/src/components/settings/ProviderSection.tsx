@@ -621,7 +621,7 @@ export function ProviderSection() {
                 list="provider-model-options"
                 value={form.model}
                 onChange={(e) => update({ model: e.target.value })}
-                placeholder={meta?.default_model ?? "deepseek-v4-flash"}
+                placeholder={meta?.default_model ?? "deepseek-flash"}
                 autoComplete="off"
               />
               <datalist id="provider-model-options">

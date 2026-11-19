@@ -48,8 +48,8 @@ const DEEPSEEK: ProviderTypeInfo = {
   display_name: "DeepSeek",
   default_base_url: "https://api.deepseek.com",
   api_modes: ["responses", "chat"],
-  suggested_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
-  default_model: "deepseek-v4-flash",
+  suggested_models: ["deepseek-flash", "deepseek-v4-pro"],
+  default_model: "deepseek-flash",
 };
 
 const QWEN: ProviderTypeInfo = {
@@ -67,7 +67,7 @@ const EXISTING: ProviderInfo = {
   name: "deepseek",
   provider_type: "deepseek",
   base_url: "https://api.deepseek.com",
-  default_model: "deepseek-v4-flash",
+  default_model: "deepseek-flash",
   has_api_key: true,
   is_default: true,
 };
@@ -160,7 +160,7 @@ describe("表单纯函数", () => {
     expect(form.providerType).toBe("deepseek");
     expect(form.name).toBe("deepseek");
     expect(form.baseUrl).toBe("https://api.deepseek.com");
-    expect(form.model).toBe("deepseek-v4-flash");
+    expect(form.model).toBe("deepseek-flash");
     // 空串 = API 风格跟随类型默认
     expect(form.api).toBe("");
   });
@@ -229,7 +229,7 @@ describe("表单纯函数", () => {
     expect(req).not.toHaveProperty("set_default");
     expect(req.name).toBe("deepseek");
     expect(req.base_url).toBe("https://api.deepseek.com");
-    expect(req.default_model).toBe("deepseek-v4-flash");
+    expect(req.default_model).toBe("deepseek-flash");
     expect(req.api).toBe("");
   });
 
@@ -291,7 +291,7 @@ describe("表单纯函数", () => {
     const filled = formFromProvider(EXISTING);
 
     expect(filled.baseUrl).toBe("https://api.deepseek.com");
-    expect(filled.model).toBe("deepseek-v4-flash");
+    expect(filled.model).toBe("deepseek-flash");
     expect(filled.setDefault).toBe(true);
   });
 });
@@ -305,7 +305,7 @@ describe("ProviderSection", () => {
     expect(container.textContent).toContain("deepseek");
     expect(container.textContent).toContain("DeepSeek");
     expect(container.textContent).toContain("默认");
-    expect(container.textContent).toContain("deepseek-v4-flash");
+    expect(container.textContent).toContain("deepseek-flash");
     expect(container.textContent).not.toContain("未配置 API Key");
   });
 
@@ -327,7 +327,7 @@ describe("ProviderSection", () => {
     expect(inputById("provider-base-url").value).toBe(
       "https://api.deepseek.com",
     );
-    expect(inputById("provider-model").value).toBe("deepseek-v4-flash");
+    expect(inputById("provider-model").value).toBe("deepseek-flash");
     expect(inputById("provider-name").value).toBe("deepseek");
   });
 
@@ -336,7 +336,7 @@ describe("ProviderSection", () => {
       success: false,
       message: "HTTP 401（API Key 无效）：invalid api key",
       provider_type: "deepseek",
-      model: "deepseek-v4-flash",
+      model: "deepseek-flash",
     });
 
     await renderSection();
@@ -357,7 +357,7 @@ describe("ProviderSection", () => {
       api_key: "sk-test",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
     });
     expect(document.body.textContent).toContain("HTTP 401");
   });
@@ -392,7 +392,7 @@ describe("ProviderSection", () => {
       type: "deepseek",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
       api_key: "sk-test",
     });
   });
