@@ -20,12 +20,16 @@ import {
   conversationLiveStreamUrl,
   conversationStreamUrl,
   getMessages,
+  pauseConversation,
+  resumeConversation,
+  steerConversationTurn,
   uploadConversationImage,
 } from "@/api/conversations";
 import { SPACE_MASTER_AGENT, useSpaceConversation } from "@/queries/spaceChat";
 import { useInflightTaskCount, useSpaceTasks } from "@/queries/spaceDetail";
 import { errorText } from "@/lib/api";
 import { parseServerTimestamp } from "@/lib/format";
+import { ignoreNoRunningTask } from "@/lib/turnControls";
 import { cn } from "@/lib/utils";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSpaceActivityStore } from "@/stores/spaceActivityStore";
@@ -134,6 +138,24 @@ function SpaceConversationChat({
           cancelTurn={() =>
             cancelConversationTurn(SPACE_MASTER_AGENT, convId, { wsId })
           }
+          // 在途说话：输入进该轮的 pending 队列，下一次模型请求前并入。
+          steerTurn={(text, imageIds) =>
+            steerConversationTurn(SPACE_MASTER_AGENT, convId, text, {
+              imageIds,
+              wsId,
+            })
+          }
+          // 暂停落点在边界检查点，轮可能在我们按下前就结束了（409 不是故障）。
+          onPause={() => {
+            void pauseConversation(SPACE_MASTER_AGENT, convId, {
+              wsId,
+            }).catch((err) => ignoreNoRunningTask(err, "暂停"));
+          }}
+          onResume={() => {
+            void resumeConversation(SPACE_MASTER_AGENT, convId, {
+              wsId,
+            }).catch((err) => ignoreNoRunningTask(err, "恢复"));
+          }}
           // 快照落定补一次历史（user 行可能晚于历史快照落库）；
           // `done` 之后同样取一次：以落库结果替换本地气泡。
           onAttachSettled={() => void history.refetch()}

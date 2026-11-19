@@ -95,24 +95,35 @@ export async function getMessages(
  * 暂停在边界检查点落地：请求发出前，或工具批执行前。请求在途时须等本次模型调用
  * 收尾；工具批执行中不打断，批跑完才停；无工具调用的轮次暂停被吸收。故 200 只
  * 表示「请求已收到」；实际状态由 SSE `looper_state` 事件下发。
+ *
+ * 空间显式传入：会话归属校验按请求所落的空间查，而调用方手里的会话未必属于
+ * 「当前空间」（dock 恒落在 Peco 空间上）。
  */
 export async function pauseConversation(
   agentId: string,
   convId: string,
+  options: { wsId?: string } = {},
 ): Promise<SuccessResponse> {
+  const { wsId } = options;
   const res = await api.post<SuccessResponse>(
     `${chatBase(agentId)}/${convId}/pause`,
+    {},
+    { params: wsId ? { ws: wsId } : {}, ...spaceScope(wsId) },
   );
   return res.data;
 }
 
-/** 请求恢复该对话被暂停的 ReAct 轮（幂等）。 */
+/** 请求恢复该对话被暂停的 ReAct 轮（幂等）；空间同 `pauseConversation`。 */
 export async function resumeConversation(
   agentId: string,
   convId: string,
+  options: { wsId?: string } = {},
 ): Promise<SuccessResponse> {
+  const { wsId } = options;
   const res = await api.post<SuccessResponse>(
     `${chatBase(agentId)}/${convId}/resume`,
+    {},
+    { params: wsId ? { ws: wsId } : {}, ...spaceScope(wsId) },
   );
   return res.data;
 }
@@ -213,6 +224,35 @@ export async function cancelConversationTurn(
     await api.post<SuccessResponse>(
       `${chatBase(agentId)}/${convId}/cancel`,
       {},
+      { params: wsId ? { ws: wsId } : {}, ...spaceScope(wsId) },
+    );
+    return "accepted";
+  } catch (err) {
+    if ((err as { code?: string } | null)?.code === "no_running_task") {
+      return "no_running_task";
+    }
+    throw err;
+  }
+}
+
+/**
+ * 把输入排进该会话在途轮的 pending 队列：`POST .../steer?ws=`。
+ *
+ * 200 只表示**已投递** —— 下一次模型请求前才并入（不是立即生效）；本轮若先结束，
+ * 这些输入随轮边界成为下一轮输入。409 `no_running_task` 表示没有在途轮，映射成
+ * `"no_running_task"` 交给界面改走普通发送；其余错误照常抛（交给 toast）。
+ */
+export async function steerConversationTurn(
+  agentId: string,
+  convId: string,
+  message: string,
+  options: { imageIds?: string[]; wsId?: string } = {},
+): Promise<"accepted" | "no_running_task"> {
+  const { imageIds = [], wsId } = options;
+  try {
+    await api.post<SuccessResponse>(
+      `${chatBase(agentId)}/${convId}/steer`,
+      { message, image_ids: imageIds },
       { params: wsId ? { ws: wsId } : {}, ...spaceScope(wsId) },
     );
     return "accepted";

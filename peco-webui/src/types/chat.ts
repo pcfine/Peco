@@ -137,6 +137,13 @@ export interface TurnSnapshotData {
   agent_calls: TurnSnapshotAgentCall[];
   /** 最近一次模型调用的用量；无则 0/0。 */
   usage: UsageData;
+  /**
+   * 这一轮由谁发起：`headless` = 后台唤醒轮（没有人守着它）。
+   *
+   * 缺省按 `live` 处理（旧后端不下发）。界面据此隐藏暂停入口 —— 唤醒轮没有
+   * 人能看着它恢复，摆一个暂停按钮只会留下一个停住的后台轮。
+   */
+  audience?: "live" | "headless";
 }
 
 /** 在途轮的权威状态：`cancelling` 已投递取消命令但收尾尚未发生。 */

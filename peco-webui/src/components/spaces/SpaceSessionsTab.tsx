@@ -17,11 +17,15 @@ import {
   deleteConversation,
   getMessages,
   listConversations,
+  pauseConversation,
+  resumeConversation,
+  steerConversationTurn,
   updateConversation,
   uploadConversationImage,
 } from "@/api/conversations";
 import { errorText } from "@/lib/api";
 import { parseServerTimestamp } from "@/lib/format";
+import { ignoreNoRunningTask } from "@/lib/turnControls";
 import { cn } from "@/lib/utils";
 
 /** 空间里的总管 agent：派发都落到它身上，会话也归它。 */
@@ -208,6 +212,21 @@ export function SpaceSessionsTab({
             }
             // 「停止」改走服务端取消：200 = 命令已投递，守着连接等 done
             cancelTurn={() => cancelConversationTurn(AGENT, active, { wsId })}
+            // 在途说话：输入进该轮的 pending 队列，下一次模型请求前并入。
+            steerTurn={(text, imageIds) =>
+              steerConversationTurn(AGENT, active, text, { imageIds, wsId })
+            }
+            // 暂停落点在边界检查点，轮可能在我们按下前就结束了（409 不是故障）。
+            onPause={() => {
+              void pauseConversation(AGENT, active, { wsId }).catch((err) =>
+                ignoreNoRunningTask(err, "暂停"),
+              );
+            }}
+            onResume={() => {
+              void resumeConversation(AGENT, active, { wsId }).catch((err) =>
+                ignoreNoRunningTask(err, "恢复"),
+              );
+            }}
             onAttachSettled={() => void history.refetch()}
             onTurnSettled={() => void history.refetch()}
             welcomeMessage="这个空间已经就绪。把要它做的事写下来。"

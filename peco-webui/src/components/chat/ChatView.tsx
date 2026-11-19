@@ -338,6 +338,16 @@ export interface ChatViewProps {
    */
   cancelTurn?: () => Promise<CancelTurnOutcome>;
   /**
+   * [可选] 在途轮注入：把输入排进当前轮的 pending 队列。提供时在途仍可输入发送。
+   *
+   * `"accepted"` = 已投递（下一次模型请求前并入，不是立即生效）；
+   * `"no_running_task"` = 轮刚好收尾（409），这条输入改走普通发送。
+   */
+  steerTurn?: (
+    text: string,
+    imageIds: string[],
+  ) => Promise<"accepted" | "no_running_task">;
+  /**
    * [可选] 首帧 `turn_snapshot` 落定后回调一次。
    *
    * 用于补取历史：user 行可能晚于历史快照落库（帧序规则第 2 条）。
@@ -388,6 +398,7 @@ export function ChatView({
   liveStreamUrl,
   historySettled,
   cancelTurn,
+  steerTurn,
   onAttachSettled,
   onTurnSettled,
 }: ChatViewProps) {
@@ -420,6 +431,12 @@ export function ChatView({
   const [attachEpoch, setAttachEpoch] = useState(0);
   /** 收尾计数器：`done` 之后每次 +1，effect 里再回调 onTurnSettled（见 settleTurn） */
   const [settleSeq, setSettleSeq] = useState(0);
+  /** internal 模式在途排队的输入（已投进该轮 pending，尚未并入模型请求） */
+  const [internalQueued, setInternalQueuedState] = useState<
+    QueuedChatMessage[]
+  >([]);
+  /** 在途轮是后台唤醒（没有人守着）：不给暂停入口，没人能看着它恢复 */
+  const [headlessTurn, setHeadlessTurn] = useState(false);
   const [usage, setUsage] = useState<UsageData | null>(null);
   /** 已上传待发送的附件（图片 + 文档） */
   const [pendingAttachments, setPendingAttachments] = useState<
@@ -450,6 +467,21 @@ export function ChatView({
    * 那样算出来的锚点会落到上一轮。
    */
   const userCountRef = useRef(countUserMessages(initialMessages));
+  /**
+   * `internalQueued` 的同步副本 —— 读流循环里要在同一拍内摘掉并读回队列，
+   * 而 setState 的下一拍才到。
+   */
+  const internalQueuedRef = useRef<QueuedChatMessage[]>([]);
+  /** 排队条目的单调 id（仅用于渲染 key） */
+  const queuedSeqRef = useRef(0);
+  /**
+   * 轮已收尾（409）而没投递成功的那条输入：等流式态真正落下来再当普通消息发。
+   *
+   * 此刻 `streamingRef` 仍为 true，当场 `sendMessage` 会被自己挡掉。
+   */
+  const steerFallbackRef = useRef<{ text: string; images: ChatAttachment[] }[]>(
+    [],
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const unreadCountRef = useRef(0);
   const unreadDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -490,6 +522,8 @@ export function ChatView({
   liveStreamUrlRef.current = liveStreamUrl;
   const cancelTurnRef = useRef(cancelTurn);
   cancelTurnRef.current = cancelTurn;
+  const steerTurnRef = useRef(steerTurn);
+  steerTurnRef.current = steerTurn;
   const onAttachSettledRef = useRef(onAttachSettled);
   onAttachSettledRef.current = onAttachSettled;
   const onTurnSettledRef = useRef(onTurnSettled);
@@ -513,6 +547,45 @@ export function ChatView({
   // `usage` state; external mode reads from the parent-provided prop.
   const effectiveUsage = isExternalMode ? externalUsage : usage;
 
+  /** 在途排队队列的唯一写入口：ref 与 state 必须同拍（读流循环里同步读回）。 */
+  const commitInternalQueued = useCallback((next: QueuedChatMessage[]) => {
+    internalQueuedRef.current = next;
+    setInternalQueuedState(next);
+  }, []);
+
+  /**
+   * `user_steer`：把「已排队」的那几条落成正式气泡，并在其后开一个新宿主。
+   *
+   * 切分是展示需要 —— 服务端把这些输入并进了同一条 user 消息，之后的增量该落在
+   * 新宿主上，旧气泡保留已产出的内容。气泡文本优先取本地原文：服务端下发的是
+   * 归一后的合并口径，只在本地没有对应条目时（别的客户端注入、attach 接上的轮）
+   * 才用它兜底。
+   */
+  const applyUserSteer = useCallback(
+    (count: number, serverText: string) => {
+      const queued = internalQueuedRef.current;
+      const texts =
+        queued.length >= count
+          ? queued.slice(0, count).map((item) => item.text)
+          : [serverText];
+      commitInternalQueued(queued.slice(count));
+      const at = Date.now();
+      setMessages((prev) => [
+        ...prev,
+        ...texts.map((text): ChatMessage => ({
+          role: "user",
+          content: text,
+          turnIndex: 0,
+          steered: true,
+          timestampMs: at,
+        })),
+        { role: "assistant", content: "", turnIndex: 0, timestampMs: at },
+      ]);
+      userCountRef.current += texts.length;
+    },
+    [commitInternalQueued],
+  );
+
   /**
    * 一轮收尾：**先**关流式态，下一次提交再回调 `onTurnSettled`。
    *
@@ -534,12 +607,16 @@ export function ChatView({
     setStreaming(false);
     setPaused(false);
     setCancelling(false);
+    setHeadlessTurn(false);
+    // 队列在这里清空：这些输入要么已经由 `user_steer` 变成气泡，要么已被服务端
+    // 当下一轮输入消费掉（`done` 之后的历史 refetch 会补回来）。重发就是重复。
+    commitInternalQueued([]);
     if (cancelTimerRef.current) {
       clearTimeout(cancelTimerRef.current);
       cancelTimerRef.current = undefined;
     }
     setSettleSeq((n) => n + 1);
-  }, []);
+  }, [commitInternalQueued]);
 
   /** 登记一条未落库的失败：气泡本体沿用 `reduceStreamEvent` 的那一份。 */
   const retainFailure = useCallback((data: ErrorData) => {
@@ -666,6 +743,7 @@ export function ChatView({
               // 先记水位再应用（帧序规则第 2 条）：快照之后的重叠帧一律丢弃
               watermark = event.data.seq;
               setUsage(event.data.usage);
+              setHeadlessTurn(event.data.audience === "headless");
               // 快照早于下面的水位过滤，单独计一帧
               framesApplied += 1;
             } else {
@@ -691,6 +769,10 @@ export function ChatView({
             if (event.event === "done") {
               // `done` 是唯一的「流结束」信号：关流式态 → 下一拍 refetch 以库里为准
               settleTurn();
+              continue;
+            }
+            if (event.event === "user_steer") {
+              applyUserSteer(event.data.count, event.data.text);
               continue;
             }
             handleSSEEvent(event, setMessages, setStreaming, setPaused, () => {
@@ -737,7 +819,7 @@ export function ChatView({
         abortRef.current = null;
       }
     },
-    [settleTurn, retainFailure],
+    [settleTurn, retainFailure, applyUserSteer],
   );
 
   // ── Sync messages when initialMessages changes (pool keep-alive) ─────────
@@ -767,6 +849,49 @@ export function ChatView({
     }
   }, [initialMessages, isExternalMode]);
 
+  // ── 在途轮注入（steering）────────────────────────────────────────────
+  //
+  // external 模式那一半的对称：轮在跑也能说话，输入进该轮的 pending 队列，
+  // 下一次模型请求前并入，而不是另开一条流抢在途 run。
+
+  const steerInFlight = useCallback(
+    async (text: string) => {
+      const steer = steerTurnRef.current;
+      if (!steer) return;
+      const attachments = pendingAttachmentsRef.current;
+      const images = attachments.filter((att) => att.kind === "image");
+      setInput("");
+      // 图片随这条一起进 pending；文档没有对应的注入通路，留在输入区等下一次
+      // 普通发送 —— 静默丢掉用户的附件比留在原地更难解释。
+      setPendingAttachments(attachments.filter((att) => att.kind !== "image"));
+      try {
+        const outcome = await steer(
+          text,
+          images.map((att) => att.id),
+        );
+        if (outcome === "accepted") {
+          queuedSeqRef.current += 1;
+          commitInternalQueued([
+            ...internalQueuedRef.current,
+            { id: `steer-${queuedSeqRef.current}`, text },
+          ]);
+          return;
+        }
+        // 轮刚好收尾：这条还没投递，先存着（此刻 streamingRef 仍为 true，
+        // 当场发会被自己挡掉），等流式态落下来再当普通消息发。
+        steerFallbackRef.current = [
+          ...steerFallbackRef.current,
+          { text, images },
+        ];
+      } catch {
+        setInput(text);
+        setPendingAttachments(attachments);
+        toast.error("发送失败，请重试");
+      }
+    },
+    [commitInternalQueued],
+  );
+
   // ── handleSend: reads from input → clears input → delegates to sendMessage ─
 
   const handleSend = useCallback(async () => {
@@ -774,13 +899,19 @@ export function ChatView({
     const streaming = externalIsStreamingRef.current ?? streamingRef.current;
     const attachments = pendingAttachmentsRef.current;
     // external 模式允许在途发送：消息进入排队区，由 store 经控制通道投递，
-    // 在下一次模型请求或下一轮生效。internal 模式仍要求轮到 Idle 才能发。
+    // 在下一次模型请求或下一轮生效。internal 模式只有接上了 steerTurn 才有
+    // 同样的排队通路，否则仍要求轮到 Idle 才能发。
+    const steering = !isExternalMode && streaming && !!steerTurnRef.current;
     if (
       (!currentInput.trim() && attachments.length === 0) ||
-      (streaming && !isExternalMode) ||
+      (streaming && !isExternalMode && !steering) ||
       uploadingRef.current
     )
       return;
+    if (steering) {
+      await steerInFlight(currentInput);
+      return;
+    }
     setInput("");
     if (onExternalSendRef.current) {
       setPendingAttachments([]);
@@ -788,7 +919,7 @@ export function ChatView({
     } else {
       await sendMessage(currentInput);
     }
-  }, [sendMessage, isExternalMode]);
+  }, [sendMessage, isExternalMode, steerInFlight]);
 
   // ── initialQuery auto-send ──────────────────────────────────────────────
 
@@ -998,6 +1129,7 @@ export function ChatView({
               setUsage(event.data.usage);
               setStreaming(true);
               setPaused(event.data.phase === "paused");
+              setHeadlessTurn(event.data.audience === "headless");
               setCancelling(event.data.phase === "cancelling");
               // 规则 2 末句：快照落定后补取一次历史，补齐可能晚于历史快照
               // 落库的 user 行（窗口 W4）
@@ -1022,6 +1154,12 @@ export function ChatView({
               settleTurn();
               continue;
             }
+            // 接上的这一轮也可能被注入：排队的输入要在这里落成气泡，否则只有
+            // 等 `done` 之后的历史 refetch 才看得见它。
+            if (event.event === "user_steer") {
+              applyUserSteer(event.data.count, event.data.text);
+              continue;
+            }
             handleSSEEvent(event, setMessages, setStreaming, setPaused);
           }
         }
@@ -1044,7 +1182,14 @@ export function ChatView({
       controller.abort();
       if (attachAbortRef.current === controller) attachAbortRef.current = null;
     };
-  }, [canAttachTurn, visible, attachEpoch, settleTurn, retainFailure]);
+  }, [
+    canAttachTurn,
+    visible,
+    attachEpoch,
+    settleTurn,
+    retainFailure,
+    applyUserSteer,
+  ]);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -1238,13 +1383,26 @@ export function ChatView({
     onTurnSettledRef.current?.();
   }, [settleSeq]);
 
+  // 被 409 挡回来的输入等这一轮真正落下来再发。一次只放一条：发出去的那条自己
+  // 会把流式态重新拉起来，本 effect 因此不会连着放完。
+  useEffect(() => {
+    if (isStreaming) return;
+    const next = steerFallbackRef.current.shift();
+    if (!next) return;
+    // `sendMessage` 从 ref 读附件：先把这条的图片摆回去，flush 出来的才是原样
+    pendingAttachmentsRef.current = next.images;
+    setPendingAttachments(next.images);
+    void sendMessage(next.text);
+  }, [isStreaming, sendMessage]);
+
   // external 模式的 SSE 由 store 管理，本地循环收不到 `looper_state`，
   // 故以父组件传入的 externalPaused 为权威；internal 模式仍认本地事件。
   const effectivePaused = isExternalMode ? externalPaused : paused;
-  // external 模式在途也允许输入（消息排队，下一次请求/下一轮送达）；
-  // internal 模式仍要求轮到 Idle。
-  const isInputDisabled = (isStreaming && !isExternalMode) || !visible;
-  const queuedCount = externalQueued.length;
+  // 在途仍可输入的两条通路：external（store 投递）与 internal 接了 steerTurn
+  //（本组件自己把输入注进该轮队列）。都没有时仍要求轮到 Idle。
+  const isInputDisabled =
+    (isStreaming && !isExternalMode && !steerTurn) || !visible;
+  const queued = isExternalMode ? externalQueued : internalQueued;
 
   // 暂态的两个解除点：服务端确认挂起，或本轮结束（按钮随门控消失）
   useEffect(() => {
@@ -1338,20 +1496,22 @@ export function ChatView({
       <div className="pt-4 mt-4">
         {composerNotice}
         <div className="flex flex-col rounded-2xl border bg-card focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary/25">
-          {/* 在途轮已排队、尚未被模型请求消费的输入。送达后由 store 落成正式
-              气泡（`user_steer` / 轮次收尾兜底），这里只承担「没有石沉大海」的
-              即时回显。 */}
-          {queuedCount > 0 && (
+          {/* 在途轮已排队、尚未被模型请求消费的输入。送达后落成正式气泡
+              （`user_steer` / 轮次收尾兜底），这里只承担「没有石沉大海」的
+              即时回显。external 的队列归 store，internal 的归本组件。 */}
+          {queued.length > 0 && (
             <div
               data-slot="queued-inputs"
               className="flex flex-col gap-1 px-3 pt-2 text-xs text-muted-foreground"
             >
-              {externalQueued.map((item) => (
+              {queued.map((item) => (
                 <div key={item.id} className="flex items-start gap-1.5">
                   <span className="shrink-0 text-muted-foreground/70">
                     已排队
                   </span>
-                  <span className="line-clamp-1 break-all">{item.text}</span>
+                  <span className="line-clamp-1 min-w-0 break-all">
+                    {item.text}
+                  </span>
                 </div>
               ))}
               <div className="text-muted-foreground/60">
@@ -1365,7 +1525,7 @@ export function ChatView({
             placeholder={
               isInputDisabled
                 ? "加载中…"
-                : isExternalMode && isStreaming
+                : isStreaming && (isExternalMode || !!steerTurn)
                   ? "输入消息，将在下一次模型请求时送达…"
                   : "输入消息..."
             }
@@ -1501,7 +1661,8 @@ export function ChatView({
                 outputTokens={effectiveUsage?.output_tokens}
                 contextWindow={contextWindowTokens}
               />
-              {isStreaming && onPause && onResume && (
+              {/* 唤醒轮没有人守着：摆一个暂停入口，停住的后台轮就没人来恢复。 */}
+              {isStreaming && onPause && onResume && !headlessTurn && (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
@@ -1553,11 +1714,13 @@ export function ChatView({
                   </TooltipContent>
                 </Tooltip>
               )}
-              {/* external 模式在途也保留发送入口（消息排队）；internal 模式
-                  流式中仍只给停止，避免新 SSE 顶替在途 run。 */}
-              {(!isStreaming || isExternalMode) && (
+              {/* 在途也保留发送入口的两条通路：external（store 排队）与 internal
+                  接了 steerTurn（注入当前轮队列）。都没有时流式中只给停止，
+                  避免新 SSE 顶替在途 run。 */}
+              {(!isStreaming || isExternalMode || !!steerTurn) && (
                 <Button
                   size="sm"
+                  aria-label="发送"
                   onClick={handleSend}
                   disabled={
                     (!input.trim() && pendingAttachments.length === 0) ||
@@ -2202,8 +2365,8 @@ export function reduceStreamEvent(
       return applyTurnSnapshot(messages, event.data);
     case "usage":
     case "looper_state":
-    // steering 的气泡切分由 store 负责（需要同时消费「已排队」状态）；
-    // 纯 reducer 视角下消息列表不变。internal 模式收不到该事件。
+    // steering 的气泡切分由消费方负责（store / 读流循环）：它要同时消费
+    // 「已排队」状态并另起一个宿主。纯 reducer 视角下消息列表不变。
     case "user_steer":
       return messages;
     case "context_compacted":

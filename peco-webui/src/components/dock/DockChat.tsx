@@ -9,9 +9,13 @@ import {
   conversationLiveStreamUrl,
   conversationStreamUrl,
   getMessages,
+  pauseConversation,
+  resumeConversation,
+  steerConversationTurn,
   uploadConversationImage,
 } from "@/api/conversations";
 import { parseServerTimestamp } from "@/lib/format";
+import { ignoreNoRunningTask } from "@/lib/turnControls";
 import { useSpaceActivityStore } from "@/stores/spaceActivityStore";
 
 /** 抽屉在这条会话上的身份：与页面壳各记一笔，互不覆盖。 */
@@ -73,6 +77,21 @@ export function DockChat({ agentId, convId, wsId }: DockChatProps) {
       liveStreamUrl={() => conversationLiveStreamUrl(agentId, convId, { wsId })}
       // 「停止」改走服务端取消（200 = 命令已投递，等 done 收尾）
       cancelTurn={() => cancelConversationTurn(agentId, convId, { wsId })}
+      // 在途说话：输入进该轮的 pending 队列，下一次模型请求前并入。
+      steerTurn={(text, imageIds) =>
+        steerConversationTurn(agentId, convId, text, { imageIds, wsId })
+      }
+      // 暂停落点在边界检查点，轮可能在我们按下前就结束了（409 不是故障）。
+      onPause={() => {
+        void pauseConversation(agentId, convId, { wsId }).catch((err) =>
+          ignoreNoRunningTask(err, "暂停"),
+        );
+      }}
+      onResume={() => {
+        void resumeConversation(agentId, convId, { wsId }).catch((err) =>
+          ignoreNoRunningTask(err, "恢复"),
+        );
+      }}
       onAttachSettled={() => void historyQuery.refetch()}
       onTurnSettled={() => void historyQuery.refetch()}
       welcomeMessage="让 Peco 开始一件事。它会派发到某个空间，或直接回答。"
