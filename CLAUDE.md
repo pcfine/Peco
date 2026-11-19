@@ -268,7 +268,7 @@ api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com"
 # api = "responses"（默认）| "chat" — 选择 Responses 端点或 chat completions
 [providers.deepseek.default]
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 temperature = 0.7
 max_tokens = 4096
 stream = true
@@ -310,7 +310,7 @@ agent:
   description: "Agent 的描述信息"
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-pro"
+  model: "deepseek-flash"
   temperature: 0.3
 tools: [shell, fetch, search_knowledge]
 mcp: [helixdb-docs]
