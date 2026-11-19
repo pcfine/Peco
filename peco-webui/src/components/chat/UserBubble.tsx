@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { FileText } from "lucide-react";
 import { formatMessageTime } from "@/lib/time";
 import type { ChatMessage } from "./ChatView";
-import { MESSAGE_TIME_CLASS } from "./messageTime";
+import { MessageMeta } from "./MessageMeta";
 import { UserImageLightbox } from "./UserImageLightbox";
 
 /** 96px 方形缩略图，`w-24` 是上限；窄列下靠 min-w-0 + shrink 收缩 */
@@ -56,15 +56,13 @@ export function UserBubble({ message }: { message: ChatMessage }) {
   // 空白正文不算内容，不造空气泡
   const hasText = message.content.trim() !== "";
 
-  const timeNode = time ? (
-    <time
-      dateTime={time.iso}
-      data-slot="message-time"
-      className={`${MESSAGE_TIME_CLASS} right-0`}
-    >
-      {time.label}
-    </time>
-  ) : null;
+  const metaNode = (
+    <MessageMeta
+      align="end"
+      time={time}
+      copyText={hasText ? message.content : undefined}
+    />
+  );
 
   if (images.length === 0) {
     // 无图消息沿用单气泡结构
@@ -76,7 +74,7 @@ export function UserBubble({ message }: { message: ChatMessage }) {
         >
           <AttachmentChips items={attachments} withMargin />
           {message.content}
-          {timeNode}
+          {metaNode}
         </div>
       </div>
     );
@@ -142,7 +140,7 @@ export function UserBubble({ message }: { message: ChatMessage }) {
         ) : (
           imageBlock
         )}
-        {timeNode}
+        {metaNode}
       </div>
       <UserImageLightbox
         image={

@@ -54,7 +54,7 @@ import {
 } from "@/components/ui/collapsible";
 import { CHEVRON, FOLD_ROW } from "@/components/chat/foldRow";
 import { CHAT_MEASURE } from "@/components/chat/measure";
-import { MESSAGE_TIME_CLASS } from "@/components/chat/messageTime";
+import { MessageMeta } from "@/components/chat/MessageMeta";
 import { UserBubble } from "@/components/chat/UserBubble";
 import { WakeNotice, isWakeNotice } from "@/components/chat/WakeNotice";
 import { BrandMark } from "@/components/common/BrandMark";
@@ -1969,15 +1969,11 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             className="group relative w-full rounded-2xl rounded-bl-md bg-bubble border border-border px-4 py-2 text-sm"
           >
             <MarkdownRenderer content={message.content} />
-            {resultTime && (
-              <time
-                dateTime={resultTime.iso}
-                data-slot="message-time"
-                className={`${MESSAGE_TIME_CLASS} left-0`}
-              >
-                {resultTime.label}
-              </time>
-            )}
+            <MessageMeta
+              align="start"
+              time={resultTime}
+              copyText={message.content}
+            />
           </div>
         )}
       </div>

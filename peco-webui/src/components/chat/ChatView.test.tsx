@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ChatView, type ChatMessage } from "@/components/chat/ChatView";
 
@@ -7,6 +7,29 @@ const WAKE_CONTENT = [
   "[peco-wake] 后台任务结果（2 项）",
   "- task=t_a state=done target=ws_a dir=/tmp/a digest=改了三个文件",
 ].join("\n");
+
+const originalClipboard = Object.getOwnPropertyDescriptor(
+  navigator,
+  "clipboard",
+);
+
+/** jsdom 没有 `navigator.clipboard`，复制按钮的断言得自己装一个。 */
+function stubClipboard(value: unknown) {
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    writable: true,
+    value,
+  });
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  if (originalClipboard) {
+    Object.defineProperty(navigator, "clipboard", originalClipboard);
+  } else {
+    delete (navigator as { clipboard?: unknown }).clipboard;
+  }
+});
 
 function renderMessages(messages: ChatMessage[]) {
   return render(
@@ -119,5 +142,69 @@ describe("消息区垂直锚定", () => {
     for (const bubble of bubbles) {
       expect(list.contains(bubble)).toBe(true);
     }
+  });
+});
+
+describe("气泡下的复制按钮", () => {
+  it("助手正文气泡带复制按钮，复制的是原始 markdown", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    stubClipboard({ writeText });
+    const { container } = renderMessages([
+      {
+        role: "assistant",
+        content: "**粗体** 与 `代码`",
+        turnIndex: 0,
+        timestampMs: Date.now(),
+      },
+    ]);
+
+    const bubble = container.querySelector("[data-slot='assistant-result']");
+    expect(bubble).not.toBeNull();
+    // 显形与 pointer-events 都靠 group-hover，气泡容器必须带 group
+    expect((bubble as Element).className.split(/\s+/)).toContain("group");
+    const button = (bubble as Element).querySelector(
+      "[data-slot='message-copy']",
+    );
+    expect(button).not.toBeNull();
+
+    fireEvent.click(button as Element);
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("**粗体** 与 `代码`"),
+    );
+    // 渲染结果里确实有 strong，复制值仍是带记号的原文
+    expect((bubble as Element).querySelector("strong")).not.toBeNull();
+  });
+
+  it("用户气泡下的复制按钮给的是用户原文", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    stubClipboard({ writeText });
+    const { container } = renderMessages([
+      { role: "user", content: "**粗体** 问一句", turnIndex: 0 },
+    ]);
+
+    const bubble = container.querySelector("[data-slot='user-bubble']");
+    const button = (bubble as Element).querySelector(
+      "[data-slot='message-copy']",
+    );
+    expect(button).not.toBeNull();
+
+    fireEvent.click(button as Element);
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("**粗体** 问一句"),
+    );
+  });
+
+  it("错误气泡不带复制按钮", () => {
+    const { container } = renderMessages([
+      { role: "assistant", content: "出错了", turnIndex: 0, isError: true },
+    ]);
+
+    const bubble = container.querySelector("[data-slot='assistant-bubble']");
+    expect(bubble).not.toBeNull();
+    expect(
+      (bubble as Element).querySelector("[data-slot='message-copy']"),
+    ).toBeNull();
   });
 });
