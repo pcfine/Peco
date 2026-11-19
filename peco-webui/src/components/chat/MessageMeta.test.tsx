@@ -185,7 +185,15 @@ describe("气泡元信息行", () => {
 
   it("剪贴板 API 不存在时走 textarea 兜底，成功后同样显示已复制", async () => {
     stubClipboard(undefined);
-    const execCommand = vi.fn().mockReturnValue(true);
+    // 临时节点用完即拆，事后拿不到引用：execCommand 执行的那一刻是唯一还能观察到
+    // 「复制时焦点落在哪」的时机。
+    let focusedAtCopy: Element | null = null;
+    let copyTarget: Element | null = null;
+    const execCommand = vi.fn(() => {
+      focusedAtCopy = document.activeElement;
+      copyTarget = document.querySelector("textarea");
+      return true;
+    });
     stubExecCommand(execCommand);
     renderMeta({ copyText: "兜底文本" });
 
@@ -198,10 +206,32 @@ describe("气泡元信息行", () => {
     await flushAsync();
 
     expect(execCommand).toHaveBeenCalledWith("copy");
+    // 焦点没落到临时节点上时部分浏览器不给选区，execCommand 复制到的是空白
+    expect(copyTarget).not.toBeNull();
+    expect(focusedAtCopy).toBe(copyTarget);
     expect(screen.getByRole("button", { name: COPIED_LABEL })).toBe(button);
     // 兜底节点用完即拆：留在 DOM 里的 textarea 会让下一个气泡复制到旧值
     expect(document.querySelector("textarea")).toBeNull();
     expect(document.activeElement).toBe(button);
+  });
+
+  it("还焦点抛错时不改判复制结果：勾标照出，异常不穿到调用方", async () => {
+    stubClipboard(undefined);
+    stubExecCommand(vi.fn().mockReturnValue(true));
+    renderMeta({ copyText: "兜底文本" });
+
+    const button = screen.getByRole("button", { name: COPY_LABEL });
+    button.focus();
+    // 复制成功后只剩「还焦点」还会抛：这一步失败也只能算收尾噪音
+    vi.spyOn(button, "focus").mockImplementation(() => {
+      throw new Error("focus refused");
+    });
+
+    fireEvent.click(button);
+    await flushAsync();
+
+    expect(screen.getByRole("button", { name: COPIED_LABEL })).toBe(button);
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   it("剪贴板 API 抛错时同样落到兜底路径", async () => {
@@ -212,11 +242,13 @@ describe("气泡元信息行", () => {
     stubExecCommand(execCommand);
     renderMeta({ copyText: "兜底文本" });
 
-    fireEvent.click(screen.getByRole("button", { name: COPY_LABEL }));
+    const button = screen.getByRole("button", { name: COPY_LABEL });
+    fireEvent.click(button);
     await flushAsync();
 
     expect(execCommand).toHaveBeenCalledWith("copy");
-    expect(screen.getByRole("button", { name: COPIED_LABEL })).toBeTruthy();
+    expect(screen.getByRole("button", { name: COPIED_LABEL })).toBe(button);
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it("两条路径都失败时提示手动选择，图标与标签都不改", async () => {
@@ -264,11 +296,13 @@ describe("气泡元信息行", () => {
     stubExecCommand(undefined);
     renderMeta({ copyText: "兜底文本" });
 
-    fireEvent.click(screen.getByRole("button", { name: COPY_LABEL }));
+    const button = screen.getByRole("button", { name: COPY_LABEL });
+    fireEvent.click(button);
     await flushAsync();
 
     expect(toast.error).toHaveBeenCalledWith("复制失败，请手动选择文本");
-    expect(screen.getByRole("button", { name: COPY_LABEL })).toBeTruthy();
+    expect(screen.getByRole("button", { name: COPY_LABEL })).toBe(button);
+    expect(toast.success).not.toHaveBeenCalled();
     expect(document.querySelector("textarea")).toBeNull();
   });
 

@@ -44,7 +44,12 @@ function copyViaTextarea(text: string): boolean {
   } finally {
     textarea.remove();
     if (prev instanceof HTMLElement && prev.isConnected) {
-      prev.focus({ preventScroll: true });
+      try {
+        prev.focus({ preventScroll: true });
+      } catch {
+        // 还焦点是收尾动作：它失败不该把「已经复制成功」改判成失败，也不该让
+        // 异常穿到调用方去 —— 那样用户既拿不到提示，也看不到勾标。
+      }
     }
   }
 }
