@@ -12,6 +12,8 @@ use peco_daemon::config::{self, DaemonConfig};
 use peco_daemon::db;
 use peco_daemon::error::DaemonError;
 use peco_daemon::http;
+use peco_daemon::schedule::access as schedule_store;
+use peco_daemon::schedule::scheduler::Scheduler;
 use peco_daemon::single_instance;
 use peco_daemon::space::SpaceEnv;
 use peco_daemon::space::ledger::SqliteTaskLedger;
@@ -149,6 +151,25 @@ async fn run() -> Result<(), DaemonError> {
 
     // 资源模块经这一个适配层取实例：Hub 仍是唯一真源，注册表只做 ws_id → 目录。
     let spaces = Arc::new(SpaceRegistry::new(hub.clone(), env.clone()));
+    let chat_runs = Arc::new(ChatActiveRuns::new());
+    // 投递端在这里才拿到 `SpaceRegistry` 与 `SpaceEnv`：泵必须早于观察者存在，
+    // 故只能晚绑定（`OnceLock`），否则 `pump ↔ AppState` 会成 Arc 环。
+    // 定时任务的通知走同一份投递端：落点固定是 Peco 空间的 `@master` 会话。
+    let delivery = Arc::new(PecoDelivery::new(
+        pool.clone(),
+        spaces.clone(),
+        chat_runs.clone(),
+        env.peco.clone(),
+        Arc::downgrade(&env),
+    ));
+    let schedules = Arc::new(Scheduler::new(
+        pool.clone(),
+        spaces.clone(),
+        chat_runs.clone(),
+        env.peco.clone(),
+        Arc::downgrade(&env),
+        delivery.clone(),
+    ));
     let state = AppState {
         pool,
         hub,
@@ -156,18 +177,11 @@ async fn run() -> Result<(), DaemonError> {
         config,
         tasks,
         spaces,
-        chat_runs: Arc::new(ChatActiveRuns::new()),
+        chat_runs,
         wake,
+        schedules,
     };
-    // 投递端在这里才拿到 `SpaceRegistry` 与 `AppState`：泵必须早于观察者存在，
-    // 故只能晚绑定（`OnceLock`），否则 `pump ↔ AppState` 会成 Arc 环。
-    state.wake.attach_delivery(Arc::new(PecoDelivery::new(
-        state.pool.clone(),
-        state.spaces.clone(),
-        state.chat_runs.clone(),
-        state.env.peco.clone(),
-        Arc::downgrade(&state.env),
-    )));
+    state.wake.attach_delivery(delivery);
 
     // 观察者已随上一个进程消失，只有台账知道哪些任务在飞：在接客之前对一遍账。
     // 失败只 warn（`reconcile_ledger` 自己吞错），一个坏行不该拦住 daemon 启动。
@@ -185,6 +199,22 @@ async fn run() -> Result<(), DaemonError> {
     // 首个 tick 就看不到这些行。
     state.wake.startup_reclaim().await;
     state.wake.spawn();
+
+    // 上个进程留在 running 的行没有观察者了：只收 running，pending 留着继续重试。
+    match db::schedules::interrupt_running(&state.pool).await {
+        Ok(0) => {}
+        Ok(count) => info!(count, "schedule runs interrupted by the previous process"),
+        Err(e) => warn!(error = %e, "cannot reconcile the schedule runs at startup"),
+    }
+    // 排期存储要在任何一个 agent 被加载之前装好：`save_schedule` 只按进程级注入面
+    // 决定加不加入工具集，装晚了就先拿到一份没有它的配置。
+    if schedule_store::install(state.pool.clone()).is_err() {
+        error!("process-level schedule store already initialized; refusing to start");
+        return Err(DaemonError::Internal {
+            message: "schedule store already installed".into(),
+        });
+    }
+    state.schedules.spawn();
 
     http::serve(state).await?;
     info!("http server stopped; daemon exit");

@@ -17,6 +17,7 @@ pub mod memory_consolidation_state;
 pub mod memory_recall_stats;
 pub mod memory_supersede;
 pub mod messages;
+pub mod schedules;
 pub mod session_archive;
 pub mod teams;
 pub mod workflow_executions;
@@ -729,6 +730,24 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::info!("Migration 028 completed");
     } else {
         tracing::debug!("Migration 028 skipped: d_dispatches.output_truncated already exists");
+    }
+
+    // ── Migration 029: 定时任务两张表 ─────────────────────────────────────
+    // 门控查 `scheduled_runs` 是否存在：全新库由 `schema.sql` 一次建全 → 跳过；
+    // 旧库缺表才需要建。取 run 表而不取 task 表，是因为 029 的全部语句都带
+    // `IF NOT EXISTS`，崩在两张表之间时下一次启动会把缺的那张补齐。
+    let has_scheduled_runs = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='scheduled_runs'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_scheduled_runs {
+        run_migration(pool, "029", include_str!("migrations/029_schedules.sql")).await?;
+        tracing::info!("Migration 029 completed");
+    } else {
+        tracing::debug!("Migration 029 skipped: scheduled_runs table already exists");
     }
 
     Ok(())

@@ -31,6 +31,63 @@ async fn empty_db_seeds_single_local_user_and_new_tables() {
     }
 }
 
+/// 定时任务的两张表在全新库里由 `schema.sql` 一次建全（不靠迁移 029 补）。
+///
+/// 迁移 029 的门控只看「`scheduled_runs` 在不在」：`schema.sql` 漏写时全新库要靠
+/// 029 建表才勉强可用，而两张表的 CHECK 与唯一索引只要有一处不同形，新旧库就会
+/// 对同一条表达式给出不同的结论。故这里既查表也查那条部分唯一索引。
+#[tokio::test]
+async fn empty_db_has_the_schedule_tables() {
+    let env = new_env(&[]).await;
+
+    for table in ["scheduled_tasks", "scheduled_runs"] {
+        assert!(table_exists(&env.pool, table).await, "表 {table} 应已建出");
+    }
+    assert!(
+        index_exists(&env.pool, "uq_scheduled_run_slot").await,
+        "同一槽位只能有一行 cron run，唯一索引必须建在全新库里"
+    );
+    assert!(index_exists(&env.pool, "idx_scheduled_due").await);
+    assert!(index_exists(&env.pool, "idx_scheduled_runs_by_schedule").await);
+    // notify_attempt_at 是后加的列：漏在 schema.sql 里，全新库的通知重试会永久卡住。
+    let columns = table_columns(&env.pool, "scheduled_runs").await;
+    for column in [
+        "notify_state",
+        "notify_attempts",
+        "notify_attempt_at",
+        "notified_at",
+    ] {
+        assert!(
+            columns.contains(&column.to_string()),
+            "scheduled_runs 缺列 {column}"
+        );
+    }
+}
+
+/// `schema.sql` 的文本必须在 `-- @after-migrations` 之前声明这两张表：放在分隔线
+/// 之后会让旧库先跑 029 再建表，两边 DDL 一旦不同形就再也收敛不了。
+#[test]
+fn schema_sql_declares_the_schedule_tables_before_the_marker() {
+    let schema = include_str!("../src/db/schema.sql");
+    let (before, after) = schema
+        .split_once("-- @after-migrations")
+        .expect("schema.sql 必须有迁移分界线");
+    for table in ["scheduled_tasks", "scheduled_runs"] {
+        assert!(
+            before.contains(&format!("CREATE TABLE IF NOT EXISTS {table} (")),
+            "{table} 必须在迁移前段落建出"
+        );
+        assert!(
+            !after.contains(&format!("CREATE TABLE IF NOT EXISTS {table} (")),
+            "{table} 不得只在迁移后段落出现"
+        );
+    }
+    assert!(
+        before.contains("uq_scheduled_run_slot"),
+        "槽位唯一索引属于新库的一次性建全"
+    );
+}
+
 /// P1-2 附带：迁移可重复执行（daemon 每次启动都会跑一遍）。
 #[tokio::test]
 async fn migrations_are_rerunnable_without_duplicating_seed() {
@@ -429,6 +486,15 @@ async fn legacy_dispatch_ledger(pool: &sqlx::SqlitePool) {
     ] {
         sqlx::raw_sql(statement).execute(pool).await.unwrap();
     }
+}
+
+async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
+    sqlx::query_scalar(&format!(
+        "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }
 
 async fn column_names(pool: &sqlx::SqlitePool) -> Vec<String> {

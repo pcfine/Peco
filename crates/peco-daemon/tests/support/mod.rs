@@ -235,15 +235,33 @@ impl TestEnv {
     }
 
     fn with_env(&self, env: Arc<SpaceEnv>) -> AppState {
+        let spaces = Arc::new(SpaceRegistry::new(self.hub.clone(), env.clone()));
+        let chat_runs = Arc::new(peco_daemon::chat::ChatActiveRuns::new());
+        // 与 `main` 同一条装配链：通知与排期共用同一份投递端与同一张实例表。
+        let delivery = Arc::new(peco_daemon::wake::deliver::PecoDelivery::new(
+            self.pool.clone(),
+            spaces.clone(),
+            chat_runs.clone(),
+            env.peco.clone(),
+            Arc::downgrade(&env),
+        ));
         AppState {
             pool: self.pool.clone(),
             hub: self.hub.clone(),
             env: env.clone(),
             config: self.config.clone(),
             tasks: self.tasks.clone(),
-            spaces: Arc::new(SpaceRegistry::new(self.hub.clone(), env)),
-            chat_runs: Arc::new(peco_daemon::chat::ChatActiveRuns::new()),
+            spaces: spaces.clone(),
+            chat_runs: chat_runs.clone(),
             wake: self.wake.clone(),
+            schedules: Arc::new(peco_daemon::schedule::scheduler::Scheduler::new(
+                self.pool.clone(),
+                spaces.clone(),
+                chat_runs.clone(),
+                env.peco.clone(),
+                Arc::downgrade(&env),
+                delivery,
+            )),
         }
     }
 

@@ -6,6 +6,7 @@
 pub mod brand;
 pub mod events;
 pub mod peco;
+pub mod schedules;
 pub mod space;
 pub mod space_artifacts;
 pub mod space_conversation;
@@ -132,6 +133,19 @@ pub fn router(state: AppState) -> Router {
             "/api/teams/{team_id}/providers/{name}/test",
             post(provider::test_connection),
         )
+        // 定时任务：列表类接口一律裸数组（与 `/api/spaces` 一致）。
+        // `preview` 是静态段，与 `{id}` 子树不重叠（前者两段、后者三段）。
+        .route(
+            "/api/schedules",
+            get(schedules::list).post(schedules::create),
+        )
+        .route("/api/schedules/preview", post(schedules::preview))
+        .route(
+            "/api/schedules/{id}",
+            axum::routing::patch(schedules::update).delete(schedules::delete),
+        )
+        .route("/api/schedules/{id}/run", post(schedules::run))
+        .route("/api/schedules/{id}/runs", get(schedules::runs))
         .route("/api/peco", get(peco::detail))
         // 左栏品牌图：全局一张，不分空间也不分团队。
         .route("/api/brand", get(brand::get).put(brand::update))

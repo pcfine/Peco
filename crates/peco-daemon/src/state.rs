@@ -16,6 +16,7 @@ use sqlx::SqlitePool;
 
 use crate::chat::active::ChatActiveRuns;
 use crate::config::DaemonConfig;
+use crate::schedule::scheduler::Scheduler;
 use crate::space::SpaceEnv;
 use crate::space::registry::SpaceRegistry;
 use crate::space::tasks::TaskObserver;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub chat_runs: Arc<ChatActiveRuns>,
     /// 任务终态 → Peco 会话的投递泵。观察者叫醒它，它按台账决定投什么。
     pub wake: Arc<WakePump>,
+    /// 定时任务的调度器：手动运行的入口在它身上，列表与历史只读库里那两张表。
+    pub schedules: Arc<Scheduler>,
 }
 
 impl AppState {

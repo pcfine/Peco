@@ -41,6 +41,9 @@ mime_guess = { workspace = true }
 # 团队目录文件监听（外部编辑器改 agent.md 后把新内容送进已打开的空间）
 notify = { workspace = true }
 
+# 定时任务的 cron 解析与下次触发时刻计算（与 peco-server 同一实现）
+croner = "2.2"
+
 # Errors / logging / time / ids
 thiserror = { workspace = true }
 tracing = { workspace = true }

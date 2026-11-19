@@ -19,6 +19,7 @@ pub mod knowledge;
 pub mod mcp_config;
 pub mod memory;
 pub mod provider;
+pub mod schedule;
 pub mod session_dto;
 pub mod session_store;
 pub mod single_instance;
