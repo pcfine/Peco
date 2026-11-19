@@ -56,7 +56,7 @@ agent:
   version: "1.0"
 llm:
   provider: deepseek
-  model: deepseek-chat
+  model: deepseek-flash
   temperature: 0.7
 tools:
   - shell
@@ -422,7 +422,7 @@ api_key = "${DEEPSEEK_API_KEY}"
 base_url = "https://api.deepseek.com"
 
 [providers.deepseek.default]
-model = "deepseek-chat"
+model = "deepseek-flash"
 temperature = 0.7
 max_tokens = 4096
 ```

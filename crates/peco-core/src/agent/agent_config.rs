@@ -20,7 +20,7 @@ use crate::config::LlmApiParams;
 ///   description: "A helpful agent"
 /// llm:
 ///   provider: "deepseek"
-///   model: "deepseek-v4-flash"
+///   model: "deepseek-flash"
 /// tools:
 ///   - shell
 /// ---
@@ -164,7 +164,7 @@ impl ModelConfig {
 /// ```ignore
 /// let config = ModelConfigBuilder::new()
 ///     .provider_name("deepseek")
-///     .model_name("deepseek-v4-pro")
+///     .model_name("deepseek-flash")
 ///     .temperature(0.7)
 ///     .stream(true)
 ///     .build();
@@ -200,7 +200,7 @@ impl ModelConfigBuilder {
         self
     }
 
-    /// 设置模型名称（如 `"deepseek-v4-pro"`）。
+    /// 设置模型名称（如 `"deepseek-flash"`）。
     pub fn model_name(mut self, name: impl Into<String>) -> Self {
         self.model_name = Some(name.into());
         self
@@ -298,7 +298,7 @@ pub struct AssembleAgentMdParams {
 ///     description: "A helpful agent".into(),
 ///     template_version: None,
 ///     provider: "deepseek".into(),
-///     model: "deepseek-v4-flash".into(),
+///     model: "deepseek-flash".into(),
 ///     temperature: None,
 ///     max_tokens: None,
 ///     stream: None,
@@ -602,7 +602,7 @@ mod tests {
             description: "Minimal config".into(),
             template_version: None,
             provider: "deepseek".into(),
-            model: "deepseek-v4-flash".into(),
+            model: "deepseek-flash".into(),
             temperature: None,
             max_tokens: None,
             stream: None,
@@ -626,7 +626,7 @@ mod tests {
 
         let llm = profile.llm.expect("llm section should be present");
         assert_eq!(llm.provider.as_deref(), Some("deepseek"));
-        assert_eq!(llm.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(llm.model.as_deref(), Some("deepseek-flash"));
         assert!(llm.temperature.is_none());
         assert!(llm.max_tokens.is_none());
         assert!(llm.stream.is_none());

@@ -5,7 +5,7 @@ agent:
 # ── 模型参数 ──
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
   temperature: 0.3
   max_tokens: 4096
   stream: false

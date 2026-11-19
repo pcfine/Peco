@@ -562,7 +562,7 @@ fn api_mode_of(entry: &ProviderEntry) -> Option<&str> {
 ///
 /// 注意：本判定落在 provider + API 风格这一层，不含模型能力。文本模态模型
 ///（如 `deepseek-v4-pro`）走 anthropic 端点时同样返回 true，图片会被服务端
-/// 忽略而非报错。部署所用 `deepseek-flash` / `deepseek-v4-flash` 均为视觉模型。
+/// 忽略而非报错。部署所用 `deepseek-flash` 为视觉模型。
 pub fn supports_image_input_for(user_config: &UserConfig, provider_name: Option<&str>) -> bool {
     let provider_name = provider_name.unwrap_or_else(|| user_config.default_provider_name());
     match user_config.provider_entry(Some(provider_name)) {

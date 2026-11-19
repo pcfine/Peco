@@ -400,14 +400,14 @@ mod tests {
             .unwrap()
             .with_base_url(&base_url);
 
-        let mut request = sample_request("deepseek-v4-flash");
+        let mut request = sample_request("deepseek-flash");
         request.input = Vec::new().into();
         let _ = provider.generate_full(&request).await;
 
         let logs = capture.contents();
         assert!(logs.contains("input_items=0"), "空历史计数不对：\n{logs}");
         assert!(
-            logs.contains("model=deepseek-v4-flash"),
+            logs.contains("model=deepseek-flash"),
             "缺少 model：\n{logs}"
         );
         assert!(

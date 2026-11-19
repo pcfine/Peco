@@ -251,7 +251,7 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             kb_name: "@private_memory".to_string(),
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
             analyze_min_chars: 50,
             extraction_top_k: 5,
             recall_top_k: 5,
@@ -309,7 +309,7 @@ mod tests {
         let c = MemoryConfig::default();
         assert!(c.enabled);
         assert_eq!(c.kb_name, "@private_memory");
-        assert_eq!(c.model, "deepseek-v4-flash");
+        assert_eq!(c.model, "deepseek-flash");
         assert_eq!(c.analyze_min_chars, 50);
         // 召回窗口 3 → 5、注入上限 800 → 1000
         assert_eq!(c.recall_top_k, 5);

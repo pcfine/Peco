@@ -601,14 +601,14 @@ mod tests {
     #[test]
     fn omitted_model_keeps_params() {
         let old = Some(LlmApiParams {
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
             temperature: Some(0.3),
             max_tokens: Some(4096),
             stream: Some(true),
             reasoning_effort: Some("high".to_string()),
         });
         let kept = merge_default_model(old.clone(), None).unwrap();
-        assert_eq!(kept.model, "deepseek-v4-flash");
+        assert_eq!(kept.model, "deepseek-flash");
         assert_eq!(kept.temperature, Some(0.3));
         assert_eq!(kept.max_tokens, Some(4096));
         assert_eq!(kept.reasoning_effort.as_deref(), Some("high"));
@@ -650,10 +650,7 @@ mod tests {
             .find(|i| i.provider_type == "deepseek")
             .unwrap();
         assert_eq!(ds.default_base_url, "https://api.deepseek.com");
-        assert!(
-            ds.suggested_models
-                .contains(&"deepseek-v4-flash".to_string())
-        );
+        assert!(ds.suggested_models.contains(&"deepseek-flash".to_string()));
     }
 
     fn empty_config() -> ProvidersConfig {
@@ -722,7 +719,7 @@ mod tests {
         let mut config = empty_config();
         config.providers.insert(
             "deepseek".to_string(),
-            entry("deepseek", Some("sk-old"), Some("deepseek-v4-flash")),
+            entry("deepseek", Some("sk-old"), Some("deepseek-flash")),
         );
 
         let mut r = req(Some("deepseek"), "deepseek");
@@ -733,7 +730,7 @@ mod tests {
         assert_eq!(stored.api_key.as_deref(), Some("sk-old"));
         assert_eq!(stored.base_url.as_deref(), Some("https://proxy.internal"));
         // 模型也一并保留
-        assert_eq!(stored.default.as_ref().unwrap().model, "deepseek-v4-flash");
+        assert_eq!(stored.default.as_ref().unwrap().model, "deepseek-flash");
 
         // 显式空串才是"清空凭据"
         let mut clear = req(Some("deepseek"), "deepseek");
@@ -786,20 +783,20 @@ mod tests {
 
         let mut r = req(Some("gateway"), "deepseek");
         r.base_url = Some("https://api.deepseek.com".to_string());
-        r.default_model = Some("deepseek-v4-flash".to_string());
+        r.default_model = Some("deepseek-flash".to_string());
         apply_upsert(&mut config, &r).unwrap();
 
         let stored = config.providers.get("gateway").unwrap();
         assert_eq!(stored.provider_type, "deepseek");
         assert!(stored.api_key.is_none(), "旧类型密钥被继承了");
-        assert_eq!(stored.default.as_ref().unwrap().model, "deepseek-v4-flash");
+        assert_eq!(stored.default.as_ref().unwrap().model, "deepseek-flash");
 
         // 类型不变时仍然按部分更新语义保留
         let mut keep = req(Some("gateway"), "deepseek");
         keep.base_url = Some("https://proxy.internal".to_string());
         apply_upsert(&mut config, &keep).unwrap();
         let stored = config.providers.get("gateway").unwrap();
-        assert_eq!(stored.default.as_ref().unwrap().model, "deepseek-v4-flash");
+        assert_eq!(stored.default.as_ref().unwrap().model, "deepseek-flash");
         assert_eq!(stored.base_url.as_deref(), Some("https://proxy.internal"));
     }
 

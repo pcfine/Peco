@@ -201,7 +201,7 @@ impl PecoConfig {
                 ENV_COMPACTION_KEEP_RECENT_TOKENS,
                 128_000,
             ),
-            summarizer_model: "deepseek-v4-flash".to_string(),
+            summarizer_model: "deepseek-flash".to_string(),
             strip: CompactionStripConfig {
                 shadow: env_bool(&get, ENV_COMPACTION_STRIP_SHADOW, true),
                 keep_recent_turns: env_parse(&get, ENV_COMPACTION_STRIP_KEEP_RECENT_TURNS, 4),

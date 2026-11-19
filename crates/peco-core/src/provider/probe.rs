@@ -311,7 +311,7 @@ mod tests {
         let outcome = run_probe(target(
             "deepseek",
             Some("${PECO_PROBE_MISSING_VAR_9F3A}"),
-            Some("deepseek-v4-flash"),
+            Some("deepseek-flash"),
         ))
         .await;
         assert!(!outcome.success);

@@ -19,7 +19,7 @@ async fn test_create_agent() {
             "name": "代码审查员",
             "description": "负责代码质量审查",
             "system_prompt": "你是一位资深代码审查专家",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "tools": ["shell", "fetch"],
             "icon": "🔍"
         }))
@@ -32,7 +32,7 @@ async fn test_create_agent() {
     assert_eq!(body["name"], "代码审查员");
     assert_eq!(body["description"], "负责代码质量审查");
     // model 现在是 Option<String>，创建时指定了值
-    assert_eq!(body["model"], "deepseek-v4-flash");
+    assert_eq!(body["model"], "deepseek-flash");
     assert_eq!(body["icon"], "🔍");
     assert!(body["id"].as_str().is_some());
     // 验证 tools 被正确存储
@@ -335,7 +335,7 @@ async fn test_agent_detail_from_file_not_db() {
             "name": "file-truth-test",
             "description": "原始描述",
             "system_prompt": "原始 system prompt",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "temperature": 0.7
         }))
         .send()
@@ -449,7 +449,7 @@ async fn test_update_partial_fields_preserves_others() {
             "name": "partial-update-test",
             "description": "原始",
             "system_prompt": "原始 prompt",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "temperature": 0.7,
             "max_iterations": 25,
             "tools": ["shell"]
@@ -474,7 +474,7 @@ async fn test_update_partial_fields_preserves_others() {
 
     assert_eq!(body["description"], "更新后的描述");
     // 未更新的字段保持不变
-    assert_eq!(body["model"], "deepseek-v4-flash");
+    assert_eq!(body["model"], "deepseek-flash");
     assert_eq!(body["temperature"], 0.7);
     assert_eq!(body["max_iterations"], 25);
     let tools: Vec<&str> = body["tools"]

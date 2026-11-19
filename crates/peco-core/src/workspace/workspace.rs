@@ -958,7 +958,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("providers.toml");
         let content = format!(
-            "default_provider = \"deepseek\"\n\n[providers.deepseek]\ntype = \"deepseek\"\napi_key = \"{key}\"\nbase_url = \"https://api.deepseek.com\"\n\n[providers.deepseek.default]\nmodel = \"deepseek-v4-flash\"\n"
+            "default_provider = \"deepseek\"\n\n[providers.deepseek]\ntype = \"deepseek\"\napi_key = \"{key}\"\nbase_url = \"https://api.deepseek.com\"\n\n[providers.deepseek.default]\nmodel = \"deepseek-flash\"\n"
         );
         std::fs::write(&path, content).unwrap();
     }

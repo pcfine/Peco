@@ -17,7 +17,7 @@
 //!     let provider = DeepSeek::from_env()?;
 //!
 //!     let request = GenerateRequest {
-//!         model: "deepseek-v4-pro".to_string(),
+//!         model: "deepseek-flash".to_string(),
 //!         instructions: Some("你是一个乐于助人的助手。".to_string()),
 //!         input: vec![Arc::new(InputItem::Message {
 //!             role: Role::User,

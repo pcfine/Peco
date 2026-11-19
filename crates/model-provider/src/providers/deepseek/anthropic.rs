@@ -1410,7 +1410,7 @@ mod tests {
 
     fn make_request() -> GenerateRequest {
         GenerateRequest {
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
             instructions: Some("你是一个助手".to_string()),
             input: Arc::from([Arc::new(InputItem::Message {
                 role: Role::User,
@@ -1482,7 +1482,7 @@ mod tests {
     #[test]
     fn test_build_request_body_basic() {
         let json = build_body(&make_request(), false);
-        assert_eq!(json["model"], "deepseek-v4-flash");
+        assert_eq!(json["model"], "deepseek-flash");
         assert_eq!(json["system"], "你是一个助手");
         assert!(json.get("stream").is_none());
         let messages = json["messages"].as_array().unwrap();

@@ -132,7 +132,7 @@ impl ToolDyn for SaveAgent {
                   description: \"代码审查员 — Reviews code for bugs and style issues\"\n\
                 llm:\n\
                   provider: \"deepseek\"\n\
-                  model: \"deepseek-v4-flash\"\n\
+                  model: \"deepseek-flash\"\n\
                 tools: [\"shell\", \"fetch\", \"read_skill\"]\n\
                 max_iterations: 15\n\
                 ---\n\

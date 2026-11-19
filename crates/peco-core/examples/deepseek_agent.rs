@@ -120,7 +120,7 @@ type = "deepseek"
 api_key = "${DEEPSEEK_API_KEY}"
 
 [providers.deepseek.default]
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 temperature = 0.7
 max_tokens = 4096
 "#;
@@ -140,7 +140,7 @@ agent:
   description: "A simple example agent"
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
   temperature: 0.7
   max_tokens: 4096
 tools: []

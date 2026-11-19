@@ -998,7 +998,7 @@ mod tests {
             Arc::clone(km),
             db.clone(),
             KB,
-            "deepseek-v4-flash",
+            "deepseek-flash",
             config,
             Arc::new(NullProvider),
         )

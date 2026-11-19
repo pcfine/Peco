@@ -131,7 +131,7 @@ mod tests {
                 base_url: Some("https://api.deepseek.com".to_string()),
                 api: None,
                 default: Some(LlmApiParams {
-                    model: "deepseek-v4-flash".to_string(),
+                    model: "deepseek-flash".to_string(),
                     temperature: Some(0.7),
                     max_tokens: None,
                     stream: None,

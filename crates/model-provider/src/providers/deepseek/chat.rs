@@ -745,8 +745,8 @@ impl DeepSeekBuilder {
 // 公共模型名称常量
 // ============================================================================
 
-/// DeepSeek V4 Flash — 快速且经济。
-pub const DEEPSEEK_V4_FLASH: &str = "deepseek-v4-flash";
+/// DeepSeek V4.1 Flash — 快速且经济（规范名）。
+pub const DEEPSEEK_FLASH: &str = "deepseek-flash";
 
 /// DeepSeek V4 Pro — 最强大的模型。
 pub const DEEPSEEK_V4_PRO: &str = "deepseek-v4-pro";

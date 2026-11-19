@@ -19,7 +19,7 @@ use std::collections::HashMap;
 /// api_key = "${DEEPSEEK_API_KEY}"
 ///
 /// [providers.deepseek.default]
-/// model = "deepseek-v4-flash"
+/// model = "deepseek-flash"
 /// temperature = 0.7
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -6,7 +6,7 @@ mod responses;
 
 pub use anthropic::DeepSeekAnthropicAdapter;
 pub use chat::{
-    DEEPSEEK_API_BASE_URL, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, DeepSeek,
+    DEEPSEEK_API_BASE_URL, DEEPSEEK_FLASH, DEEPSEEK_V4_PRO, DeepSeek,
     DeepSeekChatCompletionsAdapter,
 };
 pub use responses::DeepSeekResponsesAdapter;

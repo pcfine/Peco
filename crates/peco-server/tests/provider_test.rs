@@ -98,7 +98,7 @@ async fn test_upsert_keeps_api_key_when_omitted() {
         .json(&json!({
             "type": "deepseek",
             "api_key": "sk-first",
-            "default_model": "deepseek-v4-flash"
+            "default_model": "deepseek-flash"
         }))
         .send()
         .await
@@ -128,7 +128,7 @@ async fn test_upsert_keeps_api_key_when_omitted() {
 
     assert_eq!(body["has_api_key"], true, "api_key 被清空了: {body}");
     assert_eq!(body["base_url"], "https://proxy.internal/v1");
-    assert_eq!(body["default_model"], "deepseek-v4-flash");
+    assert_eq!(body["default_model"], "deepseek-flash");
     assert_eq!(body["is_default"], true);
 }
 
@@ -137,7 +137,7 @@ async fn test_upsert_keeps_api_key_when_omitted() {
 async fn test_list_providers_reports_fields() {
     let app = TestApp::new().await;
 
-    for (ty, model) in [("deepseek", "deepseek-v4-flash"), ("openai", "gpt-5.2")] {
+    for (ty, model) in [("deepseek", "deepseek-flash"), ("openai", "gpt-5.2")] {
         let resp = app
             .put("/api/providers")
             .json(&json!({
@@ -274,7 +274,7 @@ async fn test_type_change_drops_old_credentials() {
             "name": "gateway",
             "type": "deepseek",
             "base_url": "https://api.deepseek.com",
-            "default_model": "deepseek-v4-flash"
+            "default_model": "deepseek-flash"
         }))
         .send()
         .await
@@ -290,7 +290,7 @@ async fn test_type_change_drops_old_credentials() {
         .await
         .unwrap();
     assert_eq!(body["provider_type"], "deepseek");
-    assert_eq!(body["default_model"], "deepseek-v4-flash");
+    assert_eq!(body["default_model"], "deepseek-flash");
     assert_eq!(body["has_api_key"], false, "旧类型的密钥被继承了: {body}");
 }
 
@@ -432,7 +432,7 @@ async fn test_list_provider_types() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m == "deepseek-v4-flash")
+            .any(|m| m == "deepseek-flash")
     );
 
     let openai = types
