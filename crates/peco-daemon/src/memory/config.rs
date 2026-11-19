@@ -17,7 +17,7 @@ pub const ENV_TOKEN_CAP: &str = "PECO_MEMORY_TOKEN_CAP";
 /// 记忆 KB 名（与团队模板保持一致，不开环境变量：它同时是模板里的约定名）。
 pub const KB_NAME: &str = "@private_memory";
 
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_MODEL: &str = "deepseek-flash";
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_TOKEN_CAP: usize = 2000;
 
@@ -143,7 +143,7 @@ mod tests {
     fn absent_env_falls_back_to_the_defaults() {
         let config = MemoryConfig::from_env_with(reader(&[]));
         assert_eq!(config, MemoryConfig::default());
-        assert_eq!(config.model, "deepseek-v4-flash");
+        assert_eq!(config.model, "deepseek-flash");
         assert_eq!(config.top_k, 5);
         assert_eq!(config.token_cap, 2000);
         assert_eq!(config.kb_name, "@private_memory");

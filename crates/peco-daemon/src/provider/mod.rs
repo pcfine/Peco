@@ -876,14 +876,14 @@ mod tests {
     #[test]
     fn omitted_model_keeps_params() {
         let old = Some(LlmApiParams {
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
             temperature: Some(0.3),
             max_tokens: Some(4096),
             stream: Some(true),
             reasoning_effort: Some("high".to_string()),
         });
         let kept = merge_default_model(old.clone(), None).unwrap();
-        assert_eq!(kept.model, "deepseek-v4-flash");
+        assert_eq!(kept.model, "deepseek-flash");
         assert_eq!(kept.temperature, Some(0.3));
         assert_eq!(kept.max_tokens, Some(4096));
 

@@ -175,10 +175,7 @@ fn assemble_params_from_request(req: &CreateAgentRequest) -> AssembleAgentMdPara
         // 全新 agent 无模板版本
         template_version: None,
         provider: req.provider.clone().unwrap_or_else(|| "deepseek".into()),
-        model: req
-            .model
-            .clone()
-            .unwrap_or_else(|| "deepseek-v4-flash".into()),
+        model: req.model.clone().unwrap_or_else(|| "deepseek-flash".into()),
         temperature: req.temperature,
         max_tokens: req.max_tokens,
         stream: req.stream,
@@ -392,7 +389,7 @@ fn deletable_error(name: &str, error: WorkspaceError) -> ApiError {
 ///   "name": "代码审查员",
 ///   "description": "负责代码质量审查",
 ///   "system_prompt": "你是一位资深代码审查专家...",
-///   "model": "deepseek-v4-flash",
+///   "model": "deepseek-flash",
 ///   "tools": ["shell", "fetch"]
 /// }
 /// ```
@@ -777,7 +774,7 @@ agent:
 template_version: 7
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
 tools:
   - "shell"
 knowledge_bases: ["@private_memory"]
@@ -812,7 +809,7 @@ agent:
   description: "d"
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
   web_search: true
 ---
 
@@ -824,7 +821,7 @@ agent:
   description: "d"
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
   web_search: false
 ---
 
