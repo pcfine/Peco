@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
+use super::schedule_tools::ScheduleAccess;
 use super::workspace_tools::WorkspaceHub;
 use crate::agent::{Agent, AgentError};
 use crate::config::{McpServerConfig, TransportType};
@@ -211,6 +212,11 @@ pub struct ToolDependencies {
     /// 只持弱引用：Hub 强持有已打开的 `WorkSpace`，后者经 AgentManager 指回
     /// Agent 与工具；强引用会闭合 `Hub → WorkSpace → Agent → 工具 → Hub`。
     pub workspace_hub: Option<Weak<WorkspaceHub>>,
+    /// 定时任务存储。Optional — None 时 `save_schedule` 被 warn + skip。
+    ///
+    /// 只持弱引用之外的考虑：排期存储（daemon 的 `DaemonScheduleAccess`）只握
+    /// 连接池，不指回任何已有工具，故这里无需防环，`Arc` 即可复用同一份实例。
+    pub schedule_access: Option<Arc<dyn ScheduleAccess>>,
 }
 
 impl Clone for ToolDependencies {
@@ -229,6 +235,7 @@ impl Clone for ToolDependencies {
             memory_audit: self.memory_audit.clone(),
             machine_runtime: self.machine_runtime.clone(),
             workspace_hub: self.workspace_hub.clone(),
+            schedule_access: self.schedule_access.clone(),
         }
     }
 }

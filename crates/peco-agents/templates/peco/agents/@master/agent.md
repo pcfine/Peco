@@ -39,6 +39,8 @@ tools:
   - add_to_knowledge_base
   - add_facts_to_knowledge_base
   - sync_knowledge_base
+  # 定时任务 — 向空间投递周期性任务
+  - save_schedule
   # 协作层 — 委托和编排
   - delegate_sub_agent
   - run_parallel_sub_agents

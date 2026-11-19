@@ -106,9 +106,10 @@ fn build_agent(agent_dir: &std::path::Path) -> Result<Arc<Agent>, Box<dyn std::e
         work_dir: peco_core::workspace::WorkDir::new("."),
         web_search: None,
         memory_audit: None, // fail-closed：无审计存储时删除工具运行时拒绝
-        // 示例不提供机器任务与跨空间编排：工具缺依赖时 warn + skip。
+        // 示例不提供机器任务、跨空间编排与定时任务：工具缺依赖时 warn + skip。
         machine_runtime: None,
         workspace_hub: None,
+        schedule_access: None,
     };
 
     let agent_md = agent_dir.join("agent.md");

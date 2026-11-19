@@ -315,6 +315,7 @@ impl AgentManager {
             memory_audit: self.memory_audit.read().unwrap().clone(),
             machine_runtime: Some(Arc::downgrade(&self.machine_runtime)),
             workspace_hub: Some(Arc::downgrade(&crate::tools::workspace_hub())),
+            schedule_access: crate::tools::schedule_access(),
         }
     }
 
@@ -361,6 +362,7 @@ impl AgentManager {
             memory_audit,
             machine_runtime: Some(Arc::downgrade(&self.machine_runtime)),
             workspace_hub: Some(Arc::downgrade(&crate::tools::workspace_hub())),
+            schedule_access: crate::tools::schedule_access(),
         }
     }
 
@@ -696,6 +698,8 @@ impl AgentAccess for AmAgentAccess {
             machine_runtime: None,
             // 跨空间编排只属于顶层总管：子 agent 拿不到注入面，模板里写了也只是 skip。
             workspace_hub: None,
+            // 定时任务同理：子 agent 排期等于绕过总管的编排意志。
+            schedule_access: None,
         };
 
         let agent = Agent::from_file(&path, &self.user_config, &deps)?;

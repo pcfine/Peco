@@ -11,6 +11,7 @@ mod machine_tool;
 mod mcp_tools;
 mod memory_delete;
 mod proc_group;
+mod schedule_tools;
 mod shell;
 mod skill_tools;
 mod sub_agent;
@@ -41,6 +42,10 @@ pub use memory_delete::{
     delete_entity_by_id, delete_entity_by_name,
 };
 pub use proc_group::{GroupGuard, configure_process_group};
+pub use schedule_tools::{
+    NewSchedule, SaveSchedule, ScheduleAccess, ScheduleError, ScheduleInfo,
+    install_schedule_access, schedule_access,
+};
 pub use shell::{ShellExec, ShellTool};
 pub use skill_tools::{DeleteSkill, ListSkills, ReadSkill, SaveSkill};
 pub use sub_agent::{DelegateSubAgent, RunParallelSubAgents};

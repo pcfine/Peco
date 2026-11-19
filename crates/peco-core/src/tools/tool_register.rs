@@ -16,9 +16,9 @@ use crate::tools::{
     DeleteKbDocument, DeleteKbDocuments, DeleteMcpServer, DeleteSkill, DispatchToWorkspace, Fetch,
     GetKnowledgeBaseDocs, InspectMachineTask, InspectWorkspaceTask, ListKnowledgeBases,
     ListMcpServers, ListSkills, OpenWorkspace, QueryEntityFacts, ReadAgent, ReadSkill,
-    RunMachineTask, RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSkill, SearchKnowledge,
-    ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn, ToolError,
-    ToolExecutor, WebSearchTool, WorkspaceHub,
+    RunMachineTask, RunParallelSubAgents, SaveAgent, SaveMcpServer, SaveSchedule, SaveSkill,
+    SearchKnowledge, ShellTool, ShowWorkspace, SyncKnowledgeBase, TestMcpConnection, ToolDyn,
+    ToolError, ToolExecutor, WebSearchTool, WorkspaceHub,
 };
 use crate::workflow::persistence::NullWorkflowPersister;
 use crate::workflow::tools::{DeleteWorkflow, ExecuteWorkflow, ListWorkflows, SaveWorkflow};
@@ -68,6 +68,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "open_workspace",
     "dispatch_to_workspace",
     "inspect_workspace_task",
+    "save_schedule",
 ];
 
 /// 可选依赖缺失时跳过该工具 — 与未知工具名一致采用 warn + skip，而非 panic。
@@ -180,6 +181,12 @@ impl ToolRegister {
                 "inspect_workspace_task" => match workspace_hub(deps) {
                     Some(hub) => Some(Box::new(InspectWorkspaceTask::new(Arc::downgrade(&hub)))),
                     None => skip_missing_dep("inspect_workspace_task", "workspace hub"),
+                },
+
+                // ── 定时任务（schedule_access 缺失时 warn + skip）──
+                "save_schedule" => match deps.schedule_access.as_ref() {
+                    Some(access) => Some(Box::new(SaveSchedule::new(access.clone()))),
+                    None => skip_missing_dep("save_schedule", "schedule store"),
                 },
 
                 "save_agent" => Some(Box::new(SaveAgent::new(deps.agent_access.clone()))),
@@ -479,6 +486,17 @@ mod tests {
         }
     }
 
+    struct StubScheduleAccess;
+    #[async_trait::async_trait]
+    impl crate::tools::ScheduleAccess for StubScheduleAccess {
+        async fn save(
+            &self,
+            _request: crate::tools::NewSchedule,
+        ) -> Result<crate::tools::ScheduleInfo, crate::tools::ScheduleError> {
+            unimplemented!("not called during tool construction")
+        }
+    }
+
     // ── 夹具 ─────────────────────────────────────────────────────────────
 
     fn base_deps() -> ToolDependencies {
@@ -502,6 +520,7 @@ mod tests {
             memory_audit: None,
             machine_runtime: None,
             workspace_hub: None,
+            schedule_access: None,
         }
     }
 
@@ -528,6 +547,7 @@ mod tests {
         )));
         deps.machine_runtime = Some(Arc::downgrade(&shared_machine_runtime()));
         deps.workspace_hub = Some(Arc::downgrade(&shared_workspace_hub()));
+        deps.schedule_access = Some(Arc::new(StubScheduleAccess));
         deps
     }
 
@@ -586,6 +606,7 @@ mod tests {
             "open_workspace",
             "dispatch_to_workspace",
             "inspect_workspace_task",
+            "save_schedule",
         ] {
             assert!(
                 !names.contains(&name.to_string()),
