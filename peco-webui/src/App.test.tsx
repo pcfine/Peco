@@ -97,6 +97,17 @@ vi.mock("@/api/tasks", () => ({
   listTasks: async () => [],
 }));
 
+// 定时任务页仍然只读一次列表：空清单就是它的空态，冒烟这一层不测增删改。
+vi.mock("@/api/schedules", () => ({
+  listSchedules: async () => [],
+  listScheduleRuns: async () => [],
+  previewCron: async () => ({ next: [] }),
+  createSchedule: vi.fn(),
+  updateSchedule: vi.fn(),
+  deleteSchedule: vi.fn(),
+  runSchedule: vi.fn(),
+}));
+
 vi.mock("@/api/conversations", () => ({
   getMessages: mocks.getMessages,
   conversationStreamUrl: (agentId: string, convId: string) =>
@@ -251,9 +262,13 @@ describe("壳与路由", () => {
     expect(screen.getByRole("button", { name: "创建并打开" })).toBeDisabled();
   });
 
-  it("/schedules 是占位页，文案说清未实现", async () => {
+  it("/schedules 空清单时给一句语义说明，不是占位页", async () => {
     renderAt("/schedules");
-    expect(await screen.findByText(/本期尚未实现/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        /定时任务按 cron 把一段话投进指定空间的 @master 会话/,
+      ),
+    ).toBeInTheDocument();
   });
 
   it("/spaces/:wsId 是聊天页：单对话壳 + 右栏，/status 才是状态页", async () => {

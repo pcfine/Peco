@@ -475,3 +475,86 @@ export interface KnowledgeBase {
   created_at: string;
   updated_at: string;
 }
+
+/**
+ * `GET /api/schedules` 的一行。
+ *
+ * 时间字段是 UTC 文本 `YYYY-MM-DD HH:MM:SS`（无时区后缀），展示前必须按本机
+ * 时区换算，走 `parseServerTimestamp`。
+ */
+export interface ScheduleView {
+  id: string;
+  name: string;
+  target_ws_id: string;
+  /** 目标空间的人读名；后端给不出时是空串，展示层回落到 `target_ws_id`。 */
+  target_label: string;
+  /** 定时投进目标空间 `@master` 会话的那段话。 */
+  prompt: string;
+  cron_expr: string;
+  enabled: boolean;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_status:
+    "completed" | "failed" | "skipped" | "timeout" | "interrupted" | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ScheduleRunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "timeout"
+  | "interrupted";
+
+/** `GET /api/schedules/{id}/runs` 的一行。 */
+export interface ScheduleRun {
+  id: string;
+  schedule_id: string;
+  trigger_kind: "cron" | "manual";
+  scheduled_for: string;
+  status: ScheduleRunStatus;
+  /** 已经尝试过几次；`pending` 行按它报「第 N 次」。 */
+  attempts: number;
+  conversation_id: string | null;
+  started_at: string;
+  finished_at: string | null;
+  result_digest: string | null;
+  error: string | null;
+  notify_state: "none" | "pending" | "sent" | "skipped" | "failed";
+  notified_at: string | null;
+}
+
+/** `POST /api/schedules` 的请求体；`enabled` 缺省由服务端补 `true`。 */
+export interface CreateScheduleRequest {
+  name: string;
+  target_ws_id: string;
+  prompt: string;
+  cron_expr: string;
+  enabled?: boolean;
+}
+
+/** `PATCH /api/schedules/{id}` 的请求体：省略即不改。 */
+export interface UpdateScheduleRequest {
+  name?: string;
+  target_ws_id?: string;
+  prompt?: string;
+  cron_expr?: string;
+  enabled?: boolean;
+}
+
+/** `POST /api/schedules/preview` 的回执：最多 3 个 UTC 文本时刻。 */
+export interface CronPreview {
+  next: string[];
+}
+
+/**
+ * `POST /api/schedules/{id}/run` 的回执：`pending` 表示目标会话忙，已排队；
+ * `failed` 表示同步启动就失败了，原因在运行历史里。
+ */
+export interface ScheduleRunAccepted {
+  run_id: string;
+  status: "running" | "pending" | "failed";
+}
