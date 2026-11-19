@@ -3,12 +3,13 @@
 // ============================================================================
 //
 // 一轮 chat 的 looper 由 run 任务独占持有（见 `chat::run`），请求之外无从触达；
-// 暂停 / 恢复 / 取消必须在**另一条 HTTP 请求**里对在途 looper 施加控制，故这里
-// 给出「会话 → 控制通道」的注册表：
+// 暂停 / 恢复 / 取消 / 在途注入都必须从**另一条 HTTP 请求**里施加到在途 looper 上，
+// 故这里给出「会话 → 控制通道」的注册表：
 //
 //   POST .../pause   ─┐
-//   POST .../resume  ─┼─→ ChatActiveRuns ──mpsc──→ run 任务 ──→ LooperHandle::pause()/resume()/cancel()
-//   POST .../cancel  ─┘
+//   POST .../resume  ─┼─→ ChatActiveRuns ──mpsc──→ run 任务 ──→ LooperHandle
+//   POST .../cancel  ─┤                                       ├ pause() / resume() / cancel()
+//   POST .../steer   ─┘                                       └ send_query_content()
 //
 // 条目与 run 任务同寿命（任务结束由 [`ChatRunGuard`] 移除），条目里同时挂着这一轮
 // 的 [`TurnFeed`]：两者必须同寿命，否则会出现「feed 还在、控制没了」或反之。
@@ -22,17 +23,20 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use model_provider::Content;
 use tokio::sync::mpsc;
 
 use super::feed::{LiveFrames, TurnFeed};
 
-/// 控制命令 —— run 任务转译为 `LooperHandle::pause()` / `resume()` / `cancel()`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 控制命令 —— run 任务转译为 `LooperHandle` 上的同名操作。
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatControl {
     Pause,
     Resume,
     /// 会话级取消：收尾在 looper 的步进边界，可能晚于 HTTP 响应。
     Cancel,
+    /// 在途注入：内容进当前轮的 pending，下一次模型请求前才并入。
+    Query(Content),
 }
 
 /// 控制通道容量。命令在 SSE 任务的 `select!` 上即时消费，容量只作背压缓冲。
@@ -159,6 +163,14 @@ impl ChatActiveRuns {
         self.send(conversation_id, ChatControl::Cancel)
     }
 
+    /// 向在途轮注入一段用户输入；`false` 表示该会话无在途轮（或控制通道已关闭）。
+    ///
+    /// `true` 只说明内容进了这一轮的 pending 队列 —— 它在下一次模型请求前才并入，
+    /// 不是在途轮的即时打断。
+    pub fn steer(&self, conversation_id: &str, content: Content) -> bool {
+        self.send(conversation_id, ChatControl::Query(content))
+    }
+
     /// 加入该会话在途轮的帧流；无在途轮、或这一轮已进入终态时返回 `None`
     /// （调用方据此回 204：历史已是权威）。
     ///
@@ -264,6 +276,25 @@ mod tests {
         assert_eq!(rx.recv().await, Some(ChatControl::Pause));
         assert!(registry.resume("c1"));
         assert_eq!(rx.recv().await, Some(ChatControl::Resume));
+    }
+
+    #[tokio::test]
+    async fn steer_reaches_the_running_turn() {
+        let registry = ChatActiveRuns::new();
+
+        assert!(
+            !registry.steer("c2", Content::Text("插一句".to_string())),
+            "无在途轮时注入失败（调用方据此回退成普通发送）"
+        );
+
+        let (mut rx, _guard) = registry.register("c1");
+        assert!(registry.steer("c1", Content::Text("插一句".to_string())));
+        match rx.recv().await {
+            Some(ChatControl::Query(content)) => {
+                assert_eq!(content, Content::Text("插一句".to_string()))
+            }
+            other => panic!("在途轮必须收到注入的内容，实际 {other:?}"),
+        }
     }
 
     #[tokio::test]

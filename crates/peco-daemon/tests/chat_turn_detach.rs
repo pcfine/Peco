@@ -97,6 +97,10 @@ impl Harness {
         format!("/api/chat/@master/conversations/{conv_id}/cancel")
     }
 
+    fn steer_uri(&self, conv_id: &str) -> String {
+        format!("/api/chat/@master/conversations/{conv_id}/steer")
+    }
+
     /// 普通请求（响应体读到底）。
     async fn call(&self, method: Method, uri: &str) -> HttpReply {
         call_in_space(&self.router, method, uri, None, Some(&self.ws_id)).await
@@ -134,6 +138,25 @@ impl Harness {
                 self.describe(conv_id).await
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 等这条 user 行出现，最多 [`STEP_TIMEOUT`]。
+    ///
+    /// 只在「命令已被 run 任务接住」需要断言的地方使用（它先落库、再投递给 looper）。
+    /// 等不到只返回、不在这里失败：行没写出来该由调用方自己的断情报出来。
+    async fn await_user_row(&self, conv_id: &str, content: &str) {
+        let deadline = tokio::time::Instant::now() + STEP_TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            let hit = self
+                .stored(conv_id)
+                .await
+                .iter()
+                .any(|row| row.role == "user" && row.content == content);
+            if hit {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -763,4 +786,122 @@ async fn a_superseded_run_salvages_its_partial_answer() {
 
     let row = harness.wait_for_assistant(&conv_id).await;
     assert_eq!(row.content, "半段", "兜底落库必须保住已产出的正文");
+}
+
+// ============================================================================
+// 在途注入：内容必须真的进下一次模型请求
+// ============================================================================
+
+/// 在途轮的 steer 内容必须出现在**下一次**模型请求里 —— 这是「注入送达」的唯一
+/// 判据。控制通道收到命令、库里多一条 user 行，都只说明有人收下了，说明不了模型
+/// 见过这句话。
+///
+/// 时序由假上游自己裁决：第一次请求（不带工具结果）进 responder 后先通知测试、
+/// 再卡在 gate 上，于是「第一次请求仍在途」是可观测事实，注入必然落在它之后。放行
+/// 闩也在测试手里，且只在 run 任务接住这条命令后才放手 —— 「注入赶在第二次请求
+/// （带工具结果）排空 pending 之前」因此是等出来的事实，不靠 sleep 竞速。
+///
+/// 两条 user 行的先后不需要任何等待就能断言：两行都由 run 任务写（单写者），原消息
+/// 行落库在进入事件循环之前、注入行在循环内，插入顺序因此恒等于阅读顺序。改由
+/// handler 写就变成两个任务抢同一个表（同一秒内按 `rowid` 排），这条断言会随机反转。
+///
+/// 变异方法：删掉 `chat/run.rs` 的 `ChatControl::Query(content)` 分支里的
+/// `messages::insert` → 库里只剩原消息一条 user 行，顺序断言变红；让该分支丢弃
+/// content（不调 `send_query_content`）→ pending 队列始终为空，本轮不发
+/// `user_steer`，第二次请求里也没有这句正文，前几条断言变红。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn steered_content_reaches_the_next_model_request() {
+    let (gate, release) = gate();
+    let (arrived_tx, arrived_rx) = oneshot::channel();
+    let arrived = Arc::new(Mutex::new(Some(arrived_tx)));
+    let upstream = FakeUpstream::start(move |request: Value| {
+        let gate = Arc::clone(&gate);
+        let arrived = Arc::clone(&arrived);
+        async move {
+            if upstream::model_of(&request) != "master" {
+                return Reply::Text(String::new());
+            }
+            if upstream::has_tool_result(&request) {
+                return Reply::Text("后半".to_string());
+            }
+            if let Some(tx) = arrived.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            wait_for_gate(&gate).await;
+            Reply::text_and_tool_call("半段", "show_workspace", json!({}))
+        }
+    })
+    .await;
+    let harness = Harness::new(&upstream, &["show_workspace"]).await;
+    let conv_id = harness.create_conversation().await;
+
+    let mut reader = harness
+        .open_stream(&harness.stream_uri(&conv_id, "hi"))
+        .await;
+    let first = reader.next_frame("注入 首帧").await.expect("首帧必须到");
+    assert_eq!(first.event, "turn_snapshot", "首帧必须是快照");
+
+    tokio::time::timeout(STEP_TIMEOUT, arrived_rx)
+        .await
+        .unwrap_or_else(|_| panic!("{STEP_TIMEOUT:?} 内上游必须收到第一次请求"))
+        .expect("上游的通知端必须还在");
+
+    // 第一次请求还卡在 gate 上：此刻注入，只会并入这一轮尚未发出的下一次请求。
+    let steered = call_in_space(
+        &harness.router,
+        Method::POST,
+        &harness.steer_uri(&conv_id),
+        Some(json!({"message": "补充一句"})),
+        Some(&harness.ws_id),
+    )
+    .await;
+    assert_eq!(steered.status, 200, "body={}", steered.body);
+
+    // 等 run 任务接住这条命令再放行模型：`200` 只说明命令进了会话的控制通道，还没
+    // 到 run 任务手里；此刻放行，注入正文会赶不上第二次请求（本轮没有第三次），
+    // `user_steer` 断言就测不到东西。这与两条 user 行的先后无关 —— 那由单写者保证。
+    harness.await_user_row(&conv_id, "补充一句").await;
+
+    release.send(()).expect("放行闩必须还在");
+    let frames = reader.drain_to_done("注入 收尾").await;
+
+    let steer_frame = frames
+        .iter()
+        .find(|frame| frame.event == "user_steer")
+        .unwrap_or_else(|| panic!("并入排队输入必须下发 user_steer 帧，实际 {frames:?}"));
+    assert_eq!(
+        steer_frame.payload()["count"],
+        json!(1),
+        "一批注入 = 一条，实际 {steer_frame:?}"
+    );
+    assert_eq!(
+        steer_frame.payload()["text"],
+        json!("补充一句"),
+        "展示正文必须就是注入的那句话，实际 {steer_frame:?}"
+    );
+
+    let exchanges = upstream.exchanges_with_model("master");
+    assert!(
+        exchanges.len() >= 2,
+        "这一轮至少要问两次模型（首段 + 工具后续轮），实际 {} 次",
+        exchanges.len()
+    );
+    let second = serde_json::to_string(&exchanges[1].request).expect("请求体必须可序列化");
+    assert!(
+        second.contains("补充一句"),
+        "注入的正文必须进第二次模型请求，实际请求体 = {second}"
+    );
+
+    let rows = harness.stored(&conv_id).await;
+    let users: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.role == "user")
+        .map(|row| row.content.as_str())
+        .collect();
+    assert_eq!(
+        users,
+        vec!["hi", "补充一句"],
+        "原消息在注入之前，实际 {}",
+        harness.describe(&conv_id).await
+    );
 }

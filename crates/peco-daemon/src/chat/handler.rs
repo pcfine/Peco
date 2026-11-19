@@ -100,6 +100,16 @@ pub struct StreamQuery {
     pub image_ids: Option<String>,
 }
 
+/// 在途注入请求体。
+///
+/// 与 `/stream` 的查询参数不同：注入是 POST，图片引用走 JSON 数组而不是逗号分隔串。
+#[derive(Debug, Deserialize)]
+pub struct SteerRequest {
+    pub message: String,
+    #[serde(default)]
+    pub image_ids: Vec<String>,
+}
+
 /// 消息列表查询参数。
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
@@ -134,6 +144,28 @@ pub(crate) fn row_to_response(row: &conversations::ConversationRow) -> Conversat
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
     }
+}
+
+/// 用户文本 + 图片引用 → 交给 looper 的 [`Content`]。
+///
+/// `/stream` 与 `/steer` 必须是同一份编码：无图走 `Content::Text`、有图走
+/// `Content::Parts`（文本在前），否则同一段输入经两条入口进入会话会得到两种形状。
+async fn build_message_content(
+    state: &AppState,
+    ws_id: &str,
+    message: &str,
+    image_ids: &[String],
+) -> Result<Content, ApiError> {
+    let image_parts = super::images::resolve_image_parts(state, ws_id, image_ids).await?;
+    if image_parts.is_empty() {
+        return Ok(Content::Text(message.to_string()));
+    }
+    let mut parts = Vec::with_capacity(1 + image_parts.len());
+    parts.push(ContentPart::Text {
+        text: message.to_string(),
+    });
+    parts.extend(image_parts);
+    Ok(Content::Parts(parts))
 }
 
 // ── Conversation Handlers ────────────────────────────────────────────────────
@@ -385,17 +417,7 @@ pub async fn stream_chat(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    let image_parts = super::images::resolve_image_parts(&state, &ws_id, &image_ids).await?;
-    let message_content = if image_parts.is_empty() {
-        Content::Text(message.clone())
-    } else {
-        let mut parts = Vec::with_capacity(1 + image_parts.len());
-        parts.push(ContentPart::Text {
-            text: message.clone(),
-        });
-        parts.extend(image_parts);
-        Content::Parts(parts)
-    };
+    let message_content = build_message_content(&state, &ws_id, &message, &image_ids).await?;
 
     // ── 1. 加载对话（本空间内的会话，别的一律 404）──────────────────────
     let conv = conversations::find_by_id_and_workspace(&state.pool, &conv_id, &ws_id)
@@ -464,6 +486,52 @@ pub async fn cancel_chat(
             format!("no running task for conversation '{conv_id}'"),
         ))
     }
+}
+
+/// `POST /api/chat/{agentId}/conversations/{id}/steer`
+///
+/// 把一段用户输入注入该会话**在途**的那一轮：内容进 pending 队列，下一次模型请求
+/// 前才并入（`200` 只表示已投递，不是已送达）。无在途轮时返回 409
+/// `no_running_task`，前端据此回退成普通发送。
+///
+/// user 行由 run 任务写（单写者），见 `chat/run.rs` 的 `ChatControl::Query` 分支：
+/// 那条路径上原消息行必已落库，注入行因此排在它之后；在这里写就与 run 任务竞争，
+/// 同一秒内按 `rowid` 排会让历史顺序反过来。
+pub async fn steer_chat(
+    LocalUser { ws_id }: LocalUser,
+    State(state): State<AppState>,
+    Path((_agent_name, conv_id)): Path<(String, String)>,
+    Json(req): Json<SteerRequest>,
+) -> Result<Json<SuccessResponse>, ApiError> {
+    let message = req.message.trim().to_string();
+    if message.is_empty() {
+        return Err(ApiError::BadRequest("message is required".into()));
+    }
+
+    require_owned_conversation(&state, &ws_id, &conv_id).await?;
+
+    let content = build_message_content(&state, &ws_id, &message, &req.image_ids).await?;
+
+    // 投递失败说明这一轮已经结束：调用方回退成 `/stream` 发一条新的。
+    if !state.chat_runs.steer(&conv_id, content) {
+        return Err(ApiError::coded(
+            StatusCode::CONFLICT,
+            "no_running_task",
+            format!("no running task for conversation '{conv_id}'"),
+        ));
+    }
+
+    // 投递已经发生：touch 失败只是活跃时间没刷新，不能因此回 5xx —— 前端会把
+    // 「已投递」当失败退回重发，同一条输入于是被注入两次。
+    if let Err(e) = conversations::touch(&state.pool, &conv_id).await {
+        tracing::warn!(
+            conversation_id = %conv_id,
+            error = %e,
+            "steer delivered but conversation touch failed"
+        );
+    }
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 // ── 暂停 / 恢复 ──────────────────────────────────────────────────────────────

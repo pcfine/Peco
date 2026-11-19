@@ -487,3 +487,129 @@ async fn stream_without_a_usable_provider_fails_fast() {
         );
     }
 }
+
+// ── 在途注入（steer）────────────────────────────────────────────────────────
+
+/// 注入的空 message 是 400：校验在会话归属之前，不需要夹具先造会话。
+#[tokio::test]
+async fn steer_rejects_an_empty_message() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+
+    let created = env
+        .post_in(&ws_id, &conversations_uri("@master"), json!({}))
+        .await;
+    let conv_id = created.body["id"].as_str().unwrap().to_string();
+
+    let reply = env
+        .post_in(
+            &ws_id,
+            &format!("/api/chat/@master/conversations/{conv_id}/steer"),
+            json!({"message": "   "}),
+        )
+        .await;
+    assert_eq!(reply.status, 400, "body={}", reply.body);
+    // 未分类的 400 不带 `code`（只有 `Coded` 才追加），类别走 `error`。
+    assert_eq!(
+        reply.body["error"],
+        json!("bad_request"),
+        "body={}",
+        reply.body
+    );
+    assert!(
+        reply.body["details"]
+            .as_str()
+            .is_some_and(|details| details.contains("message is required")),
+        "body={}",
+        reply.body
+    );
+}
+
+/// 别的空间 / 不存在的会话一律 404（不泄露存在性）。
+#[tokio::test]
+async fn steer_requires_an_owned_conversation() {
+    let env = new_env(&["research"]).await;
+    let ws_a = env.open_space("alpha", "research").await;
+    let ws_b = env.open_space("beta", "research").await;
+
+    let created = env
+        .post_in(&ws_a, &conversations_uri("@master"), json!({}))
+        .await;
+    let conv_id = created.body["id"].as_str().unwrap().to_string();
+
+    for (ws, id) in [(&ws_a, "no-such-conv"), (&ws_b, conv_id.as_str())] {
+        let reply = env
+            .post_in(
+                ws,
+                &format!("/api/chat/@master/conversations/{id}/steer"),
+                json!({"message": "插一句"}),
+            )
+            .await;
+        assert_eq!(reply.status, 404, "{ws}/{id} body={}", reply.body);
+    }
+}
+
+/// 没有在途轮时是 409 `no_running_task` —— 前端按这个 code 回退成普通发送。
+///
+/// 变异方法：`steer` 返回 `false` 时照样回 200 → 前端会把一段再也不会被模型看到的
+/// 输入当成本轮的一部分，断言变红。
+#[tokio::test]
+async fn steer_without_a_running_turn_is_coded_conflict() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+
+    let created = env
+        .post_in(&ws_id, &conversations_uri("@master"), json!({}))
+        .await;
+    let conv_id = created.body["id"].as_str().unwrap().to_string();
+
+    let reply = env
+        .post_in(
+            &ws_id,
+            &format!("/api/chat/@master/conversations/{conv_id}/steer"),
+            json!({"message": "插一句"}),
+        )
+        .await;
+    assert_eq!(reply.status, 409, "body={}", reply.body);
+    assert_eq!(reply.code(), "no_running_task", "body={}", reply.body);
+}
+
+/// 有在途轮：命令落到通道。
+///
+/// 落库由 run 任务负责（单写者），见 `chat_turn_detach` 的端到端用例 —— 这里用
+/// 占位 run（注册表直接登记，真起一轮要 provider）拿不到那条行，也不该由 handler 写。
+///
+/// 占位 run 与 `a_failed_stream_request_does_not_supersede_the_running_turn` 同一手法。
+#[tokio::test]
+async fn steer_into_a_running_turn_is_delivered_to_the_control_channel() {
+    let env = new_env(&["research"]).await;
+    let ws_id = env.open_space("alpha", "research").await;
+
+    let created = env
+        .post_in(&ws_id, &conversations_uri("@master"), json!({}))
+        .await;
+    let conv_id = created.body["id"].as_str().unwrap().to_string();
+
+    let chat_runs = Arc::new(ChatActiveRuns::new());
+    let (mut control_rx, _placeholder_guard) = chat_runs.register(&conv_id);
+    let router = peco_daemon::http::router(AppState {
+        chat_runs: chat_runs.clone(),
+        ..env.app_state()
+    });
+
+    let reply = call_in_space(
+        &router,
+        Method::POST,
+        &format!("/api/chat/@master/conversations/{conv_id}/steer"),
+        Some(json!({"message": "顺便看一下日志"})),
+        Some(&ws_id),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "body={}", reply.body);
+    assert_eq!(reply.body["success"], json!(true));
+
+    assert!(
+        control_rx.try_recv().is_ok(),
+        "注入必须落进在途轮的控制通道"
+    );
+}

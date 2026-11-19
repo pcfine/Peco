@@ -65,6 +65,10 @@ pub fn router() -> Router<AppState> {
             post(handler::cancel_chat),
         )
         .route(
+            "/{agent_id}/conversations/{id}/steer",
+            post(handler::steer_chat),
+        )
+        .route(
             "/{agent_id}/conversations/{id}/pause",
             post(handler::pause_chat),
         )

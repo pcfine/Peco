@@ -62,6 +62,8 @@ pub struct TurnSnapshot {
     /// 本快照已覆盖到的最后一帧序号；客户端丢弃 `id <= seq` 的后续帧。
     pub(crate) seq: u64,
     pub(crate) phase: Phase,
+    /// 这一轮的在途受众；唤醒轮没有可暂停的入口（没有客户端能 Resume）。
+    pub(crate) audience: Audience,
     /// 本轮**已产出**的 assistant 正文（不是历史库存量）。
     pub(crate) text: String,
     pub(crate) reasoning: String,
@@ -79,6 +81,17 @@ pub enum Phase {
     Paused,
     /// 已收到 cancel、尚未收尾。
     Cancelling,
+}
+
+/// 这一轮的在途受众。
+///
+/// 与 [`RunAudience`](super::run::RunAudience) 描述同一件事，但那一侧在 run 任务的
+/// 闭包里，订阅者拿不到；快照里带一份，前端才能知道「这一轮的暂停按钮没有对象」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Audience {
+    Live,
+    Headless,
 }
 
 /// 工具卡状态。
@@ -131,6 +144,7 @@ impl TurnFeed {
                     conversation_id,
                     seq: 0,
                     phase: Phase::Running,
+                    audience: Audience::Live,
                     text: String::new(),
                     reasoning: String::new(),
                     tool_calls: Vec::new(),
@@ -174,6 +188,12 @@ impl TurnFeed {
     /// `POST .../cancel` 得知进入取消态。
     pub(crate) fn mark_cancelling(&self) {
         self.lock().snapshot.phase = Phase::Cancelling;
+    }
+
+    /// 标记这一轮是唤醒轮（无客户端）。必须在 [`Self::start`] 之前调用：
+    /// 快照随起始订阅端一并取出，此后再改就赶不上首帧了。
+    pub(crate) fn mark_headless(&self) {
+        self.lock().snapshot.audience = Audience::Headless;
     }
 
     /// 起始订阅端：feed 刚建、还没有任何帧时用（`chat::run` 在 spawn 之前调用）。
@@ -734,6 +754,23 @@ mod tests {
             "已 finished 的 feed 不得再接受订阅：否则客户端会等一个永远不会来的 done"
         );
         assert_eq!(feed.snapshot().text, "答", "快照仍可读（落后补发要用）");
+    }
+
+    /// 受众随快照下发：前端据此决定是否给这一轮显示暂停按钮。
+    ///
+    /// 变异方法：`mark_headless` 改成写别的字段（或不写）→ 第二条断言恒为 `live`。
+    #[test]
+    fn the_snapshot_reports_the_audience() {
+        let feed = TurnFeed::new("conv-1".to_string());
+        let snapshot = serde_json::to_value(feed.snapshot()).expect("快照必须可序列化");
+        assert_eq!(snapshot["audience"], "live", "HTTP 入口的轮默认 live");
+
+        feed.mark_headless();
+        let snapshot = serde_json::to_value(feed.snapshot()).expect("快照必须可序列化");
+        assert_eq!(
+            snapshot["audience"], "headless",
+            "唤醒轮没有客户端能 Resume，必须自报 headless"
+        );
     }
 
     /// 取消的可见性由快照承载，不额外占一帧：`turn_snapshot` 是订阅首帧专用载荷，

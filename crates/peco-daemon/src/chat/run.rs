@@ -119,16 +119,10 @@ fn idle_timeout_ends_the_turn(has_subscribers: bool) -> bool {
     !has_subscribers
 }
 
-/// 单次暂停的总上限。
-///
-/// 暂停中不计 [`RUN_IDLE_TIMEOUT`]：暂停是用户意图，不该被杀。但「暂停了又没人
-/// 恢复」会把会话钉死（条目不移除 ⇒ 该会话的唤醒队列永久让路），故给暂停一个总
-/// 上限，到点按取消收尾。它兜的是「有人在用、但走开了」的那一类；无客户端的轮
-/// 压根不受暂停影响（见控制分支），不需要这层兜底。
-///
-/// 暂停上限与「有没有订阅者」无关，值与判据都不随 [`RUN_IDLE_TIMEOUT`] 一起动：
-/// 有人在看也照样到点取消。
-pub(crate) const PAUSED_MAX: Duration = Duration::from_secs(30 * 60);
+// 暂停无时限，也不留替代性的兜底超时。代价是明确的：暂停中的轮会一直占着
+// `ChatActiveRuns` 的条目 —— 该会话再发消息是 409，唤醒队列也一直让路 —— 直到
+// 用户 Resume 或 Cancel。这是要的语义：暂停若会自己到点取消，用户回来时看到的
+// 就是一句悄悄消失的对话。条目何时释放，完全由用户决定。
 
 /// 这一轮有没有 HTTP 订阅者。
 ///
@@ -315,6 +309,10 @@ pub(crate) async fn spawn_run(
         .try_register(&conv_id)
         .ok_or(RunError::Busy)?;
 
+    // 受众在首帧快照里下发，晚于 `feed.start()` 就赶不上了。
+    if matches!(audience, RunAudience::Headless) {
+        feed.mark_headless();
+    }
     let sink = match audience {
         RunAudience::Live => RunSink::Live(Arc::clone(&feed)),
         RunAudience::Headless => RunSink::Headless(Arc::clone(&feed)),
@@ -436,11 +434,12 @@ pub(crate) async fn spawn_run(
         // 空闲看门狗：见 [`RUN_IDLE_TIMEOUT`]，每条事件重置。
         let idle_deadline = tokio::time::sleep(RUN_IDLE_TIMEOUT);
         tokio::pin!(idle_deadline);
-        // 暂停的开始时刻 + [`PAUSED_MAX`]；`None` = 不在暂停态。
-        let mut paused_until: Option<Instant> = None;
+        // 是否处在暂停态。暂停无时限：看门狗在暂停期间整个关掉（见下方空闲分支）。
+        let mut paused = false;
 
         loop {
-            // 三路复用：looper 事件 / 空闲（含暂停上限）/ 控制命令。
+            // 三路复用：looper 事件 / 空闲看门狗 / 控制命令。暂停中空闲那一路
+            // 整个关掉，于是只剩事件与控制 —— 暂停因此没有时限。
             //
             // 没有「客户端断连」这一路 —— 连接只是出口之一，它的消失不是事件。
             tokio::select! {
@@ -684,13 +683,14 @@ pub(crate) async fn spawn_run(
                         break;
                     }
 
-                    // 暂停态是 [`PAUSED_MAX`] 的唯一判据：控制命令只表示意图，落地点
-                    // 在边界检查点，故以 looper 的状态迁移为准。
+                    // 暂停态以 looper 的状态迁移为准：控制命令只表示意图，落地点在
+                    // 边界检查点。
                     Some(event @ LooperEvent::StateChange { to, .. }) => {
                         if to.is_paused() {
-                            paused_until = Some(Instant::now() + PAUSED_MAX);
-                        } else if paused_until.take().is_some() {
+                            paused = true;
+                        } else if paused {
                             // 恢复：空闲计时在暂停期间已经过期，重新起算。
+                            paused = false;
                             idle_deadline.as_mut().reset(Instant::now() + RUN_IDLE_TIMEOUT);
                         }
                         if let Some(sse_ev) = map_looper_event(event, &conv_id_for_bg) {
@@ -721,7 +721,7 @@ pub(crate) async fn spawn_run(
                 }
 
                 // 空闲到点：见 [`RUN_IDLE_TIMEOUT`]。
-                _ = &mut idle_deadline, if paused_until.is_none() => {
+                _ = &mut idle_deadline, if !paused => {
                     if !idle_timeout_ends_the_turn(sink.feed().has_subscribers()) {
                         // 不发帧、不改状态：又一个空闲窗口过去不是用户可见的事件。
                         idle_deadline.as_mut().reset(Instant::now() + RUN_IDLE_TIMEOUT);
@@ -736,25 +736,6 @@ pub(crate) async fn spawn_run(
                         message: "这一轮长时间没有任何产出，服务端已收尾（已产出的正文照旧落库）"
                             .to_string(),
                         cancelled: false,
-                        conversation_id: conv_id_for_bg.clone(),
-                    });
-                    break;
-                }
-
-                // 暂停上限到点：见 [`PAUSED_MAX`]。`break` 之后 `drop(handle)` 关掉
-                // 控制通道，暂停中的 looper 据此走 `finalize_cancel`（冻结在途轮、
-                // 保住已产出的正文），与显式 cancel 同一条收尾路径。
-                _ = tokio::time::sleep_until(paused_until.unwrap_or_else(Instant::now)),
-                    if paused_until.is_some() =>
-                {
-                    tracing::warn!(
-                        conversation_id = %conv_id_for_bg,
-                        paused_max_secs = PAUSED_MAX.as_secs(),
-                        "run stayed paused beyond the limit; cancelling the turn"
-                    );
-                    abnormal_exit = Some(ChatSseEvent::Error {
-                        message: "本轮暂停超过上限，服务端已取消这一轮".to_string(),
-                        cancelled: true,
                         conversation_id: conv_id_for_bg.clone(),
                     });
                     break;
@@ -796,6 +777,40 @@ pub(crate) async fn spawn_run(
                                 );
                             }
                         }
+                        Some(ChatControl::Query(content)) => {
+                            // 用户行由本任务写：原消息行已在进入本循环前写完，故这里写出
+                            // 的行必然排在它之后。交给 handler 写会与那次插入竞争（同一
+                            // 秒内按 rowid 排，历史顺序会反过来）。
+                            let text = content.text_view_plain();
+                            if let Err(e) = messages::insert(
+                                &db_for_bg,
+                                &Uuid::new_v4().to_string(),
+                                &conv_id_for_bg,
+                                "user",
+                                &text,
+                                None,
+                                None,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    conversation_id = %conv_id_for_bg,
+                                    error = %e,
+                                    "steered user message not persisted"
+                                );
+                            }
+
+                            // 注入只是把用户输入排进这一轮的 pending：与 pause 不同，
+                            // 它不会把队列钉死，故 headless 轮不需要特判。送不进去说明
+                            // looper 已经退出，订阅者很快会收到 `done`，不必额外收尾。
+                            if let Err(e) = handle.send_query_content(content).await {
+                                tracing::warn!(
+                                    conversation_id = %conv_id_for_bg,
+                                    error = %e,
+                                    "Failed to deliver steering input"
+                                );
+                            }
+                        }
                         Some(ChatControl::Cancel) => {
                             // 取消是会话级命令：先让快照进入 cancelling（此刻及之后
                             // 的订阅者据此渲染「正在停止」），收尾在 looper 的步进
@@ -828,7 +843,7 @@ pub(crate) async fn spawn_run(
         }
 
         // ── 收尾（所有退出路径共用）────────────────────────────────────────
-        // 兜底落库：中途退出（空闲超时、暂停上限、控制端关闭、looper 意外结束）
+        // 兜底落库：中途退出（空闲超时、控制端关闭、looper 意外结束）
         // 走不到 `TurnComplete` 分支，这一轮已产出的正文只活在内存里。这是「不丢」
         // 的下限，与轮末的正常写入不重复：单任务串行 + `persisted_this_turn`。
         // 顺序即 I1：落库严格早于终态帧（`_end_guard` 补的 `done` 同样在后面）。
@@ -1027,21 +1042,6 @@ mod tests {
         assert!(
             RUN_IDLE_TIMEOUT >= Duration::from_secs(300),
             "上限太短会把正常的长回答掐断"
-        );
-    }
-
-    /// 暂停上限必须宽到能容纳「用户真的离开一会儿」：它只兜「暂停了但没人恢复」，
-    /// 不该变成一种几分钟就自动杀轮的行为。同时也必须有限 —— 条目不移除，该会话的
-    /// 唤醒队列会一直让路。
-    #[test]
-    fn the_pause_limit_is_generous_but_finite() {
-        assert!(
-            PAUSED_MAX >= Duration::from_secs(15 * 60),
-            "暂停上限 {PAUSED_MAX:?} 太短，用户回来时这一轮已经没了"
-        );
-        assert!(
-            PAUSED_MAX <= Duration::from_secs(120 * 60),
-            "暂停上限 {PAUSED_MAX:?} 太长，暂停且无人恢复会把会话钉死"
         );
     }
 
