@@ -27,8 +27,8 @@ const DEEPSEEK: ProviderTypeInfo = {
   display_name: "DeepSeek",
   default_base_url: "https://api.deepseek.com",
   api_modes: ["responses", "chat"],
-  suggested_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
-  default_model: "deepseek-v4-flash",
+  suggested_models: ["deepseek-flash", "deepseek-v4-pro"],
+  default_model: "deepseek-flash",
 };
 
 const QWEN: ProviderTypeInfo = {
@@ -136,7 +136,7 @@ describe("候选表（纯函数）", () => {
   it("模型候选 = 该 provider 的默认模型 + 同类型目录候选，去重保序", () => {
     expect(modelNames(ALIAS, TYPES)).toEqual([
       "my-finetune",
-      "deepseek-v4-flash",
+      "deepseek-flash",
       "deepseek-v4-pro",
     ]);
     // 没设默认模型时只剩目录候选。
@@ -163,7 +163,7 @@ describe("AgentModelPicker", () => {
 
     expect(await optionsOf("model")).toEqual([
       "my-finetune",
-      "deepseek-v4-flash",
+      "deepseek-flash",
       "deepseek-v4-pro",
     ]);
   });

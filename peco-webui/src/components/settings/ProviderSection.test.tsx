@@ -54,8 +54,8 @@ const DEEPSEEK: ProviderTypeInfo = {
   display_name: "DeepSeek",
   default_base_url: "https://api.deepseek.com",
   api_modes: ["responses", "chat"],
-  suggested_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
-  default_model: "deepseek-v4-flash",
+  suggested_models: ["deepseek-flash", "deepseek-v4-pro"],
+  default_model: "deepseek-flash",
 };
 
 const QWEN: ProviderTypeInfo = {
@@ -82,7 +82,7 @@ const EXISTING: ProviderInfo = {
   name: "deepseek",
   provider_type: "deepseek",
   base_url: "https://api.deepseek.com",
-  default_model: "deepseek-v4-flash",
+  default_model: "deepseek-flash",
   api: null,
   has_api_key: true,
   is_default: true,
@@ -129,7 +129,7 @@ const UNRESOLVED: ProviderInfo = {
   name: "deepseek-env",
   provider_type: "deepseek",
   base_url: null,
-  default_model: "deepseek-v4-flash",
+  default_model: "deepseek-flash",
   api: null,
   has_api_key: false,
   api_key_status: "env_unresolved",
@@ -230,7 +230,7 @@ describe("表单纯函数", () => {
       apiKey: "",
       baseUrl: "https://api.deepseek.com",
       api: "",
-      model: "deepseek-v4-flash",
+      model: "deepseek-flash",
       setDefault: false,
     });
   });
@@ -283,7 +283,7 @@ describe("表单纯函数", () => {
       type: "deepseek",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
     });
 
     const filled = toUpsertRequest({
@@ -352,7 +352,7 @@ describe("表单纯函数", () => {
       api_key: "",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
     });
   });
 });
@@ -392,7 +392,7 @@ describe("ProviderSection", () => {
       type: "deepseek",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
       api_key: "sk-test",
     });
   });
@@ -418,7 +418,7 @@ describe("ProviderSection", () => {
       type: "deepseek",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
       // 它本来就是默认 provider：勾选态回读，PUT 幂等地再申明一次
       set_default: true,
     });
@@ -432,7 +432,7 @@ describe("ProviderSection", () => {
         success: false,
         message: "HTTP 401（API Key 无效）：invalid api key",
         provider_type: "deepseek",
-        model: "deepseek-v4-flash",
+        model: "deepseek-flash",
       },
     });
     renderSection();
@@ -452,7 +452,7 @@ describe("ProviderSection", () => {
         success: true,
         message: "连接正常",
         provider_type: "deepseek",
-        model: "deepseek-v4-flash",
+        model: "deepseek-flash",
       },
     });
     renderSection();
@@ -471,7 +471,7 @@ describe("ProviderSection", () => {
       api_key: "sk-test",
       base_url: "https://api.deepseek.com",
       api: "",
-      default_model: "deepseek-v4-flash",
+      default_model: "deepseek-flash",
     });
     expect(await screen.findByText(/试连成功/)).toBeInTheDocument();
   });

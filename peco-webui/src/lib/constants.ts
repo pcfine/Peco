@@ -6,7 +6,8 @@ export const MODELS = [
 /** 默认模型 —— API 的 flash 档规范名。 */
 export const DEFAULT_MODEL = "deepseek-flash";
 
-/** 历史别名 → 规范名。`deepseek-v4-flash` 仍可调用，但 /models 已只列规范名。 */
+/** 历史别名 → 规范名。`deepseek-v4-flash` 是旧别名：API 仍接受，对应的模型已下线，
+ * 请求由 `deepseek-flash`（V4.1 Flash）提供服务。 */
 const LEGACY_MODEL_ALIASES: Record<string, string> = {
   "deepseek-v4-flash": "deepseek-flash",
 };

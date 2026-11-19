@@ -759,7 +759,7 @@ export function ProviderSection({ scope }: { scope: ProviderScope }) {
                     list="provider-model-options"
                     value={form.model}
                     onChange={(event) => update({ model: event.target.value })}
-                    placeholder={meta?.default_model ?? "deepseek-v4-flash"}
+                    placeholder={meta?.default_model ?? "deepseek-flash"}
                     autoComplete="off"
                     className="h-8 font-mono text-xs"
                   />

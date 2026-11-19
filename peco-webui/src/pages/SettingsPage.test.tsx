@@ -64,7 +64,7 @@ const TYPES = [
     default_base_url: "https://api.deepseek.com",
     api_modes: ["responses"],
     suggested_models: [],
-    default_model: "deepseek-v4-flash",
+    default_model: "deepseek-flash",
   },
 ];
 
