@@ -5,7 +5,7 @@ agent:
 template_version: 1
 llm:
   provider: "deepseek"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
   temperature: 0.3
   max_tokens: 393216
   stream: true
