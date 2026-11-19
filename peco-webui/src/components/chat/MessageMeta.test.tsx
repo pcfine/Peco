@@ -189,13 +189,19 @@ describe("气泡元信息行", () => {
     stubExecCommand(execCommand);
     renderMeta({ copyText: "兜底文本" });
 
-    fireEvent.click(screen.getByRole("button", { name: COPY_LABEL }));
+    const button = screen.getByRole("button", { name: COPY_LABEL });
+    // 键盘用户按回车复制：焦点必须留在按钮上，否则每次复制完都要重新 Tab 回来
+    button.focus();
+    expect(document.activeElement).toBe(button);
+
+    fireEvent.click(button);
     await flushAsync();
 
     expect(execCommand).toHaveBeenCalledWith("copy");
-    expect(screen.getByRole("button", { name: COPIED_LABEL })).toBeTruthy();
+    expect(screen.getByRole("button", { name: COPIED_LABEL })).toBe(button);
     // 兜底节点用完即拆：留在 DOM 里的 textarea 会让下一个气泡复制到旧值
     expect(document.querySelector("textarea")).toBeNull();
+    expect(document.activeElement).toBe(button);
   });
 
   it("剪贴板 API 抛错时同样落到兜底路径", async () => {
@@ -240,6 +246,30 @@ describe("气泡元信息行", () => {
     expect(
       container.querySelector("[data-slot='message-time']"),
     ).not.toBeNull();
+  });
+
+  it("只有正文没有时间戳时行照样渲染，但不落 time 元素", () => {
+    const { container } = renderMeta({ time: null, copyText: "正文" });
+
+    const row = container.querySelector("[data-slot='message-meta']");
+    expect(row).not.toBeNull();
+    expect(container.querySelector("[data-slot='message-time']")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: COPY_LABEL }),
+    ).toBeInTheDocument();
+  });
+
+  it("execCommand 也不存在时按失败处理：不抛异常、给出提示、不留 textarea", async () => {
+    stubClipboard(undefined);
+    stubExecCommand(undefined);
+    renderMeta({ copyText: "兜底文本" });
+
+    fireEvent.click(screen.getByRole("button", { name: COPY_LABEL }));
+    await flushAsync();
+
+    expect(toast.error).toHaveBeenCalledWith("复制失败，请手动选择文本");
+    expect(screen.getByRole("button", { name: COPY_LABEL })).toBeTruthy();
+    expect(document.querySelector("textarea")).toBeNull();
   });
 
   it("既无时间也无正文时整行不落 DOM", () => {

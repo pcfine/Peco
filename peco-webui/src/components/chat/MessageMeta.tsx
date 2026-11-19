@@ -12,9 +12,10 @@ const COPIED_FEEDBACK_MS = 1500;
 /**
  * 零间隙（`top-full` 且无外边距）是悬停链的成立条件：行容器是气泡 `group` 的子
  * 节点，指针落在按钮上时祖先 `:hover` 仍成立，盒边相接即可一路悬停过来。
- * 不拿 `group-hover:pointer-events-auto` 当垫片 —— `align="start"` 的行是
- * `left-0 right-0` 全宽，悬停时长成一条 24px 高的透明带，挡住下一条消息的点击。
- * 代价：时间戳比原先贴边的 10px 行盒低约 5px（换成 24px 行盒内置中），换取悬停可用性。
+ * 可点垫片只给按钮（`group-hover:pointer-events-auto` 在按钮上），行容器不给 ——
+ * `align="start"` 的行容器是 `left-0 right-0` 全宽，一旦可点就成一条 24px 高的
+ * 透明带，挡住下一条消息的点击。
+ * 行高 24px 与按钮同高，时间戳与图标按同一条中线居中。
  */
 const ROW_CLASS =
   "pointer-events-none select-none absolute top-full z-10 flex h-6 items-center gap-2 whitespace-nowrap opacity-0 group-hover:opacity-100 focus-within:opacity-100";
@@ -25,7 +26,7 @@ const ROW_CLASS =
  * 与气泡的 x 区间重叠。用户气泡若反转行方向把时间顶到最右，窄气泡（58px 的「你好」
  * 撑不下 60px 时间戳 + 24px 按钮）会让整行向左溢出，按钮落到气泡左边界之外，
  * 悬停链在气泡与按钮之间断开，按钮再也拿不回来。
- * 代价：用户气泡的时间戳因此左移 32px（按钮 24px + 间距 8px），不再紧贴右边界。
+ * 代价：用户气泡的时间戳距右边界 32px（按钮 24px + 间距 8px）。
  */
 const ALIGN_CLASS = {
   start: "left-0 right-0 justify-between",

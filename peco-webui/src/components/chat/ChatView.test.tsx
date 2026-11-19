@@ -167,6 +167,15 @@ describe("气泡下的复制按钮", () => {
     );
     expect(button).not.toBeNull();
 
+    // 助手正文气泡左对齐：行全宽、时间与按钮分居两端
+    const meta = (bubble as Element).querySelector(
+      "[data-slot='message-meta']",
+    );
+    expect(meta).not.toBeNull();
+    const metaClasses = (meta as Element).className.split(/\s+/);
+    expect(metaClasses).toContain("left-0");
+    expect(metaClasses).toContain("justify-between");
+
     fireEvent.click(button as Element);
 
     await waitFor(() =>

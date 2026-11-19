@@ -85,5 +85,11 @@ describe("用户气泡的复制按钮", () => {
     expect(meta?.parentElement).toBe(bubble);
     expect(bubble?.className.split(/\s+/)).toContain("group");
     expect(bubble?.className.split(/\s+/)).toContain("relative");
+
+    // 用户气泡右对齐：行右锚且不反转，按钮才落在气泡右边界内侧
+    const metaClasses = (meta as Element).className.split(/\s+/);
+    expect(metaClasses).toContain("right-0");
+    expect(metaClasses).not.toContain("left-0");
+    expect(metaClasses).not.toContain("flex-row-reverse");
   });
 });
