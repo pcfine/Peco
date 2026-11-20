@@ -69,7 +69,7 @@ function CapabilityGroup({
 
   return (
     <div className="space-y-1">
-      <span className="text-caption font-medium text-ink-faint">{title}</span>
+      <span className="text-caption font-semibold text-ink">{title}</span>
       {merged.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {merged.map((option) => {
@@ -182,20 +182,21 @@ export function AgentEditor({
               className="h-8 font-mono text-xs"
             />
           </FieldRow>
-          <FieldRow label="描述" htmlFor="agent-description">
-            <Input
+          <FieldRow label="描述" htmlFor="agent-description" wide>
+            <Textarea
               id="agent-description"
+              rows={2}
               value={current.description}
               onChange={(event) => update({ description: event.target.value })}
               placeholder="名称 — 说明"
               disabled={busy}
-              className="h-8 text-xs"
+              className="min-h-[56px] resize-y text-xs"
             />
           </FieldRow>
         </ConfigSection>
 
         <ConfigSection title="模型">
-          <div className="grid grid-cols-1 gap-2 @min-[560px]/team:grid-cols-2">
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
             <AgentModelPicker
               teamId={teamId}
               provider={current.provider}
@@ -208,61 +209,64 @@ export function AgentEditor({
         </ConfigSection>
 
         <ConfigSection title="能力">
-          <CapabilityGroup
-            title="tools"
-            options={TOOLS.map((tool) => ({
-              value: tool.value,
-              label: tool.label,
-            }))}
-            selected={current.tools}
-            onToggle={(value) =>
-              update({ tools: toggleValue(current.tools, value) })
-            }
-            disabled={busy}
-          />
-          <CapabilityGroup
-            title="skills"
-            options={(skills.data ?? []).map((skill) => ({
-              value: skill.name,
-              label: skill.name,
-            }))}
-            selected={current.skills}
-            onToggle={(value) =>
-              update({ skills: toggleValue(current.skills, value) })
-            }
-            error={skills.error ? `读取失败：${errorText(skills.error)}` : null}
-            disabled={busy}
-          />
-          <CapabilityGroup
-            title="MCP"
-            options={Object.keys(mcp.data?.mcpServers ?? {}).map((name) => ({
-              value: name,
-              label: name,
-            }))}
-            selected={current.mcp_servers}
-            onToggle={(value) =>
-              update({ mcp_servers: toggleValue(current.mcp_servers, value) })
-            }
-            error={mcp.error ? `读取失败：${errorText(mcp.error)}` : null}
-            disabled={busy}
-          />
-          <CapabilityGroup
-            title="知识库"
-            options={(knowledge.data ?? []).map((kb) => ({
-              value: kb.name,
-              label: kb.name,
-            }))}
-            selected={current.knowledge_bases}
-            onToggle={(value) =>
-              update({
-                knowledge_bases: toggleValue(current.knowledge_bases, value),
-              })
-            }
-            error={
-              knowledge.error ? `读取失败：${errorText(knowledge.error)}` : null
-            }
-            disabled={busy}
-          />
+          <div className="space-y-4">
+            <CapabilityGroup
+              title="tools"
+              options={TOOLS.map((tool) => ({ value: tool, label: tool }))}
+              selected={current.tools}
+              onToggle={(value) =>
+                update({ tools: toggleValue(current.tools, value) })
+              }
+              disabled={busy}
+            />
+            <CapabilityGroup
+              title="skills"
+              options={(skills.data ?? []).map((skill) => ({
+                value: skill.name,
+                label: skill.name,
+              }))}
+              selected={current.skills}
+              onToggle={(value) =>
+                update({ skills: toggleValue(current.skills, value) })
+              }
+              error={
+                skills.error ? `读取失败：${errorText(skills.error)}` : null
+              }
+              disabled={busy}
+            />
+            <CapabilityGroup
+              title="MCP"
+              options={Object.keys(mcp.data?.mcpServers ?? {}).map((name) => ({
+                value: name,
+                label: name,
+              }))}
+              selected={current.mcp_servers}
+              onToggle={(value) =>
+                update({ mcp_servers: toggleValue(current.mcp_servers, value) })
+              }
+              error={mcp.error ? `读取失败：${errorText(mcp.error)}` : null}
+              disabled={busy}
+            />
+            <CapabilityGroup
+              title="知识库"
+              options={(knowledge.data ?? []).map((kb) => ({
+                value: kb.name,
+                label: kb.name,
+              }))}
+              selected={current.knowledge_bases}
+              onToggle={(value) =>
+                update({
+                  knowledge_bases: toggleValue(current.knowledge_bases, value),
+                })
+              }
+              error={
+                knowledge.error
+                  ? `读取失败：${errorText(knowledge.error)}`
+                  : null
+              }
+              disabled={busy}
+            />
+          </div>
         </ConfigSection>
 
         <ConfigSection title="参数">

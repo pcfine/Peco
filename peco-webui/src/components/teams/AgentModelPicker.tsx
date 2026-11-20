@@ -121,14 +121,14 @@ export function AgentModelPicker({
 
   return (
     <>
-      <div className="space-y-1">
-        <span className="text-2xs text-ink-faint">provider</span>
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 text-2xs text-ink-faint">provider</span>
         <Select
           value={provider ?? undefined}
           onValueChange={onProviderChange}
           disabled={disabled}
         >
-          <SelectTrigger className="h-8 w-full" aria-label="provider">
+          <SelectTrigger className="h-8 w-40" aria-label="provider">
             <SelectValue placeholder="默认" />
           </SelectTrigger>
           <SelectContent>
@@ -140,14 +140,14 @@ export function AgentModelPicker({
           </SelectContent>
         </Select>
       </div>
-      <div className="space-y-1">
-        <span className="text-2xs text-ink-faint">model</span>
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 text-2xs text-ink-faint">model</span>
         <Select
           value={model ?? undefined}
           onValueChange={onModelChange}
           disabled={disabled}
         >
-          <SelectTrigger className="h-8 w-full" aria-label="model">
+          <SelectTrigger className="h-8 w-40" aria-label="model">
             <SelectValue placeholder="默认" />
           </SelectTrigger>
           <SelectContent>

@@ -39,14 +39,15 @@ export const PROVIDERS = [
   { value: "openai", label: "OpenAI" },
 ] as const;
 
+/** agent.md 的 tools 字段取值 —— 界面直接展示原始英文名，不做中文化。 */
 export const TOOLS = [
-  { value: "shell", label: "Shell 执行" },
-  { value: "fetch", label: "HTTP 请求" },
-  { value: "web_search", label: "网页搜索" },
-  { value: "search_knowledge", label: "知识搜索" },
-  { value: "list_knowledge_bases", label: "知识库列表" },
-  { value: "add_to_knowledge_base", label: "添加到知识库" },
-  { value: "sync_knowledge_base", label: "同步知识库" },
+  "shell",
+  "fetch",
+  "web_search",
+  "search_knowledge",
+  "list_knowledge_bases",
+  "add_to_knowledge_base",
+  "sync_knowledge_base",
 ] as const;
 
 export const EMBEDDING_MODELS = [
