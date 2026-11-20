@@ -15,6 +15,19 @@ import { useUiStore } from "@/stores/uiStore";
 
 // 壳的挂载冒烟：只验证路由与面板都渲染出来。数据来源全换成固定值 ——
 // 这一层测的不是取数，真接口由 daemon 的集成测试覆盖。
+// 闸门在壳之前问一次会话状态：这一层测的是路由与面板，统一按「已登录」放行。
+vi.mock("@/api/auth", () => ({
+  getAuthStatus: async () => ({
+    registered: true,
+    authenticated: true,
+    username: "pcfine",
+  }),
+  login: vi.fn(),
+  register: vi.fn(),
+  logout: vi.fn(),
+  changePassword: vi.fn(),
+}));
+
 vi.mock("@/api/peco", () => ({
   getPeco: async () => ({
     ws_id: "ws_peco",

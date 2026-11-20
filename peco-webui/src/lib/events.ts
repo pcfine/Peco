@@ -4,7 +4,25 @@
 // 写在界面上。这里自己排退避，并把每次尝试报给调用方。
 
 import type { TaskEvent } from "@/types/daemon";
+import { getAuthStatus } from "@/api/auth";
 import { MAX_RETRIES, retryDelay, type SseState } from "@/lib/sseState";
+import { useAuthStore } from "@/stores/authStore";
+
+/**
+ * 事件流重连用尽后问一次会话状态。
+ *
+ * `EventSource` 拿不到状态码：登录过期与 daemon 掉线在它眼里是同一个 error，
+ * 只有 `/auth/status` 能分辨。探测本身失败说明不了会话有问题（多半是 daemon
+ * 不在），交给闸门自己的错误态，不在这里再报一次。
+ */
+async function probeSession(): Promise<void> {
+  try {
+    const status = await getAuthStatus();
+    if (!status.authenticated) useAuthStore.getState().markUnauthenticated();
+  } catch {
+    // 探测无果：保持现状，重连状态机已经在界面上说了「连接失败」。
+  }
+}
 
 export interface TaskStreamHandlers {
   /** 事件本身是「哪一行变了」的通知，不是行内容 —— 回调里只该失效或重取 query。 */
@@ -21,6 +39,8 @@ export function openTaskStream(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let attempt = 0;
   let stopped = false;
+  /** 每次掉线只探一次会话：失败态下不会再有 error，但可见性恢复会重连一次。 */
+  let probed = false;
 
   const detach = () => {
     source?.close();
@@ -30,6 +50,10 @@ export function openTaskStream(
   const schedule = () => {
     if (attempt >= MAX_RETRIES) {
       onState({ kind: "failed" });
+      if (!probed) {
+        probed = true;
+        void probeSession();
+      }
       return;
     }
     attempt += 1;
@@ -45,6 +69,7 @@ export function openTaskStream(
     source = new EventSource(url);
     source.onopen = () => {
       attempt = 0;
+      probed = false;
       onState({ kind: "open" });
     };
     source.addEventListener("task", ((raw: MessageEvent<string>) => {

@@ -1,6 +1,7 @@
 // 全站唯一的 axios 实例：请求头归属与错误形状都从这里出，调用方不各拼一份。
 
 import axios, { AxiosError } from "axios";
+import { useAuthStore } from "@/stores/authStore";
 import { useSpaceStore } from "@/stores/spaceStore";
 
 /**
@@ -14,6 +15,8 @@ export class ApiError extends Error {
   readonly code?: string;
   readonly inflightDispatch?: number;
   readonly inflightForeign?: number;
+  /** 429 的冷却秒数：登录页要把它数给用户看。 */
+  readonly retryAfter?: number;
 
   constructor(
     message: string,
@@ -22,6 +25,7 @@ export class ApiError extends Error {
       code?: string;
       inflightDispatch?: number;
       inflightForeign?: number;
+      retryAfter?: number;
     } = {},
   ) {
     super(message);
@@ -30,6 +34,7 @@ export class ApiError extends Error {
     this.code = options.code;
     this.inflightDispatch = options.inflightDispatch;
     this.inflightForeign = options.inflightForeign;
+    this.retryAfter = options.retryAfter;
   }
 }
 
@@ -40,6 +45,7 @@ interface ErrorBody {
   code?: string;
   inflight_dispatch?: number;
   inflight_foreign?: number;
+  retry_after?: number;
 }
 
 export const api = axios.create({
@@ -85,10 +91,31 @@ export function resourceScope(scope: ResourceScope) {
   };
 }
 
+/**
+ * 认证端点自己的 401/403 是业务语义（密码不对、正在注册），不代表会话刚失效：
+ * 在这里翻会话态会把「登录页输错密码」变成一次无意义的闸门重渲染。
+ */
+const AUTH_BUSINESS_PATHS = ["/auth/status", "/auth/login", "/auth/register"];
+
+function isAuthBusinessPath(url: string | undefined): boolean {
+  if (!url) return false;
+  const path = url.replace(/^\/api(?=\/)/, "");
+  return AUTH_BUSINESS_PATHS.some(
+    (endpoint) => path === endpoint || path.startsWith(`${endpoint}?`),
+  );
+}
+
 api.interceptors.response.use(
   (response) => response,
   (error: AxiosError<ErrorBody>) => {
     const body = error.response?.data;
+    if (
+      error.response?.status === 401 &&
+      body?.code === "unauthenticated" &&
+      !isAuthBusinessPath(error.config?.url)
+    ) {
+      useAuthStore.getState().markUnauthenticated();
+    }
     const message =
       body?.details ||
       body?.error ||
@@ -102,6 +129,7 @@ api.interceptors.response.use(
         code: body?.code,
         inflightDispatch: body?.inflight_dispatch,
         inflightForeign: body?.inflight_foreign,
+        retryAfter: body?.retry_after,
       }),
     );
   },

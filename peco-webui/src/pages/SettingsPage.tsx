@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { PageFrame } from "@/components/layout/PageFrame";
+import { AuthSection } from "@/components/settings/AuthSection";
 import { BrandSection } from "@/components/settings/BrandSection";
 import { ProviderSection } from "@/components/settings/ProviderSection";
 import {
@@ -173,6 +174,8 @@ export function SettingsPage() {
         </section>
 
         <ProviderSection scope={scope} />
+
+        <AuthSection />
       </div>
     </PageFrame>
   );

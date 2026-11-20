@@ -17,9 +17,10 @@ export default defineConfig({
   server: {
     // 旧工程占 9233，两个前端并排跑时不能撞端口。
     port: 5174,
+    // daemon 开了 HTTPS 后是自签证书：dev 代理要接受它，否则整站 API 都连不上。
     proxy: {
-      "/api": { target: daemonUrl, changeOrigin: true },
-      "/uploads": { target: daemonUrl, changeOrigin: true },
+      "/api": { target: daemonUrl, changeOrigin: true, secure: false },
+      "/uploads": { target: daemonUrl, changeOrigin: true, secure: false },
     },
   },
   test: {
