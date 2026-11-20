@@ -264,6 +264,14 @@ html:not(.dark) {
   }
 }
 
+/* hljs 主题的规则未分层，优先级高于 @layer，utility 压不住；
+   编辑器里把它还原成透明底片，与 textarea 的 caret 对齐。 */
+[data-code-editor] pre code.hljs {
+  padding: 0;
+  overflow: visible;
+  background: transparent;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

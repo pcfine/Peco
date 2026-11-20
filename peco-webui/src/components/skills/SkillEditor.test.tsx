@@ -105,6 +105,14 @@ function textarea(): HTMLTextAreaElement {
   return el;
 }
 
+/** 源码 pane 的内容列：CodeEditor 的定位父节点就是承载宽度约束的那一层。 */
+function sourceColumn(): HTMLElement {
+  const el = pane("source").querySelector<HTMLElement>("[data-code-editor]");
+  const column = el?.parentElement;
+  if (!column) throw new Error("source column not found");
+  return column;
+}
+
 /** 绕过 React 的 value 追踪，触发一次真实的 onChange。 */
 function typeInto(el: HTMLTextAreaElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(
@@ -202,6 +210,34 @@ describe("SkillEditor", () => {
     await act(async () => buttonByTestId("mode-source").click());
     expect(pane("preview").hidden).toBe(true);
     expect(textarea()).toBe(before);
+  });
+
+  it("只有分栏态收窄源码列，纯源码态铺满 pane", async () => {
+    renderEditor();
+    await screen.findByTestId("action-bar");
+
+    expect(sourceColumn().className).toContain("max-w-[700px]");
+    expect(sourceColumn().className).toContain("mx-auto");
+
+    await act(async () => buttonByTestId("mode-source").click());
+    expect(sourceColumn().className).not.toContain("max-w");
+    expect(sourceColumn().className).toContain("w-full");
+
+    await act(async () => buttonByTestId("mode-preview").click());
+    await act(async () => buttonByTestId("mode-split").click());
+    expect(sourceColumn().className).toContain("max-w-[700px]");
+  });
+
+  it("资源文件没有预览态，源码列同样铺满", async () => {
+    containerWidth = 1400;
+    renderEditor();
+    await screen.findByTestId("action-bar");
+
+    await openFile("scripts/run.py");
+    await waitFor(() => expect(textarea().value).toBe("print('hi')"));
+
+    expect(sourceColumn().className).not.toContain("max-w");
+    expect(sourceColumn().className).toContain("w-full");
   });
 
   it("切回文件后继续输入，光标与滚动不被拉回旧快照", async () => {

@@ -704,7 +704,7 @@ export function SkillEditor({ scope, name, onBack }: SkillEditorProps) {
                   ) : activeDoc ? (
                     <div
                       className={
-                        isSkillMd
+                        isSkillMd && effectiveMode === "split"
                           ? "mx-auto h-full w-full max-w-[700px]"
                           : "h-full w-full"
                       }
