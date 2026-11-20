@@ -24,6 +24,7 @@ use peco_daemon::db;
 use peco_daemon::db::dispatches::{self, NewDispatch, WakeSkipReason, WakeState};
 use peco_daemon::db::workspaces;
 use peco_daemon::error::DaemonError;
+use peco_daemon::shutdown::Shutdown;
 use peco_daemon::space::SpaceEnv;
 use peco_daemon::space::ledger::SqliteTaskLedger;
 use peco_daemon::space::open::{self, DaemonOpener, ensure_open_indexed};
@@ -79,6 +80,8 @@ pub struct TestEnv {
     pub tasks: Arc<TaskObserver>,
     /// 与观察者同一份的投递泵；投递用例要给它接上 `PecoDelivery` 才能跑。
     pub wake: Arc<WakePump>,
+    /// 与泵、调度器、`AppState` 共享的停机闩：停机用例要能一次置位全部部件。
+    pub shutdown: Shutdown,
     _home_guard: TempDir,
 }
 
@@ -98,7 +101,8 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
     // 这一最低优先文件层。读 core 的默认位置会让用例随开发机的配置漂移。
     let system_config = peco_daemon::config::base_system_config();
     let peco = Arc::new(peco_daemon::space::peco::resolve(&config.peco_home));
-    let wake = Arc::new(WakePump::new(pool.clone(), peco.clone()));
+    let shutdown = Shutdown::new();
+    let wake = Arc::new(WakePump::new(pool.clone(), peco.clone(), shutdown.clone()));
     let tasks = Arc::new(TaskObserver::new(pool.clone(), wake.clone()));
     let env = Arc::new(SpaceEnv::new(
         &config,
@@ -130,6 +134,7 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
         opener,
         tasks,
         wake,
+        shutdown,
         _home_guard: home_guard,
     }
 }
@@ -261,7 +266,9 @@ impl TestEnv {
                 env.peco.clone(),
                 Arc::downgrade(&env),
                 delivery,
+                self.shutdown.clone(),
             )),
+            shutdown: self.shutdown.clone(),
         }
     }
 

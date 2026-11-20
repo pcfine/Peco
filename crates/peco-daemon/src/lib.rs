@@ -22,6 +22,7 @@ pub mod provider;
 pub mod schedule;
 pub mod session_dto;
 pub mod session_store;
+pub mod shutdown;
 pub mod single_instance;
 pub mod skill;
 pub mod space;

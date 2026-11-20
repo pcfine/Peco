@@ -357,46 +357,66 @@ impl FeedState {
 ///
 /// 结束判据是 `done` 而不是「广播通道关闭」：订阅端自己也持着 `Arc<TurnFeed>`，
 /// 只要它还在，广播发送端就不会 drop —— 等关闭等于永远等下去。
-pub(crate) fn frame_stream(frames: LiveFrames) -> impl Stream<Item = Result<Event, Infallible>> {
-    futures::stream::unfold(Some(Cursor::Snapshot(frames)), |state| async move {
-        let state = state?;
-        match state {
-            Cursor::Snapshot(LiveFrames { feed, rx, snapshot }) => Some((
-                Ok(to_wire(snapshot.seq, &ChatSseEvent::TurnSnapshot(snapshot))),
-                Some(Cursor::Live { feed, rx }),
-            )),
-            Cursor::Live { feed, mut rx } => match rx.recv().await {
-                Ok(frame) => {
-                    let last = matches!(&frame.event, ChatSseEvent::Done { .. });
-                    let event = to_wire(frame.seq, &frame.event);
-                    let next = (!last).then_some(Cursor::Live { feed, rx });
-                    Some((Ok(event), next))
+///
+/// 停机闩也是结束判据：这是永久流，靠「等连接自然结束」等的优雅退出一辈子等不到。
+/// 这里只断流、不补收尾帧 —— 收尾帧属于 run 任务。
+pub(crate) fn frame_stream(
+    frames: LiveFrames,
+    shutdown: crate::shutdown::Shutdown,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    futures::stream::unfold(
+        Some(Cursor::Snapshot(frames, shutdown)),
+        |state| async move {
+            let state = state?;
+            match state {
+                Cursor::Snapshot(LiveFrames { feed, rx, snapshot }, shutdown) => Some((
+                    Ok(to_wire(snapshot.seq, &ChatSseEvent::TurnSnapshot(snapshot))),
+                    Some(Cursor::Live { feed, rx, shutdown }),
+                )),
+                Cursor::Live {
+                    feed,
+                    mut rx,
+                    shutdown,
+                } => {
+                    let received = tokio::select! {
+                        _ = shutdown.cancelled() => return None,
+                        received = rx.recv() => received,
+                    };
+                    match received {
+                        Ok(frame) => {
+                            let last = matches!(&frame.event, ChatSseEvent::Done { .. });
+                            let event = to_wire(frame.seq, &frame.event);
+                            let next = (!last).then_some(Cursor::Live { feed, rx, shutdown });
+                            Some((Ok(event), next))
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // 落后于广播缓冲：补发一帧**新快照**而不是重放旧帧 ——
+                            // 旧帧的正文已经包含在快照里，重放只会让客户端重复一遍。
+                            warn!(
+                                conversation_id = %feed.conversation_id(),
+                                skipped,
+                                "SSE subscriber lagged behind the feed; resending a snapshot"
+                            );
+                            let snapshot = feed.snapshot();
+                            Some((
+                                Ok(to_wire(snapshot.seq, &ChatSseEvent::TurnSnapshot(snapshot))),
+                                Some(Cursor::Live { feed, rx, shutdown }),
+                            ))
+                        }
+                        Err(broadcast::error::RecvError::Closed) => None,
+                    }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // 落后于广播缓冲：补发一帧**新快照**而不是重放旧帧 ——
-                    // 旧帧的正文已经包含在快照里，重放只会让客户端重复一遍。
-                    warn!(
-                        conversation_id = %feed.conversation_id(),
-                        skipped,
-                        "SSE subscriber lagged behind the feed; resending a snapshot"
-                    );
-                    let snapshot = feed.snapshot();
-                    Some((
-                        Ok(to_wire(snapshot.seq, &ChatSseEvent::TurnSnapshot(snapshot))),
-                        Some(Cursor::Live { feed, rx }),
-                    ))
-                }
-                Err(broadcast::error::RecvError::Closed) => None,
-            },
-        }
-    })
+            }
+        },
+    )
 }
 
 enum Cursor {
-    Snapshot(LiveFrames),
+    Snapshot(LiveFrames, crate::shutdown::Shutdown),
     Live {
         feed: Arc<TurnFeed>,
         rx: broadcast::Receiver<Arc<Frame>>,
+        shutdown: crate::shutdown::Shutdown,
     },
 }
 
@@ -443,7 +463,7 @@ mod tests {
     }
 
     async fn collect(frames: LiveFrames) -> Vec<Wire> {
-        frame_stream(frames)
+        frame_stream(frames, crate::shutdown::Shutdown::new())
             .map(|item| {
                 let event = item.expect("帧流不会产出错误项");
                 let wire = wire_of(event);

@@ -415,17 +415,19 @@ pub async fn record_task_last_run(
     Ok(result.rows_affected())
 }
 
-/// 启动对账：上个进程停在 `running` 的行没有观察者了。
+/// 收尾停在 `running` 的行：没有观察者了，`error` 记下是谁收的尾。
+///
+/// 停机收尾与启动对账看到的是同一种行，读者靠 `reason` 区分两者。
 ///
 /// `pending` 保留 —— 它本来就等着重试，退回去等于丢失「会话忙」这条已有结论。
-pub async fn interrupt_running(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+pub async fn interrupt_running(pool: &SqlitePool, reason: &str) -> Result<u64, sqlx::Error> {
     let sql = format!(
         "UPDATE scheduled_runs SET status = '{}', finished_at = datetime('now'), \
-         error = '进程重启时仍在运行' WHERE status = '{}'",
+         error = ? WHERE status = '{}'",
         RunStatus::Interrupted.as_str(),
         RunStatus::Running.as_str(),
     );
-    let result = sqlx::query(&sql).execute(pool).await?;
+    let result = sqlx::query(&sql).bind(reason).execute(pool).await?;
     Ok(result.rows_affected())
 }
 
@@ -630,7 +632,9 @@ mod tests {
         seed_run(&pool, "r2", "s1", "2026-01-01 00:01:00").await;
         mark_running(&pool, "r1", "conv-1").await.unwrap();
 
-        let interrupted = interrupt_running(&pool).await.unwrap();
+        let interrupted = interrupt_running(&pool, "进程重启时仍在运行")
+            .await
+            .unwrap();
 
         assert_eq!(interrupted, 1, "只有 running 的那一行被收尾");
         let r1 = run_by_id(&pool, "r1").await.unwrap().unwrap();

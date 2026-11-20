@@ -272,6 +272,10 @@ pub async fn open(
     State(state): State<AppState>,
     UrlPath(ws_id): UrlPath<String>,
 ) -> Result<Json<SpaceView>, DaemonError> {
+    // 停机序列会关掉所有已打开空间，此时再开一个只会立刻被丢下。
+    if state.shutdown.is_cancelled() {
+        return Err(DaemonError::ShuttingDown);
+    }
     // 未知 id 在 opener 之前就拒掉：路径错的请求不该走一遍目录判定。
     let row = by_id(&state, &ws_id).await?;
     // 实例活着就已经是「打开」，目录在不在只影响下一次打开：这里放行，

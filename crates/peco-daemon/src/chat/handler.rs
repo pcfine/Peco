@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::api_error::ApiError;
 use crate::auth::LocalUser;
 use crate::db::{conversations, messages};
+use crate::error::DaemonError;
 use crate::session_dto::{
     ItemView, TurnData, group_input_items, turn_interrupted_reason, turns_to_dto,
 };
@@ -382,8 +383,11 @@ impl From<RunError> for ApiError {
 
 /// 把一订阅端包成 SSE 响应。keep-alive 保留：一轮可以长时间没有帧（模型在读长
 /// 上下文），连接不能因此被中间设备判死。
-fn sse_response(frames: LiveFrames) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(feed::frame_stream(frames)).keep_alive(
+fn sse_response(
+    frames: LiveFrames,
+    shutdown: crate::shutdown::Shutdown,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(feed::frame_stream(frames, shutdown)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
@@ -402,6 +406,10 @@ pub async fn stream_chat(
     Path((_agent_name, conv_id)): Path<(String, String)>,
     Query(params): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
+    // 停机之后不再开新轮：这一轮注定要被取消，开了也只是给用户一条被中断的对话。
+    if state.shutdown.is_cancelled() {
+        return Err(DaemonError::ShuttingDown.into());
+    }
     let message = params.message.trim().to_string();
     if message.is_empty() {
         return Err(ApiError::BadRequest("message is required".into()));
@@ -442,7 +450,7 @@ pub async fn stream_chat(
     )
     .await?;
 
-    Ok(sse_response(frames).into_response())
+    Ok(sse_response(frames, state.shutdown.clone()).into_response())
 }
 
 /// `GET /api/chat/{agentId}/conversations/{id}/stream/live`
@@ -460,7 +468,7 @@ pub async fn subscribe_chat(
     require_owned_conversation(&state, &ws_id, &conv_id).await?;
 
     match state.chat_runs.attach(&conv_id) {
-        Some(frames) => Ok(sse_response(frames).into_response()),
+        Some(frames) => Ok(sse_response(frames, state.shutdown.clone()).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }

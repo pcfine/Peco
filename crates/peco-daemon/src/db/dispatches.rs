@@ -518,6 +518,18 @@ pub async fn orphan_by_task(pool: &SqlitePool, task_id: &str) -> Result<u64, sql
     Ok(result.rows_affected())
 }
 
+/// 停机收尾：所有未终态行置 `orphan`，返回受影响行数。
+///
+/// 逐行复用 [`orphan_by_task`]：台账里「结果已不可回捞」只有这一种表达。
+pub async fn orphan_all_active(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let rows = list_active(pool).await?;
+    let mut total = 0;
+    for row in &rows {
+        total += orphan_by_task(pool, &row.task_id).await?;
+    }
+    Ok(total)
+}
+
 /// 在飞台账置 `orphan`，返回受影响行数。
 ///
 /// 关闭空间会销毁唯一持有结果的 Hub，未落库的在飞任务将永远查不到结果；

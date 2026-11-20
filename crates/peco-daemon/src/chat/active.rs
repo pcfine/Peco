@@ -35,6 +35,8 @@ pub enum ChatControl {
     Resume,
     /// 会话级取消：收尾在 looper 的步进边界，可能晚于 HTTP 响应。
     Cancel,
+    /// 停机取消：走 core 既有的取消，再补一帧说明；历史措辞由停机序列统一改写。
+    Shutdown,
     /// 在途注入：内容进当前轮的 pending，下一次模型请求前才并入。
     Query(Content),
 }
@@ -163,6 +165,23 @@ impl ChatActiveRuns {
         self.send(conversation_id, ChatControl::Cancel)
     }
 
+    /// 停机：给每个在途会话投一条 [`ChatControl::Shutdown`]，返回投递成功的会话 id。
+    ///
+    /// 返回 id 而不是条数：停机序列要按 id 改写历史里的中断措辞。
+    pub fn cancel_all_for_shutdown(&self) -> Vec<String> {
+        let map = self.inner.lock().unwrap();
+        map.iter()
+            .filter(|(_, entry)| entry.tx.try_send(ChatControl::Shutdown).is_ok())
+            .map(|(conversation_id, _)| conversation_id.clone())
+            .collect()
+    }
+
+    /// 仍有活控制端的条目数 —— 停机等着它归零（守卫 drop 时条目才移除）。
+    pub fn active_count(&self) -> usize {
+        let map = self.inner.lock().unwrap();
+        map.values().filter(|entry| !entry.tx.is_closed()).count()
+    }
+
     /// 向在途轮注入一段用户输入；`false` 表示该会话无在途轮（或控制通道已关闭）。
     ///
     /// `true` 只说明内容进了这一轮的 pending 队列 —— 它在下一次模型请求前才并入，
@@ -263,6 +282,47 @@ mod tests {
             None,
             "用户侧顶替唤醒侧后旧通道关闭"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_all_for_shutdown_reaches_every_live_entry() {
+        let registry = ChatActiveRuns::new();
+        assert!(
+            registry.cancel_all_for_shutdown().is_empty(),
+            "空表投递空表"
+        );
+
+        let (mut rx_a, _guard_a) = registry.register("c1");
+        let (mut rx_b, _guard_b) = registry.register("c2");
+        // 死条目（接收端已 drop）不算投递成功，否则停机等待会被一个幽灵条目卡住。
+        let (rx_dead, _guard_dead) = registry.register("c3");
+        drop(rx_dead);
+
+        let mut delivered = registry.cancel_all_for_shutdown();
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            vec!["c1".to_string(), "c2".to_string()],
+            "返回的必须是真正收到命令的会话 id（改写措辞要用它逐个查库）"
+        );
+        assert_eq!(rx_a.recv().await, Some(ChatControl::Shutdown));
+        assert_eq!(rx_b.recv().await, Some(ChatControl::Shutdown));
+        assert_eq!(registry.active_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn active_count_tracks_live_entries_only() {
+        let registry = ChatActiveRuns::new();
+        assert_eq!(registry.active_count(), 0);
+
+        let (rx, guard) = registry.register("c1");
+        assert_eq!(registry.active_count(), 1);
+
+        drop(rx);
+        assert_eq!(registry.active_count(), 0, "接收端已 drop 的条目不算在途");
+
+        drop(guard);
+        assert_eq!(registry.active_count(), 0);
     }
 
     #[tokio::test]

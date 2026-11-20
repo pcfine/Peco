@@ -179,22 +179,25 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// 监听并阻塞到优雅退出信号。
+///
+/// 返回时所有连接（含永久 SSE）都已结束 —— 停机序列据此排在它之后。
 pub async fn serve(state: AppState) -> std::io::Result<()> {
     let bind_addr = state.config.bind_addr;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(addr = %bind_addr, "http listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+    axum::serve(listener, router(state.clone()))
+        .with_graceful_shutdown(shutdown_signal(state.shutdown.clone()))
         .await
 }
 
-/// 监听 SIGINT 与 SIGTERM，任一个都落到同一条优雅退出路径。
+/// 监听 SIGINT 与 SIGTERM，任一个都落到同一条优雅退出路径：只置停机闩，收尾排在
+/// `serve` 返回之后（见 [`crate::shutdown::drain`]），顺序由调用关系保证。
 ///
 /// `systemctl stop` 发的是 SIGTERM：只等 SIGINT 的话它会被默认处置直接终止，
 /// 在飞轮次断、sqlite 不 close、`daemon.pid` 残留（清理只在 Drop 里做一次）。
 /// 信号注册失败时只留 journal 证据并保持 pending —— 装不上信号处理器不该让
 /// 服务起不来，该让运维在日志里看见。
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown: crate::shutdown::Shutdown) {
     let interrupt = async {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {}
@@ -226,6 +229,7 @@ async fn shutdown_signal() {
         _ = terminate => "term",
     };
     tracing::info!(signal, "shutdown signal received; draining");
+    shutdown.cancel();
 }
 
 /// 错误响应体 `{code, message}` 的唯一形状定义。

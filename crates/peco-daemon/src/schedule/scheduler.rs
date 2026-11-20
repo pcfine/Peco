@@ -7,15 +7,17 @@
 //! 与 `wake::pump` 同一套监督手法：本模块只有一个长驻循环，它退出或 panic 之后
 //! 没有别的部件会发现「再也没有人看排期」，所以外层套一层带退避的重启。
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use chrono::{Local, Utc};
 use sqlx::SqlitePool;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::chat::active::ChatActiveRuns;
 use crate::db::schedules::{self, NewRun, ScheduledRunRow, ScheduledTaskRow};
+use crate::shutdown::Shutdown;
 use crate::space::SpaceEnv;
 use crate::space::peco::PecoIdentity;
 use crate::space::registry::SpaceRegistry;
@@ -64,9 +66,13 @@ pub struct Scheduler {
     /// 若成强引用，关掉的空间会随调度器一起钉在内存里。
     env: Weak<SpaceEnv>,
     delivery: Arc<PecoDelivery>,
+    shutdown: Shutdown,
+    /// `Mutex` 是因为 `spawn` 拿 `&Arc<Self>`，而 `stop` 要移出句柄。
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Scheduler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: SqlitePool,
         spaces: Arc<SpaceRegistry>,
@@ -74,6 +80,7 @@ impl Scheduler {
         peco: Arc<PecoIdentity>,
         env: Weak<SpaceEnv>,
         delivery: Arc<PecoDelivery>,
+        shutdown: Shutdown,
     ) -> Self {
         Self {
             pool,
@@ -82,23 +89,45 @@ impl Scheduler {
             peco,
             env,
             delivery,
+            shutdown,
+            task: Mutex::new(None),
         }
     }
 
     /// 起后台循环；调用即返回。
     pub fn spawn(self: &Arc<Self>) {
         let scheduler = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut backoff = RESTART_BACKOFF;
             loop {
-                match tokio::spawn(Arc::clone(&scheduler).run()).await {
+                let outcome = tokio::select! {
+                    _ = scheduler.shutdown.cancelled() => return,
+                    outcome = tokio::spawn(Arc::clone(&scheduler).run()) => outcome,
+                };
+                // 停机时 `run` 正常返回不是故障：不判一下 journal 里会留一句「正在重启它」。
+                if scheduler.shutdown.is_cancelled() {
+                    return;
+                }
+                match outcome {
                     Ok(()) => warn!("schedule loop returned; restarting it"),
                     Err(e) => warn!(error = %e, "schedule loop died; restarting it"),
                 }
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = scheduler.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
                 backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
             }
         });
+        *self.task.lock().unwrap() = Some(task);
+    }
+
+    /// 停机：等监督任务退出，排期因此确定不会再触发（关库要在它之后）。
+    pub async fn stop(&self) {
+        let task = self.task.lock().unwrap().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     /// 循环体：**先 tick 再睡**。
@@ -113,7 +142,10 @@ impl Scheduler {
         );
         loop {
             self.tick().await;
-            tokio::time::sleep(TICK).await;
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(TICK) => {}
+            }
         }
     }
 

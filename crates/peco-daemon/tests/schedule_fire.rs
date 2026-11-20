@@ -70,6 +70,7 @@ fn scheduler(
         peco,
         Arc::downgrade(&env.env),
         delivery,
+        env.shutdown.clone(),
     ))
 }
 

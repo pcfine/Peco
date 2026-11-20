@@ -14,6 +14,7 @@ use peco_daemon::error::DaemonError;
 use peco_daemon::http;
 use peco_daemon::schedule::access as schedule_store;
 use peco_daemon::schedule::scheduler::Scheduler;
+use peco_daemon::shutdown::Shutdown;
 use peco_daemon::single_instance;
 use peco_daemon::space::SpaceEnv;
 use peco_daemon::space::ledger::SqliteTaskLedger;
@@ -103,7 +104,8 @@ async fn run() -> Result<(), DaemonError> {
     }
     // 唤醒泵先于观察者建出：终态回调要在同一份泵上叫醒它，观察者因此持一个
     // 泵的引用；反过来泵若持 `AppState` 就成环了（见 `attach_delivery`）。
-    let wake = Arc::new(WakePump::new(pool.clone(), peco.clone()));
+    let shutdown = Shutdown::new();
+    let wake = Arc::new(WakePump::new(pool.clone(), peco.clone(), shutdown.clone()));
     let tasks = Arc::new(TaskObserver::new(pool.clone(), wake.clone()));
     let env = Arc::new(SpaceEnv::new(
         &config,
@@ -169,6 +171,7 @@ async fn run() -> Result<(), DaemonError> {
         env.peco.clone(),
         Arc::downgrade(&env),
         delivery.clone(),
+        shutdown.clone(),
     ));
     let state = AppState {
         pool,
@@ -180,6 +183,7 @@ async fn run() -> Result<(), DaemonError> {
         chat_runs,
         wake,
         schedules,
+        shutdown,
     };
     state.wake.attach_delivery(delivery);
 
@@ -201,7 +205,7 @@ async fn run() -> Result<(), DaemonError> {
     state.wake.spawn();
 
     // 上个进程留在 running 的行没有观察者了：只收 running，pending 留着继续重试。
-    match db::schedules::interrupt_running(&state.pool).await {
+    match db::schedules::interrupt_running(&state.pool, "进程重启时仍在运行").await {
         Ok(0) => {}
         Ok(count) => info!(count, "schedule runs interrupted by the previous process"),
         Err(e) => warn!(error = %e, "cannot reconcile the schedule runs at startup"),
@@ -216,7 +220,10 @@ async fn run() -> Result<(), DaemonError> {
     }
     state.schedules.spawn();
 
-    http::serve(state).await?;
-    info!("http server stopped; daemon exit");
+    // `serve` 返回（SSE 全部断流）之后才收尾，否则泵的最后一帧会写到关掉的流上。
+    http::serve(state.clone()).await?;
+    info!("http server stopped; draining");
+    peco_daemon::shutdown::drain(&state).await;
+    info!("daemon exit");
     Ok(())
 }

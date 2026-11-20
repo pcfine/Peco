@@ -122,6 +122,10 @@ pub enum DaemonError {
     #[error("{message}")]
     Internal { message: String },
 
+    /// 服务已在停机序列中：新活一律拒，已有轮次不受影响。
+    #[error("服务正在停机，请稍后重试")]
+    ShuttingDown,
+
     #[error("another peco-daemon is running (pid {pid}, from '{pid_file}')")]
     AlreadyRunning { pid: u32, pid_file: String },
 
@@ -167,6 +171,7 @@ impl DaemonError {
             Self::InvalidPath { .. } => "invalid_path",
             Self::InvalidArgument { .. } => "invalid_argument",
             Self::Internal { .. } => "internal",
+            Self::ShuttingDown => "shutting_down",
             Self::AlreadyRunning { .. } => "daemon_already_running",
             Self::Workspace(_) => "workspace_open_failed",
             Self::Db(_) => "db_error",
@@ -201,6 +206,7 @@ impl DaemonError {
             | Self::WsBusy { .. }
             | Self::ConversationInFlight { .. }
             | Self::InflightTasks { .. } => StatusCode::CONFLICT,
+            Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             Self::MarkerWriteFailed { .. }
             | Self::AlreadyRunning { .. }
             | Self::Workspace(_)
@@ -242,6 +248,11 @@ mod tests {
                 },
                 "team_not_found",
                 StatusCode::NOT_FOUND,
+            ),
+            (
+                DaemonError::ShuttingDown,
+                "shutting_down",
+                StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
                 DaemonError::ProviderNotFound {

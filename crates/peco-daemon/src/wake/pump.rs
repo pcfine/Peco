@@ -4,13 +4,15 @@
 //! 不许早退 —— 行一旦进了 `delivering`，提前返回只能等 60 秒超时或重启才有人
 //! 把它捞回来。
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::db::dispatches;
+use crate::shutdown::Shutdown;
 use crate::space::peco::PecoIdentity;
 
 use super::compose::compose;
@@ -32,15 +34,20 @@ pub struct WakePump {
     /// 晚绑定：投递端要在 `AppState` 建好之后才拿得到 `SpaceRegistry`，而泵必须
     /// 在那之前就交给观察者。反过来持有会成 Arc 环。
     delivery: OnceLock<Arc<dyn DeliverySink>>,
+    shutdown: Shutdown,
+    /// `Mutex` 是因为 `spawn` 拿 `&Arc<Self>`，而 `stop` 要移出句柄。
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl WakePump {
-    pub fn new(pool: SqlitePool, peco: Arc<PecoIdentity>) -> Self {
+    pub fn new(pool: SqlitePool, peco: Arc<PecoIdentity>, shutdown: Shutdown) -> Self {
         Self {
             pool,
             peco,
             notify: Notify::new(),
             delivery: OnceLock::new(),
+            shutdown,
+            task: Mutex::new(None),
         }
     }
 
@@ -82,17 +89,37 @@ impl WakePump {
     /// warn 并重启，带退避，免得一个每次启动就 panic 的循环被无间隔地拉起。
     pub fn spawn(self: &Arc<Self>) {
         let pump = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut backoff = PUMP_RESTART_BACKOFF;
             loop {
-                match tokio::spawn(Arc::clone(&pump).run()).await {
+                let outcome = tokio::select! {
+                    _ = pump.shutdown.cancelled() => return,
+                    outcome = tokio::spawn(Arc::clone(&pump).run()) => outcome,
+                };
+                // 停机时 `run` 正常返回不是故障：不判一下 journal 里会留一句「正在重启它」。
+                if pump.shutdown.is_cancelled() {
+                    return;
+                }
+                match outcome {
                     Ok(()) => warn!("wake pump loop returned; restarting it"),
                     Err(e) => warn!(error = %e, "wake pump loop died; restarting it"),
                 }
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = pump.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
                 backoff = (backoff * 2).min(PUMP_RESTART_BACKOFF_MAX);
             }
         });
+        *self.task.lock().unwrap() = Some(task);
+    }
+
+    /// 停机：等监督任务退出，泵因此确定不会再投递（关库要在它之后）。
+    pub async fn stop(&self) {
+        let task = self.task.lock().unwrap().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     async fn run(self: Arc<Self>) {
@@ -103,6 +130,7 @@ impl WakePump {
         );
         loop {
             tokio::select! {
+                _ = self.shutdown.cancelled() => return,
                 _ = self.notify.notified() => {}
                 _ = tokio::time::sleep(TICK) => {}
             }
@@ -282,6 +310,7 @@ mod tests {
                 team_id: "peco".to_string(),
                 from_marker: true,
             }),
+            Shutdown::new(),
         ))
     }
 

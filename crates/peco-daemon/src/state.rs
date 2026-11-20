@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 use crate::chat::active::ChatActiveRuns;
 use crate::config::DaemonConfig;
 use crate::schedule::scheduler::Scheduler;
+use crate::shutdown::Shutdown;
 use crate::space::SpaceEnv;
 use crate::space::registry::SpaceRegistry;
 use crate::space::tasks::TaskObserver;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub wake: Arc<WakePump>,
     /// 定时任务的调度器：手动运行的入口在它身上，列表与历史只读库里那两张表。
     pub schedules: Arc<Scheduler>,
+    /// 停机闩：长驻循环与永久 SSE 都 select 它。
+    pub shutdown: Shutdown,
 }
 
 impl AppState {

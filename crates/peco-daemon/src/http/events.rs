@@ -93,11 +93,16 @@ pub async fn stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let receiver = state.tasks.subscribe();
+    let shutdown = state.shutdown.clone();
     let stream = futures::stream::unfold(
-        (receiver, state.pool.clone()),
-        |(mut receiver, pool)| async move {
+        (receiver, state.pool.clone(), shutdown),
+        |(mut receiver, pool, shutdown)| async move {
             loop {
-                let event = match receiver.recv().await {
+                let received = tokio::select! {
+                    _ = shutdown.cancelled() => return None,
+                    received = receiver.recv() => received,
+                };
+                let event = match received {
                     Ok(event) => event,
                     // 慢消费者丢事件：台账是权威，前端按需重取即可，不补发。
                     Err(RecvError::Lagged(skipped)) => {
@@ -117,7 +122,7 @@ pub async fn stream(
                         None => continue,
                     }
                 };
-                return Some((Ok(to_event(&payload)), (receiver, pool)));
+                return Some((Ok(to_event(&payload)), (receiver, pool, shutdown)));
             }
         },
     );

@@ -265,6 +265,10 @@ pub async fn run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<RunNowResponse>, ApiError> {
+    // 停机序列先停调度再收尾在飞轮：此时手动触发的这一轮注定被取消。
+    if state.shutdown.is_cancelled() {
+        return Err(DaemonError::ShuttingDown.into());
+    }
     match state.schedules.run_now(&id).await {
         Ok(run) => Ok(Json(RunNowResponse {
             run_id: run.run_id,

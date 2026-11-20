@@ -112,6 +112,12 @@ impl Drop for TurnEndGuard {
 /// [`crate::wake::DELIVERING_TIMEOUT`] 长一个数量级。
 pub(crate) const RUN_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// 停机取消之后等 looper 收尾的上限（冻结 + 落盘）。
+///
+/// 工具卡住时这一轮永远走不到 Idle：宁可少落一条快照，也不能让进程等在这里
+/// 被 SIGKILL。
+pub(crate) const SHUTDOWN_SETTLE: Duration = Duration::from_secs(4);
+
 /// 到点是否真要收尾（判据见 [`RUN_IDLE_TIMEOUT`]）。单独成函数是为了能单测 ——
 /// 循环体在 `spawn_run` 的 `tokio::spawn` 里，装配它要真实 DB、已打开的空间与带
 /// provider 的 Agent。
@@ -436,10 +442,13 @@ pub(crate) async fn spawn_run(
         tokio::pin!(idle_deadline);
         // 是否处在暂停态。暂停无时限：看门狗在暂停期间整个关掉（见下方空闲分支）。
         let mut paused = false;
+        let shutdown_deadline = tokio::time::sleep(SHUTDOWN_SETTLE);
+        tokio::pin!(shutdown_deadline);
+        let mut shutting_down = false;
 
         loop {
-            // 三路复用：looper 事件 / 空闲看门狗 / 控制命令。暂停中空闲那一路
-            // 整个关掉，于是只剩事件与控制 —— 暂停因此没有时限。
+            // 四路复用：looper 事件 / 空闲看门狗 / 停机兜底 / 控制命令；暂停中空闲
+            // 那一路关掉（暂停因此没有时限）。
             //
             // 没有「客户端断连」这一路 —— 连接只是出口之一，它的消失不是事件。
             tokio::select! {
@@ -741,6 +750,15 @@ pub(crate) async fn spawn_run(
                     break;
                 }
 
+                _ = &mut shutdown_deadline, if shutting_down => {
+                    tracing::warn!(
+                        conversation_id = %conv_id_for_bg,
+                        settle_secs = SHUTDOWN_SETTLE.as_secs(),
+                        "looper did not settle after the shutdown cancel; ending the turn"
+                    );
+                    break;
+                }
+
                 // 暂停 / 恢复 / 取消：来自 `POST .../pause|resume|cancel`。
                 cmd = control_rx.recv() => {
                     idle_deadline.as_mut().reset(Instant::now() + RUN_IDLE_TIMEOUT);
@@ -823,6 +841,27 @@ pub(crate) async fn spawn_run(
                                     "Failed to deliver cancel"
                                 );
                             }
+                        }
+                        Some(ChatControl::Shutdown) => {
+                            // 先告知断开的原因，再走 core 的取消收尾：冻结与落盘都在
+                            // looper 侧，本任务消费事件到 Idle，落盘因此早于进程退出。
+                            sink.feed().mark_cancelling();
+                            sink.send(ChatSseEvent::Error {
+                                message: "服务重启，本轮已中止".to_string(),
+                                cancelled: true,
+                                conversation_id: conv_id_for_bg.clone(),
+                            });
+                            if let Err(e) = handle.cancel().await {
+                                tracing::warn!(
+                                    conversation_id = %conv_id_for_bg,
+                                    error = %e,
+                                    "Failed to deliver the shutdown cancel"
+                                );
+                            }
+                            shutting_down = true;
+                            shutdown_deadline
+                                .as_mut()
+                                .reset(Instant::now() + SHUTDOWN_SETTLE);
                         }
                         None => {
                             // 控制发送端关闭（条目被摘除/顶替）：没有继续的理由。
@@ -1111,7 +1150,7 @@ mod tests {
         use futures::StreamExt;
         use futures::executor::block_on;
 
-        let stream = super::super::feed::frame_stream(frames);
+        let stream = super::super::feed::frame_stream(frames, crate::shutdown::Shutdown::new());
         block_on(stream.collect::<Vec<_>>())
             .into_iter()
             .map(|item| {

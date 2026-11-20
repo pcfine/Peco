@@ -80,7 +80,11 @@ async fn peco_identity(env: &TestEnv, ws_id: &str) -> Arc<PecoIdentity> {
 /// 把泵与投递端接起来，返回两者；`chat_runs` 交给调用方是为了能预先「占住会话」。
 fn wired_pump(env: &TestEnv, peco: Arc<PecoIdentity>) -> (Arc<WakePump>, Arc<ChatActiveRuns>) {
     let chat_runs = Arc::new(ChatActiveRuns::new());
-    let pump = Arc::new(WakePump::new(env.pool.clone(), peco.clone()));
+    let pump = Arc::new(WakePump::new(
+        env.pool.clone(),
+        peco.clone(),
+        env.shutdown.clone(),
+    ));
     pump.attach_delivery(Arc::new(PecoDelivery::new(
         env.pool.clone(),
         env.spaces(),
@@ -605,7 +609,7 @@ async fn startup_reclaim_returns_leftover_deliveries_to_pending() {
         team_id: "peco".to_string(),
         from_marker: true,
     });
-    let pump = WakePump::new(env.pool.clone(), peco);
+    let pump = WakePump::new(env.pool.clone(), peco, env.shutdown.clone());
 
     env.peco_pending_row(1, "t-leftover", "ws_peco").await;
     sqlx::query(

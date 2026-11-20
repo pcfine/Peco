@@ -234,18 +234,23 @@ pub async fn stream(
         .await
         .map_err(|err| observation_error(err, &ws_id, Some(&task_id)))?;
 
+    let shutdown = state.shutdown.clone();
     let frames = futures::stream::unfold(
         StreamState {
             hub: state.hub.clone(),
             work_dir,
             task,
             stream: first,
+            shutdown,
         },
         |mut state| async move {
             loop {
                 // 先取出事件再匹配：`Lagged` 分支要换掉 `state.stream`，借用必须
                 // 在此之前结束。
-                let event = state.stream.next().await;
+                let event = tokio::select! {
+                    _ = state.shutdown.cancelled() => return None,
+                    event = state.stream.next() => event,
+                };
                 match event {
                     Some(ObsEvent::Snapshot(snapshot)) => {
                         return Some((snapshot_frame(snapshot), state));
@@ -281,6 +286,7 @@ struct StreamState {
     work_dir: PathBuf,
     task: TaskId,
     stream: ObsStream,
+    shutdown: crate::shutdown::Shutdown,
 }
 
 fn snapshot_frame(snapshot: TaskSnapshot) -> Result<Event, Infallible> {

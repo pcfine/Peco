@@ -236,6 +236,65 @@ fn sigterm_exits_zero_and_removes_the_pid_file() {
     );
 }
 
+/// 开着永久 SSE 时 SIGTERM 仍须在 3s 内退出且 rc=0。
+///
+/// `/api/events` 与任务观察流都是「浏览器开着就永不结束」的流，靠它自然结束来等
+/// 优雅退出等于永远等不到。变异方法：把 `shutdown.cancel()` 从信号闭包里删掉
+/// （或让 `http::serve` 回到只等连接）⇒ 本用例在 [`wait_exit`] 处超时变红。
+#[test]
+fn sigterm_exits_zero_within_three_seconds_while_an_sse_stream_is_open() {
+    let home = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let data_home = home.path().to_path_buf();
+    let mut instance = Instance::launch(
+        || {
+            let mut command = Instance::daemon_binary();
+            command.env("PECO_HOME", &data_home);
+            command
+        },
+        data_home.clone(),
+        &logs.path().join("daemon.log"),
+    );
+
+    instance.wait_until_serving().expect("daemon 应开始接客");
+
+    // 这条连接活到用例结束：先确认握手成功，否则测的是「没有在途连接」的路径。
+    let mut sse = TcpStream::connect(&instance.addr).expect("连上守护进程");
+    write!(
+        sse,
+        "GET /api/events HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
+        instance.addr
+    )
+    .expect("写出 SSE 请求");
+    let mut header = [0u8; 64];
+    let read = sse.read(&mut header).expect("SSE 响应头可读");
+    let head = String::from_utf8_lossy(&header[..read]).to_string();
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "SSE 握手失败：{head}\n{}",
+        instance.logs()
+    );
+
+    let started = Instant::now();
+    instance.sigterm();
+    let status = instance.wait_exit();
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM 必须走优雅退出。日志：\n{}",
+        instance.logs()
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "SIGTERM 到进程退出用了 {elapsed:?}，超过 3s。日志：\n{}",
+        instance.logs()
+    );
+
+    drop(sse);
+}
+
 /// 不设 `PECO_HOME` 时数据根是 `$HOME/<HOME_DIR_NAME>`；用临时 `HOME` 隔开真实家目录。
 #[test]
 fn without_peco_home_the_data_root_is_the_home_dir_name() {
