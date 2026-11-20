@@ -16,3 +16,8 @@ helix/
 # Peco 空间标记与派发产物（本地运行态，不入库）
 /.workspace.json
 /dispatch/
+
+# 本地验收与构建产物（不入库）
+/output/
+/.playwright-mcp/
+/peco-webui/e2e-record-intro/
