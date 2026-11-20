@@ -51,7 +51,7 @@ async fn upload_with_purpose(
     data: &[u8],
 ) -> (StatusCode, serde_json::Value) {
     let boundary = "peco-test-boundary";
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::POST)
         .uri("/api/upload")
         .header(
@@ -77,7 +77,7 @@ async fn upload(
 ) -> (StatusCode, serde_json::Value) {
     let boundary = "peco-test-boundary";
     let body = multipart_body(boundary, field, "icon.png", content_type, data);
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::POST)
         .uri("/api/upload")
         .header(

@@ -40,6 +40,12 @@ pub const HOME_DIR_NAME: &str = ".peco-daemon";
 /// 与既有服务（9227 / 6969 / 6970 / 9233）错开的默认监听地址。
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:6971";
 
+/// setup token 的默认文件名（`$PECO_HOME/token`）。
+///
+/// 它是「谁有权把本地账号绑到密码上」的唯一凭据，也是自动化的 Bearer 令牌：
+/// 落在 daemon 自己的数据根里，与 `daemon.toml` 同级。
+pub const TOKEN_FILE: &str = "token";
+
 /// 全局退出策略 — 单空间 `inherit` 时用它（`ask` 只在服务端等价 `keep`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -95,6 +101,11 @@ pub struct DaemonConfig {
     providers_root: PathBuf,
     pub bind_addr: SocketAddr,
     pub exit_policy: GlobalExitPolicy,
+    /// HTTPS 素材。两个都配齐才开 TLS，缺任一维持 HTTP。
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    /// setup token 文件；缺省是 `$PECO_HOME/token`。
+    token_file: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -126,8 +137,8 @@ impl DaemonConfig {
 
     /// 从指定的 `$PECO_HOME` 读 `daemon.toml`；文件缺失即全默认。
     pub fn load_from(home: &Path) -> Result<Self, DaemonError> {
-        let file = read_config_file(home)?;
-        let bind_addr = match file.daemon.bind_addr {
+        let FileConfig { daemon, workspace } = read_config_file(home)?;
+        let bind_addr = match daemon.bind_addr {
             Some(raw) => raw
                 .parse()
                 .map_err(|_| DaemonError::Config(format!("invalid bind_addr '{raw}'")))?,
@@ -135,7 +146,7 @@ impl DaemonConfig {
                 .parse()
                 .expect("DEFAULT_BIND_ADDR 是编译期常量"),
         };
-        let exit_policy = match file.workspace.exit_policy {
+        let exit_policy = match workspace.exit_policy {
             Some(raw) => parse_exit_policy(&raw)?,
             None => GlobalExitPolicy::Ask,
         };
@@ -144,10 +155,34 @@ impl DaemonConfig {
         let peco_home = normalize_home(home);
         Ok(Self {
             providers_root: peco_home.clone(),
+            token_file: daemon
+                .token_file
+                .map(|raw| resolve_against(&peco_home, raw)),
+            tls_cert: daemon.tls_cert.map(|raw| resolve_against(&peco_home, raw)),
+            tls_key: daemon.tls_key.map(|raw| resolve_against(&peco_home, raw)),
             peco_home,
             bind_addr,
             exit_policy,
         })
+    }
+
+    /// HTTPS 素材：证书与私钥都配齐才返回。
+    pub fn tls(&self) -> Option<(&Path, &Path)> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            _ => None,
+        }
+    }
+
+    /// 只配了一侧。启动期据此 warn：静默跑 HTTP 会让人以为在跑 HTTPS。
+    pub fn has_partial_tls(&self) -> bool {
+        self.tls_cert.is_some() != self.tls_key.is_some()
+    }
+
+    pub fn token_path(&self) -> PathBuf {
+        self.token_file
+            .clone()
+            .unwrap_or_else(|| self.peco_home.join(TOKEN_FILE))
     }
 
     /// 系统层 provider 文件的目录（低优先层，所有团队共用）。
@@ -183,6 +218,9 @@ struct FileConfig {
 #[serde(default)]
 struct DaemonSection {
     bind_addr: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    token_file: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +243,19 @@ fn read_config_file(home: &Path) -> Result<FileConfig, DaemonError> {
     };
     toml::from_str(&raw)
         .map_err(|e| DaemonError::Config(format!("cannot parse '{}': {e}", path.display())))
+}
+
+/// 相对路径按数据根解析。
+///
+/// 含义取决于 CWD 的路径会随启动方式漂移（systemd 的 `WorkingDirectory` 与手动
+/// 启动下的 CWD 不是同一个目录），证书与 token 文件因此只认数据根。
+fn resolve_against(home: &Path, raw: String) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        home.join(path)
+    }
 }
 
 fn apply_env(
@@ -543,6 +594,52 @@ mod tests {
         )
         .unwrap();
         assert!(check_system_providers_file(&path).is_ok());
+    }
+
+    /// 两个都配齐才开 TLS；只配一侧只留日志，行为维持明文。
+    ///
+    /// 变异方法：把 `tls()` 改成「有任一就返回」 ⇒ 缺私钥那条断言变红。
+    #[test]
+    fn tls_needs_both_the_certificate_and_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let write = |toml: &str| {
+            std::fs::write(home.join(CONFIG_FILE), toml).unwrap();
+            DaemonConfig::load_from(&home).unwrap()
+        };
+
+        let neither = write("[daemon]\nbind_addr = \"127.0.0.1:6971\"\n");
+        assert!(neither.tls().is_none());
+        assert!(!neither.has_partial_tls(), "什么都没配不算配了一半");
+        assert_eq!(
+            neither.token_path(),
+            home.join(TOKEN_FILE),
+            "缺省落在数据根"
+        );
+
+        let only_cert = write("[daemon]\ntls_cert = \"cert.pem\"\n");
+        assert!(only_cert.tls().is_none(), "缺私钥不得开 TLS");
+        assert!(only_cert.has_partial_tls(), "配了一半必须能被识别出来");
+
+        let both = write("[daemon]\ntls_cert = \"cert.pem\"\ntls_key = \"/etc/peco/key.pem\"\n");
+        let (cert, key) = both.tls().expect("两个都配了才有 TLS");
+        assert_eq!(cert, home.join("cert.pem"), "相对路径按数据根解析");
+        assert_eq!(key, Path::new("/etc/peco/key.pem"), "绝对路径原样保留");
+        assert!(!both.has_partial_tls());
+    }
+
+    #[test]
+    fn the_token_file_can_be_relocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(
+            home.join(CONFIG_FILE),
+            "[daemon]\ntoken_file = \"secrets/setup-token\"\n",
+        )
+        .unwrap();
+
+        let config = DaemonConfig::load_from(&home).unwrap();
+        assert_eq!(config.token_path(), home.join("secrets/setup-token"));
     }
 
     #[test]

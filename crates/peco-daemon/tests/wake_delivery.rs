@@ -656,7 +656,7 @@ async fn start_stream_turn(
     message: &str,
 ) -> tokio::task::JoinHandle<Vec<String>> {
     let uri = format!("/api/chat/@master/conversations/{conv_id}/stream?message={message}");
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::GET)
         .uri(&uri)
         .header("X-Peco-Space", ws_id)

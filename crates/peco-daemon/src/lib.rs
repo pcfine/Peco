@@ -29,6 +29,7 @@ pub mod space;
 pub mod state;
 pub mod team;
 pub mod wake;
+pub mod web_auth;
 
 /// 单用户身份：DB 各表的 `user_id` 列恒写这个值。
 ///

@@ -22,6 +22,7 @@ use crate::space::SpaceEnv;
 use crate::space::registry::SpaceRegistry;
 use crate::space::tasks::TaskObserver;
 use crate::wake::pump::WakePump;
+use crate::web_auth::WebAuth;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -42,6 +43,8 @@ pub struct AppState {
     pub schedules: Arc<Scheduler>,
     /// 停机闩：长驻循环与永久 SSE 都 select 它。
     pub shutdown: Shutdown,
+    /// Web 访问身份：Bearer 令牌与会话 cookie 的判定都从这里取。
+    pub web_auth: Arc<WebAuth>,
 }
 
 impl AppState {

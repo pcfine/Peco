@@ -306,6 +306,22 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_runs_by_schedule ON scheduled_runs(sche
 -- 下一次触发算出的还是同一个槽位，唯一索引让重复触发收敛到同一行而不是双发。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_run_slot ON scheduled_runs(schedule_id, scheduled_for) WHERE trigger_kind = 'cron';
 
+-- 浏览器会话：一条登录一枚票据。新库在这里一次建全，旧库由迁移 030 补齐；
+-- 两处 DDL 必须同形，否则新旧库的唯一约束与索引理解不一致。
+--
+-- 库里只落票据的 sha256：库文件泄漏不等于会话泄漏，摘要也换不回 cookie。
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at   TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    user_agent   TEXT,
+    ip           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
+
 -- @after-migrations
 -- 上一行是执行器的分界：以下的语句等版本化迁移跑完再执行。
 -- 团队 / 空间索引建在迁移 018 给旧库补出的新列上 —— 迁移前建索引会在旧库上

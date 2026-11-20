@@ -94,7 +94,7 @@ async fn a_ledger_event_reaches_an_open_connection() {
     let target_dir = env.work_dir_of(&ws_id).await;
 
     let router = env.router();
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::GET)
         .uri("/api/events")
         .body(Body::empty())
@@ -176,7 +176,7 @@ async fn a_ledger_event_reaches_an_open_connection() {
 async fn a_wake_turn_event_is_built_from_the_event_itself() {
     let env = new_env(&[]).await;
     let router = env.router();
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::GET)
         .uri("/api/events")
         .body(Body::empty())

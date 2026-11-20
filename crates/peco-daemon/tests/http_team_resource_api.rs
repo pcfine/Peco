@@ -56,7 +56,7 @@ async fn call(
 ) -> HttpReply {
     use tower::ServiceExt;
 
-    let mut builder = Request::builder().method(method).uri(uri);
+    let mut builder = support::bearer(Request::builder().method(method).uri(uri));
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -74,6 +74,7 @@ async fn call(
         .expect("router 不会失败");
 
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024)
         .await
         .expect("响应体可读");
@@ -82,7 +83,11 @@ async fn call(
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    HttpReply { status, body }
+    HttpReply {
+        status,
+        headers,
+        body,
+    }
 }
 
 /// 单请求夹具：每个请求一份 `AppState`（不关心 console 复用的用例用它）。

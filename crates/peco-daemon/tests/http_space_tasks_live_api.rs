@@ -168,7 +168,7 @@ where
 }
 
 async fn open_stream(env: &TestEnv, ws_id: &str, task_id: &str) -> Body {
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::GET)
         .uri(format!("/api/spaces/{ws_id}/tasks/{task_id}/stream"))
         .body(Body::empty())

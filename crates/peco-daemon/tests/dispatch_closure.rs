@@ -83,7 +83,7 @@ async fn start_turn(env: &TestEnv, ws_id: &str, agent: &str, message: &str) -> T
         .to_string();
 
     let uri = format!("/api/chat/{agent}/conversations/{conv_id}/stream?message={message}");
-    let request = Request::builder()
+    let request = support::bearer(Request::builder())
         .method(Method::GET)
         .uri(&uri)
         .header("X-Peco-Space", ws_id)

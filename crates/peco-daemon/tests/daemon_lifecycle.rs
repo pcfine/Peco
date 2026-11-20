@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use peco_daemon::config::HOME_DIR_NAME;
+use peco_daemon::config::{HOME_DIR_NAME, TOKEN_FILE};
 use peco_daemon::single_instance::PID_FILE;
 
 /// 与既有服务（9227 / 6969 / 6970 / 9233）以及默认地址 6971 都错开。
@@ -17,6 +17,23 @@ const RESERVED_PORTS: [u16; 5] = [6971, 6969, 6970, 9227, 9233];
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 挂着不理会关闭的连接时，SIGTERM 到退出的上限：服务的连接宽限是 2s，留出余量。
+///
+/// 上界远低于 systemd 的 `TimeoutStopSec=30` —— 落到那个数就意味着会吃 SIGKILL。
+const STUCK_SHUTDOWN_CEILING: Duration = Duration::from_secs(3);
+
+/// 等进程退出的探测窗口，比上面几条断言上限都宽。
+///
+/// 探测只是为了让用例能结束：真正的判据是耗时断言，窗口若等于断言上限，那条
+/// 断言就永远不可能失败，退化时也只能报「超时」而报不出真实耗时。
+const EXIT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 没有挂住连接时，「置停机闩 → `serve` 返回」的上限。
+///
+/// 比连接宽限（2s）短一个量级：宽限是上限而不是固定等待，把它写成 sleep 会立刻
+/// 突破这条。
+const FAST_EXIT_CEILING: Duration = Duration::from_millis(1500);
 
 /// 端口由 `free_port()` 挑好再交给守护进程，中间存在抢跑窗口；撞车就换一个再来。
 const PORT_ATTEMPTS: usize = 3;
@@ -126,6 +143,39 @@ impl Instance {
         }
     }
 
+    /// 限时等退出，超时返回 `None` 由调用方断言。
+    ///
+    /// 与时长为 30s 的 [`Self::wait_exit`] 分开：那条要证明「不必等 systemd 兜底」，
+    /// 用它测宽限的话，停机退化到 10s 也算通过。
+    fn wait_exit_within(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        poll(timeout, || self.child.try_wait().unwrap())
+    }
+
+    /// 建一条「请求没收完」的连接并挂着不关：服务端在等剩下的字节，停机时这条
+    /// 连接不会自行结束 —— 代理转发留下的半截连接就是这个形状。
+    ///
+    /// 不用「已答完、只是不关连接」那种：服务端的优雅关闭会主动关掉空闲的
+    /// keep-alive 连接，那样的连接证不出「有上界」。
+    fn hold_unfinished_request(&self, head: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(&self.addr).expect("连上守护进程");
+        write!(stream, "{head}").expect("写出半截请求");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("设置读超时");
+        let mut probe = [0u8; 16];
+        match stream.read(&mut probe) {
+            // 一个字都没答，正是要挂住的状态。
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Ok(n) => panic!("半截请求不该有响应，却读到 {n} 字节"),
+            Err(e) => panic!("探测这条连接失败：{e}"),
+        }
+        stream
+    }
+
     /// 收尾的 Drop 是否跑过：pid 文件消失即说明 `run()` 退了作用域。
     fn wait_pid_file_removed(&self) {
         poll(SHUTDOWN_TIMEOUT, || {
@@ -138,6 +188,35 @@ impl Instance {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
 
+    /// 等某一行日志出现。
+    ///
+    /// 停机用例拿日志行切时序：进程退出的时刻里含着 tokio 运行时与连接池的收尾，
+    /// 那段不是停机逻辑的账。
+    fn wait_for_log(&self, needle: &str) {
+        poll(SHUTDOWN_TIMEOUT, || {
+            self.logs().contains(needle).then_some(())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{SHUTDOWN_TIMEOUT:?} 内没等到日志 {needle:?}：{}",
+                self.logs()
+            )
+        });
+    }
+
+    /// 启动链写出的 setup token。就绪轮询可能在它落盘之前就开始，故读不到时返回
+    /// 空串（那时的请求必然还是 401，轮询会继续）。
+    fn token(&self) -> String {
+        std::fs::read_to_string(self.data_home.join(TOKEN_FILE))
+            .map(|raw| raw.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// 每个请求都带令牌：`/api` 全面要求认证，缺了它连就绪都判定不了。
+    fn authorization(&self) -> String {
+        format!("Bearer {}", self.token())
+    }
+
     fn get(&self, path: &str) -> String {
         self.try_get(path)
             .unwrap_or_else(|| panic!("GET {path} 没有响应：{}", self.logs()))
@@ -148,8 +227,9 @@ impl Instance {
         let mut stream = TcpStream::connect(&self.addr).ok()?;
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            self.addr
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nConnection: close\r\n\r\n",
+            self.addr,
+            self.authorization()
         )
         .ok()?;
         let mut raw = String::new();
@@ -262,8 +342,10 @@ fn sigterm_exits_zero_within_three_seconds_while_an_sse_stream_is_open() {
     let mut sse = TcpStream::connect(&instance.addr).expect("连上守护进程");
     write!(
         sse,
-        "GET /api/events HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\n\r\n",
-        instance.addr
+        "GET /api/events HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\n\
+         Accept: text/event-stream\r\n\r\n",
+        instance.addr,
+        instance.authorization()
     )
     .expect("写出 SSE 请求");
     let mut header = [0u8; 64];
@@ -293,6 +375,127 @@ fn sigterm_exits_zero_within_three_seconds_while_an_sse_stream_is_open() {
     );
 
     drop(sse);
+}
+
+/// 挂着不理会关闭的连接时，SIGTERM 仍须在连接宽限内退出且 rc=0。
+///
+/// 两种形态都是「请求在途、客户端不再发字节」：收尾等在途请求自然结束，那个等
+/// 没有上界的话进程会一直挂到 systemd 的 `TimeoutStopSec` 送 SIGKILL，而收尾
+/// 序列一步都没跑。
+///
+/// 变异方法：把明文分支改回 `axum::serve(...).with_graceful_shutdown(...)`
+/// ⇒ 进程一直不退，本用例的耗时断言变红。
+#[test]
+fn sigterm_exits_within_the_conn_grace_while_a_connection_is_stuck() {
+    let home = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let data_home = home.path().to_path_buf();
+    let mut instance = Instance::launch(
+        || {
+            let mut command = Instance::daemon_binary();
+            command.env("PECO_HOME", &data_home);
+            command
+        },
+        data_home.clone(),
+        &logs.path().join("daemon.log"),
+    );
+
+    instance.wait_until_serving().expect("daemon 应开始接客");
+
+    let auth = instance.authorization();
+    // 请求头没收完，服务端在等剩下的字节。
+    let _stuck_head = instance.hold_unfinished_request(&format!(
+        "GET /api/peco HTTP/1.1\r\nHost: {}\r\nAuthorization: {auth}\r\n",
+        instance.addr
+    ));
+    // 请求体没收完：上传 handler 在等 body，同样不会自行结束。
+    let _stuck_body = instance.hold_unfinished_request(&format!(
+        "POST /api/upload HTTP/1.1\r\nHost: {}\r\nAuthorization: {auth}\r\n\
+         Content-Type: multipart/form-data; boundary=x\r\nContent-Length: 100000\r\n\r\n--x\r\n",
+        instance.addr
+    ));
+
+    let started = Instant::now();
+    instance.sigterm();
+    let status = instance.wait_exit_within(EXIT_PROBE_TIMEOUT);
+    let elapsed = started.elapsed();
+
+    let logs = instance.logs();
+    let status = status.unwrap_or_else(|| {
+        panic!("SIGTERM 后 {EXIT_PROBE_TIMEOUT:?} 进程仍在：挂住的连接把停机拖住了。日志：\n{logs}")
+    });
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "必须走优雅退出（被信号终止时 code 为 None）。日志：\n{logs}"
+    );
+    assert!(
+        elapsed < STUCK_SHUTDOWN_CEILING,
+        "SIGTERM 到退出用了 {elapsed:?}，超过 {STUCK_SHUTDOWN_CEILING:?}。日志：\n{logs}"
+    );
+    // 退出得早还不够：强断之后的收尾必须照跑完，否则在飞轮次与台账都没落定。
+    for expected in [
+        "http server stopped; draining",
+        "shutdown drain complete",
+        "daemon exit",
+    ] {
+        assert!(
+            logs.contains(expected),
+            "缺少收尾证据 {expected:?}。日志：\n{logs}"
+        );
+    }
+    assert!(!instance.pid_file().exists(), "pid 文件应由 Drop 删除");
+}
+
+/// 没有挂住连接时不得等满宽限：宽限是上限，不是固定延迟。
+///
+/// 计时只覆盖「置停机闩 → `serve` 返回」，两端去认守护进程自己的日志行：进程退出
+/// 之后 tokio 运行时与连接池的收尾在满载下要一两秒，把它算进来，宽限那 2s 就淹没
+/// 在噪声里，重复多轮取最小值也分不开。
+///
+/// 变异方法：把宽限写成无条件 `sleep(CONN_GRACE)` ⇒ `http server stopped` 比
+/// `shutdown signal received` 晚约 2s，本用例在 [`FAST_EXIT_CEILING`] 处变红。
+#[test]
+fn sigterm_does_not_wait_for_the_whole_grace_without_stuck_connections() {
+    let home = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let data_home = home.path().to_path_buf();
+    let mut instance = Instance::launch(
+        || {
+            let mut command = Instance::daemon_binary();
+            command.env("PECO_HOME", &data_home);
+            command
+        },
+        data_home.clone(),
+        &logs.path().join("daemon.log"),
+    );
+
+    instance.wait_until_serving().expect("daemon 应开始接客");
+
+    instance.sigterm();
+    instance.wait_for_log("shutdown signal received");
+    let started = Instant::now();
+    instance.wait_for_log("http server stopped; draining");
+    let lag = started.elapsed();
+
+    let status = instance.wait_exit_within(EXIT_PROBE_TIMEOUT);
+    let logs = instance.logs();
+    let status = status.unwrap_or_else(|| {
+        panic!("SIGTERM 后 {EXIT_PROBE_TIMEOUT:?} 进程仍在：没有连接可等却仍在等。日志：\n{logs}")
+    });
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "必须走优雅退出（被信号终止时 code 为 None）。日志：\n{logs}"
+    );
+    assert!(
+        lag < FAST_EXIT_CEILING,
+        "置停机闩到 serve 返回用了 {lag:?}，宽限被当成了固定等待。日志：\n{logs}"
+    );
+    assert!(
+        logs.contains("shutdown drain complete"),
+        "收尾序列必须跑完。日志：\n{logs}"
+    );
 }
 
 /// 不设 `PECO_HOME` 时数据根是 `$HOME/<HOME_DIR_NAME>`；用临时 `HOME` 隔开真实家目录。

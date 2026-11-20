@@ -3,6 +3,7 @@
 //! 这一层不碰 marker、不碰实例表状态机 —— 那些判断都在 `space` 与
 //! `WorkspaceHub` 里，HTTP 只负责路由、请求体与错误体形状。
 
+pub mod auth;
 pub mod brand;
 pub mod events;
 pub mod peco;
@@ -18,13 +19,16 @@ pub mod tasks;
 pub mod team;
 pub mod upload;
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use axum::Json;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::Serialize;
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -38,9 +42,19 @@ use crate::provider;
 use crate::skill;
 use crate::state::AppState;
 
+/// 停机的连接宽限：到点仍未结束的连接被强制断开，停机不会无限期挂着。
+///
+/// 两条监听路径共用这一个数：拆成两个的话，一处调整会让另一处的上界悄悄漂移。
+const CONN_GRACE: Duration = Duration::from_secs(2);
+
 pub fn router(state: AppState) -> Router {
     let uploads_dir = state.config.peco_home.join("uploads");
     let router = Router::new()
+        .route("/api/auth/status", get(auth::status))
+        .route("/api/auth/register", post(auth::register))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/password", post(auth::change_password))
         .route("/api/spaces", get(space::list).post(space::create))
         .route(
             "/api/spaces/{ws_id}",
@@ -170,24 +184,96 @@ pub fn router(state: AppState) -> Router {
         None => router,
     };
 
-    // 两层跨领域中间件必须罩住 fallback：先挂 fallback 再 `.layer()`，静态响应
-    // 才和 API 响应带同样的 CORS 头，日志里也不会只出现接口请求。
+    // 日志层在闸门外面：被闸门挡下的请求同样留痕。两层都挂在 fallback 之后才
+    // 罩得住它。
     router
+        .layer(from_fn_with_state(state.clone(), auth::require_auth))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
 /// 监听并阻塞到优雅退出信号。
 ///
-/// 返回时所有连接（含永久 SSE）都已结束 —— 停机序列据此排在它之后。
+/// 返回时连接要么已全部自行结束，要么已按 [`CONN_GRACE`] 断掉 —— 停机序列据此
+/// 排在它之后，不必再关心还有没有连接挂着。
+///
+/// 证书与私钥都配了才走 HTTPS；缺任一维持明文。
 pub async fn serve(state: AppState) -> std::io::Result<()> {
     let bind_addr = state.config.bind_addr;
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(addr = %bind_addr, "http listening");
-    axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state.shutdown.clone()))
+    // 先取出配置与闩：下面要把 `state` 移进路由，借着自己的字段移不过去。
+    let config = state.config.clone();
+    let shutdown = state.shutdown.clone();
+    let service = router(state).into_make_service_with_connect_info::<SocketAddr>();
+
+    match config.tls() {
+        Some((cert, key)) => {
+            let tls = tls_config(cert, key).await?;
+            tracing::info!(
+                addr = %bind_addr,
+                cert = %cert.display(),
+                "https listening"
+            );
+            let handle = axum_server::Handle::new();
+            let serving = axum_server::bind_rustls(bind_addr, tls)
+                .handle(handle.clone())
+                .serve(service);
+            serve_with_grace(handle, shutdown, serving).await
+        }
+        None => {
+            tracing::info!(addr = %bind_addr, "http listening");
+            let handle = axum_server::Handle::new();
+            let serving = axum_server::bind(bind_addr)
+                .handle(handle.clone())
+                .serve(service);
+            serve_with_grace(handle, shutdown, serving).await
+        }
+    }
+}
+
+/// 装 ring provider 并读证书。
+///
+/// `tls-rustls-no-provider` 把进程级 provider 的选择权留在这里：默认那条会拉
+/// aws-lc-rs，构建链需要 cmake/nasm。装过一次之后再装是 no-op，重复调用无害。
+async fn tls_config(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> std::io::Result<axum_server::tls_rustls::RustlsConfig> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
         .await
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot load TLS material from '{}' and '{}': {e}",
+                    cert.display(),
+                    key.display()
+                ),
+            )
+        })
+}
+
+/// 两条监听形态共用的停机序列：信号到达先置停机闩（各条永久 SSE 据此自行收尾），
+/// 再让监听器停止接客，然后按 [`CONN_GRACE`] 断掉剩下的连接 —— 于是本函数返回的
+/// 时刻与客户端配不配合无关。
+async fn serve_with_grace<F>(
+    handle: axum_server::Handle,
+    shutdown: crate::shutdown::Shutdown,
+    serving: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    let graceful = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal(shutdown).await;
+        // 宽限只兜「客户端不理会关闭」：正常路径上各条流自己收尾，远快于它。
+        graceful.graceful_shutdown(Some(CONN_GRACE));
+    });
+
+    serving.await
 }
 
 /// 监听 SIGINT 与 SIGTERM，任一个都落到同一条优雅退出路径：只置停机闩，收尾排在
@@ -265,5 +351,35 @@ impl IntoResponse for DaemonError {
             tracing::error!(code = body.code, error = %body.message, "request failed");
         }
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 证书坏了要以 `io::Error` 带路径报出来：TLS 素材是部署输入，
+    /// 不能在启动期 panic 成一段 backtrace，也不该静默降级成明文。
+    #[tokio::test]
+    async fn broken_tls_material_is_an_io_error_with_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+
+        let err = tls_config(&cert, &key).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("cert.pem"),
+            "错误要指出是哪个文件：{message}"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::write(&cert, "not a certificate").unwrap();
+        std::fs::write(&key, "not a key").unwrap();
+        let err = tls_config(&cert, &key).await.unwrap_err();
+        assert!(
+            err.to_string().contains("cert.pem") && err.to_string().contains("key.pem"),
+            "两个文件都要出现在错误里：{err}"
+        );
     }
 }

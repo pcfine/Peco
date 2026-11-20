@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use peco_core::config::SystemConfig;
 use peco_core::tools::{
     OpenRequest, WorkspaceHandle, WorkspaceHub, WorkspaceOpenError, WorkspaceOpener,
@@ -32,10 +32,31 @@ use peco_daemon::space::registry::SpaceRegistry;
 use peco_daemon::space::tasks::TaskObserver;
 use peco_daemon::state::AppState;
 use peco_daemon::wake::pump::WakePump;
+use peco_daemon::web_auth::WebAuth;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use upstream::FakeUpstream;
+
+/// 夹具统一的 Bearer 令牌，同时充当 setup token。
+///
+/// 固定值而不是随机值：请求辅助函数与用例都要能直接写它，省掉「先读文件再拼头」
+/// 这一层；真正的随机生成与 0600 落盘由 `web_auth::token` 的单测钉住。
+pub const BEARER_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// 给请求构造器带上 Bearer 令牌 —— 认证闸门之外的路由不需要它，但带上无害；
+/// 手搓请求的用例经它过闸门，不必各自拼一遍头。
+pub fn bearer(builder: RequestBuilder) -> RequestBuilder {
+    builder.header(header::AUTHORIZATION, bearer_header())
+}
+
+/// 手搓请求的构造器类型：`bearer` 收它、返回它。
+pub type RequestBuilder = axum::http::request::Builder;
+
+/// `Authorization` 的完整取值。`send` 收的是借用切片，故留一份 String。
+pub fn bearer_header() -> String {
+    format!("Bearer {BEARER_TOKEN}")
+}
 
 /// 包装真实 `DaemonOpener`：只在打开成功时计数。
 ///
@@ -82,6 +103,9 @@ pub struct TestEnv {
     pub wake: Arc<WakePump>,
     /// 与泵、调度器、`AppState` 共享的停机闩：停机用例要能一次置位全部部件。
     pub shutdown: Shutdown,
+    /// 进程内的认证状态。必须与 `AppState` 共用同一份：登录限流就活在这里，
+    /// 每次请求各建一份会让「连续失败 5 次」永远数不满。
+    pub web_auth: Arc<WebAuth>,
     _home_guard: TempDir,
 }
 
@@ -94,6 +118,8 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
 
     // 走 load_from 而不是 load：环境变量不该影响测试的实际路径与默认值。
     let config = DaemonConfig::load_from(home_guard.path()).unwrap();
+    // 与启动链同形：token 文件是注册用的 setup token，夹具直接写定值。
+    std::fs::write(config.token_path(), BEARER_TOKEN).unwrap();
     let pool = db::connect(&config.db_url()).await.unwrap();
     db::run_migrations(&pool).await.unwrap();
 
@@ -126,6 +152,7 @@ pub async fn new_env(teams: &[&str]) -> TestEnv {
     let config = Arc::new(config);
 
     TestEnv {
+        web_auth: Arc::new(WebAuth::new(BEARER_TOKEN.to_string(), false)),
         home: config.peco_home.clone(),
         pool,
         env,
@@ -239,6 +266,11 @@ impl TestEnv {
         env
     }
 
+    /// 逐字段装配 `AppState` 的用例从这里取同一份认证状态，不必各造一份。
+    pub fn web_auth(&self) -> Arc<WebAuth> {
+        self.web_auth.clone()
+    }
+
     fn with_env(&self, env: Arc<SpaceEnv>) -> AppState {
         let spaces = Arc::new(SpaceRegistry::new(self.hub.clone(), env.clone()));
         let chat_runs = Arc::new(peco_daemon::chat::ChatActiveRuns::new());
@@ -269,6 +301,7 @@ impl TestEnv {
                 self.shutdown.clone(),
             )),
             shutdown: self.shutdown.clone(),
+            web_auth: self.web_auth(),
         }
     }
 
@@ -487,15 +520,21 @@ impl TestEnv {
     }
 }
 
-/// 一次 HTTP 往返的结果：状态码、解析后的 JSON 体。
+/// 一次 HTTP 往返的结果：状态码、响应头、解析后的 JSON 体。
 pub struct HttpReply {
     pub status: StatusCode,
+    pub headers: HeaderMap,
     pub body: Value,
 }
 
 impl HttpReply {
     pub fn code(&self) -> &str {
         self.body["code"].as_str().unwrap_or_default()
+    }
+
+    /// `Set-Cookie` 的值；认证用例要读它拿到会话票据。
+    pub fn set_cookie(&self) -> Option<&str> {
+        self.headers.get(header::SET_COOKIE)?.to_str().ok()
     }
 }
 
@@ -504,22 +543,65 @@ pub async fn call(router: &Router, method: Method, uri: &str, body: Option<Value
     call_in_space(router, method, uri, body, None).await
 }
 
-/// 同上，附带空间选择器请求头。
-///
-/// 资源模块的每个 handler 都要求 `LocalUser`，缺这条头就只能走 `?ws=` 兜底，
-/// 两条路径要分开测。
-pub async fn call_in_space(
+/// 带 Bearer 令牌的请求：与 `TestEnv::get` 同类，但作用在任意路由上。
+pub async fn call_authed(
     router: &Router,
     method: Method,
     uri: &str,
     body: Option<Value>,
-    ws_id: Option<&str>,
+) -> HttpReply {
+    let authorization = bearer_header();
+    send(
+        router,
+        method,
+        uri,
+        body,
+        &[(header::AUTHORIZATION.as_str(), authorization.as_str())],
+    )
+    .await
+}
+
+/// 不带任何凭据的请求：认证闸门与登录限流的用例要看 401 / 403。
+pub async fn call_anonymous(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> HttpReply {
+    send(router, method, uri, body, &[]).await
+}
+
+/// 带一枚 `peco_session` cookie 的请求：会话续期与吊销都靠它观察。
+pub async fn call_with_session(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    cookie: &str,
+) -> HttpReply {
+    send(
+        router,
+        method,
+        uri,
+        body,
+        &[(header::COOKIE.as_str(), cookie)],
+    )
+    .await
+}
+
+/// 底层一次往返：额外头由调用方给。
+async fn send(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
 ) -> HttpReply {
     use tower::ServiceExt;
 
     let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(ws_id) = ws_id {
-        builder = builder.header("X-Peco-Space", ws_id);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
     }
     let request_body = match body {
         Some(json) => {
@@ -535,6 +617,7 @@ pub async fn call_in_space(
         .expect("router 不会失败");
 
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024)
         .await
         .expect("响应体可读");
@@ -543,7 +626,30 @@ pub async fn call_in_space(
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    HttpReply { status, body }
+    HttpReply {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// 同上，附带空间选择器请求头。
+///
+/// 资源模块的每个 handler 都要求 `LocalUser`，缺这条头就只能走 `?ws=` 兜底，
+/// 两条路径要分开测。
+pub async fn call_in_space(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    ws_id: Option<&str>,
+) -> HttpReply {
+    let authorization = bearer_header();
+    let mut headers = vec![(header::AUTHORIZATION.as_str(), authorization.as_str())];
+    if let Some(ws_id) = ws_id {
+        headers.push(("X-Peco-Space", ws_id));
+    }
+    send(router, method, uri, body, &headers).await
 }
 
 /// 发起一次请求并返回**未消费**的响应体。
@@ -558,7 +664,7 @@ pub async fn stream_in_space(
 ) -> axum::response::Response {
     use tower::ServiceExt;
 
-    let mut builder = Request::builder().method(method).uri(uri);
+    let mut builder = bearer(Request::builder().method(method).uri(uri));
     if let Some(ws_id) = ws_id {
         builder = builder.header("X-Peco-Space", ws_id);
     }

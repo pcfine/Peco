@@ -44,6 +44,16 @@ notify = { workspace = true }
 # 定时任务的 cron 解析与下次触发时刻计算（与 peco-server 同一实现）
 croner = "2.2"
 
+# 账号 + 密码认证：密码摘要用 bcrypt，会话票据只落 sha256 摘要
+bcrypt = { workspace = true }
+sha2 = { workspace = true }
+# 票据是 32 字节随机数（会话 cookie 与 setup token 同一套生成）
+rand = "0.9"
+# HTTPS 监听。`tls-rustls-no-provider` 让 provider 由本 crate 指定（ring）；
+# 默认的 `tls-rustls` 会拉 aws-lc-rs，那条构建链要 cmake/nasm。
+axum-server = { version = "0.7.3", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Errors / logging / time / ids
 thiserror = { workspace = true }
 tracing = { workspace = true }

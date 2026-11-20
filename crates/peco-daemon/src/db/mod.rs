@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod artifacts;
+pub mod auth_sessions;
 pub mod compaction_log;
 pub mod context_shadow;
 pub mod conversations;
@@ -20,6 +21,7 @@ pub mod messages;
 pub mod schedules;
 pub mod session_archive;
 pub mod teams;
+pub mod users;
 pub mod workflow_executions;
 pub mod workflow_schedules;
 pub mod workspaces;
@@ -748,6 +750,29 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::info!("Migration 029 completed");
     } else {
         tracing::debug!("Migration 029 skipped: scheduled_runs table already exists");
+    }
+
+    // ── Migration 030: 浏览器会话 ─────────────────────────────────────────
+    // 门控查表：全新库由 `schema.sql` 一次建全 → 跳过；旧库缺表才需要建。
+    // 030 的全部语句都带 `IF NOT EXISTS`，崩在建表与建索引之间时下一次启动会把
+    // 缺的那条补齐。
+    let has_auth_sessions = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='auth_sessions'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_auth_sessions {
+        run_migration(
+            pool,
+            "030",
+            include_str!("migrations/030_auth_sessions.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 030 completed");
+    } else {
+        tracing::debug!("Migration 030 skipped: auth_sessions table already exists");
     }
 
     Ok(())

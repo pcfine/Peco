@@ -25,6 +25,7 @@ use peco_daemon::space::tasks::TaskObserver;
 use peco_daemon::state::AppState;
 use peco_daemon::wake::deliver::PecoDelivery;
 use peco_daemon::wake::pump::WakePump;
+use peco_daemon::web_auth::WebAuth;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -47,6 +48,19 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), DaemonError> {
     let config = Arc::new(DaemonConfig::load()?);
     std::fs::create_dir_all(&config.peco_home)?;
+
+    // 只配了证书或只配了私钥时不报错：按规格维持明文。但必须留日志 ——
+    // 静默跑 HTTP 会让人以为自己在跑 HTTPS。
+    if config.has_partial_tls() {
+        warn!("only one of tls_cert / tls_key is set; serving plain HTTP");
+    }
+
+    // setup token：注册要用它，自动化也可以直接拿它当 Bearer 令牌。缺失就生成，
+    // 因此「没有 token 文件」不会变成另一个启动前置条件。
+    let token_path = config.token_path();
+    let token = peco_daemon::web_auth::token::load_or_create(&token_path)?;
+    let https = config.tls().is_some();
+    info!(path = %token_path.display(), https, "web auth ready");
 
     let pool = db::connect(&config.db_url()).await?;
     db::run_migrations(&pool).await?;
@@ -184,6 +198,7 @@ async fn run() -> Result<(), DaemonError> {
         wake,
         schedules,
         shutdown,
+        web_auth: Arc::new(WebAuth::new(token, https)),
     };
     state.wake.attach_delivery(delivery);
 

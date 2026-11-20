@@ -77,7 +77,8 @@ async fn serve(files: ServeDir, req: Request<Body>) -> Response<Body> {
     }
 }
 
-fn is_api_path(path: &str) -> bool {
+/// 认证闸门复用同一份判定：两处各写一份，新增前缀时必漏一处。
+pub(crate) fn is_api_path(path: &str) -> bool {
     let decoded = percent_decode(path);
     let first = decoded.split('/').find(|segment| !segment.is_empty());
     first.is_some_and(|segment| {

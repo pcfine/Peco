@@ -77,8 +77,18 @@ impl Reply {
     }
 }
 
+/// 匿名请求：静态层必须能这样访问（登录页自己要先打得开）。
 async fn get(router: &Router, uri: &str) -> Reply {
-    let request = Request::builder()
+    get_with(router, uri, Request::builder()).await
+}
+
+/// 带 Bearer 令牌：`/api` 与 `/uploads` 的路由契约要在过闸门之后才看得到。
+async fn get_api(router: &Router, uri: &str) -> Reply {
+    get_with(router, uri, support::bearer(Request::builder())).await
+}
+
+async fn get_with(router: &Router, uri: &str, builder: support::RequestBuilder) -> Reply {
+    let request = builder
         .method(Method::GET)
         .uri(uri)
         .body(Body::empty())
@@ -191,22 +201,26 @@ async fn an_extensionless_file_in_dist_beats_the_spa_fallback() {
     assert_eq!(reply.text(), "User-agent: *");
 }
 
-/// 静态响应与 API 响应必须带同样的跨域头：中间件挂在 fallback 之后才罩得住它。
+/// 前端产物公开、接口不公开，且两者都不再带跨域头（同源部署 + vite 代理）。
+///
+/// 变异方法：把闸门改成罩住整棵路由（含 fallback）⇒ 匿名 `/` 变成 401，
+/// 「登录页自己要先打得开」这条断言变红。
 #[tokio::test]
-async fn static_and_api_responses_share_the_cross_origin_headers() {
+async fn static_responses_are_public_and_nobody_ships_cors_headers() {
     let (env, dist) = router_with_site().await;
     let router = router_with_dist(&env, Some(dist.path()));
 
     let index = get(&router, "/").await;
-    let api = get(&router, "/api/peco").await;
-    assert_eq!(index.status, StatusCode::OK);
+    assert_eq!(index.status, StatusCode::OK, "前端入口不得要求认证");
+    assert_eq!(index.text(), INDEX_BODY);
+    assert_eq!(index.cors, None, "不再下发跨域头");
+
+    let api = get_api(&router, "/api/peco").await;
     assert_eq!(api.status, StatusCode::OK);
-    assert_eq!(
-        index.cors.as_deref(),
-        Some("*"),
-        "静态响应的 CORS 头缺失：中间件没罩住 fallback"
-    );
-    assert_eq!(index.cors, api.cors);
+    assert_eq!(api.cors, None, "接口同样不下发跨域头");
+
+    let anonymous = get(&router, "/api/peco").await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "接口要认证");
 }
 
 /// `/api` 与 `/uploads` 的 404 必须保持「空体」，不能被 fallback 换成 HTML。
@@ -216,12 +230,12 @@ async fn api_and_uploads_misses_stay_empty_404() {
     let router = router_with_dist(&env, Some(dist.path()));
 
     for uri in ["/api/nope", "/uploads/nope"] {
-        let reply = get(&router, uri).await;
+        let reply = get_api(&router, uri).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri}");
         assert_eq!(reply.body.len(), 0, "{uri} 的响应体必须为空");
     }
 
-    let alive = get(&router, "/api/peco").await;
+    let alive = get_api(&router, "/api/peco").await;
     assert_eq!(alive.status, StatusCode::OK, "真实接口不受静态层影响");
 }
 
@@ -232,13 +246,13 @@ async fn api_prefix_guards_survive_normalization_tricks() {
     let router = router_with_dist(&env, Some(dist.path()));
 
     for uri in ["//api/nope", "/%61pi/nope", "/api%2fnope", "/API/nope"] {
-        let reply = get(&router, uri).await;
+        let reply = get_api(&router, uri).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri} 属于接口前缀");
         assert!(reply.body.is_empty(), "{uri} 的响应体必须为空");
     }
 
     // 真实接口在守卫之外：判定放宽不能把它一起挡掉。
-    assert_eq!(get(&router, "/api/peco").await.status, StatusCode::OK);
+    assert_eq!(get_api(&router, "/api/peco").await.status, StatusCode::OK);
     assert_eq!(get(&router, "/spaces/ws_peco").await.status, StatusCode::OK);
 }
 
@@ -251,7 +265,7 @@ async fn without_the_env_var_every_path_is_404() {
     let reply = get(&router, "/").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        get(&router, "/api/peco").await.status,
+        get_api(&router, "/api/peco").await.status,
         StatusCode::OK,
         "接口与静态层是否挂载无关"
     );
@@ -278,5 +292,5 @@ async fn an_unusable_dist_leaves_the_static_layer_off() {
         StatusCode::NOT_FOUND,
         "dist 不可用时 `/` 仍是 404"
     );
-    assert_eq!(get(&router, "/api/peco").await.status, StatusCode::OK);
+    assert_eq!(get_api(&router, "/api/peco").await.status, StatusCode::OK);
 }
