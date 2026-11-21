@@ -488,6 +488,25 @@ async fn legacy_dispatch_ledger(pool: &sqlx::SqlitePool) {
     }
 }
 
+/// 回收站列与索引在全新库里由 `schema.sql` 一次建全（不靠迁移 031 补）。
+///
+/// 漏了列，`db/workspaces.rs` 的每条 SELECT 都会报 `no such column`；漏了索引，
+/// 「回收站里有哪些」这条最热查询会在每次打开列表时全表扫一遍。
+#[tokio::test]
+async fn empty_db_has_the_trash_column_and_index() {
+    let env = new_env(&[]).await;
+
+    let columns = table_columns(&env.pool, "workspaces").await;
+    assert!(
+        columns.contains(&"deleted_at".to_string()),
+        "workspaces.deleted_at 必须由 schema.sql 建出: {columns:?}"
+    );
+    assert!(
+        index_exists(&env.pool, "idx_workspaces_deleted").await,
+        "回收站索引必须建在全新库里"
+    );
+}
+
 async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
     sqlx::query_scalar(&format!(
         "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"

@@ -584,9 +584,9 @@ async fn detail_of_unknown_space_is_404() {
     );
 }
 
-/// `DELETE` 保留台账行（purge 只删空间行）。
+/// 两条删除强度都保留台账行：移入回收站只挂起，永久销毁才删行。
 #[tokio::test]
-async fn purge_keeps_the_ledger() {
+async fn deletion_keeps_the_ledger() {
     let env = new_env(&["research"]).await;
     let work_dir = env.work_dir("zeta");
     let created = env
@@ -602,15 +602,24 @@ async fn purge_keeps_the_ledger() {
         1
     );
 
-    let replied = env.delete(&format!("/api/spaces/{ws_id}")).await;
-    assert_eq!(replied.status, 200, "body={}", replied.body);
-    assert_eq!(replied.body["purged"], json!(true));
+    // 缺省 DELETE = 移入回收站：行还在（`deleted_at` 非空），台账与目录都不动。
+    let trashed = env.delete(&format!("/api/spaces/{ws_id}")).await;
+    assert_eq!(trashed.status, 200, "body={}", trashed.body);
+    assert_eq!(trashed.body["trashed"], json!(true));
+    assert_eq!(
+        env.count_workspaces(&work_dir).await,
+        1,
+        "回收站里的空间行必须留着（恢复靠它）"
+    );
+    assert_eq!(env.count_dispatches(&ws_id).await, 1, "台账必须长于空间行");
+
+    // `?purge=true` = 永久销毁：行没了，台账与工作目录照旧留着。
+    let purged = env.delete(&format!("/api/spaces/{ws_id}?purge=true")).await;
+    assert_eq!(purged.status, 200, "body={}", purged.body);
+    assert_eq!(purged.body["purged"], json!(true));
     assert_eq!(env.count_workspaces(&work_dir).await, 0, "空间行应被删除");
     assert_eq!(env.count_dispatches(&ws_id).await, 1, "台账必须长于空间行");
-    assert!(
-        work_dir.exists(),
-        "purge 只删索引行，不碰 work_dir 与 marker"
-    );
+    assert!(work_dir.exists(), "销毁只摘牌，不碰 work_dir 里的文件");
 }
 
 /// `input_required` / `auth_required` 不是终态 ⇒ 计入门槛，关闭被 `409` 拒绝。

@@ -2,7 +2,7 @@
 // Conversations 数据库查询函数
 // ============================================================================
 
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::LOCAL_USER_ID;
 
@@ -358,4 +358,45 @@ pub async fn delete(pool: &SqlitePool, conversation_id: &str) -> Result<bool, sq
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// 一个空间名下所有子表：销毁空间时逐张清空，顺序即依赖顺序的近似。
+///
+/// 列成常量而不是拼在一条 SQL 里：每张表都是独立的「按 conversation_id 删」，
+/// 写成一条 UNION 只会让「漏了哪张表」看不出来。
+const SPACE_HISTORY_TABLES: &[&str] = &[
+    "messages",
+    "session_snapshots",
+    "conversation_inflight_turns",
+    "usage_logs",
+    "peco_compaction_log",
+    "peco_session_archives",
+    "peco_context_shadow",
+    "artifacts",
+];
+
+/// 删掉一个空间的全部会话历史（八张子表 + `conversations`），返回删掉的会话数。
+///
+/// 收连接而不是池：调用方要么在自己的事务里删（回收站上限的清扫），要么一次
+/// 删完（永久销毁），原子性由调用方决定。`d_dispatches` 与 `memory_audit` 不在
+/// 这里 —— 台账与审计的生命周期长于空间，它们不是会话历史。
+pub async fn delete_space_history(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> Result<u64, sqlx::Error> {
+    for table in SPACE_HISTORY_TABLES {
+        let sql = format!(
+            "DELETE FROM {table} WHERE conversation_id IN \
+             (SELECT id FROM conversations WHERE workspace_id = ?)"
+        );
+        sqlx::query(&sql)
+            .bind(workspace_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let result = sqlx::query("DELETE FROM conversations WHERE workspace_id = ?")
+        .bind(workspace_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(result.rows_affected())
 }

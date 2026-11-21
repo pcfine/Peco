@@ -37,7 +37,15 @@ fn template_master_version() -> i64 {
     )
 }
 
-fn private_memory_config_path(home: &Path) -> PathBuf {
+/// 该空间自己的记忆库配置 —— 记忆是一个空间一份，不再挂在团队目录下。
+fn private_memory_config_path(home: &Path, ws_id: &str) -> PathBuf {
+    home.join("memory")
+        .join(ws_id)
+        .join("@private_memory/kb_config.json")
+}
+
+/// 团队级记忆库的落点：升级后它不该再由模板铺出。
+fn team_private_memory_config_path(home: &Path) -> PathBuf {
     home.join("teams")
         .join("peco")
         .join("knowledge/@private_memory/kb_config.json")
@@ -65,10 +73,11 @@ fn agent_backups(home: &Path) -> Vec<PathBuf> {
 /// 连跑两次引导：模板文件与索引都必须收敛，用户改过的字节必须留着。
 ///
 /// 「留着」的承诺只覆盖记录/知识文件：`agents/*/agent.md` 按 `template_version`
-/// 升版覆盖（见 `space::bootstrap` 的模块说明），故这里改的是知识库配置。
+/// 升版覆盖（见 `space::bootstrap` 的模块说明），故这里改的是记忆库配置 ——
+/// 它由「打开空间」写下（每空间一份），引导第二次跑会重走打开路径。
 ///
-/// 变异方法：铺模板时去掉「已存在则跳过」，第二次启动会把用户改过的 kb 配置
-/// 覆盖回模板内容 → 本测试的字节相等断言变红。
+/// 变异方法：打开路径每次都重写 `kb_config.json`（而不是「不存在才写」）→
+/// 第二次引导会把用户改过的配置覆盖回默认值 → 字节相等断言变红。
 #[tokio::test]
 async fn bootstrapping_twice_keeps_user_edits_and_a_single_row() {
     let env = new_env(&[]).await;
@@ -79,16 +88,30 @@ async fn bootstrapping_twice_keeps_user_edits_and_a_single_row() {
     let template_bytes = std::fs::read(&agent).unwrap();
     assert!(!template_bytes.is_empty(), "模板文件不该是空的");
 
-    let config = private_memory_config_path(&env.home);
+    // 打开空间就会写下该空间自己的记忆库配置；团队目录里不该再有它。
+    let ws_id = env.env.peco.ws_id.clone();
+    let config = private_memory_config_path(&env.home, &ws_id);
+    assert!(
+        config.is_file(),
+        "打开空间后必须写每空间记忆配置: {}",
+        config.display()
+    );
+    assert!(
+        !team_private_memory_config_path(&env.home).is_file(),
+        "模板不再铺团队级记忆库"
+    );
     let edited = b"{\"edited_by_user\": true}\n";
     std::fs::write(&config, edited).unwrap();
 
+    // 丢掉实例表的缓存，让第二次引导真的重走一遍打开路径（否则字节相等只是
+    // 「什么都没发生」）。
+    env.hub.forget(&env.env.peco.work_dir);
     bootstrap_peco(&env.env).await;
 
     assert_eq!(
         std::fs::read(&config).unwrap(),
         edited,
-        "第二次引导覆盖了用户改过的知识文件"
+        "第二次引导覆盖了用户改过的记忆配置"
     );
     assert_eq!(
         std::fs::read(&agent).unwrap(),

@@ -18,12 +18,13 @@ use crate::chat::run::{RunAudience, RunDeps, RunError, spawn_run};
 use crate::chat::sse::ChatSseEvent;
 use crate::db::conversations;
 use crate::db::schedules::{self, ScheduledRunRow, ScheduledTaskRow};
+use crate::db::workspaces;
 use crate::space::SpaceEnv;
 use crate::space::registry::SpaceRegistry;
 
 use super::{
-    MAX_RUN, RunStatus, SKIP_CONVERSATION_BUSY, busy_gives_up, notify, parse_utc_text, retry_at,
-    utc_text,
+    MAX_RUN, RunStatus, SKIP_CONVERSATION_BUSY, SKIP_SPACE_TRASHED, busy_gives_up, notify,
+    parse_utc_text, retry_at, utc_text,
 };
 
 /// 投递落到哪个 agent 的会话：空间页里用户看的那个对话面。
@@ -84,6 +85,17 @@ pub(crate) async fn fire(
     task: &ScheduledTaskRow,
     run: &ScheduledRunRow,
 ) -> Result<(), sqlx::Error> {
+    // ── 0. 目标在回收站里 ⇒ 这一轮没得跑 ────────────────────────────────
+    // 存量的排期行不会随「移入回收站」消失（行还在，只是挂起），它们指向的空间
+    // 已经不存在于可用世界；照常尝试只会每次失败一次，把执行历史刷满。
+    if let Some(row) = workspaces::by_id(deps.pool, &task.target_ws_id).await?
+        && row.is_trashed()
+    {
+        schedules::mark_skipped(deps.pool, &run.id, SKIP_SPACE_TRASHED).await?;
+        schedules::record_task_last_run(deps.pool, &task.id, RunStatus::Skipped).await?;
+        return Ok(());
+    }
+
     // ── 1. 打开目标空间 ──────────────────────────────────────────────────
     // 定时任务没有「用户点进来」这个前置动作，因此这里必须自己把空间打开：
     // 调度说过「到点在这个空间里做一件事」，空间关着也要做。

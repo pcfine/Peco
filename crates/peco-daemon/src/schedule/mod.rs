@@ -64,6 +64,8 @@ pub const SKIP_MISSED: &str = "missed";
 pub const SKIP_PREVIOUS_RUNNING: &str = "previous_running";
 pub const SKIP_CONVERSATION_BUSY: &str = "conversation_busy";
 pub const SKIP_SCHEDULE_DISABLED: &str = "schedule_disabled";
+/// 目标空间进了回收站：排期行还指着它，但它已经不接受运行。
+pub const SKIP_SPACE_TRASHED: &str = "space_trashed";
 
 /// run 的状态。与 `scheduled_runs.status` 的 CHECK 同集合。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

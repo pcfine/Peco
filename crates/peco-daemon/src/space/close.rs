@@ -1,4 +1,4 @@
-//! 空间关闭与删除（`stop` / `purge`）。
+//! 空间关闭（`stop`）。删除与回收站在 [`super::trash`]。
 //!
 //! 两者共用同一道门槛：drop `WorkSpace` 会连带销毁唯一持有任务结果的 Hub，
 //! 未终态台账必须先落 `orphan`，否则重启对账无从判断任务去哪了。
@@ -67,51 +67,8 @@ pub async fn close_workspace(
     })
 }
 
-/// 删除空间行（台账保留）。
-pub async fn purge_workspace(
-    env: &SpaceEnv,
-    hub: &Arc<WorkspaceHub>,
-    ws_id: &str,
-    force: bool,
-) -> Result<CloseOutcome, DaemonError> {
-    // Peco 空间是 Peco 会话的宿主：删掉行等于删掉主管，只能关闭不能删除。
-    // 判定先于查行：保留 id 无论索引在不在都不该被删。
-    if env.peco.is_peco_space(ws_id) {
-        return Err(DaemonError::ReservedSpace {
-            ws_id: ws_id.to_string(),
-        });
-    }
-
-    let row =
-        workspaces::by_id(&env.pool, ws_id)
-            .await?
-            .ok_or_else(|| DaemonError::SpaceNotFound {
-                ws_id: ws_id.to_string(),
-            })?;
-
-    let (inflight, orphaned) = pass_gate(env, ws_id, force).await?;
-
-    let dir = PathBuf::from(&row.work_dir);
-    hub.begin_close(&dir)
-        .await
-        .map_err(|e| map_tool_error(e, ws_id))?;
-
-    let result = workspaces::delete(&env.pool, ws_id)
-        .await
-        .map(|_| ())
-        .map_err(DaemonError::from);
-    hub.finish_close(&dir).await;
-    result?;
-
-    Ok(CloseOutcome {
-        inflight,
-        orphaned,
-        purged: true,
-    })
-}
-
 /// 门槛：先统计，不通过就 409 且不动实例表；`force` 时把在飞台账置 `orphan`。
-async fn pass_gate(
+pub(crate) async fn pass_gate(
     env: &SpaceEnv,
     ws_id: &str,
     force: bool,

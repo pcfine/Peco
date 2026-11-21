@@ -14,6 +14,10 @@ use crate::space::manifest;
 /// 单空间退出策略的默认值：跟随全局。
 pub const EXIT_POLICY_INHERIT: &str = "inherit";
 
+/// 五处读行共用的列清单：漏一列就是某个调用方拿不到 `deleted_at`。
+const ROW_COLUMNS: &str = "id, work_dir, team_id, label, exit_policy, created_at, \
+                           last_opened_at, closed_at, deleted_at";
+
 /// workspaces 表完整行。
 #[derive(Debug, sqlx::FromRow)]
 pub struct WorkspaceRow {
@@ -25,6 +29,15 @@ pub struct WorkspaceRow {
     pub created_at: String,
     pub last_opened_at: Option<String>,
     pub closed_at: Option<String>,
+    /// 非空 = 在回收站：行与会话、记忆都还在，只是不再算「可用空间」。
+    pub deleted_at: Option<String>,
+}
+
+impl WorkspaceRow {
+    /// 在回收站里（`deleted_at` 非空）。
+    pub fn is_trashed(&self) -> bool {
+        self.deleted_at.is_some()
+    }
 }
 
 /// 写入一行的入参。
@@ -62,26 +75,22 @@ pub async fn by_work_dir(
     pool: &SqlitePool,
     work_dir: &str,
 ) -> Result<Option<WorkspaceRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkspaceRow>(
-        "SELECT id, work_dir, team_id, label, exit_policy, created_at, last_opened_at, closed_at \
-         FROM workspaces WHERE work_dir = ?",
-    )
-    .bind(work_dir)
-    .fetch_optional(pool)
-    .await
+    let sql = format!("SELECT {ROW_COLUMNS} FROM workspaces WHERE work_dir = ?");
+    sqlx::query_as::<_, WorkspaceRow>(&sql)
+        .bind(work_dir)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn by_id(pool: &SqlitePool, id: &str) -> Result<Option<WorkspaceRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkspaceRow>(
-        "SELECT id, work_dir, team_id, label, exit_policy, created_at, last_opened_at, closed_at \
-         FROM workspaces WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
+    let sql = format!("SELECT {ROW_COLUMNS} FROM workspaces WHERE id = ?");
+    sqlx::query_as::<_, WorkspaceRow>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
-/// 同团队里仍未关闭的空间目录（`closed_at IS NULL`）。
+/// 同团队里仍未关闭、也不在回收站的空间目录（`closed_at IS NULL`）。
 ///
 /// 只取目录：调用方要的是「哪些实例可能还活着」，行里的其它列由实例表
 /// （`WorkspaceHub`）决定，多读一遍就会有两份可能不一致的答案。
@@ -90,30 +99,35 @@ pub async fn open_work_dirs_by_team(
     team_id: &str,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
-        "SELECT work_dir FROM workspaces WHERE team_id = ? AND closed_at IS NULL",
+        "SELECT work_dir FROM workspaces \
+         WHERE team_id = ? AND closed_at IS NULL AND deleted_at IS NULL",
     )
     .bind(team_id)
     .fetch_all(pool)
     .await
 }
 
-/// 全部仍未关闭的空间目录（`closed_at IS NULL`），跨团队。
+/// 全部仍未关闭、也不在回收站的空间目录（`closed_at IS NULL`），跨团队。
 ///
 /// 改 Peco 的 provider 会波及所有继承它的团队，只刷 Peco 自己的空间等于让
 /// 其余团队一直拿着旧快照。
 pub async fn open_work_dirs(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>("SELECT work_dir FROM workspaces WHERE closed_at IS NULL")
-        .fetch_all(pool)
-        .await
-}
-
-pub async fn list(pool: &SqlitePool) -> Result<Vec<WorkspaceRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkspaceRow>(
-        "SELECT id, work_dir, team_id, label, exit_policy, created_at, last_opened_at, closed_at \
-         FROM workspaces ORDER BY created_at, id",
+    sqlx::query_scalar::<_, String>(
+        "SELECT work_dir FROM workspaces WHERE closed_at IS NULL AND deleted_at IS NULL",
     )
     .fetch_all(pool)
     .await
+}
+
+/// 活动空间（不含回收站），按创建序。
+pub async fn list(pool: &SqlitePool) -> Result<Vec<WorkspaceRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM workspaces WHERE deleted_at IS NULL \
+                       ORDER BY created_at, id"
+    );
+    sqlx::query_as::<_, WorkspaceRow>(&sql)
+        .fetch_all(pool)
+        .await
 }
 
 /// 标记一次成功打开；同时清掉 `closed_at`（重新打开即复活）。
@@ -168,6 +182,52 @@ pub async fn set_closed_at(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Erro
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// 移入回收站：只置 `deleted_at`，会话与记忆一律不动。
+pub async fn set_deleted_at(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE workspaces SET deleted_at = datetime('now') WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 出回收站。`closed_at` 不动：恢复后是「已关闭」，要不要打开是用户的下一件事。
+pub async fn clear_deleted_at(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE workspaces SET deleted_at = NULL WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 回收站清单，最近移入的在前。
+pub async fn trashed(pool: &SqlitePool) -> Result<Vec<WorkspaceRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM workspaces WHERE deleted_at IS NOT NULL \
+         ORDER BY deleted_at DESC, id"
+    );
+    sqlx::query_as::<_, WorkspaceRow>(&sql)
+        .fetch_all(pool)
+        .await
+}
+
+/// 回收站里的行数（上限判据）。
+pub async fn count_trashed(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workspaces WHERE deleted_at IS NOT NULL")
+        .fetch_one(pool)
+        .await
+}
+
+/// 某团队里还需要做存量记忆迁移的空间（含回收站行）。
+///
+/// 回收站行也算：它被恢复后仍要靠团队旧库迁移，团队级摘牌必须等它完成。
+pub async fn ids_by_team(pool: &SqlitePool, team_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT id FROM workspaces WHERE team_id = ? ORDER BY id")
+        .bind(team_id)
+        .fetch_all(pool)
+        .await
 }
 
 /// 硬删空间行（`purge`）。台账行不随之删除 —— 那是另一张表。
@@ -308,13 +368,14 @@ pub async fn list_by_team(
     pool: &SqlitePool,
     team_id: &str,
 ) -> Result<Vec<WorkspaceRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkspaceRow>(
-        "SELECT id, work_dir, team_id, label, exit_policy, created_at, last_opened_at, closed_at \
-         FROM workspaces WHERE team_id = ? ORDER BY created_at, id",
-    )
-    .bind(team_id)
-    .fetch_all(pool)
-    .await
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM workspaces WHERE team_id = ? AND deleted_at IS NULL \
+         ORDER BY created_at, id"
+    );
+    sqlx::query_as::<_, WorkspaceRow>(&sql)
+        .bind(team_id)
+        .fetch_all(pool)
+        .await
 }
 
 #[cfg(test)]

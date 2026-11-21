@@ -346,8 +346,13 @@ fn invalid_cron(error: cron::CronError) -> ApiError {
     )
 }
 
+/// 目标空间必须是一个可用空间：回收站里的行还在库里，但它不是合法的排期目标。
 async fn ensure_space_exists(state: &AppState, ws_id: &str) -> Result<(), ApiError> {
     match workspaces::by_id(&state.pool, ws_id).await? {
+        Some(row) if row.is_trashed() => Err(DaemonError::SpaceTrashed {
+            ws_id: ws_id.to_string(),
+        }
+        .into()),
         Some(_) => Ok(()),
         None => Err(DaemonError::SpaceNotFound {
             ws_id: ws_id.to_string(),

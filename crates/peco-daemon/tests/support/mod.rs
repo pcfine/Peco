@@ -722,6 +722,34 @@ impl TestEnv {
             )
             .await;
         assert_eq!(reply.status, 201, "建空间失败: {}", reply.body);
-        reply.body["ws_id"].as_str().unwrap().to_string()
+        let ws_id = reply.body["ws_id"].as_str().unwrap().to_string();
+        self.use_in_memory_memory_backend(&ws_id);
+        ws_id
+    }
+
+    /// 把该空间的记忆库换成 InMemory 后端（测试专用）。
+    ///
+    /// 默认配置是生产口径（HelixDb + bge-base）：测试环境里既没有 Helix 服务、
+    /// 也没有模型缓存，留着它会让每一轮对话都付一次「打开记忆库失败」的等待，
+    /// 而记忆库本身的落盘位置、隔离维度与读写路径都不变。空间尚未用过记忆库时
+    /// （`KnowledgeManager` 是懒加载的）改写配置是安全的。
+    pub fn use_in_memory_memory_backend(&self, ws_id: &str) {
+        self.write_memory_backend(ws_id, "InMemory", "all-mini-l-m-l6-v2-q");
+    }
+
+    /// 直写记忆库的 `kb_config.json`：`backend` / `embedding_model` 由调用方决定。
+    pub fn write_memory_backend(&self, ws_id: &str, backend: &str, embedding_model: &str) {
+        let dir = self.home.join("memory").join(ws_id).join("@private_memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = json!({
+            "name": "@private_memory",
+            "description": "测试记忆库",
+            "embedding_model": embedding_model,
+            "chunking": {"type": "fixed-size", "size": 100},
+            "backend": backend,
+            "storage_path": null,
+            "default_storage_mode": "full",
+        });
+        std::fs::write(dir.join("kb_config.json"), config.to_string()).unwrap();
     }
 }

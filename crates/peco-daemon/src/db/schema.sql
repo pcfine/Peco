@@ -215,7 +215,9 @@ CREATE TABLE IF NOT EXISTS workspaces (
                    CHECK (exit_policy IN ('inherit','keep','stop')),
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     last_opened_at TEXT,
-    closed_at      TEXT
+    closed_at      TEXT,
+    -- 非空 = 在回收站：行与会话、记忆都留着，只是不再出现在清单与打开路径里。
+    deleted_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workspaces_team ON workspaces(team_id);
 
@@ -334,3 +336,5 @@ CREATE INDEX IF NOT EXISTS idx_conversations_workspace_agent ON conversations(wo
 -- 永久留在库里。DROP 也覆盖「019 已成功、进程随后崩溃」的窗口。
 DROP INDEX IF EXISTS idx_dispatches_state;
 CREATE INDEX IF NOT EXISTS idx_dispatches_task_state ON d_dispatches(target_ws_id, task_state);
+-- 回收站索引建在迁移 031 给旧库补出的列上，故放在分界之后。
+CREATE INDEX IF NOT EXISTS idx_workspaces_deleted ON workspaces(deleted_at);

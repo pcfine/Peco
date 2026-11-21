@@ -159,6 +159,17 @@ impl TaskObservationSink for TaskObserver {
             );
             return;
         };
+        // 回收站行还占着目录，但它已经不是可用目标：把它写进台账等于让后续唤醒
+        // 与取消都指向一个「已删除」的空间。
+        if row.is_trashed() {
+            warn!(
+                task_id = %obs.task_id,
+                target_dir,
+                ws_id = %row.id,
+                "dispatch target is in the trash; ledger insert skipped"
+            );
+            return;
+        }
 
         let state = snapshot.state.as_str();
         let id = format!("d_{}", obs.task_id);

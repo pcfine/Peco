@@ -1,28 +1,25 @@
-//! `/api/spaces/{ws_id}/memory/documents` —— 按空间浏览记忆。
+//! `/api/spaces/{ws_id}/memory/documents` —— 按空间浏览它自己的记忆库。
 //!
-//! 重点不在「能不能列出来」，而在**归属只由 `ws_id` 标签决定**：同团队的空间
-//! 共用一套物理记忆库，物理上彼此可见，可见性因此完全由过滤决定。用例的夹具
-//! 刻意把同一批文档写进两个空间的库里，让「去掉过滤」必然表现为串记忆。
+//! 重点在**读的是哪个库**：每个空间一份物理记忆库（`$PECO_HOME/memory/<ws_id>/`），
+//! 端点必须读本空间那一份，而不是团队库。夹具刻意把同一条内容同时写进两个空间的
+//! 库与团队库，让「读错了库」必然表现为串记忆。
 
 mod support;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use knowledge_base::{
     BackendType, ChunkingStrategySerde, DocumentMetadata, FastembedModelTypeSerde, KbConfig,
 };
 use peco_core::knowledge::KnowledgeManager;
+use peco_core::tools::KnowledgeAccess;
 use peco_daemon::memory::WS_ID_TAG;
 use serde_json::json;
 use support::{TestEnv, new_env};
 
 const MEMORY_KB: &str = "@private_memory";
 
-/// 并发建库会抢同一份 fastembed 模型缓存，抢输的那次初始化直接失败 ——
-/// 夹具因此串行建库；库建成之后的读写互不影响。
-static KB_BUILD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-/// 一条待写入的记忆：`ws_id` 为 `None` 就是升级前的老记忆（没有归属标签）。
+/// 一条待写入的记忆：`ws_id` 为 `None` = 没有归属标签（迁移过来的老记忆就是这样）。
 struct Doc<'a> {
     ws_id: Option<&'a str>,
     source: &'a str,
@@ -39,29 +36,29 @@ fn doc<'a>(ws_id: Option<&'a str>, source: &'a str, title: &'a str, content: &'a
     }
 }
 
+/// 空间自己的记忆管理器（打开空间时注入的那一份）。
 async fn memory_km(env: &TestEnv, ws_id: &str) -> Arc<KnowledgeManager> {
-    env.open(ws_id)
-        .await
-        .expect("空间应已打开")
+    let handle = env.open(ws_id).await.expect("空间应已打开");
+    handle
         .workspace()
-        .knowledge_manager()
-        .clone()
+        .memory_manager()
+        .cloned()
+        .expect("打开的空间必须带记忆管理器")
 }
 
-/// 保证 `@private_memory` 存在。第二个 `KnowledgeManager` 实例会从磁盘上的
-/// `kb_config.json` 打开同一个库，因此只需建一次。
-async fn ensure_memory_kb(km: &KnowledgeManager) {
-    let _guard = KB_BUILD
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    let existing = km.list_kbs().await.unwrap();
+/// 团队库（升级前的共享记忆库）；端点不该读它。
+///
+/// 模板已不再携带团队级 `@private_memory`，这里手工建一份「存量旧库」。
+async fn team_km(env: &TestEnv, ws_id: &str) -> Arc<KnowledgeManager> {
+    let handle = env.open(ws_id).await.expect("空间应已打开");
+    let km = Arc::clone(handle.workspace().knowledge_manager());
+    let existing = km.list_kbs().await.expect("列出团队库");
     if existing.iter().any(|kb| kb.name == MEMORY_KB) {
-        return;
+        return km;
     }
     km.create_kb(KbConfig {
         name: MEMORY_KB.into(),
-        description: "测试记忆库".into(),
+        description: "团队级旧记忆库".into(),
         embedding_model: FastembedModelTypeSerde::AllMiniLML6V2Q,
         chunking: ChunkingStrategySerde::FixedSize { size: 100 },
         backend: BackendType::InMemory,
@@ -70,53 +67,33 @@ async fn ensure_memory_kb(km: &KnowledgeManager) {
         helix_url: None,
     })
     .await
-    .unwrap();
+    .expect("建出团队级旧记忆库");
+    km
 }
 
-/// 把同一批文档写进给定空间的库里，返回与 `docs` 同序的文档 id。
-///
-/// 写两份是夹具的刻意设计：生产上同团队的空间共用一套物理 KB（`kb_scope` =
-/// team_id），而测试用的 InMemory 后端是进程实例级的，各 `WorkSpace` 一份。
-/// 只写一份的话，「对方空间看不到我的记忆」会因为对方库里根本没有这些文档而
-/// 恒成立 —— 去掉 ws_id 过滤也照样通过，隔离用例就成了假绿。
-async fn seed(env: &TestEnv, spaces: &[&str], docs: &[Doc<'_>]) -> Vec<String> {
+/// 把文档写进给定管理器的 `@private_memory`，返回与 `docs` 同序的 id。
+async fn write(km: &Arc<KnowledgeManager>, docs: &[Doc<'_>]) -> Vec<String> {
     let mut ids = Vec::new();
-    for (index, ws_id) in spaces.iter().enumerate() {
-        let km = memory_km(env, ws_id).await;
-        ensure_memory_kb(&km).await;
-        for doc in docs {
-            let mut metadata = DocumentMetadata::default();
-            if let Some(tag) = doc.ws_id {
-                metadata
-                    .extra
-                    .insert(WS_ID_TAG.to_string(), tag.to_string());
-            }
-            let written = km
-                .add_text_to_kb_with_metadata(
-                    MEMORY_KB,
-                    doc.title,
-                    doc.content,
-                    doc.source,
-                    metadata,
-                )
-                .await
-                .unwrap();
-            // 文档 id 由正文决定，各实例写入同一份内容得到同一个 id：
-            // 收集第一份即可，用例不必记住「哪个 id 来自哪份实例」。
-            if index == 0 {
-                ids.push(written.id);
-            }
+    for doc in docs {
+        let mut metadata = DocumentMetadata::default();
+        if let Some(tag) = doc.ws_id {
+            metadata
+                .extra
+                .insert(WS_ID_TAG.to_string(), tag.to_string());
         }
+        let written = km
+            .add_text_to_kb_with_metadata(MEMORY_KB, doc.title, doc.content, doc.source, metadata)
+            .await
+            .expect("写入记忆库");
+        ids.push(written.id);
     }
     ids
 }
 
-async fn raw_titles(env: &TestEnv, ws_id: &str) -> Vec<String> {
-    memory_km(env, ws_id)
+async fn raw_titles(km: &Arc<KnowledgeManager>) -> Vec<String> {
+    km.list_memory_documents_with_content(MEMORY_KB, 100)
         .await
-        .list_memory_documents_with_content(MEMORY_KB, 100)
-        .await
-        .unwrap()
+        .expect("列出记忆库")
         .into_iter()
         .map(|doc| doc.title)
         .collect()
@@ -140,43 +117,49 @@ fn sorted_item_titles(body: &serde_json::Value) -> Vec<String> {
 
 /// 两个空间各写两条记忆 ⇒ 各自的列表只含自己的（双向）。
 ///
-/// 变异：去掉列表里的 `belongs_to` 过滤 → 两个空间都看到 4 条（外加一份无标签
-/// 老记忆共 5 条），两条 `assert_eq!(total, 2)` 与内容断言同时变红。
+/// 变异：把 handler 里的记忆管理器换回 `ws.knowledge_manager()`（团队库）→
+/// ws_a 的列表会多出团队库那条，两条 `total` 断言与内容断言同时变红。
 #[tokio::test]
 async fn list_stays_inside_its_own_space_in_both_directions() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
     let ws_b = env.open_space("mem-b", "research").await;
-    seed(
-        &env,
-        &[&ws_a, &ws_b],
+
+    write(
+        &memory_km(&env, &ws_a).await,
+        &[
+            doc(None, "ppa_semantic", "a_rust", "用户的主开发语言是 Rust"),
+            doc(Some(&ws_a), "ppa_episodic", "a_release", "周五发布 v2"),
+        ],
+    )
+    .await;
+    write(
+        &memory_km(&env, &ws_b).await,
         &[
             doc(
-                Some(&ws_a),
-                "ppa_semantic",
-                "a_rust",
-                "用户的主开发语言是 Rust",
-            ),
-            doc(Some(&ws_a), "ppa_episodic", "a_release", "周五发布 v2"),
-            doc(
-                Some(&ws_b),
+                None,
                 "ppa_semantic",
                 "b_python",
                 "用户的主开发语言是 Python",
             ),
-            doc(Some(&ws_b), "ppa_episodic", "b_standup", "周一开例会"),
-            // 没有 ws_id 的老记忆：同一份库里存在，但谁都无权展示它。
-            doc(None, "ppa_semantic", "legacy_indent", "用户偏好 tab 缩进"),
+            doc(None, "ppa_episodic", "b_standup", "周一开例会"),
         ],
     )
     .await;
+    // 团队库里也放一条同名库的文档：端点读团队库就会把它列出来。
+    write(
+        &team_km(&env, &ws_a).await,
+        &[doc(
+            Some(&ws_a),
+            "ppa_semantic",
+            "team_leftover",
+            "团队级旧记忆",
+        )],
+    )
+    .await;
 
-    // 前提：两份实例里都确实躺着别人的文档 —— 否则本用例测不到过滤。
-    for ws_id in [&ws_a, &ws_b] {
-        let titles = raw_titles(&env, ws_id).await;
-        assert_eq!(titles.len(), 5, "库里应能看到全部 5 条: {titles:?}");
-        assert!(titles.contains(&"b_python".to_string()), "{titles:?}");
-    }
+    // 前提：两份实例里都躺着别人的 / 无标签的文档 —— 否则本用例测不到「读哪个库」。
+    assert_eq!(raw_titles(&memory_km(&env, &ws_a).await).await.len(), 2);
 
     let from_a = env
         .get(&format!("/api/spaces/{ws_a}/memory/documents"))
@@ -185,17 +168,14 @@ async fn list_stays_inside_its_own_space_in_both_directions() {
     assert_eq!(from_a.body["total"], json!(2), "body={}", from_a.body);
     assert_eq!(
         sorted_item_titles(&from_a.body),
-        vec!["a_release", "a_rust"]
+        vec!["a_release", "a_rust"],
+        "无标签的记忆同样是本空间的（迁移过来的老记忆没有标签）"
     );
     let a_text = from_a.body.to_string();
     assert!(!a_text.contains("Python"), "不得列出 ws_b 的记忆: {a_text}");
     assert!(
-        !a_text.contains("周一开例会"),
-        "不得列出 ws_b 的记忆: {a_text}"
-    );
-    assert!(
-        !a_text.contains("tab 缩进"),
-        "不得列出无标签的老记忆: {a_text}"
+        !a_text.contains("团队级旧记忆"),
+        "不得列出团队库的文档: {a_text}"
     );
 
     let from_b = env
@@ -210,39 +190,32 @@ async fn list_stays_inside_its_own_space_in_both_directions() {
     let b_text = from_b.body.to_string();
     assert!(!b_text.contains("Rust"), "不得列出 ws_a 的记忆: {b_text}");
     assert!(
-        !b_text.contains("周五发布 v2"),
-        "不得列出 ws_a 的记忆: {b_text}"
+        !b_text.contains("团队级旧记忆"),
+        "不得列出团队库的文档: {b_text}"
     );
 }
 
-/// 空空间：库里只有别人的记忆与无标签老记忆 ⇒ 列表为空，`total` 也是 0。
-///
-/// 变异：去掉 `belongs_to` 过滤 → 这份列表会把 ws_a 的两条与老记忆一起列出来。
+/// 空空间：别人的库里写满了，本空间的库还没内容 ⇒ 列表为空，`total` 也是 0。
 #[tokio::test]
-async fn empty_space_lists_nothing_even_when_the_kb_has_documents() {
+async fn empty_space_lists_nothing_even_when_other_libraries_have_documents() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
     let ws_b = env.open_space("mem-b", "research").await;
-    seed(
-        &env,
-        &[&ws_a, &ws_b],
-        &[
-            doc(
-                Some(&ws_a),
-                "ppa_semantic",
-                "a_rust",
-                "用户的主开发语言是 Rust",
-            ),
-            doc(None, "ppa_semantic", "legacy_indent", "用户偏好 tab 缩进"),
-        ],
+    write(
+        &memory_km(&env, &ws_a).await,
+        &[doc(
+            None,
+            "ppa_semantic",
+            "a_rust",
+            "用户的主开发语言是 Rust",
+        )],
     )
     .await;
-
-    assert_eq!(
-        raw_titles(&env, &ws_b).await.len(),
-        2,
-        "前提：库里有两份文档"
-    );
+    write(
+        &team_km(&env, &ws_a).await,
+        &[doc(None, "ppa_semantic", "team_leftover", "团队级旧记忆")],
+    )
+    .await;
 
     let reply = env
         .get(&format!("/api/spaces/{ws_b}/memory/documents"))
@@ -257,18 +230,12 @@ async fn empty_space_lists_nothing_even_when_the_kb_has_documents() {
 async fn category_and_query_narrow_within_the_space() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
-    seed(
-        &env,
-        &[&ws_a],
+    write(
+        &memory_km(&env, &ws_a).await,
         &[
-            doc(Some(&ws_a), "ppa_profile", "memory_1", "用户偏好简洁的回答"),
-            doc(
-                Some(&ws_a),
-                "ppa_semantic",
-                "memory_2",
-                "用户在用 Rust 写 daemon",
-            ),
-            doc(Some(&ws_a), "ppa_episodic", "memory_3", "周五上线"),
+            doc(None, "ppa_profile", "memory_1", "用户偏好简洁的回答"),
+            doc(None, "ppa_semantic", "memory_2", "用户在用 Rust 写 daemon"),
+            doc(None, "ppa_episodic", "memory_3", "周五上线"),
         ],
     )
     .await;
@@ -319,15 +286,14 @@ async fn category_and_query_narrow_within_the_space() {
 async fn pagination_covers_the_offset_boundaries() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
-    seed(
-        &env,
-        &[&ws_a],
+    write(
+        &memory_km(&env, &ws_a).await,
         &[
-            doc(Some(&ws_a), "ppa_semantic", "p1", "记忆一"),
-            doc(Some(&ws_a), "ppa_semantic", "p2", "记忆二"),
-            doc(Some(&ws_a), "ppa_semantic", "p3", "记忆三"),
-            doc(Some(&ws_a), "ppa_semantic", "p4", "记忆四"),
-            doc(Some(&ws_a), "ppa_semantic", "p5", "记忆五"),
+            doc(None, "ppa_semantic", "p1", "记忆一"),
+            doc(None, "ppa_semantic", "p2", "记忆二"),
+            doc(None, "ppa_semantic", "p3", "记忆三"),
+            doc(None, "ppa_semantic", "p4", "记忆四"),
+            doc(None, "ppa_semantic", "p5", "记忆五"),
         ],
     )
     .await;
@@ -374,16 +340,13 @@ async fn pagination_covers_the_offset_boundaries() {
 }
 
 /// 详情：本空间的文档给完整正文（不是截图式截断），并带上 metadata。
-///
-/// 变异：详情改成不做 `belongs_to` 校验 → 下一个用例变红，本用例不变。
 #[tokio::test]
 async fn detail_returns_full_content_for_own_documents() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
     let long_body = format!("{}尾巴", "长".repeat(300));
-    let ids = seed(
-        &env,
-        &[&ws_a],
+    let ids = write(
+        &memory_km(&env, &ws_a).await,
         &[doc(Some(&ws_a), "ppa_semantic", "memory_long", &long_body)],
     )
     .await;
@@ -416,45 +379,41 @@ async fn detail_returns_full_content_for_own_documents() {
 
 /// 跨空间与不存在回同一个 404：分开报就等于确认「这个 id 真实存在」。
 ///
-/// 变异：详情去掉 `belongs_to` 校验（直接返回文档）→ 跨空间那条断言从 404
-/// 变成 200，本用例变红。
+/// 变异：详情改成读团队库 → 下面第二条（别的空间的文档）会变成 200。
 #[tokio::test]
-async fn detail_hides_foreign_missing_and_legacy_documents_behind_404() {
+async fn detail_hides_foreign_and_missing_documents_behind_404() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
     let ws_b = env.open_space("mem-b", "research").await;
-    let ids = seed(
-        &env,
-        &[&ws_a, &ws_b],
-        &[
-            doc(
-                Some(&ws_a),
-                "ppa_semantic",
-                "a_rust",
-                "用户的主开发语言是 Rust",
-            ),
-            doc(
-                Some(&ws_b),
-                "ppa_semantic",
-                "b_python",
-                "用户的主开发语言是 Python",
-            ),
-            doc(None, "ppa_semantic", "legacy_indent", "用户偏好 tab 缩进"),
-        ],
+    let own = write(
+        &memory_km(&env, &ws_a).await,
+        &[doc(
+            None,
+            "ppa_semantic",
+            "a_rust",
+            "用户的主开发语言是 Rust",
+        )],
     )
     .await;
-    let foreign_id = &ids[1];
-    let legacy_id = &ids[2];
+    let foreign = write(
+        &memory_km(&env, &ws_b).await,
+        &[doc(
+            None,
+            "ppa_semantic",
+            "b_python",
+            "用户的主开发语言是 Python",
+        )],
+    )
+    .await;
 
     // 前提：这条路在本空间里是通的，否则「跨空间 404」可能只是路由不通。
-    let own = env
-        .get(&format!("/api/spaces/{ws_a}/memory/documents/{}", ids[0]))
+    let ok = env
+        .get(&format!("/api/spaces/{ws_a}/memory/documents/{}", own[0]))
         .await;
-    assert_eq!(own.status, 200, "body={}", own.body);
+    assert_eq!(ok.status, 200, "body={}", ok.body);
 
     for (doc_id, label) in [
-        (foreign_id.clone(), "别的空间的文档"),
-        (legacy_id.clone(), "没有归属标签的老记忆"),
+        (foreign[0].clone(), "别的空间的文档"),
         ("doc_does_not_exist".to_string(), "不存在的 id"),
     ] {
         let reply = env
@@ -475,11 +434,10 @@ async fn detail_hides_foreign_missing_and_legacy_documents_behind_404() {
 async fn memory_endpoints_require_an_open_space() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
-    let ids = seed(
-        &env,
-        &[&ws_a],
+    let ids = write(
+        &memory_km(&env, &ws_a).await,
         &[doc(
-            Some(&ws_a),
+            None,
             "ppa_semantic",
             "a_rust",
             "用户的主开发语言是 Rust",
@@ -513,11 +471,20 @@ async fn memory_endpoints_require_an_open_space() {
     assert_eq!(ghost.code(), "space_not_found");
 }
 
-/// 新空间还没有记忆库 ⇒ 空列表，不是 500；详情仍然是 404。
+/// 记忆库配置被删掉（库不存在）⇒ 空列表，不是 500；详情仍然是 404。
 #[tokio::test]
 async fn missing_memory_kb_lists_nothing() {
     let env = new_env(&["research"]).await;
     let ws_a = env.open_space("mem-a", "research").await;
+    // 删掉配置 = 这个空间从未建过库；打开路径只保证「首次打开时写默认配置」。
+    std::fs::remove_file(
+        env.home
+            .join("memory")
+            .join(&ws_a)
+            .join("@private_memory")
+            .join("kb_config.json"),
+    )
+    .unwrap();
 
     let list = env
         .get(&format!("/api/spaces/{ws_a}/memory/documents"))

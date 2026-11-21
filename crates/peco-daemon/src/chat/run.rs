@@ -21,6 +21,7 @@ use model_provider::{Content, Usage, text_of_blocks};
 use peco_core::agent::{AgentLooper, LooperEvent, LooperState, ResponseOrigin};
 use peco_core::session::Session;
 use peco_core::session::SessionPersister;
+use peco_core::tools::KnowledgeAccess;
 use sqlx::SqlitePool;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -336,8 +337,8 @@ pub(crate) async fn spawn_run(
         &team_id,
         ws.work_dir().root().to_path_buf(),
         Arc::clone(agent.provider()),
-        // 记忆写进本轮空间自己的库：同一个团队的空间共用一套 KB，标签才分得开。
-        Arc::clone(ws.knowledge_manager()),
+        // 记忆写进本轮空间自己的库（打开空间时注入的那一份），不是团队的。
+        ws.memory_manager().map(Arc::clone),
         // 压缩日志与边界观测按会话归档，指标才能只读本会话的时间线。
         &conv_id,
     );

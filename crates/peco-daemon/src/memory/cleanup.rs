@@ -11,14 +11,8 @@ use knowledge_base::Document;
 use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
 use tracing::warn;
 
-use super::WS_ID_TAG;
 use super::config::MemoryConfig;
-
-/// 全量扫描上限。
-///
-/// 取一个远大于单用户实际规模的具体上界：`list_all` 需要一个 limit，
-/// 交给它 `usize::MAX` 会让后端按不可能达到的规模预分配缓冲。
-const SCAN_LIMIT: usize = 10_000;
+use super::{MEMORY_SCAN_LIMIT, WS_ID_TAG};
 
 /// 删除无空间标签的旧记忆，返回删除条数。
 ///
@@ -29,7 +23,7 @@ pub async fn purge_legacy(
     config: &MemoryConfig,
 ) -> Result<usize, KnowledgeModuleError> {
     let documents = match km
-        .list_memory_documents_with_content(&config.kb_name, SCAN_LIMIT)
+        .list_memory_documents_with_content(&config.kb_name, MEMORY_SCAN_LIMIT)
         .await
     {
         Ok(documents) => documents,

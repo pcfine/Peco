@@ -34,6 +34,8 @@ impl SpaceCatalogContext {
     /// 采集 + 落格式；任何 DB 失败都上抛给 [`DynamicContext::query`] 降级。
     async fn catalog(&self) -> Result<Catalog, DaemonError> {
         let mut spaces = Vec::new();
+        // `workspaces::list` 已排除回收站行；这里再取一个计数，好在清单末尾说明
+        // 「少掉的那些去哪了」—— 模型看不到某个目录时，唯一的解释来源就是这句。
         for row in workspaces::list(&self.pool).await? {
             // 只排除用户显式关过的目标：替他撤销一次关闭，比漏一个目标更糟。
             // 「当前没打开」不是排除理由 —— 派发自己会 `ensure_open` 再投递，
@@ -62,6 +64,7 @@ impl SpaceCatalogContext {
 
         Ok(Catalog {
             spaces,
+            trashed: workspaces::count_trashed(&self.pool).await?,
             teams: self.team_lines(),
             current_dir: std::fs::canonicalize(&self.peco.work_dir)
                 .unwrap_or_else(|_| self.peco.work_dir.clone())
@@ -131,6 +134,8 @@ struct SpaceEntry {
 struct Catalog {
     /// 已按最近活跃倒序。
     spaces: Vec<SpaceEntry>,
+    /// 回收站里的空间数；它们不可派发，也不在上面这份清单里。
+    trashed: i64,
     teams: Vec<String>,
     current_dir: String,
     current_ws_id: String,
@@ -174,6 +179,12 @@ impl Catalog {
             self.current_dir,
             self.current_ws_id
         ));
+        if self.trashed > 0 {
+            out.push_str(&format!(
+                "另有 {} 个空间在回收站（不在清单里，不可作为派发目标）\n",
+                self.trashed
+            ));
+        }
 
         out.push_str("## 团队\n");
         for line in &self.teams[..kept_teams] {

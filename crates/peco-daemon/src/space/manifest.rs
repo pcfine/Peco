@@ -22,6 +22,19 @@ pub fn write(dir: &Path, value: &WorkspaceManifest) -> Result<(), DaemonError> {
     manifest::write(dir, value).map_err(map_error)
 }
 
+/// 删掉目录里的记录文件；文件不存在视为成功。
+///
+/// 这是删除路径上**唯一**允许删的文件 —— 工作目录里的用户文件永不被删。
+/// 删它是「不再复活」的关键：普查只认 marker，marker 没了目录就不会重新变成
+/// 空间，同时该目录立刻可以被建成新空间。
+pub fn remove(dir: &Path) -> Result<(), DaemonError> {
+    match std::fs::remove_file(dir.join(MANIFEST_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DaemonError::Io(e)),
+    }
+}
+
 /// 只建不改：目标已存在时返回 `false`。
 ///
 /// 引导流程据此保持幂等：并发两次启动只有一次真正写盘，已有的记录字节不变。

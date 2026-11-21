@@ -15,6 +15,7 @@ pub mod reconcile;
 pub mod registry;
 pub mod report;
 pub mod tasks;
+pub mod trash;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
@@ -152,8 +153,9 @@ impl SpaceEnv {
     /// 抽取与召回也只对「同一个空间里持续对话的 @master」有意义。machine 任务
     /// 每条都是新建的临时会话、跑完即弃，历史不跨轮增长，挂上只是白付成本。
     ///
-    /// `km` 必须是本轮空间自己的知识管理器：记忆库按团队隔离（`kb_scope`），
-    /// 用别的团队的实例会把记忆写进别人的库。
+    /// `memory` 是本轮空间自己的记忆管理器（打开空间时注入）：记忆库一个空间
+    /// 一份，拿团队管理器会把记忆写进别人的库。为 `None` 时不挂记忆读写 ——
+    /// 没有库可写，挂上去只会每轮白付一次失败。
     ///
     /// `conversation_id` 只用于把压缩日志与边界观测挂到本轮会话上。
     pub fn chat_looper_config(
@@ -162,7 +164,7 @@ impl SpaceEnv {
         team_id: &str,
         work_dir: PathBuf,
         provider: Arc<dyn ModelProvider>,
-        km: Arc<KnowledgeManager>,
+        memory: Option<Arc<KnowledgeManager>>,
         conversation_id: &str,
     ) -> LooperConfig {
         let mut config = self.looper_config(ws_id, team_id, work_dir);
@@ -217,17 +219,24 @@ impl SpaceEnv {
             limits.strip.tool_output_max_chars,
         )));
 
+        let Some(memory_km) = memory else {
+            tracing::warn!(
+                ws_id,
+                "space has no memory manager; memory read/write is off for this turn"
+            );
+            return config;
+        };
         let memory = MemoryConfig::from_env();
         // push 而不是替换：`from_env()` 的 hook 链与本轮的派发观察 hook 都要保留，
         // 记忆提取只是又一位观察者。
         config.hooks.push(Arc::new(MemoryExtractionHook::new(
-            Arc::clone(&km),
+            Arc::clone(&memory_km),
             Arc::new(ModelTurnAnalyzer::new(provider, memory.model.clone())),
             memory.clone(),
             ws_id,
         )));
         config.dynamic_context =
-            Some(self.memory_context(ws_id, km, memory, config.dynamic_context.take()));
+            Some(self.memory_context(ws_id, memory_km, memory, config.dynamic_context.take()));
         config
     }
 

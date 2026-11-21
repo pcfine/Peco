@@ -89,7 +89,7 @@ async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
         "peco",
         work_dir.clone(),
         provider.clone(),
-        Arc::clone(&km),
+        Some(Arc::clone(&km)),
         "conv-chat-1",
     );
     assert!(chat.compaction.is_some(), "聊天 run 必须挂压缩");
@@ -125,9 +125,14 @@ async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
     );
 
     // 非 Peco 空间：没有空间清单，但记忆召回与压缩照挂。
-    let plain =
-        env.env
-            .chat_looper_config("ws_plain", "peco", work_dir, provider, km, "conv-plain-1");
+    let plain = env.env.chat_looper_config(
+        "ws_plain",
+        "peco",
+        work_dir,
+        provider,
+        Some(km),
+        "conv-plain-1",
+    );
     assert!(
         plain.dynamic_context.is_some(),
         "记忆召回对每个空间的 @master 都生效"

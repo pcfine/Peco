@@ -69,8 +69,10 @@ impl DaemonScheduleAccess {
 mod schedules_targets {
     use sqlx::SqlitePool;
 
+    /// 回收站里的空间不算目标：排期是「到点在这个空间里做一件事」，
+    /// 指向一个已删除的空间只会在每次触发时失败一次。
     pub async fn by_id(pool: &SqlitePool, ws_id: &str) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT id FROM workspaces WHERE id = ?")
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE id = ? AND deleted_at IS NULL")
             .bind(ws_id)
             .fetch_optional(pool)
             .await
@@ -78,11 +80,14 @@ mod schedules_targets {
 
     /// 按人读名字找：`label` 与 `team_id` 都算（用户可能只记得团队名）。
     pub async fn by_name(pool: &SqlitePool, name: &str) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT id FROM workspaces WHERE label = ? OR team_id = ? ORDER BY id")
-            .bind(name)
-            .bind(name)
-            .fetch_all(pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT id FROM workspaces WHERE (label = ? OR team_id = ?) \
+             AND deleted_at IS NULL ORDER BY id",
+        )
+        .bind(name)
+        .bind(name)
+        .fetch_all(pool)
+        .await
     }
 }
 

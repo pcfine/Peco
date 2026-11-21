@@ -775,6 +775,28 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 030 skipped: auth_sessions table already exists");
     }
 
+    // ── Migration 031: 工作空间回收站 ─────────────────────────────────────
+    // 门控查列：全新库由 `schema.sql` 一次建全（含列与索引）→ 跳过；
+    // `ALTER TABLE ADD COLUMN` 不可重复执行，故必须按列判定。
+    let workspaces_has_deleted_at = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('workspaces') WHERE name = 'deleted_at'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !workspaces_has_deleted_at {
+        run_migration(
+            pool,
+            "031",
+            include_str!("migrations/031_workspaces_trash.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 031 completed");
+    } else {
+        tracing::debug!("Migration 031 skipped: workspaces.deleted_at already exists");
+    }
+
     Ok(())
 }
 

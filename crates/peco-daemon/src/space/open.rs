@@ -26,8 +26,8 @@ use crate::db::teams::{self, NewTeam};
 use crate::db::workspaces::{self, EXIT_POLICY_INHERIT, NewWorkspace, WorkspaceRow};
 use crate::error::DaemonError;
 use crate::file_watcher::FileWatcher;
-use crate::memory::cleanup;
 use crate::memory::config::MemoryConfig;
+use crate::memory::{cleanup, layout, migration};
 use crate::provider::layer_roots_for;
 use crate::space::SpaceEnv;
 use crate::space::index;
@@ -66,6 +66,14 @@ impl DaemonOpener {
                     .await?
             }
         };
+
+        // 回收站里的空间行还占着 `work_dir`（UNIQUE），但它已经不该被打开：
+        // 会话与记忆都挂起，打开一个「已删除」的空间只会让它半死不活地跑起来。
+        if row.is_trashed() {
+            return Err(DaemonError::SpaceTrashed {
+                ws_id: row.id.clone(),
+            });
+        }
 
         // ── 2. marker/DB 冲突决策表 ────────────────────────────────────────
         let previously_opened = row.last_opened_at.is_some();
@@ -145,10 +153,28 @@ impl DaemonOpener {
         ws.inject_deps();
         ws.set_memory_audit(Arc::new(SqliteMemoryAudit::new(env.pool.clone())));
 
+        // 空间私有记忆：必须在任何 agent 加载之前注入，否则已构建的 agent 内嵌的
+        // 是 None，`@memory` 子 agent 会继续读写团队库。这里只写配置、不建库 ——
+        // `create_kb`/`open_kb` 会立刻加载嵌入模型，打开路径上不能付这笔开销。
+        let memory_root = layout::memory_root(&env.home, &row.id);
+        layout::ensure(&memory_root)?;
+        let memory = layout::manager(&memory_root, &row.id);
+        ws.set_memory_manager(Arc::clone(&memory));
+
         // 旧记忆清理挂在打开链路上：空间一打开记忆库就可用，且这是每次启动都会
         // 经过的地方。它是迁移动作，不该进请求路径 —— 全量扫描一次的开销放在
         // 打开空间时付一次，而不是每轮对话都付。
         spawn_legacy_memory_purge(Arc::clone(ws.knowledge_manager()), &team);
+
+        // 存量记忆搬家与上面的清理同属升级动作：异步、不阻塞打开。
+        spawn_legacy_memory_migration(
+            Arc::clone(&self.env),
+            Arc::clone(ws.knowledge_manager()),
+            memory,
+            memory_root,
+            row.id.clone(),
+            team.clone(),
+        );
 
         // machine 执行体的观察 hook 必须在任何 machine 注册之前注入：注册时取快照，
         // 晚一步就等于「被派发的 @master 自己再派发出去的任务永远没人观察」。
@@ -337,6 +363,122 @@ fn spawn_legacy_memory_purge(km: Arc<KnowledgeManager>, team: &str) {
     });
 }
 
+/// 把团队旧库里属于本空间的记忆搬进空间记忆库，只记日志。
+///
+/// 与 [`spawn_legacy_memory_purge`] 同位置同形状：搬家是升级动作，不该进请求
+/// 路径，也不该因为一个坏掉的知识库拦住空间打开。
+fn spawn_legacy_memory_migration(
+    env: Arc<SpaceEnv>,
+    team_km: Arc<KnowledgeManager>,
+    memory: Arc<KnowledgeManager>,
+    memory_root: PathBuf,
+    ws_id: String,
+    team: String,
+) {
+    if migration::is_migrated(&memory_root) {
+        return;
+    }
+    tokio::spawn(async move {
+        migrate_legacy_memory(&env, &team_km, &memory, &memory_root, &ws_id, &team).await;
+    });
+}
+
+/// 搬一次存量记忆，搬完若团队再无待迁移的空间就摘牌团队级记忆库。
+///
+/// 公开面是为了让用例能在**同一批管理器实例**上重放这一步：InMemory 后端的
+/// 记忆库是进程实例级的，另建实例只会读到空库，那样测不到真正的搬运。
+pub async fn migrate_legacy_memory(
+    env: &SpaceEnv,
+    team_km: &Arc<KnowledgeManager>,
+    memory: &Arc<KnowledgeManager>,
+    memory_root: &Path,
+    ws_id: &str,
+    team: &str,
+) -> migration::MigrationReport {
+    let config = MemoryConfig::from_env();
+    let report = migration::migrate(team_km, memory, memory_root, ws_id, &config).await;
+    if !report.skipped && report.complete() {
+        disable_team_memory_library(env, team, ws_id).await;
+    }
+    report
+}
+
+/// 团队级记忆库摘牌：把它的 `kb_config.json` 改名成 `.disabled`。
+///
+/// 摘牌是为了关闭隐私口 —— 团队库里还留着其它空间的记忆，只要它还在团队管理器
+/// 的扫描范围内，agent 的知识工具就看得见。数据不动，改回名字即回滚。
+///
+/// 只在「该团队再没有别的空间需要迁移」时才摘：先摘牌会让后打开的空间读到
+/// 「团队库不存在」，它的存量记忆就此永远搬不出来。回收站行也算在内 ——
+/// 恢复之后它们仍要迁移。
+async fn disable_team_memory_library(env: &SpaceEnv, team: &str, ws_id: &str) {
+    let siblings = match workspaces::ids_by_team(&env.pool, team).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(team, error = %e, "cannot list the team spaces; memory library left in place");
+            return;
+        }
+    };
+    let pending: Vec<&str> = siblings
+        .iter()
+        .map(String::as_str)
+        .filter(|id| *id != ws_id)
+        .filter(|id| !migration::is_migrated(&layout::memory_root(&env.home, id)))
+        .collect();
+    if !pending.is_empty() {
+        tracing::info!(
+            team,
+            ws_id,
+            pending = pending.len(),
+            "other spaces still need their legacy memories; team memory library left enabled"
+        );
+        return;
+    }
+    match rename_memory_kb_configs(&env.team_root(team).join("knowledge")) {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(
+            team,
+            count,
+            "team memory library retired; rename kb_config.json.disabled back to roll back"
+        ),
+        Err(e) => tracing::warn!(team, error = %e, "cannot retire the team memory library"),
+    }
+}
+
+/// 把团队知识根下所有「库名是 `@private_memory`」的配置改名成 `.disabled`，返回改名数。
+///
+/// 按配置里的 `name` 认库而不是按目录名：模板铺的目录叫 `@private_memory`，
+/// 由 API 建的同名库落在 `private_memory`，两个名字指的是同一个库。
+fn rename_memory_kb_configs(knowledge_root: &Path) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(knowledge_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut renamed = 0;
+    for entry in entries {
+        let dir = entry?.path();
+        let config = dir.join("kb_config.json");
+        if !config.is_file() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&config) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if value.get("name").and_then(serde_json::Value::as_str)
+            != Some(crate::memory::config::KB_NAME)
+        {
+            continue;
+        }
+        std::fs::rename(&config, dir.join("kb_config.json.disabled"))?;
+        renamed += 1;
+    }
+    Ok(renamed)
+}
+
 /// 启动团队根的文件监听。
 ///
 /// Hub 是晚绑定注入的（它需要 opener，而 opener 需要 Hub 才能扇出）；没有 Hub
@@ -375,6 +517,11 @@ pub async fn ensure_open_indexed(
             .ok_or_else(|| DaemonError::SpaceNotFound {
                 ws_id: ws_id.to_string(),
             })?;
+    if row.is_trashed() {
+        return Err(DaemonError::SpaceTrashed {
+            ws_id: ws_id.to_string(),
+        });
+    }
     let work_dir = PathBuf::from(&row.work_dir);
 
     if row.last_opened_at.is_some() && !work_dir.is_dir() {
@@ -427,6 +574,12 @@ pub async fn resolve_ws_id(
     let work_dir_str = work_dir.to_string_lossy().into_owned();
 
     if let Some(row) = workspaces::by_work_dir(&env.pool, &work_dir_str).await? {
+        // 回收站行仍占着 `work_dir`。销毁它再建新空间由 `POST /api/spaces` 负责；
+        // 这里是「按目录解析身份」的通用入口，撞上 trashed 只能拒绝，否则会把
+        // 一个已删除的空间交回调用方。
+        if row.is_trashed() {
+            return Err(DaemonError::SpaceTrashed { ws_id: row.id });
+        }
         // 同目录换团队是改绑，不是重新打开：静默返回既有空间会让调用方以为已经
         // 绑到新团队，而 marker 与对话历史仍属于旧团队。
         if row.team_id != team_id {

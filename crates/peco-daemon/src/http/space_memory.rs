@@ -1,21 +1,24 @@
-//! `/api/spaces/{ws_id}/memory/documents` —— 按空间浏览团队记忆库。
+//! `/api/spaces/{ws_id}/memory/documents` —— 按空间浏览它自己的记忆库。
 //!
-//! 同团队的所有空间共用一套物理 KB（`kb_scope = team_id`），归属证据只有文档
-//! metadata 里的 [`WS_ID_TAG`]：列表与详情都必须自己按标签过滤，读不到标签的
-//! 文档一律判为「不属于任何空间」（fail-closed）—— 记忆正文是用户对话的摘要，
-//! 放行一条没有标签的文档就等于让别的空间看见它。
+//! 记忆库一个空间一份（`$PECO_HOME/memory/<ws_id>/`），归属由「读的是哪个库」
+//! 决定，不再靠文档标签：迁移过来的老记忆没有标签，按标签过滤会把它们全部藏掉。
 //!
 //! 只读：删除/巩固/审计仍归团队维度的记忆管理面，这里不重复开一条写路径。
+
+use std::path::Path;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
 use knowledge_base::{Document, DocumentMetadata};
-use peco_core::knowledge::KnowledgeModuleError;
+use peco_core::knowledge::{KnowledgeManager, KnowledgeModuleError};
+use peco_core::tools::KnowledgeAccess;
 use serde::{Deserialize, Serialize};
 
+use crate::db::workspaces;
 use crate::error::DaemonError;
-use crate::memory::WS_ID_TAG;
 use crate::memory::config::MemoryConfig;
+use crate::memory::{MEMORY_SCAN_LIMIT, layout};
 use crate::state::AppState;
 
 /// 默认一页条数。
@@ -24,11 +27,6 @@ const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 /// snippet 的字数上限。
 const SNIPPET_CHARS: usize = 200;
-/// 一次扫描的文档数上限。
-///
-/// 记忆库按团队累积，量级是几百条；取一个远大于实际规模的具体上界，而不是把
-/// `usize::MAX` 交给底层按不可能达到的规模预分配。
-const SCAN_LIMIT: usize = 10_000;
 /// 记忆写入路径给文档打的 `source` 前缀（`ppa_{category}`）。
 const SOURCE_PREFIX: &str = "ppa_";
 
@@ -130,16 +128,11 @@ pub async fn list(
         .filter(|raw| !raw.is_empty())
         .map(str::to_lowercase);
 
-    let km = state
-        .spaces
-        .workspace(&ws_id)
-        .await?
-        .knowledge_manager()
-        .clone();
+    let km = memory_manager(&state, &ws_id).await?;
     let kb_name = MemoryConfig::from_env().kb_name;
 
     let documents = match km
-        .list_memory_documents_with_content(&kb_name, SCAN_LIMIT)
+        .list_memory_documents_with_content(&kb_name, MEMORY_SCAN_LIMIT)
         .await
     {
         Ok(documents) => documents,
@@ -155,7 +148,6 @@ pub async fn list(
 
     let mut items: Vec<DocumentItemView> = documents
         .iter()
-        .filter(|document| belongs_to(document, &ws_id))
         .filter(|document| match category {
             Some(category) => MemoryCategory::of(&document.source_path) == category,
             None => true,
@@ -188,12 +180,7 @@ pub async fn detail(
     State(state): State<AppState>,
     UrlPath((ws_id, doc_id)): UrlPath<(String, String)>,
 ) -> Result<Json<DocumentDetailView>, DaemonError> {
-    let km = state
-        .spaces
-        .workspace(&ws_id)
-        .await?
-        .knowledge_manager()
-        .clone();
+    let km = memory_manager(&state, &ws_id).await?;
     let kb_name = MemoryConfig::from_env().kb_name;
 
     let document = match km.get_document(&kb_name, &doc_id).await {
@@ -206,14 +193,12 @@ pub async fn detail(
         }
     };
 
-    // 「不存在」与「属于别的空间」回同一个错误：区分开就等于告诉调用方某个 id
-    // 真实存在，跨空间探测因此能一条条试出别人的文档 id。
-    let document = document
-        .filter(|document| belongs_to(document, &ws_id))
-        .ok_or_else(|| DaemonError::MemoryDocumentNotFound {
-            ws_id: ws_id.clone(),
-            doc_id: doc_id.clone(),
-        })?;
+    // 不存在的 id 与「属于别的空间」回同一个错误：区分开就等于告诉调用方某个
+    // id 真实存在，跨空间探测因此能一条条试出别人的文档 id。
+    let document = document.ok_or_else(|| DaemonError::MemoryDocumentNotFound {
+        ws_id: ws_id.clone(),
+        doc_id: doc_id.clone(),
+    })?;
 
     let category = MemoryCategory::of(&document.source_path).as_str();
     let Document {
@@ -235,12 +220,32 @@ pub async fn detail(
     }))
 }
 
-/// 文档是否属于该空间。
+/// 该空间的记忆管理器。
 ///
-/// 标签缺失或值与路径里的 `ws_id` 不同，都判为不属于：无法证明归属的文档不该
-/// 出现在任何一个空间的列表里 —— 宁可少给一条，也不跨空间串记忆。
-fn belongs_to(document: &Document, ws_id: &str) -> bool {
-    document.metadata.extra.get(WS_ID_TAG).map(String::as_str) == Some(ws_id)
+/// 已打开的空间用实例里注入的那一份（同一个库、同一份缓存）；回收站里的空间
+/// 没有实例，但库还在盘上 —— 只读浏览按同一个 scope 现建一个即可，否则用户在
+/// 回收站里看不到自己要恢复的记忆。已关闭且不在回收站的空间仍是 `space_not_open`。
+async fn memory_manager(
+    state: &AppState,
+    ws_id: &str,
+) -> Result<Arc<KnowledgeManager>, DaemonError> {
+    let row = workspaces::by_id(&state.pool, ws_id)
+        .await?
+        .ok_or_else(|| DaemonError::SpaceNotFound {
+            ws_id: ws_id.to_string(),
+        })?;
+    if let Some(handle) = state.hub.get(Path::new(&row.work_dir))
+        && let Some(km) = handle.workspace().memory_manager()
+    {
+        return Ok(Arc::clone(km));
+    }
+    if row.is_trashed() {
+        let root = layout::memory_root(&state.env.home, ws_id);
+        return Ok(layout::manager(&root, ws_id));
+    }
+    Err(DaemonError::SpaceNotOpen {
+        ws_id: ws_id.to_string(),
+    })
 }
 
 /// 标题或正文命中子串（大小写不敏感）。
@@ -285,6 +290,7 @@ fn snippet(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::WS_ID_TAG;
 
     fn document(ws_id: Option<&str>, source: &str, title: &str, content: &str) -> Document {
         let mut metadata = DocumentMetadata::default();
@@ -316,23 +322,6 @@ mod tests {
         assert!(MemoryCategory::parse("other").is_some());
         assert!(MemoryCategory::parse("Profile").is_none(), "取值区分大小写");
         assert!(MemoryCategory::parse("").is_none());
-    }
-
-    /// 无标签的文档不属于任何空间 —— 列表与详情共用这一条判据。
-    #[test]
-    fn untagged_documents_belong_to_no_space() {
-        assert!(belongs_to(
-            &document(Some("ws_a"), "ppa_profile", "t", "c"),
-            "ws_a"
-        ));
-        assert!(!belongs_to(
-            &document(Some("ws_b"), "ppa_profile", "t", "c"),
-            "ws_a"
-        ));
-        assert!(!belongs_to(
-            &document(None, "ppa_profile", "t", "c"),
-            "ws_a"
-        ));
     }
 
     #[test]

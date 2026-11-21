@@ -83,10 +83,12 @@ async fn create_team_installs_template_and_index_row() {
         root.join("agents/@master/agent.md").is_file(),
         "模板 agent 必须落盘"
     );
+    // 模板不再铺团队级记忆库：记忆是一个空间一份，配置在打开空间时写下。
     assert!(
-        root.join("knowledge/@private_memory/kb_config.json")
-            .is_file(),
-        "模板知识库配置必须落盘"
+        !root
+            .join("knowledge/@private_memory/kb_config.json")
+            .exists(),
+        "团队级记忆库不该再由模板铺出"
     );
     let team_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("team.json")).unwrap()).unwrap();
@@ -109,6 +111,15 @@ async fn create_team_installs_template_and_index_row() {
         )
         .await;
     assert_eq!(space.status, 201, "body={}", space.body);
+    let ws_id = space.body["ws_id"].as_str().expect("建空间必须回 ws_id");
+    assert!(
+        env.home
+            .join("memory")
+            .join(ws_id)
+            .join("@private_memory/kb_config.json")
+            .is_file(),
+        "打开空间后必须写该空间自己的记忆配置"
+    );
 
     let listed = env.get("/api/teams").await;
     let writing = listed

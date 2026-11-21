@@ -19,10 +19,16 @@ use crate::space::close as space_close;
 use crate::space::manifest;
 use crate::space::open;
 use crate::space::peco::PECO_TEAM_ID;
+use crate::space::trash as space_trash;
 use crate::state::AppState;
 
 const STATUS_OPEN: &str = "open";
 const STATUS_CLOSED: &str = "closed";
+
+/// `SpaceView.state` 的三种取值：前端的三个分组读它，不再从 `closed_at` 猜。
+const STATE_ACTIVE: &str = "active";
+const STATE_CLOSED: &str = "closed";
+const STATE_TRASHED: &str = "trashed";
 
 /// marker 的身份字段；`exit_policy` / `label` 属于 DB，不在这里出现。
 ///
@@ -53,6 +59,11 @@ pub struct SpaceView {
     /// 只说明「本次进程里开没开」，回答不了「是否曾经被显式关闭」——
     /// 三组划分（进行中 / 已存在 / 已关闭）需要下面的两个时刻列。
     pub status: &'static str,
+    /// `active` / `closed` / `trashed`：比 `status` 多一个「在回收站里」。
+    ///
+    /// 回收站行不在 `GET /api/spaces` 的清单里，但详情仍然回它（前端恢复流程
+    /// 要读），靠这个字段区分，不必再从 `closed_at` 反推。
+    pub state: &'static str,
     /// 显式关闭的时刻；重新打开会清空。
     pub closed_at: Option<String>,
     /// 最近一次成功打开的时刻；从未打开过为 `null`。
@@ -106,7 +117,10 @@ pub struct ListQuery {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PurgeQuery {
+    /// 越过在飞任务门槛（回收站与永久销毁共用）。
     pub force: Option<bool>,
+    /// `true` = 永久销毁；缺省 = 移入回收站。
+    pub purge: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +131,29 @@ pub struct CloseResponse {
 #[derive(Debug, Serialize)]
 pub struct PurgeResponse {
     pub purged: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrashResponse {
+    pub trashed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RestoreResponse {
+    pub restored: bool,
+    pub ws_id: String,
+}
+
+/// 回收站清单的一行：只回答「叫什么、哪个团队、什么时候进去的」。
+#[derive(Debug, Serialize)]
+pub struct TrashItem {
+    pub ws_id: String,
+    /// marker 里的人类可读名称；marker 已随删除摘掉，因此实际取自 `label`
+    /// 再退回目录末段。
+    pub name: String,
+    pub team_id: String,
+    pub work_dir: String,
+    pub trashed_at: String,
 }
 
 pub async fn list(
@@ -157,6 +194,18 @@ pub async fn create(
     }
     let work_dir = open::normalize_work_dir(Path::new(&request.work_dir))?;
     let key = work_dir.to_string_lossy().into_owned();
+    // `work_dir` 有 UNIQUE 约束，回收站行会一直占着它。同一目录重建前必须先按
+    // 销毁语义清掉那一行（会话 + 记忆 + marker）：新空间是新身份，旧身份的会话
+    // 留在库里只会变成一条谁也打不开的历史。
+    //
+    // 这条路径 `force`：能进回收站就说明它已经不在服务中，残下的在飞台账行
+    // 不该挡住用户把目录用起来。
+    if let Some(row) = workspaces::by_work_dir(&state.pool, &key).await?
+        && row.is_trashed()
+    {
+        space_trash::purge_workspace(&state.env, &state.hub, &row.id, true).await?;
+        tracing::info!(ws_id = %row.id, work_dir = %key, "trashed space destroyed to reuse its directory");
+    }
     let existed = workspaces::by_work_dir(&state.pool, &key).await?.is_some();
 
     // 团队校验发生在 resolve_ws_id 内部，且先于任何建目录动作：team 不存在时
@@ -304,20 +353,71 @@ pub async fn close(
     Ok(Json(CloseResponse { stopped: true }))
 }
 
-pub async fn purge(
+/// `DELETE /api/spaces/{ws_id}`：缺省移入回收站，`?purge=true` 永久销毁。
+///
+/// 两条分支共用一个路由：它们是同一个资源上的两种删除强度，分成两个 URL 会让
+/// 调用方以为「回收站里的空间」是另一种资源。
+pub async fn remove(
     State(state): State<AppState>,
     UrlPath(ws_id): UrlPath<String>,
     Query(query): Query<PurgeQuery>,
-) -> Result<Json<PurgeResponse>, DaemonError> {
+) -> Result<Response, DaemonError> {
     let force = query.force.unwrap_or(false);
-    let outcome = space_close::purge_workspace(&state.env, &state.hub, &ws_id, force).await?;
+    if query.purge.unwrap_or(false) {
+        let outcome = space_trash::purge_workspace(&state.env, &state.hub, &ws_id, force).await?;
+        tracing::info!(
+            ws_id,
+            force,
+            orphaned = outcome.orphaned,
+            "space row purged; ledger and work_dir files kept"
+        );
+        return Ok(Json(PurgeResponse { purged: true }).into_response());
+    }
+
+    let outcome = space_trash::trash_workspace(&state.env, &state.hub, &ws_id, force).await?;
     tracing::info!(
         ws_id,
         force,
-        orphaned = outcome.orphaned,
-        "space row purged; ledger kept"
+        evicted = outcome.evicted,
+        "space moved to trash; conversations and memories kept"
     );
-    Ok(Json(PurgeResponse { purged: true }))
+    Ok(Json(TrashResponse { trashed: true }).into_response())
+}
+
+/// 回收站清单，最近移入的在前。
+pub async fn trash(State(state): State<AppState>) -> Result<Json<Vec<TrashItem>>, DaemonError> {
+    let rows = workspaces::trashed(&state.pool).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| TrashItem {
+                name: trash_name(&row),
+                ws_id: row.id,
+                team_id: row.team_id,
+                work_dir: row.work_dir,
+                trashed_at: row.deleted_at.unwrap_or_default(),
+            })
+            .collect(),
+    ))
+}
+
+/// `POST /api/spaces/{ws_id}/restore`：出回收站。
+pub async fn restore(
+    State(state): State<AppState>,
+    UrlPath(ws_id): UrlPath<String>,
+) -> Result<Json<RestoreResponse>, DaemonError> {
+    let restored = space_trash::restore_workspace(&state.env, &ws_id).await?;
+    Ok(Json(RestoreResponse { restored, ws_id }))
+}
+
+/// 回收站里的展示名：marker → `label` → 目录末段。
+///
+/// marker 在移入回收站时就被摘掉了，因此实际走的是后两级；先读 marker 是为了
+/// 手工把记录文件放回去的人也能看到原来的名字。
+fn trash_name(row: &WorkspaceRow) -> String {
+    match manifest::read(Path::new(&row.work_dir)) {
+        Ok(Some(found)) if !found.name.trim().is_empty() => found.name,
+        _ => space_trash::display_name(row),
+    }
 }
 
 async fn by_id(state: &AppState, ws_id: &str) -> Result<WorkspaceRow, DaemonError> {
@@ -335,6 +435,13 @@ async fn space_view(state: &AppState, row: WorkspaceRow) -> Result<SpaceView, Da
     let effective_exit_policy = resolve_exit_policy(&row.exit_policy, state.config.exit_policy);
     // 坏 marker 只降级这一行（列表不整体失败）；只读一次，`name` 与 `marker` 同源。
     let marker = marker_info(Path::new(&row.work_dir));
+    let state = if row.is_trashed() {
+        STATE_TRASHED
+    } else if is_open {
+        STATE_ACTIVE
+    } else {
+        STATE_CLOSED
+    };
     Ok(SpaceView {
         ws_id: row.id,
         work_dir: row.work_dir.clone(),
@@ -343,6 +450,7 @@ async fn space_view(state: &AppState, row: WorkspaceRow) -> Result<SpaceView, Da
         exit_policy: row.exit_policy,
         effective_exit_policy: effective_exit_policy.as_str().to_string(),
         status: if is_open { STATUS_OPEN } else { STATUS_CLOSED },
+        state,
         closed_at: row.closed_at,
         last_opened_at: row.last_opened_at,
         reserved,

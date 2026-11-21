@@ -125,9 +125,9 @@ impl MemoryExtractionHook {
                 .extra
                 .insert(WS_ID_TAG.to_string(), ws_id.to_string());
             let title = format!("memory_{base_ts}_{index}");
-            // id 必须带空间作用域：团队共用一套 KB，只按正文哈希时两个空间说出
-            // 同一句话会折叠成同一条文档，后写者的 ws_id 覆盖先写者，先写的空间
-            // 就此丢记忆。
+            // 记忆库已按空间物理分开，标签与 id 作用域不再承担隔离；两者都留着是
+            // 为了回滚路径 —— 团队级旧库仍在盘上（改名摘牌，未删除），把配置改回去
+            // 就能回到「一套库 + 标签区分归属」的形态，读写口径必须一致。
             match km
                 .add_text_to_kb_scoped(
                     &config.kb_name,

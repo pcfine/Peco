@@ -4,8 +4,9 @@ mod support;
 
 use peco_daemon::db::dispatches;
 use peco_daemon::error::DaemonError;
-use peco_daemon::space::close::{close_workspace, purge_workspace};
+use peco_daemon::space::close::close_workspace;
 use peco_daemon::space::manifest::MANIFEST_FILE;
+use peco_daemon::space::trash::purge_workspace;
 use support::new_env;
 
 /// P1-13 三格：删行不减台账、marker 存活时重建 `ws_id` 不变、目录与 marker 全删才换新身份。

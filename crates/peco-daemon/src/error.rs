@@ -91,6 +91,18 @@ pub enum DaemonError {
     #[error("space '{ws_id}' is reserved and cannot be deleted; close it instead")]
     ReservedSpace { ws_id: String },
 
+    /// 空间在回收站里：行还在，但它已经不接受打开与派发。
+    #[error("space '{ws_id}' is in the trash; restore it before using it")]
+    SpaceTrashed { ws_id: String },
+
+    /// 恢复的对象不在回收站里；正常流程走不到，直接调接口才会看见。
+    #[error("space '{ws_id}' is not in the trash")]
+    NotTrashed { ws_id: String },
+
+    /// 目录已被别的空间占用：marker 里的 ws_id 与要恢复的那一行不同。
+    #[error("work_dir '{work_dir}' is already used by another space")]
+    WorkDirReused { work_dir: String },
+
     #[error("task '{task_id}' not found in the dispatch ledger")]
     TaskNotFound { task_id: String },
 
@@ -162,6 +174,9 @@ impl DaemonError {
             Self::SpaceNotFound { .. } => "space_not_found",
             Self::SpaceNotOpen { .. } => "space_not_open",
             Self::ReservedSpace { .. } => "reserved_space",
+            Self::SpaceTrashed { .. } => "space_trashed",
+            Self::NotTrashed { .. } => "not_trashed",
+            Self::WorkDirReused { .. } => "work_dir_reused",
             Self::TaskNotFound { .. } => "task_not_found",
             Self::MemoryDocumentNotFound { .. } => "memory_document_not_found",
             Self::TeamExists { .. } => "team_exists",
@@ -202,6 +217,9 @@ impl DaemonError {
             | Self::MarkerCorrupt { .. }
             | Self::MarkerSchemaUnsupported { .. }
             | Self::WorkDirMissing { .. }
+            | Self::SpaceTrashed { .. }
+            | Self::NotTrashed { .. }
+            | Self::WorkDirReused { .. }
             | Self::SpaceNotOpen { .. }
             | Self::WsBusy { .. }
             | Self::ConversationInFlight { .. }
@@ -389,6 +407,27 @@ mod tests {
                 },
                 "task_not_found",
                 StatusCode::NOT_FOUND,
+            ),
+            (
+                DaemonError::SpaceTrashed {
+                    ws_id: "ws_a".into(),
+                },
+                "space_trashed",
+                StatusCode::CONFLICT,
+            ),
+            (
+                DaemonError::NotTrashed {
+                    ws_id: "ws_a".into(),
+                },
+                "not_trashed",
+                StatusCode::CONFLICT,
+            ),
+            (
+                DaemonError::WorkDirReused {
+                    work_dir: "/w".into(),
+                },
+                "work_dir_reused",
+                StatusCode::CONFLICT,
             ),
             (
                 DaemonError::MemoryDocumentNotFound {

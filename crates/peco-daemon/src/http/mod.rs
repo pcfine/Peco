@@ -58,8 +58,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/spaces", get(space::list).post(space::create))
         .route(
             "/api/spaces/{ws_id}",
-            get(space::detail).patch(space::update).delete(space::purge),
+            get(space::detail)
+                .patch(space::update)
+                .delete(space::remove),
         )
+        // 回收站是静态段，优先于 `{ws_id}`：`trash` 不会被当成一个空间 id。
+        .route("/api/spaces/trash", get(space::trash))
+        .route("/api/spaces/{ws_id}/restore", post(space::restore))
         .route("/api/spaces/{ws_id}/close", post(space::close))
         .route("/api/spaces/{ws_id}/open", post(space::open))
         .route("/api/spaces/{ws_id}/tasks", get(tasks::list_for_space))

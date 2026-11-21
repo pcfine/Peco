@@ -13,7 +13,17 @@ pub mod cleanup;
 pub mod compose;
 pub mod config;
 pub mod hook;
+pub mod layout;
+pub mod migration;
 pub mod recall;
+
+/// 记忆库的单次扫描上限。
+///
+/// 浏览端点、存量迁移与销毁都要「把库里的文档取出来」，三处取同一个数：
+/// 各自写一份上界，改一处就会漏掉另一处（比如上限调大后迁移仍只搬一万条）。
+/// 取一个远大于单用户实际规模的具体上界，而不是把 `usize::MAX` 交给底层按不可能
+/// 达到的规模预分配缓冲。
+pub const MEMORY_SCAN_LIMIT: usize = 10_000;
 
 /// 文档记忆里的空间标签键。
 ///
