@@ -76,7 +76,6 @@ vi.mock("@/api/spaces", () => ({
   spaceArtifacts: async () => ({ items: [], total: 0 }),
   closeSpace: async () => ({ stopped: true }),
   createSpace: (...args: unknown[]) => mocks.createSpace(...args),
-  deleteSpace: async () => ({ purged: true }),
 }));
 
 vi.mock("@/api/teams", () => ({

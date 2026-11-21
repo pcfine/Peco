@@ -52,7 +52,6 @@ vi.mock("@/api/spaces", () => ({
   closeSpace: (wsId: string, force?: boolean) => closeSpace(wsId, force),
   listSpaces: async () => [],
   createSpace: async () => ({ ws_id: "ws_new" }),
-  deleteSpace: async () => ({ purged: true }),
 }));
 
 function task(overrides: Partial<Task> = {}): Task {

@@ -76,7 +76,9 @@ vi.mock("@/api/spaces", () => ({
   // 冒烟用的空间本来就是 open：自动打开不会发这一枪，但入口得在。
   openSpace: async () => pecoSpace,
   createSpace: async () => ({ ws_id: "ws_new" }),
-  deleteSpace: async () => ({ purged: true }),
+  // 列表页挂着回收站页签：删掉的是「移入回收站」那条，不是永久销毁。
+  listTrashSpaces: async () => [],
+  trashSpace: async () => ({ trashed: true as const }),
 }));
 
 vi.mock("@/api/teams", () => ({

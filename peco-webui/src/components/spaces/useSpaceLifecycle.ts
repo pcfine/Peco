@@ -13,6 +13,20 @@ export interface InflightCounts {
   foreign: number;
 }
 
+/**
+ * 409 `inflight_tasks` 不是失败，是「要不要强制」：计数就在错误体里，比再查一遍详情准。
+ * 其余错误返回 null，由调用方按普通失败展示。
+ */
+export function inflightGate(error: unknown): InflightCounts | null {
+  if (!(error instanceof ApiError) || error.code !== "inflight_tasks") {
+    return null;
+  }
+  return {
+    dispatch: error.inflightDispatch ?? 0,
+    foreign: error.inflightForeign ?? 0,
+  };
+}
+
 export interface CloseSpaceState {
   close: () => void;
   forceClose: () => void;
@@ -39,11 +53,9 @@ export function useCloseSpace(wsId: string): CloseSpaceState {
     },
     onError: (error) => {
       // 409 不是失败而是「需要用户再决定一次」：Dialog 不关，改展示计数。
-      if (error instanceof ApiError && error.code === "inflight_tasks") {
-        setPending({
-          dispatch: error.inflightDispatch ?? 0,
-          foreign: error.inflightForeign ?? 0,
-        });
+      const gate = inflightGate(error);
+      if (gate) {
+        setPending(gate);
         return;
       }
       toast.error(errorText(error));

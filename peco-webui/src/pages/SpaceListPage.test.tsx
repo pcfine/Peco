@@ -51,6 +51,7 @@ vi.mock("@/api/peco", () => ({
 vi.mock("@/api/spaces", () => ({
   listSpaces: async () => [spaceA, spaceB],
   ensureSpaceConversation: (wsId: string) => ensureSpaceConversation(wsId),
+  listTrashSpaces: async () => [],
 }));
 
 vi.mock("@/api/tasks", () => ({ listTasks: async () => [] }));

@@ -12,6 +12,7 @@ import type {
   SpaceOpened,
   SpaceOverview,
   Task,
+  TrashSpace,
 } from "@/types/daemon";
 
 export async function listSpaces(): Promise<Space[]> {
@@ -199,15 +200,56 @@ export async function closeSpace(
   return res.data;
 }
 
-export async function deleteSpace(
+/**
+ * 回收站上限：daemon 在移入后同步销毁最旧一条，不返回销毁了谁。
+ * 前端只知道「满了」这件事，用来提示用户列表正在滚动淘汰。
+ */
+export const TRASH_CAPACITY = 100;
+
+/** 回收站清单，按移入时间倒序（daemon 排好，前端不再排）。 */
+export async function listTrashSpaces(): Promise<TrashSpace[]> {
+  const res = await api.get<TrashSpace[]>("/spaces/trash");
+  return res.data;
+}
+
+/**
+ * 移入回收站：会话与记忆原样留着，只清掉目录里的 marker。
+ *
+ * `force` 越过在飞任务门槛（409 `inflight_tasks` 之后的第二条路），与关闭同一条语义。
+ */
+export async function trashSpace(
   wsId: string,
   force = false,
-): Promise<{ purged: boolean }> {
-  const res = await api.delete<{ purged: boolean }>(
+): Promise<{ trashed: true }> {
+  const res = await api.delete<{ trashed: true }>(
     `/spaces/${encodeURIComponent(wsId)}`,
-    {
-      params: force ? { force } : undefined,
-    },
+    { params: force ? { force } : undefined },
+  );
+  return res.data;
+}
+
+/**
+ * 永久销毁：会话与记忆一并删掉，工作目录里的文件与台账保留。
+ *
+ * 与移入回收站是同一个路径上的另一条分支（`purge=true`），不是两种资源。
+ */
+export async function purgeSpace(
+  wsId: string,
+  force = false,
+): Promise<{ purged: true }> {
+  const res = await api.delete<{ purged: true }>(
+    `/spaces/${encodeURIComponent(wsId)}`,
+    { params: { purge: true, force: force || undefined } },
+  );
+  return res.data;
+}
+
+/** 恢复：清掉 `deleted_at`，建回 marker；恢复后仍是「已关闭」，要不要打开是用户的下一件事。 */
+export async function restoreSpace(
+  wsId: string,
+): Promise<{ restored: true; ws_id: string }> {
+  const res = await api.post<{ restored: true; ws_id: string }>(
+    `/spaces/${encodeURIComponent(wsId)}/restore`,
   );
   return res.data;
 }

@@ -21,6 +21,11 @@ export interface Space {
   effective_exit_policy: string;
   /** `open` = 实例在 Hub 里；`closed` = 本次未打开。 */
   status: "open" | "closed";
+  /**
+   * 空间在哪个状态机上：`trashed` 已经不在 `GET /api/spaces` 的清单里，
+   * 但详情仍能回它，靠这个字段区分，不必再从 `closed_at` 推断。
+   */
+  state?: "active" | "closed" | "trashed";
   /** 显式关闭的时刻；重新打开会清空。三组划分靠它与 `last_opened_at`。 */
   closed_at: string | null;
   /** 最近一次成功打开的时刻；从未打开过为 null。 */
@@ -29,6 +34,19 @@ export interface Space {
   inflight_dispatch: number;
   inflight_foreign: number;
   marker: MarkerInfo | null;
+}
+
+/**
+ * `GET /api/spaces/trash` 的一行。字段是清单的子集：回收站只回答
+ * 「叫什么、哪个团队、什么时候进去的」，会话与记忆的细节不在这里。
+ */
+export interface TrashSpace {
+  ws_id: string;
+  /** marker 缺失时为 null，显示回落见 `spaceLabel`。 */
+  name: string | null;
+  team_id: string;
+  work_dir: string;
+  trashed_at: string;
 }
 
 /**
