@@ -13,7 +13,9 @@ use model_provider::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::deps::{KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry};
+use super::deps::{
+    KnowledgeAccess, MEMORY_KB_NAME, MemoryAuditAccess, MemoryAuditEntry, manager_for_kb,
+};
 use super::memory_delete::{DeleteOrigin, delete_document, delete_entity_by_name};
 // 图事实标签与审计快照的「来源」同一口径：删除侧（含 REST 端点）只认这个字面量。
 use super::memory_delete::GRAPH_FACT_SOURCE;
@@ -77,7 +79,7 @@ impl ToolDyn for SearchKnowledge {
                     },
                     "kb_name": {
                         "type": "string",
-                        "description": "Knowledge base name to search. If omitted, searches all knowledge bases."
+                        "description": "Knowledge base name to search. If omitted, searches all team knowledge bases (private memory is not included)."
                     },
                     "top_k": {
                         "type": "integer",
@@ -107,11 +109,10 @@ impl ToolDyn for SearchKnowledge {
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
 
-            let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(string_err)?;
-
             let formatted = if let Some(name) = &parsed.kb_name {
                 check_kb_access(&self.allowed_kbs, name)?;
+                let km = manager_for_kb(&self.access, name);
+                km.ensure_loaded().await.map_err(string_err)?;
                 let results = km
                     .search_kb(name, &parsed.query, parsed.top_k)
                     .await
@@ -126,6 +127,10 @@ impl ToolDyn for SearchKnowledge {
                     })
                     .collect::<Vec<_>>()
             } else {
+                // 未指定 KB 的「全库搜索」只覆盖团队库：记忆靠自动召回，混进来
+                // 会让模型把检索范围当成一条漏掉的空间记忆。
+                let km = self.access.knowledge_manager();
+                km.ensure_loaded().await.map_err(string_err)?;
                 // search_all → 仅保留允许列表中的 KB
                 let all = km
                     .search_all(&parsed.query, parsed.top_k)
@@ -167,6 +172,39 @@ impl ListKnowledgeBases {
             allowed_kbs,
         }
     }
+
+    /// 团队库 + 空间记忆库合并，同名只留记忆库那一份。
+    ///
+    /// 团队库里可能还躺着未摘牌的旧 `@private_memory`（迁移前的团队级记忆库），
+    /// 它与空间记忆库同名但内容不同 —— 不去重会让模型以为记忆有两份。
+    /// 记忆库尚未建出来时也要占一席：`@memory` agent 只在这一个库上工作，
+    /// 列表里缺了它，模型会判定自己失去记忆能力。
+    async fn list_all_kbs(&self) -> Result<Vec<knowledge_base::KbInfo>, ToolError> {
+        let team = self.access.knowledge_manager();
+        team.ensure_loaded().await.map_err(string_err)?;
+        let mut infos = team.list_kbs().await.map_err(string_err)?;
+
+        let Some(memory) = self.access.memory_manager() else {
+            return Ok(infos);
+        };
+        memory.ensure_loaded().await.map_err(string_err)?;
+        let memory_infos = memory.list_kbs().await.map_err(string_err)?;
+
+        infos.retain(|i| i.name != MEMORY_KB_NAME);
+        match memory_infos.into_iter().find(|i| i.name == MEMORY_KB_NAME) {
+            Some(info) => infos.push(info),
+            // 库还没建（延迟建库）：元信息不可知，给一份零计数的占位条目。
+            None => infos.push(knowledge_base::KbInfo {
+                name: MEMORY_KB_NAME.to_string(),
+                description: "空间私有记忆 — 存储偏好、事实、事件、关系".to_string(),
+                backend: "-".to_string(),
+                embedding_model: "-".to_string(),
+                document_count: 0,
+                chunk_count: 0,
+            }),
+        }
+        Ok(infos)
+    }
 }
 
 impl ToolDyn for ListKnowledgeBases {
@@ -189,10 +227,7 @@ impl ToolDyn for ListKnowledgeBases {
         _args: String,
     ) -> Pin<Box<dyn Future<Output = Result<Content, ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(string_err)?;
-
-            let infos = km.list_kbs().await.map_err(string_err)?;
+            let infos = self.list_all_kbs().await?;
             let display: Vec<_> = infos
                 .into_iter()
                 .filter(|i| self.allowed_kbs.contains(&i.name))
@@ -290,7 +325,7 @@ impl ToolDyn for AddToKnowledgeBase {
 
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
 
-            let km = self.access.knowledge_manager();
+            let km = manager_for_kb(&self.access, &parsed.kb_name);
             km.ensure_loaded().await.map_err(string_err)?;
 
             let doc = km
@@ -364,11 +399,11 @@ impl ToolDyn for SyncKnowledgeBase {
             }
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
-            let km = self.access.knowledge_manager();
-            km.ensure_loaded().await.map_err(string_err)?;
 
             if let Some(name) = parsed.kb_name {
                 check_kb_access(&self.allowed_kbs, &name)?;
+                let km = manager_for_kb(&self.access, &name);
+                km.ensure_loaded().await.map_err(string_err)?;
                 let report = km.sync_kb(&name).await.map_err(string_err)?;
                 info!(kb = %name, added = report.added, updated = report.updated, removed = report.removed, "KB synced via tool");
                 Ok(Content::Text(format!(
@@ -385,7 +420,12 @@ impl ToolDyn for SyncKnowledgeBase {
                 let mut reports = Vec::new();
                 let mut errors = Vec::new();
                 for kb_name in &self.allowed_kbs {
-                    match km.sync_kb(kb_name).await {
+                    let km = manager_for_kb(&self.access, kb_name);
+                    let synced = match km.ensure_loaded().await {
+                        Ok(()) => km.sync_kb(kb_name).await,
+                        Err(e) => Err(e),
+                    };
+                    match synced {
                         Ok(report) => reports.push((kb_name.clone(), report)),
                         Err(e) => {
                             warn!(kb = %kb_name, error = %e, "KB sync failed");
@@ -490,7 +530,7 @@ and source_filter to restrict to entries whose source starts with the given pref
 
             let parsed: Args = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
-            let km = self.access.knowledge_manager();
+            let km = manager_for_kb(&self.access, &parsed.kb_name);
             km.ensure_loaded().await.map_err(string_err)?;
 
             let limit = parsed.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
@@ -677,7 +717,7 @@ impl ToolDyn for AddFactsToKnowledgeBase {
 
             check_kb_access(&self.allowed_kbs, &parsed.kb_name)?;
 
-            let km = self.access.knowledge_manager();
+            let km = manager_for_kb(&self.access, &parsed.kb_name);
             km.ensure_loaded().await.map_err(string_err)?;
             let stored = km
                 .add_facts_to_kb(&parsed.kb_name, &facts, parsed.index_text)
@@ -768,7 +808,7 @@ impl ToolDyn for QueryEntityFacts {
             // `max_depth` 直通遍历的分配与查询次数，必须夹紧（见 MAX_TRAVERSAL_DEPTH）。
             let max_depth = parsed.max_depth.min(knowledge_base::MAX_TRAVERSAL_DEPTH);
 
-            let km = self.access.knowledge_manager();
+            let km = manager_for_kb(&self.access, &parsed.kb_name);
             km.ensure_loaded().await.map_err(string_err)?;
 
             let steps = km
@@ -1214,7 +1254,7 @@ async fn delete_fact_one(
     predicate: &str,
     object: &str,
 ) -> Result<(i64, usize), ToolError> {
-    let km = access.knowledge_manager();
+    let km = manager_for_kb(access, kb_name);
     km.ensure_loaded().await.map_err(string_err)?;
 
     // 先读 — 既做存在性判定，也拿到审计需要的边快照（含真实 weight）。
@@ -1510,10 +1550,17 @@ mod tests {
 
     /// 建好 KB 的测试管理器（TempDir 由调用方持有保活）。
     async fn make_km() -> (tempfile::TempDir, Arc<KnowledgeManager>) {
+        make_km_with(&[KB]).await
+    }
+
+    /// 建好指定若干 KB 的测试管理器 —— 团队库与记忆库是两个独立管理器。
+    async fn make_km_with(names: &[&str]) -> (tempfile::TempDir, Arc<KnowledgeManager>) {
         let tmp = tempfile::tempdir().unwrap();
         let km = Arc::new(KnowledgeManager::new(tmp.path().to_path_buf()));
         km.ensure_loaded().await.unwrap();
-        km.create_kb(make_test_config(KB)).await.unwrap();
+        for name in names {
+            km.create_kb(make_test_config(name)).await.unwrap();
+        }
         (tmp, km)
     }
 
@@ -1532,6 +1579,34 @@ mod tests {
     fn access_of(km: &Arc<KnowledgeManager>) -> Arc<dyn KnowledgeAccess> {
         Arc::new(StubAccess {
             manager: Arc::clone(km),
+        })
+    }
+
+    /// 团队库 + 可选空间记忆库 —— 工具面路由的宿主形态。
+    struct DualAccess {
+        team: Arc<KnowledgeManager>,
+        memory: Option<Arc<KnowledgeManager>>,
+    }
+
+    impl KnowledgeAccess for DualAccess {
+        fn user_id(&self) -> &str {
+            "test-user"
+        }
+        fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
+            &self.team
+        }
+        fn memory_manager(&self) -> Option<&Arc<KnowledgeManager>> {
+            self.memory.as_ref()
+        }
+    }
+
+    fn dual_access(
+        team: &Arc<KnowledgeManager>,
+        memory: Option<&Arc<KnowledgeManager>>,
+    ) -> Arc<dyn KnowledgeAccess> {
+        Arc::new(DualAccess {
+            team: Arc::clone(team),
+            memory: memory.map(Arc::clone),
         })
     }
 
@@ -2360,5 +2435,162 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["limit"], 50);
         assert_eq!(body["count"], 7);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // KB 名路由 — @private_memory 归空间记忆库，其余归团队库
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// 团队库里还留着未摘牌的旧 `@private_memory`，记忆管理器也存在：
+    /// 读写删都必须落在记忆库，团队库里的同名库一份也不许动。
+    #[tokio::test]
+    async fn memory_kb_routes_to_memory_manager() {
+        let (_team_dir, team) = make_km_with(&["team_docs", KB]).await;
+        let (_mem_dir, memory) = make_km_with(&[KB]).await;
+        let access = dual_access(&team, Some(&memory));
+        let allowed = vec![KB.to_string(), "team_docs".to_string()];
+
+        let add = AddToKnowledgeBase::new(Arc::clone(&access), allowed.clone());
+        add.call(json!({ "kb_name": KB, "title": "pref", "content": "用户偏好 Rust" }).to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            memory.list_documents(KB, 0, 10).await.unwrap().len(),
+            1,
+            "记忆库写入必须落在空间记忆管理器"
+        );
+        assert!(
+            team.list_documents(KB, 0, 10).await.unwrap().is_empty(),
+            "@private_memory 不得写进团队库"
+        );
+
+        // 非记忆库的 KB 仍归团队库 —— 这是「按名字选管理器」的反向证据
+        add.call(
+            json!({ "kb_name": "team_docs", "title": "doc", "content": "团队共享记录" })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            team.list_documents("team_docs", 0, 10).await.unwrap().len(),
+            1
+        );
+        assert!(
+            memory.list_documents("team_docs", 0, 10).await.is_err(),
+            "团队库的 KB 不该被记进空间记忆库"
+        );
+
+        // 读：文档列表也走记忆库
+        let docs = GetKnowledgeBaseDocs::new(Arc::clone(&access), allowed.clone());
+        let Content::Text(text) = docs
+            .call(json!({ "kb_name": KB }).to_string())
+            .await
+            .unwrap()
+        else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["documents"][0]["title"], "pref");
+    }
+
+    /// 删除路径（`memory_delete` 编排）同样按 KB 名选管理器：删记忆库的文档
+    /// 不得在团队库上找 —— 那边的同名库没有这条文档。
+    #[tokio::test]
+    async fn memory_kb_delete_routes_to_memory_manager() {
+        let (_team_dir, team) = make_km_with(&["team_docs", KB]).await;
+        let (_mem_dir, memory) = make_km_with(&[KB]).await;
+        let access = dual_access(&team, Some(&memory));
+
+        let doc = memory
+            .add_text_to_kb(KB, "memory_9", "用户喜欢黑咖啡", "ppa_semantic")
+            .await
+            .unwrap();
+        let spy = Arc::new(SpyAudit::new());
+        let tool = DeleteKbDocument::new(access, vec![KB.to_string()], Some(spy.clone()));
+
+        tool.call(json!({ "kb_name": KB, "doc_id": doc.id }).to_string())
+            .await
+            .unwrap();
+        assert!(memory.get_document(KB, &doc.id).await.unwrap().is_none());
+        assert_eq!(
+            spy.log(),
+            vec![format!("pending:{}", doc.id), "done:1".to_string()]
+        );
+    }
+
+    /// 合并两库且 `@private_memory` 只出现一次 —— 出现的那份必须是空间记忆库的。
+    #[tokio::test]
+    async fn list_knowledge_bases_merges_and_dedupes_memory_kb() {
+        let (_team_dir, team) = make_km_with(&["team_docs", KB]).await;
+        let (_mem_dir, memory) = make_km_with(&[KB]).await;
+        team.add_text_to_kb(KB, "old_team_memory", "团队级旧记忆", "ppa_semantic")
+            .await
+            .unwrap();
+        for i in 0..2 {
+            memory
+                .add_text_to_kb(KB, &format!("m{i}"), &format!("记忆 {i}"), "ppa_semantic")
+                .await
+                .unwrap();
+        }
+
+        let tool = ListKnowledgeBases::new(
+            dual_access(&team, Some(&memory)),
+            vec!["team_docs".to_string(), KB.to_string()],
+        );
+        let Content::Text(text) = tool.call("{}".to_string()).await.unwrap() else {
+            panic!("expected text content");
+        };
+        let list: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let names: Vec<&str> = list.iter().map(|i| i["name"].as_str().unwrap()).collect();
+
+        assert_eq!(
+            names.iter().filter(|n| **n == KB).count(),
+            1,
+            "@private_memory 必须且只能出现一次: {names:?}"
+        );
+        assert!(names.contains(&"team_docs"), "{names:?}");
+        let memory_entry = list.iter().find(|i| i["name"] == KB).unwrap();
+        assert_eq!(
+            memory_entry["document_count"], 2,
+            "同名条目必须取空间记忆库那份（团队旧库只有 1 条）: {text}"
+        );
+    }
+
+    /// 记忆库还没建出来时也要占一席：`@memory` agent 的整条能力都挂在这个库上。
+    #[tokio::test]
+    async fn list_knowledge_bases_shows_uncreated_memory_kb_once() {
+        let (_team_dir, team) = make_km_with(&[KB]).await;
+        let (_mem_dir, memory) = make_km_with(&[]).await;
+
+        let tool = ListKnowledgeBases::new(dual_access(&team, Some(&memory)), vec![KB.to_string()]);
+        let Content::Text(text) = tool.call("{}".to_string()).await.unwrap() else {
+            panic!("expected text content");
+        };
+        let list: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(list.len(), 1, "只剩 @private_memory: {text}");
+        assert_eq!(list[0]["name"], KB);
+        assert_eq!(list[0]["document_count"], 0);
+    }
+
+    /// 没有记忆管理器（未接入空间记忆的宿主）时行为不变：只列团队库。
+    #[tokio::test]
+    async fn list_knowledge_bases_without_memory_manager_lists_team_only() {
+        let (_team_dir, team) = make_km_with(&["team_docs", KB]).await;
+        let tool = ListKnowledgeBases::new(
+            dual_access(&team, None),
+            vec!["team_docs".to_string(), KB.to_string()],
+        );
+        let Content::Text(text) = tool.call("{}".to_string()).await.unwrap() else {
+            panic!("expected text content");
+        };
+        let list: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let names: Vec<&str> = list.iter().map(|i| i["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names.contains(&"team_docs") && names.contains(&KB),
+            "{names:?}"
+        );
     }
 }

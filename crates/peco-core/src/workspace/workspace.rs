@@ -216,6 +216,14 @@ impl WorkSpace {
         self.agent_manager.set_memory_audit(ma);
     }
 
+    /// 注入空间记忆管理器（由宿主在打开空间时调用）。
+    ///
+    /// WorkSpace 不持有记忆库本身，注入面在 [`AgentManager`] 上 ——
+    /// 工具构建与 Tier-2 缓存都发生在那边。
+    pub fn set_memory_manager(&self, km: Arc<KnowledgeManager>) {
+        self.agent_manager.set_memory_manager(km);
+    }
+
     pub fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
     }
@@ -633,6 +641,9 @@ impl KnowledgeAccess for WorkSpace {
     }
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
+    }
+    fn memory_manager(&self) -> Option<&Arc<KnowledgeManager>> {
+        self.agent_manager.memory_manager()
     }
 }
 

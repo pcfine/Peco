@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{info, warn};
 
-use super::deps::{KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry};
+use super::deps::{KnowledgeAccess, MemoryAuditAccess, MemoryAuditEntry, manager_for_kb};
 use crate::knowledge::hash_manifest::now_iso8601;
 use crate::knowledge::{KnowledgeManager, KnowledgeModuleError};
 use knowledge_base::KnowledgeError;
@@ -103,7 +103,7 @@ pub async fn delete_document(
     doc_id: &str,
     origin: DeleteOrigin,
 ) -> Result<DeletedDoc, MemoryDeleteError> {
-    let km = access.knowledge_manager();
+    let km = manager_for_kb(access, kb_name);
     km.ensure_loaded()
         .await
         .map_err(|e| MemoryDeleteError::Internal(e.to_string()))?;
@@ -187,7 +187,7 @@ pub async fn delete_entity_by_name(
     cascade: bool,
     origin: DeleteOrigin,
 ) -> Result<DeletedEntity, MemoryDeleteError> {
-    let km = access.knowledge_manager();
+    let km = manager_for_kb(access, kb_name);
     delete_entity_flow(
         km,
         access.user_id(),
@@ -209,7 +209,7 @@ pub async fn delete_entity_by_id(
     cascade: bool,
     origin: DeleteOrigin,
 ) -> Result<DeletedEntity, MemoryDeleteError> {
-    let km = access.knowledge_manager();
+    let km = manager_for_kb(access, kb_name);
     delete_entity_flow(
         km,
         access.user_id(),

@@ -63,6 +63,33 @@ pub trait SkillProvider: Send + Sync {
 pub trait KnowledgeAccess: Send + Sync {
     fn user_id(&self) -> &str;
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager>;
+    /// 本空间的记忆管理器（私有记忆库的宿主）。
+    ///
+    /// 默认 None = 宿主没有空间级记忆库，所有 KB 都落回团队库 —— 保持既有行为，
+    /// 不给已有实现方增加破坏性改动。
+    fn memory_manager(&self) -> Option<&Arc<KnowledgeManager>> {
+        None
+    }
+}
+
+/// 空间私有记忆的库名 —— 与模板 `agent.md` 的 `knowledge_bases` 同一口径。
+pub(crate) const MEMORY_KB_NAME: &str = "@private_memory";
+
+/// 按 KB 名选管理器：`@private_memory` 归空间记忆库，其余归团队库。
+///
+/// 记忆库与团队库是两个独立的 `KnowledgeManager`（目录与 scope 都不同），
+/// 认名字不认调用方，工具面才能在不改入参的前提下各回各家。没有记忆管理器
+/// 时一律落回团队库。
+pub(crate) fn manager_for_kb<'a>(
+    access: &'a Arc<dyn KnowledgeAccess>,
+    kb_name: &str,
+) -> &'a Arc<KnowledgeManager> {
+    if kb_name == MEMORY_KB_NAME
+        && let Some(memory) = access.memory_manager()
+    {
+        return memory;
+    }
+    access.knowledge_manager()
 }
 
 // ============================================================================

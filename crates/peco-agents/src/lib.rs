@@ -116,10 +116,24 @@ mod tests {
                 .all(|(path, _)| tmp.path().join(path).exists()),
             "所有模板 agent.md 都必须落盘"
         );
-        assert!(
-            tmp.path()
-                .join("knowledge/@private_memory/kb_config.json")
-                .exists()
-        );
+    }
+
+    /// 记忆库由宿主在打开空间时按空间创建，模板里再铺一份团队级
+    /// `@private_memory` 就等于把记忆重新变成团队共享。
+    #[test]
+    fn templates_ship_no_knowledge_config() {
+        for template in BuiltinTemplate::all() {
+            let knowledge_configs: Vec<&str> = template
+                .files
+                .iter()
+                .map(|(path, _)| *path)
+                .filter(|path| path.starts_with("knowledge/"))
+                .collect();
+            assert!(
+                knowledge_configs.is_empty(),
+                "模板 {} 携带了知识库配置: {knowledge_configs:?}",
+                template.name
+            );
+        }
     }
 }

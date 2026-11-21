@@ -19,7 +19,8 @@
 //! `try_new_from_user_defined` 加载 `Xenova/bge-base-zh-v1.5` 的 ONNX
 //! 导出，模型文件经 hf-hub 下载并缓存到 `~/.cache/huggingface/hub`。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::config::EmbeddingModelConfig;
 use crate::error::KnowledgeError;
@@ -39,7 +40,7 @@ use hf_hub::api::sync::Api;
 const BGE_BASE_ZH_V15_REPO: &str = "Xenova/bge-base-zh-v1.5";
 
 /// 支持的嵌入模型类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FastembedModelType {
     /// BGESmallZHV15 — 512 维，中文优化，轻量。
     BGESmallZHV15,
@@ -134,6 +135,63 @@ fn try_new_bge_base_zh() -> Result<TextEmbedding, KnowledgeError> {
 }
 
 // ---------------------------------------------------------------------------
+// 进程级模型缓存
+// ---------------------------------------------------------------------------
+
+/// 模型类型 → 已加载模型。一个进程只持有每种模型的一份。
+type ModelCache = Mutex<HashMap<FastembedModelType, Arc<TextEmbedding>>>;
+
+/// 空间记忆库按空间各建一份，若每次 `FastembedEngine::new` 都重新加载，
+/// N 个空间就是 N 份 bge 常驻（每份数百 MB）。缓存键是模型类型，因此
+/// 量化模型与全精度模型可以共存，不会互相顶掉。
+static ENGINES: OnceLock<ModelCache> = OnceLock::new();
+
+fn engines() -> &'static ModelCache {
+    ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取缓存中的模型；缺失时调用 `load` 加载并写回。
+///
+/// 加载失败**不写缓存**：下载被墙或磁盘写满是一次性故障，缓存这个失败会让
+/// 整个进程再也建不出知识库。
+///
+/// 加载期间持锁 —— 多空间并发首次加载时只有一次真正加载，其余等待复用，
+/// 顺带消除两个 KB 同时初始化抢同一份模型缓存导致的偶发失败。
+///
+/// `V` 泛型化只服务于测试：计数与失败重试的断言不该为了跑一次用例去下载模型。
+fn cached_model<V, F>(
+    cache: &Mutex<HashMap<FastembedModelType, Arc<V>>>,
+    model_type: FastembedModelType,
+    load: F,
+) -> Result<Arc<V>, KnowledgeError>
+where
+    F: FnOnce() -> Result<V, KnowledgeError>,
+{
+    // 持锁期间若 `load` panic，锁会带毒；缓存内容本身仍然自洽，继续用。
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(model) = guard.get(&model_type) {
+        return Ok(Arc::clone(model));
+    }
+    let model = Arc::new(load()?);
+    guard.insert(model_type, Arc::clone(&model));
+    Ok(model)
+}
+
+/// 真正加载模型（下载 / 反序列化），只在缓存缺失时执行。
+fn load_model(model_type: FastembedModelType) -> Result<TextEmbedding, KnowledgeError> {
+    match model_type {
+        // fastembed 精选清单未收录 bge-base-zh-v1.5，走 user-defined 加载
+        FastembedModelType::BGEBaseZHV15 => try_new_bge_base_zh(),
+        FastembedModelType::BGESmallZHV15 => try_new_builtin(FastembedModel::BGESmallZHV15),
+        FastembedModelType::BGELargeZHV15 => try_new_builtin(FastembedModel::BGELargeZHV15),
+        FastembedModelType::AllMiniLML6V2Q => try_new_builtin(FastembedModel::AllMiniLML6V2Q),
+        FastembedModelType::MultilingualE5Small => {
+            try_new_builtin(FastembedModel::MultilingualE5Small)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FastembedEngine
 // ---------------------------------------------------------------------------
 
@@ -161,24 +219,18 @@ pub struct FastembedEngine {
 impl FastembedEngine {
     /// 使用指定模型类型初始化嵌入引擎。
     ///
+    /// 引擎按模型类型在进程内共享：同一模型类型重复构造只加载一次。
     /// 首次调用会从 HuggingFace 下载模型并缓存到本地。
     pub fn new(model_type: FastembedModelType) -> Result<Self, KnowledgeError> {
-        let model = match model_type {
-            // fastembed 精选清单未收录 bge-base-zh-v1.5，走 user-defined 加载
-            FastembedModelType::BGEBaseZHV15 => try_new_bge_base_zh()?,
-            FastembedModelType::BGESmallZHV15 => try_new_builtin(FastembedModel::BGESmallZHV15)?,
-            FastembedModelType::BGELargeZHV15 => try_new_builtin(FastembedModel::BGELargeZHV15)?,
-            FastembedModelType::AllMiniLML6V2Q => try_new_builtin(FastembedModel::AllMiniLML6V2Q)?,
-            FastembedModelType::MultilingualE5Small => {
-                try_new_builtin(FastembedModel::MultilingualE5Small)?
-            }
-        };
-
         let ndims = model_type.ndims();
-        tracing::info!(?model_type, ndims, "Fastembed embedding engine initialized");
+        let model = cached_model(engines(), model_type, || {
+            let model = load_model(model_type)?;
+            tracing::info!(?model_type, ndims, "Fastembed embedding engine initialized");
+            Ok(model)
+        })?;
 
         Ok(Self {
-            model: Arc::new(model),
+            model,
             ndims,
             model_type,
         })
@@ -285,6 +337,77 @@ impl EmbeddingEngine for FastembedEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 同一模型类型只加载一次：计数断言不引入第二个真模型。
+    ///
+    /// 用 `cached_model` 的泛型值类型做计数替身 —— 直接对 `FastembedEngine::new`
+    /// 计数就得为用例下载模型，无网环境必红。
+    #[test]
+    fn same_model_type_loads_once() {
+        let cache: Mutex<HashMap<FastembedModelType, Arc<usize>>> = Mutex::new(HashMap::new());
+        let loads = AtomicUsize::new(0);
+
+        let first = cached_model(&cache, FastembedModelType::BGESmallZHV15, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(1usize)
+        })
+        .expect("首次加载应成功");
+        let second = cached_model(&cache, FastembedModelType::BGESmallZHV15, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(2usize)
+        })
+        .expect("命中缓存应成功");
+
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "同一模型类型不得重复加载");
+        assert!(Arc::ptr_eq(&first, &second), "两次构造必须共享同一份模型");
+
+        // 换模型类型才允许再加载一次
+        let other = cached_model(&cache, FastembedModelType::BGELargeZHV15, || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(3usize)
+        })
+        .expect("另一模型类型应加载");
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(*other, 3);
+    }
+
+    /// 加载失败不写缓存：下次仍会重试，而不是把一次性故障固化成永久失败。
+    #[test]
+    fn failed_load_is_not_cached() {
+        let cache: Mutex<HashMap<FastembedModelType, Arc<u8>>> = Mutex::new(HashMap::new());
+
+        let err = cached_model(&cache, FastembedModelType::MultilingualE5Small, || {
+            Err(KnowledgeError::EmbeddingError("模型下载失败".into()))
+        })
+        .expect_err("加载失败应返回错误");
+        assert!(err.to_string().contains("模型下载失败"));
+        assert!(cache.lock().unwrap().is_empty(), "失败结果不得进缓存");
+
+        let ok = cached_model(&cache, FastembedModelType::MultilingualE5Small, || Ok(7u8))
+            .expect("重试应成功");
+        assert_eq!(*ok, 7);
+    }
+
+    /// 真实的 `FastembedEngine::new` 也必须共享同一份模型实例。
+    ///
+    /// 依赖本地模型缓存；取不到模型（无网且无缓存）时跳过，避免环境相关的红灯。
+    #[test]
+    fn engine_instances_share_one_model() {
+        let (first, second) = match (
+            FastembedEngine::new(FastembedModelType::AllMiniLML6V2Q),
+            FastembedEngine::new(FastembedModelType::AllMiniLML6V2Q),
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return,
+        };
+        assert!(
+            Arc::ptr_eq(&first.model, &second.model),
+            "同一模型类型的引擎必须复用同一份 TextEmbedding"
+        );
+        assert_eq!(first.ndims(), 384);
+        assert_eq!(second.model_type(), FastembedModelType::AllMiniLML6V2Q);
+    }
 
     #[test]
     fn model_type_ndims() {

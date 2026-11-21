@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use tracing::{debug, info, warn};
 
@@ -71,6 +71,9 @@ pub struct AgentManager {
     mcp_config: Arc<McpConfigStore>,
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
+    /// 空间记忆管理器（由宿主在打开空间时注入）。
+    /// None（默认）= 没有空间级记忆库，`@private_memory` 落回团队库。
+    memory_manager: OnceLock<Arc<KnowledgeManager>>,
     /// Tier-1 元数据缓存（name → AgentMeta）
     metas: RwLock<HashMap<String, AgentMeta>>,
     /// Tier-2 完整 Agent 实例缓存（name → Arc<Agent>）
@@ -122,6 +125,7 @@ impl AgentManager {
             mcp_config: Arc::new(mcp_config),
             skill_registry,
             knowledge_manager,
+            memory_manager: OnceLock::new(),
             metas: RwLock::new(HashMap::new()),
             cache: RwLock::new(HashMap::new()),
             workflow_access: RwLock::new(None),
@@ -162,6 +166,16 @@ impl AgentManager {
     /// 注入 [`crate::tools::deps::NoopMemoryAudit`] 仅限测试放行删除。
     pub fn set_memory_audit(&self, ma: Arc<dyn MemoryAuditAccess>) {
         *self.memory_audit.write().unwrap() = Some(ma);
+    }
+
+    /// 注入空间记忆管理器（由宿主在打开空间时调用）。
+    ///
+    /// 记忆库与团队库的目录、scope 都不同，且一个空间只有一份记忆库，
+    /// 因此只装一次：重复注入保留首个，避免运行中换库导致已写入的记忆失联。
+    pub fn set_memory_manager(&self, km: Arc<KnowledgeManager>) {
+        if self.memory_manager.set(km).is_err() {
+            debug!("memory manager already set, keeping the first one");
+        }
     }
 
     // ── 初始化 ───────────────────────────────────────────────────────
@@ -331,6 +345,7 @@ impl AgentManager {
         let workflow_access = self.workflow_access.read().unwrap().clone();
         let mcp_access = self.mcp_access.read().unwrap().clone();
         let memory_audit = self.memory_audit.read().unwrap().clone();
+        let memory_manager = self.memory_manager.get().cloned();
         ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
@@ -339,6 +354,7 @@ impl AgentManager {
                 user_config: config,
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
+                memory_manager: memory_manager.clone(),
                 workflow_access: workflow_access.clone(),
                 mcp_access: mcp_access.clone(),
                 web_search: self.web_search.read().unwrap().clone(),
@@ -351,6 +367,7 @@ impl AgentManager {
             knowledge_access: Arc::new(AmKnowledgeAccess {
                 user_id: self.user_id.clone(),
                 km: self.knowledge_manager.clone(),
+                memory_manager: memory_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
             workflow_access,
@@ -623,6 +640,10 @@ impl KnowledgeAccess for AgentManager {
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.knowledge_manager
     }
+
+    fn memory_manager(&self) -> Option<&Arc<KnowledgeManager>> {
+        self.memory_manager.get()
+    }
 }
 
 // ============================================================================
@@ -646,6 +667,8 @@ struct AmAgentAccess {
     user_config: UserConfig,
     skill_registry: Arc<SkillRegister>,
     knowledge_manager: Arc<KnowledgeManager>,
+    /// 空间记忆管理器（透传给子 Agent 的 ToolDependencies；`@memory` 只靠它工作）。
+    memory_manager: Option<Arc<KnowledgeManager>>,
     workflow_access: Option<Arc<dyn WorkflowAccess>>,
     mcp_access: Option<Arc<dyn McpAccess>>,
     /// AgentManager 构造期缓存的搜索后端（`web_search` 子 Agent 装配用）。
@@ -655,17 +678,11 @@ struct AmAgentAccess {
     work_dir: WorkDir,
 }
 
-impl AgentAccess for AmAgentAccess {
-    fn load_agent(&self, name: &str) -> Result<Arc<Agent>, AgentError> {
-        let path = self.agents_dir.join(name).join("agent.md");
-        if !path.exists() {
-            return Err(AgentError::Config(format!(
-                "agent '{name}' not found at {}",
-                path.display()
-            )));
-        }
-
-        let deps = ToolDependencies {
+impl AmAgentAccess {
+    /// 下一层子 Agent 的依赖集。与 `AgentManager` 的两条构建路径同形，
+    /// 差别只在「子 agent 拿不到 runtime / Hub / 排期」这三项。
+    fn build_deps(&self) -> ToolDependencies {
+        ToolDependencies {
             agent_access: Arc::new(AmAgentAccess {
                 agents_dir: self.agents_dir.clone(),
                 workspace_root: self.workspace_root.clone(),
@@ -673,6 +690,7 @@ impl AgentAccess for AmAgentAccess {
                 user_config: self.user_config.clone(),
                 skill_registry: self.skill_registry.clone(),
                 knowledge_manager: self.knowledge_manager.clone(),
+                memory_manager: self.memory_manager.clone(),
                 workflow_access: self.workflow_access.clone(),
                 mcp_access: self.mcp_access.clone(),
                 web_search: self.web_search.clone(),
@@ -685,6 +703,7 @@ impl AgentAccess for AmAgentAccess {
             knowledge_access: Arc::new(AmKnowledgeAccess {
                 user_id: self.user_id.clone(),
                 km: self.knowledge_manager.clone(),
+                memory_manager: self.memory_manager.clone(),
             }),
             allowed_kbs: Vec::new(),
             workflow_access: self.workflow_access.clone(),
@@ -700,9 +719,21 @@ impl AgentAccess for AmAgentAccess {
             workspace_hub: None,
             // 定时任务同理：子 agent 排期等于绕过总管的编排意志。
             schedule_access: None,
-        };
+        }
+    }
+}
 
-        let agent = Agent::from_file(&path, &self.user_config, &deps)?;
+impl AgentAccess for AmAgentAccess {
+    fn load_agent(&self, name: &str) -> Result<Arc<Agent>, AgentError> {
+        let path = self.agents_dir.join(name).join("agent.md");
+        if !path.exists() {
+            return Err(AgentError::Config(format!(
+                "agent '{name}' not found at {}",
+                path.display()
+            )));
+        }
+
+        let agent = Agent::from_file(&path, &self.user_config, &self.build_deps())?;
         Ok(Arc::new(agent))
     }
 
@@ -791,6 +822,7 @@ impl SkillProvider for AmSkillProvider {
 struct AmKnowledgeAccess {
     user_id: String,
     km: Arc<KnowledgeManager>,
+    memory_manager: Option<Arc<KnowledgeManager>>,
 }
 
 impl KnowledgeAccess for AmKnowledgeAccess {
@@ -800,6 +832,10 @@ impl KnowledgeAccess for AmKnowledgeAccess {
 
     fn knowledge_manager(&self) -> &Arc<KnowledgeManager> {
         &self.km
+    }
+
+    fn memory_manager(&self) -> Option<&Arc<KnowledgeManager>> {
+        self.memory_manager.as_ref()
     }
 }
 
@@ -814,9 +850,9 @@ mod tests {
     use crate::tools::{MemoryAuditEntry, NoopMemoryAudit};
     use std::collections::HashMap;
 
-    /// 带一个可用 provider 的管理器：加载 agent.md 需要能构造 provider。
-    fn manager_with_provider(root: &Path) -> Arc<AgentManager> {
-        let user_config = UserConfig {
+    /// 带一个可用 provider 的用户配置：加载 agent.md 需要能构造 provider。
+    fn provider_config() -> UserConfig {
+        UserConfig {
             providers: ProvidersConfig {
                 default_provider: "deepseek".into(),
                 providers: HashMap::from([(
@@ -832,7 +868,12 @@ mod tests {
                 web_search: None,
             },
             mcp: McpConfig::empty(),
-        };
+        }
+    }
+
+    /// 带一个可用 provider 的管理器：加载 agent.md 需要能构造 provider。
+    fn manager_with_provider(root: &Path) -> Arc<AgentManager> {
+        let user_config = provider_config();
         Arc::new(AgentManager::new(
             root.join("agents"),
             "test-user".into(),
@@ -881,6 +922,86 @@ mod tests {
             am.build_deps().memory_audit.is_some(),
             "注入后 build_deps 必须携带审计访问"
         );
+    }
+
+    /// 记忆管理器必须走到三条路径：trait 直读、顶层 deps、子 agent deps。
+    ///
+    /// `@memory` 是经 `AgentAccess::load_agent` 加载的子 agent，它的知识工具
+    /// 只认这条透传 —— 漏一层就退回团队库去读写别人的记忆。
+    #[test]
+    fn memory_manager_reaches_trait_object_top_level_and_sub_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = manager_with_provider(tmp.path());
+        assert!(
+            am.memory_manager().is_none(),
+            "未注入时不得凭空造出一个记忆管理器"
+        );
+
+        let memory = Arc::new(KnowledgeManager::new(tmp.path().join("memory")));
+        am.set_memory_manager(Arc::clone(&memory));
+
+        let as_trait: &dyn KnowledgeAccess = am.as_ref();
+        assert!(
+            Arc::ptr_eq(
+                as_trait.memory_manager().expect("注入后 trait 必须能看到"),
+                &memory
+            ),
+            "trait 直读必须是注入的那一个"
+        );
+
+        let top = am.build_deps();
+        assert!(Arc::ptr_eq(
+            top.knowledge_access
+                .memory_manager()
+                .expect("build_deps 必须携带"),
+            &memory
+        ));
+        let direct = am.build_deps_direct();
+        assert!(Arc::ptr_eq(
+            direct
+                .knowledge_access
+                .memory_manager()
+                .expect("build_deps_direct 必须携带"),
+            &memory
+        ));
+
+        // 再下一层的子 agent：AmAgentAccess 自己攒的依赖集
+        let nested = AmAgentAccess {
+            agents_dir: tmp.path().join("agents"),
+            workspace_root: tmp.path().to_path_buf(),
+            user_id: "test-user".into(),
+            user_config: provider_config(),
+            skill_registry: Arc::new(SkillRegister::new(tmp.path().join("skills")).unwrap()),
+            knowledge_manager: Arc::clone(as_trait.knowledge_manager()),
+            memory_manager: Some(Arc::clone(&memory)),
+            workflow_access: None,
+            mcp_access: None,
+            web_search: None,
+            memory_audit: None,
+            work_dir: WorkDir::new(tmp.path().join("work")),
+        };
+        assert!(Arc::ptr_eq(
+            nested
+                .build_deps()
+                .knowledge_access
+                .memory_manager()
+                .expect("子 agent 依赖集必须携带"),
+            &memory
+        ));
+    }
+
+    /// 记忆库只装一次：重复注入保留首个，避免运行中换库导致已写入的记忆失联。
+    #[test]
+    fn set_memory_manager_keeps_the_first_injection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = manager_with_provider(tmp.path());
+        let first = Arc::new(KnowledgeManager::new(tmp.path().join("memory")));
+        let second = Arc::new(KnowledgeManager::new(tmp.path().join("other")));
+
+        am.set_memory_manager(Arc::clone(&first));
+        am.set_memory_manager(Arc::clone(&second));
+
+        assert!(Arc::ptr_eq(am.memory_manager().expect("已注入"), &first));
     }
 
     /// 机器任务工具只拿弱引用：升级必须落到 AgentManager 自己持有的那个 runtime，

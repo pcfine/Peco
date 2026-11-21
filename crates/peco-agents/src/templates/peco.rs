@@ -12,9 +12,5 @@ pub const PECO: BuiltinTemplate = BuiltinTemplate {
             "agents/@memory/agent.md",
             include_bytes!("../../templates/peco/agents/@memory/agent.md"),
         ),
-        (
-            "knowledge/@private_memory/kb_config.json",
-            include_bytes!("../../templates/peco/knowledge/@private_memory/kb_config.json"),
-        ),
     ],
 };
