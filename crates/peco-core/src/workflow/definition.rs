@@ -325,6 +325,22 @@ impl StepOutcome {
 // Pre-validation — 在 serde 严格解析前检查 YAML 结构，给出可操作的错误信息
 // ============================================================================
 
+/// 报错里附带的示例。它本身必须能被 `WorkflowDefinition::from_yaml` 解析 ——
+/// 模型最可能照抄这段文本，示例写错等于教它再错一次。
+const WORKFLOW_EXAMPLE: &str = r#"---
+workflow:
+  name: "my-workflow"
+  description: "what it does"
+  version: "1.0"
+  steps:
+    - id: "step1"
+      name: "Step Name"
+      type: agent  # or shell
+      config:
+        agent: "@agent-name"
+        prompt: "instructions"
+---"#;
+
 /// 在严格解析之前预校验 workflow YAML 结构。
 ///
 /// 解析为通用 `serde_json::Value`，逐步骤检查 config 是否包含
@@ -343,35 +359,14 @@ pub fn pre_validate_workflow_yaml(yaml: &str) -> Result<(), WorkflowError> {
     // 解析为通用 JSON value（宽松模式，不要求所有字段类型匹配）
     let parsed: serde_json::Value = serde_yaml::from_str(frontmatter).map_err(|e| {
         WorkflowError::Parse(format!(
-            "YAML syntax error: {e}\n\
-             Expected format:\n\
-             ---\n\
-             workflow:\n\
-               name: \"my-workflow\"\n\
-               description: \"what it does\"\n\
-               version: \"1.0\"\n\
-               steps:\n\
-                 - id: \"step1\"\n\
-                   name: \"Step Name\"\n\
-                   type: agent  # or shell\n\
-                   config:\n\
-                     agent: \"@agent-name\"\n\
-                     prompt: \"instructions\"\n\
-             ---"
+            "YAML syntax error: {e}\nExpected format:\n{WORKFLOW_EXAMPLE}"
         ))
     })?;
 
     let workflow = parsed.get("workflow").ok_or_else(|| {
-        WorkflowError::Parse(
-            "Missing top-level 'workflow:' key.\n\
-             Expected format:\n\
-             ---\n\
-             workflow:\n\
-               name: \"my-workflow\"\n\
-               ...\n\
-             ---"
-            .into(),
-        )
+        WorkflowError::Parse(format!(
+            "Missing top-level 'workflow:' key.\nExpected format:\n{WORKFLOW_EXAMPLE}"
+        ))
     })?;
 
     let steps = match workflow.get("steps") {
@@ -755,6 +750,28 @@ mod pre_validate_tests {
         let yaml = "---\nname: \"test\"\n---";
         let err = pre_validate_workflow_yaml(yaml).unwrap_err();
         assert!(err.to_string().contains("Missing top-level 'workflow:'"));
+    }
+
+    /// 报错示例是模型最容易照抄的文本：它必须能走通真实解析链路，
+    /// 否则模型照抄一次就再失败一次。
+    #[test]
+    fn test_error_example_is_itself_parseable() {
+        let err = pre_validate_workflow_yaml("---\nname: \"test\"\n---").unwrap_err();
+        let msg = err.to_string();
+        let start = msg
+            .find("---")
+            .expect("error message should embed an example");
+        let end = msg.rfind("---").expect("example should be framed by '---'");
+        let example = &msg[start..end + 3];
+
+        let def = WorkflowDefinition::from_yaml(example)
+            .unwrap_or_else(|e| panic!("example embedded in the error must parse: {e}\n{example}"));
+        assert_eq!(
+            def.steps.len(),
+            1,
+            "example should carry one step: {example}"
+        );
+        assert_eq!(def.version, "1.0", "example should pin version: {example}");
     }
 
     #[test]

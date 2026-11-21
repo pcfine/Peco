@@ -207,6 +207,8 @@ impl ToolDyn for SaveSkill {
                 The content must be a complete SKILL.md file with YAML frontmatter \
                 (name, description, allowed-tools) followed by Markdown instructions.\n\
                 \n\
+                YAML indentation is structure: name, description and allowed-tools are all flat top-level keys at column 0, and none of them nests. If they are indented or grouped under a parent key, the file is rejected (name and description are required exactly at the top level); allowed-tools on its own would silently become empty.\n\
+                \n\
                 Required frontmatter fields:\n\
                   name: unique skill identifier (lowercase, no spaces)\n\
                   description: what the skill does and when to use it\n\
