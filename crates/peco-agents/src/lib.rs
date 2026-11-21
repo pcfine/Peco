@@ -6,7 +6,7 @@
 //! # 依赖方向
 //!
 //! ```text
-//! peco-cli / peco-server → peco-agents → （无 peco-core 依赖）
+//! peco-daemon → peco-agents → （无 peco-core 依赖）
 //! ```
 //!
 //! peco-core 不依赖本 crate，保持零模板假设。
