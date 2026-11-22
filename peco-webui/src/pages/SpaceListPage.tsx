@@ -20,6 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { latestActivityByWs } from "@/components/board/panel-spaces";
 import { SpaceRemovalDialog } from "@/components/spaces/SpaceRemovalDialog";
 import { SpaceTrashList } from "@/components/spaces/SpaceTrashList";
+import { useCloseSpace } from "@/components/spaces/useSpaceLifecycle";
 import { useEnterSpace } from "@/hooks/useOpenSpaces";
 import { errorText } from "@/lib/api";
 import { relativeTime } from "@/lib/relative";
@@ -61,8 +62,18 @@ function SpaceRow({
   onRemove: () => void;
 }) {
   const name = spaceLabel(space);
+  const group = spaceGroupOf(space);
   // 在飞任务含外来；蓝点跟在最近打开（本页即当前）的空间上。
   const inflight = space.inflight_dispatch + space.inflight_foreign;
+  const close = useCloseSpace(space.ws_id);
+  // 只有空闲的已打开空间能关：关闭会卸载实例，在飞的活没有落点。
+  const closable = group === "running" && inflight === 0;
+  const closeHint =
+    group !== "running"
+      ? "空间未打开，无需关闭"
+      : inflight > 0
+        ? `还有 ${inflight} 个任务在飞，等工作结束再关闭`
+        : "关闭空间";
   return (
     <li
       data-ws-id={space.ws_id}
@@ -76,7 +87,7 @@ function SpaceRow({
       >
         <span className="flex min-w-0 items-center gap-2">
           <SpaceStatusMark
-            group={spaceGroupOf(space)}
+            group={group}
             recent={active}
             inflight={inflight}
           />
@@ -100,15 +111,26 @@ function SpaceRow({
           {relativeTime(activityAt)}
         </span>
       </button>
-      <Link
-        to={`/spaces/${encodeURIComponent(space.ws_id)}/status`}
-        aria-label={`${name} 状态`}
-        className="grid h-6 shrink-0 place-items-center rounded-sm bg-line/60 px-2 text-caption font-medium text-ink-muted hover:bg-line hover:text-ink"
+      <button
+        type="button"
+        onClick={close.close}
+        disabled={!closable}
+        title={closeHint}
+        aria-label={`关闭空间 ${name}`}
+        className="grid h-6 shrink-0 place-items-center rounded-sm bg-line/60 px-2 text-caption font-medium text-ink-muted transition-colors duration-[120ms] enabled:hover:bg-line enabled:hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
       >
-        状态
-      </Link>
-      {/* 保留空间删不掉（daemon 400 `reserved_space`）：不给一个注定失败的按钮。 */}
-      {!space.reserved && (
+        关闭
+      </button>
+      {/* 保留空间删不掉（daemon 400 `reserved_space`）：不给一个注定失败的按钮，
+          但槽位照留 —— 它少一截会把整列「在飞」推到别的行对不齐。 */}
+      {space.reserved ? (
+        <span
+          aria-hidden="true"
+          className="invisible grid h-6 shrink-0 place-items-center rounded-sm px-2 text-caption font-medium"
+        >
+          删除
+        </span>
+      ) : (
         <button
           type="button"
           onClick={onRemove}

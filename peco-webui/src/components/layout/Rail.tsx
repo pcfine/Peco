@@ -34,11 +34,11 @@ import { cn } from "@/lib/utils";
 import type { Space } from "@/types/daemon";
 
 /**
- * 当前路由落在哪个空间上：详情页与状态页都算这个空间。
+ * 当前路由落在哪个空间上：只有空间详情页算。
  * `/spaces`、`/spaces/new` 是工作室栏目，不归到任何空间行。
  */
 function spaceIdInPath(pathname: string): string | null {
-  const match = /^\/spaces\/([^/]+)(?:\/status)?$/.exec(pathname);
+  const match = /^\/spaces\/([^/]+)$/.exec(pathname);
   if (!match || match[1] === "new") return null;
   try {
     return decodeURIComponent(match[1]);

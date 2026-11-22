@@ -6,6 +6,6 @@ export function isPecoSurface(
   // 地址栏里带不带尾斜杠是同一页，比较前先归一。
   const path = pathname.replace(/\/+$/, "") || "/";
   if (path === "/peco") return true;
-  // `/spaces/{pecoWsId}/status` 没有聊天列，不算同一个会话本体。
+  // 只有聊天页算会话本体；工作室列表之类的路由不是。
   return Boolean(pecoWsId) && path === `/spaces/${pecoWsId}`;
 }

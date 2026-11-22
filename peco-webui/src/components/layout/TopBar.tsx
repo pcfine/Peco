@@ -24,7 +24,6 @@ const PAGE_TITLES: Record<string, string> = {
 function titleOf(pathname: string): string {
   if (pathname === "/peco") return "Peco 聊天";
   if (PAGE_TITLES[pathname]) return PAGE_TITLES[pathname];
-  if (/^\/spaces\/[^/]+\/status$/.test(pathname)) return "空间状态";
   if (pathname.startsWith("/spaces/")) return "空间聊天";
   if (pathname.startsWith("/teams/")) return "团队配置";
   return "";

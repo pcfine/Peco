@@ -1,11 +1,12 @@
 // 空间的开关动作。关闭被 409 拦下时，两个在飞计数直接来自那一刻的响应体，
 // 不从空间详情里另取一份 —— 详情里的是 15s 前的数，而挡住决定的就是这一刻的数。
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { closeSpace, createSpace, openSpace } from "@/api/spaces";
 import { ApiError, errorText } from "@/lib/api";
+import { useOpenSpacesStore } from "@/stores/openSpacesStore";
 import type { Space } from "@/types/daemon";
 
 export interface InflightCounts {
@@ -14,7 +15,7 @@ export interface InflightCounts {
 }
 
 /**
- * 409 `inflight_tasks` 不是失败，是「要不要强制」：计数就在错误体里，比再查一遍详情准。
+ * 409 `inflight_tasks` 的计数就在错误体里，比再查一遍详情准。
  * 其余错误返回 null，由调用方按普通失败展示。
  */
 export function inflightGate(error: unknown): InflightCounts | null {
@@ -29,33 +30,33 @@ export function inflightGate(error: unknown): InflightCounts | null {
 
 export interface CloseSpaceState {
   close: () => void;
-  forceClose: () => void;
-  dismiss: () => void;
-  /** 非空即表示 409 已发生，Dialog 要开。 */
-  pending: InflightCounts | null;
   closing: boolean;
-  forcing: boolean;
-  error: unknown;
 }
 
+/**
+ * 关闭空间：只在空闲时发起，所以 409 说明计数在点击前后变了 —— 不提供强制关闭
+ * （关闭会卸载实例，在飞的活没有落点），只提示并刷新计数，让按钮自己变灰。
+ */
 export function useCloseSpace(wsId: string): CloseSpaceState {
   const queryClient = useQueryClient();
-  const [pending, setPending] = useState<InflightCounts | null>(null);
 
   const mutation = useMutation({
-    mutationFn: (force: boolean) => closeSpace(wsId, force),
+    mutationFn: () => closeSpace(wsId),
     onSuccess: () => {
-      setPending(null);
+      // 关闭即离开打开集：左栏的「已打开」只留活实例。
+      useOpenSpacesStore.getState().close(wsId);
       toast.success("空间已关闭");
       void queryClient.invalidateQueries({ queryKey: ["space", wsId] });
       void queryClient.invalidateQueries({ queryKey: ["spaces"] });
       void queryClient.invalidateQueries({ queryKey: ["space-tasks", wsId] });
     },
     onError: (error) => {
-      // 409 不是失败而是「需要用户再决定一次」：Dialog 不关，改展示计数。
       const gate = inflightGate(error);
       if (gate) {
-        setPending(gate);
+        toast.error(
+          `还有 ${gate.dispatch + gate.foreign} 个任务在飞，等工作结束再关闭`,
+        );
+        void queryClient.invalidateQueries({ queryKey: ["spaces"] });
         return;
       }
       toast.error(errorText(error));
@@ -63,16 +64,8 @@ export function useCloseSpace(wsId: string): CloseSpaceState {
   });
 
   return {
-    close: () => mutation.mutate(false),
-    forceClose: () => mutation.mutate(true),
-    dismiss: () => {
-      setPending(null);
-      mutation.reset();
-    },
-    pending,
-    closing: mutation.isPending && pending === null,
-    forcing: mutation.isPending && pending !== null,
-    error: mutation.error,
+    close: () => mutation.mutate(),
+    closing: mutation.isPending,
   };
 }
 

@@ -9,10 +9,10 @@ describe("Peco 会话本体所在的页面", () => {
     expect(isPecoSurface("/spaces/ws_peco/", "ws_peco")).toBe(true);
   });
 
-  it("状态页没有聊天列，别的空间页也不是 Peco 会话", () => {
-    expect(isPecoSurface("/spaces/ws_peco/status", "ws_peco")).toBe(false);
+  it("别的空间页与工作室列表都不是 Peco 会话", () => {
     expect(isPecoSurface("/spaces/ws_a", "ws_peco")).toBe(false);
     expect(isPecoSurface("/spaces", "ws_peco")).toBe(false);
+    expect(isPecoSurface("/spaces/ws_peco/foo", "ws_peco")).toBe(false);
   });
 
   it("Peco 空间 id 未到手时只认 /peco", () => {

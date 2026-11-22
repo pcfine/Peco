@@ -286,21 +286,19 @@ describe("壳与路由", () => {
     ).toBeInTheDocument();
   });
 
-  it("/spaces/:wsId 是聊天页：单对话壳 + 右栏，/status 才是状态页", async () => {
-    const chat = renderAt("/spaces/ws_peco");
+  it("/spaces/:wsId 是聊天页：单对话壳 + 右栏", async () => {
+    renderAt("/spaces/ws_peco");
     expect(await screen.findByTestId("space-chat-shell")).toBeInTheDocument();
     expect(screen.getByTestId("space-panel")).toHaveAttribute(
       "data-mode",
       "files",
     );
     expect(screen.getByTestId("path")).toHaveTextContent("/spaces/ws_peco");
-    chat.unmount();
+  });
 
+  it("旧状态页已废弃：不再有这条路由", async () => {
     renderAt("/spaces/ws_peco/status");
-    expect(
-      await screen.findByRole("tab", { name: /任务台账/ }),
-    ).toBeInTheDocument();
-    // 状态页不承载聊天：它没有单对话壳。
+    expect(await screen.findByText("页面不存在")).toBeInTheDocument();
     expect(screen.queryByTestId("space-chat-shell")).toBeNull();
   });
 
@@ -309,7 +307,6 @@ describe("壳与路由", () => {
     ["/peco", "Peco"],
     ["/spaces", "工作室"],
     ["/spaces/ws_peco", "Peco"],
-    ["/spaces/ws_peco/status", "Peco"],
     ["/spaces/new", "新建空间"],
     ["/teams", "团队"],
     ["/teams/peco", "Peco"],

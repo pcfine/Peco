@@ -10,8 +10,7 @@
 // `/spaces/A` → `/spaces/B` 之间复用同一个路由元素，页面因此不重挂载，
 // 切走的空间继续跑它的流；左栏切换只改激活态与路由。
 //
-// 已知限制：进 `/spaces/:wsId/status` 或 `/peco` 会离开这个路由元素，
-// 隐藏空间的流随组件卸载中断。
+// 已知限制：进 `/peco` 会离开这个路由元素，隐藏空间的流随组件卸载中断。
 
 import { useEffect, useMemo, useRef } from "react";
 import { Loader2 } from "lucide-react";
@@ -20,7 +19,6 @@ import { ErrorBanner } from "@/components/common/ErrorBanner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ClearConversationDialog } from "@/components/spaces/ClearConversationDialog";
-import { CloseSpaceDialog } from "@/components/spaces/CloseSpaceDialog";
 import { SpaceChatHeader } from "@/components/spaces/SpaceChatHeader";
 import { SpaceChatShell } from "@/components/spaces/SpaceChatShell";
 import { SpacePanelHeader } from "@/components/spaces/SpacePanelHeader";
@@ -32,7 +30,6 @@ import {
 import { useConversationClear } from "@/components/spaces/useConversationClear";
 import {
   type SpaceOpenNoticePhase,
-  useCloseSpace,
   useOpenSpaceOnEnter,
 } from "@/components/spaces/useSpaceLifecycle";
 import { WORK_INLINE_MIN, workWidthOf } from "@/components/layout/shellMetrics";
@@ -109,7 +106,6 @@ function SpaceOpenNotice({
 export function SpaceDetailPage() {
   const { wsId = "" } = useParams();
   const space = useSpace(wsId);
-  const close = useCloseSpace(wsId);
   const autoOpen = useOpenSpaceOnEnter(space.data);
   const openIds = useOpenSpacesStore((state) => state.openIds);
   const viewport = useViewportWidth();
@@ -283,14 +279,6 @@ export function SpaceDetailPage() {
         onConfirm={clear.confirm}
       />
 
-      <CloseSpaceDialog
-        open={close.pending !== null}
-        inflight={close.pending}
-        onWait={close.dismiss}
-        onForce={() => close.forceClose()}
-        forcing={close.forcing}
-        error={close.error}
-      />
     </div>
   );
 }

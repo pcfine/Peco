@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SpaceListPage } from "@/pages/SpaceListPage";
@@ -11,6 +17,8 @@ const ensureSpaceConversation = vi.fn(async (_wsId: string) => ({
   conversation_id: "conv_a",
   created: true,
 }));
+
+const closeSpace = vi.fn(async (_wsId: string) => ({ stopped: true }));
 
 const spaceA: Space = {
   ws_id: "ws_a",
@@ -38,6 +46,15 @@ const spaceB: Space = {
   inflight_dispatch: 2,
 };
 
+/** 有行、本次没开：关闭对它是无意义的，按钮只能是灰的。 */
+const spaceC: Space = {
+  ...spaceA,
+  ws_id: "ws_c",
+  work_dir: "/tmp/spaces/c/work",
+  label: "空间 C",
+  status: "closed",
+};
+
 vi.mock("@/api/peco", () => ({
   getPeco: async () => ({
     ws_id: "ws_peco",
@@ -49,8 +66,9 @@ vi.mock("@/api/peco", () => ({
 }));
 
 vi.mock("@/api/spaces", () => ({
-  listSpaces: async () => [spaceA, spaceB],
+  listSpaces: async () => [spaceA, spaceB, spaceC],
   ensureSpaceConversation: (wsId: string) => ensureSpaceConversation(wsId),
+  closeSpace: (wsId: string) => closeSpace(wsId),
   listTrashSpaces: async () => [],
 }));
 
@@ -78,6 +96,7 @@ function renderList() {
 beforeEach(() => {
   localStorage.clear();
   ensureSpaceConversation.mockClear();
+  closeSpace.mockClear();
   useSpaceStore.setState({ currentWsId: "ws_peco" });
   useOpenSpacesStore.setState({
     openIds: [],
@@ -99,12 +118,41 @@ describe("工作室列表", () => {
     expect(screen.getByTestId("path")).toHaveTextContent("/spaces/ws_a");
   });
 
-  it("右侧「状态」进状态页，不进聊天页", async () => {
+  it("空闲的已打开空间能关闭：调接口并把行移出打开集", async () => {
+    useOpenSpacesStore.setState({
+      openIds: ["ws_a"],
+      activeWsId: "ws_a",
+      seeded: true,
+    });
     renderList();
 
-    expect(
-      await screen.findByRole("link", { name: "空间 A 状态" }),
-    ).toHaveAttribute("href", "/spaces/ws_a/status");
+    const button = await screen.findByRole("button", {
+      name: "关闭空间 空间 A",
+    });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+
+    await waitFor(() => expect(closeSpace).toHaveBeenCalledWith("ws_a"));
+    await waitFor(() =>
+      expect(useOpenSpacesStore.getState().openIds).toEqual([]),
+    );
+  });
+
+  it("在飞的空间与未打开的空间都不能关闭", async () => {
+    renderList();
+
+    const busy = await screen.findByRole("button", {
+      name: "关闭空间 空间 B",
+    });
+    expect(busy).toBeDisabled();
+    expect(busy).toHaveAttribute(
+      "title",
+      "还有 2 个任务在飞，等工作结束再关闭",
+    );
+
+    const dormant = screen.getByRole("button", { name: "关闭空间 空间 C" });
+    expect(dormant).toBeDisabled();
+    expect(dormant).toHaveAttribute("title", "空间未打开，无需关闭");
   });
 
   it("在跑的行状态位是「在运行 · N 个任务在飞」，空闲的行没有", async () => {
