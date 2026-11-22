@@ -86,6 +86,11 @@ impl SpaceRegistry {
         Ok(self.handle(ws_id).await?.workspace())
     }
 
+    /// 确保空间已打开并返回实例；已打开时复用 Hub 里的那一份。
+    pub async fn open(&self, ws_id: &str) -> Result<Arc<dyn WorkspaceHandle>, DaemonError> {
+        crate::space::open::ensure_open_indexed(&self.env, &self.hub, ws_id).await
+    }
+
     /// 空间的工作目录（已索引即可得，不需要实例）。
     pub async fn work_dir(&self, ws_id: &str) -> Result<PathBuf, DaemonError> {
         Ok(PathBuf::from(self.index_row(ws_id).await?.work_dir))

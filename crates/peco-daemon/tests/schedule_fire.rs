@@ -15,7 +15,7 @@ use peco_daemon::db::schedules::{self, ScheduledRunRow, ScheduledTaskRow};
 use peco_daemon::schedule::scheduler::Scheduler;
 use peco_daemon::space::peco::PecoIdentity;
 use peco_daemon::state::AppState;
-use peco_daemon::wake::deliver::PecoDelivery;
+use peco_daemon::wake::deliver::WakeDelivery;
 use serde_json::{Value, json};
 use support::upstream::{FakeUpstream, Reply};
 use support::{TestEnv, call, fixture, install_team, new_env};
@@ -56,11 +56,10 @@ fn scheduler(
     chat_runs: Arc<ChatActiveRuns>,
 ) -> Arc<Scheduler> {
     let spaces = env.spaces();
-    let delivery = Arc::new(PecoDelivery::new(
+    let delivery = Arc::new(WakeDelivery::new(
         env.pool.clone(),
         spaces.clone(),
         chat_runs.clone(),
-        peco.clone(),
         Arc::downgrade(&env.env),
     ));
     Arc::new(Scheduler::new(

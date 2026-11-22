@@ -37,7 +37,7 @@ pub struct AppState {
     /// 会话级 chat 控制注册表：暂停/恢复必须从**另一条请求**触达在途 looper，
     /// 而 looper 由 SSE 请求任务独占持有，故只能在这里留一个会话 → 控制通道的表。
     pub chat_runs: Arc<ChatActiveRuns>,
-    /// 任务终态 → Peco 会话的投递泵。观察者叫醒它，它按台账决定投什么。
+    /// 任务终态 → 派发方会话的投递泵。观察者叫醒它，它按台账逐目标分组投递。
     pub wake: Arc<WakePump>,
     /// 定时任务的调度器：手动运行的入口在它身上，列表与历史只读库里那两张表。
     pub schedules: Arc<Scheduler>,
@@ -57,8 +57,10 @@ impl AppState {
         origin_ws_id: String,
         principal: String,
         origin_dir: PathBuf,
+        conversation_id: Option<String>,
     ) -> Arc<DispatchWatchHook> {
-        self.env.dispatch_hook(origin_ws_id, principal, origin_dir)
+        self.env
+            .dispatch_hook(origin_ws_id, principal, origin_dir, conversation_id)
     }
 
     /// 为一次 `AgentLooper` 会话组装配置。

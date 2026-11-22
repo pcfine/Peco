@@ -275,11 +275,10 @@ impl TestEnv {
         let spaces = Arc::new(SpaceRegistry::new(self.hub.clone(), env.clone()));
         let chat_runs = Arc::new(peco_daemon::chat::ChatActiveRuns::new());
         // 与 `main` 同一条装配链：通知与排期共用同一份投递端与同一张实例表。
-        let delivery = Arc::new(peco_daemon::wake::deliver::PecoDelivery::new(
+        let delivery = Arc::new(peco_daemon::wake::deliver::WakeDelivery::new(
             self.pool.clone(),
             spaces.clone(),
             chat_runs.clone(),
-            env.peco.clone(),
             Arc::downgrade(&env),
         ));
         AppState {
@@ -392,6 +391,7 @@ impl TestEnv {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id,
+                origin_conversation_id: None,
                 agent_name: "@coder",
                 origin_kind,
                 task_state,
@@ -420,6 +420,7 @@ impl TestEnv {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: target_ws_id,
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "working",

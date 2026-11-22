@@ -23,7 +23,7 @@ use peco_daemon::space::peco;
 use peco_daemon::space::registry::SpaceRegistry;
 use peco_daemon::space::tasks::TaskObserver;
 use peco_daemon::state::AppState;
-use peco_daemon::wake::deliver::PecoDelivery;
+use peco_daemon::wake::deliver::WakeDelivery;
 use peco_daemon::wake::pump::WakePump;
 use peco_daemon::web_auth::WebAuth;
 
@@ -171,11 +171,10 @@ async fn run() -> Result<(), DaemonError> {
     // 投递端在这里才拿到 `SpaceRegistry` 与 `SpaceEnv`：泵必须早于观察者存在，
     // 故只能晚绑定（`OnceLock`），否则 `pump ↔ AppState` 会成 Arc 环。
     // 定时任务的通知走同一份投递端：落点固定是 Peco 空间的 `@master` 会话。
-    let delivery = Arc::new(PecoDelivery::new(
+    let delivery = Arc::new(WakeDelivery::new(
         pool.clone(),
         spaces.clone(),
         chat_runs.clone(),
-        env.peco.clone(),
         Arc::downgrade(&env),
     ));
     let schedules = Arc::new(Scheduler::new(

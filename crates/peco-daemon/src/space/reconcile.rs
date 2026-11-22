@@ -207,6 +207,7 @@ fn resubscribe(state: &AppState, row: &DispatchRow, dir: &Path) {
         row.origin_ws_id.clone(),
         row.target_team_id.clone(),
         dir.to_path_buf(),
+        row.origin_conversation_id.clone(),
     );
     let call = ToolCall::new(
         format!("reconcile-{}", row.task_id),

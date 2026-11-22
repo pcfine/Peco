@@ -1,4 +1,4 @@
-//! P4 唤醒闭环的投递用例：认领之后真的把一条 `[peco-wake]` 送进 Peco 会话并跑完一轮。
+//! 唤醒闭环的投递用例：认领之后真的把一条 `[peco-wake]` 送进派发方会话并跑完一轮。
 //!
 //! 每个用例自带一个真实空间与一份指向假上游的 `providers.toml`，走的是生产同一条
 //! `chat::run` 执行链；差别只在没有 SSE 客户端（`RunSink::Headless`）。
@@ -16,11 +16,12 @@ use futures::StreamExt;
 use peco_core::agent::hooks::{DispatchObservation, DispatchOrigin, TaskObservationSink};
 use peco_core::machine::{OutputView, Progress, TaskId, TaskSnapshot, TaskSource, TaskState};
 use peco_daemon::chat::ChatActiveRuns;
+use peco_daemon::db::conversations::{self, CreateConversationParams};
 use peco_daemon::db::dispatches;
 use peco_daemon::space::peco::PecoIdentity;
 use peco_daemon::space::tasks::TaskObserver;
 use peco_daemon::state::AppState;
-use peco_daemon::wake::deliver::PecoDelivery;
+use peco_daemon::wake::deliver::WakeDelivery;
 use peco_daemon::wake::pump::WakePump;
 use peco_daemon::wake::{RETRY_BACKOFF, TICK};
 use serde_json::{Value, json};
@@ -85,21 +86,18 @@ fn wired_pump(env: &TestEnv, peco: Arc<PecoIdentity>) -> (Arc<WakePump>, Arc<Cha
         peco.clone(),
         env.shutdown.clone(),
     ));
-    pump.attach_delivery(Arc::new(PecoDelivery::new(
+    pump.attach_delivery(Arc::new(WakeDelivery::new(
         env.pool.clone(),
         env.spaces(),
         chat_runs.clone(),
-        peco,
         Arc::downgrade(&env.env),
     )));
     (pump, chat_runs)
 }
 
 /// 观察者要叫醒的是同一个泵：接线漏了，终态事件就到不了投递侧。
-fn wired_observer(env: &TestEnv, pump: &Arc<WakePump>, peco: &Arc<PecoIdentity>) -> TaskObserver {
-    let tasks = TaskObserver::new(env.pool.clone(), pump.clone());
-    tasks.attach_peco(peco.clone());
-    tasks
+fn wired_observer(env: &TestEnv, pump: &Arc<WakePump>) -> TaskObserver {
+    TaskObserver::new(env.pool.clone(), pump.clone())
 }
 
 fn observation(task_id: TaskId, origin_ws_id: &str) -> DispatchObservation {
@@ -108,6 +106,7 @@ fn observation(task_id: TaskId, origin_ws_id: &str) -> DispatchObservation {
             ws_id: origin_ws_id.into(),
             principal: "local".into(),
             origin_dir: env_origin_dir(),
+            conversation_id: None,
         },
         target_dir: env_origin_dir(),
         task_id,
@@ -232,17 +231,47 @@ async fn wait_for_delivered(env: &TestEnv, task_id: &str) -> LedgerRow {
 }
 
 async fn wait_for_message(env: &TestEnv, role: &str) -> String {
-    let deadline = Instant::now() + WAKE_DEADLINE;
+    let limit = if role == "user" {
+        WAKE_DEADLINE
+    } else {
+        STREAM_DEADLINE
+    };
+    let deadline = Instant::now() + limit;
     loop {
         if let Some(content) = message_contents(env, role).await.into_iter().next() {
             return content;
         }
         assert!(
             Instant::now() < deadline,
-            "{WAKE_DEADLINE:?} 内必须出现 role={role} 的消息"
+            "{limit:?} 内必须出现 role={role} 的消息"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn seed_pending_for(
+    env: &TestEnv,
+    seq: i64,
+    task_id: &str,
+    origin_ws_id: &str,
+    conversation_id: &str,
+) {
+    sqlx::query(
+        "INSERT INTO d_dispatches (id, task_id, target_ws_id, target_work_dir, \
+         target_team_id, origin_ws_id, origin_conversation_id, agent_name, origin_kind, \
+         task_state, wake_state, result_digest, created_at) \
+         VALUES (?, ?, ?, '/tmp/work', 'research', ?, ?, '@master', 'run_machine_task', \
+         'completed', 'pending', '重构完成，12 个测试通过', ?)",
+    )
+    .bind(format!("d_{task_id}"))
+    .bind(task_id)
+    .bind(origin_ws_id)
+    .bind(origin_ws_id)
+    .bind(conversation_id)
+    .bind(format!("2026-01-01 00:00:{seq:02}"))
+    .execute(&env.pool)
+    .await
+    .unwrap();
 }
 
 fn text_reply(text: &str) -> impl Fn(Value) -> std::future::Ready<Reply> + Send + Sync + 'static {
@@ -278,7 +307,7 @@ async fn w1_a_finished_task_wakes_peco_and_runs_a_real_turn() {
     let ws_id = open_peco_space(&env, &upstream).await;
     let peco = peco_identity(&env, &ws_id).await;
     let (pump, _chat_runs) = wired_pump(&env, peco.clone());
-    let tasks = wired_observer(&env, &pump, &peco);
+    let tasks = wired_observer(&env, &pump);
 
     let task_id = TaskId(Uuid::new_v4());
     env.peco_pending_row(1, &task_id.to_string(), &ws_id).await;
@@ -330,6 +359,89 @@ async fn w1_a_finished_task_wakes_peco_and_runs_a_real_turn() {
 }
 
 // ============================================================================
+// 谁派发谁接收：非 Peco 空间的会话也要收到通知
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_task_returns_to_the_dispatching_conversation() {
+    let env = new_env(&[]).await;
+    let upstream = FakeUpstream::start(text_reply("收到，结果已核对")).await;
+    install_team(
+        &env,
+        "research",
+        &upstream,
+        &[fixture("@master", "master", &[])],
+    );
+    let dir = env.work_dir("research_space");
+    let ws_id = env.resolve(&dir, "research").await.unwrap();
+    env.open(&ws_id).await.unwrap();
+
+    let conv_id = "c_origin_chat".to_string();
+    conversations::insert(
+        &env.pool,
+        &CreateConversationParams {
+            id: conv_id.clone(),
+            workspace_id: ws_id.clone(),
+            agent_id: None,
+            agent_name: "@master".to_string(),
+            title: "派发前的那段对话".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let peco = peco_identity(&env, &ws_id).await;
+    let (pump, _chat_runs) = wired_pump(&env, peco);
+    seed_pending_for(&env, 1, "t-origin", &ws_id, &conv_id).await;
+
+    pump.tick().await;
+
+    let row = wait_for_delivered(&env, "t-origin").await;
+    assert!(row.delivered_at.is_some(), "送达必须留时间戳：{row:?}");
+
+    let deadline = Instant::now() + WAKE_DEADLINE;
+    let user = loop {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE role = 'user' AND conversation_id = ? LIMIT 1",
+        )
+        .bind(&conv_id)
+        .fetch_optional(&env.pool)
+        .await
+        .unwrap();
+        if let Some(content) = found {
+            break content;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{WAKE_DEADLINE:?} 内发起会话必须收到唤醒消息"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(user.starts_with("[peco-wake]"), "{user}");
+    assert!(user.contains("t-origin"), "要带完整 task_id：{user}");
+
+    let deadline = Instant::now() + STREAM_DEADLINE;
+    let assistant = loop {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE role = 'assistant' AND conversation_id = ? LIMIT 1",
+        )
+        .bind(&conv_id)
+        .fetch_optional(&env.pool)
+        .await
+        .unwrap();
+        if let Some(content) = found {
+            break content;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{STREAM_DEADLINE:?} 内发起会话必须收到 agent 的回复"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(assistant, "收到，结果已核对");
+}
+
+// ============================================================================
 // A1：注册不唤醒，终态才唤醒
 // ============================================================================
 
@@ -346,7 +458,7 @@ async fn registering_alone_never_wakes_and_the_terminal_state_does() {
     let ws_id = open_peco_space(&env, &upstream).await;
     let peco = peco_identity(&env, &ws_id).await;
     let (pump, _chat_runs) = wired_pump(&env, peco.clone());
-    let tasks = wired_observer(&env, &pump, &peco);
+    let tasks = wired_observer(&env, &pump);
 
     let task_id = TaskId(Uuid::new_v4());
     let mut obs = observation(task_id, &ws_id);
@@ -418,11 +530,11 @@ async fn w14_a_headless_run_ignores_pause_and_still_finishes() {
     );
     // assistant 行落库早于这一轮收尾：守卫要等 spawn 出的任务结束才 drop，
     // 「消息已经看得见」不等于「条目已经清掉」，故等条目真的消失再断言。
-    let deadline = Instant::now() + WAKE_DEADLINE;
+    let deadline = Instant::now() + STREAM_DEADLINE;
     while chat_runs.is_active(&conv_id) {
         if Instant::now() >= deadline {
             panic!(
-                "{WAKE_DEADLINE:?} 内这一轮必须结束，但会话 {conv_id} 仍是 active：\
+                "{STREAM_DEADLINE:?} 内这一轮必须结束，但会话 {conv_id} 仍是 active：\
                  结束之后守卫必须 drop，否则该会话的唤醒队列会被永久堵死"
             );
         }
@@ -477,7 +589,7 @@ async fn a_finished_wake_turn_broadcasts_a_wake_turn_done_event() {
     pump.tick().await;
 
     let event = loop {
-        let received = timeout(WAKE_DEADLINE, events.recv())
+        let received = timeout(STREAM_DEADLINE, events.recv())
             .await
             .expect("唤醒轮结束后必须有事件");
         let event = received.expect("广播通道不得关闭");
@@ -536,15 +648,22 @@ async fn w9_replaying_the_same_row_delivers_one_message() {
 }
 
 // ============================================================================
-// W11：目标空间没打开 → 显式失败
+// W11：来源空间没打开 → 投递时先打开，再投
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn w11_a_closed_target_space_marks_the_row_failed() {
-    let env = new_env(&["peco"]).await;
-    // 只索引、不打开：`SpaceRegistry` 拿不到实例，`space_not_open` 是投递的失败面。
+async fn w11_a_closed_origin_space_is_opened_before_delivery() {
+    let env = new_env(&[]).await;
+    let upstream = FakeUpstream::start(text_reply("收到，我去核对这条任务")).await;
+    install_team(
+        &env,
+        "peco",
+        &upstream,
+        &[fixture("@master", "master", &[])],
+    );
     let dir = env.work_dir("closed_peco");
     let ws_id = env.resolve(&dir, "peco").await.unwrap();
+    assert!(!env.is_open(&ws_id).await, "夹具前提：空间此刻是关着的");
     let peco = peco_identity(&env, &ws_id).await;
     let (pump, _chat_runs) = wired_pump(&env, peco);
 
@@ -552,10 +671,48 @@ async fn w11_a_closed_target_space_marks_the_row_failed() {
 
     pump.tick().await;
 
-    let row = ledger_row(&env, "t-closed").await;
-    assert_eq!(row.wake_state, "failed", "投不出去要显形：{row:?}");
-    assert_eq!(row.wake_attempts, 1, "失败的尝试要计数");
-    assert_eq!(message_count(&env).await, 0, "失败时不得落一条假消息");
+    let row = wait_for_delivered(&env, "t-closed").await;
+    assert!(row.delivered_at.is_some(), "送达必须留时间戳：{row:?}");
+    assert!(
+        env.is_open(&ws_id).await,
+        "投递必须先打开来源空间，再往会话里投"
+    );
+    let user = wait_for_message(&env, "user").await;
+    assert!(user.starts_with("[peco-wake]"), "{user}");
+}
+
+// ============================================================================
+// W11b：来源空间已经不存在 → 跳过，不建会话空壳
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w11b_a_missing_origin_space_skips_the_row() {
+    let env = new_env(&[]).await;
+    let peco = Arc::new(PecoIdentity {
+        ws_id: "ws_missing".to_string(),
+        work_dir: env.home.join("spaces").join("missing").join("work"),
+        team_id: "research".to_string(),
+        from_marker: false,
+    });
+    let (pump, _chat_runs) = wired_pump(&env, peco);
+    seed_pending_for(&env, 1, "t-gone", "ws_missing", "c_any").await;
+
+    pump.tick().await;
+
+    let (wake_state, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT wake_state, wake_skip_reason FROM d_dispatches WHERE task_id = 't-gone'",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(wake_state, "skipped", "永远投不出去的行要停掉");
+    assert_eq!(reason.as_deref(), Some("space_closed"), "成因交给关闭");
+    assert_eq!(message_count(&env).await, 0, "没投出去就不该落下任何消息");
+    let conversations: i64 = sqlx::query_scalar("SELECT count(*) FROM conversations")
+        .fetch_one(&env.pool)
+        .await
+        .unwrap();
+    assert_eq!(conversations, 0, "空间都不在了，不得给它建会话空壳");
 }
 
 // ============================================================================

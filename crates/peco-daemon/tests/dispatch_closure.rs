@@ -429,14 +429,13 @@ async fn closing_the_target_space_orphans_the_ledger_row() {
     let (task_state, wake_state) = env.task_and_wake_state(&ws_b, &row.task_id).await;
     assert_eq!(task_state, "orphan", "空间被关闭后这条台账必须是 orphan");
     assert_eq!(
-        wake_state, "skipped",
-        "孤儿行不得再唤醒（结果已随 Hub 消失）"
+        wake_state, "pending",
+        "跨空间来源的孤儿行仍要唤醒发起方，告诉它任务断了"
     );
-    // 这行注册时就因来源不是 Peco 而 skipped；关闭只补任务态，不覆盖更早的成因。
     assert_eq!(
-        env.wake_skip_reason(&ws_b, &row.task_id).await.as_deref(),
-        Some("not_peco_origin"),
-        "已跳过的行保留更早的原因，不被 space_closed 顶掉"
+        env.wake_skip_reason(&ws_b, &row.task_id).await,
+        None,
+        "进待投递的行不写跳过原因"
     );
 
     // 放行那个卡住的回复，避免后台任务泄漏到下一个用例。
@@ -606,6 +605,7 @@ async fn insert_row(
             target_work_dir: &dir.to_string_lossy(),
             target_team_id: "t_d_team",
             origin_ws_id: "ws_origin",
+            origin_conversation_id: None,
             agent_name: "@master",
             origin_kind: "dispatch_to_workspace",
             task_state,

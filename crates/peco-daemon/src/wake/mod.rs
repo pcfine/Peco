@@ -1,6 +1,6 @@
 //! 唤醒闭环的领域逻辑：谁该被唤醒、一次唤醒最多带多少、消息长什么样。
 //!
-//! 台账只记录「任务已经终态」；「Peco 要不要因此再跑一轮」是另一件事，判据与
+//! 台账只记录「任务已经终态」；「派发方要不要因此再跑一轮」是另一件事，判据与
 //! 格式都属于唤醒侧知识，集中在这里，写入端（`space::tasks`）与查询端
 //! （`db::dispatches`）各自不再持有第二份。
 
@@ -11,7 +11,6 @@ pub mod pump;
 use std::time::Duration;
 
 use crate::db::dispatches::RetryBackoff;
-use crate::space::peco::PecoIdentity;
 
 /// 一次合成最多带几行台账：唤醒是「主动复核」，攒太多会让一轮的成本随积压线性增长。
 pub const MAX_BATCH: i64 = 5;
@@ -51,59 +50,23 @@ pub const RETRY_BACKOFF: RetryBackoff = RetryBackoff {
 pub const PUMP_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 pub const PUMP_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
-/// 够得着唤醒的派发来源：Peco 亲自派出去的跨空间任务，与 Peco 自己空间里的异步任务。
-///
-/// 与 `d_dispatches.origin_kind` 的 CHECK 同集合；多一个值意味着唤醒侧要处理
-/// 一种它没见过的任务来源。
-const PECO_ORIGIN_KINDS: &[&str] = &["run_machine_task", "dispatch_to_workspace"];
+/// 够得着唤醒的派发来源，与 `d_dispatches.origin_kind` 的 CHECK 同集合。
+const WAKE_ORIGIN_KINDS: &[&str] = &["run_machine_task", "dispatch_to_workspace"];
 
-/// 这条台账该不该进唤醒队列 —— 全仓唯一的判据。
-///
-/// 只看两件事：发起方是不是 Peco 自己的空间，以及来源是不是 Peco 会亲自动手
-/// 的那两种。别的空间 `@master` 自用的异步任务，结论属于那个空间的语义，Peco
-/// 既无权复核，也不该被叫醒。身份走 [`PecoIdentity::is_peco_space`]：`ws_id`
-/// 是运行时从记录文件派生的，拿种子常量比较会在用户改过 `session_id` 之后判错。
-pub fn qualifies(origin_ws_id: &str, origin_kind: &str, peco: &PecoIdentity) -> bool {
-    peco.is_peco_space(origin_ws_id) && PECO_ORIGIN_KINDS.contains(&origin_kind)
+/// 这条台账该不该进唤醒队列 —— 全仓唯一的判据：只看来源工具名，没见过的来源不猜。
+pub fn qualifies(origin_kind: &str) -> bool {
+    WAKE_ORIGIN_KINDS.contains(&origin_kind)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::space::peco::PECO_WS_ID_SEED;
-
-    fn identity(ws_id: &str) -> PecoIdentity {
-        PecoIdentity {
-            ws_id: ws_id.to_string(),
-            work_dir: PathBuf::from("/tmp/peco/work"),
-            team_id: "peco".to_string(),
-            from_marker: true,
-        }
-    }
 
     #[test]
-    fn only_pecos_own_dispatch_kinds_qualify() {
-        let peco = identity("ws_recorded");
-
-        assert!(qualifies("ws_recorded", "run_machine_task", &peco));
-        assert!(qualifies("ws_recorded", "dispatch_to_workspace", &peco));
-        assert!(
-            !qualifies("ws_other", "run_machine_task", &peco),
-            "别的空间的自有任务不是 Peco 的待办"
-        );
-        assert!(
-            !qualifies("ws_recorded", "unknown_kind", &peco),
-            "没见过的来源不猜"
-        );
-    }
-
-    /// 身份来自记录文件时与种子不同值：判据一旦退回比种子，这条就会红。
-    #[test]
-    fn the_seed_is_never_a_stand_in_for_the_identity() {
-        let peco = identity("ws_recorded");
-
-        assert!(!qualifies(PECO_WS_ID_SEED, "run_machine_task", &peco));
+    fn both_dispatch_tools_qualify_and_unknown_kinds_do_not() {
+        assert!(qualifies("run_machine_task"));
+        assert!(qualifies("dispatch_to_workspace"));
+        assert!(!qualifies("unknown_kind"), "没见过的来源不猜");
+        assert!(!qualifies(""), "空来源不是唤醒来源");
     }
 }

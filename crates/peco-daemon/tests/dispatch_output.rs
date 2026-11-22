@@ -81,6 +81,7 @@ fn observation(target_dir: PathBuf, task_id: TaskId) -> DispatchObservation {
             ws_id: "peco".into(),
             principal: "local".into(),
             origin_dir: PathBuf::from("/tmp/peco-origin"),
+            conversation_id: None,
         },
         target_dir,
         task_id,

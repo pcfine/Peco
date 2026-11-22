@@ -136,7 +136,7 @@ peco-webui (React 19 前端，独立工程；产物由 daemon 同源托管，或
 **Machine / 跨空间派发**（[crates/peco-core/src/machine/](crates/peco-core/src/machine/)）：
 - `machine.rs` / `runtime.rs` / `hub.rs` / `state.rs` / `store.rs`：跨空间「机器任务」的运行体与生命周期。派发工具（`run_machine_task` / `dispatch_to_workspace`）在 `tools/machine_tool.rs`、`tools/workspace_tools.rs`。
 - `agent/hooks/dispatch_watch.rs`：`DispatchWatchHook` 在任务终态把结果回写台账（daemon 侧由 SQLite sink 承接）。
-- daemon 侧：`space/ledger.rs` + `db/dispatches.rs` 存台账，`wake/`（`pump` / `compose` / `deliver`）负责任务终态后唤醒 Peco（debounce tick 5s、批量上限、重试退避）。
+- daemon 侧：`space/ledger.rs` + `db/dispatches.rs` 存台账，`wake/`（`pump` / `compose` / `deliver`）负责任务终态后把结果送回**派发方**：`d_dispatches.origin_conversation_id` 指向的会话；机器执行体没有会话时回落到来源空间的 `@master` 空间会话；来源空间关闭则先 `SpaceRegistry::open` 再投（debounce tick 5s、按目标分组、批量上限、重试退避）。
 
 **Workflow**（[crates/peco-core/src/workflow/](crates/peco-core/src/workflow/)）：
 - 声明式 DAG 工作流编排引擎，与 ReAct 循环互补 — 提供确定性步骤编排。

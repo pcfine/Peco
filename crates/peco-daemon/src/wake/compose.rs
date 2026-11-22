@@ -68,6 +68,7 @@ mod tests {
             target_work_dir: "/tmp/work".to_string(),
             target_team_id: "research".to_string(),
             origin_ws_id: "ws_peco".to_string(),
+            origin_conversation_id: None,
             agent_name: "@master".to_string(),
             origin_kind: "run_machine_task".to_string(),
             task_state: task_state.to_string(),

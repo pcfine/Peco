@@ -233,6 +233,8 @@ CREATE TABLE IF NOT EXISTS d_dispatches (
     target_work_dir TEXT NOT NULL,
     target_team_id  TEXT NOT NULL,
     origin_ws_id    TEXT NOT NULL,
+    -- 发起派发的聊天会话；NULL = 机器执行体发起（无会话），通知回落空间会话
+    origin_conversation_id TEXT,
     agent_name      TEXT NOT NULL,
     origin_kind     TEXT NOT NULL
                     CHECK (origin_kind IN ('run_machine_task','dispatch_to_workspace')),

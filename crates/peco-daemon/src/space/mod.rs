@@ -80,9 +80,6 @@ impl SpaceEnv {
         peco: Arc<PecoIdentity>,
         tasks: Arc<TaskObserver>,
     ) -> Self {
-        // 唤醒判据要认「谁是 Peco」，而观察者先于本结构体构造：两份值只在
-        // 这个装配点同时在场，身份因此在这里交接。
-        tasks.attach_peco(peco.clone());
         Self {
             home: config.peco_home.clone(),
             providers_root: config.system_providers_root().to_path_buf(),
@@ -105,6 +102,7 @@ impl SpaceEnv {
         origin_ws_id: String,
         principal: String,
         origin_dir: PathBuf,
+        conversation_id: Option<String>,
     ) -> Arc<DispatchWatchHook> {
         let hub = self
             .hub()
@@ -115,6 +113,7 @@ impl SpaceEnv {
                 ws_id: origin_ws_id,
                 principal,
                 origin_dir,
+                conversation_id,
             },
             Arc::clone(&self.tasks) as Arc<dyn TaskObservationSink>,
         ))
@@ -125,7 +124,21 @@ impl SpaceEnv {
     /// 清单只给 Peco 自己的空间：它列的是「可派发目标 + 当前空间」，团队总管拿到
     /// 这份清单就会把任务派给不属于自己的空间。Peco 与其它空间共用同一条会话
     /// 路径，因此差异只能落在这里。
+    ///
+    /// `conversation_id` 是发起派发的聊天会话，任务终态通知按它回流；machine
+    /// 执行体没有会话，传 `None`。
     pub fn looper_config(&self, ws_id: &str, team_id: &str, work_dir: PathBuf) -> LooperConfig {
+        self.looper_config_for(ws_id, team_id, work_dir, None)
+    }
+
+    /// [`Self::looper_config`] 的完整形态：多一个来源会话。hook 只在这里 push 一次。
+    fn looper_config_for(
+        &self,
+        ws_id: &str,
+        team_id: &str,
+        work_dir: PathBuf,
+        conversation_id: Option<&str>,
+    ) -> LooperConfig {
         // push 而不是整体覆盖 `hooks`：`from_env()` 给出的 hook 链仍要生效；
         // 少了这一条，本轮派发出去的异步任务没有任何人观察。
         let mut config = LooperConfig {
@@ -133,9 +146,12 @@ impl SpaceEnv {
             persist_on_failure: true,
             ..LooperConfig::from_env()
         };
-        config
-            .hooks
-            .push(self.dispatch_hook(ws_id.to_string(), team_id.to_string(), work_dir));
+        config.hooks.push(self.dispatch_hook(
+            ws_id.to_string(),
+            team_id.to_string(),
+            work_dir,
+            conversation_id.map(str::to_string),
+        ));
         if self.peco.is_peco_space(ws_id) {
             config.dynamic_context = Some(Arc::new(SpaceCatalogContext::new(
                 self.pool.clone(),
@@ -174,7 +190,7 @@ impl SpaceEnv {
         memory: Option<Arc<KnowledgeManager>>,
         conversation_id: &str,
     ) -> LooperConfig {
-        let mut config = self.looper_config(ws_id, team_id, work_dir);
+        let mut config = self.looper_config_for(ws_id, team_id, work_dir, Some(conversation_id));
         // 钳制必须每次装配都跑：它决定下方 policy 与 filter 的入参，缓存一次会让
         // 「改 env 后重启」与「运行期生效」两套口径并存。
         let mut limits = compaction::limits();

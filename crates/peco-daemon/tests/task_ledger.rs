@@ -11,7 +11,6 @@ use peco_core::machine::{
     ObsEvent, OutputView, Progress, TaggedJson, TaskId, TaskOutcome, TaskSnapshot, TaskSource,
     TaskState, Update, UpdateBody, UpdateOrigin,
 };
-use peco_daemon::space::tasks::TaskObserver;
 use serde_json::json;
 use support::new_env;
 use uuid::Uuid;
@@ -58,6 +57,7 @@ fn observation(target_dir: PathBuf, task_id: TaskId) -> DispatchObservation {
             ws_id: "peco".into(),
             principal: "local".into(),
             origin_dir: PathBuf::from("/tmp/peco-origin"),
+            conversation_id: None,
         },
         target_dir,
         task_id,
@@ -85,15 +85,13 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
         .await;
     assert_eq!(
         env.task_and_wake_state(&ws_id, &task.to_string()).await,
-        ("working".to_string(), "skipped".to_string()),
-        "注册即落库，且 A+B 阶段不产生唤醒"
+        ("working".to_string(), "awaiting".to_string()),
+        "注册即落库，终态之前只登记唤醒"
     );
     assert_eq!(
-        env.wake_skip_reason(&ws_id, &task.to_string())
-            .await
-            .as_deref(),
-        Some("not_peco_origin"),
-        "夹具的发起方不是 Peco 空间，跳过要说明是来源不合规"
+        env.wake_skip_reason(&ws_id, &task.to_string()).await,
+        None,
+        "等终态不是跳过，不写原因"
     );
 
     let update = ObsEvent::Update(Update {
@@ -140,8 +138,8 @@ async fn registered_state_and_terminal_roundtrip_through_http() {
     assert_eq!(items[0]["origin_kind"], json!("dispatch_to_workspace"));
     assert_eq!(items[0]["agent_name"], json!("@master"));
     assert_eq!(items[0]["task_state"], json!("completed"));
-    assert_eq!(items[0]["wake_state"], json!("skipped"));
-    assert_eq!(items[0]["wake_skip_reason"], json!("not_peco_origin"));
+    assert_eq!(items[0]["wake_state"], json!("pending"));
+    assert_eq!(items[0]["wake_skip_reason"], json!(null));
     assert_eq!(items[0]["result_digest"], json!("final answer"));
     assert!(
         items[0].get("state").is_none(),
@@ -364,62 +362,6 @@ async fn terminal_digest_is_truncated_and_non_text_is_null() {
             .await
             .unwrap();
     assert!(digest.is_none(), "非文本输出不应落摘要");
-}
-
-/// 观察者拿不到 Peco 身份（装配异常）时跳过要自成一因：它与「来源不是 Peco」
-/// 都落在 `wake_state='skipped'`，只有 `wake_skip_reason` 能区分「该修装配」
-/// 和「本该如此」。
-#[tokio::test]
-async fn a_task_observer_without_peco_identity_records_that_reason() {
-    let env = new_env(&["research"]).await;
-    let work_dir = env.work_dir("no-identity-space");
-    let ws_id = env.resolve(&work_dir, "research").await.unwrap();
-    let target_dir = env.work_dir_of(&ws_id).await;
-
-    // 故意不调 attach_peco：等价于装配点漏注入身份。
-    let observer = TaskObserver::new(env.pool.clone(), env.wake.clone());
-    let sink: &dyn TaskObservationSink = &observer;
-
-    // 来源取 Peco 自己的空间：只要身份在场，这一行本该进队列。
-    let peco_ws_id = env.env.peco.ws_id.clone();
-    let blind = TaskId(Uuid::new_v4());
-    let mut blind_obs = observation(target_dir.clone(), blind);
-    blind_obs.origin.ws_id = peco_ws_id.clone();
-    sink.on_registered(&blind_obs, &snapshot(blind, TaskState::Working, None))
-        .await;
-
-    assert_eq!(
-        env.task_and_wake_state(&ws_id, &blind.to_string()).await.1,
-        "skipped"
-    );
-    assert_eq!(
-        env.wake_skip_reason(&ws_id, &blind.to_string())
-            .await
-            .as_deref(),
-        Some("peco_identity_missing"),
-        "身份缺失是装配异常，不能与来源不合规混成同一个原因"
-    );
-
-    // 同一来源、同一形状，身份注入后就该进队列 —— 证明上一条的成因确实是身份。
-    observer.attach_peco(env.env.peco.clone());
-    let sighted = TaskId(Uuid::new_v4());
-    let mut sighted_obs = observation(target_dir, sighted);
-    sighted_obs.origin.ws_id = peco_ws_id;
-    sink.on_registered(&sighted_obs, &snapshot(sighted, TaskState::Working, None))
-        .await;
-
-    assert_eq!(
-        env.task_and_wake_state(&ws_id, &sighted.to_string())
-            .await
-            .1,
-        "awaiting",
-        "注册那一刻只登记，终态才入队"
-    );
-    assert_eq!(
-        env.wake_skip_reason(&ws_id, &sighted.to_string()).await,
-        None,
-        "进队列的行不写跳过原因"
-    );
 }
 
 /// 注册登记「等终态」，终态才入队 —— 这两步是同一条契约的两半，缺任一半都会

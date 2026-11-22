@@ -21,7 +21,7 @@ use crate::shutdown::Shutdown;
 use crate::space::SpaceEnv;
 use crate::space::peco::PecoIdentity;
 use crate::space::registry::SpaceRegistry;
-use crate::wake::deliver::{Delivery, DeliverySink, PecoDelivery};
+use crate::wake::deliver::{Delivery, DeliverySink, WakeDelivery, WakeTarget};
 
 use super::fire::{self, FireDeps};
 use super::{
@@ -62,10 +62,10 @@ pub struct Scheduler {
     chat_runs: Arc<ChatActiveRuns>,
     /// 只用于日志口径与通知落点说明：通知经 `delivery` 投进 Peco 空间的 `@master`。
     peco: Arc<PecoIdentity>,
-    /// 只持弱引用：与 `PecoDelivery` 同一手法，`scheduler → env → hub → 实例 → 工具`
+    /// 只持弱引用：与 `WakeDelivery` 同一手法，`scheduler → env → hub → 实例 → 工具`
     /// 若成强引用，关掉的空间会随调度器一起钉在内存里。
     env: Weak<SpaceEnv>,
-    delivery: Arc<PecoDelivery>,
+    delivery: Arc<WakeDelivery>,
     shutdown: Shutdown,
     /// `Mutex` 是因为 `spawn` 拿 `&Arc<Self>`，而 `stop` 要移出句柄。
     task: Mutex<Option<JoinHandle<()>>>,
@@ -79,7 +79,7 @@ impl Scheduler {
         chat_runs: Arc<ChatActiveRuns>,
         peco: Arc<PecoIdentity>,
         env: Weak<SpaceEnv>,
-        delivery: Arc<PecoDelivery>,
+        delivery: Arc<WakeDelivery>,
         shutdown: Shutdown,
     ) -> Self {
         Self {
@@ -291,12 +291,15 @@ impl Scheduler {
                 continue;
             };
             let text = notify::compose_notification(&task, &run);
-            match self.delivery.deliver(text).await {
+            // 定时任务的通知固定落在 Peco 空间的空间会话：它的语义是平台通知，
+            // 与派发台账的来源路由无关。
+            let target = WakeTarget::space(self.peco.ws_id.clone());
+            match self.delivery.deliver(&target, text).await {
                 Delivery::Delivered => {
                     schedules::mark_notified(&self.pool, &run.id).await?;
                 }
-                // 用户正在 Peco 那边对话：不是投不出去，等一会儿。
-                Delivery::Busy => {
+                // 用户正在 Peco 那边对话，或空间刚好在开关之间：不是投不出去，等一会儿。
+                Delivery::Busy | Delivery::Deferred => {
                     if run.notify_attempts + 1 >= NOTIFY_MAX_ATTEMPTS {
                         schedules::mark_notify_gave_up(
                             &self.pool,
@@ -312,6 +315,11 @@ impl Scheduler {
                         )
                         .await?;
                     }
+                }
+                Delivery::Skipped => {
+                    warn!(run_id = %run.id, "schedule notification target is gone");
+                    schedules::mark_notify_gave_up(&self.pool, &run.id, super::NotifyState::Failed)
+                        .await?;
                 }
                 Delivery::Failed(reason) => {
                     warn!(run_id = %run.id, reason, "schedule notification failed");

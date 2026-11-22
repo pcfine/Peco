@@ -16,19 +16,19 @@ use crate::shutdown::Shutdown;
 use crate::space::peco::PecoIdentity;
 
 use super::compose::compose;
-use super::deliver::{Delivery, DeliverySink, PecoDelivery};
+use super::deliver::{Delivery, DeliverySink, WakeDelivery, WakeTarget};
 use super::{
     DELIVERING_TIMEOUT, MAX_ATTEMPTS, MAX_BATCH, PUMP_RESTART_BACKOFF, PUMP_RESTART_BACKOFF_MAX,
     RETRY_BACKOFF, TICK,
 };
 
-/// 把「台账里等着投」的行变成「Peco 会话里跑起来的一轮」。
+/// 把「台账里等着投」的行变成「派发方会话里跑起来的一轮」。
 ///
 /// 只在终态事件与定时器上醒来，不扫全表：台账里待唤醒的行数上界是「未通知的
 /// 终态任务数」，与累计任务数无关。
 pub struct WakePump {
     pool: SqlitePool,
-    /// 目标是 Peco 自己的空间；日志与启动回收都要能说清「为谁而开」。
+    /// 只用于启动日志（说清这个泵由谁拉起）；投递落点由台账逐行决定。
     peco: Arc<PecoIdentity>,
     notify: Notify,
     /// 晚绑定：投递端要在 `AppState` 建好之后才拿得到 `SpaceRegistry`，而泵必须
@@ -52,7 +52,7 @@ impl WakePump {
     }
 
     /// 注入投递端。重复注入只 warn：先到的那一份才是真正在用的。
-    pub fn attach_delivery(&self, delivery: Arc<PecoDelivery>) {
+    pub fn attach_delivery(&self, delivery: Arc<WakeDelivery>) {
         let sink: Arc<dyn DeliverySink> = delivery;
         if self.delivery.set(sink).is_err() {
             warn!("wake pump already has a delivery sink; keeping the first one");
@@ -159,46 +159,86 @@ impl WakePump {
             return;
         };
 
-        if delivery.is_busy().await {
-            // 用户正在看这个会话：本轮让路。没认领就不算一次尝试，下一轮再来。
-            return;
-        }
+        // 一批里的行可能来自不同会话：按目标分组后逐组认领与投递。忙的组整组
+        // 让路（没认领就不算一次尝试），不挡住同批里其它会话。
+        for (target, rows) in group_by_target(rows) {
+            if delivery.is_busy(&target).await {
+                // 用户正在看这个会话：本轮让路，下一轮再来。
+                continue;
+            }
 
-        let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            match dispatches::claim(&self.pool, &row.id, RETRY_BACKOFF).await {
-                // 1 = 这一行由本次投递拿下；0 = 别的投递者刚拿走它，或它还在退避里。
-                Ok(1) => claimed.push(row),
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(task_id = %row.task_id, error = %e, "wake pump cannot claim the row")
+            let mut claimed = Vec::with_capacity(rows.len());
+            for row in rows {
+                match dispatches::claim(&self.pool, &row.id, RETRY_BACKOFF).await {
+                    // 1 = 这一行由本次投递拿下；0 = 别的投递者刚拿走它，或它还在退避里。
+                    Ok(1) => claimed.push(row),
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(task_id = %row.task_id, error = %e, "wake pump cannot claim the row")
+                    }
                 }
             }
-        }
-        if claimed.is_empty() {
-            return;
-        }
+            if claimed.is_empty() {
+                continue;
+            }
 
-        // 从这里到 mark_* 之间不得早退：行已经进了 `delivering`，任何提前返回都会
-        // 把它钉在那里等 60 秒超时。`compose` 是纯函数，第三条路不存在。
-        match delivery.deliver(compose(&claimed)).await {
+            self.deliver_group(delivery.as_ref(), &target, &claimed)
+                .await;
+        }
+    }
+
+    /// 把一组已认领的行投出去，并落台账结论。
+    ///
+    /// 从这里到 `mark_*` 之间不得早退：行已经进了 `delivering`，提前返回会把它
+    /// 钉在那里等 60 秒超时。
+    async fn deliver_group(
+        &self,
+        delivery: &dyn DeliverySink,
+        target: &WakeTarget,
+        claimed: &[dispatches::DispatchRow],
+    ) {
+        match delivery.deliver(target, compose(claimed)).await {
             Delivery::Delivered => {
-                for row in &claimed {
+                for row in claimed {
                     if let Err(e) = dispatches::mark_delivered(&self.pool, &row.id).await {
                         warn!(task_id = %row.task_id, error = %e, "cannot mark the row delivered");
                     }
                 }
             }
-            Delivery::Busy => {
-                for row in &claimed {
+            // 忙与短暂不可用都是「这次不算数」：回滚认领，尝试次数一并退回。
+            Delivery::Busy | Delivery::Deferred => {
+                for row in claimed {
                     if let Err(e) = dispatches::release_claim(&self.pool, &row.id).await {
                         warn!(task_id = %row.task_id, error = %e, "cannot roll the claim back");
                     }
                 }
             }
+            Delivery::Skipped => {
+                warn!(
+                    count = claimed.len(),
+                    ws_id = %target.ws_id,
+                    "wake target space is gone; rows skipped for good"
+                );
+                for row in claimed {
+                    if let Err(e) = dispatches::mark_skipped(
+                        &self.pool,
+                        &row.id,
+                        dispatches::WakeSkipReason::SpaceClosed,
+                    )
+                    .await
+                    {
+                        warn!(task_id = %row.task_id, error = %e, "cannot skip the row");
+                    }
+                }
+            }
             Delivery::Failed(reason) => {
-                warn!(count = claimed.len(), reason, "wake delivery failed");
-                for row in &claimed {
+                warn!(
+                    count = claimed.len(),
+                    ws_id = %target.ws_id,
+                    reason,
+                    "wake delivery failed"
+                );
+                for row in claimed {
                     if let Err(e) = dispatches::mark_failed(&self.pool, &row.id).await {
                         warn!(task_id = %row.task_id, error = %e, "cannot mark the row failed");
                     }
@@ -231,6 +271,24 @@ impl WakePump {
     }
 }
 
+/// 按投递目标分组，保持首次出现顺序：同一 tick 取到的同目标行才合成一条消息。
+fn group_by_target(
+    rows: Vec<dispatches::DispatchRow>,
+) -> Vec<(WakeTarget, Vec<dispatches::DispatchRow>)> {
+    let mut groups: Vec<(WakeTarget, Vec<dispatches::DispatchRow>)> = Vec::new();
+    for row in rows {
+        let target = WakeTarget {
+            ws_id: row.origin_ws_id.clone(),
+            conversation_id: row.origin_conversation_id.clone(),
+        };
+        match groups.iter_mut().find(|(existing, _)| *existing == target) {
+            Some((_, items)) => items.push(row),
+            None => groups.push((target, vec![row])),
+        }
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -245,6 +303,7 @@ mod tests {
     /// 单独摘出来，认领与回滚的落库结果才可穷举。
     struct FakeSink {
         busy: bool,
+        busy_conversation: Option<String>,
         outcome: FakeOutcome,
         delivered: AtomicUsize,
         texts: Mutex<Vec<String>>,
@@ -261,7 +320,18 @@ mod tests {
         fn new(busy: bool, outcome: FakeOutcome) -> Arc<Self> {
             Arc::new(Self {
                 busy,
+                busy_conversation: None,
                 outcome,
+                delivered: AtomicUsize::new(0),
+                texts: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn busy_conversation(conversation_id: &str) -> Arc<Self> {
+            Arc::new(Self {
+                busy: false,
+                busy_conversation: Some(conversation_id.to_string()),
+                outcome: FakeOutcome::Delivered,
                 delivered: AtomicUsize::new(0),
                 texts: Mutex::new(Vec::new()),
             })
@@ -278,11 +348,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DeliverySink for FakeSink {
-        async fn is_busy(&self) -> bool {
+        async fn is_busy(&self, target: &WakeTarget) -> bool {
             self.busy
+                || self
+                    .busy_conversation
+                    .as_deref()
+                    .is_some_and(|id| target.conversation_id.as_deref() == Some(id))
         }
 
-        async fn deliver(&self, text: String) -> Delivery {
+        async fn deliver(&self, _target: &WakeTarget, text: String) -> Delivery {
             self.delivered.fetch_add(1, Ordering::SeqCst);
             self.texts.lock().unwrap().push(text);
             match self.outcome {
@@ -315,6 +389,15 @@ mod tests {
     }
 
     async fn seed_pending(pool: &SqlitePool, task_id: &str) {
+        seed_pending_for(pool, task_id, "ws_peco", None).await;
+    }
+
+    async fn seed_pending_for(
+        pool: &SqlitePool,
+        task_id: &str,
+        origin_ws_id: &str,
+        origin_conversation_id: Option<&str>,
+    ) {
         dispatches::insert(
             pool,
             &NewDispatch {
@@ -323,7 +406,8 @@ mod tests {
                 target_ws_id: "ws_peco",
                 target_work_dir: "/tmp/work",
                 target_team_id: "peco",
-                origin_ws_id: "ws_peco",
+                origin_ws_id,
+                origin_conversation_id,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "completed",
@@ -457,6 +541,31 @@ mod tests {
         assert_eq!(attempts, 1, "退避窗口里的 tick 不得再认领");
         assert_eq!(state, "pending", "还有预算，行必须留在队列里");
         assert!(claimed_at.is_some(), "认领时间要留着算退避");
+    }
+
+    #[tokio::test]
+    async fn a_busy_target_does_not_block_another_target() {
+        let (pool, _dir) = test_pool().await;
+        seed_pending_for(&pool, "t-busy", "ws_peco", Some("c_busy")).await;
+        seed_pending_for(&pool, "t-idle", "ws_peco", Some("c_idle")).await;
+        let pump = pump_for(&pool);
+        let sink = FakeSink::busy_conversation("c_busy");
+        assert!(pump.delivery.set(sink.clone()).is_ok());
+
+        pump.tick().await;
+
+        assert_eq!(sink.delivered_count(), 1, "只有闲目标该被投递");
+        assert!(
+            sink.texts()[0].contains("t-idle"),
+            "投出去的必须是闲目标的行：{}",
+            sink.texts()[0]
+        );
+        assert_eq!(
+            row_of(&pool, "t-busy").await,
+            ("pending".to_string(), 0, None),
+            "忙目标保持待投递、不计尝试"
+        );
+        assert_eq!(row_of(&pool, "t-idle").await.0, "delivered");
     }
 
     /// 一轮只取一批：`MAX_BATCH` 之外的行留在队列里等下一轮。

@@ -13,8 +13,8 @@ pub use crate::db::dispatch_state::{WakeSkipReason, WakeState};
 ///
 /// `output` 只取「有没有」，正文由 [`crate::space::ledger`] 按 id 单查。
 const ROW_COLUMNS: &str = "id, task_id, target_ws_id, target_work_dir, target_team_id, \
-     origin_ws_id, agent_name, origin_kind, task_state, wake_state, wake_skip_reason, \
-     result_digest, prompt_digest, dispatch_id, created_at, terminal_at, \
+     origin_ws_id, origin_conversation_id, agent_name, origin_kind, task_state, wake_state, \
+     wake_skip_reason, result_digest, prompt_digest, dispatch_id, created_at, terminal_at, \
      (output IS NOT NULL) AS has_output";
 
 /// `d_dispatches` 的完整行；HTTP 任务视图直接投影这组列。
@@ -26,6 +26,7 @@ pub struct DispatchRow {
     pub target_work_dir: String,
     pub target_team_id: String,
     pub origin_ws_id: String,
+    pub origin_conversation_id: Option<String>,
     pub agent_name: String,
     pub origin_kind: String,
     pub task_state: String,
@@ -60,6 +61,7 @@ pub struct NewDispatch<'a> {
     pub target_work_dir: &'a str,
     pub target_team_id: &'a str,
     pub origin_ws_id: &'a str,
+    pub origin_conversation_id: Option<&'a str>,
     pub agent_name: &'a str,
     pub origin_kind: &'a str,
     pub task_state: &'a str,
@@ -126,9 +128,9 @@ pub async fn insert(pool: &SqlitePool, dispatch: &NewDispatch<'_>) -> Result<u64
     let result = sqlx::query(
         "INSERT INTO d_dispatches \
          (id, task_id, target_ws_id, target_work_dir, target_team_id, origin_ws_id, \
-          agent_name, origin_kind, task_state, wake_state, wake_skip_reason, prompt_digest, \
-          dispatch_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+          origin_conversation_id, agent_name, origin_kind, task_state, wake_state, \
+          wake_skip_reason, prompt_digest, dispatch_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(target_ws_id, task_id) DO NOTHING",
     )
     .bind(dispatch.id)
@@ -137,6 +139,7 @@ pub async fn insert(pool: &SqlitePool, dispatch: &NewDispatch<'_>) -> Result<u64
     .bind(dispatch.target_work_dir)
     .bind(dispatch.target_team_id)
     .bind(dispatch.origin_ws_id)
+    .bind(dispatch.origin_conversation_id)
     .bind(dispatch.agent_name)
     .bind(dispatch.origin_kind)
     .bind(dispatch.task_state)
@@ -536,10 +539,11 @@ pub async fn orphan_all_active(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
 /// 先标 `orphan` 是重启后对账的唯一依据，台账本身长于空间行。
 ///
 /// 唤醒态分三类：
-/// - `awaiting`（任务还没到终态）→ `pending`：这正是要通知 Peco「断了一条」的
+/// - `awaiting`（任务还没到终态）→ `pending`：这正是要通知发起方「断了一条」的
 ///   时刻，跳过就没人在看板之外知道这件事。
-/// - `pending` / `failed`（还没投出去）→ `skipped` + `space_closed`：空间都没了，
-///   再唤醒 Peco 去查只会拿到「任务不存在」，投出去只是白跑一轮。
+/// - `pending` / `failed` **且发起方就是被关闭的空间** → `skipped` + `space_closed`：
+///   接收方自己的空间都关了，再投只会拿到「任务不存在」。
+///   发起方是**别的空间**时保留原唤醒态：关闭的是目标空间，通知仍要送回发起方。
 /// - `delivering` / `delivered`：一条唤醒已经发出或已送达 —— 倒回 `skipped`，
 ///   台账就变成「消息发出过，却记着没发」，重投与去重都失去依据。
 ///
@@ -550,8 +554,10 @@ pub async fn mark_orphan(pool: &SqlitePool, target_ws_id: &str) -> Result<u64, s
     let sql = format!(
         "UPDATE d_dispatches SET task_state = '{orphan}', terminal_at = datetime('now'), \
          wake_skip_reason = CASE WHEN wake_state IN ('{pending}','{failed}') \
+         AND origin_ws_id = target_ws_id \
          THEN '{space_closed}' ELSE wake_skip_reason END, \
-         wake_state = CASE WHEN wake_state IN ('{pending}','{failed}') THEN '{skipped}' \
+         wake_state = CASE WHEN wake_state IN ('{pending}','{failed}') \
+         AND origin_ws_id = target_ws_id THEN '{skipped}' \
          WHEN wake_state = '{awaiting}' THEN '{pending}' \
          ELSE wake_state END \
          WHERE target_ws_id = ? AND task_state IN ({active})",
@@ -683,6 +689,26 @@ pub async fn mark_failed(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error
         delivering = WakeState::Delivering.as_str(),
     );
     let result = sqlx::query(&sql).bind(id).execute(pool).await?;
+    Ok(result.rows_affected())
+}
+
+/// 目标空间已不存在：这条通知永远投不出去，直接跳过（与 [`mark_failed`] 的重排语义分开）。
+pub async fn mark_skipped(
+    pool: &SqlitePool,
+    id: &str,
+    reason: WakeSkipReason,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "UPDATE d_dispatches SET wake_state = '{skipped}', wake_skip_reason = ? \
+         WHERE id = ? AND wake_state = '{delivering}'",
+        skipped = WakeState::Skipped.as_str(),
+        delivering = WakeState::Delivering.as_str(),
+    );
+    let result = sqlx::query(&sql)
+        .bind(reason.as_str())
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -818,6 +844,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "working",
@@ -1026,6 +1053,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "completed",
@@ -1087,6 +1115,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state,
@@ -1172,6 +1201,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "completed",
@@ -1207,6 +1237,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "completed",
@@ -1365,6 +1396,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "working",
@@ -1453,6 +1485,7 @@ mod tests {
                 target_work_dir: "/tmp/work",
                 target_team_id: "research",
                 origin_ws_id: "ws_peco",
+                origin_conversation_id: None,
                 agent_name: "@master",
                 origin_kind: "run_machine_task",
                 task_state: "working",
@@ -1513,13 +1546,8 @@ mod tests {
         );
     }
 
-    /// 空间关闭只把「还没投出去」的行改成跳过并记 `space_closed`；已送达/在途的
-    /// 行保持唤醒态，原因留空 —— reason 非空当且仅当 skipped。
-    ///
-    /// 这条同时锁住 UPDATE 的多列求值语义：原因与唤醒态的 CASE 都读旧行值，
-    /// 若哪一列先落地再被另一列读到，`pending` 行会得到一个空原因。
     #[tokio::test]
-    async fn closing_a_space_skips_only_the_rows_that_were_not_delivered() {
+    async fn closing_a_space_skips_only_rows_addressed_to_itself() {
         let (pool, _dir) = test_pool().await;
         for (id, wake_state) in [
             ("d_pending", WakeState::Pending),
@@ -1536,6 +1564,7 @@ mod tests {
                     target_work_dir: "/tmp/work",
                     target_team_id: "research",
                     origin_ws_id: "ws_peco",
+                    origin_conversation_id: None,
                     agent_name: "@master",
                     origin_kind: "run_machine_task",
                     task_state: "working",
@@ -1548,25 +1577,49 @@ mod tests {
             .await
             .unwrap();
         }
+        insert(
+            &pool,
+            &NewDispatch {
+                id: "d_self",
+                task_id: "d_self",
+                target_ws_id: "ws_a",
+                target_work_dir: "/tmp/work",
+                target_team_id: "research",
+                origin_ws_id: "ws_a",
+                origin_conversation_id: None,
+                agent_name: "@master",
+                origin_kind: "run_machine_task",
+                task_state: "working",
+                wake_state: WakeState::Pending,
+                wake_skip_reason: None,
+                prompt_digest: None,
+                dispatch_id: None,
+            },
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(mark_orphan(&pool, "ws_a").await.unwrap(), 4);
+        assert_eq!(mark_orphan(&pool, "ws_a").await.unwrap(), 5);
         let task_orphan = TASK_ORPHAN_STATE.to_string();
 
         assert_eq!(
             ledger_of(&pool, "d_pending").await,
-            (
-                task_orphan.clone(),
-                "skipped".to_string(),
-                Some("space_closed".to_string())
-            )
+            (task_orphan.clone(), "pending".to_string(), None),
+            "跨空间来源的待投行仍要送回发起方"
         );
         assert_eq!(
             ledger_of(&pool, "d_failed").await,
+            (task_orphan.clone(), "failed".to_string(), None),
+            "跨空间来源的失败行保留重排依据"
+        );
+        assert_eq!(
+            ledger_of(&pool, "d_self").await,
             (
                 task_orphan.clone(),
                 "skipped".to_string(),
                 Some("space_closed".to_string())
-            )
+            ),
+            "发起方自己的空间关了，待投行不再唤醒"
         );
         assert_eq!(
             ledger_of(&pool, "d_delivering").await,

@@ -46,14 +46,14 @@ impl WakeState {
 /// `wake_state='skipped'` 的成因；只在跳过时非空。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeSkipReason {
-    /// 来源不是 Peco 该唤醒的派发。
+    /// 来源工具不是会回流结果的两种派发之一（历史行沿用该成因名）。
     NotPecoOrigin,
-    /// 观察者还没拿到 Peco 身份（装配异常），宁可不叫醒。
+    /// 历史行：观察者当时还没拿到 Peco 身份。新写入不再产生该值。
     PecoIdentityMissing,
     /// 历史行里的运行期失联成因。失联的行改为进待投递队列（Peco 要收到一条
     /// orphan 文案），故新写入不再产生该值。
     Orphaned,
-    /// 目标空间被关闭，唤醒只会拿到「任务不存在」。
+    /// 投递目标空间已不可用（关闭的自派发、回收站、空间行丢失）。
     SpaceClosed,
     /// 唤醒重试次数用尽。
     AttemptsExhausted,

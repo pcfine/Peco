@@ -184,6 +184,7 @@ impl DaemonOpener {
                 row.id.clone(),
                 team.clone(),
                 work_dir.clone(),
+                None,
             )]),
             None => tracing::warn!(
                 ws_id = %row.id,

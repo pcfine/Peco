@@ -50,6 +50,7 @@ pub struct DispatchOrigin {
     /// 发起方 workspace 的 work_dir。`run_machine_task` 的任务落在发起方自己的
     /// Hub 里，结果中没有目录，只能从这里取。
     pub origin_dir: PathBuf,
+    pub conversation_id: Option<String>,
 }
 
 /// 一次观察的身份：目标目录 + 任务 id 是重订阅与事后查询的唯一句柄。
@@ -599,6 +600,7 @@ mod tests {
             ws_id: "ws_origin".to_string(),
             principal: "alice".to_string(),
             origin_dir: dir.to_path_buf(),
+            conversation_id: None,
         }
     }
 

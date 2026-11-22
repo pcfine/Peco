@@ -7,7 +7,7 @@
 //! 注册那一刻按 [`wake::qualifies`] 决定这行要不要进唤醒队列（进则停在
 //! `awaiting`，终态落库时才转 `pending`）：来源判据只有那一份，这里不再写一遍名单。
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use peco_core::agent::hooks::{DispatchObservation, MAX_DIGEST_CHARS, TaskObservationSink};
@@ -20,7 +20,6 @@ use tracing::{debug, warn};
 use crate::db::dispatch_state::{WakeSkipReason, WakeState};
 use crate::db::dispatches::{self, NewDispatch};
 use crate::db::workspaces;
-use crate::space::peco::PecoIdentity;
 use crate::space::report;
 use crate::wake;
 use crate::wake::pump::WakePump;
@@ -48,9 +47,6 @@ pub struct TaskEvent {
 pub struct TaskObserver {
     pool: SqlitePool,
     events: broadcast::Sender<TaskEvent>,
-    /// 判据要区分「Peco 的待办」与「别的空间的自有任务」，故这里必须知道
-    /// Peco 是谁；晚绑定的理由见 [`TaskObserver::attach_peco`]。
-    peco: OnceLock<Arc<PecoIdentity>>,
     /// 终态落地后要有人去投递：唤醒泵是唯一入口，观察者只负责叫醒它。
     wake: Arc<WakePump>,
 }
@@ -58,56 +54,12 @@ pub struct TaskObserver {
 impl TaskObserver {
     pub fn new(pool: SqlitePool, wake: Arc<WakePump>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
-        Self {
-            pool,
-            events,
-            peco: OnceLock::new(),
-            wake,
-        }
+        Self { pool, events, wake }
     }
 
-    /// 注入 Peco 身份。晚绑定是构造顺序决定的：观察者先于
-    /// [`SpaceEnv`](crate::space::SpaceEnv) 建出（它是那边的依赖），两份值只在
-    /// 那个装配点同时在场。
-    ///
-    /// 同一个身份被注入多次是装配常态（测试夹具与 `SpaceEnv` 各来一次），静默；
-    /// 只有换了一个 `ws_id` 才说明装配点拿错了身份，那才 warn —— 先到的那份才是
-    /// 本进程真正在用的。
-    pub fn attach_peco(&self, peco: Arc<PecoIdentity>) {
-        let Err(repeated) = self.peco.set(peco) else {
-            return;
-        };
-        let kept = self
-            .peco
-            .get()
-            .map(|kept| kept.ws_id.clone())
-            .unwrap_or_default();
-        if kept != repeated.ws_id {
-            warn!(
-                kept = %kept,
-                rejected = %repeated.ws_id,
-                "task observer already has another peco identity; keeping the first one"
-            );
-        }
-    }
-
-    /// 这一行的唤醒态与（跳过时的）成因；身份未注入时一律不唤醒 —— 宁可少一条
-    /// 通知，也不能把别的空间的自有任务当成 Peco 的待办叫醒它。
-    ///
-    /// 两种跳过来自完全不同的故障：来源不合规是正常语义，身份缺失是装配异常，
-    /// 台账上必须分得开。
+    /// 这一行的唤醒态与（跳过时的）成因：只看来源工具名，没见过的来源不猜。
     fn wake_disposition(&self, obs: &DispatchObservation) -> (WakeState, Option<WakeSkipReason>) {
-        let Some(peco) = self.peco.get() else {
-            warn!(
-                task_id = %obs.task_id,
-                "task observer has no peco identity; dispatch ledger row will not wake"
-            );
-            return (
-                WakeState::Skipped,
-                Some(WakeSkipReason::PecoIdentityMissing),
-            );
-        };
-        if wake::qualifies(&obs.origin.ws_id, &obs.origin_kind, peco) {
+        if wake::qualifies(&obs.origin_kind) {
             // 注册时任务还没跑完：此刻没有可投的内容，终态落库时才入队。
             (WakeState::Awaiting, None)
         } else {
@@ -183,6 +135,7 @@ impl TaskObservationSink for TaskObserver {
                 target_work_dir: &row.work_dir,
                 target_team_id: &row.team_id,
                 origin_ws_id: &obs.origin.ws_id,
+                origin_conversation_id: obs.origin.conversation_id.as_deref(),
                 agent_name: &obs.agent_name,
                 origin_kind: &obs.origin_kind,
                 task_state: state,

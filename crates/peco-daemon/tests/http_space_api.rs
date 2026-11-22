@@ -678,12 +678,16 @@ async fn close_is_rejected_while_a_task_waits_for_input() {
     assert_eq!(forced.status, 200, "body={}", forced.body);
     assert_eq!(env.task_and_wake_state(&ws_id, "w1").await.0, "orphan");
     assert_eq!(env.task_and_wake_state(&ws_id, "w2").await.0, "orphan");
-    // 两行本来还在等唤醒；强制关闭把它们停掉，并留下「空间关了」这个原因。
     for task_id in ["w1", "w2"] {
         assert_eq!(
-            env.wake_skip_reason(&ws_id, task_id).await.as_deref(),
-            Some("space_closed"),
-            "{task_id} 的跳过原因必须是空间关闭"
+            env.task_and_wake_state(&ws_id, task_id).await.1,
+            "pending",
+            "{task_id} 的唤醒态必须保留"
+        );
+        assert_eq!(
+            env.wake_skip_reason(&ws_id, task_id).await,
+            None,
+            "{task_id} 没被跳过，就不该有原因"
         );
     }
 }

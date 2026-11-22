@@ -18,9 +18,8 @@ use peco_core::agent::hooks::{DispatchObservation, DispatchOrigin, TaskObservati
 use peco_core::machine::{OutputView, Progress, TaskId, TaskSnapshot, TaskSource, TaskState};
 use peco_daemon::chat::ChatActiveRuns;
 use peco_daemon::db::dispatches::{self, DispatchRow};
-use peco_daemon::space::peco::PecoIdentity;
 use peco_daemon::space::tasks::TaskObserver;
-use peco_daemon::wake::deliver::PecoDelivery;
+use peco_daemon::wake::deliver::WakeDelivery;
 use peco_daemon::wake::{self, compose::compose};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -74,6 +73,7 @@ fn observation(target_dir: PathBuf, task_id: TaskId, origin_ws_id: &str) -> Disp
             ws_id: origin_ws_id.into(),
             principal: "local".into(),
             origin_dir: PathBuf::from("/tmp/peco-origin"),
+            conversation_id: None,
         },
         target_dir,
         task_id,
@@ -163,23 +163,12 @@ async fn open_peco_space(env: &TestEnv, upstream: &FakeUpstream) -> String {
     ws_id
 }
 
-/// 与台账里的空间对上的 Peco 身份：投递端只按它决定「投给谁、去哪儿开实例」。
-async fn peco_identity(env: &TestEnv, ws_id: &str) -> Arc<PecoIdentity> {
-    Arc::new(PecoIdentity {
-        ws_id: ws_id.to_string(),
-        work_dir: env.work_dir_of(ws_id).await,
-        team_id: "peco".to_string(),
-        from_marker: true,
-    })
-}
-
 /// 给夹具里的泵接上真实投递端（与 daemon 启动同一条装配路径）。
-fn wire_delivery(env: &TestEnv, peco: Arc<PecoIdentity>) {
-    env.wake.attach_delivery(Arc::new(PecoDelivery::new(
+fn wire_delivery(env: &TestEnv) {
+    env.wake.attach_delivery(Arc::new(WakeDelivery::new(
         env.pool.clone(),
         env.spaces(),
         Arc::new(ChatActiveRuns::new()),
-        peco,
         Arc::downgrade(&env.env),
     )));
 }
@@ -205,71 +194,48 @@ async fn wait_for_wake_message(env: &TestEnv) -> String {
 }
 
 // ============================================================================
-// W2：非 Peco 来源不进队列
+// W2：任意来源空间的两种派发都进队列
 // ============================================================================
 
-/// 判据必须看运行时解析出的身份，不能拿种子常量顶替 —— 这里的身份刻意为
-/// `ws_recorded`（与 `PECO_WS_ID_SEED` 不同值），退回比种子就会把 Peco 自己的
-/// 任务也判成「别人的」。
 #[tokio::test]
-async fn non_peco_origins_never_enter_the_wake_queue() {
+async fn every_dispatch_origin_enters_the_wake_queue() {
     let env = new_env(&["research"]).await;
     let dir = env.work_dir("wake_space");
     let target_ws_id = env.resolve(&dir, "research").await.unwrap();
     let target_dir = env.work_dir_of(&target_ws_id).await;
 
-    let peco = Arc::new(PecoIdentity {
-        ws_id: "ws_recorded".to_string(),
-        work_dir: env.home.join("spaces").join("peco").join("work"),
-        team_id: "peco".to_string(),
-        from_marker: true,
-    });
     let tasks = Arc::new(TaskObserver::new(env.pool.clone(), env.wake.clone()));
-    tasks.attach_peco(peco);
     let sink: &dyn TaskObservationSink = tasks.as_ref();
 
-    let own = TaskId(Uuid::new_v4());
+    let first = TaskId(Uuid::new_v4());
     sink.on_registered(
-        &observation(target_dir.clone(), own, "ws_recorded"),
-        &snapshot(own),
+        &observation(target_dir.clone(), first, "ws_recorded"),
+        &snapshot(first),
     )
     .await;
-    let foreign = TaskId(Uuid::new_v4());
+    let second = TaskId(Uuid::new_v4());
     sink.on_registered(
-        &observation(target_dir, foreign, "ws_other"),
-        &snapshot(foreign),
+        &observation(target_dir, second, "ws_other"),
+        &snapshot(second),
     )
     .await;
 
-    assert_eq!(
-        env.task_and_wake_state(&target_ws_id, &own.to_string())
-            .await
-            .1,
-        "awaiting",
-        "Peco 自己派出去的任务要进队列（注册那一刻只是登记，终态才入队）"
-    );
-    assert_eq!(
-        env.wake_skip_reason(&target_ws_id, &own.to_string()).await,
-        None,
-        "进队列的行不写跳过原因"
-    );
-    assert_eq!(
-        env.task_and_wake_state(&target_ws_id, &foreign.to_string())
-            .await
-            .1,
-        "skipped",
-        "别的空间的自有任务不是 Peco 的待办"
-    );
-    assert_eq!(
-        env.wake_skip_reason(&target_ws_id, &foreign.to_string())
-            .await
-            .as_deref(),
-        Some("not_peco_origin"),
-        "另一个空间的来源要标成 not_peco_origin"
-    );
-    // 判据本身不产生队列项：入队发生在终态。两条都跑到终态，队列里才该只剩
-    // `own` 那一行 —— 只看注册期的 wake_state 断不出「投递侧看不到别的行」。
-    for task in [&own, &foreign] {
+    for task in [&first, &second] {
+        assert_eq!(
+            env.task_and_wake_state(&target_ws_id, &task.to_string())
+                .await
+                .1,
+            "awaiting",
+            "两种已知来源都要进队列（注册那一刻只是登记，终态才入队）"
+        );
+        assert_eq!(
+            env.wake_skip_reason(&target_ws_id, &task.to_string()).await,
+            None,
+            "进队列的行不写跳过原因"
+        );
+    }
+
+    for task in [&first, &second] {
         dispatches::finish(&env.pool, &task.to_string(), "completed", None, None, false)
             .await
             .unwrap();
@@ -277,14 +243,11 @@ async fn non_peco_origins_never_enter_the_wake_queue() {
     let pending = dispatches::list_pending(&env.pool, wake::MAX_BATCH, wake::RETRY_BACKOFF)
         .await
         .unwrap();
-    assert_eq!(
-        pending
-            .iter()
-            .map(|row| row.task_id.clone())
-            .collect::<Vec<_>>(),
-        vec![own.to_string()],
-        "投递侧只能看到那一行"
-    );
+    let mut ids: Vec<String> = pending.into_iter().map(|row| row.task_id).collect();
+    ids.sort();
+    let mut expected = vec![first.to_string(), second.to_string()];
+    expected.sort();
+    assert_eq!(ids, expected, "两条来源都该由投递侧接手");
 }
 
 // ============================================================================
@@ -317,7 +280,7 @@ async fn a_tick_delivers_at_most_five_rows_and_leaves_the_rest_pending() {
     let upstream =
         FakeUpstream::start(|_: Value| async move { Reply::Text("收到".to_string()) }).await;
     let ws_id = open_peco_space(&env, &upstream).await;
-    wire_delivery(&env, peco_identity(&env, &ws_id).await);
+    wire_delivery(&env);
     for seq in 1..=7 {
         env.peco_pending_row(seq, &format!("t-{seq}"), &ws_id).await;
     }
@@ -485,19 +448,22 @@ async fn claiming_the_same_row_twice_yields_one_delivery() {
 // W12：关闭空间的竞态
 // ============================================================================
 
-/// 关闭空间只把「还没投出去」的行停掉；在途与已送达的行留着唤醒态 —— 它们
-/// 已经有一条消息在途或已送达，倒回 `skipped` 会让台账与事实分叉。
 #[tokio::test]
-async fn closing_a_space_keeps_the_wake_state_of_rows_already_in_flight() {
+async fn closing_a_space_only_stops_rows_addressed_to_itself() {
     let env = new_env(&[]).await;
     for (seq, task_id) in [
         (1, "t-delivering"),
         (2, "t-delivered"),
         (3, "t-pending"),
         (4, "t-failed"),
+        (5, "t-self"),
     ] {
         env.pending_row(seq, task_id, "working", None).await;
     }
+    sqlx::query("UPDATE d_dispatches SET origin_ws_id = 'ws_target' WHERE task_id = 't-self'")
+        .execute(&env.pool)
+        .await
+        .unwrap();
     arrange(&env.pool, "t-delivering", "delivering", 1).await;
     arrange(&env.pool, "t-delivered", "delivered", 1).await;
     arrange(&env.pool, "t-failed", "failed", 1).await;
@@ -506,8 +472,14 @@ async fn closing_a_space_keeps_the_wake_state_of_rows_already_in_flight() {
         .await
         .unwrap();
 
-    assert_eq!(orphaned, 4, "孤儿化照旧按状态维度计数");
-    for task_id in ["t-delivering", "t-delivered", "t-pending", "t-failed"] {
+    assert_eq!(orphaned, 5, "孤儿化照旧按状态维度计数");
+    for task_id in [
+        "t-delivering",
+        "t-delivered",
+        "t-pending",
+        "t-failed",
+        "t-self",
+    ] {
         let (task_state, _) = env.task_and_wake_state("ws_target", task_id).await;
         assert_eq!(task_state, "orphan", "{task_id} 必须被孤儿化");
     }
@@ -523,18 +495,25 @@ async fn closing_a_space_keeps_the_wake_state_of_rows_already_in_flight() {
     );
     assert_eq!(
         wake_state(&env.pool, "t-pending").await,
-        "skipped",
-        "还没投出去的行不再唤醒"
+        "pending",
+        "跨空间来源的待投行仍要送回发起方"
     );
-    // 只有「还没投出去」的两种态被关闭顶掉；在途与已送达保留原唤醒态。
-    for task_id in ["t-pending", "t-failed"] {
-        assert_eq!(
-            skip_reason(&env.pool, task_id).await.as_deref(),
-            Some("space_closed"),
-            "{task_id} 的跳过原因由关闭给出"
-        );
-    }
-    for task_id in ["t-delivering", "t-delivered"] {
+    assert_eq!(
+        wake_state(&env.pool, "t-failed").await,
+        "failed",
+        "跨空间来源的失败行保留重排依据"
+    );
+    assert_eq!(
+        wake_state(&env.pool, "t-self").await,
+        "skipped",
+        "接收方自己的空间关了，待投行不再唤醒"
+    );
+    assert_eq!(
+        skip_reason(&env.pool, "t-self").await.as_deref(),
+        Some("space_closed"),
+        "自派发行的跳过原因由关闭给出"
+    );
+    for task_id in ["t-pending", "t-failed", "t-delivering", "t-delivered"] {
         assert_eq!(
             skip_reason(&env.pool, task_id).await,
             None,
@@ -544,5 +523,12 @@ async fn closing_a_space_keeps_the_wake_state_of_rows_already_in_flight() {
     let pending = dispatches::list_pending(&env.pool, wake::MAX_BATCH, wake::RETRY_BACKOFF)
         .await
         .unwrap();
-    assert!(pending.is_empty(), "没有行留给投递侧");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|row| row.task_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t-pending"],
+        "只有跨空间来源的待投行还留给投递侧"
+    );
 }

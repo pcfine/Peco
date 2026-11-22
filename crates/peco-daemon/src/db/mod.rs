@@ -797,6 +797,31 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         tracing::debug!("Migration 031 skipped: workspaces.deleted_at already exists");
     }
 
+    // ── Migration 032: d_dispatches.origin_conversation_id ────────────────
+    // 门控查列：全新库由 `schema.sql` 一次建全 → 跳过；`ALTER TABLE ADD COLUMN`
+    // 不可重复执行，故必须按列判定。
+    let has_dispatch_origin_conversation = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pragma_table_info('d_dispatches') \
+         WHERE name = 'origin_conversation_id'",
+    )
+    .fetch_one(pool)
+    .await?
+        > 0;
+
+    if !has_dispatch_origin_conversation {
+        run_migration(
+            pool,
+            "032",
+            include_str!("migrations/032_dispatch_origin_conversation.sql"),
+        )
+        .await?;
+        tracing::info!("Migration 032 completed");
+    } else {
+        tracing::debug!(
+            "Migration 032 skipped: d_dispatches.origin_conversation_id already exists"
+        );
+    }
+
     Ok(())
 }
 

@@ -146,17 +146,17 @@ async fn close_is_blocked_by_dispatched_inflight_until_forced() {
             .unwrap();
     assert_eq!(task_states, vec!["orphan", "orphan"]);
 
-    // 两行都还在等唤醒：关闭必须把它们停掉，并说明是「空间关了」而不是别的。
-    let reasons: Vec<Option<String>> =
-        sqlx::query_scalar("SELECT wake_skip_reason FROM d_dispatches WHERE target_ws_id = ?")
-            .bind(&ws_id)
-            .fetch_all(&env.pool)
-            .await
-            .unwrap();
+    let wake: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT wake_state, wake_skip_reason FROM d_dispatches WHERE target_ws_id = ?",
+    )
+    .bind(&ws_id)
+    .fetch_all(&env.pool)
+    .await
+    .unwrap();
     assert_eq!(
-        reasons,
-        vec![Some("space_closed".to_string()); 2],
-        "强制关闭停掉待投递的行，原因必须是 space_closed"
+        wake,
+        vec![("pending".to_string(), None); 2],
+        "跨空间来源的待投行保留唤醒，交给发起方空间投递"
     );
 
     let closed_at: Option<String> =
