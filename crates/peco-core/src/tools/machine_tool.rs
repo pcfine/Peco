@@ -205,12 +205,17 @@ impl ToolDyn for RunMachineTask {
             name: "run_machine_task".to_string(),
             description: "Submit one or more tasks to other agents and run them concurrently. \
                 Each task is one agent turn (model -> tools -> ... -> final answer) running in \
-                the background in this workspace. By default this call waits until every task is \
-                terminal or timeout_secs elapses (default 300s) and returns each result. Set \
-                wait=false to get task ids back immediately and poll them later with \
-                inspect_machine_task. A wait timeout never cancels anything: unfinished tasks \
-                keep running, their current state is returned, so you can inspect or cancel them \
-                afterwards. You cannot choose the machine kind; agent_name selects the agent."
+                the background in this workspace. This is the asynchronous delegation path: by \
+                default the call returns task ids right after submission and the current turn \
+                ends immediately, so the caller and its conversation stay free while the tasks \
+                run. Poll them later with inspect_machine_task; results are also reported back \
+                to this conversation when the tasks finish. Set wait=true only when the result \
+                is needed within this turn: that blocks until every task is terminal or \
+                timeout_secs elapses (default 300s). Use delegate_sub_agent instead when the \
+                sub-agent result is required synchronously in this turn - it always waits. A \
+                wait timeout never cancels anything: unfinished tasks keep running, their \
+                current state is returned. You cannot choose the machine kind; agent_name \
+                selects the agent."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -244,8 +249,8 @@ impl ToolDyn for RunMachineTask {
                     },
                     "wait": {
                         "type": "boolean",
-                        "default": true,
-                        "description": "true: block until every task is terminal or timeout_secs elapses. false: return right after submission."
+                        "default": false,
+                        "description": "false (default): return right after submission; the tasks keep running in the background. true: block this turn until every task is terminal or timeout_secs elapses - use only when the result is needed now."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -296,14 +301,11 @@ impl ToolDyn for RunMachineTask {
     }
 }
 
-fn wait_by_default() -> bool {
-    true
-}
-
 #[derive(Deserialize)]
 struct RunArgs {
     tasks: Vec<TaskArgs>,
-    #[serde(default = "wait_by_default")]
+    /// 默认异步提交；确实要在本轮拿结果时才显式 `true`。
+    #[serde(default)]
     wait: bool,
     timeout_secs: Option<u64>,
 }
@@ -1440,8 +1442,9 @@ mod tests {
         Ok(parse(&text))
     }
 
+    /// 同步提交的单任务：默认已改为异步，要看结果的用例必须显式带 `wait: true`。
     fn one_task(agent_name: &str) -> Value {
-        json!({ "tasks": [{ "agent_name": agent_name, "prompt": "p" }] })
+        json!({ "tasks": [{ "agent_name": agent_name, "prompt": "p" }], "wait": true })
     }
 
     #[tokio::test]
@@ -1452,7 +1455,10 @@ mod tests {
 
             let (value, decls) = run_json(
                 &tool,
-                json!({ "tasks": [{ "agent_name": "worker", "prompt": "say hi" }] }),
+                json!({
+                    "tasks": [{ "agent_name": "worker", "prompt": "say hi" }],
+                    "wait": true
+                }),
             )
             .await;
 
@@ -1503,7 +1509,7 @@ mod tests {
                     .map(|name| json!({ "agent_name": name, "prompt": "p" }))
                     .collect();
 
-                let (value, _) = run_json(&tool, json!({ "tasks": tasks })).await;
+                let (value, _) = run_json(&tool, json!({ "tasks": tasks, "wait": true })).await;
 
                 let results = value["results"].as_array().expect("results array");
                 assert_eq!(results.len(), 2);
@@ -1528,7 +1534,8 @@ mod tests {
                     "tasks": [
                         { "agent_name": "worker", "prompt": "p" },
                         { "agent_name": "ghost", "prompt": "p" }
-                    ]
+                    ],
+                    "wait": true
                 }),
             )
             .await;
@@ -1576,7 +1583,8 @@ mod tests {
                         { "agent_name": "worker", "prompt": "first" },
                         { "agent_name": "ghost", "prompt": "second" },
                         { "agent_name": "helper", "prompt": "third" }
-                    ]
+                    ],
+                    "wait": true
                 }),
             )
             .await;
@@ -1657,6 +1665,7 @@ mod tests {
                 tokio::spawn(async move {
                     let args = json!({
                         "tasks": [{ "agent_name": "worker", "prompt": "p" }],
+                        "wait": true,
                         "timeout_secs": 1
                     });
                     tool.call(args.to_string()).await
@@ -1958,7 +1967,8 @@ mod tests {
                     "tasks": [
                         { "agent_name": "a", "prompt": "p" },
                         { "agent_name": "b", "prompt": "p" }
-                    ]
+                    ],
+                    "wait": true
                 }),
             )
             .await;
@@ -2083,7 +2093,7 @@ mod tests {
                 .collect();
 
             let content = tool
-                .call(json!({ "tasks": tasks }).to_string())
+                .call(json!({ "tasks": tasks, "wait": true }).to_string())
                 .await
                 .expect("run_machine_task must succeed");
             let Content::Text(text) = content else {
@@ -2636,14 +2646,14 @@ mod tests {
     }
 
     #[test]
-    fn the_wait_timeout_defaults_to_300_seconds() {
+    fn submissions_are_async_by_default_and_the_wait_timeout_defaults_to_300_seconds() {
         let defaults: RunArgs =
             serde_json::from_str(r#"{"tasks":[{"agent_name":"a","prompt":"p"}]}"#).expect("parse");
         assert_eq!(
             defaults.resolved_timeout(),
             Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS)
         );
-        assert!(defaults.wait, "wait defaults to true");
+        assert!(!defaults.wait, "wait defaults to false: submit and return");
 
         let explicit: RunArgs =
             serde_json::from_str(r#"{"tasks":[{"agent_name":"a","prompt":"p"}],"timeout_secs":5}"#)
@@ -2690,7 +2700,7 @@ mod tests {
         );
     }
 
-    /// 同步提交（默认 `wait=true`）不得带 `async` 键：台账扫描会把带键的任务
+    /// 同步提交（显式 `wait=true`）不得带 `async` 键：台账扫描会把带键的任务
     /// 当成待唤醒项，同步调用当轮已拿到结果，补记只会造成冗余轮次。
     #[test]
     fn only_async_submissions_are_labelled() {
@@ -2748,7 +2758,10 @@ mod tests {
             let sync_tool = runner(&[("worker", scripted_agent_named("done"))], &runtime);
             let (value, _) = run_json(
                 &sync_tool,
-                json!({ "tasks": [{ "agent_name": "worker", "prompt": "p" }] }),
+                json!({
+                    "tasks": [{ "agent_name": "worker", "prompt": "p" }],
+                    "wait": true
+                }),
             )
             .await;
             let sync_id = task_id_of(&value["results"][0]["task_id"]);
