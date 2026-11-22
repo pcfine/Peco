@@ -7,7 +7,7 @@ llm:
   provider: "deepseek"
   model: "deepseek-flash"
   temperature: 0.1
-  max_tokens: 32768
+  max_tokens: 131072
   stream: false
 tools:
   - search_knowledge

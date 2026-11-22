@@ -89,6 +89,7 @@ async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
         "peco",
         work_dir.clone(),
         provider.clone(),
+        Some(65_536),
         Some(Arc::clone(&km)),
         "conv-chat-1",
     );
@@ -130,6 +131,7 @@ async fn chat_runs_get_compaction_and_machine_tasks_do_not() {
         "peco",
         work_dir,
         provider,
+        Some(65_536),
         Some(km),
         "conv-plain-1",
     );
@@ -169,6 +171,8 @@ async fn boundary_fold_persists_summary_and_both_observation_rows() {
         keep_recent_tokens: 4_800,
         summarizer_model: "fixed".to_string(),
         history_token_budget: 1_200,
+        model_context_tokens: 1_048_576,
+        context_margin_tokens: 32_768,
         strip: CompactionStripConfig::default(),
     };
     let policy = limits.to_policy(Arc::new(FixedSummarizer));

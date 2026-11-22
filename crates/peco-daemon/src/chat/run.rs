@@ -337,6 +337,8 @@ pub(crate) async fn spawn_run(
         &team_id,
         ws.work_dir().root().to_path_buf(),
         Arc::clone(agent.provider()),
+        // 请求级护栏从模型窗口里扣掉本轮输出预留，剩余才是消息体预算。
+        agent.model_config().max_tokens,
         // 记忆写进本轮空间自己的库（打开空间时注入的那一份），不是团队的。
         ws.memory_manager().map(Arc::clone),
         // 压缩日志与边界观测按会话归档，指标才能只读本会话的时间线。

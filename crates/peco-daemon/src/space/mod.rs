@@ -157,13 +157,20 @@ impl SpaceEnv {
     /// 一份，拿团队管理器会把记忆写进别人的库。为 `None` 时不挂记忆读写 ——
     /// 没有库可写，挂上去只会每轮白付一次失败。
     ///
+    /// `max_output_tokens` 是本轮 agent 的 `llm.max_tokens`：请求级护栏用它从
+    /// 模型窗口里扣掉输出预留，剩余部分才是消息体预算。
+    ///
     /// `conversation_id` 只用于把压缩日志与边界观测挂到本轮会话上。
+    // 装配点：空间、团队、目录、provider、输出预算、记忆、会话 id 各自正交，
+    // 打包成结构体只会把同一份参数搬来搬去。
+    #[allow(clippy::too_many_arguments)]
     pub fn chat_looper_config(
         &self,
         ws_id: &str,
         team_id: &str,
         work_dir: PathBuf,
         provider: Arc<dyn ModelProvider>,
+        max_output_tokens: Option<u32>,
         memory: Option<Arc<KnowledgeManager>>,
         conversation_id: &str,
     ) -> LooperConfig {
@@ -191,9 +198,14 @@ impl SpaceEnv {
         }
         // 历史窗口是会话语义：没有它，压缩负责把历史折叠掉，而模型仍会收到全部
         // 未折叠轮 —— 折叠阈值之下的增长没有任何裁剪点。
-        config.message_filter = Some(Arc::new(PecoContextFilter::new(
-            limits.history_token_budget,
-        )));
+        //
+        // 请求预算再给当前轮加一道护栏：压缩只在轮次边界运行，单轮内工具输出
+        // 暴涨仍会推过模型窗口。预算 = 窗口 − 输出预算 − 系统提示/动态上下文余量，
+        // 超限时过滤器从旧到新削减工具输出，而不是等 provider 返回 400。
+        config.message_filter = Some(Arc::new(
+            PecoContextFilter::new(limits.history_token_budget)
+                .with_request_budget(limits.request_message_budget(max_output_tokens)),
+        ));
         // 摘要器与收尾报告器共用同一个实例：两者都是「读一遍既有内容、产出短文本」
         // 的元任务，复用同一个 provider 与模型即可，另建一份只会多一份配置漂移。
         let summarizer: Arc<dyn TurnSummarizer> = Arc::new(ModelSummarizer::new(

@@ -37,6 +37,10 @@ pub const ENV_CONTEXT_SHADOW_RETENTION_DAYS: &str = "PECO_COMPACTION_CONTEXT_SHA
 pub const ENV_VIEW_GUARD_TOKENS: &str = "PECO_COMPACTION_VIEW_GUARD_TOKENS";
 /// viewable 保留预算（`0` = 关）。
 pub const ENV_KEEP_VIEW_TOKENS: &str = "PECO_COMPACTION_KEEP_VIEW_TOKENS";
+/// 模型上下文窗口（token）的环境变量入口。
+pub const ENV_MODEL_CONTEXT_TOKENS: &str = "PECO_MODEL_CONTEXT_TOKENS";
+/// 请求级护栏为系统提示 / 动态上下文预留的余量（token）。
+pub const ENV_CONTEXT_MARGIN_TOKENS: &str = "PECO_CONTEXT_MARGIN_TOKENS";
 
 const DEFAULT_TRIGGER_TOKENS: usize = 384_000;
 const DEFAULT_KEEP_RECENT_TOKENS: usize = 128_000;
@@ -44,6 +48,10 @@ const DEFAULT_SUMMARIZER_MODEL: &str = "deepseek-flash";
 const DEFAULT_HISTORY_TOKEN_BUDGET: usize = 128_000;
 const DEFAULT_STRIP_KEEP_RECENT_TURNS: usize = 4;
 const DEFAULT_CONTEXT_SHADOW_RETENTION_DAYS: u64 = 30;
+/// deepseek-flash 的真实窗口（由 provider 的 context overflow 报错确认）。
+const DEFAULT_MODEL_CONTEXT_TOKENS: usize = 1_048_576;
+/// 系统提示 + 记忆召回 + Skill 正文等的保守余量。
+const DEFAULT_CONTEXT_MARGIN_TOKENS: usize = 32_768;
 
 /// 历史削减与边界观测参数。
 ///
@@ -98,6 +106,10 @@ pub struct CompactionLimits {
     /// 口径：仅统计轮内 viewable 条目（User / Assistant 文本），不含 tool 输出
     /// 与 reasoning —— 与 [`Self::trigger_tokens`] 的「全量轮」口径不可直接比较。
     pub history_token_budget: usize,
+    /// 模型上下文窗口（token）；请求级护栏据此计算消息体预算。
+    pub model_context_tokens: usize,
+    /// 系统提示 / 动态上下文的预留余量（token）。
+    pub context_margin_tokens: usize,
     pub strip: CompactionStripConfig,
 }
 
@@ -129,6 +141,16 @@ fn limits_from<F: Fn(&str) -> Option<String>>(get: F) -> CompactionLimits {
             &get,
             ENV_HISTORY_TOKEN_BUDGET,
             DEFAULT_HISTORY_TOKEN_BUDGET,
+        ),
+        model_context_tokens: parse_or(
+            &get,
+            ENV_MODEL_CONTEXT_TOKENS,
+            DEFAULT_MODEL_CONTEXT_TOKENS,
+        ),
+        context_margin_tokens: parse_or(
+            &get,
+            ENV_CONTEXT_MARGIN_TOKENS,
+            DEFAULT_CONTEXT_MARGIN_TOKENS,
         ),
         strip: CompactionStripConfig {
             shadow: parse_bool_or(&get, ENV_STRIP_SHADOW, defaults.shadow),
@@ -287,6 +309,34 @@ impl CompactionLimits {
         }
 
         violations
+    }
+
+    /// 请求消息体预算：模型窗口 − 本轮输出预算 − 系统提示/动态上下文余量。
+    ///
+    /// 这是 [`PecoContextFilter`](peco_core::agent::PecoContextFilter) 当前轮
+    /// 护栏的入参。压缩只在轮次边界运行，单轮内工具输出暴涨仍能推过窗口；
+    /// 过滤器按此预算在**每次请求前**从旧到新削减工具输出。
+    ///
+    /// 输出预算取 agent.md 的 `max_tokens`（截断重试的抬升目标默认更小，
+    /// 已被输出预算覆盖）。配置过紧时不 panic：预算过小只会让护栏更早
+    /// 开始削减，并打一条告警。
+    pub fn request_message_budget(&self, max_output_tokens: Option<u32>) -> usize {
+        let output = max_output_tokens.map_or(0, |v| v as usize);
+        let budget = self
+            .model_context_tokens
+            .saturating_sub(output)
+            .saturating_sub(self.context_margin_tokens);
+        if budget <= self.history_token_budget {
+            warn!(
+                model_context_tokens = self.model_context_tokens,
+                output_tokens = output,
+                context_margin_tokens = self.context_margin_tokens,
+                history_token_budget = self.history_token_budget,
+                request_budget = budget,
+                "request budget at or below history window; current turn will be trimmed aggressively"
+            );
+        }
+        budget
     }
 
     /// 由配置构造压缩策略：钳制后的字段就是 policy 的入参，中间不再有第二份取值。
@@ -501,6 +551,28 @@ mod tests {
         assert_eq!(limits.keep_recent_tokens, DEFAULT_KEEP_RECENT_TOKENS);
         assert_eq!(limits.summarizer_model, DEFAULT_SUMMARIZER_MODEL);
         assert_eq!(limits.history_token_budget, DEFAULT_HISTORY_TOKEN_BUDGET);
+        assert_eq!(limits.model_context_tokens, DEFAULT_MODEL_CONTEXT_TOKENS);
+        assert_eq!(limits.context_margin_tokens, DEFAULT_CONTEXT_MARGIN_TOKENS);
+    }
+
+    /// 请求预算 = 模型窗口 − 输出预算 − 系统提示余量。
+    #[test]
+    fn request_budget_subtracts_output_and_margin() {
+        let limits = limits_from(reader(&[]));
+        assert_eq!(
+            limits.request_message_budget(Some(65_536)),
+            DEFAULT_MODEL_CONTEXT_TOKENS - 65_536 - DEFAULT_CONTEXT_MARGIN_TOKENS
+        );
+        assert_eq!(
+            limits.request_message_budget(None),
+            DEFAULT_MODEL_CONTEXT_TOKENS - DEFAULT_CONTEXT_MARGIN_TOKENS
+        );
+
+        let limits = limits_from(reader(&[
+            (ENV_MODEL_CONTEXT_TOKENS, "200000"),
+            (ENV_CONTEXT_MARGIN_TOKENS, "1000"),
+        ]));
+        assert_eq!(limits.request_message_budget(Some(50_000)), 149_000);
     }
 
     /// 三个变量各自独立生效：只覆盖触发阈值与模型名时，保留区仍是默认。
