@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum_extra::extract::Multipart;
+use axum_extra::extract::multipart::MultipartError;
 use knowledge_base::manager::config::{
     BackendType, ChunkingStrategySerde, FastembedModelTypeSerde, KbConfig,
 };
@@ -20,7 +21,7 @@ use crate::db::{documents, knowledge_bases};
 use crate::state::AppState;
 use tracing::{error, info, warn};
 
-use super::reconcile;
+use super::{BYTES_PER_MB, MAX_DOC_BYTES, MAX_UPLOAD_BODY_BYTES, reconcile};
 
 // ── Request / Response 类型 ─────────────────────────────────────────────────
 
@@ -233,6 +234,41 @@ fn is_allowed_mime(mime: &str) -> bool {
             | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     ) || mime.starts_with("text/")
+}
+
+/// 单文件体积检查：超限一律 413，`details` 里同时给出实际体积与上限，
+/// 让人一眼看出超了多少而不是只知道「失败了」。
+fn check_doc_size(len: usize) -> Result<(), ApiError> {
+    if len > MAX_DOC_BYTES {
+        return Err(file_too_large(format!(
+            "file too large: {len} bytes ({:.1} MB), limit {MAX_DOC_BYTES} bytes ({:.0} MB)",
+            len as f64 / BYTES_PER_MB as f64,
+            MAX_DOC_BYTES as f64 / BYTES_PER_MB as f64,
+        )));
+    }
+    Ok(())
+}
+
+/// multipart 读取失败：请求体被 `DefaultBodyLimit` 截断是体积问题，其余是坏请求。
+///
+/// 原样透出 `Multipart::bytes` 的错误只会得到「Error parsing
+/// multipart/form-data request」，用户看不出是文件太大。
+fn multipart_read_error(e: MultipartError) -> ApiError {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return file_too_large(format!(
+            "file too large: upload body exceeded {MAX_UPLOAD_BODY_BYTES} bytes \
+             ({:.0} MB) including multipart overhead, a single file must be at most \
+             {MAX_DOC_BYTES} bytes ({:.0} MB)",
+            MAX_UPLOAD_BODY_BYTES as f64 / BYTES_PER_MB as f64,
+            MAX_DOC_BYTES as f64 / BYTES_PER_MB as f64,
+        ));
+    }
+    ApiError::BadRequest(format!("failed to read uploaded file: {e}"))
+}
+
+/// 体积超限的唯一出口，前端按 `code` 分支、按 `details` 展示。
+fn file_too_large(message: String) -> ApiError {
+    ApiError::coded(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large", message)
 }
 
 /// KB 细节（后端 / 嵌入模型 / 计数）只在实例的管理器里可得。
@@ -523,7 +559,7 @@ pub async fn upload_document(
     let mut mime_type: Option<String> = None;
     let mut data: Vec<u8> = Vec::new();
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_read_error)? {
         let name = field.name().map(|s| s.to_string());
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
@@ -531,13 +567,12 @@ pub async fn upload_document(
         if name.as_deref() == Some("file") {
             filename = file_name;
             mime_type = content_type;
-            data = field
-                .bytes()
-                .await
-                .map_err(|e| ApiError::BadRequest(format!("failed to read uploaded file: {e}")))?
-                .to_vec();
+            data = field.bytes().await.map_err(multipart_read_error)?.to_vec();
         }
     }
+
+    // 体积判定先于类型判定：超大文件哪怕扩展名也不对，也要先说明是体积问题。
+    check_doc_size(data.len())?;
 
     let filename = filename.ok_or_else(|| ApiError::BadRequest("file field is required".into()))?;
     let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -797,6 +832,31 @@ mod tests {
 
         assert!(is_supported_upload("text/markdown", "a.md"));
         assert!(is_supported_upload("application/pdf", "a.pdf"));
+    }
+
+    /// 边界：正好等于上限放行，多一个字节即 413。
+    ///
+    /// 变异方法（实测过）：把 `check_doc_size` 的 `>` 改成 `>=` —— 上限本身
+    /// 被拒，第一条断言变红。
+    #[test]
+    fn doc_size_boundary_rejects_one_byte_over_the_limit() {
+        assert!(
+            check_doc_size(MAX_DOC_BYTES).is_ok(),
+            "正好 {MAX_DOC_BYTES} 字节必须放行"
+        );
+
+        let error = check_doc_size(MAX_DOC_BYTES + 1).expect_err("多一个字节必须被拒");
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.code(), "file_too_large");
+        let message = error.message();
+        assert!(
+            message.contains(&MAX_DOC_BYTES.to_string()),
+            "文案必须带上限: {message}"
+        );
+        assert!(
+            message.contains(&(MAX_DOC_BYTES + 1).to_string()),
+            "文案必须带实际体积: {message}"
+        );
     }
 
     /// REST 建库路径默认走 HelixDB 后端。
