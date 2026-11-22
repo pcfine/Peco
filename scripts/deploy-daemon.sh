@@ -192,8 +192,6 @@ resolve_paths() {
   else
     BIND_ADDR="$DEFAULT_BIND"
   fi
-  PROBE_URL="http://$BIND_ADDR/api/peco"
-
   if [[ -n "${PECO_LOG+set}" ]]; then
     LOG_LEVEL="${PECO_LOG}"
   elif [[ -n "$baseline_log" ]]; then
@@ -264,6 +262,17 @@ resolve_paths() {
     # 基线里的数据根：没有 PECO_HOME 行时就是 daemon 自己的默认值。
     UNIT_BASELINE_DATA_ROOT="$(realpath -m -- "${UNIT_BASELINE_HOME:-$HOME/$HOME_DIR_NAME}")"
   fi
+
+  # 探针跟随 daemon 的实际协议：daemon.toml 同时给出证书与私钥才会开 HTTPS。
+  PROBE_HOST="$(probe_host_of "$BIND_ADDR")"
+  if daemon_tls_enabled "$DATA_HOME"; then
+    PROBE_SCHEME="https"
+    PROBE_INSECURE=1
+  else
+    PROBE_SCHEME="http"
+    PROBE_INSECURE=0
+  fi
+  PROBE_URL="$PROBE_SCHEME://$PROBE_HOST/api/auth/status"
 
   if [[ "$NO_BUILD" == "1" ]]; then
     SKIP_BUILD=1
@@ -532,7 +541,7 @@ render_unit() {
 wait_healthy() {
   local deadline=$((SECONDS + 30))
   while [[ "$SECONDS" -lt "$deadline" ]]; do
-    if curl -fsS --max-time 2 "$PROBE_URL" >/dev/null 2>&1; then
+    if probe_curl "$PROBE_URL" >/dev/null 2>&1; then
       log_info "daemon answers $PROBE_URL"
       return 0
     fi
@@ -543,12 +552,110 @@ wait_healthy() {
   die "daemon did not become healthy in 30s"
 }
 
+# 监听地址里的通配地址换成回环：0.0.0.0 / [::] 都能从本机回环访问到。
+probe_host_of() {
+  local addr="$1" host port
+  case "$addr" in
+    \[*\]:*) host="${addr%:*}" ; port="${addr##*:}" ;;
+    *:*) host="${addr%:*}" ; port="${addr##*:}" ;;
+    *) host="$addr" ; port="" ;;
+  esac
+  case "$host" in
+    0.0.0.0|"") host="127.0.0.1" ;;
+    "[::]"|"::") host="[::1]" ;;
+  esac
+  if [[ -n "$port" ]]; then
+    printf '%s:%s' "$host" "$port"
+  else
+    printf '%s' "$host"
+  fi
+}
+
+# `[daemon]` 段里同时配齐 tls_cert 与 tls_key 才算开 TLS；缺一侧 daemon 仍走明文。
+daemon_tls_enabled() {
+  local file="$1/daemon.toml"
+  [[ -f "$file" ]] || return 1
+  awk '
+    /^[[:space:]]*\[/ {
+      in_daemon = ($0 ~ /^[[:space:]]*\[daemon\]([[:space:]]*(#|$))/)
+      next
+    }
+    in_daemon && /^[[:space:]]*tls_cert[[:space:]]*=/ { cert = 1 }
+    in_daemon && /^[[:space:]]*tls_key[[:space:]]*=/ { key = 1 }
+    END { exit !(cert && key) }
+  ' "$file"
+}
+
+# setup token 的落点：`[daemon] token_file` 优先，缺省 `<home>/token`。
+daemon_token_file() {
+  local home="$1" file="$1/daemon.toml" raw=""
+  if [[ -f "$file" ]]; then
+    raw="$(awk '
+      /^[[:space:]]*\[/ {
+        in_daemon = ($0 ~ /^[[:space:]]*\[daemon\]([[:space:]]*(#|$))/)
+        next
+      }
+      in_daemon && /^[[:space:]]*token_file[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        gsub(/^"|"[[:space:]]*$/, "")
+        print
+        exit
+      }
+    ' "$file")"
+  fi
+  if [[ -n "$raw" ]]; then
+    case "$raw" in
+      /*) printf '%s' "$raw" ;;
+      *) printf '%s/%s' "$home" "$raw" ;;
+    esac
+  else
+    printf '%s/token' "$home"
+  fi
+}
+
+# 健康探针：HTTPS 用自签证书，必须跳过校验；本机探测一律绕过代理。
+probe_curl() {
+  local -a args=(-fsS --max-time 2 --noproxy '*')
+  [[ "${PROBE_INSECURE:-0}" == "1" ]] && args+=(-k)
+  curl "${args[@]}" "$@"
+}
+
 api_work_dir() {
-  local body work_dir
-  body="$(curl -fsS --max-time 2 "$PROBE_URL")" || return 1
-  work_dir="$(sed -nE 's/.*"work_dir":"([^"]*)".*/\1/p' <<<"$body")"
-  [[ -n "$work_dir" ]] || return 1
-  printf '%s' "$work_dir"
+  local host token home file body work_dir scheme
+  local -a homes=()
+  host="$(probe_host_of "$BIND_ADDR")"
+  [[ -n "${DATA_HOME:-}" ]] && homes+=("$DATA_HOME")
+  [[ -n "${PECO_DAEMON_HOME:-}" ]] && homes+=("$PECO_DAEMON_HOME")
+  [[ -n "${UNIT_BASELINE_HOME:-}" ]] && homes+=("$UNIT_BASELINE_HOME")
+  if [[ ${#homes[@]} -eq 0 ]]; then
+    local name
+    if name="$(require_home_dir_name "$CONFIG_SRC" 2>/dev/null)"; then
+      homes+=("$HOME/$name")
+    fi
+  fi
+
+  token=""
+  for home in "${homes[@]}"; do
+    file="$(daemon_token_file "$home")"
+    if [[ -f "$file" ]]; then
+      token="$(tr -d '[:space:]' <"$file")"
+      break
+    fi
+  done
+
+  for scheme in https http; do
+    local -a args=(-fsS --max-time 2 --noproxy '*')
+    [[ "$scheme" == "https" ]] && args+=(-k)
+    [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
+    if body="$(curl "${args[@]}" "$scheme://$host/api/peco" 2>/dev/null)"; then
+      work_dir="$(sed -nE 's/.*"work_dir":"([^"]*)".*/\1/p' <<<"$body")"
+      if [[ -n "$work_dir" ]]; then
+        printf '%s' "$work_dir"
+        return 0
+      fi
+    fi
+  done
+  return 1
 }
 
 # work_dir 形如 <home>/spaces/<team>/work，去掉这三段即数据根。
@@ -563,7 +670,7 @@ home_from_work_dir() {
 
 assert_data_root() {
   local work_dir home
-  work_dir="$(api_work_dir)" || die "cannot read $PROBE_URL; is the daemon up?"
+  work_dir="$(api_work_dir)" || die "cannot read /api/peco from $DATA_HOME; is the daemon up?"
   home="$(home_from_work_dir "$work_dir")"     || die "cannot derive the data root from work_dir '$work_dir'"
   # 最后一道闸：跑起来的 daemon 承认的数据根必须与脚本认定的那个一致。
   if [[ "$work_dir" != "$DATA_HOME"/* || "$home" != "$DATA_HOME" ]]; then
@@ -731,7 +838,7 @@ print_summary() {
   printf '  binary:    %s\n' "$BIN"
   printf '  data root: %s\n' "$DATA_HOME"
   printf '  cwd:       %s\n' "$(readlink "/proc/$(systemctl --user show -p MainPID --value "$SERVICE")/cwd" 2>/dev/null || echo '<unknown>')"
-  printf '  url:       http://%s/\n' "$BIND_ADDR"
+  printf '  url:       %s://%s/\n' "$PROBE_SCHEME" "$PROBE_HOST"
   printf '  logs:      journalctl --user -u %s -f\n' "$SERVICE"
 }
 
@@ -794,7 +901,7 @@ cmd_install() {
   assert_data_root
   check_linger
   print_summary
-  log_info "deployed: http://$BIND_ADDR/"
+  log_info "deployed: $PROBE_SCHEME://$PROBE_HOST/"
 }
 
 # ── 子命令：status ────────────────────────────────────────────────────────
