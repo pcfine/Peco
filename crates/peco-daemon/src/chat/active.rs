@@ -96,13 +96,19 @@ impl ChatActiveRuns {
         (reg.control_rx, reg.guard)
     }
 
-    /// 无客户端的运行注册：该会话已有条目时返回 `None`，**不顶替**。
+    /// 无客户端的运行注册：该会话已有**活的**在途运行时返回 `None`，**不顶替**。
     ///
     /// 「查 + 插」必须在同一把锁内完成：分成两步做，两个投递者会同时看到空闲，
     /// 后一个把前一个刚起的运行顶掉。
+    ///
+    /// 判据与 [`Self::is_active`] 同源（控制发送端未关闭）：条目要到守卫 drop 才
+    /// 移除，把守卫尚未回收的死条目当成在跑的，会让会话一直 409。
     pub(crate) fn try_register(&self, conversation_id: &str) -> Option<RunRegistration> {
         let mut map = self.inner.lock().unwrap();
-        if map.contains_key(conversation_id) {
+        if map
+            .get(conversation_id)
+            .is_some_and(|entry| !entry.tx.is_closed())
+        {
             return None;
         }
         Some(self.insert_locked(&mut map, conversation_id))
@@ -268,6 +274,21 @@ mod tests {
 
         drop(rx);
         assert!(!registry.is_active("c1"), "接收端已 drop 的运行不算在途");
+    }
+
+    #[tokio::test]
+    async fn a_dead_entry_does_not_block_the_next_run() {
+        let registry = ChatActiveRuns::new();
+        let (rx, guard) = registry.register("c1");
+        drop(rx);
+        assert!(!registry.is_active("c1"), "接收端已 drop 的运行不算在途");
+
+        let next = registry.try_register("c1");
+        assert!(next.is_some(), "死条目不得让会话一直忙");
+
+        // 旧守卫 drop 时 token 已不匹配：不得删掉新条目。
+        drop(guard);
+        assert!(registry.is_active("c1"), "旧守卫不得误删新条目");
     }
 
     #[tokio::test]

@@ -229,6 +229,48 @@ describe("在途轮注入", () => {
   });
 });
 
+describe("发送撞上服务端未接上的在途轮", () => {
+  it("409 conversation_busy：改为 steering 投递，而不是让用户先停止", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ code: "conversation_busy", error: "busy" }),
+        { status: 409 },
+      ),
+    );
+    const steerTurn = vi.fn(async () => "accepted" as const);
+    const { container } = renderView({ steerTurn });
+
+    send("继续处理这个任务");
+
+    await waitFor(() =>
+      expect(steerTurn).toHaveBeenCalledWith("继续处理这个任务", []),
+    );
+    // 只发了一次：没有再开第二条流去抢在途轮
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(queuedBlock(container)).not.toBeNull());
+    expect(screen.getByRole("textbox")).toHaveValue("");
+    expect(toast.error).not.toHaveBeenCalledWith("这一轮还在跑，先停止再发");
+  });
+
+  it("steering 也失败（轮在 409 与投递之间收尾）：维持原来的失败提示与输入", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ code: "conversation_busy", error: "busy" }),
+        { status: 409 },
+      ),
+    );
+    const steerTurn = vi.fn(async () => "no_running_task" as const);
+    renderView({ steerTurn });
+
+    send("再试一次");
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("这一轮还在跑，先停止再发"),
+    );
+    expect(screen.getByRole("textbox")).toHaveValue("再试一次");
+  });
+});
+
 describe("attach 接上的轮", () => {
   it("收到 user_steer：队列清空、气泡切分、增量落到新宿主", async () => {
     const stream = controlledStream();

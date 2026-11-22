@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
+  ATTACH_IDLE_POLL_MS,
   CANCEL_ABORT_MS,
   ChatView,
   applyTurnSnapshot,
@@ -208,7 +209,7 @@ describe("重新订阅在途轮", () => {
     );
   });
 
-  it("204（无在途轮）什么都不做：不新建气泡、不建连接", async () => {
+  it("204（无在途轮）不新建气泡、不建连接", async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
     const onAttachSettled = vi.fn();
     const onTurnSettled = vi.fn();
@@ -219,6 +220,28 @@ describe("重新订阅在途轮", () => {
     expect(container.querySelector("[data-slot='assistant-turn']")).toBeNull();
     expect(onAttachSettled).not.toHaveBeenCalled();
     expect(onTurnSettled).not.toHaveBeenCalled();
+  });
+
+  it("204 空闲后定时重探：服务端后来起的轮（定时/唤醒）能被接上", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const stream = controlledStream();
+    fetchMock.mockResolvedValueOnce(stream.response);
+    const { container } = renderView();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // 空闲不是终态：等到重探间隔后再发一次订阅。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ATTACH_IDLE_POLL_MS);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await stream.push(snapshotFrame(5, "AB"));
+    expect(container.textContent).toContain("AB");
   });
 
   it("可见性回到 true 时重新订阅（切走再回来）", async () => {

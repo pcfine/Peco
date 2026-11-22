@@ -163,6 +163,14 @@ export interface ChatAttachment {
  */
 export const CANCEL_ABORT_MS = 10_000;
 
+/**
+ * 空闲时重新探测在途轮的间隔。
+ *
+ * 一轮也可能由定时任务、唤醒投递或另一个标签页发起；不重探的话页面会停在
+ * idle，发送却撞 409。3s 与任务实时列表同一量级。
+ */
+export const ATTACH_IDLE_POLL_MS = 3_000;
+
 /** 一轮的终态：正常完成 / 失败 / 用户取消。 */
 export type TurnStatus = "success" | "failed" | "cancelled";
 
@@ -668,6 +676,9 @@ export function ChatView({
 
       const controller = new AbortController();
       abortRef.current = controller;
+      // 本地流接手出口：停掉空闲重探/在途订阅，避免两条流抢同一轮。
+      attachAbortRef.current?.abort();
+      attachAbortRef.current = null;
 
       /**
        * 撤掉刚乐观插进去的两条气泡，输入与附件原样还给用户。
@@ -709,6 +720,35 @@ export function ChatView({
           // 观测点即分类点：回了响应就一定不是「连不上」，别再落进 catch。
           const failure = fromResponse(response.status, errText);
           restoreOptimistic();
+          // 409 conversation_busy：服务端有一轮在跑而本页没接上（定时/唤醒/
+          // 另一个标签页起的轮都不通知本页）。改为 steering 投递，而不是让用户先停止。
+          if (
+            failure.kind === "server" &&
+            failure.code === "conversation_busy" &&
+            steerTurnRef.current
+          ) {
+            const images = attachments.filter((a) => a.kind === "image");
+            try {
+              const outcome = await steerTurnRef.current(
+                text,
+                images.map((a) => a.id),
+              );
+              if (outcome === "accepted") {
+                setInput("");
+                setPendingAttachments(
+                  attachments.filter((a) => a.kind !== "image"),
+                );
+                queuedSeqRef.current += 1;
+                commitInternalQueued([
+                  ...internalQueuedRef.current,
+                  { id: `steer-${queuedSeqRef.current}`, text },
+                ]);
+                return;
+              }
+            } catch {
+              // 投递失败退回普通失败提示；输入已由 restoreOptimistic 还给用户。
+            }
+          }
           reportFailure(failure);
           return;
         }
@@ -817,9 +857,11 @@ export function ChatView({
         setPaused(false);
         setCancelling(false);
         abortRef.current = null;
+        // 本地收尾后重订阅：下一轮（唤醒/定时）必须能被这个页面看见。
+        setAttachEpoch((n) => n + 1);
       }
     },
-    [settleTurn, retainFailure, applyUserSteer],
+    [settleTurn, retainFailure, applyUserSteer, commitInternalQueued],
   );
 
   // ── Sync messages when initialMessages changes (pool keep-alive) ─────────
@@ -1078,7 +1120,17 @@ export function ChatView({
       );
     };
 
+    /** 本页拿到的 204 只说明「那一刻空闲」，不是「以后都空闲」。 */
+    const scheduleIdlePoll = (attempt: number) => {
+      if (disposed || abortRef.current) return;
+      timer = setTimeout(() => {
+        void run(attempt);
+      }, ATTACH_IDLE_POLL_MS);
+    };
+
     const run = async (attempt: number): Promise<void> => {
+      // 本地发送的流就是出口：让路，别再叠一条订阅。
+      if (abortRef.current) return;
       let watermark = -1;
       let sawDone = false;
       try {
@@ -1087,9 +1139,11 @@ export function ChatView({
         if (response.status === 204) {
           // 无在途轮：历史即权威。顺手把可能残留的流式态收干净（隐藏期间这一轮
           // 跑完时我们不在，没人替我们关它）。
+          if (abortRef.current) return;
           setStreaming(false);
           setCancelling(false);
           setAttachFailed(false);
+          scheduleIdlePoll(attempt);
           return;
         }
         if (!response.ok || !response.body) {
@@ -1165,7 +1219,12 @@ export function ChatView({
         }
 
         // 规则 7：没有 `done` 而流结束 = 连接失败，不得自行判定轮已结束
-        if (!sawDone) retry(attempt);
+        if (!sawDone) {
+          retry(attempt);
+          return;
+        }
+        // 正常收尾后继续空闲重探，等下一次服务端侧的轮。
+        scheduleIdlePoll(attempt);
       } catch {
         if (disposed || controller.signal.aborted) return;
         retry(attempt);
